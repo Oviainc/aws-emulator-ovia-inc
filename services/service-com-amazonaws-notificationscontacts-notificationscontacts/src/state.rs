@@ -165,10 +165,9 @@ pub fn satisfies_tag_key_pattern(key: &str) -> bool {
 ///
 /// `member` is the map member the keys arrived through (`tags`), and that member is the
 /// path the refusal blames: the centralized walk visits no map key at all, so there is
-/// no element position of its spelling to name, and the key itself is the value the
-/// clause echoes. A request carrying several bad keys is refused for the
-/// lexicographically first of them, so one request always reads the same way however the
-/// map happened to hand its keys over.
+/// no element position of its spelling to name. A request carrying several bad keys is
+/// refused for the lexicographically first of them, so one request always reads the same
+/// way however the map happened to hand its keys over.
 pub fn check_tag_map_keys<'a, I>(member: &str, keys: I) -> Result<(), ValidationException>
 where
     I: IntoIterator<Item = &'a str>,
@@ -177,10 +176,7 @@ where
         .into_iter()
         .filter(|key| !satisfies_tag_key_pattern(key))
         .min();
-    refuse_outside_pattern(
-        TAG_KEY_PATTERN,
-        refused.map(|key| (member.to_string(), key)),
-    )
+    refuse_outside_pattern(TAG_KEY_PATTERN, refused.map(|_| member.to_string()))
 }
 
 /// `Ok` when every ELEMENT of a `TagKeys` member in `keys` satisfies
@@ -200,7 +196,7 @@ where
         .find(|(_, key)| !satisfies_tag_key_pattern(key));
     refuse_outside_pattern(
         TAG_KEY_PATTERN,
-        refused.map(|(index, key)| (element_path(member, index + 1), key)),
+        refused.map(|(index, _)| element_path(member, index + 1)),
     )
 }
 
@@ -214,16 +210,16 @@ fn element_path(member: &str, position: usize) -> String {
 }
 
 /// `Ok` when `offender` is `None`, else the modelled 400 that
-/// [`pattern_validation_failure`] words for the `(path, value)` it carries.
+/// [`pattern_validation_failure`] words for the member path it carries.
 ///
 /// The ONE refusal path for a `@pattern` this service has to apply by hand, so no caller
 /// of it can word such a refusal its own way.
 fn refuse_outside_pattern(
     pattern: &str,
-    offender: Option<(String, &str)>,
+    offender: Option<String>,
 ) -> Result<(), ValidationException> {
     match offender {
-        Some((path, value)) => Err(pattern_validation_failure(&path, pattern, value)),
+        Some(path) => Err(pattern_validation_failure(&path, pattern)),
         None => Ok(()),
     }
 }
@@ -281,7 +277,7 @@ pub fn satisfies_email_contact_name_pattern(name: &str) -> bool {
 pub fn check_email_contact_name(member: &str, name: &str) -> Result<(), ValidationException> {
     refuse_outside_pattern(
         EMAIL_CONTACT_NAME_PATTERN,
-        (!satisfies_email_contact_name_pattern(name)).then(|| (member.to_string(), name)),
+        (!satisfies_email_contact_name_pattern(name)).then(|| member.to_string()),
     )
 }
 
@@ -339,7 +335,7 @@ pub fn check_email_contact_address(
 ) -> Result<(), ValidationException> {
     refuse_outside_pattern(
         EMAIL_CONTACT_ADDRESS_PATTERN,
-        (!satisfies_email_contact_address_pattern(address)).then(|| (member.to_string(), address)),
+        (!satisfies_email_contact_address_pattern(address)).then(|| member.to_string()),
     )
 }
 
@@ -640,6 +636,30 @@ pub fn contact_not_found(arn: &str) -> ResourceNotFoundException {
     }
 }
 
+/// What the tag plane states for a resource it holds no record of: FIXED text, naming
+/// neither the resource it looked for nor the ARN the request asked about.
+///
+/// The requested ARN is still reported, through the member the shape has for it
+/// (`ResourceNotFoundException$resourceId`, "the ID of the resource that wasn't found"),
+/// so nothing a caller needs is lost by a sentence that carries no parameter.
+const TAGGED_RESOURCE_NOT_FOUND: &str = "Resource was not found";
+
+/// The modelled 404 the TAG PLANE answers for a resource this store does not hold — the
+/// one lookup `TagResource`, `UntagResource` and `ListTagsForResource` share.
+///
+/// A tag-plane operation takes the ARN of ANY taggable resource of this service rather
+/// than of the email contact alone (`TagResource`: "a resource, as identified by its
+/// Amazon Resource Name"), so its refusal states that a resource was not found and names
+/// no resource kind; the readers and writers of the contact itself keep their own
+/// sentence, which names the contact they were asked for.
+pub fn tagged_resource_not_found(arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: TAGGED_RESOURCE_NOT_FOUND.to_string(),
+        resource_id: arn.to_string(),
+        resource_type: CONTACT_RESOURCE_TYPE.to_string(),
+    }
+}
+
 /// The modelled 404 for an email contact that holds no outstanding activation token.
 ///
 /// An activation token is a resource of its own, minted only by `SendActivationCode`
@@ -681,73 +701,42 @@ pub fn field_validation_failure(member: &str, why: &str) -> ValidationException 
     }
 }
 
-/// What the framework's constraint clause puts between the value it echoes and the
-/// requirement that value broke, so the requirement half can be read back off it.
-const CONSTRAINT_CLAUSE_SEPARATOR: &str = " failed to satisfy constraint: ";
-
-/// Ceiling on a refused value as a refusal ECHOES it, in bytes.
+/// The modelled 400 for a value outside the `@pattern` its member declares.
 ///
-/// A `@pattern` applied by hand is applied to a value nothing else bounds the length of —
-/// `TagKey` declares its 1..128 bound INSIDE the very pattern the centralized walk could
-/// not apply, so a key of any size reaches a handler — and the clause interpolates that
-/// value, so without a ceiling one request would choose the size of its own error
-/// response. The echo is there for the caller to see WHAT was refused, which a prefix
-/// satisfies: twice the longest value any pattern applied here admits
-/// ([`MAX_TAG_KEY_LEN`] characters) already shows a value no such pattern could match.
-const MAX_ECHOED_VALUE_BYTES: usize = 2 * MAX_TAG_KEY_LEN;
-
-/// `value` as a clause should interpolate it: itself when short, else a prefix cut on a
-/// character boundary followed by the size of what was sent.
-///
-/// RENDERING ONLY. A pattern is applied to the value the request sent, never to this: a
-/// value judged in its elided form would be judged against text the caller never wrote.
-fn echoed(value: &str) -> std::borrow::Cow<'_, str> {
-    if value.len() <= MAX_ECHOED_VALUE_BYTES {
-        return std::borrow::Cow::Borrowed(value);
-    }
-    let mut end = MAX_ECHOED_VALUE_BYTES;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    std::borrow::Cow::Owned(format!("{}... [{} bytes]", &value[..end], value.len()))
-}
-
-/// The modelled 400 for a `value` outside the `@pattern` its member declares.
-///
-/// The sentence is NOT written here: the violation is handed to the framework's own
-/// renderer, so a `@pattern` this service has to apply itself is refused in exactly the
-/// words the centralized walk uses for a `@pattern` it could apply — the envelope, the
-/// member path, the value the request submitted and the expression the model declares —
-/// and `fieldList` blames the member with the requirement half of that same clause.
+/// The sentence is NOT written here: the expression a clause advertises, the clause, the
+/// envelope and the requirement half are the framework's and the cross-service
+/// validation-message renderings', so a `@pattern` this service has to apply itself is
+/// refused in exactly the words a `@pattern` the centralized walk could apply is. No
+/// clause of this service states the value that broke the constraint, so none is passed
+/// here.
 ///
 /// `path` is that member path, spelled the way the framework spells one: a member names
 /// itself, and a collection element names its position too (see [`element_path`]).
-///
-/// The echoed value is elided at [`MAX_ECHOED_VALUE_BYTES`], so one clause cannot carry
-/// request-sized content whatever the member's own modelled bounds are.
-pub fn pattern_validation_failure(
-    path: &str,
-    pattern: &str,
-    value: &str,
-) -> ValidationException {
+pub fn pattern_validation_failure(path: &str, pattern: &str) -> ValidationException {
+    // The expression a clause advertises, the clause itself, the envelope around it and
+    // the requirement half `fieldList` blames the member with are every one of them the
+    // framework's or the cross-service renderings' — nothing about this sentence is
+    // written here, so a `@pattern` applied by hand cannot be worded differently from one
+    // the centralized walk applied.
+    let kind = ::aws_smithy_schema_server::ViolationKind::Pattern(
+        ::service_common::validation::unanchored(pattern),
+    );
     let violation = ::aws_smithy_schema_server::Violation {
         path: path.to_string(),
-        kind: ::aws_smithy_schema_server::ViolationKind::Pattern(pattern.to_string()),
-        value: Some(echoed(value).into_owned()),
-        sensitive: false,
+        kind: kind.clone(),
+        // The request DID carry a value — it is simply not stated, which is what this
+        // marks: a clause that reported it as absent would state a different fact.
+        value: None,
+        sensitive: true,
     };
     let clause = violation.message();
-    let requirement = clause
-        .split_once(CONSTRAINT_CLAUSE_SEPARATOR)
-        .map_or(clause.as_str(), |(_, requirement)| requirement)
-        .to_string();
     ValidationException {
-        message: ::aws_smithy_schema_server::envelope(std::slice::from_ref(&violation))
+        message: ::service_common::validation_message::envelope_over(std::slice::from_ref(&clause))
             .unwrap_or(clause),
         reason: VALIDATION_REASON_FIELD.to_string(),
         field_list: Some(vec![ValidationExceptionField {
             name: path.to_string(),
-            message: requirement,
+            message: ::service_common::validation_message::requirement(kind),
         }]),
     }
 }

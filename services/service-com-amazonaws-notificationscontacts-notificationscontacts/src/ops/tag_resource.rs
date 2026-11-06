@@ -176,9 +176,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let contact = store.contact_mut(&input.arn).ok_or_else(|| {
-            TagResourceErrorModeled::ResourceNotFoundException(crate::state::contact_not_found(
-                &input.arn,
-            ))
+            TagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::tagged_resource_not_found(&input.arn),
+            )
         })?;
 
         // A key the request repeats replaces a value rather than adding a pair, so only

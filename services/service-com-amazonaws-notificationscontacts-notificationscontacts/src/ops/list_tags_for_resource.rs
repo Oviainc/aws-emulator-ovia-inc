@@ -158,7 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let contact = store.contact(&input.arn).ok_or_else(|| {
             ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                crate::state::contact_not_found(&input.arn),
+                crate::state::tagged_resource_not_found(&input.arn),
             )
         })?;
 

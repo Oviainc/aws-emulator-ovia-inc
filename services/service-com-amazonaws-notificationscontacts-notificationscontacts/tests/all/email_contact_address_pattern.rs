@@ -27,6 +27,12 @@ use crate::email_contacts::{create, emulator, error_code, get_ok, list, Emulator
 /// The character the modelled pattern requires between its two `.+` runs.
 const SEPARATOR: char = '@';
 
+/// The expression a refusal of this member ADVERTISES: the modelled pattern as this
+/// service publishes it, which is [`EMAIL_CONTACT_ADDRESS_PATTERN`] without the
+/// whole-value anchors it is written with. Transcribed rather than computed, so the suite
+/// states the published expression independently of the code that strips the anchors.
+const PUBLISHED_ADDRESS_PATTERN: &str = r"(.+)@(.+)";
+
 /// The fewest characters the member's own `@length` admits
 /// (`smithy_query(query="shape",shape="EmailContactAddress")` reports `len 6..254`), so a
 /// row refused by the PATTERN stays clear of the length bound.
@@ -283,10 +289,11 @@ async fn create_email_contact_applies_the_modelled_email_address_pattern() {
     }
 }
 
-/// The refusal of a value the LENGTH admits and the pattern does not reads in exactly the
-/// words the framework's centralized walk uses for a `@pattern` it can apply itself — so
-/// the three line terminators the walk's own engine admits are refused the same way the
-/// one it excludes is.
+/// The refusal of a value the LENGTH admits and the pattern does not blames the member,
+/// advertises the expression this service publishes for it and states no value — the one
+/// wording every constraint refusal of this service carries, whether the walk applied the
+/// constraint or a handler did. So the three line terminators the walk's own engine admits
+/// are refused the same way the one it excludes is.
 #[tokio::test]
 async fn the_refusal_blames_the_member_and_states_the_modelled_expression() {
     for (character, terminator) in LINE_TERMINATORS {
@@ -309,39 +316,20 @@ async fn the_refusal_blames_the_member_and_states_the_modelled_expression() {
             .and_then(Value::as_str)
             .unwrap_or_else(|| panic!("case {character:?}: expected a message, got {body:?}"));
 
-        // Rendered by the framework's own renderer rather than transcribed, because "the
-        // same words the centralized walk uses" IS the rule; the fixed halves of the
-        // sentence are pinned as literal text below.
-        let violation = aws_smithy_schema_server::Violation {
-            path: "emailAddress".to_string(),
-            kind: aws_smithy_schema_server::ViolationKind::Pattern(
-                EMAIL_CONTACT_ADDRESS_PATTERN.to_string(),
-            ),
-            value: Some(address.clone()),
-            sensitive: false,
-        };
-        let expected = aws_smithy_schema_server::envelope(std::slice::from_ref(&violation))
-            .unwrap_or_else(|| panic!("one violation renders one envelope"));
+        // The whole sentence, transcribed: the envelope, the member path and the
+        // expression this service publishes for the member — the modelled one stripped of
+        // the whole-value anchors it is written with — and no sign of the refused value.
+        let expected = format!(
+            "1 validation error detected: Value at 'emailAddress' failed to satisfy constraint: \
+             Member must satisfy regular expression pattern: {PUBLISHED_ADDRESS_PATTERN}"
+        );
         assert_eq!(
             stated, expected,
-            "case {character:?}: the refusal must read as the framework words this violation, \
-             got {stated:?}"
+            "case {character:?}: expected {expected:?}, got {stated:?}"
         );
         assert!(
-            stated.starts_with("1 validation error detected: "),
-            "case {character:?}: the refusal must carry the validation envelope, got {stated:?}"
-        );
-        assert!(
-            stated.contains("at 'emailAddress'"),
-            "case {character:?}: the refusal must blame the member the request wrote, got \
-             {stated:?}"
-        );
-        assert!(
-            stated.contains(&format!(
-                "Member must satisfy regular expression pattern: {EMAIL_CONTACT_ADDRESS_PATTERN}"
-            )),
-            "case {character:?}: the refusal must state {EMAIL_CONTACT_ADDRESS_PATTERN:?}, got \
-             {stated:?}"
+            !stated.contains(&address),
+            "case {character:?}: the refusal must not state the value it refused, got {stated:?}"
         );
     }
 }

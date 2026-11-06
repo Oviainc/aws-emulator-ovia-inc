@@ -8,12 +8,12 @@
 //! what a signed AWS SDK request observes.
 //!
 //! The rule under test: a modelled `@pattern` this service applies ITSELF is refused in
-//! the same words the framework's centralized constraint walk uses for a `@pattern` it
-//! can apply — the `N validation error detected:` envelope around
-//! `Value '<the submitted value>' at '<the member path>' failed to satisfy constraint:
-//! Member must satisfy regular expression pattern: <the expression the model declares>`,
-//! with `fieldList` blaming that same path with the requirement half of that clause —
-//! whichever member and whichever expression it is.
+//! the same words every constraint refusal of this service carries — the
+//! `N validation error detected:` envelope around
+//! `Value at '<the member path>' failed to satisfy constraint: Member must satisfy regular
+//! expression pattern: <the expression this service publishes for the member>`, stating no
+//! submitted value, with `fieldList` blaming that same path with the requirement half of
+//! that clause — whichever member and whichever expression it is.
 //!
 //! Two modelled patterns reach this service by hand, for reasons that are the
 //! framework's rather than the model's: `EmailContactName`'s `[\w-.~]+`, whose character
@@ -22,10 +22,9 @@
 //! spans BOTH, and every member each travels through: `CreateEmailContact$name`,
 //! `CreateEmailContact$tags`, `TagResource$tags` and `UntagResource$tagKeys`.
 //!
-//! The expectation is RENDERED by the framework's own renderer rather than transcribed
-//! into the assertion, which is the rule itself; the fixed halves of the sentence (the
-//! envelope, `at '<path>'`, the expression) are additionally pinned as literal text, so
-//! the suite states AWS's wording independently of the renderer that produces it.
+//! The expectation is TRANSCRIBED: the envelope, `at '<path>'` and the expression this
+//! service publishes for the member are pinned as literal text, so the suite states AWS's
+//! wording independently of the code that renders it.
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_notificationscontacts_notificationscontacts::ops::types::UNTAG_RESOURCE_INPUT_SCHEMA;
@@ -37,9 +36,19 @@ use crate::email_contacts::{create, emulator, error_code, Emulator};
 use crate::resource_tag_writes::{tag, untag, TAG_MUTATION_SUCCESS_STATUS};
 use crate::resource_tags::{create_tagged, pair, tag_map, tags_ok};
 
-/// What the framework's constraint clause puts between the value it echoes and the
-/// requirement that value broke.
+/// What the framework's constraint clause puts between its subject and the requirement
+/// the refused value broke.
 const CONSTRAINT_SEPARATOR: &str = " failed to satisfy constraint: ";
+
+/// The expression a refusal ADVERTISES for a member whose modelled `@pattern` is
+/// [`TAG_KEY_PATTERN`]: that pattern as this service publishes it, without the
+/// whole-value anchors it is written with. Transcribed, so the suite states the published
+/// expression independently of the code that strips those anchors.
+const PUBLISHED_TAG_KEY_PATTERN: &str = r"(?!aws:).{1,128}";
+
+/// The same for [`EMAIL_CONTACT_NAME_PATTERN`], which the model writes with neither
+/// anchor — so what this service publishes for it is that expression itself.
+const PUBLISHED_NAME_PATTERN: &str = r"[\w-.~]+";
 
 /// The prefix `TagKey`'s leading `(?!aws:)` look-ahead excludes.
 const RESERVED_PREFIX: &str = "aws:";
@@ -61,11 +70,12 @@ struct Case {
     /// What this row varies, named in every assertion.
     what: &'static str,
     request: Request,
-    /// The value the clause must echo: the one value of the request outside the pattern.
+    /// The one value of the request outside the pattern, which the refusal must NOT
+    /// state.
     value: String,
     /// The path the clause must blame.
     path: String,
-    /// The expression the model declares for the member that path names.
+    /// The expression a refusal of the member that path names advertises.
     pattern: &'static str,
 }
 
@@ -90,42 +100,42 @@ fn refusal_table() -> Vec<Case> {
             request: Request::TagResourceTags(keys(&["aws:owner"])),
             value: "aws:owner".to_string(),
             path: "tags".to_string(),
-            pattern: TAG_KEY_PATTERN,
+            pattern: PUBLISHED_TAG_KEY_PATTERN,
         },
         Case {
             what: "the reserved prefix alone on TagResource",
             request: Request::TagResourceTags(keys(&[RESERVED_PREFIX])),
             value: RESERVED_PREFIX.to_string(),
             path: "tags".to_string(),
-            pattern: TAG_KEY_PATTERN,
+            pattern: PUBLISHED_TAG_KEY_PATTERN,
         },
         Case {
             what: "the empty tag key on TagResource",
             request: Request::TagResourceTags(keys(&[""])),
             value: String::new(),
             path: "tags".to_string(),
-            pattern: TAG_KEY_PATTERN,
+            pattern: PUBLISHED_TAG_KEY_PATTERN,
         },
         Case {
             what: "a tag key one character past the maximum on TagResource",
             request: Request::TagResourceTags(vec![over_long.clone()]),
             value: over_long.clone(),
             path: "tags".to_string(),
-            pattern: TAG_KEY_PATTERN,
+            pattern: PUBLISHED_TAG_KEY_PATTERN,
         },
         Case {
             what: "a reserved tag key beside two legal ones on TagResource",
             request: Request::TagResourceTags(keys(&["team", "aws:owner", "env"])),
             value: "aws:owner".to_string(),
             path: "tags".to_string(),
-            pattern: TAG_KEY_PATTERN,
+            pattern: PUBLISHED_TAG_KEY_PATTERN,
         },
         Case {
             what: "two refused tag keys on TagResource, the lexicographically first blamed",
             request: Request::TagResourceTags(keys(&["aws:owner", ""])),
             value: String::new(),
             path: "tags".to_string(),
-            pattern: TAG_KEY_PATTERN,
+            pattern: PUBLISHED_TAG_KEY_PATTERN,
         },
         // The same pattern, the same path spelling, through the create that mints the
         // resource the map travels with.
@@ -134,14 +144,14 @@ fn refusal_table() -> Vec<Case> {
             request: Request::CreateTags(keys(&["line\u{2028}break"])),
             value: "line\u{2028}break".to_string(),
             path: "tags".to_string(),
-            pattern: TAG_KEY_PATTERN,
+            pattern: PUBLISHED_TAG_KEY_PATTERN,
         },
         Case {
             what: "a reserved tag key beside a legal one on CreateEmailContact",
             request: Request::CreateTags(keys(&["team", "aws:cost"])),
             value: "aws:cost".to_string(),
             path: "tags".to_string(),
-            pattern: TAG_KEY_PATTERN,
+            pattern: PUBLISHED_TAG_KEY_PATTERN,
         },
         // `TagKey` through a LIST element: the walk names an element by its 1-based
         // position and the step into the collection, so the path moves with the position.
@@ -150,14 +160,14 @@ fn refusal_table() -> Vec<Case> {
             request: Request::UntagTagKeys(keys(&["aws:owner"])),
             value: "aws:owner".to_string(),
             path: "tagKeys.1.member".to_string(),
-            pattern: TAG_KEY_PATTERN,
+            pattern: PUBLISHED_TAG_KEY_PATTERN,
         },
         Case {
             what: "a reserved element after a legal one on UntagResource",
             request: Request::UntagTagKeys(keys(&["team", "aws:owner"])),
             value: "aws:owner".to_string(),
             path: "tagKeys.2.member".to_string(),
-            pattern: TAG_KEY_PATTERN,
+            pattern: PUBLISHED_TAG_KEY_PATTERN,
         },
         Case {
             what: "an over-long element third on UntagResource",
@@ -168,14 +178,14 @@ fn refusal_table() -> Vec<Case> {
             ]),
             value: over_long,
             path: "tagKeys.3.member".to_string(),
-            pattern: TAG_KEY_PATTERN,
+            pattern: PUBLISHED_TAG_KEY_PATTERN,
         },
         Case {
             what: "two refused elements on UntagResource, the first one blamed",
             request: Request::UntagTagKeys(keys(&["aws:owner", "line\nbreak"])),
             value: "aws:owner".to_string(),
             path: "tagKeys.1.member".to_string(),
-            pattern: TAG_KEY_PATTERN,
+            pattern: PUBLISHED_TAG_KEY_PATTERN,
         },
         // `EmailContactName` through a plain string member: the member names itself.
         Case {
@@ -183,21 +193,21 @@ fn refusal_table() -> Vec<Case> {
             request: Request::Name("team alpha".to_string()),
             value: "team alpha".to_string(),
             path: "name".to_string(),
-            pattern: EMAIL_CONTACT_NAME_PATTERN,
+            pattern: PUBLISHED_NAME_PATTERN,
         },
         Case {
             what: "a name carrying a slash on CreateEmailContact",
             request: Request::Name("a/b".to_string()),
             value: "a/b".to_string(),
             path: "name".to_string(),
-            pattern: EMAIL_CONTACT_NAME_PATTERN,
+            pattern: PUBLISHED_NAME_PATTERN,
         },
         Case {
             what: "a name of non-ascii letters on CreateEmailContact",
             request: Request::Name("équipe".to_string()),
             value: "équipe".to_string(),
             path: "name".to_string(),
-            pattern: EMAIL_CONTACT_NAME_PATTERN,
+            pattern: PUBLISHED_NAME_PATTERN,
         },
     ]
 }
@@ -253,25 +263,15 @@ async fn refused(em: &Emulator, index: usize, request: &Request) -> (u16, Value)
     }
 }
 
-/// The words the framework's own renderer gives a `@pattern` violation at `path`: the
-/// whole envelope, and the requirement half of its clause.
+/// The words a `@pattern` refusal at `path` carries: the whole envelope, and the
+/// requirement half of its clause.
 ///
-/// Rendered rather than transcribed, because "the same words the centralized walk uses"
-/// IS the rule under test.
-fn rendered(path: &str, pattern: &str, value: &str) -> (String, String) {
-    let violation = aws_smithy_schema_server::Violation {
-        path: path.to_string(),
-        kind: aws_smithy_schema_server::ViolationKind::Pattern(pattern.to_string()),
-        value: Some(value.to_string()),
-        sensitive: false,
-    };
-    let clause = violation.message();
-    let requirement = clause
-        .split_once(CONSTRAINT_SEPARATOR)
-        .map(|(_, requirement)| requirement.to_string())
-        .unwrap_or_else(|| panic!("the rendered clause states a requirement, got {clause:?}"));
-    let envelope = aws_smithy_schema_server::envelope(std::slice::from_ref(&violation))
-        .unwrap_or_else(|| panic!("one violation renders one envelope"));
+/// TRANSCRIBED — the sentence this service states is the rule under test, so it is written
+/// out here rather than produced by the code that renders it.
+fn transcribed(path: &str, pattern: &str) -> (String, String) {
+    let requirement = format!("Member must satisfy regular expression pattern: {pattern}");
+    let envelope =
+        format!("1 validation error detected: Value at '{path}'{CONSTRAINT_SEPARATOR}{requirement}");
     (envelope, requirement)
 }
 
@@ -293,7 +293,7 @@ fn message(body: &Value) -> &str {
 }
 
 #[tokio::test]
-async fn every_hand_applied_pattern_is_refused_in_the_frameworks_own_words() {
+async fn every_hand_applied_pattern_is_refused_in_this_services_own_words() {
     let table = refusal_table();
     assert!(
         table.len() >= 5,
@@ -322,34 +322,44 @@ async fn every_hand_applied_pattern_is_refused_in_the_frameworks_own_words() {
         );
 
         let stated = message(&body);
-        let (expected, requirement) = rendered(&case.path, case.pattern, &case.value);
+        let (expected, requirement) = transcribed(&case.path, case.pattern);
         assert_eq!(
             stated, expected,
-            "case {:?}: the refusal must read exactly as the framework's renderer words \
-             this violation, got {stated:?}",
+            "case {:?}: expected {expected:?}, got {stated:?}",
             case.what
         );
 
-        // The fixed halves of that sentence, pinned as literal text so the suite states
-        // the wording independently of the renderer that produced the line above.
+        // The halves of that sentence, each pinned on its own, and the one thing it must
+        // NOT carry: the value the request submitted.
         assert!(
             stated.starts_with("1 validation error detected: "),
             "case {:?}: the refusal must carry the validation envelope, got {stated:?}",
             case.what
         );
         assert!(
-            stated.contains(&format!("Value '{}' at '{}'", case.value, case.path)),
-            "case {:?}: the refusal must echo {} at the member path {:?}, got {stated:?}",
+            stated.contains(&format!("Value at '{}'", case.path)),
+            "case {:?}: the refusal must blame the member path {:?} and state no value, got \
+             {stated:?}",
             case.what,
-            shown(&case.value),
             case.path
+        );
+        // A row whose refused value occurs inside the ADVERTISED expression itself — the
+        // reserved prefix that expression's look-ahead names — cannot be told apart by
+        // containment; the equality above already pins its whole sentence.
+        assert!(
+            case.value.is_empty()
+                || case.pattern.contains(case.value.as_str())
+                || !stated.contains(&case.value),
+            "case {:?}: the refusal must not state the value it refused ({}), got {stated:?}",
+            case.what,
+            shown(&case.value)
         );
         assert!(
             stated.contains(&format!(
                 "{CONSTRAINT_SEPARATOR}Member must satisfy regular expression pattern: {}",
                 case.pattern
             )),
-            "case {:?}: the refusal must state the expression the model declares, got \
+            "case {:?}: the refusal must state the expression this service publishes, got \
              {stated:?}",
             case.what
         );
@@ -422,13 +432,13 @@ async fn the_same_request_without_the_offending_value_is_accepted() {
     );
 }
 
-/// A refused value is ECHOED into the clause, and `TagKey` declares its 1..128 bound
-/// INSIDE the pattern the centralized walk cannot apply — so a key of any size reaches
-/// the handler. The echo is therefore bounded: a huge key still earns the refusal, which
-/// still states the path and the expression, and shows a PREFIX of what was sent rather
-/// than letting one request choose the size of its own error response.
+/// `TagKey` declares its 1..128 bound INSIDE the pattern the centralized walk cannot
+/// apply, so a key of ANY size reaches the handler. Such a key still earns the refusal,
+/// which still names the path and the expression — and because no clause of this service
+/// states the value it refused, the answer stays small whatever the request's size: one
+/// request cannot choose the size of its own error response.
 #[tokio::test]
-async fn a_huge_refused_tag_key_is_echoed_as_a_bounded_prefix() {
+async fn a_huge_refused_tag_key_is_refused_without_being_stated() {
     let em = emulator();
     let arn = create_tagged(&em, "huge", Some(&starting_tags())).await;
     let huge = format!("{RESERVED_PREFIX}{}", "k".repeat(100_000));
@@ -439,19 +449,14 @@ async fn a_huge_refused_tag_key_is_echoed_as_a_bounded_prefix() {
         "case \"a tag key far past any bound\": expected 400, got {status} / {body:?}"
     );
     let stated = message(&body);
-    assert!(
-        stated.contains(TAG_KEY_PATTERN),
-        "case \"a tag key far past any bound\": the refusal must still state the modelled \
-         expression, got {stated:?}"
+    let (expected, _) = transcribed("tags", PUBLISHED_TAG_KEY_PATTERN);
+    assert_eq!(
+        stated, expected,
+        "case \"a tag key far past any bound\": expected {expected:?}, got {stated:?}"
     );
     assert!(
-        stated.contains("at 'tags'"),
-        "case \"a tag key far past any bound\": the refusal must still name the member path, \
-         got {stated:?}"
-    );
-    assert!(
-        stated.contains(&"k".repeat(MAX_TAG_KEY_LEN)),
-        "case \"a tag key far past any bound\": the refusal must still show what was refused, \
+        !stated.contains(&"k".repeat(MAX_TAG_KEY_LEN)),
+        "case \"a tag key far past any bound\": the refusal must not state the key it refused, \
          got {stated:?}"
     );
     assert!(
@@ -468,6 +473,33 @@ async fn a_huge_refused_tag_key_is_echoed_as_a_bounded_prefix() {
         "case \"a tag key far past any bound\": a refused write persists nothing, got \
          {reported:?}"
     );
+}
+
+/// The expressions these refusals ADVERTISE are the model's own stripped of the
+/// whole-value anchors each is written with, rather than literals that can drift from the
+/// model.
+#[test]
+fn each_published_expression_is_the_modelled_one_without_its_anchors() {
+    // (case, the model's expression, the one a refusal advertises)
+    for (case, modelled, published) in [
+        (
+            "the tag-key expression, anchored at both ends",
+            TAG_KEY_PATTERN,
+            PUBLISHED_TAG_KEY_PATTERN,
+        ),
+        (
+            "the name expression, anchored by neither end",
+            EMAIL_CONTACT_NAME_PATTERN,
+            PUBLISHED_NAME_PATTERN,
+        ),
+    ] {
+        let head = modelled.strip_prefix('^').unwrap_or(modelled);
+        let stripped = head.strip_suffix('$').unwrap_or(head);
+        assert_eq!(
+            stripped, published,
+            "case {case:?}: expected {stripped:?}, got {published:?}"
+        );
+    }
 }
 
 /// The expression the tag-key refusals state is the one the MODEL declares for the member

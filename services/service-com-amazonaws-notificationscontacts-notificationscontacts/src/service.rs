@@ -65,6 +65,10 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Which of the cross-service refusal renderings this service states a boundary refusal
+/// in. See [`Service::override_refusal`] below.
+pub(crate) mod validation;
+
 use aws_smithy_runtime_api::http::{Request as WireRequest, Response as WireResponse};
 use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::{ProtocolError, ServerProtocol};
@@ -237,16 +241,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. The wording is NOT written here, nor in the module below: it is the
+        // cross-service renderings in `service_common::validation_message`, so this
+        // service cannot word one constraint differently from another service. What
+        // `validation::refused` chooses is which of those renderings this service's
+        // recordings show.
+        validation::refused(refusal)
     }
 
     fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {

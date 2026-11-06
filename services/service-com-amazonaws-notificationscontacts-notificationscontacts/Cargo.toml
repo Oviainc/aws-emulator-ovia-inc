@@ -26,6 +26,10 @@ hex = { workspace = true }
 # Computes the integrity tag that `nextToken` carries, so a token this service never
 # issued is refused rather than resumed from.
 sha2 = { workspace = true }
+# The cross-service validation-message renderings this service's refusals delegate to:
+# the per-member envelope with every clause's value half withheld, the unanchored
+# `@pattern` expression, and the schema layer's property-count finding.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -174,9 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let contact = store.contact_mut(&input.arn).ok_or_else(|| {
-            UntagResourceErrorModeled::ResourceNotFoundException(crate::state::contact_not_found(
-                &input.arn,
-            ))
+            UntagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::tagged_resource_not_found(&input.arn),
+            )
         })?;
 
         // Removing a key the contact never carried is a no-op success, which is what
