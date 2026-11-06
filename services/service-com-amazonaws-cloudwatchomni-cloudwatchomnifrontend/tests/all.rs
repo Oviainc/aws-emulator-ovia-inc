@@ -15,6 +15,8 @@
 mod access_profile_lifecycle;
 #[path = "all/domain_space_lifecycle.rs"]
 mod domain_space_lifecycle;
+#[path = "all/omni_dashboard_lifecycle.rs"]
+mod omni_dashboard_lifecycle;
 #[path = "all/probe.rs"]
 mod probe;
 #[path = "all/state_roundtrip.rs"]

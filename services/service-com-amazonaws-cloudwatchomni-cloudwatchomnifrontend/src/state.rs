@@ -2,8 +2,9 @@
 
 //! Engine state for the com-amazonaws-cloudwatchomni-cloudwatchomnifrontend service.
 //!
-//! One store holds the service's resource hierarchy — a domain, and the spaces that
-//! belong to it — plus the small amount of bookkeeping the modelled contract needs:
+//! One store holds the service's resource hierarchy — a domain, the spaces that
+//! belong to it, and the access profiles and dashboards those spaces hold — plus the
+//! small amount of bookkeeping the modelled contract needs:
 //! a name index for the duplicate-name conflict, the idempotency-token maps for the
 //! `@idempotencyToken` creates, and a monotonic sequence so list pagination is
 //! deterministic across pages.
@@ -16,8 +17,8 @@
 use std::collections::HashMap;
 
 use crate::ops::types::{
-    AccessProfile, Domain, EncryptionConfiguration, IdentityProviderConfiguration, Space,
-    SpaceSummary,
+    AccessProfile, Domain, EncryptionConfiguration, IdentityProviderConfiguration, OmniDashboard,
+    Space, SpaceSummary,
 };
 
 /// The region a resource is recorded in when the request carries no SigV4
@@ -105,6 +106,36 @@ pub const SPACE_QUOTA: usize = 10_000;
 /// [`access_profile_named`]: ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::access_profile_named
 pub const ACCESS_PROFILE_QUOTA: usize = 10_000;
 
+/// The resource type an `OmniDashboard`'s ARN carries, as the model's own
+/// `CreateOmniDashboard` example documents it
+/// (`arn:aws:cloudwatch:<region>:<account>:omni-dashboard/<dashboardId>`).
+pub const OMNI_DASHBOARD_ARN_RESOURCE_TYPE: &str = "omni-dashboard";
+
+/// How many dashboards the store holds before `CreateOmniDashboard` refuses with the
+/// modelled `ServiceQuotaExceededException`.
+///
+/// The emulator's OWN bound, for the same reason as [`DOMAIN_QUOTA`]. It bounds
+/// [`ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::omni_dashboards`] and, with
+/// it, `create_omni_dashboard_tokens` (one entry per live dashboard) — and therefore the
+/// per-request work [`omni_dashboard_named`] does under the store lock, which is linear
+/// in the number of stored dashboards.
+///
+/// [`omni_dashboard_named`]: ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::omni_dashboard_named
+pub const OMNI_DASHBOARD_QUOTA: usize = 10_000;
+
+/// A dashboard as persisted. The wire `OmniDashboard` shape carries no parent id, so
+/// the space the dashboard lives in is kept beside it: a dashboard is addressed by its
+/// space AND its id.
+#[derive(Debug, Clone)]
+pub struct StoredOmniDashboard {
+    /// Creation order, so `ListOmniDashboards`-style enumeration is stable.
+    pub seq: u64,
+    /// The id of the space this dashboard belongs to.
+    pub space_id: String,
+    /// Exactly what `GetOmniDashboard` returns.
+    pub dashboard: OmniDashboard,
+}
+
 /// A domain as persisted, with the bookkeeping the wire shape does not carry.
 #[derive(Debug, Clone)]
 pub struct StoredDomain {
@@ -154,7 +185,8 @@ pub struct StoredAccessProfile {
 /// Every map here is BOUNDED: `domains` (and the two maps keyed one-to-one to a live
 /// domain) by [`DOMAIN_QUOTA`], `spaces` (and the token map keyed to a live space) by
 /// [`SPACE_QUOTA`], `access_profiles` (and the token map keyed to a live profile) by
-/// [`ACCESS_PROFILE_QUOTA`]. The creates refuse with the modelled
+/// [`ACCESS_PROFILE_QUOTA`], `omni_dashboards` (and the token map keyed to a live
+/// dashboard) by [`OMNI_DASHBOARD_QUOTA`]. The creates refuse with the modelled
 /// `ServiceQuotaExceededException` once the bound is reached, and the deletes release
 /// records and their tokens together, so nothing in the store grows without end.
 #[derive(Debug, Default)]
@@ -173,7 +205,12 @@ pub struct ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
     pub access_profiles: HashMap<String, StoredAccessProfile>,
     /// `CreateAccessProfile` `clientToken` -> the `profileId` that token created.
     pub create_access_profile_tokens: HashMap<String, String>,
-    /// Hands out [`StoredDomain::seq`] / [`StoredSpace::seq`] / [`StoredAccessProfile::seq`].
+    /// Every persisted dashboard, keyed by its `dashboardId`.
+    pub omni_dashboards: HashMap<String, StoredOmniDashboard>,
+    /// `CreateOmniDashboard` `clientToken` -> the `dashboardId` that token created.
+    pub create_omni_dashboard_tokens: HashMap<String, String>,
+    /// Hands out [`StoredDomain::seq`] / [`StoredSpace::seq`] / [`StoredAccessProfile::seq`]
+    /// / [`StoredOmniDashboard::seq`].
     next_seq: u64,
 }
 
@@ -207,6 +244,15 @@ impl ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
         self.access_profiles
             .values()
             .find(|stored| stored.profile.space_id == space_id && stored.profile.name == name)
+    }
+
+    /// The dashboard `space_id` holds under `name`, if the store holds one.
+    ///
+    /// Linear in the number of stored dashboards, which [`OMNI_DASHBOARD_QUOTA`] bounds.
+    pub fn omni_dashboard_named(&self, space_id: &str, name: &str) -> Option<&StoredOmniDashboard> {
+        self.omni_dashboards
+            .values()
+            .find(|stored| stored.space_id == space_id && stored.dashboard.name == name)
     }
 
     /// Whether any stored space still belongs to `domain_id`.
@@ -309,6 +355,12 @@ pub fn mint_profile_id() -> String {
     fresh_uuid()
 }
 
+/// A fresh `dashboardId`. `DashboardId`'s model doc: "a lowercase v4 UUID assigned
+/// when the dashboard is created".
+pub fn mint_dashboard_id() -> String {
+    fresh_uuid()
+}
+
 /// The ARN of a domain, in this service's ARN namespace.
 pub fn domain_arn(region: &str, domain_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("domain/{domain_id}"))
@@ -330,6 +382,42 @@ pub fn access_profile_arn(region: &str, space_id: &str, profile_id: &str) -> Str
         region,
         &format!("space/{space_id}/access-profile/{profile_id}"),
     )
+}
+
+/// The ARN of a dashboard, in this service's ARN namespace.
+///
+/// The form is the one the model's own `CreateOmniDashboard` example documents for
+/// `OmniDashboard.arn`: the `omni-dashboard` resource type and the dashboard's id, in
+/// the account and the region the dashboard lives in. A dashboard's ARN therefore does
+/// not repeat its parent space.
+pub fn omni_dashboard_arn(region: &str, dashboard_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{OMNI_DASHBOARD_ARN_RESOURCE_TYPE}/{dashboard_id}"),
+    )
+}
+
+/// The principal that made this request, for a `createdBy` member.
+///
+/// Derived from the request's own SigV4 access key id, so the member reports who
+/// called rather than a fabricated identity. That id is caller-controlled text, so it
+/// is first reduced to the characters an access key id can hold; a request that carries
+/// no credential scope (an unsigned, in-process call) reports the emulator's default
+/// principal.
+pub fn caller_principal(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String {
+    let filtered: String = ::engine::extract_akid(&ctx.parts().headers)
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(128)
+        .collect();
+    let access_key_id = if filtered.is_empty() {
+        "default"
+    } else {
+        filtered.as_str()
+    };
+    // An IAM principal is account-scoped, hence the empty region segment.
+    ::engine::emulator_arn("iam", "", &format!("user/{access_key_id}"))
 }
 
 /// A domain's HTTPS endpoint URL, built from its id, its region and this service's
@@ -432,6 +520,54 @@ pub fn access_profile_view(stored: &StoredAccessProfile) -> AccessProfile {
         assume_status: Some(assume_status.to_string()),
         ..stored.profile.clone()
     }
+}
+
+/// The member of a dashboard body that carries the dashboard's panels.
+pub const DASHBOARD_BODY_PANELS: &str = "panels";
+
+/// Why `body` is not a dashboard definition, or `None` when it is one.
+///
+/// `body`'s model doc is "The dashboard definition, as a JSON document": a definition
+/// is a JSON OBJECT, and the panels it lays out are its `panels` member — a list whose
+/// entries are panel objects. Anything else (text that is not JSON at all, a JSON
+/// scalar or array, a document with no panels, or a `panels` member that is not a list
+/// of objects) is not a dashboard definition, so an operation that takes one refuses it
+/// rather than persisting a body no reader can lay out.
+///
+/// The returned text names the member and what was wrong with it, which is all a
+/// caller has to fix the request from.
+pub fn dashboard_body_rejection(body: &str) -> Option<String> {
+    let document: ::serde_json::Value = match ::serde_json::from_str(body) {
+        Ok(document) => document,
+        Err(_) => {
+            return Some("The dashboard body is not a valid JSON document.".to_string());
+        }
+    };
+    let Some(members) = document.as_object() else {
+        return Some(format!(
+            "The dashboard body must be a JSON object with a '{DASHBOARD_BODY_PANELS}' array."
+        ));
+    };
+    let Some(panels) = members.get(DASHBOARD_BODY_PANELS) else {
+        return Some(format!(
+            "The dashboard body must contain a '{DASHBOARD_BODY_PANELS}' array."
+        ));
+    };
+    let Some(panels) = panels.as_array() else {
+        return Some(format!(
+            "The dashboard body member '{DASHBOARD_BODY_PANELS}' must be an array of panel \
+             objects."
+        ));
+    };
+    panels
+        .iter()
+        .position(|panel| !panel.is_object())
+        .map(|index| {
+            format!(
+                "The dashboard body member '{DASHBOARD_BODY_PANELS}[{index}]' must be a panel \
+                 object."
+            )
+        })
 }
 
 /// The prefix a space-list page token carries, so a token minted for one collection
