@@ -62,6 +62,8 @@
 //! and at most one CA certificate override per region,
 //! and at most `MAX_REGIONS * MAX_EVENTS_PER_REGION` recorded lifecycle events —
 //! the log `DescribeEvents` reports, a ring per region (see [`events`]) —
+//! and at most [`CONFIGURATION_CHECKS`]`.len()` recommendations per DB instance or DB
+//! cluster the configuration analysis found an issue in (see [`recommendations`]),
 //! whatever sequence of requests arrives, and every
 //! per-request scan reads one region's ordered range rather than the whole map.
 
@@ -122,11 +124,12 @@ pub mod tenant_databases;
 // The same split, one concern per file, for the rest of this store's record families and
 // for the reference data the handlers read beside them: the parameter-group records and the
 // catalog rules over them, the event subscription record, the option-group records, the
-// shard-group record, the published CA certificates, and the event category / source-type
-// catalog. Each is glob-re-exported, so every one of them is still reached as
-// `crate::state::<name>`.
+// shard-group record, the published CA certificates, the configuration analysis behind
+// `DescribeDBRecommendations`, and the event category / source-type catalog. Each is
+// glob-re-exported, so every one of them is still reached as `crate::state::<name>`.
 mod certificates;
 mod event_catalog;
+mod recommendations;
 mod event_subscriptions;
 mod option_groups;
 mod parameter_groups;
@@ -135,6 +138,7 @@ mod snapshots;
 
 pub use certificates::*;
 pub use event_catalog::*;
+pub use recommendations::*;
 pub use event_subscriptions::*;
 pub use option_groups::*;
 pub use parameter_groups::*;
@@ -380,6 +384,16 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// Monotonic counter behind every server-assigned id this service mints, so
     /// resource ids and endpoint hosts are unique and reproducible.
     pub mint_counter: u64,
+    /// The recommendations this service's configuration analysis has raised, by
+    /// `(region, recommendation_key)` — what `DescribeDBRecommendations` reports.
+    ///
+    /// Keyed by the resource and the check rather than by the minted recommendation id, so
+    /// one check raises at most one record per resource; the record carries the id a caller
+    /// names it by. [`Self::settle_db_recommendations`] is the only writer, and it raises a
+    /// record only for a resource this store holds, so the map is bounded by the
+    /// per-region instance and cluster quotas times [`CONFIGURATION_CHECKS`]`.len()`, over
+    /// at most [`MAX_REGIONS`] regions.
+    pub db_recommendations: BTreeMap<RegionalKey, DbRecommendationRecord>,
     /// The live engine endpoint of each DB instance that has one, by the same
     /// `(region, DBInstanceIdentifier)` key as [`Self::db_instances`].
     ///
@@ -606,6 +620,11 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         if let Some(log) = self.events.get_mut(region) {
             log.prune(now_as_wire_timestamp().as_secs_f64());
         }
+        // The configuration analysis runs over the resources this region holds, now that
+        // the statuses above are the ones the clock owes: see
+        // [`Self::settle_db_recommendations`] for why what it writes was owed at this
+        // instant too.
+        self.settle_db_recommendations(region);
     }
 
     /// Record `event` for the resource `source_identifier` / `source_arn` in `region`: the
@@ -1260,6 +1279,10 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .chain(self.db_proxies.keys())
             .chain(self.export_tasks.keys())
             .chain(self.custom_db_engine_versions.keys())
+            // A raised recommendation is about a resource of the same region, so its
+            // bucket is already counted; it is chained all the same, so no map of this
+            // store can hold a region the cap does not see.
+            .chain(self.db_recommendations.keys())
             .map(|(stored, _)| stored.as_str())
             .chain(self.certificate_overrides.keys().map(String::as_str))
             // The event log outlives the records it is about — a deleted instance's events

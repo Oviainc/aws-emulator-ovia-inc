@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBRecommendations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBRecommendations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBRecommendations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the recommendations this service's configuration analysis has raised in the
+//! region the request is signed for — see [`crate::state::CONFIGURATION_CHECKS`] for the
+//! analysis itself — narrowed by `Filters`, by the `LastUpdatedAfter` /
+//! `LastUpdatedBefore` window and paged by `MaxRecords` / `Marker`.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +151,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBRecommendations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBRecommendationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBRecommendations"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeDBRecommendationsError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBRecommendationsError::invalid_parameter_value)?;
+        // `Locale`: "the language that you choose to return the list of recommendations",
+        // with a published set of valid values. A value outside it names no language the
+        // text is available in, so it is refused rather than served in another one.
+        if let Some(locale) = &input.locale {
+            crate::state::check_recommendation_locale(locale)
+                .map_err(DescribeDBRecommendationsError::invalid_parameter_value)?;
+        }
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters)
+            .map_err(DescribeDBRecommendationsError::invalid_parameter_value)?;
+        crate::state::check_filter_terms(&filters)
+            .map_err(DescribeDBRecommendationsError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones owed
+        // at this instant whether or not anybody called. The configuration analysis runs
+        // there too, so what this reports is what the resources of the region are
+        // configured to be at this instant.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: a request sees only the recommendations raised about the
+        // resources of the region it was signed for.
+        let reported: Vec<(String, DBRecommendation)> = store
+            .db_recommendations_in(&region)
+            .into_iter()
+            // "A filter to include only the recommendations that were updated after this
+            // specified time" / "before this specified time", so a window either end of
+            // which is absent is unbounded at that end.
+            .filter(|record| {
+                input.last_updated_after.as_ref().is_none_or(|after| {
+                    record.updated_time.as_secs_f64() > after.as_secs_f64()
+                })
+            })
+            .filter(|record| {
+                input.last_updated_before.as_ref().is_none_or(|before| {
+                    record.updated_time.as_secs_f64() < before.as_secs_f64()
+                })
+            })
+            // "The results list only includes the recommendations whose <member> is one of
+            // the specified filter values": every filter has to match, any one of its
+            // values may.
+            .filter(|record| filters.iter().all(|filter| matches_filter(record, filter)))
+            .map(|record| (record.page_key(), record.to_wire()))
+            .collect();
+
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(reported, input.marker.as_deref(), page_size)
+            .map_err(DescribeDBRecommendationsError::invalid_parameter_value)?;
+        Ok(DescribeDBRecommendationsOutput {
+            db_recommendations: Some(page.items),
+            marker: page.next_marker,
+        })
     }
+}
+
+/// The filter names this operation's `Filters` member documents: "`recommendation-id`",
+/// "`status`", "`severity`", "`type-id`", "`dbi-resource-id`", "`cluster-resource-id`",
+/// "`pg-arn`" and "`cluster-pg-arn`". RDS refuses any other name, and so does this
+/// operation — with a 400, because quietly ignoring a filter would report recommendations
+/// the caller excluded.
+const SUPPORTED_FILTER_NAMES: [&str; 8] = [
+    "recommendation-id",
+    "status",
+    "severity",
+    "type-id",
+    "dbi-resource-id",
+    "cluster-resource-id",
+    "pg-arn",
+    "cluster-pg-arn",
+];
+
+/// Refuse a filter this operation does not support, in the sentence Amazon RDS answers an
+/// unrecognized filter name with: fixed text, then the name the request carried and
+/// nothing after it. "Filter names are case-sensitive."
+fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
+    for filter in filters {
+        if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
+            return Err(format!("Unrecognized filter name: {}", filter.name));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `record` matches one filter: true when any of the filter's values matches the
+/// member that filter names. "Filter values are case-sensitive."
+///
+/// A filter VALUE is a match term rather than a value set to validate: "the results list
+/// only includes the recommendations whose status is one of the specified filter values",
+/// so a value no recommendation holds narrows the report to nothing instead of refusing
+/// the request — only the filter NAME says which member is being narrowed, and that is
+/// what [`check_filter_names`] holds the request to.
+fn matches_filter(record: &crate::state::DbRecommendationRecord, filter: &Filter) -> bool {
+    filter.values.iter().any(|wanted| match filter.name.as_str() {
+        // "Accepts a list of recommendation identifiers."
+        "recommendation-id" => *wanted == record.recommendation_id,
+        // "Accepts a list of recommendation statuses."
+        "status" => *wanted == record.status,
+        // "Accepts a list of recommendation severities."
+        "severity" => *wanted == record.check.severity,
+        // "Accepts a list of recommendation type identifiers."
+        "type-id" => *wanted == record.check.type_id,
+        // "Accepts a list of database resource identifiers" / "of cluster resource
+        // identifiers", so a filter naming one family never selects a recommendation
+        // about the other.
+        "dbi-resource-id" => {
+            record.subject == crate::state::RecommendationSubject::DbInstance
+                && *wanted == record.resource_id
+        }
+        "cluster-resource-id" => {
+            record.subject == crate::state::RecommendationSubject::DbCluster
+                && *wanted == record.resource_id
+        }
+        // "Accepts a list of parameter group ARNs" / "of cluster parameter group ARNs":
+        // the analysis this service performs reads the configuration of DB instances and
+        // DB clusters, and raises no recommendation ABOUT a parameter group, so a filter
+        // on one selects none of the records — it narrows the report rather than widening
+        // it, which is why it is accepted and matches nothing.
+        "pg-arn" | "cluster-pg-arn" => false,
+        // Unreachable: `check_filter_names` refused every other name up front.
+        _ => false,
+    })
 }
