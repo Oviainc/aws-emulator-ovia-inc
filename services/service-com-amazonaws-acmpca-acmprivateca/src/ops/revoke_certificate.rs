@@ -224,19 +224,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // A revocation is signed with the CA's own private key and published in the
             // CA's revocation information, so only a CA that holds its certificate and can
-            // still sign with it revokes one: in any other status the CA is not one that
-            // has issued the certificates a revocation could name, whatever serial the
-            // request carries.
-            if !crate::state::REVOCABLE_STATUSES.contains(&record.status.as_str()) {
-                return Err(invalid_state(
-                    crate::state::not_in_state_to_have_issued_message(&ca_arn),
-                ));
-            }
+            // still sign with it revokes one. That is a precondition on the CA, judged
+            // once the certificate the request NAMES has been resolved on it, so it is
+            // read here and answered below: a serial the CA carries no certificate for
+            // names no certificate in any status the CA rests in, and the absence reported
+            // is the one of the resource the request asked about.
+            let revocable = crate::state::REVOCABLE_STATUSES.contains(&record.status.as_str());
 
             // "You cannot revoke a root CA self-signed certificate." (this operation's
             // docs): the CA's own certificate is the one its revocation information is
             // signed under, so it is refused before any certificate of the CA is looked
             // up — the CA holds it whether or not it was issued through this emulator.
+            //
+            // The prohibition is about WHICH certificate the request names, and the
+            // documentation states it unconditionally, so it is answered whatever status
+            // the CA rests in: a certificate that can never be revoked is not one a change
+            // of the CA's status could make revocable.
             if record.is_own_self_signed_serial(&input.certificate_serial) {
                 return Err(invalid_request(
                     crate::state::ROOT_SELF_SIGNED_REVOCATION_MESSAGE.to_string(),
@@ -256,6 +259,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::CERTIFICATE_NOT_FOUND_MESSAGE.to_string(),
                 ));
             };
+            // The certificate the request named is one this CA holds, so what is left to
+            // judge is the CA: outside a status it can sign and publish a revocation in,
+            // the refusal is the one about the authority.
+            if !revocable {
+                return Err(invalid_state(
+                    crate::state::not_in_state_to_have_issued_message(&ca_arn),
+                ));
+            }
             // Revocation is terminal, so a second request for one certificate is a request
             // this service has already completed rather than one it performs again: the
             // reason and the instant the first call recorded stay as they are.

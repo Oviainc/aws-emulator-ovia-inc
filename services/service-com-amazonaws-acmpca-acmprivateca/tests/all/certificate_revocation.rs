@@ -423,27 +423,32 @@ async fn the_cas_arn_resolves_before_the_serial() {
     }
 }
 
-/// Every `CertificateAuthorityStatus` the model declares, against whether a CA in it
-/// revokes one of its certificates — and a refused revocation leaves both the certificate
-/// and the CA exactly as they were.
-#[tokio::test]
-async fn revocation_is_allowed_only_from_the_statuses_a_ca_can_still_sign_in() {
-    let emulator = Emulator::new();
-    let csr = certification_request(&emulator, "status table", "status-leaf").await;
+/// Every `CertificateAuthorityStatus` the model declares, against whether a CA resting in
+/// it revokes a certificate it HOLDS: "ACTIVE — the CA is active and can be used to issue
+/// and revoke certificates", a disabled CA "can no longer issue certificates, but it
+/// continues to revoke them and to publish CRLs", and every other status either has no
+/// certificate of its own yet, cannot sign with it any more, or is waiting to be restored
+/// (the private CA lifecycle).
+///
+/// One table, read by every suite below that drives a status, so the two cannot drift when
+/// the model gains a member.
+const REVOCATION_BY_STATUS: &[(&str, bool)] = &[
+    (STATUS_ACTIVE, true),
+    (STATUS_DISABLED, true),
+    (STATUS_CREATING, false),
+    (STATUS_PENDING_CERTIFICATE, false),
+    (STATUS_EXPIRED, false),
+    (STATUS_FAILED, false),
+    (STATUS_DELETED, false),
+];
 
-    // (status, whether a revocation is accepted in it)
-    let rows: &[(&str, bool)] = &[
-        (STATUS_ACTIVE, true),
-        (STATUS_DISABLED, true),
-        (STATUS_CREATING, false),
-        (STATUS_PENDING_CERTIFICATE, false),
-        (STATUS_EXPIRED, false),
-        (STATUS_FAILED, false),
-        (STATUS_DELETED, false),
-    ];
-
-    // The table spans the whole enum, so a member the model gains cannot go untested.
-    let mut covered: Vec<&str> = rows.iter().map(|(status, _)| *status).collect();
+/// Assert [`REVOCATION_BY_STATUS`] spans the whole enum, so a member the model gains cannot
+/// go untested.
+fn the_table_spans_the_status_enum() {
+    let mut covered: Vec<&str> = REVOCATION_BY_STATUS
+        .iter()
+        .map(|(status, _)| *status)
+        .collect();
     covered.sort_unstable();
     let mut declared: Vec<&str> = CERTIFICATE_AUTHORITY_STATUS_VALUES.to_vec();
     declared.sort_unstable();
@@ -452,8 +457,19 @@ async fn revocation_is_allowed_only_from_the_statuses_a_ca_can_still_sign_in() {
         "the table must span every CertificateAuthorityStatus the model declares, got \
          {covered:?} against {declared:?}"
     );
+}
 
-    for (index, (status, accepted)) in rows.iter().enumerate() {
+/// Every `CertificateAuthorityStatus` the model declares, against whether a CA in it
+/// revokes one of its certificates — and a refused revocation leaves both the certificate
+/// and the CA exactly as they were.
+#[tokio::test]
+async fn revocation_is_allowed_only_from_the_statuses_a_ca_can_still_sign_in() {
+    let emulator = Emulator::new();
+    let csr = certification_request(&emulator, "status table", "status-leaf").await;
+
+    the_table_spans_the_status_enum();
+
+    for (index, (status, accepted)) in REVOCATION_BY_STATUS.iter().enumerate() {
         let case = format!("revocation from {status}");
         let (ca_arn, _certificate) = active_ca(&emulator, &format!("status-{index}")).await;
         let serial = issued_serial(&emulator, &case, &ca_arn, &csr).await;
@@ -500,6 +516,179 @@ async fn revocation_is_allowed_only_from_the_statuses_a_ca_can_still_sign_in() {
                  {held:?}"
             );
         }
+    }
+}
+
+/// The serial a revocation names is resolved on the CA BEFORE the CA's own lifecycle
+/// status is judged: a serial the CA carries no certificate for is the certificate's
+/// not-found refusal in every status the CA can rest in, and the state refusal is reserved
+/// for a revocation of a certificate the CA does hold.
+///
+/// The rows differ along both of the things the rule generalises over: the status the CA
+/// rests in (every member `CertificateAuthorityStatus` declares) and the way the serial
+/// names no certificate of that CA (a value nothing was issued under, no value at all, a
+/// value that is not hexadecimal, a sibling value of the one the CA holds, and another
+/// authority's certificate).
+#[tokio::test]
+async fn an_unknown_serial_is_not_found_whatever_status_the_ca_rests_in() {
+    let emulator = Emulator::new();
+    let (ca_arn, _certificate) = active_ca(&emulator, "unknown-serial-statuses").await;
+    let (other_arn, _other_certificate) = active_ca(&emulator, "another-authority").await;
+    let csr = certification_request(&emulator, "unknown serials by status", "by-status-leaf").await;
+    let theirs = issued_serial(&emulator, "another authority", &other_arn, &csr).await;
+
+    the_table_spans_the_status_enum();
+
+    for (status, accepted) in REVOCATION_BY_STATUS {
+        // A certificate of this CA per row, so the row that accepts a revocation does not
+        // leave the next one asking about a certificate already revoked.
+        let row = format!("a revocation against a {status} CA");
+        let held = issued_serial(&emulator, &row, &ca_arn, &csr).await;
+        force_status(&emulator, &ca_arn, status, &row);
+
+        // Every way a serial can name no certificate of this CA.
+        let unknown: Vec<(String, String)> = vec![
+            (
+                "a hexadecimal serial nothing was issued under".to_string(),
+                "0a1b2c3d4e5f6071".to_string(),
+            ),
+            (
+                "the empty serial the member's length allows".to_string(),
+                String::new(),
+            ),
+            (
+                "a serial that is not hexadecimal at all".to_string(),
+                "not-a-serial".to_string(),
+            ),
+            (
+                "one digit more than the serial the CA holds".to_string(),
+                format!("{held}0"),
+            ),
+            (
+                "another authority's certificate".to_string(),
+                theirs.clone(),
+            ),
+        ];
+
+        for (named, serial) in &unknown {
+            let case = format!("{row} naming {named}");
+            let refused = emulator
+                .refused(
+                    &case,
+                    "RevokeCertificate",
+                    &revocation(&ca_arn, serial, "UNSPECIFIED"),
+                    "ResourceNotFoundException",
+                )
+                .await;
+            let message = error_message(&refused, &case);
+            assert_eq!(
+                message, CERTIFICATE_NOT_FOUND_MESSAGE,
+                "case {case:?}: expected the service's certificate not-found sentence, got \
+                 {message:?}"
+            );
+        }
+
+        // None of those refusals touched anything: neither the certificate the CA does
+        // hold nor the status it rests in.
+        let recorded = stored_revocation(&emulator, &ca_arn, &held, &row);
+        assert!(
+            recorded.is_none(),
+            "case {row:?}: a refused revocation must record none, got {recorded:?}"
+        );
+        let other = stored_revocation(&emulator, &other_arn, &theirs, &row);
+        assert!(
+            other.is_none(),
+            "case {row:?}: a refusal must leave another authority's certificate alone, got \
+             {other:?}"
+        );
+        let held_status = stored_status(&emulator, &ca_arn, &row);
+        assert_eq!(
+            &held_status, status,
+            "case {row:?}: a refused revocation must leave the CA's status alone, got \
+             {held_status:?}"
+        );
+
+        // The same request for the serial this CA DOES hold is where the status decides:
+        // accepted where the CA can still sign a revocation, and the state refusal
+        // naming the CA everywhere else.
+        let case = format!("{row} naming the serial it holds");
+        if *accepted {
+            emulator
+                .ok(
+                    &case,
+                    "RevokeCertificate",
+                    &revocation(&ca_arn, &held, "KEY_COMPROMISE"),
+                )
+                .await;
+            let recorded = stored_revocation(&emulator, &ca_arn, &held, &case);
+            assert!(
+                recorded.is_some_and(|(reason, _)| reason == "KEY_COMPROMISE"),
+                "case {case:?}: expected the revocation to be recorded"
+            );
+        } else {
+            let refused = emulator
+                .refused(
+                    &case,
+                    "RevokeCertificate",
+                    &revocation(&ca_arn, &held, "KEY_COMPROMISE"),
+                    "InvalidStateException",
+                )
+                .await;
+            let message = error_message(&refused, &case);
+            assert_eq!(
+                message,
+                not_in_state_to_have_issued_message(&ca_arn),
+                "case {case:?}: expected the sentence naming the CA the request carried, got \
+                 {message:?}"
+            );
+        }
+
+        // The next row starts from a CA that can issue the certificate it needs.
+        force_status(&emulator, &ca_arn, STATUS_ACTIVE, &row);
+    }
+}
+
+/// The documented prohibition on revoking a root CA's own self-signed certificate is about
+/// WHICH certificate the request names, so it is the answer in every status the CA rests in:
+/// a certificate that can never be revoked is not one a change of the CA's status makes
+/// revocable.
+///
+/// The rows differ along the status the CA rests in (every member
+/// `CertificateAuthorityStatus` declares) and the spelling the serial arrives in.
+#[tokio::test]
+async fn a_root_cas_own_certificate_is_refused_in_every_status() {
+    let emulator = Emulator::new();
+    let case = "a root CA activated with its own certificate";
+    let (ca_arn, certificate) = active_ca(&emulator, "own-certificate-statuses").await;
+    let own = serial_of(&certificate, case);
+
+    // The whole enum, so a member the model gains cannot go untested.
+    let mut statuses: Vec<&str> = CERTIFICATE_AUTHORITY_STATUS_VALUES.to_vec();
+    statuses.sort_unstable();
+
+    for (index, status) in statuses.iter().enumerate() {
+        let (spelling, spell) = SERIAL_SPELLINGS[index % SERIAL_SPELLINGS.len()];
+        let case = format!("the CA's own certificate under {status}, named {spelling}");
+        force_status(&emulator, &ca_arn, status, &case);
+        let refused = emulator
+            .refused(
+                &case,
+                "RevokeCertificate",
+                &revocation(&ca_arn, &spell(&own), "KEY_COMPROMISE"),
+                "InvalidRequestException",
+            )
+            .await;
+        let message = error_message(&refused, &case);
+        assert_eq!(
+            message, ROOT_SELF_SIGNED_REVOCATION_MESSAGE,
+            "case {case:?}: expected the refusal's own sentence, got {message:?}"
+        );
+        let held = stored_status(&emulator, &ca_arn, &case);
+        assert_eq!(
+            &held, status,
+            "case {case:?}: a refused revocation must leave the CA's status alone, got \
+             {held:?}"
+        );
     }
 }
 
