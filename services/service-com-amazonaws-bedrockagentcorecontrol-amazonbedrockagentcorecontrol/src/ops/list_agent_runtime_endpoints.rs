@@ -11,6 +11,11 @@
 //! each endpoint, including the `CREATING` -> `READY` transition the clock owes it.
 //! Reporting only: nothing here writes.
 //!
+//! The operation models no not-found error and its `runtimeEndpoints` is required, so
+//! an `agentRuntimeId` that satisfies the modelled grammar and names no runtime of
+//! this account is answered the modelled success with an empty page; the modelled
+//! `ValidationException` is reserved for input that fails a modelled constraint.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -163,21 +168,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let store = state.lock();
 
-        // An endpoint is addressed only through its runtime, so a listing for a
-        // runtime this account does not hold is refused — never an empty page, which
-        // would say the runtime is there and holds nothing. This operation models no
-        // not-found error, so the refusal is its modelled `ValidationException`,
-        // carrying the one sentence the endpoint family words an agent it could not
-        // resolve in.
-        let runtime = store
-            .agent_runtimes
-            .get(&input.agent_runtime_id)
-            .ok_or_else(|| {
-                ListAgentRuntimeEndpointsErrorModeled::ValidationException(unresolvable_runtime(
-                    &input.agent_runtime_id,
-                ))
-            })?;
-
         // The token is opaque on the wire: it carries the endpoint name the previous
         // page ended on, and the next page starts strictly after it.
         let resume_after = match input.next_token.as_deref() {
@@ -197,6 +187,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this service pages by one rule, and the endpoints are keyed by name, so the
         // order is the same on every call.
         let page_size = crate::state::page_size(input.max_results, MAX_PAGE_SIZE);
+
+        // Resolving the runtime is not an input question: this operation models no
+        // not-found error and its `runtimeEndpoints` is required, so an id that
+        // satisfies the modelled constraints and names no runtime of this account has
+        // no endpoint to report, and the answer is the modelled success — an empty
+        // page with nothing to resume. `ValidationException` stays for input that
+        // fails the modelled constraints (the id grammar, the `maxResults` range, a
+        // `nextToken` this service did not issue), so a caller can still tell a
+        // malformed request from a runtime that is not there.
+        let Some(runtime) = store.agent_runtimes.get(&input.agent_runtime_id) else {
+            return Ok(ListAgentRuntimeEndpointsOutput {
+                runtime_endpoints: Vec::new(),
+                next_token: None,
+            });
+        };
+
         let (runtime_endpoints, next_token) = crate::state::page_over(
             &runtime.endpoints,
             resume_after.as_deref(),
@@ -217,29 +223,6 @@ const MAX_PAGE_SIZE: i32 = 100;
 
 /// The request member a refused page token is reported against.
 const NEXT_TOKEN_MEMBER: &str = "nextToken";
-
-/// The request member that named a runtime this account does not hold.
-const AGENT_RUNTIME_ID_MEMBER: &str = "agentRuntimeId";
-
-/// The modelled refusal of a listing whose `agentRuntimeId` names no runtime of
-/// this account.
-///
-/// The sentence is `crate::state`'s one sentence for an agent an endpoint operation
-/// could not resolve, so a caller naming an absent runtime reads the same wording
-/// here as from the endpoint reads that do model a not-found error; the member that
-/// failed is reported in the `fieldList` the shape declares for exactly that.
-fn unresolvable_runtime(agent_runtime_id: &str) -> ValidationException {
-    ValidationException {
-        message: crate::state::agent_not_found_for_endpoint(agent_runtime_id)
-            .message
-            .unwrap_or_default(),
-        reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
-        field_list: Some(vec![ValidationExceptionField {
-            name: AGENT_RUNTIME_ID_MEMBER.to_string(),
-            message: "must name an agent runtime of this account".to_string(),
-        }]),
-    }
-}
 
 /// One endpoint's `AgentRuntimeEndpoint` list entry.
 ///

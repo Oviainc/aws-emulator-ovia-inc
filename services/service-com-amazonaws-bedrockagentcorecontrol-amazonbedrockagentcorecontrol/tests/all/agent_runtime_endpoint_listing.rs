@@ -11,9 +11,11 @@
 //! endpoint persisted on that runtime, each summarised from that endpoint's own record
 //! — so the listing cannot disagree with `GetAgentRuntimeEndpoint` — in one
 //! deterministic order, cut into pages of at most `maxResults` entries that resume
-//! exactly where the previous page ended; and because an endpoint is addressed only
-//! through its runtime, a runtime this account does not hold is refused rather than
-//! reported as an empty page.
+//! exactly where the previous page ended; and because the operation models no
+//! not-found error, an `agentRuntimeId` inside the modelled grammar that names no
+//! runtime of this account is answered the modelled success with an empty page, the
+//! modelled `ValidationException` being reserved for input that fails a modelled
+//! constraint.
 //!
 //! Sources: `smithy_query(query="operation",operation="ListAgentRuntimeEndpoints,\
 //! CreateAgentRuntimeEndpoint,GetAgentRuntimeEndpoint")` for the routes, the success
@@ -478,33 +480,165 @@ async fn max_results_outside_the_modelled_range_is_refused() {
     }
 }
 
-/// An endpoint is addressed only through its runtime, so a listing for a runtime this
-/// account does not hold is refused — never an empty page, which a runtime that exists
-/// and holds nothing is answered with instead.
+/// Resolving the runtime is not an input question: `ListAgentRuntimeEndpoints` models
+/// no not-found error (its errors are `AccessDeniedException`,
+/// `InternalServerException`, `ThrottlingException` and `ValidationException`) and its
+/// `runtimeEndpoints` is required, so an `agentRuntimeId` inside the modelled grammar
+/// that names no runtime of this account is answered the modelled success: an empty
+/// `runtimeEndpoints` and no `nextToken`.
 ///
-/// `ListAgentRuntimeEndpoints` models no not-found error (its errors are
-/// `AccessDeniedException`, `InternalServerException`, `ThrottlingException` and
-/// `ValidationException`), so the refusal is the modelled `ValidationException`, worded
-/// the way this service words an agent an endpoint operation could not resolve.
+/// The rows differ along how the id fails to resolve (never created at all, created and
+/// then deleted) and along its shape — the shortest the pattern
+/// `^[a-zA-Z][a-zA-Z0-9_]{0,99}-[a-zA-Z0-9]{10}$` admits, underscores and digits, and
+/// the 100-character prefix bound — and each is asked for with no page size and with
+/// each bound of the modelled `maxResults` range.
 #[tokio::test]
-async fn a_listing_for_a_runtime_this_account_does_not_hold_is_refused() {
+async fn a_runtime_this_account_does_not_hold_is_an_empty_page() {
     let router = router();
-    let held = create_runtime(&router, "listing_runtime_held").await;
 
-    // Ids inside `AgentRuntimeId`'s pattern `^[a-zA-Z][a-zA-Z0-9_]{0,99}-[a-zA-Z0-9]{10}$`
-    // that no row ever creates.
-    let absent = [
-        "noSuchRuntime-abcdefghij",
-        "a-0123456789",
-        "another_runtime_entirely-zz99zz99zz",
+    // A runtime that IS held, with an endpoint on it: what the empty pages below must
+    // not be an artefact of.
+    let held = create_runtime(&router, "listing_runtime_held").await;
+    endpoint(&router, &held, &json!({"name": "held_endpoint"})).await;
+
+    // One row's id is a runtime this suite creates and then deletes — the cleanup probe
+    // a reconciler makes after a runtime is gone.
+    let deleted = create_runtime(&router, "listing_runtime_deleted").await;
+    let removed = send(&router, "DELETE", &format!("/runtimes/{deleted}/"), None).await;
+    assert_eq!(
+        removed.status, 202,
+        "deleting the runtime must succeed for this suite to say anything, got {} with {}",
+        removed.status, removed.body
+    );
+
+    // Ids inside `AgentRuntimeId`'s pattern that name no runtime of this account: the
+    // shortest the pattern admits, a prefix of digits and underscores, the 100-character
+    // prefix bound, and the id of the runtime just deleted.
+    let absent: Vec<(String, String)> = vec![
+        (
+            "the shortest id the pattern admits".to_string(),
+            "a-0123456789".to_string(),
+        ),
+        (
+            "a prefix of letters, digits and underscores".to_string(),
+            "another_runtime_entirely7-zz99zz99zz".to_string(),
+        ),
+        (
+            "the 100-character prefix bound".to_string(),
+            format!("r{}-AB12cd34EF", "x".repeat(99)),
+        ),
+        (
+            "a runtime created and then deleted".to_string(),
+            deleted.clone(),
+        ),
     ];
 
-    for runtime_id in absent {
-        let case = format!("absent runtime {runtime_id:?}");
-        let answer = list_endpoints(&router, runtime_id, None, None).await;
+    for (shape, runtime_id) in &absent {
+        for max_results in [None, Some(MAX_RESULTS_MIN), Some(MAX_RESULTS_MAX)] {
+            let case = format!("{shape} ({runtime_id:?}), maxResults={max_results:?}");
+            let answer = list_endpoints(&router, runtime_id, max_results, None).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: a runtime that is not there holds no endpoint, which is the \
+                 modelled success, got {} with {}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                at(&answer.body, "/runtimeEndpoints"),
+                json!([]),
+                "case {case:?}: the required runtimeEndpoints is reported as an empty list, got {}",
+                answer.body
+            );
+            assert_eq!(
+                at(&answer.body, "/nextToken"),
+                Value::Null,
+                "case {case:?}: an empty page leaves nothing to resume, got {}",
+                answer.body
+            );
+        }
+    }
+
+    // The empty pages above are about those ids only: the runtime that IS held still
+    // reports its endpoint.
+    let still_held = list_endpoints(&router, &held, None, None).await;
+    assert_eq!(
+        (still_held.status, reported_names(&still_held.body)),
+        (200, vec!["held_endpoint".to_string()]),
+        "case {:?}: the runtime this account does hold reports its endpoint, got {} with {}",
+        "held runtime with one endpoint",
+        still_held.status,
+        still_held.body
+    );
+}
+
+/// One row of the refusal table: a request whose input fails a modelled constraint, and
+/// the member the refusal must name.
+struct Refused {
+    case: &'static str,
+    runtime_id: &'static str,
+    max_results: Option<i64>,
+    next_token: Option<&'static str>,
+    member: &'static str,
+}
+
+/// `ValidationException` stays for input that fails a modelled constraint, whether or
+/// not the `agentRuntimeId` resolves: an absent runtime does not turn a bad page token
+/// or an out-of-range page size into a success.
+#[tokio::test]
+async fn input_constraints_are_still_refused_for_an_absent_runtime() {
+    let router = router();
+
+    // An id inside `AgentRuntimeId`'s pattern that no row creates.
+    let absent = "noSuchRuntime-abcdefghij";
+
+    // A token this service never issued (inside `NextToken`'s own len 1..2048 and
+    // `^\S*$`, so the boundary walk passes it through), each value just past a published
+    // bound of `maxResults` (range 1..100), and an id outside `AgentRuntimeId`'s own
+    // pattern `^[a-zA-Z][a-zA-Z0-9_]{0,99}-[a-zA-Z0-9]{10}$` (it starts with a digit).
+    let rows: Vec<Refused> = vec![
+        Refused {
+            case: "a nextToken this service did not issue",
+            runtime_id: absent,
+            max_results: None,
+            next_token: Some("not-a-token"),
+            member: "nextToken",
+        },
+        Refused {
+            case: "maxResults below the modelled range",
+            runtime_id: absent,
+            max_results: Some(MAX_RESULTS_MIN - 1),
+            next_token: None,
+            member: "maxResults",
+        },
+        Refused {
+            case: "maxResults above the modelled range",
+            runtime_id: absent,
+            max_results: Some(MAX_RESULTS_MAX + 1),
+            next_token: None,
+            member: "maxResults",
+        },
+        Refused {
+            case: "an agentRuntimeId outside the modelled pattern",
+            runtime_id: "0notAnId-abcdefghij",
+            max_results: None,
+            next_token: None,
+            member: "agentRuntimeId",
+        },
+    ];
+
+    for row in rows {
+        let Refused {
+            case,
+            runtime_id,
+            max_results,
+            next_token,
+            member,
+        } = row;
+        let answer = list_endpoints(&router, runtime_id, max_results, next_token).await;
         assert_eq!(
             answer.status, 400,
-            "case {case:?}: a runtime this account does not hold is refused, got {} with {}",
+            "case {case:?}: input that fails a modelled constraint is refused even when the \
+             runtime is not there, got {} with {}",
             answer.status, answer.body
         );
         assert_eq!(
@@ -513,29 +647,36 @@ async fn a_listing_for_a_runtime_this_account_does_not_hold_is_refused() {
             "case {case:?}: the refusal is the modelled ValidationException, got {}",
             answer.body
         );
-        assert_eq!(
-            text(&answer.body, "/message"),
-            format!("Agent with agentId: {runtime_id} not found"),
-            "case {case:?}: the refusal names the agent the lookup ran for, got {}",
-            answer.body
-        );
-        assert_eq!(
-            text(&answer.body, "/fieldList/0/name"),
-            "agentRuntimeId",
-            "case {case:?}: the member that failed is reported in the fieldList, got {}",
+        assert!(
+            answer.body.to_string().contains(member),
+            "case {case:?}: the refusal names the member that failed ({member}), got {}",
             answer.body
         );
     }
 
-    let answer = list_endpoints(&router, &held, None, None).await;
+    // A token this listing DID issue for one runtime is well-formed input, so a listing
+    // of a runtime that is not there resumes onto an empty page rather than a refusal.
+    let held = create_runtime(&router, "listing_runtime_token_source").await;
+    for name in ["first", "second"] {
+        endpoint(&router, &held, &json!({"name": name})).await;
+    }
+    let page = list_endpoints(&router, &held, Some(1), None).await;
+    let token = text(&page.body, "/nextToken");
+    assert!(
+        !token.is_empty(),
+        "case {:?}: a page that leaves an endpoint over hands back a token, got {}",
+        "the token this listing issued",
+        page.body
+    );
+    let resumed = list_endpoints(&router, absent, None, Some(&token)).await;
     assert_eq!(
-        (answer.status, reported(&answer.body).len()),
-        (200, 0),
-        "case {:?}: a runtime that IS held and holds no endpoint is an empty page, not a refusal, \
-         got {} with {}",
-        "held runtime with no endpoint",
-        answer.status,
-        answer.body
+        (resumed.status, at(&resumed.body, "/runtimeEndpoints")),
+        (200, json!([])),
+        "case {:?}: a well-formed token against a runtime that is not there is an empty page, got \
+         {} with {}",
+        "a token issued for another runtime",
+        resumed.status,
+        resumed.body
     );
 }
 
