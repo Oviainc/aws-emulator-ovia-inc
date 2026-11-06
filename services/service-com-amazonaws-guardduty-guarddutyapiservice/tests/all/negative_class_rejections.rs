@@ -247,7 +247,7 @@ async fn accept_invitation_without_a_pending_invitation_is_refused_and_establish
                 let (status, body) =
                     accept(&router, acceptance, &detector_id, administrator_id, invitation_id)
                         .await;
-                assert_bad_request(&case, status, &body, member, administrator_id);
+                assert_bad_request_message(&case, status, &body, UNUSABLE_INPUT_VALUE, administrator_id);
 
                 // And no administrator relationship was established: every member of
                 // the read's shape is optional, so "no administrator" is their
@@ -276,7 +276,7 @@ async fn accept_invitation_without_a_pending_invitation_is_refused_and_establish
             let case = format!("{segment}: malformed {member} {administrator_id} ({why})");
             let (status, body) =
                 accept(&router, acceptance, &detector_id, administrator_id, "bogus").await;
-            assert_bad_request(&case, status, &body, member, administrator_id);
+            assert_bad_request_message(&case, status, &body, UNUSABLE_INPUT_VALUE, administrator_id);
         }
     }
 }
@@ -298,7 +298,7 @@ async fn accept_invitation_accepts_a_pending_invitation_and_the_read_reports_it(
     ];
 
     for acceptance in ACCEPTANCES {
-        let (segment, member, _) = acceptance;
+        let (segment, _, _) = acceptance;
         for (administrator_id, invitation_id) in cases {
             let case = format!("{segment}: invitation {invitation_id:?} from {administrator_id}");
             let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -324,7 +324,7 @@ async fn accept_invitation_accepts_a_pending_invitation_and_the_read_reports_it(
                 "not-the-invitation",
             )
             .await;
-            assert_bad_request(&case, status, &body, member, administrator_id);
+            assert_bad_request_message(&case, status, &body, UNUSABLE_INPUT_VALUE, administrator_id);
             let reported = administrator_account(&router, acceptance, &detector_id).await;
             assert_eq!(
                 reported["accountId"],
@@ -381,7 +381,7 @@ async fn accept_invitation_accepts_a_pending_invitation_and_the_read_reports_it(
                 invitation_id,
             )
             .await;
-            assert_bad_request(&case, status, &body, member, administrator_id);
+            assert_bad_request_message(&case, status, &body, UNUSABLE_INPUT_VALUE, administrator_id);
             assert_eq!(
                 administrator_account(&router, acceptance, &detector_id).await,
                 established,

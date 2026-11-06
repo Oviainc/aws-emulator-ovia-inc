@@ -109,6 +109,8 @@ mod investigation_detector_timestamp;
 mod investigation_lifecycle;
 #[path = "all/investigation_listing.rs"]
 mod investigation_listing;
+#[path = "all/invitation_acceptance_refusal_text.rs"]
+mod invitation_acceptance_refusal_text;
 #[path = "all/invitation_count.rs"]
 mod invitation_count;
 #[path = "all/invitation_decline.rs"]

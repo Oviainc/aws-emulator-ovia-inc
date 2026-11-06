@@ -152,12 +152,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // administrator account whose invitation you're accepting",
         // `smithy_query(operation="AcceptAdministratorInvitation")`) but targets a
         // plain `String`, so the boundary validator accepts any value: a value that
-        // cannot be an account id at all is the parameter failure, refused before
-        // anything is looked up. The member is named by its own wire name, which is
-        // what distinguishes this rejection from the deprecated twin's.
+        // cannot be an account id at all identifies no pending invitation either,
+        // and is refused with the same fixed input-parameter sentence, before
+        // anything is looked up.
         if !crate::state::is_account_id(&input.administrator_id) {
             return Err(crate::scaffolded::Scaffolded::invalid_input(
-                crate::state::invalid_parameter_message(crate::state::ADMINISTRATOR_ID_MEMBER),
+                crate::state::INVITATION_NOT_PENDING_MESSAGE,
             ));
         }
 
@@ -172,13 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The same condition `AcceptInvitation` accepts on, read through the same
-        // state helper: the two operations are one behaviour under two names, so
-        // neither can accept an invitation the other would refuse.
+        // state helper, and refused with the same fixed sentence: the two operations
+        // are one behaviour under two names, so neither can accept an invitation the
+        // other would refuse, nor explain the refusal differently.
         if !detector.invitation_pending(&input.administrator_id, &input.invitation_id) {
             return Err(crate::scaffolded::Scaffolded::invalid_input(
-                crate::state::invitation_not_pending_message_for(
-                    crate::state::ADMINISTRATOR_ID_MEMBER,
-                ),
+                crate::state::INVITATION_NOT_PENDING_MESSAGE,
             ));
         }
 

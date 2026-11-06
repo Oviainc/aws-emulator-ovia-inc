@@ -2285,23 +2285,22 @@ pub const INVITATION_ID_MEMBER: &str = "invitationId";
 /// names whichever one the request used.
 pub const ADMINISTRATOR_ID_MEMBER: &str = "administratorId";
 
-/// The message an acceptance naming no pending invitation is refused with, naming
-/// the member that carried the administrator's account id.
+/// The sentence an invitation acceptance is refused with when the administrator
+/// account id and invitation id it carries identify no invitation pending for the
+/// account that owns the named detector.
 ///
-/// It names the two members that together identify the invitation and states the
-/// rule they broke, without quoting either value back — the wording every
-/// rejection on this service follows.
-pub fn invitation_not_pending_message_for(administrator_member: &str) -> String {
-    format!(
-        "The request is rejected because the input {administrator_member} and {INVITATION_ID_MEMBER} do not identify an invitation pending for the current account."
-    )
-}
-
-/// [`invitation_not_pending_message_for`] for the deprecated `AcceptInvitation`,
-/// whose administrator member is [`MASTER_ID_MEMBER`].
-pub fn invitation_not_pending_message() -> String {
-    invitation_not_pending_message_for(MASTER_ID_MEMBER)
-}
+/// Both members are plain Strings with no modelled pattern and neither acceptance
+/// declares a not-found shape — only `BadRequestException` (400) and
+/// `InternalServerErrorException` (500)
+/// (`smithy_query(operation="AcceptInvitation,AcceptAdministratorInvitation")`) — so
+/// a pair that resolves to nothing is refused as an unusable input PARAMETER, under
+/// the service's FIXED sentence for that class ([`INVALID_INPUT_VALUE_MESSAGE`]). It
+/// names neither [`MASTER_ID_MEMBER`]/[`ADMINISTRATOR_ID_MEMBER`] nor
+/// [`INVITATION_ID_MEMBER`], asserts no reason the lookup failed and interpolates
+/// nothing of the request or of state: a value that could never be an account id and
+/// a well-formed pair nobody invited are the one refusal, under either of the two
+/// names the acceptance is bound under.
+pub const INVITATION_NOT_PENDING_MESSAGE: &str = INVALID_INPUT_VALUE_MESSAGE;
 
 /// The message the MEMBER-side disassociation is refused with when the account
 /// that owns the named detector is monitored by no administrator.

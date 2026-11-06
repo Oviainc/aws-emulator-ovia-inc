@@ -147,11 +147,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // administrator account whose invitation you're accepting",
         // `smithy_query(operation="AcceptInvitation")`) but targets a plain
         // `String`, so the boundary validator accepts any value: a value that
-        // cannot be an account id at all is a parameter failure, refused before
+        // cannot be an account id at all identifies no pending invitation either,
+        // and is refused with the same fixed input-parameter sentence, before
         // anything is looked up.
         if !crate::state::is_account_id(&input.master_id) {
             return Err(crate::scaffolded::Scaffolded::invalid_input(
-                crate::state::invalid_parameter_message(crate::state::MASTER_ID_MEMBER),
+                crate::state::INVITATION_NOT_PENDING_MESSAGE,
             ));
         }
 
@@ -176,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // administrator relationship now exists.
         if !detector.invitation_pending(&input.master_id, &input.invitation_id) {
             return Err(crate::scaffolded::Scaffolded::invalid_input(
-                crate::state::invitation_not_pending_message(),
+                crate::state::INVITATION_NOT_PENDING_MESSAGE,
             ));
         }
 
