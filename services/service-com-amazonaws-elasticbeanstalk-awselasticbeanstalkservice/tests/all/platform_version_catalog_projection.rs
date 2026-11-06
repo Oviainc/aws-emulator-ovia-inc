@@ -33,7 +33,7 @@
 
 use service_com_amazonaws_elasticbeanstalk_awselasticbeanstalkservice as eb;
 
-use crate::lifecycle::{instant, Answer, Emulator, TEST_REGION};
+use crate::lifecycle::{elements, instant, Answer, Emulator, TEST_REGION};
 
 /// The add-ons EVERY platform version this service publishes supports: logs to
 /// Amazon S3 and to CloudWatch Logs, and enhanced health through the health
@@ -419,14 +419,33 @@ async fn every_published_version_is_described_in_full_from_the_same_record() {
             described.body
         );
         // A version Elastic Beanstalk itself publishes states no framework of
-        // its own: the one entry it reports carries neither a name nor a
-        // version.
+        // its own: the ONE entry it reports carries a `Name` and a `Version`
+        // that are both PRESENT and EMPTY. Read off the XML, because the
+        // element readers cannot tell an empty element from an absent one — the
+        // same expectation [`crate::managed_platform_catalog_rules`] states, so
+        // a change that drops either element fails in both suites.
+        let frameworks = elements(&described.body, "Frameworks");
         assert_eq!(
-            named_versions(&described, "Frameworks"),
-            vec![(String::new(), None)],
-            "case {case:?}: a managed version states no framework, got {}",
+            frameworks.len(),
+            1,
+            "case {case:?}: expected one Frameworks member, got {}",
             described.body
         );
+        let framework_members = elements(frameworks[0], "member");
+        assert_eq!(
+            framework_members.len(),
+            1,
+            "case {case:?}: expected one framework entry, got {:?}",
+            frameworks[0]
+        );
+        for member in &framework_members {
+            assert_eq!(
+                (elements(member, "Name"), elements(member, "Version")),
+                (vec![""], vec![""]),
+                "case {case:?}: a managed version states no framework, so its entry must report \
+                 an empty Name and an empty Version, got {member:?}"
+            );
+        }
         // One entry per virtualization type, each naming NO image: a managed
         // version pins no custom AMI, so every `ImageId` is reported empty
         // rather than as a machine image this service would have invented.
@@ -453,12 +472,19 @@ async fn every_published_version_is_described_in_full_from_the_same_record() {
             "case {case:?}: expected one entry per virtualization type, got {}",
             described.body
         );
-        for (virtualization_type, image_id) in &amis {
+        // And each entry's `ImageId` is PRESENT and EMPTY, read off the XML for
+        // the same reason the framework entry above is.
+        let ami_members: Vec<&str> = elements(&described.body, "CustomAmiList")
+            .iter()
+            .flat_map(|list| elements(list, "member"))
+            .collect();
+        for member in &ami_members {
             assert_eq!(
-                image_id.clone().unwrap_or_default(),
-                String::new(),
-                "case {case:?}: the {virtualization_type} entry of a managed version must name \
-                 no image, got {image_id:?}"
+                elements(member, "ImageId"),
+                vec![""],
+                "case {case:?}: the {:?} entry of a managed version must report an empty \
+                 ImageId, got {member:?}",
+                elements(member, "VirtualizationType")
             );
         }
         // The publication instants: both present, both the same instant, since
