@@ -39,6 +39,9 @@ const KMS_KEY_ID: &str = "arn:aws:kms:us-west-2:000000000000:key/12345678-1234-1
 /// nothing from the request in it.
 const INVALID_DB_ENGINE: &str = "Invalid DB engine";
 
+/// The Query API error code a value outside what its member accepts is refused with.
+const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+
 /// The sentence a request this service will not serve against a custom engine version is
 /// refused with. Spelled out here so the wording is pinned by the test rather than by the
 /// code under test.
@@ -92,6 +95,10 @@ struct CevCreateCase {
     engine: &'static str,
     engine_version: &'static str,
     extra: &'static [(&'static str, &'static str)],
+    /// The wire error `<Code>` of the refusal; `InvalidParameterValue` for a value no
+    /// engine build answers to, `InvalidParameterCombination` for members that cannot hold
+    /// together.
+    code: &'static str,
     /// `None` for a request this service accepts.
     refusal: Option<&'static str>,
 }
@@ -99,17 +106,19 @@ struct CevCreateCase {
 /// The rows of that table.
 ///
 /// `CreateCustomDBEngineVersion$Engine` publishes the engines a CEV can be created for, and
-/// `$EngineVersion` the name format one carries (`19.`*customized_string* for RDS Custom
-/// for Oracle, *major*.*minor*.*customized_string* for the SQL Server engines). The rows
-/// span both halves of that pair and both of the later guards they would otherwise trip —
-/// the KMS key an RDS Custom engine requires and the AMI RDS Custom for SQL Server requires
-/// — so what is asserted is WHICH refusal the request gets.
+/// `$EngineVersion` the name format one carries (*major*.*minor*.*customized_string* for
+/// the SQL Server engines). A CEV is built ON a published engine build, so the rows span
+/// all three halves of what names one — the engine's own name, whether this service
+/// publishes a build of that engine, and the CEV name's form — and both of the later guards
+/// they would otherwise trip, the image RDS Custom for SQL Server requires and the KMS key
+/// identifier a named key has to be, so what is asserted is WHICH refusal the request gets.
 const CEV_CREATE_CASES: &[CevCreateCase] = &[
     CevCreateCase {
         case: "an engine AWS provides the versions of, with no KMS key either",
         engine: "postgres",
         engine_version: "16.4.my_cev1",
         extra: &[],
+        code: INVALID_PARAMETER_VALUE,
         refusal: Some(INVALID_DB_ENGINE),
     },
     CevCreateCase {
@@ -117,6 +126,7 @@ const CEV_CREATE_CASES: &[CevCreateCase] = &[
         engine: "Custom-Oracle-EE",
         engine_version: "19.my_cev1",
         extra: &[("KMSKeyId", KMS_KEY_ID)],
+        code: INVALID_PARAMETER_VALUE,
         refusal: Some(INVALID_DB_ENGINE),
     },
     CevCreateCase {
@@ -124,6 +134,7 @@ const CEV_CREATE_CASES: &[CevCreateCase] = &[
         engine: "custom-oracle",
         engine_version: "19.my_cev1",
         extra: &[("KMSKeyId", KMS_KEY_ID)],
+        code: INVALID_PARAMETER_VALUE,
         refusal: Some(INVALID_DB_ENGINE),
     },
     CevCreateCase {
@@ -131,6 +142,7 @@ const CEV_CREATE_CASES: &[CevCreateCase] = &[
         engine: "custom-oracle-ee",
         engine_version: "my_cev1",
         extra: &[],
+        code: INVALID_PARAMETER_VALUE,
         refusal: Some(INVALID_DB_ENGINE),
     },
     CevCreateCase {
@@ -138,6 +150,7 @@ const CEV_CREATE_CASES: &[CevCreateCase] = &[
         engine: "custom-oracle-se2",
         engine_version: "cev-19.my_cev1",
         extra: &[("KMSKeyId", KMS_KEY_ID)],
+        code: INVALID_PARAMETER_VALUE,
         refusal: Some(INVALID_DB_ENGINE),
     },
     CevCreateCase {
@@ -145,6 +158,7 @@ const CEV_CREATE_CASES: &[CevCreateCase] = &[
         engine: "custom-sqlserver-ee",
         engine_version: "15",
         extra: &[("KMSKeyId", KMS_KEY_ID), ("ImageId", "ami-0abcdef1234567890")],
+        code: INVALID_PARAMETER_VALUE,
         refusal: Some(INVALID_DB_ENGINE),
     },
     CevCreateCase {
@@ -152,36 +166,52 @@ const CEV_CREATE_CASES: &[CevCreateCase] = &[
         engine: "custom-sqlserver-ee",
         engine_version: "15.",
         extra: &[("KMSKeyId", KMS_KEY_ID), ("ImageId", "ami-0abcdef1234567890")],
+        code: INVALID_PARAMETER_VALUE,
         refusal: Some(INVALID_DB_ENGINE),
     },
-    // The control rows: the pair names an engine build, so the request reaches the guards
-    // that come after it.
+    // An engine the member publishes and this service publishes no build of: there is
+    // nothing for the CEV to be built on, so the availability of the ENGINE is what the
+    // request is refused for — before the image and the KMS key it does not carry either.
     CevCreateCase {
-        case: "an RDS Custom engine and a well-formed name, with no KMS key",
+        case: "a published custom engine this service publishes no build of",
         engine: "custom-oracle-ee",
-        engine_version: "19.no_key_cev",
+        engine_version: "19.no_build_cev",
         extra: &[],
-        refusal: Some(
-            "KMSKeyId must be specified for engine custom-oracle-ee: a symmetric encryption \
-             KMS key is required for an RDS Custom engine version",
-        ),
+        code: INVALID_PARAMETER_VALUE,
+        refusal: Some(INVALID_DB_ENGINE),
     },
     CevCreateCase {
-        case: "RDS Custom for SQL Server and a well-formed name, with no AMI",
+        case: "the same engine with every other member it could trip a guard on",
+        engine: "custom-oracle-se2",
+        engine_version: "19.every_member_cev",
+        extra: &[
+            ("KMSKeyId", "not-a-kms-key"),
+            ("ImageId", "ami-0abcdef1234567890"),
+            ("UseAwsProvidedLatestImage", "true"),
+        ],
+        code: INVALID_PARAMETER_VALUE,
+        refusal: Some(INVALID_DB_ENGINE),
+    },
+    // The control rows: the pair names an engine build this service publishes, so the
+    // request reaches the guards that come after it.
+    CevCreateCase {
+        case: "RDS Custom for SQL Server and a well-formed name, with no image",
         engine: "custom-sqlserver-web",
         engine_version: "15.00.4249.2.no_ami_cev",
         extra: &[("KMSKeyId", KMS_KEY_ID)],
+        code: "InvalidParameterCombination",
         refusal: Some(
-            "ImageId must be specified for engine custom-sqlserver-web: an AMI ID is required \
-             to create a CEV for RDS Custom for SQL Server, unless UseAwsProvidedLatestImage \
-             or SourceCustomDbEngineVersionIdentifier names the image",
+            "exactly one of ImageId, UseAwsProvidedLatestImage or \
+             SourceCustomDbEngineVersionIdentifier must be specified: an AMI ID is required \
+             to create a CEV for RDS Custom for SQL Server",
         ),
     },
     CevCreateCase {
         case: "every prerequisite met: the CEV is created",
-        engine: "custom-oracle-ee",
-        engine_version: "19.served_cev",
-        extra: &[("KMSKeyId", KMS_KEY_ID)],
+        engine: "custom-sqlserver-ee",
+        engine_version: "15.00.4385.2.served_cev",
+        extra: &[("KMSKeyId", KMS_KEY_ID), ("ImageId", "ami-0abcdef1234567890")],
+        code: INVALID_PARAMETER_VALUE,
         refusal: None,
     },
 ];
@@ -211,7 +241,7 @@ async fn a_custom_engine_version_create_names_an_engine_build_before_anything_el
                 );
             }
             Some(message) => {
-                expect_refusal(row.case, response, 400, "InvalidParameterValue", message);
+                expect_refusal(row.case, response, 400, row.code, message);
                 // A refused create stored nothing: the pair is still unheld, so managing
                 // it is denied.
                 expect_refusal(
@@ -245,25 +275,25 @@ struct UnheldCev {
 }
 
 /// The ways a pair can name no held CEV, against the one CEV this suite creates
-/// (`custom-oracle-ee`/`19.held_cev` in [`REGION`]).
+/// (`sqlserver-ee`/`16.00.4175.1.held_cev` in [`REGION`]).
 const UNHELD_CEVS: &[UnheldCev] = &[
     UnheldCev {
         case: "a CEV name nothing created",
         region: REGION,
-        engine: "custom-oracle-ee",
-        engine_version: "19.never_created_cev",
+        engine: "sqlserver-ee",
+        engine_version: "16.00.4175.1.never_created_cev",
     },
     UnheldCev {
         case: "the held CEV name under another engine",
         region: REGION,
-        engine: "custom-oracle-se2",
-        engine_version: "19.held_cev",
+        engine: "sqlserver-se",
+        engine_version: "16.00.4175.1.held_cev",
     },
     UnheldCev {
         case: "the held CEV in another region",
         region: "eu-west-1",
-        engine: "custom-oracle-ee",
-        engine_version: "19.held_cev",
+        engine: "sqlserver-ee",
+        engine_version: "16.00.4175.1.held_cev",
     },
     UnheldCev {
         case: "an engine version this service publishes rather than one an account minted",
@@ -282,8 +312,8 @@ async fn managing_a_cev_the_account_does_not_hold_is_denied_by_every_such_call()
             &router,
             "CreateCustomDBEngineVersion",
             &[
-                ("Engine", "custom-oracle-ee"),
-                ("EngineVersion", "19.held_cev"),
+                ("Engine", "sqlserver-ee"),
+                ("EngineVersion", "16.00.4175.1.held_cev"),
                 ("KMSKeyId", KMS_KEY_ID),
             ],
         )

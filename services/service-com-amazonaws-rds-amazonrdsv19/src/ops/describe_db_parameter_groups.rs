@@ -162,34 +162,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `DBParameterGroupName` constraint: "If supplied, must match the name of an
         // existing" group — a name that matches none is the modelled 404, not an empty
-        // page.
+        // page. The groups RDS provides itself match too: the account holds a default group
+        // per engine-version family without any request having created one
+        // (`crate::state::visible_db_parameter_groups`).
         let selected: Vec<(String, crate::state::DbParameterGroupRecord)> =
             match &input.db_parameter_group_name {
                 Some(requested) => {
-                    let name = requested.to_ascii_lowercase();
-                    let Some(record) =
-                        store.db_parameter_groups.get(&(region.clone(), name.clone()))
+                    let Some(record) = store.resolve_visible_db_parameter_group(&region, requested)
                     else {
                         return Err(
                             DescribeDBParameterGroupsErrorModeled::DBParameterGroupNotFoundFault(
                                 DBParameterGroupNotFoundFault {
-                                    message: Some(format!(
-                                        "DBParameterGroup not found: {requested}"
-                                    )),
+                                    message: Some(
+                                        crate::state::db_parameter_group_not_found_message(
+                                            requested,
+                                        ),
+                                    ),
                                 },
                             )
                             .into(),
                         );
                     };
-                    vec![(name, record.clone())]
+                    vec![(record.name.clone(), record)]
                 }
                 None => store
-                    .parameter_groups_in(&region)
+                    .visible_db_parameter_groups(&region)
                     .into_iter()
-                    .map(|record| (record.name.clone(), record.clone()))
+                    .map(|record| (record.name.clone(), record))
                     .collect(),
             };
 
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
         let page = crate::state::paginate(selected, input.marker.as_deref(), page_size)
             .map_err(DescribeDBParameterGroupsError::invalid_parameter_value)?;
         Ok(DescribeDBParameterGroupsOutput {

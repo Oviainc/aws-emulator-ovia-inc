@@ -171,20 +171,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // materialised before the association is read.
         store.settle_due_transitions(&region);
 
+        // "You can't delete a default DB parameter group" — the groups RDS provides per
+        // engine-version family, named for that family
+        // (`crate::state::is_default_parameter_group_name`, the ONE reading of that name in
+        // this crate). The account holds such a group whether or not this store has a record
+        // of one, so the restriction is answered BEFORE the record lookup below: a default
+        // group is never missing, it is a group the request may not delete.
+        let name = input.db_parameter_group_name.to_ascii_lowercase();
+        if crate::state::is_default_parameter_group_name(&name) {
+            return Err(
+                DeleteDBParameterGroupErrorModeled::InvalidDBParameterGroupStateFault(
+                    InvalidDBParameterGroupStateFault {
+                        message: Some(
+                            crate::state::default_group_cannot_be_deleted_message(
+                                crate::state::DB_PARAMETER_GROUP_SUBJECT,
+                                &input.db_parameter_group_name,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // RDS is regional, and `DBParameterGroupName` is "stored as a lowercase string", so
         // the group is looked up by the lowercased name in the region the request was signed
         // for. A name that matches none is the modelled 404 — the same answer a second
         // delete of the same group gets, which is what lets a caller tell "deleted" from
         // "never existed" at the first call.
-        let name = input.db_parameter_group_name.to_ascii_lowercase();
         let key = (region.clone(), name.clone());
         if !store.db_parameter_groups.contains_key(&key) {
             return Err(
                 DeleteDBParameterGroupErrorModeled::DBParameterGroupNotFoundFault(
                     DBParameterGroupNotFoundFault {
-                        message: Some(format!(
-                            "DBParameterGroup not found: {}",
-                            input.db_parameter_group_name
+                        message: Some(crate::state::db_parameter_group_not_found_message(
+                            &input.db_parameter_group_name,
                         )),
                     },
                 )
@@ -192,25 +213,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // "You can't delete a default DB parameter group" — the groups RDS provides per
-        // engine-version family, named for that family
-        // (`crate::state::is_default_parameter_group_name`, the ONE reading of that name in
-        // this crate). No such group can be in state today, since
-        // `validate_parameter_group_name` admits no `.` in a created name, so this guard is
-        // what makes the rule hold once those groups are materialised rather than live
-        // behaviour.
-        if crate::state::is_default_parameter_group_name(&name) {
-            return Err(
-                DeleteDBParameterGroupErrorModeled::InvalidDBParameterGroupStateFault(
-                    InvalidDBParameterGroupStateFault {
-                        message: Some(format!(
-                            "DB parameter group {name} is a default group and cannot be deleted"
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
 
         // "Can't be associated with any DB instances." The association is the instance
         // record's own `DBParameterGroupName`, which carries the name as its create spelled

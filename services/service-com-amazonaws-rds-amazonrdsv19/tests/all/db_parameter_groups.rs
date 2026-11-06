@@ -40,9 +40,6 @@ fn count(xml: &str, tag: &str) -> usize {
     texts(xml, tag).len()
 }
 
-/// A call that carries no parameters beyond `Action` and `Version`.
-const NO_PARAMS: [(&str, &str); 0] = [];
-
 /// The ARN a group stored in `region` under `name` reports: the `pg` resource type AWS
 /// uses for a DB parameter group under the `rds` ARN namespace.
 ///
@@ -210,20 +207,44 @@ async fn a_created_group_is_computed_from_persisted_state() {
         }
     }
 
-    // The unfiltered describe reports every group the region holds, in name order.
+    // The unfiltered describe reports every group the region holds, in name order: the
+    // ones created above, beside the default group RDS provides for each engine-version
+    // family it publishes.
     let listed = expect_ok(
         "describe every group",
-        call(&router, "DescribeDBParameterGroups", &NO_PARAMS).await,
+        call(
+            &router,
+            "DescribeDBParameterGroups",
+            &[("MaxRecords", "100")],
+        )
+        .await,
     );
     let mut expected: Vec<String> = GROUP_CASES
         .iter()
         .map(|row| row.stored_name.to_string())
         .collect();
     expected.sort();
+    let reported = texts(&listed, "DBParameterGroupName");
+    let created: Vec<String> = reported
+        .iter()
+        .filter(|name| !name.starts_with("default."))
+        .cloned()
+        .collect();
     assert_eq!(
-        texts(&listed, "DBParameterGroupName"),
-        expected,
+        created, expected,
         "case \"describe every group\": expected every created group in name order, got {listed}"
+    );
+    // The AWS-managed catalog is there too: the account holds a default group per family
+    // without any request having created one.
+    let defaults: Vec<String> = reported
+        .iter()
+        .filter(|name| name.starts_with("default."))
+        .cloned()
+        .collect();
+    assert!(
+        defaults.len() > 1,
+        "case \"describe every group\": expected the account's default parameter groups, got \
+         {defaults:?} in {listed}"
     );
 }
 
@@ -341,13 +362,26 @@ async fn the_documented_name_rule_is_refused_at_its_bounds() {
             expect_ok(case, describe_one(&router, &value).await);
         } else {
             expect_error(case, response, 400, "InvalidParameterValue");
-            // The refusal stored nothing.
-            expect_error(
-                case,
-                describe_one(&router, &value).await,
-                404,
-                "DBParameterGroupNotFound",
-            );
+            // The refusal stored nothing. A name of the `default.` form is the exception:
+            // that name is one of the groups RDS provides itself, so the describe reports
+            // RDS's group rather than a 404 — and the create was still refused, which is
+            // what this row is about.
+            if value.starts_with("default.") {
+                let listed = expect_ok(case, describe_one(&router, &value).await);
+                assert_eq!(
+                    text(&listed, "Description"),
+                    "Default parameter group for mysql8.0",
+                    "case {case:?}: the group of that name is the one RDS provides, not the \
+                     refused create's, got {listed}"
+                );
+            } else {
+                expect_error(
+                    case,
+                    describe_one(&router, &value).await,
+                    404,
+                    "DBParameterGroupNotFound",
+                );
+            }
         }
     }
 }
@@ -690,7 +724,9 @@ async fn the_describe_refuses_what_it_cannot_serve_and_pages_what_it_can() {
         );
     }
 
-    // 25 groups, paged at the documented minimum page size: 20, a marker, then the rest.
+    // 25 groups of the account's own, paged at the documented minimum page size: 20, a
+    // marker, then the rest. The walk starts at the token for the first of them, because
+    // the default groups RDS provides are reported ahead of them in name order.
     let page_size = 20usize;
     let total = 25usize;
     let mut names: Vec<String> = (0..total).map(|index| format!("page-{index:02}")).collect();
@@ -704,7 +740,10 @@ async fn the_describe_refuses_what_it_cannot_serve_and_pages_what_it_can() {
         call(
             &router,
             "DescribeDBParameterGroups",
-            &[("MaxRecords", page_size.to_string())],
+            &[
+                ("MaxRecords", page_size.to_string()),
+                ("Marker", state::encode_marker(&names[0])),
+            ],
         )
         .await,
     );

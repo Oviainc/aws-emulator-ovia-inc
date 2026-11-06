@@ -177,7 +177,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         DescribeIntegrationsError::from(
                             DescribeIntegrationsErrorModeled::IntegrationNotFoundFault(
                                 IntegrationNotFoundFault {
-                                    message: Some(format!("Integration {requested} not found.")),
+                                    message: Some(
+                                        crate::state::integration_not_found_message(
+                                            &region, requested,
+                                        ),
+                                    ),
                                 },
                             ),
                         )

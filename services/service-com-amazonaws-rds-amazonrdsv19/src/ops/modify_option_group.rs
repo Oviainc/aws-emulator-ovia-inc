@@ -181,7 +181,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_due_transitions(&region);
 
         // RDS is regional: only the region the request was signed for is in scope, and
-        // a name no stored group has is the modelled 404.
+        // a name no stored group has is the modelled 404. An option group RDS provides
+        // itself is not the account's to change — it exists for every engine and major
+        // engine version RDS publishes (`crate::state::is_default_option_group_name`) — so
+        // it is refused with the protection RDS states for it rather than with the
+        // not-found fault a name this store holds no record of would otherwise get, exactly
+        // as `ModifyDBParameterGroup` refuses a default parameter group.
+        if crate::state::is_default_option_group_name(&name) {
+            return Err(ModifyOptionGroupError::invalid_parameter_value(
+                crate::state::CANNOT_MODIFY_DEFAULT_OPTION_GROUP_MESSAGE,
+            ));
+        }
         let Some(record) = store.option_groups.get_mut(&(region.clone(), name.clone())) else {
             return Err(ModifyOptionGroupErrorModeled::OptionGroupNotFoundFault(
                 OptionGroupNotFoundFault {

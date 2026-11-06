@@ -111,7 +111,7 @@ impl From<DeleteDBSnapshotErrorModeled> for DeleteDBSnapshotError {
 /// answer, so a caller sees one spelling of "no such snapshot".
 fn not_found(requested: &str) -> DeleteDBSnapshotError {
     DeleteDBSnapshotErrorModeled::DBSnapshotNotFoundFault(DBSnapshotNotFoundFault {
-        message: Some(format!("DBSnapshot not found: {requested}")),
+        message: Some(crate::state::db_snapshot_not_found_message(requested)),
     })
     .into()
 }

@@ -85,39 +85,40 @@ struct Case {
 ///
 /// The engines and the CEV name forms are the member's own published ones
 /// (`smithy_query(query="doc",shape="CreateCustomDBEngineVersionMessage",member="Engine"` /
-/// `member="EngineVersion"`): `19.`*customized_string* for RDS Custom for Oracle and
-/// *major*.*minor*.*customized_string* for the SQL Server engines. The major versions and
-/// parameter group families are the ones this service publishes for those engines through
-/// `DescribeDBEngineVersions`, except for the `custom-oracle-*` engines, which publish no
-/// version of their own and whose family RDS writes `<engine>-<major version>`.
+/// `member="EngineVersion"`): *major*.*minor*.*customized_string* for the SQL Server
+/// engines. The major versions and parameter group families are the ones this service
+/// publishes for those engines through `DescribeDBEngineVersions` — a CEV is built ON a
+/// published engine version, so every row's engine is one this service publishes versions
+/// of, which is what the engine-availability row of [`REFUSALS`] is the other side of.
 const CASES: &[Case] = &[
     Case {
-        engine: "custom-oracle-ee",
-        engine_version: "19.my_cev1",
-        major_engine_version: "19",
-        parameter_group_family: "custom-oracle-ee-19",
+        engine: "sqlserver-se",
+        engine_version: "15.00.4435.7.byom_cev2",
+        major_engine_version: "15.00",
+        parameter_group_family: "sqlserver-se-15.0",
+        // The largest create: every media member at once, plus a description and tags.
         extra: &[
             ("KMSKeyId", KMS_KEY_ID),
             ("Manifest", MANIFEST),
             ("DatabaseInstallationFilesS3BucketName", "my-cev-media"),
             ("DatabaseInstallationFilesS3Prefix", "000000000000/cev1"),
-            ("DatabaseInstallationFiles.member.1", "V982063-01.zip"),
-            ("DatabaseInstallationFiles.member.2", "p3262.zip"),
-            ("Description", "nineteen-c-for-my-fleet"),
+            ("DatabaseInstallationFiles.member.1", "SQLServer2019.iso"),
+            ("DatabaseInstallationFiles.member.2", "SQLServer2019-CU.exe"),
+            ("Description", "standard-edition-for-my-fleet"),
             ("Tags.Tag.1.Key", "owner"),
             ("Tags.Tag.1.Value", "platform"),
         ],
-        media_type: None,
+        media_type: Some("Customer Provided"),
     },
     Case {
-        engine: "custom-oracle-se2-cdb",
-        engine_version: "19.cdb_cev2",
-        major_engine_version: "19",
-        parameter_group_family: "custom-oracle-se2-cdb-19",
-        // The smallest create this engine serves: the KMS key RDS Custom requires, and
-        // nothing else.
+        engine: "sqlserver-dev-ee",
+        engine_version: "15.00.4385.2.dev_cev2",
+        major_engine_version: "15.00",
+        parameter_group_family: "sqlserver-dev-ee-15.0",
+        // The smallest create this engine serves: the KMS key, and nothing else — no image
+        // is owed, because the image requirement is RDS Custom for SQL Server's.
         extra: &[("KMSKeyId", KMS_KEY_ID)],
-        media_type: None,
+        media_type: Some("Customer Provided"),
     },
     Case {
         engine: "custom-sqlserver-ee",
@@ -482,14 +483,15 @@ struct Refusal {
 
 /// The requests this operation refuses, one row per rule.
 ///
-/// The engines are the ones `CreateCustomDBEngineVersion$Engine` does NOT publish — an RDS
-/// engine whose versions AWS itself provides, and a value that is no engine at all — and
-/// the parameter combinations are the two that member documentation calls out
-/// ("if you specify `UseAwsProvidedLatestImage`, you can't also specify `ImageId`"; "you
-/// can't specify a different JSON manifest when you specify
-/// `SourceCustomDbEngineVersionIdentifier`"), plus the two media prerequisites ("a
-/// symmetric encryption KMS key is required for RDS Custom"; "for RDS Custom for SQL
-/// Server, an AMI ID is required to create a CEV"). `InvalidParameterValue` and
+/// The engines are the ones no CEV can be created for: an RDS engine whose versions AWS
+/// itself provides, a value that is no engine at all, and an engine the member DOES publish
+/// but this service publishes no engine version of — a CEV is built on a published build,
+/// so an engine with none is refused before any other member of the request is read. The
+/// parameter combinations are the two that member documentation calls out ("if you specify
+/// `UseAwsProvidedLatestImage`, you can't also specify `ImageId`"; "you can't specify a
+/// different JSON manifest when you specify `SourceCustomDbEngineVersionIdentifier`"), plus
+/// the image prerequisite ("for RDS Custom for SQL Server, an AMI ID is required to create a
+/// CEV"), whose three alternative members are a combination too. `InvalidParameterValue` and
 /// `InvalidParameterCombination` are the Query API's own codes for a bad value and a bad
 /// pair; the others are this operation's modelled faults.
 const REFUSALS: &[Refusal] = &[
@@ -521,10 +523,11 @@ const REFUSALS: &[Refusal] = &[
         code: "InvalidParameterValue",
     },
     Refusal {
-        case: "an RDS Custom engine with no KMS key",
+        case: "an engine this service publishes no engine version of",
         params: &[
-            ("Engine", "custom-oracle-se2"),
-            ("EngineVersion", "19.no_key_cev"),
+            ("Engine", "custom-oracle-ee"),
+            ("EngineVersion", "19.no_build_cev"),
+            ("KMSKeyId", KMS_KEY_ID),
         ],
         status: 400,
         code: "InvalidParameterValue",
@@ -537,13 +540,13 @@ const REFUSALS: &[Refusal] = &[
             ("KMSKeyId", KMS_KEY_ID),
         ],
         status: 400,
-        code: "InvalidParameterValue",
+        code: "InvalidParameterCombination",
     },
     Refusal {
         case: "a KMS key identifier of no KMS form",
         params: &[
-            ("Engine", "custom-oracle-ee"),
-            ("EngineVersion", "19.bad_key_cev"),
+            ("Engine", "sqlserver-ee"),
+            ("EngineVersion", "16.00.4175.1.bad_key_cev"),
             ("KMSKeyId", "not-a-kms-key"),
         ],
         status: 400,
@@ -564,13 +567,13 @@ const REFUSALS: &[Refusal] = &[
     Refusal {
         case: "a manifest beside a source CEV",
         params: &[
-            ("Engine", "custom-oracle-ee"),
-            ("EngineVersion", "19.manifest_and_source_cev"),
+            ("Engine", "sqlserver-ee"),
+            ("EngineVersion", "16.00.4175.1.manifest_and_source_cev"),
             ("KMSKeyId", KMS_KEY_ID),
             ("Manifest", MANIFEST),
             (
                 "SourceCustomDbEngineVersionIdentifier",
-                "arn:aws:rds:us-west-2:000000000000:cev:custom-oracle-ee/19.src/0",
+                "arn:aws:rds:us-west-2:000000000000:cev:sqlserver-ee/16.00.4175.1.src/0",
             ),
         ],
         status: 400,
@@ -579,12 +582,12 @@ const REFUSALS: &[Refusal] = &[
     Refusal {
         case: "a source CEV nothing stored",
         params: &[
-            ("Engine", "custom-oracle-ee"),
-            ("EngineVersion", "19.no_source_cev"),
+            ("Engine", "sqlserver-ee"),
+            ("EngineVersion", "16.00.4175.1.no_source_cev"),
             ("KMSKeyId", KMS_KEY_ID),
             (
                 "SourceCustomDbEngineVersionIdentifier",
-                "arn:aws:rds:us-west-2:000000000000:cev:custom-oracle-ee/19.missing/0",
+                "arn:aws:rds:us-west-2:000000000000:cev:sqlserver-ee/16.00.4175.1.missing/0",
             ),
         ],
         status: 404,
@@ -651,8 +654,8 @@ async fn a_request_outside_the_rules_is_refused_and_stores_nothing() {
 #[tokio::test]
 async fn a_custom_version_belongs_to_the_region_it_was_created_in() {
     let router = emulator();
-    let engine = "custom-oracle-ee";
-    let engine_version = "19.regional_cev";
+    let engine = "sqlserver-se";
+    let engine_version = "15.00.4435.7.regional_cev";
     let params = [
         ("Engine", engine),
         ("EngineVersion", engine_version),
@@ -726,14 +729,14 @@ async fn a_custom_version_belongs_to_the_region_it_was_created_in() {
 #[tokio::test]
 async fn a_cev_created_from_a_source_carries_that_source_s_media() {
     let router = emulator();
-    let engine = "custom-oracle-ee";
+    let engine = "sqlserver-se";
     let source_params = [
         ("Engine", engine),
-        ("EngineVersion", "19.source_cev"),
+        ("EngineVersion", "15.00.4435.7.source_cev"),
         ("KMSKeyId", KMS_KEY_ID),
         ("Manifest", MANIFEST),
         ("DatabaseInstallationFilesS3BucketName", "my-cev-media"),
-        ("DatabaseInstallationFiles.member.1", "V982063-01.zip"),
+        ("DatabaseInstallationFiles.member.1", "SQLServer2019.iso"),
     ];
     let source = expect_ok(
         "create the source CEV",
@@ -748,7 +751,7 @@ async fn a_cev_created_from_a_source_carries_that_source_s_media() {
             ACTION,
             &[
                 ("Engine".to_string(), engine.to_string()),
-                ("EngineVersion".to_string(), "19.derived_cev".to_string()),
+                ("EngineVersion".to_string(), "15.00.4435.7.derived_cev".to_string()),
                 ("KMSKeyId".to_string(), OTHER_KMS_KEY_ID.to_string()),
                 (
                     "SourceCustomDbEngineVersionIdentifier".to_string(),
@@ -762,7 +765,7 @@ async fn a_cev_created_from_a_source_carries_that_source_s_media() {
 
     assert_eq!(
         text(&scalars, "EngineVersion"),
-        "19.derived_cev",
+        "15.00.4435.7.derived_cev",
         "the new CEV carries its own name, got {scalars}"
     );
     assert_ne!(
@@ -785,7 +788,7 @@ async fn a_cev_created_from_a_source_carries_that_source_s_media() {
     );
     assert_eq!(
         installation_files(&scalars),
-        vec!["V982063-01.zip".to_string()],
+        vec!["SQLServer2019.iso".to_string()],
         "the derived CEV must carry the source's installation files, got {scalars}"
     );
     // Its own KMS key is the one its own request named.

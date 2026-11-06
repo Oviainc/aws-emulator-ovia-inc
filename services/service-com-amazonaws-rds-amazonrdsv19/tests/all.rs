@@ -15,6 +15,8 @@
 mod account_attributes;
 #[path = "all/already_exists_refusal_sentences.rs"]
 mod already_exists_refusal_sentences;
+#[path = "all/aws_managed_group_catalog.rs"]
+mod aws_managed_group_catalog;
 #[path = "all/ca_certificate_material.rs"]
 mod ca_certificate_material;
 #[path = "all/certificate_override.rs"]
@@ -29,6 +31,8 @@ mod cluster_parameter_value_range;
 mod control_plane_operations;
 #[path = "all/custom_db_engine_versions.rs"]
 mod custom_db_engine_versions;
+#[path = "all/custom_engine_version_engine_availability.rs"]
+mod custom_engine_version_engine_availability;
 #[path = "all/db_cluster_create_record.rs"]
 mod db_cluster_create_record;
 #[path = "all/db_cluster_deletion.rs"]
@@ -53,6 +57,8 @@ mod db_instance_deletion;
 mod db_instance_engine_endpoint;
 #[path = "all/db_instance_envelope.rs"]
 mod db_instance_envelope;
+#[path = "all/db_instance_read_replicas.rs"]
+mod db_instance_read_replicas;
 #[path = "all/db_instance_stop.rs"]
 mod db_instance_stop;
 #[path = "all/db_instances.rs"]
@@ -139,6 +145,8 @@ mod global_clusters;
 mod guard_order_and_refusal_classes;
 #[path = "all/instance_configuration_guards.rs"]
 mod instance_configuration_guards;
+#[path = "all/integration_deletion.rs"]
+mod integration_deletion;
 #[path = "all/lifecycle_poll_loops.rs"]
 mod lifecycle_poll_loops;
 #[path = "all/maintenance_action_resource_guard.rs"]
@@ -175,6 +183,8 @@ mod option_group_setting_catalog;
 mod option_groups;
 #[path = "all/orderable_db_instance_options.rs"]
 mod orderable_db_instance_options;
+#[path = "all/parameter_group_and_snapshot_copies.rs"]
+mod parameter_group_and_snapshot_copies;
 #[path = "all/parameter_refusal_codes.rs"]
 mod parameter_refusal_codes;
 #[path = "all/query_catalog_reads.rs"]

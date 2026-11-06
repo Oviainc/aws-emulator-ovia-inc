@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation deletes a zero-ETL integration this service holds. It
+//! answers with the integration in the `deleting` status and the clock owes its removal a
+//! moment later, after which every read of the identifier is an `IntegrationNotFoundFault`.
+//! This is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +165,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIntegration"))
+        let region =
+            crate::state::request_region(ctx).map_err(DeleteIntegrationError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated success.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // An integration whose accepted deletion the clock has already made due is gone, and
+        // one whose creation has settled is deletable: the transitions due at this instant
+        // are materialised before the record is read.
+        store.settle_due_transitions(&region);
+
+        // `IntegrationIdentifier` is "the unique identifier of the integration", which is
+        // either the name a create gave it or its ARN; RDS is regional, so it is resolved in
+        // the region the request was signed for. A value that names no integration is the
+        // modelled 404 — the same answer a second delete of the same integration gets, which
+        // is what lets a caller tell "deleted" from "never existed" at the first call.
+        let requested = input.integration_identifier;
+        let Some(record) = store.resolve_integration(&region, &requested) else {
+            return Err(DeleteIntegrationErrorModeled::IntegrationNotFoundFault(
+                IntegrationNotFoundFault {
+                    message: Some(crate::state::integration_not_found_message(
+                        &region,
+                        &requested,
+                    )),
+                },
+            )
+            .into());
+        };
+        let key = (region.clone(), record.name.clone());
+        // An integration that is still being brought up, or that a delete has already been
+        // accepted for, is not one a delete can act on: that is what the modelled
+        // `InvalidIntegrationStateFault` reports. The status the integration is in is named,
+        // because it is what the caller has to wait out.
+        if record.status != crate::state::INTEGRATION_STATUS_ACTIVE {
+            return Err(DeleteIntegrationErrorModeled::InvalidIntegrationStateFault(
+                InvalidIntegrationStateFault {
+                    message: Some(format!(
+                        "Integration {} is in {} state but must be {} to be deleted",
+                        record.name,
+                        record.status,
+                        crate::state::INTEGRATION_STATUS_ACTIVE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The delete is accepted: the integration reports `deleting` from now on and the
+        // clock owes its removal from the store a moment later. Nothing sleeps — the due
+        // instant is stored on the record and materialised by the next call, exactly as every
+        // other accepted delete in this crate does it.
+        let Some(record) = store.integrations.get_mut(&key) else {
+            return Err(DeleteIntegrationErrorModeled::IntegrationNotFoundFault(
+                IntegrationNotFoundFault {
+                    message: Some(crate::state::integration_not_found_message(
+                        &region,
+                        &requested,
+                    )),
+                },
+            )
+            .into());
+        };
+        record.begin_deletion();
+        // The answer is the stored record projected through the SAME projection
+        // `DescribeIntegrations` reports it with, so the delete's answer and the report that
+        // still lists the integration while it is being deleted cannot disagree; only the
+        // output shape differs, and it carries exactly the members of `Integration`.
+        let projected = record.to_wire();
+        Ok(DeleteIntegrationOutput {
+            source_arn: projected.source_arn,
+            target_arn: projected.target_arn,
+            integration_name: projected.integration_name,
+            integration_arn: projected.integration_arn,
+            kms_key_id: projected.kms_key_id,
+            additional_encryption_context: projected.additional_encryption_context,
+            status: projected.status,
+            tags: projected.tags,
+            data_filter: projected.data_filter,
+            description: projected.description,
+            create_time: projected.create_time,
+            errors: projected.errors,
+        })
     }
 }

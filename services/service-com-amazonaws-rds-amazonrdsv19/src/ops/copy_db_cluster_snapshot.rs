@@ -175,17 +175,14 @@ impl From<CopyDBClusterSnapshotErrorModeled> for CopyDBClusterSnapshotError {
 /// The message is built from the request: it names BOTH the snapshot asked for and the
 /// region it was looked for in — an ARN is looked for in the region the ARN names, a plain
 /// identifier in the region the request was signed for — because a copy whose source lives
-/// in another region is exactly the case this operation exists for.
+/// in another region is exactly the case this operation exists for. The one wording its DB
+/// snapshot sibling answers with (`crate::state::snapshot_copy_source_not_found_message`).
 fn source_not_found(requested: &str, request_region: &str) -> CopyDBClusterSnapshotError {
-    // An ARN names the region it was looked for in; a plain identifier (and a region-less
-    // ARN, whose region segment is empty) was looked for in the request's own region.
-    let source_region = crate::state::arn_region(requested)
-        .filter(|region| !region.is_empty())
-        .unwrap_or(request_region);
     CopyDBClusterSnapshotErrorModeled::DBClusterSnapshotNotFoundFault(
         DBClusterSnapshotNotFoundFault {
-            message: Some(format!(
-                "Requested snapshot {requested} not found in source region {source_region}"
+            message: Some(crate::state::snapshot_copy_source_not_found_message(
+                requested,
+                request_region,
             )),
         },
     )
@@ -356,12 +353,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             kms_key_id: input.kms_key_id.clone().or_else(|| source.kms_key_id.clone()),
             // `CopyTags`: "Set to true to copy all tags from the source DB cluster snapshot
             // to the target DB cluster snapshot, and otherwise false. The default is
-            // false."
-            tags: if input.copy_tags.unwrap_or(false) {
-                source.tags.clone()
-            } else {
-                input.tags.clone().unwrap_or_default()
-            },
+            // false." It is independent of `Tags`, the caller's own list, so a request that
+            // sets both gets both (`crate::state::copied_snapshot_tags`).
+            tags: crate::state::copied_snapshot_tags(
+                input.copy_tags,
+                &input.tags.clone().unwrap_or_default(),
+                &source.tags,
+            ),
+            // `SnapshotType` is the class of the snapshot a request ASKED for, and a copy is
+            // always one of those: `automated` is reserved for the backups RDS schedules
+            // itself, so a copy of one is a manual snapshot of the account's own, whatever
+            // the source was.
+            snapshot_type: crate::state::SNAPSHOT_TYPE_MANUAL.to_string(),
             // The copy authorizes nobody: `restore` is not copied, so a snapshot shared
             // with an account does not silently keep sharing it under a new identifier.
             restore_attribute: std::collections::BTreeSet::new(),

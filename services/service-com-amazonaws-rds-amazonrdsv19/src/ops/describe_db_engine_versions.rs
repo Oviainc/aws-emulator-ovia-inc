@@ -3213,6 +3213,53 @@ pub(crate) fn publishes_engine_version(engine: &str, engine_version: &str) -> bo
     })
 }
 
+/// Whether this service publishes ANY engine version of `engine`.
+///
+/// An engine with no row in the catalogue is one this account has no build of: there is
+/// nothing to create a DB instance of and nothing for a custom engine version to be built
+/// on. `CreateCustomDBEngineVersion` reads this as the engine-availability gate it applies
+/// before anything else the request carries, and the report of this engine's versions is
+/// empty for exactly the same reason.
+pub(crate) fn publishes_engine(engine: &str) -> bool {
+    CATALOG
+        .iter()
+        .any(|entry| entry.engine.eq_ignore_ascii_case(engine))
+}
+
+/// Every `DBParameterGroupFamily` this service publishes an engine version of, each once,
+/// in catalogue order.
+///
+/// The families are what decide which default DB parameter groups the account holds
+/// (`crate::state::default_db_parameter_groups`): RDS creates one such group per family it
+/// serves, so the group list follows from this catalogue rather than from a second list
+/// that could disagree with it.
+pub(crate) fn published_parameter_group_families() -> Vec<&'static str> {
+    let mut families: Vec<&'static str> = Vec::new();
+    for entry in CATALOG {
+        if !families.contains(&entry.parameter_group_family) {
+            families.push(entry.parameter_group_family);
+        }
+    }
+    families
+}
+
+/// Every `(Engine, MajorEngineVersion)` pair this service publishes an engine version of,
+/// each once, in catalogue order.
+///
+/// The pairs are what decide which default option groups the account holds
+/// (`crate::state::default_option_groups`), the way the families above decide the default
+/// parameter groups.
+pub(crate) fn published_engine_major_versions() -> Vec<(&'static str, &'static str)> {
+    let mut pairs: Vec<(&'static str, &'static str)> = Vec::new();
+    for entry in CATALOG {
+        let pair = (entry.engine, entry.major_engine_version);
+        if !pairs.contains(&pair) {
+            pairs.push(pair);
+        }
+    }
+    pairs
+}
+
 /// Project one stored CUSTOM engine version onto the modelled `DBEngineVersion` wire
 /// shape.
 ///

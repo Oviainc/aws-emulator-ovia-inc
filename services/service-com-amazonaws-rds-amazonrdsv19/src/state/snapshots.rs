@@ -222,6 +222,55 @@ impl DbClusterSnapshotRecord {
     }
 }
 
+/// The tags a snapshot COPY carries: the ones the request named, plus the source's where
+/// `CopyTags` asked for them.
+///
+/// `CopyTags` "specifies whether to copy all tags from the source DB snapshot to the target
+/// DB snapshot" and `Tags` is the caller's own list; the two members are independent, so a
+/// request that sets both gets both. A key the request names keeps the value the REQUEST
+/// gave it — the copy's own tag wins over the source's for that key — so nothing a caller
+/// asked for is silently replaced.
+///
+/// The one rule for both copies, the DB snapshot's and the DB cluster snapshot's.
+pub fn copied_snapshot_tags(copy_tags: Option<bool>, requested: &[Tag], source: &[Tag]) -> Vec<Tag> {
+    let mut tags = requested.to_vec();
+    if copy_tags.unwrap_or(false) {
+        for tag in source {
+            if !tags.iter().any(|held| held.key == tag.key) {
+                tags.push(tag.clone());
+            }
+        }
+    }
+    tags
+}
+
+/// How Amazon RDS words the not-found fault for the SOURCE of a snapshot copy, looked for
+/// from a request signed for `request_region`.
+///
+/// A copy names its source either by identifier, in the region the request was signed for,
+/// or by ARN, in the region that ARN names — a copy whose source lives in another region is
+/// exactly what the copy operations exist for — so the refusal names BOTH the snapshot that
+/// was asked for and the region it was looked for in. `requested` is carried in the
+/// request's own spelling, and a region-less ARN (whose region segment is empty) was looked
+/// for in the request's own region.
+///
+/// The one wording for both copies, the DB snapshot's and the DB cluster snapshot's: the
+/// sentence names the resource it could not find rather than the operation.
+pub fn snapshot_copy_source_not_found_message(requested: &str, request_region: &str) -> String {
+    let source_region = arn_region(requested)
+        .filter(|region| !region.is_empty())
+        .unwrap_or(request_region);
+    format!("Requested snapshot {requested} not found in source region {source_region}")
+}
+
+/// How Amazon RDS words the DB-snapshot not-found fault: the `<type> not found: <name>`
+/// form it uses for a resource a request NAMED, carrying the request's own spelling of the
+/// identifier. Stated once here so every operation that resolves a DB snapshot answers the
+/// one text.
+pub fn db_snapshot_not_found_message(named: &str) -> String {
+    format!("DBSnapshot not found: {named}")
+}
+
 /// A stored DB snapshot: the source instance's settings as they stood when the
 /// snapshot was taken, which is why they are copied rather than re-read later.
 #[derive(Debug, Clone)]

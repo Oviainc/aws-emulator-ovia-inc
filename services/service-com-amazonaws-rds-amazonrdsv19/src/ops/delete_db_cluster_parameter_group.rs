@@ -168,36 +168,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         let name = input.db_cluster_parameter_group_name.to_ascii_lowercase();
-        let key = (region, name.clone());
-        if !store.db_cluster_parameter_groups.contains_key(&key) {
+        // "You can't delete a default cluster parameter group." The engine's own groups are
+        // the ones named for an engine-version family
+        // (`crate::state::is_default_parameter_group_name`, the ONE reading of that name in
+        // this crate). The account holds such a group whether or not this store has a record
+        // of one, so the restriction is answered BEFORE the record lookup below: a default
+        // group is never missing, it is a group the request may not delete — the same order
+        // `DeleteDBParameterGroup` answers its own default groups in.
+        if crate::state::is_default_parameter_group_name(&name) {
             return Err(
-                DeleteDBClusterParameterGroupErrorModeled::DBParameterGroupNotFoundFault(
-                    DBParameterGroupNotFoundFault {
-                        message: Some(format!(
-                            "DBClusterParameterGroup not found: {}",
-                            input.db_cluster_parameter_group_name
-                        )),
+                DeleteDBClusterParameterGroupErrorModeled::InvalidDBParameterGroupStateFault(
+                    InvalidDBParameterGroupStateFault {
+                        message: Some(
+                            crate::state::default_group_cannot_be_deleted_message(
+                                crate::state::DB_CLUSTER_PARAMETER_GROUP_SUBJECT,
+                                &input.db_cluster_parameter_group_name,
+                            ),
+                        ),
                     },
                 )
                 .into(),
             );
         }
 
-        // "You can't delete a default cluster parameter group." The engine's own groups are
-        // the ones named for an engine-version family
-        // (`crate::state::is_default_parameter_group_name`, the ONE reading of that name in
-        // this crate). No such group can be in state today —
-        // `validate_parameter_group_name` admits no `.` in a created name — so this guard is
-        // what makes the rule hold once the engine's default groups are materialised, and
-        // is not live behaviour yet.
-        if crate::state::is_default_parameter_group_name(&name) {
+        let key = (region, name.clone());
+        if !store.db_cluster_parameter_groups.contains_key(&key) {
             return Err(
-                DeleteDBClusterParameterGroupErrorModeled::InvalidDBParameterGroupStateFault(
-                    InvalidDBParameterGroupStateFault {
-                        message: Some(format!(
-                            "DB cluster parameter group {name} is a default group and cannot be \
-                             deleted"
-                        )),
+                DeleteDBClusterParameterGroupErrorModeled::DBParameterGroupNotFoundFault(
+                    DBParameterGroupNotFoundFault {
+                        message: Some(
+                            crate::state::db_cluster_parameter_group_not_found_message(
+                                &input.db_cluster_parameter_group_name,
+                            ),
+                        ),
                     },
                 )
                 .into(),

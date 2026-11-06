@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CopyDBSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CopyDBSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation copies a DB snapshot this service holds — the source
+//! instance's settings as the snapshot froze them, and the copy of the instance's storage
+//! the snapshot carries — into a new snapshot of the identifier the request asks for. This
+//! is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CopyDBSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The copy is the instance-level sibling of `CopyDBClusterSnapshot` and reads the same
+//! state through the same helpers, so a snapshot and its copy cannot disagree about what
+//! was captured. It is answered with the copy still `copying`; the copy reaches `available`
+//! on its own a moment later, which is what makes a snapshot restorable.
 //!
 //! ## Shape of an operation
 //!
@@ -173,6 +173,25 @@ impl From<CopyDBSnapshotErrorModeled> for CopyDBSnapshotError {
     }
 }
 
+/// The modelled `DBSnapshotNotFoundFault` for the SOURCE of a copy this store does not
+/// hold.
+///
+/// The message is built from the request: it names BOTH the snapshot asked for and the
+/// region it was looked for in — an ARN is looked for in the region the ARN names, a plain
+/// identifier in the region the request was signed for — because a copy whose source lives
+/// in another region is exactly the case this operation exists for. The one wording its DB
+/// CLUSTER snapshot sibling answers with
+/// (`crate::state::snapshot_copy_source_not_found_message`).
+fn source_not_found(requested: &str, request_region: &str) -> CopyDBSnapshotError {
+    CopyDBSnapshotErrorModeled::DBSnapshotNotFoundFault(DBSnapshotNotFoundFault {
+        message: Some(crate::state::snapshot_copy_source_not_found_message(
+            requested,
+            request_region,
+        )),
+    })
+    .into()
+}
+
 /// The `CopyDBSnapshot` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -209,18 +228,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CopyDBSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CopyDBSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CopyDBSnapshot"))
+        let region =
+            crate::state::request_region(ctx).map_err(CopyDBSnapshotError::validation)?;
+        // `TargetDBSnapshotIdentifier` constraints: "Can't be null, empty, or blank. Must
+        // contain from 1 to 255 letters, numbers, or hyphens. First character must be a
+        // letter. Can't end with a hyphen or contain two consecutive hyphens." A value
+        // outside that rule is refused under the subject wording RDS gives a snapshot
+        // identifier (`crate::state::identifier_subject`).
+        crate::state::check_identifier(
+            "TargetDBSnapshotIdentifier",
+            &input.target_db_snapshot_identifier,
+            255,
+        )
+        .map_err(CopyDBSnapshotError::invalid_parameter_value)?;
+        // `SourceDBSnapshotIdentifier` carries the same identifier rule where it names a
+        // snapshot by its identifier: a value that is not an identifier at all names no
+        // snapshot and is refused for the VALUE, rather than reported as a snapshot that
+        // does not exist. The rule does not apply to the two QUALIFIED forms the member
+        // documents — a snapshot's ARN ("specify a valid DB snapshot ARN"), and the
+        // `rds:`-prefixed name of an automated backup ("you might specify
+        // rds:mysql-instance1-snapshot-20130805") — both of which carry a colon, which no
+        // identifier may.
+        if !input.source_db_snapshot_identifier.contains(':') {
+            crate::state::check_identifier(
+                "SourceDBSnapshotIdentifier",
+                &input.source_db_snapshot_identifier,
+                255,
+            )
+            .map_err(CopyDBSnapshotError::invalid_parameter_value)?;
+        }
+        // `Tags` carries no `@length` and the tags are STORED on the copy, so the list the
+        // caller sized is bounded before any of it is kept.
+        crate::state::check_tag_list(input.tags.as_ref())
+            .map_err(CopyDBSnapshotError::validation)?;
+        // "The Amazon Web Services KMS key identifier is the key ARN, key ID, alias ARN, or
+        // alias name for the KMS key": a value of none of those forms names no key, which is
+        // what the modelled `KMSKeyNotAccessibleFault` reports.
+        if let Some(kms_key_id) = &input.kms_key_id {
+            if let Err(message) = crate::state::check_kms_key_id(kms_key_id) {
+                return Err(CopyDBSnapshotErrorModeled::KMSKeyNotAccessibleFault(
+                    KMSKeyNotAccessibleFault {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated copy.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // `SourceDBSnapshotIdentifier`: "If the source snapshot is in the same Amazon Web
+        // Services Region as the copy, specify a valid DB snapshot identifier" — otherwise
+        // its ARN. A value that names no stored snapshot is the modelled 404, whichever form
+        // it took, in the one wording this service answers "no such snapshot" with.
+        let requested = input.source_db_snapshot_identifier.clone();
+        let Some(source_key) = store.resolve_db_snapshot_key(&region, &requested) else {
+            return Err(source_not_found(&requested, &region));
+        };
+
+        // `DBSnapshotIdentifier` is stored as the caller spelled it, so the copy's key is
+        // the identifier the request asked for.
+        let target_key = input.target_db_snapshot_identifier.clone();
+        if store
+            .db_snapshots
+            .contains_key(&(region.clone(), target_key.clone()))
+        {
+            return Err(CopyDBSnapshotErrorModeled::DBSnapshotAlreadyExistsFault(
+                DBSnapshotAlreadyExistsFault {
+                    message: Some(format!("DB snapshot already exists: {target_key}")),
+                },
+            )
+            .into());
+        }
+        // The region's manual snapshot quota, and the number of regions this store keeps
+        // records for at all: the store cannot be grown without bound, and the modelled
+        // fault says exactly this.
+        if store.snapshots_in(&region).len() >= crate::state::DB_SNAPSHOT_QUOTA_PER_REGION
+            || !store.has_room_for_region(&region)
+        {
+            return Err(CopyDBSnapshotErrorModeled::SnapshotQuotaExceededFault(
+                SnapshotQuotaExceededFault {
+                    message: Some(format!(
+                        "the request would exceed the allowed number of manual DB snapshots \
+                         ({} per region, in at most {} regions)",
+                        crate::state::DB_SNAPSHOT_QUOTA_PER_REGION,
+                        crate::state::MAX_REGIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The record the key names. A key this store resolved and a lookup under it can
+        // only disagree if the record is not where the resolve said it was, which answers
+        // the same modelled 404 as a source that was never there: a disagreement is a
+        // "not found", never a panic that would take the whole emulator down with it.
+        let Some(source) = store.db_snapshots.get(&(region.clone(), source_key)) else {
+            return Err(source_not_found(&requested, &region));
+        };
+        // A snapshot still being taken or copied holds no data to copy yet, which is the
+        // state the modelled `InvalidDBSnapshotStateFault` reports ("the state of the DB
+        // snapshot doesn't allow deletion" is the same class of refusal) — the case a caller
+        // that copies straight after starting a snapshot sees.
+        if source.status != crate::state::SNAPSHOT_STATUS_AVAILABLE {
+            return Err(CopyDBSnapshotErrorModeled::InvalidDBSnapshotStateFault(
+                InvalidDBSnapshotStateFault {
+                    message: Some(format!(
+                        "DB snapshot {} is in {} state but must be {} to be copied",
+                        source.snapshot_identifier,
+                        source.status,
+                        crate::state::SNAPSHOT_STATUS_AVAILABLE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The copy is a snapshot OF the same instance: it carries the source's instance and
+        // the instance's own facts, down to the copy of the storage the source holds, which
+        // is what makes the copy restorable. Only the identifier, the ARN, the creation
+        // time, the tags and the status are the copy's own.
+        let copy = crate::state::DbSnapshotRecord {
+            snapshot_identifier: target_key.clone(),
+            region: region.clone(),
+            snapshot_create_time: crate::state::now_as_wire_timestamp(),
+            // RDS answers a copy in the `copying` status and the clock owes it `available`,
+            // so a caller that reads it straight back sees the copy in progress, as it would
+            // against the real service.
+            status: crate::state::SNAPSHOT_STATUS_COPYING.to_string(),
+            pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                crate::state::SNAPSHOT_STATUS_AVAILABLE,
+            )),
+            // `KmsKeyId`: "If you don't specify a value for this parameter, then the copy of
+            // the DB snapshot is encrypted with the same Amazon Web Services KMS key as the
+            // source DB snapshot" — and a copy encrypted under a named key is an encrypted
+            // snapshot even when the source was not.
+            encrypted: source.encrypted || input.kms_key_id.is_some(),
+            kms_key_id: input.kms_key_id.clone().or_else(|| source.kms_key_id.clone()),
+            // `CopyTags`: "Specifies whether to copy all tags from the source DB snapshot to
+            // the target DB snapshot. By default, tags aren't copied." It is independent of
+            // `Tags`, the caller's own list, so a request that sets both gets both
+            // (`crate::state::copied_snapshot_tags`).
+            tags: crate::state::copied_snapshot_tags(
+                input.copy_tags,
+                &input.tags.clone().unwrap_or_default(),
+                &source.tags,
+            ),
+            // `SnapshotType` is the class of the snapshot a request ASKED for, and a copy is
+            // always one of those: `automated` is reserved for the backups RDS schedules
+            // itself, so a copy of one is a manual snapshot of the account's own, whatever
+            // the source was.
+            snapshot_type: crate::state::SNAPSHOT_TYPE_MANUAL.to_string(),
+            ..source.clone()
+        };
+
+        // The answer is the record this call stored, so a following describe reports the
+        // same snapshot.
+        let db_snapshot = copy.to_wire();
+        let snapshot_arn = copy.arn();
+        store.db_snapshots.insert((region.clone(), target_key.clone()), copy);
+        // A copy is a DB snapshot this service just started taking, so the region's event
+        // log records it exactly as `CreateDBSnapshot`'s does.
+        store.record_event(
+            &region,
+            crate::state::events::DB_SNAPSHOT_CREATING,
+            &target_key,
+            snapshot_arn,
+        );
+
+        Ok(CopyDBSnapshotOutput {
+            db_snapshot: Some(db_snapshot),
+        })
     }
 }

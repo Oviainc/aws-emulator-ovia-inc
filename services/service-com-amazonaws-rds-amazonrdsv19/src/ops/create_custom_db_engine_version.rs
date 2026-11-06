@@ -337,9 +337,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // engine that names no engine, before anything else the request carries is read.
         crate::state::check_custom_engine_version_name(&engine_version)
             .map_err(CreateCustomDBEngineVersionError::invalid_parameter_value)?;
+        // A CEV is built ON a DB engine version: it packages a build of its engine, which is
+        // where its major version, its parameter group family and its capabilities come from
+        // (`custom_version_basis`). So the engine has to be one this account has builds of
+        // at all — an engine this front door publishes NO engine version for is an engine
+        // the account cannot create a version of, and `DescribeDBEngineVersions` reports an
+        // empty list for it for the same reason. It is refused with the service's own fixed
+        // sentence for an engine it will not serve, and refused HERE: this availability gate
+        // comes before every other member of the request, so a request for such an engine is
+        // never refused for an image, a manifest or a key it also carries, and never creates
+        // a version of an engine the account has none of.
+        if !crate::ops::describe_db_engine_versions::publishes_engine(&engine) {
+            return Err(CreateCustomDBEngineVersionError::invalid_parameter_value(
+                crate::state::INVALID_DB_ENGINE_MESSAGE,
+            ));
+        }
 
-        // The two combinations the operation documents as unserveable, refused before
-        // anything is resolved: each value is fine on its own, so what fails is the pair.
+        // The combinations the operation documents as unserveable, refused before anything
+        // is resolved: each value is fine on its own, so what fails is the pair.
         if input.image_id.is_some() && input.use_aws_provided_latest_image == Some(true) {
             return Err(
                 CreateCustomDBEngineVersionError::invalid_parameter_combination(
@@ -357,9 +372,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // "A symmetric encryption KMS key is required for RDS Custom, but optional for
-        // Amazon RDS": a KMS key the request names has to BE a key identifier, and an RDS
-        // Custom engine has to have been given one.
+        // "For RDS Custom for SQL Server, an AMI ID is required to create a CEV": that
+        // engine family's CEV is an image, so the request has to say WHICH image — a named
+        // AMI, the service-provided latest one, or the one a source CEV already carries. The
+        // three members are ALTERNATIVES, and the service does not answer a request that
+        // names none of them as an invalid VALUE of any one of them: exactly one has to be
+        // there, so a request that names none is as much a combination its members cannot
+        // form as one that names two.
+        let names_an_image = input.image_id.is_some()
+            || input.use_aws_provided_latest_image == Some(true)
+            || input.source_custom_db_engine_version_identifier.is_some();
+        if crate::state::is_ami_backed_custom_engine(&engine) && !names_an_image {
+            return Err(
+                CreateCustomDBEngineVersionError::invalid_parameter_combination(
+                    "exactly one of ImageId, UseAwsProvidedLatestImage or \
+                     SourceCustomDbEngineVersionIdentifier must be specified: an AMI ID is \
+                     required to create a CEV for RDS Custom for SQL Server",
+                ),
+            );
+        }
+
+        // `KMSKeyId` is an optional member, and a request that names none is NOT refused
+        // here: "a symmetric encryption KMS key is required for RDS Custom, but optional for
+        // Amazon RDS" is a requirement on the CEV's media, which RDS imports after this call
+        // is accepted, and not a precondition of accepting it. What IS checked is the value
+        // a request does give: a value of none of the forms KMS names a key by names no key,
+        // which is what the modelled `KMSKeyNotAccessibleFault` reports.
         if let Some(kms_key_id) = &input.kms_key_id {
             if let Err(message) = crate::state::check_kms_key_id(kms_key_id) {
                 return Err(
@@ -371,30 +409,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
-        } else if crate::ops::describe_db_engine_versions::is_rds_custom_engine(&engine) {
-            return Err(CreateCustomDBEngineVersionError::invalid_parameter_value(
-                format!(
-                    "KMSKeyId must be specified for engine {engine}: a symmetric encryption \
-                     KMS key is required for an RDS Custom engine version"
-                ),
-            ));
-        }
-
-        // "For RDS Custom for SQL Server, an AMI ID is required to create a CEV": that
-        // engine family's CEV is an image, so the request has to say WHICH image — a named
-        // AMI, the service-provided latest one, or the one a source CEV already carries.
-        let names_an_image = input.image_id.is_some()
-            || input.use_aws_provided_latest_image == Some(true)
-            || input.source_custom_db_engine_version_identifier.is_some();
-        if crate::state::is_ami_backed_custom_engine(&engine) && !names_an_image {
-            return Err(CreateCustomDBEngineVersionError::invalid_parameter_value(
-                format!(
-                    "ImageId must be specified for engine {engine}: an AMI ID is required to \
-                     create a CEV for RDS Custom for SQL Server, unless \
-                     UseAwsProvidedLatestImage or SourceCustomDbEngineVersionIdentifier \
-                     names the image"
-                ),
-            ));
         }
 
         // Nothing caller-sized reaches the store unchecked: the installation file list

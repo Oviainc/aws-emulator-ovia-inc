@@ -316,10 +316,13 @@ async fn a_stored_custom_engine_version_carries_the_same_member_set() {
     // and RDS Custom for SQL Server requires an AMI id.
     let rows: [Row; 2] = [
         Row {
-            engine: "custom-oracle-ee",
-            engine_version: "19.my_cev1",
-            major_engine_version: "19",
-            extra: &[("KMSKeyId", KMS_KEY_ID)],
+            engine: "custom-sqlserver-se",
+            engine_version: "15.00.4073.23.my_cev1",
+            major_engine_version: "15.00",
+            extra: &[
+                ("KMSKeyId", KMS_KEY_ID),
+                ("UseAwsProvidedLatestImage", "true"),
+            ],
         },
         Row {
             engine: "custom-sqlserver-ee",

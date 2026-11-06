@@ -385,7 +385,10 @@ async fn each_filter_criterion_narrows_the_listing_to_the_investigations_it_name
         .clone();
     let ids_created_at_latest: Vec<String> = listed
         .iter()
-        .filter(|entry| member(case, entry, "CreatedTime") == latest_created)
+        .filter(|entry| {
+            millis_of_iso8601(case, &member(case, entry, "CreatedTime"))
+                == millis_of_iso8601(case, &latest_created)
+        })
         .map(|entry| member(case, entry, "InvestigationId"))
         .collect();
     let active_ids: Vec<String> = all_ids

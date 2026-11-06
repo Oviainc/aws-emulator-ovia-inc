@@ -394,11 +394,14 @@ fn admitted_and_refused(spec: &ClusterParameterSpec) -> (Vec<String>, Vec<String
         Some((low, high)) if spec.data_type == "integer" => {
             let low: i64 = low.parse().expect("an integer range bound");
             let high: i64 = high.parse().expect("an integer range bound");
+            // One step outside each published bound, computed in a wider type so a
+            // parameter whose published maximum is the largest integer the service parses
+            // still has a value past it to be refused for.
             (
                 vec![low.to_string(), high.to_string()],
                 vec![
-                    (low - 1).to_string(),
-                    (high + 1).to_string(),
+                    (i128::from(low) - 1).to_string(),
+                    (i128::from(high) + 1).to_string(),
                     "not-a-number".to_string(),
                 ],
             )
@@ -505,8 +508,13 @@ async fn a_parameter_value_outside_the_published_set_is_refused() {
         // sent: an engine publishes hundreds of parameters per family and this catalog is a
         // sample of that list, so refusing an unpublished name would reject a parameter the
         // engine has. It is reported without the metadata only a published parameter has.
-        let unpublished = "max_connect_errors";
+        let unpublished = "innodb_old_blocks_time";
         let case = format!("{family}: a parameter the catalog does not carry");
+        assert!(
+            catalog.iter().all(|spec| spec.name != unpublished),
+            "case {case:?}: {unpublished} must be a name this family publishes NO entry for, \
+             or the row below stops testing the unpublished-name rule"
+        );
         expect_ok(
             &case,
             modify(&router, &group, &[(unpublished, "128", None)]).await,

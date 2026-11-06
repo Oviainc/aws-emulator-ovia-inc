@@ -43,11 +43,41 @@ pub fn db_cluster_parameter_group_not_found_message(named: &str) -> String {
     format!("DBClusterParameterGroup not found: {named}")
 }
 
+/// How Amazon RDS refuses a copy whose SOURCE is one of the parameter groups it provides
+/// itself: "you can't copy a default DB parameter group. Instead, create a new custom DB
+/// parameter group, which copies the default parameters and values for the specified DB
+/// parameter group family."
+///
+/// The one variable part is the value the request carried, so the caller can see which of
+/// its own values broke the rule; the rest states the restriction and the way around it.
+/// `subject` is the member the request named the source by, so the instance-level copy and
+/// the cluster-level one read as the one wording with the one difference between them.
+pub fn cannot_copy_a_default_parameter_group_message(
+    member: &str,
+    named: &str,
+    subject: &str,
+) -> String {
+    format!(
+        "invalid value '{named}' for {member}: you can't copy a default {subject}; create a \
+         new custom group for the family instead"
+    )
+}
+
 /// How Amazon RDS words the DB-parameter-group not-found fault; the instance-scoped sibling
 /// of [`db_cluster_parameter_group_not_found_message`].
 pub fn db_parameter_group_not_found_message(named: &str) -> String {
     format!("DBParameterGroup not found: {named}")
 }
+
+/// How Amazon RDS reports that the SOURCE of a parameter-group copy does not exist: ONE
+/// fixed sentence, which is why it is a constant — it names neither the group nor the
+/// member, so the same text answers whichever value the request carried.
+///
+/// A copy is the one parameter-group operation that answers this way: the reads and the
+/// delete name the group they could not find
+/// ([`db_parameter_group_not_found_message`]), while the copy reports only that the source
+/// is not a group that exists.
+pub const PARAMETER_GROUP_DOES_NOT_EXIST_MESSAGE: &str = "Parameter group does not exist";
 
 impl ComAmazonawsRdsAmazonrdsv19State {
     /// Whether the DB CLUSTER parameter group `named` is one a request may associate a

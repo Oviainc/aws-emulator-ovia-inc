@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBInstanceReadReplica
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBInstanceReadReplica`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation creates a DB instance that replicates another DB instance
+//! this service holds. The replica is a copy of the source — its engine, its data and its
+//! settings — with only the members this request names changed, and it reports the source
+//! it replicates while the source reports it. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBInstanceReadReplica::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A replica is built from the SOURCE's automated backups, so a source that keeps none
+//! cannot be replicated: that is the state refusal this operation answers before anything
+//! is stored, and `ModifyDBInstance` setting a non-zero backup retention period is what
+//! clears it.
+//!
+//! Replicating a Multi-AZ DB CLUSTER (`SourceDBClusterIdentifier`) is NOT served here: a
+//! cluster that exists is answered with the scaffold's 501 rather than with a replica of
+//! nothing, and a cluster that does not exist is the modelled not-found fault.
 //!
 //! ## Shape of an operation
 //!
@@ -362,18 +366,559 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBInstanceReadReplica` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBInstanceReadReplicaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region = crate::state::request_region(ctx)
+            .map_err(CreateDBInstanceReadReplicaError::validation)?;
+
+        // `DBInstanceIdentifier` carries the DB instance name rule, the same one
+        // `CreateDBInstance` enforces, and "this parameter is stored as a lowercase string".
+        crate::state::check_identifier("DBInstanceIdentifier", &input.db_instance_identifier, 63)
+            .map_err(CreateDBInstanceReadReplicaError::invalid_parameter_value)?;
+        let identifier = input.db_instance_identifier.to_ascii_lowercase();
+
+        // A replica replicates ONE source: `SourceDBInstanceIdentifier` "can't be specified
+        // if the SourceDBClusterIdentifier parameter is also specified", and a request that
+        // names neither names nothing to replicate. Both are refusals of the PAIR, which is
+        // the `InvalidParameterCombination` the Query API answers for members that cannot
+        // hold together.
+        match (
+            &input.source_db_instance_identifier,
+            &input.source_db_cluster_identifier,
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    CreateDBInstanceReadReplicaError::invalid_parameter_combination(
+                        "SourceDBInstanceIdentifier and SourceDBClusterIdentifier cannot both \
+                         be specified: a read replica replicates one source",
+                    ),
+                )
+            }
+            (None, None) => {
+                return Err(
+                    CreateDBInstanceReadReplicaError::invalid_parameter_combination(
+                        "either SourceDBInstanceIdentifier or SourceDBClusterIdentifier must \
+                         be specified: a read replica replicates one source",
+                    ),
+                )
+            }
+            _ => {}
+        }
+        if let Some(port) = input.port {
+            if !crate::state::PORT_RANGE.contains(&port) {
+                return Err(
+                    CreateDBInstanceReadReplicaError::invalid_parameter_value(format!(
+                        "invalid value {port} for Port: must be a value from {} to {}",
+                        crate::state::PORT_RANGE.start(),
+                        crate::state::PORT_RANGE.end()
+                    )),
+                );
+            }
+        }
+        if input.multi_az == Some(true) && input.availability_zone.is_some() {
+            return Err(
+                CreateDBInstanceReadReplicaError::invalid_parameter_combination(
+                    "AvailabilityZone can't be specified when MultiAZ is enabled",
+                ),
+            );
+        }
+        let tags = input.tags.clone().unwrap_or_default();
+        crate::state::check_tags(&tags)
+            .map_err(CreateDBInstanceReadReplicaError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated replica.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let key = (region.clone(), identifier.clone());
+
+        // Everything this create decides from the STORE is decided here, under the state
+        // lock, which is released at the end of this block: the engine endpoint below is
+        // opened asynchronously and a state guard cannot be held across an await — the same
+        // shape `CreateDBInstance` has.
+        let (mut record, source_identifier) = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+
+            // `SourceDBClusterIdentifier` names a Multi-AZ DB CLUSTER to replicate. A
+            // cluster this store does not hold is the modelled 404; replicating one it does
+            // hold is not served here, so the request is refused rather than answered with a
+            // replica of nothing. Resolved before anything is stored.
+            if let Some(named) = &input.source_db_cluster_identifier {
+                if store.resolve_db_cluster(&region, named).is_none() {
+                    return Err(CreateDBInstanceReadReplicaErrorModeled::DBClusterNotFoundFault(
+                        DBClusterNotFoundFault {
+                            message: Some(crate::state::db_cluster_cannot_be_accessed_message(
+                                named,
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+            }
+
+            // `SourceDBInstanceIdentifier`: "If the source DB instance is in the same Amazon
+            // Web Services Region as the read replica, specify a valid DB instance
+            // identifier" — otherwise its ARN — so both forms fold to the identifier the
+            // store is keyed by, and a value that names no instance there is the modelled
+            // 404.
+            let source_named = input
+                .source_db_instance_identifier
+                .clone()
+                .unwrap_or_default();
+            let source_identifier = crate::state::db_instance_identifier_of(&source_named)
+                .to_ascii_lowercase();
+            let Some(source) = store
+                .db_instances
+                .get(&(region.clone(), source_identifier.clone()))
+            else {
+                return Err(CreateDBInstanceReadReplicaErrorModeled::DBInstanceNotFoundFault(
+                    DBInstanceNotFoundFault {
+                        message: Some(format!("DBInstance not found: {source_named}")),
+                    },
+                )
+                .into());
+            };
+            let source = source.clone();
+
+            // "Cannot create a read replica for a DB Instance that belongs to a DB
+            // Cluster": a cluster member's replicas are the cluster's own, created through
+            // the cluster's operations, so this operation cannot serve one. ONE fixed
+            // sentence, which is why it carries nothing from the request.
+            if source.db_cluster_identifier.is_some() {
+                return Err(
+                    CreateDBInstanceReadReplicaError::invalid_parameter_combination(
+                        crate::state::READ_REPLICA_OF_A_CLUSTER_MEMBER_MESSAGE,
+                    ),
+                );
+            }
+            // "Must be the identifier of an existing Db2, MariaDB, MySQL, Oracle,
+            // PostgreSQL, or SQL Server DB instance": an instance of an engine outside that
+            // list is not one this operation replicates even where this service holds it
+            // outside a cluster — an Aurora or sibling control plane instance runs an engine
+            // whose replicas are cluster members. The source and this operation cannot hold
+            // together, which is the `InvalidParameterCombination` the Query API answers for
+            // that.
+            if !crate::state::engine_serves_db_instance_read_replica(&source.engine) {
+                return Err(
+                    CreateDBInstanceReadReplicaError::invalid_parameter_combination(format!(
+                        "The source DB instance {} runs engine {}, which this operation does \
+                         not create a read replica of: SourceDBInstanceIdentifier must name \
+                         an existing {} DB instance",
+                        source.identifier,
+                        source.engine,
+                        crate::state::READ_REPLICA_SOURCE_PRODUCTS
+                    )),
+                );
+            }
+
+            // "The specified DB instance must have automatic backups enabled, that is, its
+            // backup retention period must be greater than 0": a replica is built from the
+            // source's automated backups, so a source that keeps none cannot be replicated.
+            // The refusal is the service's own fixed sentence for this condition — it names
+            // the operation that turns backups on, and nothing from the request.
+            if source.backup_retention_period < 1 {
+                return Err(
+                    CreateDBInstanceReadReplicaErrorModeled::InvalidDBInstanceStateFault(
+                        InvalidDBInstanceStateFault {
+                            message: Some(
+                                crate::state::AUTOMATED_BACKUPS_NOT_ENABLED_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // A source that is not up has no backup to build the replica from either: that
+            // is the other state the modelled `InvalidDBInstanceStateFault` reports, and it
+            // is what a caller that replicates straight after a create sees.
+            if source.status != crate::state::DB_INSTANCE_STATUS_AVAILABLE {
+                return Err(
+                    CreateDBInstanceReadReplicaErrorModeled::InvalidDBInstanceStateFault(
+                        InvalidDBInstanceStateFault {
+                            message: Some(format!(
+                                "DB instance {} is in {} state but must be {} to be replicated",
+                                source.identifier,
+                                source.status,
+                                crate::state::DB_INSTANCE_STATUS_AVAILABLE
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // "Each DB instance can have up to 15 read replicas, except for the following
+            // engines: Db2 - Can have up to three replicas. Oracle - Can have up to five
+            // read replicas. SQL Server - Can have up to five read replicas." The limit is
+            // the SOURCE engine's, so it is read from the source record.
+            let limit = crate::state::read_replica_limit(&source.engine);
+            if source.read_replica_db_instance_identifiers.len() >= limit {
+                return Err(
+                    CreateDBInstanceReadReplicaErrorModeled::InvalidDBInstanceStateFault(
+                        InvalidDBInstanceStateFault {
+                            message: Some(format!(
+                                "DB instance {} already has the maximum number of read \
+                                 replicas ({limit})",
+                                source.identifier
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            if store.db_instances.contains_key(&key) {
+                return Err(
+                    CreateDBInstanceReadReplicaErrorModeled::DBInstanceAlreadyExistsFault(
+                        DBInstanceAlreadyExistsFault {
+                            message: Some(
+                                crate::state::DB_INSTANCE_ALREADY_EXISTS_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // A replica runs the SOURCE's engine — this operation has no `Engine` member —
+            // so every group it is associated with has to be one of that engine's. A group
+            // of another engine family cannot be applied to it, which is a combination of
+            // the source and the group that cannot hold.
+            //
+            // `DBSubnetGroupName`: "This value is stored as a lowercase string", so it is
+            // folded the way `CreateDBSubnetGroup` stores it.
+            let db_subnet_group_name = input
+                .db_subnet_group_name
+                .as_ref()
+                .map(|name| name.to_ascii_lowercase());
+            if let Some(name) = &db_subnet_group_name {
+                if store.resolve_db_subnet_group(&region, name).is_none() {
+                    return Err(
+                        CreateDBInstanceReadReplicaErrorModeled::DBSubnetGroupNotFoundFault(
+                            DBSubnetGroupNotFoundFault {
+                                message: Some(crate::state::db_subnet_group_not_found_message(
+                                    name,
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+            // `DBParameterGroupName`: a name that matches no group — one a request created
+            // or one of RDS's own defaults — is the modelled not-found fault, and a group of
+            // another engine's family is the combination refusal above.
+            let db_parameter_group_name = match &input.db_parameter_group_name {
+                None => source.db_parameter_group_name.clone(),
+                Some(named) => {
+                    let Some(group) = store.resolve_visible_db_parameter_group(&region, named)
+                    else {
+                        return Err(
+                            CreateDBInstanceReadReplicaErrorModeled::DBParameterGroupNotFoundFault(
+                                DBParameterGroupNotFoundFault {
+                                    message: Some(
+                                        crate::state::db_parameter_group_not_found_message(named),
+                                    ),
+                                },
+                            )
+                            .into(),
+                        );
+                    };
+                    if !crate::state::family_belongs_to_engine(&group.family, &source.engine) {
+                        return Err(
+                            CreateDBInstanceReadReplicaError::invalid_parameter_combination(
+                                format!(
+                                    "The parameter group {named} belongs to the DB parameter \
+                                     group family {}, which is not a family of the source DB \
+                                     instance's engine {}",
+                                    group.family, source.engine
+                                ),
+                            ),
+                        );
+                    }
+                    Some(group.name.clone())
+                }
+            };
+            // `OptionGroupName`: the same rule for the option group, read from the group's
+            // own `EngineName`. A name this service can resolve to no group at all is stored
+            // as given, exactly as `CreateDBInstance` stores one.
+            let option_group_name = match &input.option_group_name {
+                None => source.option_group_name.clone(),
+                Some(named) => {
+                    if let Some(group) = store.resolve_visible_option_group(&region, named) {
+                        if !group.engine_name.eq_ignore_ascii_case(&source.engine) {
+                            return Err(
+                                CreateDBInstanceReadReplicaError::invalid_parameter_combination(
+                                    format!(
+                                        "The option group {named} is an option group of engine \
+                                         {}, which is not the source DB instance's engine {}",
+                                        group.engine_name, source.engine
+                                    ),
+                                ),
+                            );
+                        }
+                    }
+                    Some(named.clone())
+                }
+            };
+
+            // The region's DB instance quota, and the number of regions this store keeps
+            // records for at all: a replica is a DB instance, so it counts against the same
+            // quota every other instance does.
+            if store.instances_in(&region).len() >= crate::state::DB_INSTANCE_QUOTA_PER_REGION
+                || !store.has_room_for_region(&region)
+            {
+                return Err(
+                    CreateDBInstanceReadReplicaErrorModeled::InstanceQuotaExceededFault(
+                        InstanceQuotaExceededFault {
+                            message: Some(format!(
+                                "the request would exceed the allowed number of DB instances \
+                                 ({} per region, in at most {} regions)",
+                                crate::state::DB_INSTANCE_QUOTA_PER_REGION,
+                                crate::state::MAX_REGIONS
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            let mint = store.next_mint();
+            let storage_type = input.storage_type.clone().unwrap_or(source.storage_type.clone());
+            // The replica is a copy of the source: every setting it reports is the source's
+            // unless this request names its own, which is what "Default: Inherits from the
+            // source DB instance" says for the members that document a default at all.
+            let mut record = crate::state::DbInstanceRecord {
+                identifier: identifier.clone(),
+                region: region.clone(),
+                // The replica is its OWN resource: it gets its own resource id and its own
+                // endpoint host, never the source's.
+                dbi_resource_id: crate::state::mint_dbi_resource_id(mint),
+                endpoint_host: crate::state::mint_endpoint_host(mint),
+                db_instance_class: input
+                    .db_instance_class
+                    .clone()
+                    .unwrap_or(source.db_instance_class.clone()),
+                // A read replica is not usable the instant the call returns: RDS answers
+                // `creating` and the replica reaches `available` on its own.
+                status: crate::state::DB_INSTANCE_STATUS_CREATING.to_string(),
+                pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                    crate::state::DB_INSTANCE_STATUS_AVAILABLE,
+                )),
+                // The source's half of the relationship is recorded below, on the source.
+                read_replica_source_db_instance_identifier: Some(source.identifier.clone()),
+                read_replica_db_instance_identifiers: Vec::new(),
+                // Filled in below, once the core has assigned the engine listener its port.
+                served_endpoint: None,
+                endpoint_port: input.port.unwrap_or(source.endpoint_port),
+                availability_zone: input
+                    .availability_zone
+                    .clone()
+                    .unwrap_or_else(|| format!("{region}a")),
+                multi_az: input.multi_az.unwrap_or(false),
+                storage_throughput: input
+                    .storage_throughput
+                    .unwrap_or(source.storage_throughput),
+                storage_type,
+                iops: input.iops.or(source.iops),
+                max_allocated_storage: input.max_allocated_storage,
+                allocated_storage: input.allocated_storage.or(source.allocated_storage),
+                kms_key_id: input.kms_key_id.clone().or(source.kms_key_id.clone()),
+                storage_encrypted: source.storage_encrypted || input.kms_key_id.is_some(),
+                publicly_accessible: input
+                    .publicly_accessible
+                    .unwrap_or(source.publicly_accessible),
+                auto_minor_version_upgrade: input
+                    .auto_minor_version_upgrade
+                    .unwrap_or(source.auto_minor_version_upgrade),
+                copy_tags_to_snapshot: input
+                    .copy_tags_to_snapshot
+                    .unwrap_or(source.copy_tags_to_snapshot),
+                deletion_protection: input
+                    .deletion_protection
+                    .unwrap_or(source.deletion_protection),
+                db_subnet_group_name: db_subnet_group_name.or(source.db_subnet_group_name.clone()),
+                db_parameter_group_name,
+                option_group_name,
+                vpc_security_group_ids: input
+                    .vpc_security_group_ids
+                    .clone()
+                    .unwrap_or(source.vpc_security_group_ids.clone()),
+                // A replica belongs to no DB cluster: it is a standalone DB instance that
+                // replicates another.
+                db_cluster_identifier: None,
+                domain: input.domain.clone().or(source.domain.clone()),
+                ca_certificate_identifier: input
+                    .ca_certificate_identifier
+                    .clone()
+                    .unwrap_or_else(|| store.default_ca_certificate(&region).to_string()),
+                monitoring_interval: input
+                    .monitoring_interval
+                    .unwrap_or(source.monitoring_interval),
+                performance_insights_enabled: input
+                    .enable_performance_insights
+                    .unwrap_or(source.performance_insights_enabled),
+                iam_database_authentication_enabled: input
+                    .enable_iam_database_authentication
+                    .unwrap_or(source.iam_database_authentication_enabled),
+                database_insights_mode: input
+                    .database_insights_mode
+                    .clone()
+                    .unwrap_or(source.database_insights_mode.clone()),
+                dedicated_log_volume: input
+                    .dedicated_log_volume
+                    .unwrap_or(source.dedicated_log_volume),
+                customer_owned_ip_enabled: input
+                    .enable_customer_owned_ip
+                    .unwrap_or(source.customer_owned_ip_enabled),
+                network_type: input.network_type.clone().unwrap_or(source.network_type.clone()),
+                backup_target: input.backup_target.clone().unwrap_or(source.backup_target.clone()),
+                // A read replica keeps no automated backup of its own until one is turned on
+                // for it: `BackupRetentionPeriod` is not a member of this operation, and
+                // "the default is 0" for a replica.
+                backup_retention_period: 0,
+                instance_create_time: crate::state::now_as_wire_timestamp(),
+                engine_started_at: crate::state::now_as_wire_timestamp(),
+                tags,
+                engine_log: crate::state::InstanceLog::default(),
+                // Everything else is the source's, and is never the request's: the engine
+                // and its version, the database the replica serves and the master credential
+                // a login is verified against are all the source's by definition — a replica
+                // of a database runs the same engine over the same data.
+                ..source.clone()
+            };
+            record.engine_log.record(format!(
+                "DB instance {} created as a read replica of {}; status {}",
+                record.identifier, source.identifier, record.status
+            ));
+            (record, source.identifier.clone())
+        };
+
+        // A COPY of the data the SOURCE holds right now, taken with the state lock released:
+        // a read replica serves the source's database, so the replica's own storage is
+        // loaded from this copy below rather than left empty. The copy is engine work, taken
+        // by the engine itself under its own bounds, exactly as the capture a snapshot of
+        // the instance takes. `None` for an engine this emulator serves no data plane for,
+        // which has no storage to copy.
+        let source_storage = crate::state::capture_instance_storage(
+            &state,
+            &(region.clone(), source_identifier.clone()),
+        )
+        .await
+        .map_err(CreateDBInstanceReadReplicaError::internal_failure)?;
+
+        // The replica's own ENGINE ENDPOINT, opened with the state lock released, exactly as
+        // `CreateDBInstance` opens an instance's: binding is asynchronous and the core owns
+        // the socket, the bind interface and the port. It is opened AFTER every refusal
+        // above has been answered, so nothing binds for a create that was going to fail.
+        let endpoint = match crate::state::engine_wire(&record.engine) {
+            Some(wire) => Some(
+                crate::state::open_engine_endpoint(
+                    &*self.engine,
+                    &state,
+                    &region,
+                    &record.dbi_resource_id,
+                    wire,
+                )
+                .await
+                .map_err(CreateDBInstanceReadReplicaError::internal_failure)?,
+            ),
+            None => None,
+        };
+        record.served_endpoint = endpoint.as_ref().map(|endpoint| endpoint.endpoint.clone());
+        // THE REPLICATION ITSELF: the data the source holds is loaded into the replica's own
+        // storage, by the engine, before the endpoint is published — so the first session a
+        // client opens on the replica reads the source's rows rather than an empty database.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBInstanceReadReplica"))
+        // On a blocking task and with no state lock held: the copy is engine work, bounded
+        // by the engine's own copy deadline, exactly as the capture that took it was.
+        if let (Some(endpoint), Some(storage)) = (endpoint.as_ref(), source_storage) {
+            let destination = endpoint.database();
+            ::tokio::task::spawn_blocking(move || destination.load_from(&storage))
+                .await
+                .map_err(|error| {
+                    CreateDBInstanceReadReplicaError::internal_failure(format!(
+                        "the source DB instance's data could not be replicated: {error}"
+                    ))
+                })?
+                .map_err(|error| {
+                    CreateDBInstanceReadReplicaError::internal_failure(format!(
+                        "the source DB instance's data could not be replicated: {}",
+                        error.message
+                    ))
+                })?;
+        }
+
+        let mut store = state.lock();
+        // Another request may have created this identifier, or deleted the source, while
+        // this one was binding, so both are answered again here rather than overwriting a
+        // stored instance or replicating one that is gone.
+        if store.db_instances.contains_key(&key) {
+            return Err(
+                CreateDBInstanceReadReplicaErrorModeled::DBInstanceAlreadyExistsFault(
+                    DBInstanceAlreadyExistsFault {
+                        message: Some(crate::state::DB_INSTANCE_ALREADY_EXISTS_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        let Some(source) = store
+            .db_instances
+            .get_mut(&(region.clone(), source_identifier.clone()))
+        else {
+            return Err(
+                CreateDBInstanceReadReplicaErrorModeled::DBInstanceNotFoundFault(
+                    DBInstanceNotFoundFault {
+                        message: Some(format!("DBInstance not found: {source_identifier}")),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The source now has this replica: both halves of the relationship are written under
+        // the one lock, so no read can see one without the other.
+        source.attach_read_replica(&identifier);
+
+        let db_instance = record.to_wire();
+        let instance_arn = record.arn();
+        let dbi_resource_id = record.dbi_resource_id.clone();
+        let engine = record.engine.clone();
+        let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
+            performance_insights_enabled: record.performance_insights_enabled,
+            database_insights_mode: Some(record.database_insights_mode.clone()),
+        };
+        store.db_instances.insert(key.clone(), record);
+        // The listener is the replica's: the store holds it, so it stays open for as long as
+        // the replica does and closes with it.
+        if let Some(endpoint) = endpoint {
+            store.db_engine_endpoints.insert(key, endpoint);
+        }
+        // The create happened, so the region's event log records it: that entry is what
+        // `DescribeEvents` reports for this instance from now on.
+        store.record_event(
+            &region,
+            crate::state::events::DB_INSTANCE_CREATED,
+            &identifier,
+            instance_arn,
+        );
+        // The id just minted is recorded in the SHARED data-source directory, with the
+        // monitoring settings this create persisted, exactly as `CreateDBInstance` records
+        // the instance it mints: a replica is a DB instance, so a service that monitors one
+        // can tell that THIS service owns the id it reports.
+        if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
+            let mut directory = directory.lock();
+            directory.register(
+                &dbi_resource_id,
+                ::service_common::db_data_sources::SERVICE_TYPE_RDS,
+                &engine,
+            );
+            directory.record_monitoring(&dbi_resource_id, monitoring);
+        }
+
+        Ok(CreateDBInstanceReadReplicaOutput {
+            db_instance: Some(db_instance),
+        })
     }
 }

@@ -187,9 +187,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `SourceOptionGroupIdentifier` "must specify a valid option group": RDS is
         // regional, so the source is resolved in the region the request was signed for,
         // by name or by the group's own ARN, and a value that names no group there is the
-        // modelled 404 in the wording this fault class uses throughout the service.
+        // modelled 404 in the wording this fault class uses throughout the service. One of
+        // RDS's own default groups is a valid source too — the account holds it without any
+        // request having created it (`crate::state::visible_option_groups`) — so a copy of
+        // one is a copy of the empty group that engine and major version starts with.
         let source_named = input.source_option_group_identifier;
-        let Some(source) = store.resolve_option_group(&region, &source_named) else {
+        let Some(source) = store.resolve_visible_option_group(&region, &source_named) else {
             return Err(CopyOptionGroupErrorModeled::OptionGroupNotFoundFault(
                 OptionGroupNotFoundFault {
                     message: Some(format!(

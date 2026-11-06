@@ -173,15 +173,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `DBParameterGroupName` is "stored as a lowercase string" and RDS is regional, so
         // the group is looked up by the lowercased name in the region the request was signed
-        // for; a name that matches none is the modelled 404, not an empty page.
-        let name = input.db_parameter_group_name.to_ascii_lowercase();
-        let Some(group) = store.db_parameter_groups.get(&(region, name)) else {
+        // for; a name that matches none is the modelled 404, not an empty page. The default
+        // group of a family resolves as well — the account holds one per family without any
+        // request having created it (`crate::state::visible_db_parameter_groups`).
+        let Some(group) =
+            store.resolve_visible_db_parameter_group(&region, &input.db_parameter_group_name)
+        else {
             return Err(
                 DescribeDBParametersErrorModeled::DBParameterGroupNotFoundFault(
                     DBParameterGroupNotFoundFault {
-                        message: Some(format!(
-                            "DBParameterGroup not found: {}",
-                            input.db_parameter_group_name
+                        message: Some(crate::state::db_parameter_group_not_found_message(
+                            &input.db_parameter_group_name,
                         )),
                     },
                 )
@@ -195,10 +197,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // difference from the cluster-level describe (whose `Source` documents no such
         // default).
         let reported: BTreeMap<String, Parameter> = match input.source.as_deref() {
-            None => every_parameter_type(group),
+            None => every_parameter_type(&group),
             Some(source) => match crate::state::parameter_source_filter(Some(source)) {
                 // The family's published defaults, with the values the engine runs with.
-                crate::state::ParameterSourceFilter::Engine => published_defaults(group),
+                crate::state::ParameterSourceFilter::Engine => published_defaults(&group),
                 // The group's own parameters: the ones a caller set.
                 crate::state::ParameterSourceFilter::Customer => group
                     .parameters

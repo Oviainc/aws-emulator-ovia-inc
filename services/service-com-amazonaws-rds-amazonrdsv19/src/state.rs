@@ -128,6 +128,7 @@ pub mod tenant_databases;
 // `DescribeDBRecommendations`, and the event category / source-type catalog. Each is
 // glob-re-exported, so every one of them is still reached as `crate::state::<name>`.
 mod certificates;
+mod default_catalog;
 mod event_catalog;
 mod recommendations;
 mod event_subscriptions;
@@ -137,6 +138,7 @@ mod shard_groups;
 mod snapshots;
 
 pub use certificates::*;
+pub use default_catalog::*;
 pub use event_catalog::*;
 pub use recommendations::*;
 pub use event_subscriptions::*;
@@ -184,8 +186,9 @@ pub use export_tasks::{
     EXPORT_TASK_STATUS_STARTING, EXPORT_TASK_STATUS_VALUES,
 };
 pub use integrations::{
-    check_integration_target_arn, check_kms_key_id, mint_integration_id, IntegrationRecord,
-    INTEGRATION_QUOTA_PER_REGION, INTEGRATION_STATUS_ACTIVE, INTEGRATION_STATUS_CREATING,
+    check_integration_target_arn, check_kms_key_id, integration_not_found_message,
+    mint_integration_id, IntegrationRecord, INTEGRATION_QUOTA_PER_REGION,
+    INTEGRATION_STATUS_ACTIVE, INTEGRATION_STATUS_CREATING, INTEGRATION_STATUS_DELETING,
     INVALID_TARGET_TYPE_MESSAGE,
 };
 pub use tags::{
@@ -952,6 +955,74 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         range_in(&self.db_parameter_groups, region)
     }
 
+    /// The DB (instance) parameter group `named` resolves to in `region`, or `None` when
+    /// nothing of that name was created there; the instance-level sibling of
+    /// [`Self::resolve_cluster_parameter_group`], resolving the same two forms — "the
+    /// identifier or ARN for the source DB parameter group" — the same way.
+    ///
+    /// This resolves the groups a request CREATED. The groups RDS provides itself are
+    /// reached through [`Self::resolve_visible_db_parameter_group`], because an operation
+    /// that may not touch one of those has to tell them apart.
+    pub fn resolve_db_parameter_group(
+        &self,
+        region: &str,
+        named: &str,
+    ) -> Option<&DbParameterGroupRecord> {
+        if let Some(stored) = self
+            .db_parameter_groups
+            .get(&(region.to_string(), named.to_ascii_lowercase()))
+        {
+            return Some(stored);
+        }
+        // Only an ARN can match the scan below, so a plain name that named nothing does
+        // not pay for rendering a region's stored ARNs.
+        if !named.starts_with("arn:") {
+            return None;
+        }
+        self.parameter_groups_in(region)
+            .into_iter()
+            .find(|record| record.arn() == named)
+    }
+
+    /// Every DB parameter group a request signed for `region` can SEE, in name order: the
+    /// groups a request created there plus the default group RDS provides for each
+    /// engine-version family ([`default_db_parameter_groups`]).
+    ///
+    /// The default groups are not records of this store, because no request creates them
+    /// and none can change them; they are reported beside the account's own because the
+    /// real service's account has them from the moment it exists. This is the
+    /// parameter-group counterpart of [`Self::visible_db_subnet_groups`].
+    pub fn visible_db_parameter_groups(&self, region: &str) -> Vec<DbParameterGroupRecord> {
+        let mut groups: Vec<DbParameterGroupRecord> = self
+            .parameter_groups_in(region)
+            .into_iter()
+            .cloned()
+            .chain(default_db_parameter_groups(region))
+            .collect();
+        groups.sort_by(|left, right| left.name.cmp(&right.name));
+        groups
+    }
+
+    /// The DB parameter group `named` resolves to in `region` — a group a request created
+    /// or one of RDS's own defaults — or `None` when nothing of that name exists.
+    ///
+    /// `DBParameterGroupName` "is stored as a lowercase string", so the name is folded the
+    /// way every create stores it.
+    pub fn resolve_visible_db_parameter_group(
+        &self,
+        region: &str,
+        named: &str,
+    ) -> Option<DbParameterGroupRecord> {
+        let folded = named.to_ascii_lowercase();
+        if let Some(stored) = self
+            .db_parameter_groups
+            .get(&(region.to_string(), folded.clone()))
+        {
+            return Some(stored.clone());
+        }
+        default_db_parameter_group(region, &folded)
+    }
+
     /// The event notification subscriptions stored in `region`, in subscription-name
     /// order.
     pub fn event_subscriptions_in(&self, region: &str) -> Vec<&EventSubscriptionRecord> {
@@ -1069,6 +1140,38 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         self.option_groups_in(region)
             .into_iter()
             .find(|record| record.arn() == named)
+    }
+
+    /// Every option group a request signed for `region` can SEE, in name order: the groups
+    /// a request created there plus the default group RDS provides for each engine and
+    /// major engine version ([`default_option_groups`]).
+    ///
+    /// The option-group counterpart of [`Self::visible_db_parameter_groups`], and for the
+    /// same reason: the real service's account has those groups from the moment it exists,
+    /// and no request creates, changes or deletes one.
+    pub fn visible_option_groups(&self, region: &str) -> Vec<OptionGroupRecord> {
+        let mut groups: Vec<OptionGroupRecord> = self
+            .option_groups_in(region)
+            .into_iter()
+            .cloned()
+            .chain(default_option_groups(region))
+            .collect();
+        groups.sort_by(|left, right| left.name.cmp(&right.name));
+        groups
+    }
+
+    /// The option group `named` resolves to in `region` — a group a request created or one
+    /// of RDS's own defaults — or `None` when nothing of that name exists; the resolving
+    /// sibling of [`Self::resolve_option_group`] that sees the AWS-managed groups too.
+    pub fn resolve_visible_option_group(
+        &self,
+        region: &str,
+        named: &str,
+    ) -> Option<OptionGroupRecord> {
+        if let Some(stored) = self.resolve_option_group(region, named) {
+            return Some(stored.clone());
+        }
+        default_option_group(region, named)
     }
 
     /// The DB subnet groups stored in `region`, in name order.
@@ -2993,6 +3096,12 @@ fn identifier_subject(member: &str) -> Option<&'static str> {
         // group is created under, which is an option group's name too — so a caller
         // reading the refusal cannot tell those paths apart by its wording.
         "OptionGroupName" | "TargetOptionGroupIdentifier" => Some("option group name"),
+        // The identifier of a DB SNAPSHOT a copy names: the source it is taken of and the
+        // name the copy is created under are both a snapshot's identifier, so the one
+        // subject answers either.
+        "SourceDBSnapshotIdentifier" | "TargetDBSnapshotIdentifier" => {
+            Some("snapshot identifier")
+        }
         _ => None,
     }
 }

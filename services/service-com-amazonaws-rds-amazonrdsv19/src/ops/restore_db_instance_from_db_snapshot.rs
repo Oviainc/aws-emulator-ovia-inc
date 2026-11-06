@@ -641,6 +641,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut record = crate::state::DbInstanceRecord {
                 identifier: identifier.clone(),
                 region: region.clone(),
+                // A restored instance replicates nothing: it is a new instance of the
+                // snapshot's data, not a replica of the instance the snapshot came from.
+                read_replica_source_db_instance_identifier: None,
+                read_replica_db_instance_identifiers: Vec::new(),
                 // The restored instance is a NEW resource: it gets its own resource id
                 // and its own endpoint host, never the source's.
                 dbi_resource_id: crate::state::mint_dbi_resource_id(mint),

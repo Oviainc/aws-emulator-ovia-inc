@@ -222,6 +222,21 @@ fn reported_names(xml: &str) -> Vec<String> {
     texts(xml, "OptionGroupName")
 }
 
+/// The groups a describe answer reports that the ACCOUNT created, in the order it reported
+/// them: every reported group except the ones Amazon RDS provides itself.
+///
+/// RDS creates a default option group per engine and major engine version
+/// (`default:<engine>-<major version>`), so a describe reports those beside an account's
+/// own groups; the assertions below are about the groups a request created, and this is
+/// what separates them. The name form is the one `CreateOptionGroup` can never produce: its
+/// `OptionGroupName` admits letters, numbers and hyphens only.
+fn account_owned_names(xml: &str) -> Vec<String> {
+    reported_names(xml)
+        .into_iter()
+        .filter(|name| !name.starts_with("default:"))
+        .collect()
+}
+
 /// One row of the create/describe round trip: the option group's four members.
 struct GroupCase {
     case: &'static str,
@@ -329,14 +344,26 @@ async fn create_persists_every_member_and_describe_reads_it_back() {
     }
 
     // With no name named, the describe reports every group the region holds, in name
-    // order — nothing more, so no default group is invented.
-    let listed = expect_ok("list every group", describe(&router, &[]).await);
+    // order: the ones created above, plus the default group RDS provides for each engine
+    // and major engine version it publishes. Nothing else is invented.
+    let listed = expect_ok("list every group", describe(&router, &[("MaxRecords", "100".to_string())]).await);
     let mut expected: Vec<&str> = GROUP_CASES.iter().map(|row| row.name).collect();
     expected.sort_unstable();
-    let reported = reported_names(&listed);
+    let reported = account_owned_names(&listed);
     assert_eq!(
         reported, expected,
         "case \"list every group\": expected {expected:?}, got {reported:?} in {listed}"
+    );
+    // The AWS-managed catalog is there too, spanning more than one engine, each group
+    // reporting the members `OptionGroup` publishes for it.
+    let defaults: Vec<String> = reported_names(&listed)
+        .into_iter()
+        .filter(|name| name.starts_with("default:"))
+        .collect();
+    assert!(
+        defaults.len() > 1,
+        "case \"list every group\": expected the account's default option groups, got \
+         {defaults:?} in {listed}"
     );
 }
 
@@ -418,11 +445,14 @@ async fn describe_selects_by_engine_name_and_major_engine_version() {
         create_group(&router, "optiongroup-mysql57", "mysql", "5.7", "mysql-legacy-options").await,
     );
 
-    // (case, parameters, the names the answer must report, in order).
+    // (case, parameters, the names the answer must report, in order). The groups RDS
+    // provides itself are reported beside them and are filtered out by
+    // `account_owned_names`, so each row states what the ACCOUNT's groups do under that
+    // selection.
     let rows: Vec<SelectionRow> = vec![
         (
             "every group",
-            vec![],
+            vec![("MaxRecords", "100".to_string())],
             vec![
                 "db2ae-options",
                 "optiongroup-mysql",
@@ -434,7 +464,10 @@ async fn describe_selects_by_engine_name_and_major_engine_version() {
         ),
         (
             "EngineName selects one engine's groups",
-            vec![("EngineName", "mysql".to_string())],
+            vec![
+                ("EngineName", "mysql".to_string()),
+                ("MaxRecords", "100".to_string()),
+            ],
             vec!["optiongroup-mysql", "optiongroup-mysql57"],
         ),
         (
@@ -451,8 +484,8 @@ async fn describe_selects_by_engine_name_and_major_engine_version() {
             vec!["sqlserver-ex-1500"],
         ),
         (
-            // A published engine no group was created for selects nothing — an empty
-            // list, not a 404: the 404 belongs to a NAME, not to a filter.
+            // A published engine no group was created for selects none of the account's
+            // own — an empty list, not a 404: the 404 belongs to a NAME, not to a filter.
             "a published engine with no groups",
             vec![("EngineName", "mariadb".to_string())],
             vec![],
@@ -469,11 +502,24 @@ async fn describe_selects_by_engine_name_and_major_engine_version() {
 
     for (case, params, expected) in rows {
         let body = expect_ok(case, describe(&router, &params).await);
-        let reported = reported_names(&body);
+        let reported = account_owned_names(&body);
         assert_eq!(
             reported, expected,
             "case {case:?}: expected {expected:?}, got {reported:?} in {body}"
         );
+        // A filter selects the AWS-managed groups by the same members: every default group
+        // the answer reports is one of the named engine and major version.
+        for (member, value) in &params {
+            if *member == "MaxRecords" {
+                continue;
+            }
+            let selected = texts(&body, if *member == "EngineName" { "EngineName" } else { "MajorEngineVersion" });
+            assert!(
+                selected.iter().all(|reported| reported == value),
+                "case {case:?}: every reported group must carry <{member}> {value:?}, got \
+                 {selected:?} in {body}"
+            );
+        }
     }
 }
 
@@ -643,18 +689,26 @@ async fn the_input_members_are_refused_outside_what_they_document() {
     }
 
     // Each published `MaxRecords` bound itself is served, which is what makes the two
-    // refusals above boundary assertions rather than blanket ones.
+    // refusals above boundary assertions rather than blanket ones. The account's one group
+    // is reported beside the default groups RDS provides, so the page is bounded by what
+    // the request asked for and carries a marker exactly while groups are left.
     for bound in ["20", "100"] {
         let case = format!("MaxRecords at the documented bound {bound}");
         let body = expect_ok(
             &case,
             describe(&router, &[("MaxRecords", bound.to_string())]).await,
         );
+        let page: usize = bound.parse().expect("the bound is a number");
         let reported = reported_names(&body);
+        assert!(
+            reported.len() <= page,
+            "case {case:?}: expected at most {page} groups, got {reported:?} in {body}"
+        );
         assert_eq!(
-            reported,
-            vec!["optiongroup-mysql".to_string()],
-            "case {case:?}: got {reported:?} in {body}"
+            optional_text(&body, "Marker").is_some(),
+            reported.len() == page,
+            "case {case:?}: a full page must carry a continuation marker and a last page \
+             must not, got {reported:?} in {body}"
         );
     }
 
@@ -664,14 +718,21 @@ async fn the_input_members_are_refused_outside_what_they_document() {
         let case = format!("published engine {engine_name} is accepted");
         let body = expect_ok(
             &case,
-            describe(&router, &[("EngineName", engine_name.to_string())]).await,
+            describe(
+                &router,
+                &[
+                    ("EngineName", engine_name.to_string()),
+                    ("MaxRecords", "100".to_string()),
+                ],
+            )
+            .await,
         );
         let expected: Vec<String> = if engine_name == "mysql" {
             vec!["optiongroup-mysql".to_string()]
         } else {
             Vec::new()
         };
-        let reported = reported_names(&body);
+        let reported = account_owned_names(&body);
         assert_eq!(
             reported, expected,
             "case {case:?}: expected {expected:?}, got {reported:?} in {body}"
@@ -752,9 +813,10 @@ async fn one_name_is_a_different_option_group_in_each_region() {
 #[tokio::test]
 async fn describe_resumes_from_the_marker() {
     let router = emulator();
-    // Three groups, so a page size of one leaves a marker twice and none on the last
-    // page. `MaxRecords` cannot go below its documented minimum of 20, so the paging
-    // is driven by the emulator's own page walk over an ordered range.
+    // Three groups of the account's own, read back beside the default groups RDS provides:
+    // `MaxRecords` cannot go below its documented minimum of 20, so the paging is driven by
+    // the emulator's own page walk over an ordered range, and the account's groups sort
+    // after every `default:` name.
     let names = ["pagegroup-a", "pagegroup-b", "pagegroup-c"];
     for name in names {
         expect_ok(
@@ -763,16 +825,20 @@ async fn describe_resumes_from_the_marker() {
         );
     }
 
-    let first = expect_ok("the first page", describe(&router, &[]).await);
+    let first = expect_ok(
+        "the first page",
+        describe(&router, &[("MaxRecords", "20".to_string())]).await,
+    );
     let reported = reported_names(&first);
     assert_eq!(
-        reported,
-        names.map(str::to_string).to_vec(),
-        "case \"the first page\": got {reported:?} in {first}"
+        reported.len(),
+        20,
+        "case \"the first page\": a page of MaxRecords=20 over more than 20 groups is \
+         exactly 20, got {reported:?} in {first}"
     );
     assert!(
-        optional_text(&first, "Marker").is_none(),
-        "case \"the first page\": a page that holds every group must carry no Marker: {first}"
+        optional_text(&first, "Marker").is_some(),
+        "case \"the first page\": a full page must carry a Marker: {first}"
     );
 
     // Resuming AT the token for a name reports that name and the ones after it: the
@@ -790,6 +856,10 @@ async fn describe_resumes_from_the_marker() {
         reported,
         vec![names[1].to_string(), names[2].to_string()],
         "case \"resume from the second name\": got {reported:?} in {resumed}"
+    );
+    assert!(
+        optional_text(&resumed, "Marker").is_none(),
+        "case \"resume from the second name\": a last page must carry no Marker: {resumed}"
     );
 }
 

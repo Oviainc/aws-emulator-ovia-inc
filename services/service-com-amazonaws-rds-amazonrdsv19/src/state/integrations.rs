@@ -28,6 +28,34 @@ pub const INTEGRATION_STATUS_CREATING: &str = "creating";
 /// `IntegrationStatus` — the status an integration reports once it is up.
 pub const INTEGRATION_STATUS_ACTIVE: &str = "active";
 
+/// `IntegrationStatus` — the status an integration reports once a delete has been accepted
+/// for it, until the clock has made its removal from the store due.
+pub const INTEGRATION_STATUS_DELETING: &str = "deleting";
+
+/// How Amazon RDS words the integration not-found fault.
+///
+/// `IntegrationIdentifier` is "the unique identifier of the integration", which a request
+/// may give as the integration's name or as its ARN; the refusal names it by the ARN either
+/// way, because that is the identifier that names one integration of one account in one
+/// region. A value that is already an ARN is carried as the request spelled it, and a plain
+/// name is rendered as the ARN it would name in `region`.
+///
+/// The sentence is the one the modelled fault publishes for ITSELF — "the specified
+/// integration could not be found" — with the identifier it is about named in it. Stated
+/// once here so every operation that resolves an integration answers the one text.
+pub fn integration_not_found_message(region: &str, named: &str) -> String {
+    let identifier = if named.starts_with("arn:") {
+        named.to_string()
+    } else {
+        emulator_server::emulator_arn(
+            ARN_NAMESPACE,
+            region,
+            &format!("{ARN_RESOURCE_TYPE}:{named}"),
+        )
+    };
+    format!("Integration with identifier {identifier} could not be found.")
+}
+
 /// The ARN resource type of an integration, as `IntegrationArn`'s own pattern spells it
 /// (`^arn:aws[a-z\-]*:rds(-[a-z]*)?:[a-z0-9\-]*:[0-9]*:integration:...$`).
 const ARN_RESOURCE_TYPE: &str = "integration";
@@ -155,6 +183,17 @@ impl IntegrationRecord {
             &self.region,
             &format!("{ARN_RESOURCE_TYPE}:{}", self.integration_id),
         )
+    }
+
+    /// Accept a delete: the integration reports [`INTEGRATION_STATUS_DELETING`] from now on,
+    /// and the clock owes its removal from the store a moment later, after which every read
+    /// of the identifier is an `IntegrationNotFoundFault`. Nothing sleeps: the due instant is
+    /// stored and materialised by
+    /// [`super::ComAmazonawsRdsAmazonrdsv19State::settle_due_transitions`], exactly as every
+    /// other accepted delete in this store does it.
+    pub fn begin_deletion(&mut self) {
+        self.status = INTEGRATION_STATUS_DELETING.to_string();
+        self.pending_status = Some(PendingStatus::removal_in_a_moment());
     }
 
     /// Project the stored record onto the modelled `Integration` shape.

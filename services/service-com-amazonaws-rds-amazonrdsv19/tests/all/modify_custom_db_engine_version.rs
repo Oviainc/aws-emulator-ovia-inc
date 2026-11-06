@@ -127,21 +127,21 @@ struct Attempt {
 
 /// The modifications refused while the CEV is still being created.
 ///
-/// One row per engine FAMILY the operation serves (RDS Custom for Oracle, RDS Custom for
-/// SQL Server, and the RDS for SQL Server bring-your-own-media engines), each attempting a
+/// One row per engine FAMILY the operation serves (the RDS Custom for SQL Server engines
+/// and the RDS for SQL Server bring-your-own-media engines), each attempting a
 /// DIFFERENT combination of the two members `ModifyCustomDBEngineVersion` takes — the
 /// mutable `Description` alone, a `Status` alone, both together, and neither — because the
 /// rule is about the state of the CEV rather than about what is being asked for.
 const ATTEMPTS: &[Attempt] = &[
     Attempt {
-        engine: "custom-oracle-ee",
-        engine_version: "19.immutable_cev1",
+        engine: "sqlserver-ee",
+        engine_version: "16.00.4175.1.immutable_cev1",
         create: &[("KMSKeyId", KMS_KEY_ID), ("Manifest", MANIFEST)],
         modify: &[("Description", "changed-while-creating")],
     },
     Attempt {
-        engine: "custom-oracle-se2-cdb",
-        engine_version: "19.immutable_cev2",
+        engine: "sqlserver-dev-ee",
+        engine_version: "16.00.4175.1.immutable_cev2",
         create: &[("KMSKeyId", KMS_KEY_ID)],
         modify: &[("Status", "inactive")],
     },
@@ -228,8 +228,8 @@ async fn a_cev_that_is_still_being_created_cannot_be_modified() {
 #[tokio::test]
 async fn a_settled_cev_moves_between_every_published_status() {
     let router = emulator();
-    let engine = "custom-oracle-ee";
-    let engine_version = "19.status_cev";
+    let engine = "sqlserver-ee";
+    let engine_version = "16.00.4175.1.status_cev";
     let created = create_cev(
         &router,
         REGION,
@@ -318,8 +318,8 @@ async fn a_settled_cev_moves_between_every_published_status() {
 #[tokio::test]
 async fn each_member_the_request_names_is_the_only_one_that_changes() {
     let router = emulator();
-    let engine = "custom-oracle-se2";
-    let engine_version = "19.described_cev";
+    let engine = "sqlserver-se";
+    let engine_version = "16.00.4175.1.described_cev";
     create_cev(
         &router,
         REGION,
@@ -421,25 +421,25 @@ struct Missing {
 }
 
 /// The ways a request can name no held CEV. The CEV the rows are written against is
-/// `custom-oracle-ee`/`19.found_cev`, created in [`REGION`].
+/// `sqlserver-ee`/`16.00.4175.1.found_cev`, created in [`REGION`].
 const MISSING: &[Missing] = &[
     Missing {
         case: "a CEV name nothing created",
         region: REGION,
-        engine: "custom-oracle-ee",
-        engine_version: "19.never_created_cev",
+        engine: "sqlserver-ee",
+        engine_version: "16.00.4175.1.never_created_cev",
     },
     Missing {
         case: "a stored CEV name under another engine",
         region: REGION,
-        engine: "custom-oracle-se2",
-        engine_version: "19.found_cev",
+        engine: "sqlserver-se",
+        engine_version: "16.00.4175.1.found_cev",
     },
     Missing {
         case: "the CEV of another region",
         region: "eu-west-1",
-        engine: "custom-oracle-ee",
-        engine_version: "19.found_cev",
+        engine: "sqlserver-ee",
+        engine_version: "16.00.4175.1.found_cev",
     },
     Missing {
         case: "an engine version this service publishes rather than one an account minted",
@@ -469,8 +469,8 @@ async fn a_request_that_names_no_held_cev_is_denied() {
         &router,
         REGION,
         "create the CEV",
-        "custom-oracle-ee",
-        "19.found_cev",
+        "sqlserver-ee",
+        "16.00.4175.1.found_cev",
         &[("KMSKeyId", KMS_KEY_ID), ("Manifest", MANIFEST)],
     )
     .await;
@@ -513,8 +513,8 @@ async fn a_request_that_names_no_held_cev_is_denied() {
         &router,
         REGION,
         "the stored CEV",
-        "custom-oracle-ee",
-        "19.found_cev",
+        "sqlserver-ee",
+        "16.00.4175.1.found_cev",
     )
     .await;
     assert_eq!(
@@ -527,8 +527,8 @@ async fn a_request_that_names_no_held_cev_is_denied() {
 #[tokio::test]
 async fn the_default_report_follows_a_cev_being_created_and_withholds_an_unusable_one() {
     let router = emulator();
-    let engine = "custom-oracle-ee";
-    let engine_version = "19.reported_cev";
+    let engine = "sqlserver-ee";
+    let engine_version = "16.00.4175.1.reported_cev";
     create_cev(
         &router,
         REGION,
@@ -597,8 +597,8 @@ async fn the_default_report_follows_a_cev_being_created_and_withholds_an_unusabl
 #[tokio::test]
 async fn a_cev_in_use_keeps_the_status_it_is_used_under() {
     let router = emulator();
-    let engine = "custom-oracle-ee";
-    let engine_version = "19.in_use_cev";
+    let engine = "sqlserver-ee";
+    let engine_version = "16.00.4175.1.in_use_cev";
     create_cev(
         &router,
         REGION,

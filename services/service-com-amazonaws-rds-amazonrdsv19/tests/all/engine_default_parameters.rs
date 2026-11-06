@@ -628,10 +628,10 @@ async fn the_parameter_name_filter_selects_exactly_the_parameters_it_names() {
 /// published bounds are served and one step past each is refused, and a `Marker` no prior
 /// page issued is refused rather than resynchronised to the first page.
 ///
-/// There is no multi-page row: the smallest page the member admits is 20 records and no
-/// engine's published catalog reaches that, so this operation owes a `Marker` for no
-/// request it can be sent — which is itself asserted below and in the suite above. Add a
-/// paging row once a catalog grows past the documented minimum.
+/// A page holds as many records as the request asked for while records are left, and the
+/// answer carries a continuation `Marker` exactly while they are: the MySQL family's
+/// published catalog is larger than the smallest page the member admits, so the paging rows
+/// below walk it to its end.
 #[tokio::test]
 async fn the_documented_max_records_window_is_served_and_its_bounds_are_refused() {
     let router = emulator();
@@ -659,9 +659,9 @@ async fn the_documented_max_records_window_is_served_and_its_bounds_are_refused(
 
     let whole_catalog = defaults_of(&router, "the whole catalog", family).await.len();
     assert!(
-        whole_catalog > 0 && whole_catalog <= low as usize,
-        "case {:?}: this family's catalog must fit the smallest page, got {whole_catalog} \
-         parameters",
+        whole_catalog > low as usize,
+        "case {:?}: this family's catalog must be larger than the smallest page for the \
+         paging rows below to walk it, got {whole_catalog} parameters",
         "the page-size rows"
     );
 
@@ -677,16 +677,42 @@ async fn the_documented_max_records_window_is_served_and_its_bounds_are_refused(
         .await;
         if served {
             let body = expect_ok(case, response);
+            let page = (max_records as usize).min(whole_catalog);
             assert_eq!(
                 reported(&body).len(),
-                whole_catalog,
-                "case {case:?}: every published parameter fits this page, got {body}"
+                page,
+                "case {case:?}: a page holds what the request asked for while records are \
+                 left, got {body}"
             );
+            // The marker is owed exactly while parameters are left to report.
             assert_eq!(
-                optional_text(&body, "Marker"),
-                None,
-                "case {case:?}: nothing is left to page, so no Marker is owed, got {body}"
+                optional_text(&body, "Marker").is_some(),
+                page < whole_catalog,
+                "case {case:?}: a Marker is owed exactly while records are left, got {body}"
             );
+            // And resuming from it reports the rest of the catalog, so the walk covers the
+            // whole published list and no record is served twice.
+            if let Some(marker) = optional_text(&body, "Marker") {
+                let rest = expect_ok(
+                    case,
+                    call(
+                        &router,
+                        ACTION,
+                        &[
+                            ("DBParameterGroupFamily", family.to_string()),
+                            ("MaxRecords", max_records.to_string()),
+                            ("Marker", marker),
+                        ],
+                    )
+                    .await,
+                );
+                assert_eq!(
+                    reported(&rest).len(),
+                    whole_catalog - page,
+                    "case {case:?}: the page after the marker reports the rest of the \
+                     catalog, got {rest}"
+                );
+            }
             continue;
         }
         expect_error(case, response, 400, INVALID_PARAMETER_VALUE);

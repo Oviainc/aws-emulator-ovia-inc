@@ -186,6 +186,83 @@ pub fn create_db_snapshot_instance_state_message(identifier: &str) -> String {
 /// `aws.api#service` trait declares them (`arnNamespace: rds`).
 pub(super) const ARN_NAMESPACE: &str = "rds";
 
+/// How Amazon RDS refuses a request that needs a DB instance's automated backups and finds
+/// them turned off: ONE fixed sentence, which is why it is a constant — it names neither
+/// the instance nor the member, only the operation that turns backups on, so the same text
+/// answers every such request.
+///
+/// `CreateDBInstanceReadReplica$SourceDBInstanceIdentifier` states the constraint the
+/// sentence reports: "The specified DB instance must have automatic backups enabled, that
+/// is, its backup retention period must be greater than 0."
+pub const AUTOMATED_BACKUPS_NOT_ENABLED_MESSAGE: &str =
+    "Automated backups are not enabled for this database instance. To enable automated \
+     backups, use ModifyDBInstance to set the backup retention period to a non-zero value.";
+
+/// How Amazon RDS refuses a read replica of a DB instance that is a member of a DB
+/// cluster: ONE fixed sentence, which is why it is a constant — it names neither the
+/// instance nor the cluster, so the same text answers every such request.
+///
+/// A cluster member's replicas belong to the CLUSTER, which has its own operations for
+/// them, so `CreateDBInstanceReadReplica` cannot serve one.
+pub const READ_REPLICA_OF_A_CLUSTER_MEMBER_MESSAGE: &str =
+    "Cannot create a read replica for a DB Instance that belongs to a DB Cluster";
+
+/// Whether a DB instance of `engine` is one a read replica can be created FROM.
+///
+/// `CreateDBInstanceReadReplicaMessage$SourceDBInstanceIdentifier` states the constraint:
+/// the source "must be the identifier of an existing Db2, MariaDB, MySQL, Oracle,
+/// PostgreSQL, or SQL Server DB instance" — the six database products this service's own DB
+/// instances run, RDS Custom's variants of them included, since an RDS Custom instance runs
+/// the same Oracle or SQL Server engine.
+///
+/// What that list leaves out is every engine whose instances are members of a CLUSTER: the
+/// Aurora engines and the two sibling control planes' ([`SIBLING_CONTROL_PLANE_ENGINES`]).
+/// A replica of one of those is a cluster member its own cluster operations create, so this
+/// operation cannot serve it.
+pub fn engine_serves_db_instance_read_replica(engine: &str) -> bool {
+    let engine = engine.to_ascii_lowercase();
+    !engine.starts_with("aurora") && !is_sibling_control_plane_engine(&engine)
+}
+
+/// The engines a read replica's source may run, as
+/// `CreateDBInstanceReadReplicaMessage$SourceDBInstanceIdentifier` names them — the text a
+/// refusal lists, so a caller can fix the request from the message alone.
+pub const READ_REPLICA_SOURCE_PRODUCTS: &str =
+    "Db2, MariaDB, MySQL, Oracle, PostgreSQL, or SQL Server";
+
+/// How many read replicas one DB instance of `engine` may have.
+///
+/// `CreateDBInstanceReadReplica$SourceDBInstanceIdentifier` publishes the limits itself:
+/// "Each DB instance can have up to 15 read replicas, except for the following engines:
+/// Db2 - Can have up to three replicas. Oracle - Can have up to five read replicas. SQL
+/// Server - Can have up to five read replicas." The engine is matched the way every other
+/// per-engine rule here matches one, by the engine FAMILY its name carries, so an edition
+/// and its RDS Custom counterpart carry the same limit.
+pub fn read_replica_limit(engine: &str) -> usize {
+    let engine = engine.to_ascii_lowercase();
+    if engine.starts_with("db2") {
+        return 3;
+    }
+    if engine.contains("oracle") || engine.contains("sqlserver") {
+        return 5;
+    }
+    15
+}
+
+/// Whether the DB parameter group family `family` is a family of `engine`.
+///
+/// A family is one major version of ONE engine, and the engine half is what its name
+/// begins with ([`crate::ops::describe_engine_default_parameters::family_engine`] carries
+/// that reading). Two engines that share a parameter vocabulary do NOT share a family: a
+/// `mysql8.0` group is not a group an Aurora MySQL instance can be given, which is why the
+/// engine the family names is compared rather than the catalog it publishes.
+///
+/// A value that names no family at all belongs to no engine.
+pub fn family_belongs_to_engine(family: &str, engine: &str) -> bool {
+    crate::ops::describe_engine_default_parameters::family_engine(family)
+        .is_some_and(|named| named.eq_ignore_ascii_case(engine))
+}
+
 /// How many DB instances one region may hold: Amazon RDS's published default quota
 /// ("DB instances": 40 per Region). Reaching it is the modelled
 /// `InstanceQuotaExceededFault` — "The request would result in the user exceeding the

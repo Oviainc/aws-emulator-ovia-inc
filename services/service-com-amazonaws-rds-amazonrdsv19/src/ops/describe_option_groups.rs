@@ -168,13 +168,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // RDS is regional: a request sees only the option groups of the region it was
-        // signed for. A name that names no stored group is the modelled 404, not an
-        // empty list — which is what lets a caller branch on "no such option group".
-        let candidates: Vec<&crate::state::OptionGroupRecord> = match &input.option_group_name {
+        // signed for. A name that names no group is the modelled 404, not an empty list —
+        // which is what lets a caller branch on "no such option group". The groups RDS
+        // provides itself resolve too: the account holds a default group per engine and
+        // major engine version without any request having created one
+        // (`crate::state::visible_option_groups`).
+        let candidates: Vec<crate::state::OptionGroupRecord> = match &input.option_group_name {
             Some(requested) => {
                 let record = store
-                    .option_groups
-                    .get(&(region.clone(), requested.clone()))
+                    .resolve_visible_option_group(&region, requested)
                     .ok_or_else(|| {
                         DescribeOptionGroupsError::from(
                             DescribeOptionGroupsErrorModeled::OptionGroupNotFoundFault(
@@ -188,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })?;
                 vec![record]
             }
-            None => store.option_groups_in(&region),
+            None => store.visible_option_groups(&region),
         };
 
         let matching: Vec<(String, OptionGroup)> = candidates

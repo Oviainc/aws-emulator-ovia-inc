@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CopyDBParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CopyDBParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation copies a DB parameter group this service holds — the
+//! source's family and the parameter values a caller set on it — into a new group of the
+//! name the request asks for. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CopyDBParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The copy is the instance-level sibling of `CopyDBClusterParameterGroup`, and reads the
+//! same state through the same helpers, so a group and its copy cannot disagree about a
+//! family or a parameter value.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +155,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CopyDBParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CopyDBParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CopyDBParameterGroup"))
+        let region =
+            crate::state::request_region(ctx).map_err(CopyDBParameterGroupError::validation)?;
+        // The model constrains neither identifier, so the rules their own documentation
+        // states are enforced here: the target name follows the name rule the API publishes
+        // for a DB parameter group ("Must contain from 1 to 255 letters, numbers, or
+        // hyphens. First character must be a letter. Can't end with a hyphen or contain two
+        // consecutive hyphens"), and "this value is stored as a lowercase string".
+        crate::state::validate_parameter_group_name(
+            "TargetDBParameterGroupIdentifier",
+            &input.target_db_parameter_group_identifier,
+        )
+        .map_err(CopyDBParameterGroupError::invalid_parameter_value)?;
+        let target = input.target_db_parameter_group_identifier.to_ascii_lowercase();
+        // Nothing caller-sized reaches the store unchecked.
+        crate::state::check_free_form(
+            "TargetDBParameterGroupDescription",
+            &input.target_db_parameter_group_description,
+        )
+        .map_err(CopyDBParameterGroupError::validation)?;
+        // The description is a required member, so it carries a value: a blank one is
+        // refused rather than stored (see `crate::state::check_not_empty`).
+        crate::state::check_not_empty(
+            "TargetDBParameterGroupDescription",
+            &input.target_db_parameter_group_description,
+        )
+        .map_err(CopyDBParameterGroupError::invalid_parameter_value)?;
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tags(&tags)
+            .map_err(CopyDBParameterGroupError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated group.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+
+        // "You can't copy a default DB parameter group. Instead, create a new custom DB
+        // parameter group, which copies the default parameters and values for the specified
+        // DB parameter group family": a name of that form is a group RDS provides, so the
+        // refusal names the restriction rather than reporting the group as missing. The name
+        // is read out of the value whether it came as a name or as an ARN, and tested by the
+        // ONE reading of a default group's name in this crate
+        // (`crate::state::is_default_parameter_group_name`).
+        let source_named = input.source_db_parameter_group_identifier.clone();
+        if crate::state::is_default_parameter_group_name(crate::state::arn_resource_name_of(
+            &source_named,
+        )) {
+            return Err(CopyDBParameterGroupError::invalid_parameter_value(
+                crate::state::cannot_copy_a_default_parameter_group_message(
+                    "SourceDBParameterGroupIdentifier",
+                    &source_named,
+                    "DB parameter group",
+                ),
+            ));
+        }
+        // RDS is regional: the source is resolved in the region the request was signed for,
+        // by name or by ARN, and a value that names no group there is the modelled
+        // not-found fault.
+        let Some(source) = store.resolve_db_parameter_group(&region, &source_named) else {
+            return Err(
+                CopyDBParameterGroupErrorModeled::DBParameterGroupNotFoundFault(
+                    DBParameterGroupNotFoundFault {
+                        message: Some(
+                            crate::state::PARAMETER_GROUP_DOES_NOT_EXIST_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The copy carries the source's family and the parameter values a caller set on it:
+        // "copies the specified DB parameter group", so a describe of the copy reports the
+        // same parameters as a describe of the source.
+        let record = crate::state::DbParameterGroupRecord {
+            name: target.clone(),
+            family: source.family.clone(),
+            description: input.target_db_parameter_group_description,
+            region: region.clone(),
+            parameters: source.parameters.clone(),
+            tags,
+        };
+
+        let key = (region.clone(), target.clone());
+        if store.db_parameter_groups.contains_key(&key) {
+            return Err(
+                CopyDBParameterGroupErrorModeled::DBParameterGroupAlreadyExistsFault(
+                    DBParameterGroupAlreadyExistsFault {
+                        message: Some(format!("Parameter group {target} already exists")),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.parameter_groups_in(&region).len()
+            >= crate::state::DB_PARAMETER_GROUP_QUOTA_PER_REGION
+            || !store.has_room_for_region(&region)
+        {
+            return Err(
+                CopyDBParameterGroupErrorModeled::DBParameterGroupQuotaExceededFault(
+                    DBParameterGroupQuotaExceededFault {
+                        message: Some(format!(
+                            "Cannot create more than {} parameter groups in {region}",
+                            crate::state::DB_PARAMETER_GROUP_QUOTA_PER_REGION
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let db_parameter_group = record.to_wire();
+        store.db_parameter_groups.insert(key, record);
+        Ok(CopyDBParameterGroupOutput {
+            db_parameter_group: Some(db_parameter_group),
+        })
     }
 }

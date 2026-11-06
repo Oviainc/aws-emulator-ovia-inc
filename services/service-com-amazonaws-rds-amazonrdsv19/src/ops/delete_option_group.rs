@@ -164,6 +164,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_due_transitions(&region);
 
+        // "You can't delete default option groups" — the groups RDS provides per engine and
+        // major engine version (`crate::state::is_default_option_group_name`). The account
+        // holds such a group whether or not this store has a record of one, so the
+        // restriction is answered BEFORE the record lookup below: a default group is never
+        // missing, it is a group the request may not delete — the same order
+        // `DeleteDBParameterGroup` answers its own default groups in.
+        if crate::state::is_default_option_group_name(&name) {
+            return Err(DeleteOptionGroupErrorModeled::InvalidOptionGroupStateFault(
+                InvalidOptionGroupStateFault {
+                    message: Some(crate::state::default_group_cannot_be_deleted_message(
+                        crate::state::OPTION_GROUP_SUBJECT,
+                        &name,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // RDS is regional: only the region the request was signed for is in scope. A
         // name that names no stored group is the modelled 404 — the same answer a
         // second delete of the same group gets, which is what lets a caller tell
@@ -177,13 +195,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // "You can't delete default option groups" — the groups AWS mints per engine
-        // major version. This service does not STORE them (nothing creates them), so a
-        // delete naming one answers the 404 above rather than the state fault the real
-        // service answers; modelling those default groups is the subject of the issues
-        // that own them, and `CreateDBInstance` says the same of the names it stores
-        // unresolved.
-        //
         // "You can't delete an option group that is associated with a DB instance" —
         // the association is the instance record's own `OptionGroupName`, so the guard
         // reads the store rather than trusting the caller. The instance that holds the

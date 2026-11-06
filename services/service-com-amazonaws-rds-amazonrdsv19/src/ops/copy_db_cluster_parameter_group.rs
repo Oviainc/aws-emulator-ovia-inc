@@ -206,11 +206,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &source_named,
         )) {
             return Err(CopyDBClusterParameterGroupError::invalid_parameter_value(
-                format!(
-                    "invalid value '{source_named}' for \
-                     SourceDBClusterParameterGroupIdentifier: you can't copy a default DB \
-                     cluster parameter group; create a new custom group for the family \
-                     instead"
+                crate::state::cannot_copy_a_default_parameter_group_message(
+                    "SourceDBClusterParameterGroupIdentifier",
+                    &source_named,
+                    "DB cluster parameter group",
                 ),
             ));
         }

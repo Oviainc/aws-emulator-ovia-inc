@@ -423,14 +423,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_master_user_password(&input.engine, password)
                 .map_err(CreateDBInstanceError::invalid_parameter_value)?;
         }
-        // Resolved here, before the store is touched, so a request naming a version
-        // this service cannot provision is refused for the version and leaves no
-        // instance behind.
+        // Resolved against the published catalogue here, before the store is touched. A
+        // value it cannot resolve is NOT refused yet: an engine version the account MINTED
+        // (a CEV) lives in this service's store rather than in that catalogue, and is a
+        // version a DB instance may be created with too, so the refusal is answered under
+        // the state lock below once the account's own versions have been consulted.
         let resolved_version = crate::ops::describe_db_engine_versions::resolve_version(
             &input.engine,
             input.engine_version.as_deref(),
-        )
-        .map_err(CreateDBInstanceError::invalid_parameter_combination)?;
+        );
 
         // No store means this service was mounted on an engine it has no state in,
         // so it cannot serve the operation at all. Unreachable with the engine the
@@ -449,6 +450,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut record = {
         let mut store = state.lock();
         store.settle_due_transitions(&region);
+
+        // The version the instance runs: one the catalogue publishes, or one the ACCOUNT
+        // minted in this region. A value that is neither names no version this service can
+        // provision, and is refused for the version, leaving no instance behind.
+        let custom_version = match &resolved_version {
+            Ok(_) => None,
+            Err(_) => store
+                .resolve_custom_db_engine_version(
+                    &region,
+                    &input.engine,
+                    input.engine_version.as_deref().unwrap_or_default(),
+                )
+                .cloned(),
+        };
+        let resolved_version = match resolved_version {
+            Ok(resolved) => resolved,
+            Err(message) => {
+                if custom_version.is_none() {
+                    return Err(CreateDBInstanceError::invalid_parameter_combination(message));
+                }
+                None
+            }
+        };
 
         // Every resource this request REFERENCES by name is resolved in the store
         // before the instance is inserted, and a name that resolves to nothing is that
@@ -595,14 +619,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => input.engine_version.clone(),
         };
         let db_parameter_group_name = input.db_parameter_group_name.or_else(|| {
-            resolved_version.map(|entry| {
-                crate::state::default_db_parameter_group_name(entry.parameter_group_family)
-            })
+            resolved_version
+                .map(|entry| entry.parameter_group_family)
+                .map(crate::state::default_db_parameter_group_name)
+                .or_else(|| {
+                    // An instance created on the account's own engine version takes the
+                    // default groups of the family and major version THAT version carries.
+                    custom_version.as_ref().map(|cev| {
+                        crate::state::default_db_parameter_group_name(&cev.parameter_group_family)
+                    })
+                })
         });
         let option_group_name = input.option_group_name.or_else(|| {
-            resolved_version.map(|entry| {
-                crate::state::default_option_group_name(&input.engine, entry.major_engine_version)
-            })
+            resolved_version
+                .map(|entry| {
+                    crate::state::default_option_group_name(
+                        &input.engine,
+                        entry.major_engine_version,
+                    )
+                })
+                .or_else(|| {
+                    custom_version.as_ref().map(|cev| {
+                        crate::state::default_option_group_name(
+                            &input.engine,
+                            &cev.major_engine_version,
+                        )
+                    })
+                })
         });
 
         let mut record = crate::state::DbInstanceRecord {
@@ -669,6 +712,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
             db_security_group_names: input.db_security_groups.unwrap_or_default(),
             db_cluster_identifier,
+            // Nothing is replicated: a DB instance this operation creates replicates no
+            // source, and a replica of it exists only once
+            // `CreateDBInstanceReadReplica` has created one.
+            read_replica_source_db_instance_identifier: None,
+            read_replica_db_instance_identifiers: Vec::new(),
             domain: input.domain,
             ca_certificate_identifier: input.ca_certificate_identifier.unwrap_or_else(|| {
                 // No `CACertificateIdentifier`: the instance is created under the CA that

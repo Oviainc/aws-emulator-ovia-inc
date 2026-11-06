@@ -146,13 +146,13 @@ struct Case {
 }
 
 /// The CEVs this suite deletes: one per engine FAMILY `CreateCustomDBEngineVersion$Engine`
-/// publishes (RDS Custom for Oracle, RDS Custom for SQL Server and the RDS for SQL Server
+/// publishes a build of (RDS Custom for SQL Server and the RDS for SQL Server
 /// bring-your-own-media engines), each minted from a different combination of the optional
 /// media members, so no assertion below depends on one engine or on one set of members.
 const CASES: &[Case] = &[
     Case {
-        engine: "custom-oracle-ee",
-        engine_version: "19.deleted_cev1",
+        engine: "sqlserver-se",
+        engine_version: "15.00.4435.7.deleted_cev1",
         create: &[
             ("KMSKeyId", KMS_KEY_ID),
             ("Manifest", MANIFEST),
@@ -160,8 +160,8 @@ const CASES: &[Case] = &[
         ],
     },
     Case {
-        engine: "custom-oracle-se2-cdb",
-        engine_version: "19.deleted_cev2",
+        engine: "sqlserver-dev-ee",
+        engine_version: "15.00.4385.2.deleted_cev2",
         create: &[("KMSKeyId", KMS_KEY_ID)],
     },
     Case {
@@ -271,25 +271,25 @@ struct Unheld {
 }
 
 /// The ways a request can name no CEV the account holds. The CEV the rows are written
-/// against is `custom-oracle-ee`/`19.held_cev`, created in [`REGION`].
+/// against is `sqlserver-ee`/`16.00.4175.1.held_cev`, created in [`REGION`].
 const UNHELD: &[Unheld] = &[
     Unheld {
         case: "a CEV name nothing created",
         region: REGION,
-        engine: "custom-oracle-ee",
-        engine_version: "19.never_created_cev",
+        engine: "sqlserver-ee",
+        engine_version: "16.00.4175.1.never_created_cev",
     },
     Unheld {
         case: "a held CEV name under another engine",
         region: REGION,
-        engine: "custom-oracle-se2",
-        engine_version: "19.held_cev",
+        engine: "sqlserver-se",
+        engine_version: "16.00.4175.1.held_cev",
     },
     Unheld {
         case: "the CEV of another region",
         region: "eu-west-1",
-        engine: "custom-oracle-ee",
-        engine_version: "19.held_cev",
+        engine: "sqlserver-ee",
+        engine_version: "16.00.4175.1.held_cev",
     },
     Unheld {
         // `postgres` 16.4 is one of the versions this service publishes as reference data
@@ -349,8 +349,8 @@ async fn a_request_that_names_no_held_cev_is_denied() {
         &router,
         REGION,
         "create the CEV",
-        "custom-oracle-ee",
-        "19.held_cev",
+        "sqlserver-ee",
+        "16.00.4175.1.held_cev",
         &[("KMSKeyId", KMS_KEY_ID), ("Manifest", MANIFEST)],
     )
     .await;
@@ -371,8 +371,8 @@ async fn a_request_that_names_no_held_cev_is_denied() {
         &router,
         REGION,
         "the held CEV",
-        "custom-oracle-ee",
-        "19.held_cev",
+        "sqlserver-ee",
+        "16.00.4175.1.held_cev",
         true,
     )
     .await;
@@ -455,15 +455,15 @@ struct InUse {
 const IN_USE: &[InUse] = &[
     InUse {
         case: "an RDS Custom DB instance running the CEV",
-        engine: "custom-oracle-ee",
-        engine_version: "19.in_use_cev",
+        engine: "sqlserver-ee",
+        engine_version: "16.00.4175.1.in_use_cev",
         instance: "emu-cev-delete-instance",
         snapshot: None,
     },
     InUse {
         case: "a snapshot taken of an instance that ran the CEV",
-        engine: "custom-oracle-se2",
-        engine_version: "19.snapshot_cev",
+        engine: "sqlserver-se",
+        engine_version: "15.00.4435.7.snapshot_cev",
         instance: "emu-cev-delete-snapshotted",
         snapshot: Some("emu-cev-delete-snapshot"),
     },

@@ -68,6 +68,18 @@ pub struct DbInstanceRecord {
     /// longer used to create new DB instances."
     pub db_security_group_names: Vec<String>,
     pub db_cluster_identifier: Option<String>,
+    /// `ReadReplicaSourceDBInstanceIdentifier` — "the identifier of the source DB instance
+    /// if this DB instance is a read replica", as `CreateDBInstanceReadReplica` resolved it,
+    /// and `None` for an instance that replicates nothing.
+    pub read_replica_source_db_instance_identifier: Option<String>,
+    /// `ReadReplicaDBInstanceIdentifiers` — "the identifiers of the read replicas associated
+    /// with this DB instance", in the order the replicas were created.
+    ///
+    /// The SOURCE's side of the same relationship, recorded on the source when a replica is
+    /// created and dropped from it when that replica is deleted
+    /// ([`Self::detach_read_replica`]), so the list never names an instance this store no
+    /// longer holds.
+    pub read_replica_db_instance_identifiers: Vec<String>,
     pub domain: Option<String>,
     /// The CA the instance's server certificate is issued under.
     pub ca_certificate_identifier: String,
@@ -142,6 +154,35 @@ impl DbInstanceRecord {
     pub fn begin_deletion(&mut self) {
         self.status = DB_INSTANCE_STATUS_DELETING.to_string();
         self.pending_status = Some(PendingStatus::removal_in_a_moment());
+    }
+
+    /// Record that `identifier` replicates this instance: the source's half of the
+    /// relationship `CreateDBInstanceReadReplica` creates.
+    ///
+    /// A replica is recorded once, so a create that is refused after this point cannot leave
+    /// the identifier named twice.
+    pub fn attach_read_replica(&mut self, identifier: &str) {
+        if !self
+            .read_replica_db_instance_identifiers
+            .iter()
+            .any(|held| held == identifier)
+        {
+            self.read_replica_db_instance_identifiers
+                .push(identifier.to_string());
+        }
+    }
+
+    /// Drop `identifier` from the replicas of this instance, for a replica that is being
+    /// deleted: the source reports the replicas it HAS, so a deleted one is not one of them.
+    pub fn detach_read_replica(&mut self, identifier: &str) {
+        self.read_replica_db_instance_identifiers
+            .retain(|held| held != identifier);
+    }
+
+    /// Stop replicating: an instance whose source DB instance is being deleted is promoted
+    /// to a standalone DB instance, so it reports no source from then on.
+    pub fn promote_from_read_replica(&mut self) {
+        self.read_replica_source_db_instance_identifier = None;
     }
 
     /// The name of the log file this instance writes, which follows from its engine; see
@@ -342,10 +383,17 @@ impl DbInstanceRecord {
             multi_az: Some(self.multi_az),
             engine_version: self.engine_version.clone(),
             auto_minor_version_upgrade: Some(self.auto_minor_version_upgrade),
-            // No implemented operation creates a read replica of an instance
-            // (`CreateDBInstanceReadReplica` is still a stub), so no instance this
-            // service holds has one: the list is EMPTY, not absent.
-            read_replica_db_instance_identifiers: Some(Vec::new()),
+            // The replicas of this instance, in the order they were created, and the source
+            // it replicates itself. Both are stored halves of one relationship
+            // `CreateDBInstanceReadReplica` creates, so an instance with no replica reports
+            // an EMPTY list rather than none, and one that replicates nothing reports no
+            // source at all.
+            read_replica_db_instance_identifiers: Some(
+                self.read_replica_db_instance_identifiers.clone(),
+            ),
+            read_replica_source_db_instance_identifier: self
+                .read_replica_source_db_instance_identifier
+                .clone(),
             license_model: self.license_model.clone(),
             iops: self.iops,
             storage_throughput: Some(self.storage_throughput),

@@ -390,6 +390,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let dbi_resource_id = record.dbi_resource_id.clone();
         let instance_arn = record.arn();
         let db_instance = record.to_wire();
+        let replicated_source = record.read_replica_source_db_instance_identifier.clone();
+        let replicas = record.read_replica_db_instance_identifiers.clone();
+        // The relationship this instance was half of ends with it. A replica that is being
+        // deleted is no longer one of its source's replicas, and the replicas of a SOURCE
+        // that is being deleted are promoted to standalone DB instances — so neither side
+        // reports a relationship with an instance the store is about to drop.
+        if let Some(source_identifier) = replicated_source {
+            if let Some(source) = store
+                .db_instances
+                .get_mut(&(region.clone(), source_identifier))
+            {
+                source.detach_read_replica(&identifier);
+            }
+        }
+        for replica_identifier in replicas {
+            if let Some(replica) = store
+                .db_instances
+                .get_mut(&(region.clone(), replica_identifier))
+            {
+                replica.promote_from_read_replica();
+            }
+        }
         // The engine is going away with the instance, so the sessions it held end here
         // rather than running SQL against an instance that is being deleted. The listener
         // itself closes when the record leaves the store
