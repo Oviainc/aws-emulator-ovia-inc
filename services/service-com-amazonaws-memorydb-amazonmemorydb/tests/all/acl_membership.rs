@@ -18,10 +18,9 @@
 //!   answers for it (recorded unit `memorydb.acl-membership-updates-rejected`), and the
 //!   same fault a change naming one user on both sides, or naming no change at all,
 //!   gets;
-//! * a name the REQUEST ITSELF repeats within one list is a different mistake —
-//!   `DuplicateUserNameFault` ("A user with the specified name already exists");
-//! * a name the change REMOVES that the ACL does not list names no member —
-//!   `UserNotFoundFault`;
+//! * a name the REQUEST ITSELF repeats within one list is a bad list value —
+//!   `InvalidParameterValueException`, the same fault a removal naming a user that is
+//!   not in this ACL gets;
 //! * an ACL name that is in no state at all — `ACLNotFoundFault`.
 //!
 //! Resource names FOLD (`users_acls_name_rules`), so each row is also exercised in a
@@ -161,17 +160,17 @@ async fn a_refused_membership_change_reports_which_mistake_it_made() {
         (
             "one name repeated in the added list",
             update_body(ACL, &[OUTSIDER, OUTSIDER], &[]),
-            "DuplicateUserNameFault",
+            "InvalidParameterValueException",
         ),
         (
             "one name repeated in the removed list, in two spellings",
             update_body(ACL, &[], &[INITIAL_MEMBERS[0], "MEMBER-ONE"]),
-            "DuplicateUserNameFault",
+            "InvalidParameterValueException",
         ),
         (
             "a member removed that the ACL does not list",
             update_body(ACL, &[], &[OUTSIDER]),
-            "UserNotFoundFault",
+            "InvalidParameterValueException",
         ),
         (
             "an ACL that is in no state at all",

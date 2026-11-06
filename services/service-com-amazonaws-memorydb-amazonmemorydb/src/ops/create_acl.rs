@@ -200,15 +200,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // `UserNames` names users, so each entry is folded the way the user store is
         // keyed: a member written in mixed case is the same user as the lower-case
-        // spelling, on both sides of the membership. A name listed twice is refused
-        // rather than stored twice, the same refusal `UpdateACL` makes.
+        // spelling, on both sides of the membership. A name listed twice is a bad list
+        // VALUE rather than a user-name collision, so it is refused with the modelled
+        // value fault and the one sentence `UpdateACL` refuses a repeated name with.
         let mut user_names: Vec<String> = Vec::with_capacity(requested_members.len());
         for name in &requested_members {
             let name = crate::state::fold_name(name);
             if user_names.contains(&name) {
-                return Err(CreateACLErrorModeled::DuplicateUserNameFault(
-                    DuplicateUserNameFault {
-                        message: Some(format!("UserNames names user {name} more than once.")),
+                return Err(CreateACLErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::DUPLICATE_MEMBER_MESSAGE.to_string()),
                     },
                 )
                 .into());

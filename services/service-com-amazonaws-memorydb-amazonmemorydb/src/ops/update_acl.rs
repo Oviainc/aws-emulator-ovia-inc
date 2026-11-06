@@ -126,9 +126,10 @@ impl From<UpdateACLErrorModeled> for UpdateACLError {
 /// maximum — so the list arrives caller-sized, and it is one factor of every membership
 /// comparison in the handler. The length is refused against
 /// [`crate::state::MAX_USERS_PER_ACL`] before a single name is folded or compared, so
-/// no work below is sized by the request; a name listed twice is refused with the
-/// modelled `DuplicateUserNameFault` rather than silently collapsed, and the set the
-/// handler then works with makes each membership test one logarithmic lookup.
+/// no work below is sized by the request; a name listed twice is a bad list VALUE and
+/// is refused with the modelled `InvalidParameterValueException` rather than silently
+/// collapsed, through the one rule `CreateACL` refuses a repeated name with, and the
+/// set the handler then works with makes each membership test one logarithmic lookup.
 fn member_set(
     member: &str,
     names: Option<Vec<String>>,
@@ -145,10 +146,10 @@ fn member_set(
     let mut folded = BTreeSet::new();
     for name in names {
         let name = crate::state::fold_name(&name);
-        if !folded.insert(name.clone()) {
-            return Err(UpdateACLErrorModeled::DuplicateUserNameFault(
-                DuplicateUserNameFault {
-                    message: Some(format!("{member} names user {name} more than once.")),
+        if !folded.insert(name) {
+            return Err(UpdateACLErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(crate::state::DUPLICATE_MEMBER_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -216,9 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 UpdateACLErrorModeled::InvalidParameterCombinationException(
                     InvalidParameterCombinationException {
                         message: Some(
-                            "At least one of UserNamesToAdd and UserNamesToRemove must be \
-                             supplied."
-                                .to_string(),
+                            crate::state::MEMBERSHIP_CHANGE_REQUIRED_MESSAGE.to_string(),
                         ),
                     },
                 )
@@ -294,39 +293,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // logarithmic lookup per named name rather than a scan of the membership.
         let current: std::collections::BTreeSet<&str> =
             acl.user_names.iter().map(String::as_str).collect();
-        // A removal names a CURRENT member: a name the ACL does not list is resolved
-        // against the stored membership rather than silently ignored.
-        if let Some(name) = to_remove
-            .iter()
-            .find(|name| !current.contains(name.as_str()))
-        {
-            return Err(UpdateACLErrorModeled::UserNotFoundFault(UserNotFoundFault {
-                message: Some(format!("User {name} is not a member of ACL {acl_name}.")),
-            })
-            .into());
-        }
-        // An addition names a user the ACL does not list yet, and a member IS a user:
-        // the name is resolved against the user store through the one rule `CreateACL`
-        // resolves its `UserNames` with, so the two write paths of one membership agree
-        // about what a member is.
-        if let Some(message) = state.absent_member_rejection(to_add.iter().map(String::as_str)) {
+        // A member IS a user, so EVERY name the change moves — on either side of it — is
+        // resolved against the user store FIRST, through the one rule `CreateACL`
+        // resolves its `UserNames` with: a name no user exists for is the absent-user
+        // fault, and only a name that does resolve can then be judged against the
+        // membership below. That ordering is what keeps the two faults apart.
+        if let Some(message) = state.absent_member_rejection(
+            to_add
+                .iter()
+                .chain(to_remove.iter())
+                .map(String::as_str),
+        ) {
             return Err(UpdateACLErrorModeled::UserNotFoundFault(UserNotFoundFault {
                 message: Some(message),
             })
             .into());
         }
+        // A removal names a CURRENT member: a name the ACL does not list is resolved
+        // against the stored membership rather than silently ignored. The user exists
+        // (resolved just above) and simply is not in this ACL, which is a bad parameter
+        // VALUE rather than an absent user.
+        if let Some(name) = to_remove
+            .iter()
+            .find(|name| !current.contains(name.as_str()))
+        {
+            return Err(UpdateACLErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(crate::state::not_member_message(name, &acl_name)),
+                },
+            )
+            .into());
+        }
         // A name added that the ACL ALREADY lists is a delta that cannot hold against
         // the membership it is applied to — the modelled COMBINATION fault, which is
-        // what AWS answers for it. `DuplicateUserNameFault` ("A user with the specified
-        // name already exists") stays what `member_set` above uses for a name the
-        // REQUEST itself repeats, so the two refusals report different mistakes.
+        // what AWS answers for it. A name the REQUEST itself repeats is a different
+        // mistake, refused by `member_set` above as a bad list value, so the two
+        // refusals report different things.
         if let Some(name) = to_add.iter().find(|name| current.contains(name.as_str())) {
             return Err(
                 UpdateACLErrorModeled::InvalidParameterCombinationException(
                     InvalidParameterCombinationException {
-                        message: Some(format!(
-                            "User {name} is already a member of ACL {acl_name}."
-                        )),
+                        message: Some(crate::state::already_member_message(name, &acl_name)),
                     },
                 )
                 .into(),

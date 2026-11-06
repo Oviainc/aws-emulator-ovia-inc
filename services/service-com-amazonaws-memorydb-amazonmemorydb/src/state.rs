@@ -2585,6 +2585,46 @@ pub fn member_count_rejection(member: &str, count: usize) -> Option<String> {
     })
 }
 
+/// What the service answers a membership list that names the SAME user twice with.
+///
+/// Fixed text: the refusal states the mistake and echoes NO name, so a request that
+/// repeats a name is reported the same way whichever list carried it and whichever
+/// write path of a membership took it (`CreateACL$UserNames`,
+/// `UpdateACL$UserNamesToAdd`, `UpdateACL$UserNamesToRemove`). A repeated entry is a
+/// bad list VALUE, not a user-name collision, so both callers map it onto their
+/// modelled `InvalidParameterValueException`.
+pub const DUPLICATE_MEMBER_MESSAGE: &str = "Duplicate user name specified.";
+
+/// What the service answers an `UpdateACL` that names no membership change at all.
+///
+/// `UserNamesToAdd` and `UserNamesToRemove` are both optional, so a request can carry
+/// neither; the refusal asks for the change rather than naming the wire members, and it
+/// has no variable part. The caller maps it onto the modelled
+/// `InvalidParameterCombinationException`: nothing is wrong with either value, the
+/// combination of them says nothing to apply.
+pub const MEMBERSHIP_CHANGE_REQUIRED_MESSAGE: &str =
+    "Please specify the list of user names to be added or removed.";
+
+/// The refusal a membership delta that ADDS a name the ACL already lists carries.
+///
+/// Neither value is prefixed with a noun: the service names the user and the ACL on
+/// their own. The caller maps it onto the modelled
+/// `InvalidParameterCombinationException` — each value names a real resource, it is the
+/// delta that cannot hold against the membership it would be applied to.
+pub fn already_member_message(user_name: &str, acl_name: &str) -> String {
+    format!("{user_name} is already a member of {acl_name}.")
+}
+
+/// The refusal a membership delta that REMOVES a name the ACL does not list carries.
+///
+/// A removal naming a user that simply is not in this ACL is a bad parameter VALUE, not
+/// an absent user, so the caller maps it onto the modelled
+/// `InvalidParameterValueException` and leaves `UserNotFoundFault` for a name no user
+/// exists for at all ([`ComAmazonawsMemorydbAmazonmemorydbState::absent_member_rejection`]).
+pub fn not_member_message(user_name: &str, acl_name: &str) -> String {
+    format!("User {user_name} is not a member of ACL {acl_name}.")
+}
+
 /// A MemoryDB resource name as the service STORES it: folded to lower case.
 ///
 /// User, ACL, cluster and parameter-group names (and a parameter group's family) are

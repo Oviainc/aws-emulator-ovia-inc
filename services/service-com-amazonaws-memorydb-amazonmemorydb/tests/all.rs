@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/acl_membership.rs"]
 mod acl_membership;
+#[path = "all/acl_membership_refusal_wording.rs"]
+mod acl_membership_refusal_wording;
 #[path = "all/acl_pending_changes.rs"]
 mod acl_pending_changes;
 #[path = "all/arn_addressed_refusals.rs"]

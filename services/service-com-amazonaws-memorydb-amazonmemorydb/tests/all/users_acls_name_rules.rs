@@ -716,7 +716,7 @@ async fn an_acls_minimum_engine_version_follows_every_membership_change() {
             "a name added twice",
             json!({ "ACLName": "moving-acl", "UserNamesToAdd": ["pw-one", "PW-ONE"] }),
             400,
-            "DuplicateUserNameFault",
+            "InvalidParameterValueException",
         ),
         (
             // AWS answers the COMBINATION fault here: the delta contradicts the
@@ -731,7 +731,7 @@ async fn an_acls_minimum_engine_version_follows_every_membership_change() {
             "a member removed that is not one",
             json!({ "ACLName": "moving-acl", "UserNamesToRemove": ["pw-two"] }),
             400,
-            "UserNotFoundFault",
+            "InvalidParameterValueException",
         ),
         // One past the membership bound, in each list that can reach it: the work a
         // request may ask for is capped before any of it runs.
