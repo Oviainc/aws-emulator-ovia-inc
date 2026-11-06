@@ -21,6 +21,8 @@ mod geofence_collections;
 mod geofences;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/resource_plane_fidelity.rs"]
+mod resource_plane_fidelity;
 #[path = "all/route_calculators.rs"]
 mod route_calculators;
 #[path = "all/state_memory_bounds.rs"]

@@ -164,22 +164,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let tracker = store.trackers.get(&input.tracker_name).ok_or_else(|| {
             GetDevicePositionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "Resource of type \"Tracker\" with name \"{}\" cannot be found.",
-                    input.tracker_name
+                message: crate::state::resource_not_found(
+                    crate::state::TRACKER_RESOURCE,
+                    &input.tracker_name,
                 ),
             })
         })?;
         let latest = tracker.latest_position(&input.device_id).ok_or_else(|| {
             // A device that holds no position under an EXISTING tracker is not a
             // missing named resource, so it is not worded as one: the
-            // `Resource of type "<Type>" with name "<name>" cannot be found.`
-            // sentence is what this service states for a tracker, a geofence
-            // collection or a calculator it cannot resolve by name, while a
-            // position read that resolved its tracker and found no samples for the
-            // device states that there are no records for the device id it was
-            // given. The sentence carries no request value: the device id is
-            // already the request's own `DeviceId` path label.
+            // `<resource> not found: <name>.` sentence is what this service states
+            // for a tracker, a geofence collection, a geofence or a calculator it
+            // cannot resolve by name, while a position read that resolved its
+            // tracker and found no samples for the device states that there are no
+            // records for the device id it was given. The sentence carries no
+            // request value: the device id is already the request's own `DeviceId`
+            // path label.
             GetDevicePositionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 message: crate::state::NO_POSITION_RECORDS.to_string(),
             })

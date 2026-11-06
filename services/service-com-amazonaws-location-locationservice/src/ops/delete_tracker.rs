@@ -153,9 +153,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.trackers.remove(&input.tracker_name).is_none() {
             return Err(DeleteTrackerErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Resource of type \"Tracker\" with name \"{}\" cannot be found.",
-                        input.tracker_name
+                    message: crate::state::resource_not_found(
+                        crate::state::TRACKER_RESOURCE,
+                        &input.tracker_name,
                     ),
                 },
             )

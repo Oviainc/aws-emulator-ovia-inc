@@ -180,9 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DescribeGeofenceCollectionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "Resource of type \"GeofenceCollection\" with name \"{}\" cannot be found.",
-                            input.collection_name
+                        message: crate::state::resource_not_found(
+                            crate::state::GEOFENCE_COLLECTION_RESOURCE,
+                            &input.collection_name,
                         ),
                     },
                 )
@@ -198,19 +198,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             pricing_plan: Some(crate::state::ALWAYS_PRICING_PLAN.to_string()),
             pricing_plan_data_source: Some(String::new()),
             kms_key_id: collection.kms_key_id.clone(),
-            tags: if collection.tags.is_empty() {
-                // An empty tag set is reported as an absent member, not as an
-                // empty map.
-                None
-            } else {
-                Some(
-                    collection
-                        .tags
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                )
-            },
+            // The tag map is projected unconditionally: an untagged collection
+            // reads back as an empty map, never as an absent member.
+            tags: crate::state::projected_tags(&collection.tags),
             create_time: crate::state::to_date_time(collection.create_time),
             update_time: crate::state::to_date_time(collection.update_time),
             // "The number of geofences in the geofence collection": however many

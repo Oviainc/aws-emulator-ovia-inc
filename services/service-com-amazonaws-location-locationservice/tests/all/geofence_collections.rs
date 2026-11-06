@@ -36,6 +36,16 @@ async fn describe_collection(router: &MultiServiceRouter, name: &str) -> Answer 
     .await
 }
 
+async fn list_collections(router: &MultiServiceRouter, body: Value) -> Answer {
+    call(
+        router,
+        "POST",
+        "/geofencing/v0/list-collections",
+        Some(body),
+    )
+    .await
+}
+
 /// One row of the create-then-describe table.
 struct CollectionCase {
     name: &'static str,
@@ -363,8 +373,8 @@ async fn recreating_a_collection_is_a_conflict_and_leaves_the_stored_one_alone()
         );
         assert_eq!(
             again.message(),
-            "Resource of type \"GeofenceCollection\" with name \"twice\" already exists.",
-            "case {description:?}: expected the conflict to name the resource type and the requested name, got {:?}",
+            "Geofence collection already exists: twice.",
+            "case {description:?}: expected the conflict to name the resource and the requested name, got {:?}",
             again.message()
         );
     }
@@ -416,8 +426,7 @@ async fn describing_a_collection_that_was_never_created_is_not_found() {
             described.error_code(),
             described.body
         );
-        let expected =
-            format!("Resource of type \"GeofenceCollection\" with name \"{name}\" cannot be found.");
+        let expected = format!("Geofence collection not found: {name}.");
         assert_eq!(
             described.message(),
             expected,
@@ -532,6 +541,137 @@ async fn a_read_does_not_change_what_a_later_reader_sees() {
             first,
             "round {round}: DescribeGeofenceCollection must report the same resource every time, got {:?}",
             again.body
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ListGeofenceCollections
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_geofence_collections_pages_over_every_stored_collection() {
+    let router = emulator();
+    let names: Vec<String> = (1..=7).map(|i| format!("collection-{i:02}")).collect();
+    for name in &names {
+        assert_eq!(
+            create_collection(&router, json!({ "CollectionName": name }))
+                .await
+                .status,
+            200,
+            "creating {name} must succeed"
+        );
+    }
+
+    // Page sizes spanning 1, divisors and non-divisors of the stored count, the
+    // exact count, the modelled maximum (`MaxResults` is `range 1..100`), and no
+    // MaxResults at all.
+    for max_results in [Some(1), Some(2), Some(3), Some(7), Some(100), None] {
+        let mut seen: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let mut body = serde_json::Map::new();
+            if let Some(limit) = max_results {
+                body.insert("MaxResults".to_string(), json!(limit));
+            }
+            if let Some(cursor) = &token {
+                body.insert("NextToken".to_string(), json!(cursor));
+            }
+            let answer = list_collections(&router, Value::Object(body)).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {max_results:?}: ListGeofenceCollections must succeed, got {} {:?}",
+                answer.status, answer.body
+            );
+            let page = answer.json();
+            let entries = page
+                .get("Entries")
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| panic!("case {max_results:?}: Entries must be a list in {page}"))
+                .clone();
+            if let Some(limit) = max_results {
+                assert!(
+                    entries.len() as i32 <= limit,
+                    "case {max_results:?}: a page must not exceed MaxResults, got {} entries",
+                    entries.len()
+                );
+            }
+            for entry in &entries {
+                let name = entry
+                    .get("CollectionName")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| {
+                        panic!("case {max_results:?}: entry has no CollectionName: {entry}")
+                    })
+                    .to_string();
+                // Every entry is computed from the stored collection.
+                assert_eq!(
+                    entry.get("Description").and_then(Value::as_str),
+                    Some(""),
+                    "case {max_results:?}: entry {name} must carry the stored Description, got {entry}"
+                );
+                assert_eq!(
+                    entry.get("PricingPlan").and_then(Value::as_str),
+                    Some("RequestBasedUsage"),
+                    "case {max_results:?}: entry {name} must always report RequestBasedUsage, got {entry}"
+                );
+                assert_eq!(
+                    millis_of(entry, "CreateTime"),
+                    millis_of(entry, "UpdateTime"),
+                    "case {max_results:?}: entry {name} was never updated, so its timestamps must match"
+                );
+                seen.push(name);
+            }
+            pages += 1;
+            assert!(
+                pages <= names.len() + 1,
+                "case {max_results:?}: pagination did not terminate, saw {seen:?}"
+            );
+            match page.get("NextToken").and_then(Value::as_str) {
+                Some(next) => token = Some(next.to_string()),
+                None => break,
+            }
+        }
+
+        assert_eq!(
+            seen, names,
+            "case {max_results:?}: paging must yield every stored collection exactly once, got {seen:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_collection_cursor_this_service_did_not_mint_is_refused() {
+    let router = emulator();
+    assert_eq!(
+        create_collection(&router, json!({ "CollectionName": "collection-01" }))
+            .await
+            .status,
+        200
+    );
+
+    // Each row is a token shape a client could send that this service never mints:
+    // no tag, this collection's tag with no page key, another list's tag, and a bare
+    // resource name.
+    for token in [
+        "not-a-token",
+        "geofence-collections",
+        "geofence-collections:",
+        "trackers:collection-01",
+        "collection-01",
+    ] {
+        let answer = list_collections(&router, json!({ "NextToken": token })).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {token:?}: a malformed NextToken must be refused with 400, got {} {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_code(),
+            "ValidationException",
+            "case {token:?}: expected ValidationException, got {:?}",
+            answer.body
         );
     }
 }

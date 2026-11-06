@@ -246,9 +246,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tracker = store.trackers.get_mut(&input.tracker_name).ok_or_else(|| {
             BatchUpdateDevicePositionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Resource of type \"Tracker\" with name \"{}\" cannot be found.",
-                        input.tracker_name
+                    message: crate::state::resource_not_found(
+                        crate::state::TRACKER_RESOURCE,
+                        &input.tracker_name,
                     ),
                 },
             )

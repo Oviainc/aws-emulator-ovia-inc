@@ -693,8 +693,8 @@ async fn a_partial_batch_stores_the_valid_entry_and_reports_only_the_invalid_one
         );
         assert_eq!(
             refused.message(),
-            "Resource of type \"Geofence\" with name \"bad\" cannot be found.",
-            "case {:?}: expected the refusal to name the resource type and the requested id, got {:?}",
+            "Geofence not found: bad.",
+            "case {:?}: expected the refusal to name the resource and the requested id, got {:?}",
             rejected.case,
             refused.message()
         );
@@ -893,8 +893,7 @@ async fn putting_into_a_collection_that_was_never_created_is_not_found() {
             "case {name:?}: expected ResourceNotFoundException, got {:?}",
             answered.body
         );
-        let expected =
-            format!("Resource of type \"GeofenceCollection\" with name \"{name}\" cannot be found.");
+        let expected = format!("Geofence collection not found: {name}.");
         assert_eq!(
             answered.message(),
             expected,
@@ -945,7 +944,7 @@ async fn getting_a_geofence_the_collection_does_not_hold_is_not_found() {
             "case {id:?}: an unknown geofence must be 404, got {} {:?}",
             read.status, read.body
         );
-        let expected = format!("Resource of type \"Geofence\" with name \"{id}\" cannot be found.");
+        let expected = format!("Geofence not found: {id}.");
         assert_eq!(
             read.message(),
             expected,

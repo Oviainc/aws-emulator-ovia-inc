@@ -189,9 +189,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DescribeRouteCalculatorErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "Route calculator not found: {}.",
-                            input.calculator_name
+                        message: crate::state::resource_not_found(
+                            crate::state::ROUTE_CALCULATOR_RESOURCE,
+                            &input.calculator_name,
                         ),
                     },
                 )
@@ -205,19 +205,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `PricingPlan` is documented as fixed: "Always returns
             // RequestBasedUsage".
             pricing_plan: Some(crate::state::ALWAYS_PRICING_PLAN.to_string()),
-            tags: if calculator.tags.is_empty() {
-                // An empty tag set is reported as an absent member, not as an
-                // empty map.
-                None
-            } else {
-                Some(
-                    calculator
-                        .tags
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                )
-            },
+            // The tag map is projected unconditionally: an untagged calculator
+            // reads back as an empty map, never as an absent member.
+            tags: crate::state::projected_tags(&calculator.tags),
             create_time: crate::state::to_date_time(calculator.create_time),
             update_time: crate::state::to_date_time(calculator.update_time),
         })

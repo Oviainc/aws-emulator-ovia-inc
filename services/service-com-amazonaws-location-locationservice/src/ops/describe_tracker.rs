@@ -183,9 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let tracker = store.trackers.get(&input.tracker_name).ok_or_else(|| {
             DescribeTrackerErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "Resource of type \"Tracker\" with name \"{}\" cannot be found.",
-                    input.tracker_name
+                message: crate::state::resource_not_found(
+                    crate::state::TRACKER_RESOURCE,
+                    &input.tracker_name,
                 ),
             })
         })?;
@@ -199,19 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // string".
             pricing_plan: Some(crate::state::ALWAYS_PRICING_PLAN.to_string()),
             pricing_plan_data_source: Some(String::new()),
-            tags: if tracker.tags.is_empty() {
-                // An empty tag set is reported as an absent member, not as an
-                // empty map.
-                None
-            } else {
-                Some(
-                    tracker
-                        .tags
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                )
-            },
+            // The tag map is projected unconditionally: an untagged tracker reads
+            // back as an empty map, never as an absent member.
+            tags: crate::state::projected_tags(&tracker.tags),
             create_time: crate::state::to_date_time(tracker.create_time),
             update_time: crate::state::to_date_time(tracker.update_time),
             kms_key_id: tracker.kms_key_id.clone(),

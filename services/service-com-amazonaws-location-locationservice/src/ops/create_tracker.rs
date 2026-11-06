@@ -207,9 +207,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exists is a conflict rather than a silent overwrite.
         if store.trackers.contains_key(&input.tracker_name) {
             return Err(CreateTrackerErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "Resource of type \"Tracker\" with name \"{}\" already exists.",
-                    input.tracker_name
+                message: crate::state::resource_already_exists(
+                    crate::state::TRACKER_RESOURCE,
+                    &input.tracker_name,
                 ),
             })
             .into());

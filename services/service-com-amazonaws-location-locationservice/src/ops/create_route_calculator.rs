@@ -235,9 +235,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.route_calculators.contains_key(&input.calculator_name) {
             return Err(CreateRouteCalculatorErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "Route calculator already exists: {}.",
-                        input.calculator_name
+                    message: crate::state::resource_already_exists(
+                        crate::state::ROUTE_CALCULATOR_RESOURCE,
+                        &input.calculator_name,
                     ),
                 },
             )

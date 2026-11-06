@@ -480,6 +480,9 @@ pub fn decode_next_token(kind: &str, token: &str) -> Result<String, String> {
 /// The cursor tag for `ListTrackers`.
 pub const TRACKERS_CURSOR: &str = "trackers";
 
+/// The cursor tag for `ListGeofenceCollections`.
+pub const GEOFENCE_COLLECTIONS_CURSOR: &str = "geofence-collections";
+
 /// Largest page any list operation in this service returns, and the page size used
 /// when the caller sends no `MaxResults`: the model bounds `MaxResults` at
 /// `range 1..100`.
@@ -555,10 +558,54 @@ pub const BATCH_VALIDATION_ERROR: &str = "ValidationError";
 /// its tracker but the device has no stored position under it.
 ///
 /// A device is not a named resource of this API — it exists only as the key of the
-/// samples reported for it — so this is NOT the
-/// `Resource of type "<Type>" with name "<name>" cannot be found.` sentence that a
-/// tracker, a geofence collection or a route calculator the service cannot resolve by
-/// name is refused with. It is fixed text: the device id it concerns is already the
-/// request's own `DeviceId`.
+/// samples reported for it — so this is NOT the [`resource_not_found`] sentence a
+/// tracker, a geofence collection, a geofence or a route calculator the service
+/// cannot resolve by name is refused with. It is fixed text: the device id it
+/// concerns is already the request's own `DeviceId`.
 pub const NO_POSITION_RECORDS: &str = "records not found for given deviceId";
+
+/// How this service names a tracker resource in a refusal about it.
+pub const TRACKER_RESOURCE: &str = "Tracker";
+
+/// How this service names a geofence collection resource in a refusal about it.
+pub const GEOFENCE_COLLECTION_RESOURCE: &str = "Geofence collection";
+
+/// How this service names a geofence resource in a refusal about it.
+pub const GEOFENCE_RESOURCE: &str = "Geofence";
+
+/// How this service names a route calculator resource in a refusal about it.
+pub const ROUTE_CALCULATOR_RESOURCE: &str = "Route calculator";
+
+/// The `ResourceNotFoundException` sentence stated for a name no resource of that
+/// kind is stored under: the resource's own name as this service writes it, then the
+/// name the request named it by, then a period.
+///
+/// `resource` is one of the `*_RESOURCE` constants above; `name` is taken from the
+/// request (a URI label or a body member), so the only variable part of the sentence
+/// is the name the caller asked about.
+pub fn resource_not_found(resource: &str, name: &str) -> String {
+    format!("{resource} not found: {name}.")
+}
+
+/// The `ConflictException` sentence stated for a create whose name a resource of
+/// that kind already holds, built from the same two parts as
+/// [`resource_not_found`].
+pub fn resource_already_exists(resource: &str, name: &str) -> String {
+    format!("{resource} already exists: {name}.")
+}
+
+/// The `Tags` member a resource read projects for a resource holding `tags`.
+///
+/// Always `Some`: a read projects the resource's tag map unconditionally, so an
+/// untagged resource reports an EMPTY map rather than omitting the member, and a
+/// client never has to tell "no tags" from "not returned".
+pub fn projected_tags(
+    tags: &BTreeMap<String, String>,
+) -> Option<::std::collections::HashMap<String, String>> {
+    Some(
+        tags.iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
 

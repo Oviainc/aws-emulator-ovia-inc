@@ -202,13 +202,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // A collection name is unique within an account, so creating one that
-        // already exists is a conflict rather than a silent overwrite.
+        // already exists is a conflict rather than a silent overwrite. The sentence
+        // is the one this service states for a name a resource of this kind
+        // already holds.
         if store.geofence_collections.contains_key(&input.collection_name) {
             return Err(CreateGeofenceCollectionErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "Resource of type \"GeofenceCollection\" with name \"{}\" already exists.",
-                        input.collection_name
+                    message: crate::state::resource_already_exists(
+                        crate::state::GEOFENCE_COLLECTION_RESOURCE,
+                        &input.collection_name,
                     ),
                 },
             )

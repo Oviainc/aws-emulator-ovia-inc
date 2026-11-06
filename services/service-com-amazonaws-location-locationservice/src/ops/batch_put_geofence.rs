@@ -217,9 +217,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 BatchPutGeofenceErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "Resource of type \"GeofenceCollection\" with name \"{}\" cannot be found.",
-                            input.collection_name
+                        message: crate::state::resource_not_found(
+                            crate::state::GEOFENCE_COLLECTION_RESOURCE,
+                            &input.collection_name,
                         ),
                     },
                 )

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGeofenceCollections
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGeofenceCollections`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGeofenceCollections::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the geofence collections persisted in
+//! [`crate::state::ComAmazonawsLocationLocationserviceState::geofence_collections`],
+//! one entry per collection in name order, paginated with an opaque cursor. A
+//! collection a delete retired is not reported. A pure read — it writes nothing.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +147,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGeofenceCollections` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGeofenceCollectionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGeofenceCollections"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListGeofenceCollectionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Amazon Location state store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // A cursor this service did not mint is refused rather than read as a
+        // resource name: a client cannot be silently handed the wrong page.
+        let start = match input.next_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_next_token(
+                    crate::state::GEOFENCE_COLLECTIONS_CURSOR,
+                    token,
+                )
+                .map_err(|why| {
+                    ListGeofenceCollectionsErrorModeled::ValidationException(ValidationException {
+                        message: why.clone(),
+                        reason: "FieldValidationFailed".to_string(),
+                        field_list: vec![ValidationExceptionField {
+                            name: "NextToken".to_string(),
+                            message: why,
+                        }],
+                    })
+                })?,
+            ),
+            None => None,
+        };
+        let limit = crate::state::page_size(input.max_results);
+
+        let store = state.lock();
+        let lower = match start.as_deref() {
+            Some(key) => ::std::ops::Bound::Included(key),
+            None => ::std::ops::Bound::Unbounded,
+        };
+
+        let mut entries = Vec::new();
+        let mut next_token = None;
+        for collection in store
+            .geofence_collections
+            .range::<str, _>((lower, ::std::ops::Bound::Unbounded))
+            .map(|(_, collection)| collection)
+        {
+            if entries.len() == limit {
+                // One collection beyond the page: its name is the next page's
+                // inclusive start key.
+                next_token = Some(crate::state::encode_next_token(
+                    crate::state::GEOFENCE_COLLECTIONS_CURSOR,
+                    &collection.name,
+                ));
+                break;
+            }
+            entries.push(ListGeofenceCollectionsResponseEntry {
+                collection_name: collection.name.clone(),
+                description: collection.description.clone(),
+                // Documented as fixed on this entry: PricingPlan "Always returns
+                // RequestBasedUsage", PricingPlanDataSource "Always returns an
+                // empty string".
+                pricing_plan: Some(crate::state::ALWAYS_PRICING_PLAN.to_string()),
+                pricing_plan_data_source: Some(String::new()),
+                create_time: crate::state::to_date_time(collection.create_time),
+                update_time: crate::state::to_date_time(collection.update_time),
+            });
+        }
+
+        Ok(ListGeofenceCollectionsOutput {
+            entries,
+            next_token,
+        })
     }
 }

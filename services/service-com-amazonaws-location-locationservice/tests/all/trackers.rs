@@ -1367,9 +1367,7 @@ async fn a_position_read_states_which_lookup_failed() {
     // The sentence each lookup failure states, written out here rather than read from
     // the crate so a reworded constant fails this test instead of moving with it.
     const NO_RECORDS: &str = "records not found for given deviceId";
-    let unknown_tracker = |name: &str| {
-        format!("Resource of type \"Tracker\" with name \"{name}\" cannot be found.")
-    };
+    let unknown_tracker = |name: &str| format!("Tracker not found: {name}.");
 
     // The tracker exists; the device has no sample under it.
     for device in ["unknown-device", "Device-1", "device-10", "device_1.a-b"] {

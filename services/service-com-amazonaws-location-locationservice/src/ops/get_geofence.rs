@@ -174,9 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.collection_name)
             .ok_or_else(|| {
                 GetGeofenceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!(
-                        "Resource of type \"GeofenceCollection\" with name \"{}\" cannot be found.",
-                        input.collection_name
+                    message: crate::state::resource_not_found(
+                        crate::state::GEOFENCE_COLLECTION_RESOURCE,
+                        &input.collection_name,
                     ),
                 })
             })?;
@@ -185,9 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource this service cannot resolve by name.
         let geofence = collection.geofences.get(&input.geofence_id).ok_or_else(|| {
             GetGeofenceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "Resource of type \"Geofence\" with name \"{}\" cannot be found.",
-                    input.geofence_id
+                message: crate::state::resource_not_found(
+                    crate::state::GEOFENCE_RESOURCE,
+                    &input.geofence_id,
                 ),
             })
         })?;
