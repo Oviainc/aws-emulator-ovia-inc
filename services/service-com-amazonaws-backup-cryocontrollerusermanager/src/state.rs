@@ -819,14 +819,18 @@ pub const MESSAGE_MAX_RESULTS_INVALID: &str = "Max Results is invalid";
 /// condition has no observed token.
 pub const MESSAGE_LEGAL_HOLD_NOT_FOUND: &str = "Cannot find legal hold";
 
-/// The sentence this service states for "the legal hold named is not one a
+/// `Code` for "the legal hold named is not one a cancellation can release" —
+/// the condition's own token, constant across the states that raise it.
+pub const ERROR_CODE_LEGAL_HOLD_NOT_ACTIVE: &str = "ERROR_22003";
+
+/// The FIXED text AWS states for "the legal hold named is not one a
 /// cancellation can release": it is still being placed, or a cancellation has
-/// already released it. No recording of this condition is available, so the
-/// wording is this service's own, built like the sentences above: fixed text
-/// naming the condition (the status the hold has to be in) rather than any part
-/// of the request. No `Code`: this condition has no observed token.
-pub const MESSAGE_LEGAL_HOLD_NOT_ACTIVE: &str =
-    "Legal hold cannot be canceled because it is not in the ACTIVE state";
+/// already released it. Unlike the sentences above this one has a VARIABLE
+/// part — the stored hold's current status, appended followed by the sentence's
+/// final `.` — so the refusal says WHICH state blocked the cancel. Built by
+/// [`legal_hold_not_active`], the one place the sentence is composed.
+pub const MESSAGE_LEGAL_HOLD_NOT_ACTIVE_PREFIX: &str =
+    "Only ACTIVE legal holds can be canceled, the current state of provided legal hold is ";
 
 /// The sentence AWS states for "the legal hold this create would make selects no
 /// recovery points" — fixed, like the ones above: it names no part of the
@@ -993,11 +997,17 @@ pub fn legal_hold_not_found() -> ResourceNotFoundException {
 }
 
 /// The modelled refusal for a cancellation of a legal hold that is not in force
-/// — see [`MESSAGE_LEGAL_HOLD_NOT_ACTIVE`]. The hold's STATE is what refuses the
-/// call, which is the condition `InvalidResourceStateException` names.
-pub fn legal_hold_not_active() -> InvalidResourceStateException {
+/// — see [`MESSAGE_LEGAL_HOLD_NOT_ACTIVE_PREFIX`]. The hold's STATE is what
+/// refuses the call, which is the condition `InvalidResourceStateException`
+/// names, so `status` is the stored hold's CURRENT `LegalHoldStatus` — read
+/// from state, never from the request — and it is reported twice: in `Context`,
+/// which a client reads to learn which state blocked the cancel, and
+/// interpolated into the sentence.
+pub fn legal_hold_not_active(status: &str) -> InvalidResourceStateException {
     InvalidResourceStateException {
-        message: Some(MESSAGE_LEGAL_HOLD_NOT_ACTIVE.to_string()),
+        code: Some(ERROR_CODE_LEGAL_HOLD_NOT_ACTIVE.to_string()),
+        message: Some(format!("{MESSAGE_LEGAL_HOLD_NOT_ACTIVE_PREFIX}{status}.")),
+        context: Some(status.to_string()),
         ..Default::default()
     }
 }

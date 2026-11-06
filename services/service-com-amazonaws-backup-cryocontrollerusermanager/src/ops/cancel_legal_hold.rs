@@ -179,8 +179,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         if hold.status != crate::state::LEGAL_HOLD_STATUS_ACTIVE {
+            // The state that refuses the call is the one the hold is STORED in,
+            // so the refusal reports that status rather than any state this
+            // handler names: a hold still being placed and one a cancellation
+            // has already released are told apart by it.
             return Err(CancelLegalHoldErrorModeled::InvalidResourceStateException(
-                crate::state::legal_hold_not_active(),
+                crate::state::legal_hold_not_active(&hold.status),
             )
             .into());
         }

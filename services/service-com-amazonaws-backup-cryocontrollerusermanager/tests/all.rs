@@ -31,6 +31,8 @@ mod framework;
 mod framework_update;
 #[path = "all/legal_hold.rs"]
 mod legal_hold;
+#[path = "all/legal_hold_cancel_state_refusal.rs"]
+mod legal_hold_cancel_state_refusal;
 #[path = "all/legal_hold_coverage.rs"]
 mod legal_hold_coverage;
 #[path = "all/legal_hold_date_range.rs"]
