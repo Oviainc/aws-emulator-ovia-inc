@@ -80,6 +80,22 @@ const ON_DEMAND_TERM_CODE: &str = "JRTCKXETXF";
 /// on-demand and the reserved dimensions share this suffix.
 const PRICE_DIMENSION_RATE_CODE: &str = "6YS6EN2CT7";
 
+/// The rate-code suffix AWS uses for the one-off upfront fee of a reserved term bought
+/// with an upfront payment. It is a SECOND dimension beside the term's usage dimension,
+/// so it carries its own suffix.
+const UPFRONT_FEE_RATE_CODE: &str = "2TG2D8R56U";
+
+/// The description AWS gives that upfront-fee dimension. It states no rate: the fee is
+/// the dimension's own `pricePerUnit`.
+const UPFRONT_FEE_DESCRIPTION: &str = "Upfront Fee";
+
+/// The unit AWS states an upfront fee in — a one-off quantity rather than a usage rate.
+const UPFRONT_FEE_UNIT: &str = "Quantity";
+
+/// The hours a reservation year is billed over, for turning a lease's hourly cost into
+/// the upfront fee a purchase option pays for it (365 days of 24 hours).
+const HOURS_PER_LEASE_YEAR: u64 = 8_760;
+
 /// The file formats each seeded price list is published in.
 const SEEDED_FILE_FORMATS: &[&str] = &["json"];
 
@@ -515,11 +531,17 @@ fn term_in_currency(
                 continue;
             };
             // The description states the same rate, so it is restated rather than left
-            // claiming the USD figure. It carries the rate exactly once.
+            // claiming the USD figure. It carries the rate exactly once, written the way
+            // a description writes it.
             let description = dimension
                 .get("description")
                 .and_then(serde_json::Value::as_str)
-                .map(|text| text.replace(&in_usd, &converted));
+                .map(|text| {
+                    text.replace(&in_usd, &converted).replace(
+                        &display_rate_text(&in_usd),
+                        &display_rate_text(&converted),
+                    )
+                });
             let Some(object) = dimension.as_object_mut() else {
                 continue;
             };
@@ -631,34 +653,77 @@ struct ProductDraft {
 
 /// One reserved offer term a reservable product is priced by.
 ///
-/// AWS publishes reserved pricing per lease length, offering class and purchase
-/// option, keyed in `terms.Reserved` by the term's own offer term code; the lease
-/// lengths the Price List API publishes are `1yr` and `3yr`. `rate_percent` is this
-/// emulator's own discount off the on-demand rate — the real discount is per SKU and
-/// is not published as a rule, so it is named here rather than implied.
+/// AWS publishes reserved pricing per lease length, offering class and purchase option,
+/// keyed in `terms.Reserved` by the term's own offer term code; the lease lengths the
+/// Price List API publishes are `1yr` and `3yr`, and each is offered under the
+/// no-upfront, partial-upfront and all-upfront purchase options. `rate_percent` and
+/// `upfront_percent` are this emulator's own discount and payment split off the
+/// on-demand rate — the real figures are per SKU and are not published as a rule, so
+/// they are named here rather than implied.
 struct ReservedTermSeed {
     offer_term_code: &'static str,
-    lease_contract_length: &'static str,
+    /// The lease length in years; `termAttributes.LeaseContractLength` is `<years>yr`.
+    lease_years: u64,
     offering_class: &'static str,
     purchase_option: &'static str,
+    /// The lease's effective hourly cost as a percentage of the on-demand rate.
     rate_percent: u64,
+    /// The share of that lease cost paid as a one-off upfront fee, which is what gives
+    /// the term its `Quantity` fee dimension; the remainder is billed per hour.
+    upfront_percent: u64,
 }
 
-/// The reserved terms every reservable product in this catalog is offered under.
+/// The reserved terms every reservable product in this catalog is offered under: one
+/// per lease length and purchase option the Price List API publishes reserved pricing
+/// for, each keyed by its own offer term code.
 const RESERVED_TERMS: &[ReservedTermSeed] = &[
     ReservedTermSeed {
         offer_term_code: "4NA7Y494T4",
-        lease_contract_length: "1yr",
+        lease_years: 1,
         offering_class: "standard",
         purchase_option: "No Upfront",
         rate_percent: 62,
+        upfront_percent: 0,
+    },
+    ReservedTermSeed {
+        offer_term_code: "6QCMYABX3D",
+        lease_years: 1,
+        offering_class: "standard",
+        purchase_option: "Partial Upfront",
+        rate_percent: 58,
+        upfront_percent: 50,
+    },
+    ReservedTermSeed {
+        offer_term_code: "HU7G6KETJZ",
+        lease_years: 1,
+        offering_class: "standard",
+        purchase_option: "All Upfront",
+        rate_percent: 57,
+        upfront_percent: 100,
     },
     ReservedTermSeed {
         offer_term_code: "BPH4J8HBKS",
-        lease_contract_length: "3yr",
+        lease_years: 3,
         offering_class: "standard",
         purchase_option: "No Upfront",
-        rate_percent: 40,
+        rate_percent: 44,
+        upfront_percent: 0,
+    },
+    ReservedTermSeed {
+        offer_term_code: "38NPMPTW36",
+        lease_years: 3,
+        offering_class: "standard",
+        purchase_option: "Partial Upfront",
+        rate_percent: 38,
+        upfront_percent: 50,
+    },
+    ReservedTermSeed {
+        offer_term_code: "MZU6U2429S",
+        lease_years: 3,
+        offering_class: "standard",
+        purchase_option: "All Upfront",
+        rate_percent: 37,
+        upfront_percent: 100,
     },
 ];
 
@@ -671,6 +736,24 @@ const RATE_SCALE: u64 = 10_000_000_000;
 /// A rate held in 1e-10 USD, as an offer document writes it.
 fn rate_text(rate_e10: u64) -> String {
     format!("{}.{:010}", rate_e10 / RATE_SCALE, rate_e10 % RATE_SCALE)
+}
+
+/// A rate as a price dimension's DESCRIPTION states it: the same number [`rate_text`]
+/// writes, without the trailing zeros of its ten-place scale and with at least one
+/// decimal place ("0.0052", "0.0"). The service states a rate in a description the way
+/// a reader would write it, not at the scale the `pricePerUnit` is published at.
+fn display_rate_text(rate_text: &str) -> String {
+    let trimmed = rate_text.trim_end_matches('0');
+    if trimmed.ends_with('.') {
+        format!("{trimmed}0")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// [`display_rate_text`] of a rate held in 1e-10 USD.
+fn display_rate(rate_e10: u64) -> String {
+    display_rate_text(&rate_text(rate_e10))
 }
 
 /// The integer count of 1e-10 units a rate's text stands for: the inverse of
@@ -810,14 +893,12 @@ fn offer_document(service_code: &str, draft: &ProductDraft) -> String {
 /// the SKU-derived term code AWS keys it by.
 fn on_demand_term(draft: &ProductDraft) -> serde_json::Map<String, serde_json::Value> {
     let sku = draft.sku.as_str();
-    let unit = draft.unit;
     let term_key = format!("{sku}.{ON_DEMAND_TERM_CODE}");
-    let rate = rate_text(draft.rate_e10);
     let dimensions = price_dimensions(
         &term_key,
-        unit,
-        &rate,
-        &format!("{rate} per {unit} of {sku}"),
+        draft.unit,
+        &rate_text(draft.rate_e10),
+        &on_demand_description(draft, draft.rate_e10),
     );
     let mut on_demand = serde_json::Map::new();
     on_demand.insert(
@@ -836,20 +917,34 @@ fn on_demand_term(draft: &ProductDraft) -> serde_json::Map<String, serde_json::V
 /// The `terms.Reserved` block for one product: one term per lease length, offering
 /// class and purchase option the catalog publishes, each keyed by its own offer term
 /// code and stating that lease's `LeaseContractLength` in `termAttributes`.
+///
+/// A term's dimensions are the ones its purchase option actually pays: the usage
+/// dimension the lease is billed per hour at, plus — only for an option that pays part
+/// or all of the lease up front — the one-off fee dimension, stated as a `Quantity`.
 fn reserved_terms(draft: &ProductDraft) -> serde_json::Map<String, serde_json::Value> {
     let sku = draft.sku.as_str();
-    let unit = draft.unit;
     let mut reserved = serde_json::Map::new();
     for term in RESERVED_TERMS {
         let term_key = format!("{sku}.{}", term.offer_term_code);
-        let rate = rate_text(scale(draft.rate_e10, term.rate_percent));
-        let lease = term.lease_contract_length;
-        let dimensions = price_dimensions(
+        // The lease's effective hourly cost, of which the upfront share is paid as a
+        // fee and the rest per hour of usage.
+        let effective_e10 = scale(draft.rate_e10, term.rate_percent);
+        let hourly_e10 = scale(effective_e10, 100_u64.saturating_sub(term.upfront_percent));
+        let mut dimensions = price_dimensions(
             &term_key,
-            unit,
-            &rate,
-            &format!("{rate} per {unit} of {sku} on a {lease} reservation"),
+            draft.unit,
+            &rate_text(hourly_e10),
+            &reserved_description(draft, hourly_e10),
         );
+        if term.upfront_percent > 0 {
+            let lease_hours = term.lease_years.saturating_mul(HOURS_PER_LEASE_YEAR);
+            let upfront_e10 = scale(
+                effective_e10.saturating_mul(lease_hours),
+                term.upfront_percent,
+            );
+            let (rate_code, dimension) = upfront_fee_dimension(&term_key, upfront_e10);
+            dimensions.insert(rate_code, dimension);
+        }
         reserved.insert(
             term_key,
             serde_json::json!({
@@ -857,7 +952,7 @@ fn reserved_terms(draft: &ProductDraft) -> serde_json::Map<String, serde_json::V
                 "offerTermCode": term.offer_term_code,
                 "effectiveDate": CATALOG_PUBLICATION_DATE,
                 "termAttributes": {
-                    "LeaseContractLength": lease,
+                    "LeaseContractLength": format!("{}yr", term.lease_years),
                     "OfferingClass": term.offering_class,
                     "PurchaseOption": term.purchase_option,
                 },
@@ -866,6 +961,60 @@ fn reserved_terms(draft: &ProductDraft) -> serde_json::Map<String, serde_json::V
         );
     }
     reserved
+}
+
+/// The sentence the Price List API puts on a product's ON-DEMAND usage dimension: the
+/// rate, then the usage it prices. A compute instance is priced per instance hour of
+/// its operating system and instance type; anything else per unit of the usage type it
+/// is billed under.
+fn on_demand_description(draft: &ProductDraft, rate_e10: u64) -> String {
+    let rate = display_rate(rate_e10);
+    match compute_instance(draft) {
+        Some((operating_system, instance_type)) => format!(
+            "${rate} per On Demand {operating_system} {instance_type} Instance Hour"
+        ),
+        None => format!("${rate} per {} of {}", draft.unit, usage_of(draft)),
+    }
+}
+
+/// The sentence the Price List API puts on a RESERVED term's usage dimension: the rate
+/// the reservation is billed at, then the usage the reservation applies to.
+fn reserved_description(draft: &ProductDraft, rate_e10: u64) -> String {
+    let rate = display_rate(rate_e10);
+    match compute_instance(draft) {
+        Some((operating_system, instance_type)) => format!(
+            "USD {rate} per {}, {instance_type} reserved instance applied",
+            reserved_platform(operating_system)
+        ),
+        None => format!("USD {rate} per {} of {}", draft.unit, usage_of(draft)),
+    }
+}
+
+/// The platform a reserved compute term names: the Price List API writes the Linux
+/// platform as the UNIX-family name, and every other operating system under its own.
+fn reserved_platform(operating_system: &str) -> String {
+    if operating_system == "Linux" {
+        "Linux/UNIX (Amazon VPC)".to_string()
+    } else {
+        format!("{operating_system} (Amazon VPC)")
+    }
+}
+
+/// The `(operating system, instance type)` a product is a compute instance of, or
+/// `None` when it is not priced per instance.
+fn compute_instance(draft: &ProductDraft) -> Option<(&str, &str)> {
+    let operating_system = draft.attributes.get("operatingSystem")?;
+    let instance_type = draft.attributes.get("instanceType")?;
+    Some((operating_system.as_str(), instance_type.as_str()))
+}
+
+/// The usage a product's rate is billed under: its usage type, or its SKU when it
+/// carries none.
+fn usage_of(draft: &ProductDraft) -> &str {
+    draft
+        .attributes
+        .get("usagetype")
+        .map_or(draft.sku.as_str(), String::as_str)
 }
 
 /// The per-unit price dimension of one term, keyed by the rate code AWS derives from
@@ -891,6 +1040,21 @@ fn price_dimensions(
         }),
     );
     dimensions
+}
+
+/// The one-off fee dimension of a reserved term bought with an upfront payment, as
+/// `(rate code, dimension)`. It prices a quantity rather than usage, so it carries no
+/// range: the fee is paid once for the whole lease.
+fn upfront_fee_dimension(term_key: &str, fee_e10: u64) -> (String, serde_json::Value) {
+    let rate_code = format!("{term_key}.{UPFRONT_FEE_RATE_CODE}");
+    let dimension = serde_json::json!({
+        "rateCode": rate_code,
+        "unit": UPFRONT_FEE_UNIT,
+        "appliesTo": [],
+        "description": UPFRONT_FEE_DESCRIPTION,
+        "pricePerUnit": { "USD": rate_text(fee_e10) },
+    });
+    (rate_code, dimension)
 }
 
 /// The price-list file sets the catalog publishes: for every service, one per Region
@@ -1090,18 +1254,30 @@ const REGIONS: &[RegionSeed] = &[
     RegionSeed::new("us-west-1", "US West (N. California)", "USW1-", 118),
     RegionSeed::new("us-west-2", "US West (Oregon)", "USW2-", 100),
     RegionSeed::new("ca-central-1", "Canada (Central)", "CAN1-", 105),
+    RegionSeed::new("ca-west-1", "Canada West (Calgary)", "CAW1-", 105),
     RegionSeed::new("eu-west-1", "EU (Ireland)", "EU-", 110),
     RegionSeed::new("eu-west-2", "EU (London)", "EUW2-", 112),
     RegionSeed::new("eu-west-3", "EU (Paris)", "EUW3-", 112),
     RegionSeed::new("eu-central-1", "EU (Frankfurt)", "EUC1-", 115),
+    RegionSeed::new("eu-central-2", "EU (Zurich)", "EUC2-", 120),
     RegionSeed::new("eu-north-1", "EU (Stockholm)", "EUN1-", 104),
+    RegionSeed::new("eu-south-1", "EU (Milan)", "EUS1-", 112),
     RegionSeed::new("ap-northeast-1", "Asia Pacific (Tokyo)", "APN1-", 125),
     RegionSeed::new("ap-northeast-2", "Asia Pacific (Seoul)", "APN2-", 115),
+    RegionSeed::new("ap-northeast-3", "Asia Pacific (Osaka)", "APN3-", 125),
     RegionSeed::new("ap-southeast-1", "Asia Pacific (Singapore)", "APS1-", 120),
     RegionSeed::new("ap-southeast-2", "Asia Pacific (Sydney)", "APS2-", 122),
+    RegionSeed::new("ap-southeast-3", "Asia Pacific (Jakarta)", "APS4-", 120),
     RegionSeed::new("ap-south-1", "Asia Pacific (Mumbai)", "APS3-", 102),
+    RegionSeed::new("ap-south-2", "Asia Pacific (Hyderabad)", "APS5-", 102),
+    RegionSeed::new("ap-east-1", "Asia Pacific (Hong Kong)", "APE1-", 130),
     RegionSeed::new("sa-east-1", "South America (Sao Paulo)", "SAE1-", 155),
+    RegionSeed::new("af-south-1", "Africa (Cape Town)", "AFS1-", 130),
+    RegionSeed::new("il-central-1", "Israel (Tel Aviv)", "ILC1-", 112),
+    RegionSeed::new("me-central-1", "Middle East (UAE)", "MEC1-", 125),
+    RegionSeed::new("me-south-1", "Middle East (Bahrain)", "MES1-", 125),
     RegionSeed::new("cn-north-1", "China (Beijing)", "CNN1-", 108),
+    RegionSeed::new("cn-northwest-1", "China (Ningxia)", "CNW1-", 108),
 ];
 
 /// The Regions a service with one usage type per Region is priced in.
@@ -1154,6 +1330,7 @@ const EC2_INSTANCE_TYPES: &[InstanceTypeSeed] = &[
     InstanceTypeSeed::new("t2.micro", "General purpose", "1", "1 GiB", "Intel Xeon Family", "No", 116_000_000),
     InstanceTypeSeed::new("t2.small", "General purpose", "1", "2 GiB", "Intel Xeon Family", "No", 230_000_000),
     InstanceTypeSeed::new("t2.medium", "General purpose", "2", "4 GiB", "Intel Xeon Family", "No", 464_000_000),
+    InstanceTypeSeed::new("t3.nano", "General purpose", "2", "0.5 GiB", "Intel Skylake E5 2686 v5", "Yes", 52_000_000),
     InstanceTypeSeed::new("t3.micro", "General purpose", "2", "1 GiB", "Intel Skylake E5 2686 v5", "Yes", 104_000_000),
     InstanceTypeSeed::new("t3.small", "General purpose", "2", "2 GiB", "Intel Skylake E5 2686 v5", "Yes", 208_000_000),
     InstanceTypeSeed::new("t3.medium", "General purpose", "2", "4 GiB", "Intel Skylake E5 2686 v5", "Yes", 416_000_000),
@@ -1173,6 +1350,35 @@ fn instance_type_seed(name: &str) -> Option<&'static InstanceTypeSeed> {
     EC2_INSTANCE_TYPES
         .iter()
         .find(|seed| seed.instance_type == name)
+}
+
+/// The normalized-unit factor AWS publishes for the SIZES in an instance type's name.
+///
+/// AWS documents the normalization factors reserved-instance size flexibility is
+/// computed in (nano 0.25 through xlarge 8), and every `<n>xlarge` is `n` times the
+/// xlarge factor. The table is the published one, keyed by the size in the type name.
+const SIZE_FACTORS: &[(&str, &str)] = &[
+    ("nano", "0.25"),
+    ("micro", "0.5"),
+    ("small", "1"),
+    ("medium", "2"),
+    ("large", "4"),
+    ("xlarge", "8"),
+];
+
+/// The `normalizationSizeFactor` attribute of an instance type, or `NA` for a size the
+/// published factor table does not cover.
+fn normalization_size_factor(instance_type: &str) -> String {
+    let Some((_, size)) = instance_type.split_once('.') else {
+        return "NA".to_string();
+    };
+    if let Some((_, factor)) = SIZE_FACTORS.iter().find(|(name, _)| *name == size) {
+        return (*factor).to_string();
+    }
+    // `<n>xlarge` is n times the xlarge factor, as the published table continues.
+    size.strip_suffix("xlarge")
+        .and_then(|multiple| multiple.parse::<u64>().ok())
+        .map_or_else(|| "NA".to_string(), |multiple| (multiple * 8).to_string())
 }
 
 /// Which instance types the catalog prices in one Region under one operating system.
@@ -1208,9 +1414,16 @@ impl ComputePlan {
     }
 }
 
-/// The compute instances the catalog prices. Every Region carries the entry-level
-/// burstable type, so `location` enumerates every Region the catalog publishes; the
-/// larger Regions carry more of the type list, and `us-east-1` carries all of it.
+/// The instance types every Region in the catalog prices under Linux: the entry-level
+/// burstable sizes, which AWS offers in every commercial Region. Every Region therefore
+/// prices them, so a filtered lookup for one of them matches a product per Region —
+/// more than one page's worth — and `location` enumerates every Region the catalog
+/// publishes.
+const BURSTABLE_EVERYWHERE: &[&str] = &["t3.nano", "t3.micro"];
+
+/// The compute instances the catalog prices. Every Region carries
+/// [`BURSTABLE_EVERYWHERE`]; the larger Regions carry more of the type list, and
+/// `us-east-1` carries all of it.
 const EC2_COMPUTE_PLAN: &[ComputePlan] = &[
     ComputePlan::new(
         "us-east-1",
@@ -1219,10 +1432,11 @@ const EC2_COMPUTE_PLAN: &[ComputePlan] = &[
         "RunInstances",
         100,
         &[
+            "t3.nano",
+            "t3.micro",
             "t2.micro",
             "t2.small",
             "t2.medium",
-            "t3.micro",
             "t3.small",
             "t3.medium",
             "t3.large",
@@ -1236,24 +1450,37 @@ const EC2_COMPUTE_PLAN: &[ComputePlan] = &[
             "m6g.large",
         ],
     ),
-    ComputePlan::new("us-east-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro", "m5.large"]),
-    ComputePlan::new("us-west-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro", "m5.large"]),
-    ComputePlan::new("us-west-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro", "m5.large", "c5.large"]),
+    ComputePlan::new("us-east-1", "Windows", LICENSE_INCLUDED, "RunInstances:0002", 200, &["t3.nano", "t3.micro", "m5.large"]),
+    ComputePlan::new("us-east-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.nano", "t3.micro", "m5.large"]),
+    ComputePlan::new("us-west-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("us-west-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.nano", "t3.micro", "m5.large", "c5.large"]),
     ComputePlan::new("us-west-2", "Windows", LICENSE_INCLUDED, "RunInstances:0002", 200, &["m5.large"]),
-    ComputePlan::new("ca-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro"]),
-    ComputePlan::new("eu-west-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro", "t3.small", "m5.large"]),
-    ComputePlan::new("eu-west-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro"]),
-    ComputePlan::new("eu-west-3", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro"]),
-    ComputePlan::new("eu-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro", "m5.large"]),
-    ComputePlan::new("eu-north-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro"]),
-    ComputePlan::new("ap-northeast-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro", "m5.large"]),
+    ComputePlan::new("ca-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("ca-west-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("eu-west-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.nano", "t3.micro", "t3.small", "m5.large"]),
+    ComputePlan::new("eu-west-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("eu-west-3", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("eu-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.nano", "t3.micro", "m5.large"]),
+    ComputePlan::new("eu-central-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("eu-north-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("eu-south-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("ap-northeast-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.nano", "t3.micro", "m5.large"]),
     ComputePlan::new("ap-northeast-1", "Windows", LICENSE_INCLUDED, "RunInstances:0002", 200, &["m5.large"]),
-    ComputePlan::new("ap-northeast-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro"]),
-    ComputePlan::new("ap-southeast-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro", "m5.large"]),
-    ComputePlan::new("ap-southeast-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro"]),
-    ComputePlan::new("ap-south-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro"]),
-    ComputePlan::new("sa-east-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro"]),
-    ComputePlan::new("cn-north-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro"]),
+    ComputePlan::new("ap-northeast-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("ap-northeast-3", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("ap-southeast-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("ap-southeast-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("ap-southeast-3", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("ap-south-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("ap-south-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("ap-east-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("sa-east-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("af-south-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("il-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("me-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("me-south-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("cn-north-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("cn-northwest-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
 ];
 
 // --- AmazonEC2: EBS volumes ------------------------------------------------
@@ -1497,6 +1724,10 @@ fn ec2_products() -> Vec<Product> {
                     ("location", region.location.to_string()),
                     ("locationType", AWS_REGION_LOCATION_TYPE.to_string()),
                     ("memory", instance.memory.to_string()),
+                    (
+                        "normalizationSizeFactor",
+                        normalization_size_factor(instance.instance_type),
+                    ),
                     ("operatingSystem", plan.operating_system.to_string()),
                     ("operation", plan.operation.to_string()),
                     ("physicalProcessor", instance.physical_processor.to_string()),

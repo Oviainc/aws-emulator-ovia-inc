@@ -150,6 +150,7 @@ async fn get_attribute_values_returns_the_distinct_values_of_the_attribute() {
                 "t3.large",
                 "t3.medium",
                 "t3.micro",
+                "t3.nano",
                 "t3.small",
             ],
         ),

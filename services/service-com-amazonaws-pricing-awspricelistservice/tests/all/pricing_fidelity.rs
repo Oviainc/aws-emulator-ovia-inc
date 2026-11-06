@@ -34,6 +34,45 @@ fn on_demand_filters(instance_type: &str) -> Value {
     ])
 }
 
+/// Every `pricePerUnit.USD` rate stated in `unit` by one term's price dimensions.
+///
+/// A term's usage dimensions and the one-off fee an upfront purchase option pays are
+/// different units, so a rule about one must not read the other.
+fn term_rates_in_unit(term: &Value, unit: &str) -> Vec<f64> {
+    term.get("priceDimensions")
+        .and_then(Value::as_object)
+        .map(|dimensions| {
+            dimensions
+                .values()
+                .filter(|dimension| {
+                    dimension.get("unit").and_then(Value::as_str) == Some(unit)
+                })
+                .filter_map(|dimension| {
+                    dimension
+                        .pointer("/pricePerUnit/USD")?
+                        .as_str()?
+                        .parse::<f64>()
+                        .ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every `pricePerUnit.USD` rate stated in `unit` across a term block keyed by offer
+/// term code.
+fn rates_in_unit(terms: &Value, unit: &str) -> Vec<f64> {
+    terms
+        .as_object()
+        .map(|by_term| {
+            by_term
+                .values()
+                .flat_map(|term| term_rates_in_unit(term, unit))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Every `pricePerUnit.USD` rate in one term block of an offer document.
 fn usd_rates(terms: &Value) -> Vec<f64> {
     terms
@@ -458,35 +497,70 @@ async fn a_reservable_product_carries_every_term_type_it_is_offered_under() {
                         "case {sku}/{key}: expected a published lease length, got {lease:?}"
                     );
                 }
-                let leases: BTreeSet<&str> = terms
+                // Reserved pricing is published per lease length, offering class AND
+                // purchase option, so every term states its own combination of the three.
+                let offers: BTreeSet<(String, String, String)> = terms
                     .values()
                     .filter_map(|term| {
-                        term.pointer("/termAttributes/LeaseContractLength")?.as_str()
+                        let attributes = term.pointer("/termAttributes")?;
+                        let text = |name: &str| {
+                            attributes
+                                .get(name)
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        };
+                        Some((
+                            text("LeaseContractLength")?,
+                            text("OfferingClass")?,
+                            text("PurchaseOption")?,
+                        ))
                     })
                     .collect();
                 assert_eq!(
-                    leases.len(),
+                    offers.len(),
                     terms.len(),
-                    "case {sku}: each reserved term must state its own lease length, got \
-                     {leases:?}"
+                    "case {sku}: each reserved term must state its own lease, offering class \
+                     and purchase option, got {offers:?}"
                 );
-                let reserved_rates = usd_rates(reserved);
-                assert!(
-                    !reserved_rates.is_empty()
-                        && reserved_rates.iter().all(|rate| *rate > 0.0),
-                    "case {sku}: expected positive reserved rates, got {reserved_rates:?}"
-                );
+
+                // The usage a reservation is billed for is priced in the same unit as the
+                // on-demand term, and below it.
+                let reserved_rates = rates_in_unit(reserved, "Hrs");
                 let cheapest_on_demand = on_demand_rates
                     .iter()
                     .copied()
                     .fold(f64::INFINITY, f64::min);
                 assert!(
-                    reserved_rates
-                        .iter()
-                        .all(|rate| *rate < cheapest_on_demand),
-                    "case {sku}: a reservation must price below on demand, {reserved_rates:?} \
-                     against {cheapest_on_demand}"
+                    !reserved_rates.is_empty()
+                        && reserved_rates
+                            .iter()
+                            .all(|rate| *rate < cheapest_on_demand),
+                    "case {sku}: a reservation must price its usage below on demand, \
+                     {reserved_rates:?} against {cheapest_on_demand}"
                 );
+
+                // An upfront payment is a one-off fee stated as a Quantity, so only a term
+                // whose purchase option pays one carries that dimension.
+                for (key, term) in terms {
+                    let option = term
+                        .pointer("/termAttributes/PurchaseOption")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let fees = term_rates_in_unit(term, "Quantity");
+                    if option == "No Upfront" {
+                        assert!(
+                            fees.is_empty(),
+                            "case {sku}/{key}: a no-upfront term pays no upfront fee, got \
+                             {fees:?}"
+                        );
+                    } else {
+                        assert!(
+                            fees.len() == 1 && fees[0] > 0.0,
+                            "case {sku}/{key}: {option} must pay exactly one positive \
+                             upfront fee, got {fees:?}"
+                        );
+                    }
+                }
                 reservable += 1;
             }
             None => {
