@@ -71,6 +71,8 @@ mod schema_extension_cancellation;
 mod schema_extensions;
 #[path = "all/shared_directories.rs"]
 mod shared_directories;
+#[path = "all/single_sign_on.rs"]
+mod single_sign_on;
 #[path = "all/snapshot_deletion.rs"]
 mod snapshot_deletion;
 #[path = "all/snapshots.rs"]

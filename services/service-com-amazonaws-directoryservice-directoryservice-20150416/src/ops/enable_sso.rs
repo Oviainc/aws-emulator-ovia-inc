@@ -1,15 +1,46 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableSso
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableSso`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableSso::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Turns single sign-on on for a stored directory, by recording it on the directory
+//! record: `DescribeDirectories` is what reports it back, as the `SsoEnabled` member of
+//! the directory's description. The flag is the whole of the change, and there is no
+//! transient status between the two values, so the enable is in force the instant it
+//! answers.
+//!
+//! The modelled `DirectoryId` pattern is refused by the framework's boundary validator
+//! BEFORE this handler runs, so a well-formed request reaches directory resolution: an
+//! id no directory is stored under is refused with `EntityDoesNotExistException`, the
+//! shared sentence this service states for a directory a call cannot reach.
+//!
+//! Two preconditions stand between a resolved directory and the flag, in the order a
+//! service that authenticates before it evaluates applies them:
+//!
+//! * `UserName`/`Password` are an ALTERNATE directory account's credentials, which the
+//!   service authenticates against the directory itself before it acts on its behalf.
+//!   This emulator holds no directory account credentials at all — the administrator
+//!   password `CreateDirectory` is called with is deliberately not stored, and no
+//!   operation of this service reports or verifies one — so an alternate account can
+//!   never be authenticated and a request that supplies one is refused with the modelled
+//!   `AuthenticationFailedException`. A request that supplies neither member asks the
+//!   service to act as its own service account, which needs no authentication.
+//! * single sign-on needs the directory's access URL, which exists only once an alias
+//!   has been assigned: `CreateAlias` is what assigns one, and until then the directory's
+//!   `Alias` is the directory id itself. Of the errors this operation models that is the
+//!   generic client-side precondition failure, `ClientException`.
+//!
+//! No stage is required beyond that: the model declares no `DirectoryUnavailableException`
+//! for this operation, and the one prerequisite single sign-on has is the access URL,
+//! which `CreateAlias` can assign while the directory is still being built.
+//!
+//! A second enable of a directory whose single sign-on is already on is not refused: the
+//! request asks for the state the directory is already in, the modelled output carries
+//! no members, and nothing in the record changes.
+//!
+//! The remaining modelled error, `InsufficientPermissionsException`, is never answered
+//! here: this service evaluates no caller identity and no permission of one, so there is
+//! no under-privileged caller for it to report. The variant's presence in the error enum
+//! is the model's, not an enforcement this handler performs.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +183,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableSso` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableSsoErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableSso"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        // Single sign-on is a property OF a directory, so the directory is resolved
+        // first: an id naming none is the modelled "specified entity could not be
+        // found", worded with this service's shared sentence for a directory a call
+        // cannot reach.
+        let directory = store
+            .directories
+            .get_mut(&input.directory_id)
+            .ok_or_else(|| {
+                EnableSsoErrorModeled::EntityDoesNotExistException(crate::state::refusal(
+                    crate::state::no_such_directory(&input.directory_id),
+                ))
+            })?;
+
+        // `UserName`/`Password` name an ALTERNATE directory account, which has to be
+        // authenticated against the directory before this service acts on its behalf,
+        // and this emulator holds no directory account credentials to authenticate one
+        // against — see this module's documentation. Neither member is stored, logged or
+        // reported back.
+        if input.user_name.is_some() || input.password.is_some() {
+            return Err(
+                EnableSsoErrorModeled::AuthenticationFailedException(crate::state::refusal(
+                    AUTHENTICATION_FAILED,
+                ))
+                .into(),
+            );
+        }
+
+        // The access URL single sign-on signs users in at is derived from the directory's
+        // alias, so a directory that has none cannot have it turned on. A directory with
+        // no alias assigned reports the directory id as its `Alias`, which is how a
+        // caller observes the same condition.
+        if directory.alias.is_none() {
+            return Err(
+                EnableSsoErrorModeled::ClientException(crate::state::refusal(alias_required(
+                    &input.directory_id,
+                )))
+                .into(),
+            );
+        }
+
+        directory.sso_enabled = true;
+
+        Ok(EnableSsoOutput {})
     }
+}
+
+/// The diagnostic of the modelled `AuthenticationFailedException`: the sentence the
+/// error shape's own documentation states for this class
+/// (`smithy_query(query="doc",shape="AuthenticationFailedException")`), which is what
+/// Directory Service answers when it could not authenticate the account a call carried.
+/// It names nothing of the request: which member of a credential pair was wrong is
+/// exactly what an authentication failure does not disclose.
+/// [`crate::state::refusal`] appends the request id, once.
+const AUTHENTICATION_FAILED: &str = "An authentication error occurred.";
+
+/// The `ClientException` diagnostic for a directory whose access URL does not exist yet.
+///
+/// The fixed text, and the `DomainId=` label Directory Service spells the directory id
+/// with in this family of diagnostics, are the wording a recorded refusal of this
+/// precondition carries. The one variable part is the id, taken from the request — never
+/// from a recording — so the sentence names the directory the caller has to fix and
+/// nothing else. [`crate::state::refusal`] appends the request id, once.
+fn alias_required(directory_id: &str) -> String {
+    format!("An alias is required before enabling SSO. DomainId={directory_id}")
 }
