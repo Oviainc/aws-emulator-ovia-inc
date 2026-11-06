@@ -2328,8 +2328,13 @@ fn map_key_refusal<'a>(
         let _ = validator.write_string(schema, key);
         for violation in validator.into_violations() {
             // A clause this report already states is not a second error, so the key it
-            // came from is not kept either.
-            if stated.insert(validation_clause(&violation)) {
+            // came from is not kept either. A map KEY is judged on its own, against the
+            // one restated member schema this walk ran, so the clause it renders is read
+            // off that one violation.
+            if stated.insert(validation_clause(
+                &violation,
+                ::std::slice::from_ref(&violation),
+            )) {
                 violations.push(violation);
             }
         }
@@ -2847,8 +2852,19 @@ pub fn validation_report(violations: &[Violation]) -> String {
     // walk of everything stated so far: a report over many violations is then rendered
     // in time proportional to how many there are.
     let mut stated: BTreeSet<String> = BTreeSet::new();
+    // The collection members already stated. A collection's clause is its ELEMENT
+    // SHAPE's whole constraint set, so it is the same clause whichever of its elements
+    // failed and however many did: rendering it a second time can state nothing new,
+    // and skipping that is what keeps a report over many failing elements from reading
+    // the whole report once per element.
+    let mut collections: BTreeSet<&str> = BTreeSet::new();
     for violation in violations {
-        let clause = validation_clause(violation);
+        if let Some(collection) = collection_of_element(&violation.path) {
+            if !collections.insert(collection) {
+                continue;
+            }
+        }
+        let clause = validation_clause(violation, violations);
         // AWS reports one error per failing MEMBER. Two violations of the same
         // collection member render the same clause (the composed constraint set of its
         // elements), so the second is not a second error.
@@ -2864,8 +2880,13 @@ pub fn validation_report(violations: &[Violation]) -> String {
 /// A violation found on a scalar ELEMENT of a list is reported at the COLLECTION
 /// member, because the rule the element failed belongs to the collection's declared
 /// element constraints; anything else is reported at the member itself.
-fn validation_clause(violation: &Violation) -> String {
-    collection_element_clause(violation).unwrap_or_else(|| scalar_clause(violation))
+///
+/// `report` is every violation the walk raised for this request: the composed
+/// requirement an element clause states is a property of the ELEMENT SHAPE rather than
+/// of one failing element, and which element shape a member holds is read off the whole
+/// report ([`composed_requirements`]).
+fn validation_clause(violation: &Violation, report: &[Violation]) -> String {
+    collection_element_clause(violation, report).unwrap_or_else(|| scalar_clause(violation))
 }
 
 /// The clause for a member that failed one of its own constraints: the member and what
@@ -2889,11 +2910,11 @@ fn scalar_clause(violation: &Violation) -> String {
 /// It is reported at the collection member's path — never the element's position —
 /// with the element shape's COMPLETE declared constraint set composed into one
 /// requirement, whichever member of that set the element actually failed.
-fn collection_element_clause(violation: &Violation) -> Option<String> {
+fn collection_element_clause(violation: &Violation, report: &[Violation]) -> Option<String> {
     let collection = collection_of_element(&violation.path)?;
     Some(format!(
         "Value at '{collection}' {CONSTRAINT_MARKER}{COMPOSED_MARKER}[{}]",
-        composed_requirements(collection, violation).join(", ")
+        composed_requirements(collection, report).join(", ")
     ))
 }
 
@@ -2910,15 +2931,28 @@ fn collection_of_element(path: &str) -> Option<&str> {
     indexed.then_some(collection)
 }
 
-/// The composed constraint list AWS states for an element of `collection`: the element
-/// shape's own constraints, in the order AWS lists them (length ceiling, then length
-/// floor, then pattern).
+/// The composed constraint list AWS states for an element of `collection`: the
+/// constraints of the element shape THAT list declares, in the order AWS lists them
+/// (length ceiling, then length floor, then pattern).
+///
+/// A member path does not name an element shape on its own — two operations can bind
+/// one path to lists whose elements are different shapes — so the path only narrows the
+/// candidates and the REPORT names the shape among them ([`element_constraints`]). The
+/// clause then states the rules the caller's value was really judged by rather than
+/// another list's; where the report names none of them, it states what every candidate
+/// declares alike, so a stated requirement is one the request has to satisfy whichever
+/// of those lists carried it.
 ///
 /// A list this service's inputs declare no element constraints for falls back to the
-/// one requirement the walk found, stated in the same composed form, so a constraint
-/// kind the framework adds later is reported rather than dropped.
-fn composed_requirements(collection: &str, violation: &Violation) -> Vec<String> {
-    match element_constraints(collection) {
+/// requirements the walk did report for that member, stated in the same composed form,
+/// so a constraint kind the framework adds later is reported rather than dropped.
+///
+/// Reading the whole report for one clause is bounded work: the walk hands over at most
+/// a fixed number of violations (`aws_smithy_schema_server::constraints` caps them), and
+/// a clause is rendered once per failing MEMBER rather than once per failing element.
+fn composed_requirements(collection: &str, report: &[Violation]) -> Vec<String> {
+    let trail = member_trail(collection);
+    match element_constraints(&trail, report) {
         Some(constraints) => {
             let mut requirements = Vec::new();
             if let Some(max) = constraints.max_length {
@@ -2927,15 +2961,85 @@ fn composed_requirements(collection: &str, violation: &Violation) -> Vec<String>
             if let Some(min) = constraints.min_length {
                 requirements.push(framework_requirement(&ViolationKind::MinLength(min)));
             }
-            if let Some(pattern) = constraints.pattern {
+            // The expression the walk judged by takes precedence over the declared one,
+            // so an element shape this service has not restated is still worded by the
+            // rule the request was judged against.
+            let judged = judged_pattern(&trail, report);
+            if let Some(pattern) = judged.or(constraints.pattern) {
                 requirements.push(pattern_requirement(&composed_pattern(pattern)));
             }
             requirements
         }
-        None => vec![match &violation.kind {
+        None => reported_requirements(&trail, report),
+    }
+}
+
+/// The `@pattern` the validating walk judged the elements of the list member `trail`
+/// names by, when an element failed it.
+///
+/// The walk reads that expression off the element shape of the list the request
+/// actually carried, so the expression NAMES that shape; the member path does not,
+/// because two operations can bind one path to lists whose element shapes declare
+/// different expressions. `None` when no element of that member failed a pattern — a
+/// length failure alone says nothing about which of those lists it came from.
+fn judged_pattern<'a>(trail: &'a str, report: &'a [Violation]) -> Option<&'a str> {
+    element_violations(trail, report).find_map(|violation| match &violation.kind {
+        ViolationKind::Pattern(pattern) => Some(pattern.as_str()),
+        _ => None,
+    })
+}
+
+/// Every violation in `report` found on a scalar element of the list member `trail`
+/// names, whichever position inside that member held the element.
+///
+/// The element shape belongs to the MEMBER, so what an element at one position failed
+/// states the same shape's rules as an element at another: a report naming several
+/// positions of one member describes one element shape, and every clause it states for
+/// that member composes the same constraint set.
+fn element_violations<'a>(
+    trail: &'a str,
+    report: &'a [Violation],
+) -> impl Iterator<Item = &'a Violation> + 'a {
+    report.iter().filter(move |violation| {
+        collection_of_element(&violation.path)
+            .is_some_and(|collection| member_trail(collection) == trail)
+    })
+}
+
+/// The composed list for a member whose elements this service declares no constraints
+/// for: every requirement the walk DID report for that member's elements, stated once
+/// each and ordered as AWS lists a composed set ([`composed_position`]).
+///
+/// Stating the whole reported set rather than one violation's requirement keeps the
+/// clause a property of the member: two elements of one member that failed two
+/// different rules are one error, as they are for a member whose element constraints
+/// are declared.
+fn reported_requirements(trail: &str, report: &[Violation]) -> Vec<String> {
+    let mut kinds: Vec<&ViolationKind> = Vec::new();
+    for violation in element_violations(trail, report) {
+        if !kinds.contains(&&violation.kind) {
+            kinds.push(&violation.kind);
+        }
+    }
+    kinds.sort_by_key(|kind| composed_position(kind));
+    kinds
+        .iter()
+        .map(|kind| match kind {
             ViolationKind::Pattern(pattern) => pattern_requirement(&composed_pattern(pattern)),
             kind => framework_requirement(kind),
-        }],
+        })
+        .collect()
+}
+
+/// Where a constraint kind sits in a composed constraint list: the order AWS states one
+/// in (length ceiling, length floor, then pattern), with any other kind after those, in
+/// the order the walk reported it.
+fn composed_position(kind: &ViolationKind) -> u8 {
+    match kind {
+        ViolationKind::MaxLength(_) => 0,
+        ViolationKind::MinLength(_) => 1,
+        ViolationKind::Pattern(_) => 2,
+        _ => 3,
     }
 }
 
@@ -2995,7 +3099,7 @@ fn framework_requirement(kind: &ViolationKind) -> String {
 
 /// The own constraints of the scalar ELEMENT of a constrained list, as AWS's composed
 /// collection-constraint list states them.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ElementConstraints {
     /// The element shape's `@length` maximum, if it declares one.
     max_length: Option<i64>,
@@ -3006,25 +3110,46 @@ struct ElementConstraints {
 }
 
 /// Every list in this service's INPUTS whose element shape carries its own
-/// constraints, keyed by the list member's dotted path with the collection steps
-/// stripped ([`member_trail`]), so one entry covers that member however deeply it is
-/// nested.
+/// constraints, under the list member's dotted path with the collection steps stripped
+/// ([`member_trail`]), so one entry covers that member however deeply it is nested.
 ///
-/// Source: `smithy_query(query="closure",operation="ListDeployments,UntagResource",
+/// A trail does NOT name one element shape: `ListDeployments$filters[].values` and
+/// `ListDeploymentPatternVersions$filters[].values` are both `filters.values`, and the
+/// two lists declare different expressions for their elements. So a trail may carry
+/// several entries, and the entry a refusal is worded by is the one the report names,
+/// or what every entry at that trail declares alike where it names none
+/// ([`element_constraints`]).
+///
+/// Source: `smithy_query(query="operation",operation="ListDeployments,\
+/// ListDeploymentPatternVersions,UntagResource")` and
+/// `smithy_query(query="shape",shape="DeploymentFilterValues,\
+/// DeploymentPatternVersionFilterValues,TagKeyList",
 /// model_path="services/service-com-amazonaws-launchwizard-launchwizard/smithy-model/\
-/// com-amazonaws-launchwizard-launchwizard.json")`. Those two operations hold the only
-/// input lists in the model whose element shape is constrained; every other input list
-/// (`DeploymentFilterList`) carries a structure element whose own members are reported
-/// under their own names.
+/// com-amazonaws-launchwizard-launchwizard.json")`. Those three operations hold every
+/// input list in the model whose element shape is constrained; the two input lists of
+/// filters themselves (`DeploymentFilterList`, `FilterList`) carry a structure element
+/// whose own members are reported under their own names.
 const LIST_ELEMENT_CONSTRAINTS: &[(&str, ElementConstraints)] = &[
     // `DeploymentFilter$values` -> `DeploymentFilterValues`, element
-    // `DeploymentFilterValue`: @length 1..100, @pattern `(^(([A-Za-z])+([0-9A-Za-z\-\_])+)$)`.
+    // `DeploymentFilterValue`: @length 1..100.
     (
-        "filters.values",
+        FILTER_VALUES_TRAIL,
         ElementConstraints {
-            max_length: Some(100),
-            min_length: Some(1),
-            pattern: Some(r"(^(([A-Za-z])+([0-9A-Za-z\-\_])+)$)"),
+            max_length: Some(FILTER_VALUE_MAX_LEN),
+            min_length: Some(FILTER_VALUE_MIN_LEN),
+            pattern: Some(DEPLOYMENT_FILTER_VALUE_PATTERN),
+        },
+    ),
+    // `DeploymentPatternVersionFilter$values` -> `DeploymentPatternVersionFilterValues`,
+    // element `DeploymentPatternVersionFilterValue`: @length 1..100. Its expression is a
+    // dotted version, which is not a value the sibling entry's expression can ever
+    // match — the two lists admit disjoint sets of values under one member trail.
+    (
+        FILTER_VALUES_TRAIL,
+        ElementConstraints {
+            max_length: Some(FILTER_VALUE_MAX_LEN),
+            min_length: Some(FILTER_VALUE_MIN_LEN),
+            pattern: Some(DEPLOYMENT_PATTERN_VERSION_FILTER_VALUE_PATTERN),
         },
     ),
     // `UntagResourceInput$tagKeys` -> `TagKeyList`, element `TagKey`. `TagKey`'s rules
@@ -3041,14 +3166,80 @@ const LIST_ELEMENT_CONSTRAINTS: &[(&str, ElementConstraints)] = &[
     ),
 ];
 
-/// The declared element constraints of the list at `collection_path`, if the model
-/// gives its elements any.
-fn element_constraints(collection_path: &str) -> Option<ElementConstraints> {
-    let trail = member_trail(collection_path);
-    LIST_ELEMENT_CONSTRAINTS
+/// The member trail both filter-value lists reduce to — the collision
+/// [`element_constraints`] resolves, named once so the entries that share it say so.
+const FILTER_VALUES_TRAIL: &str = "filters.values";
+
+/// `DeploymentFilterValue`'s `@length` bounds, which
+/// `DeploymentPatternVersionFilterValue` declares as well
+/// (`smithy_query(query="shape",shape="DeploymentFilterValue,\
+/// DeploymentPatternVersionFilterValue")`: both @length 1..100).
+const FILTER_VALUE_MIN_LEN: i64 = 1;
+/// See [`FILTER_VALUE_MIN_LEN`].
+const FILTER_VALUE_MAX_LEN: i64 = 100;
+
+/// `DeploymentFilterValue`'s `@pattern`, verbatim as the model spells it.
+const DEPLOYMENT_FILTER_VALUE_PATTERN: &str = r"(^(([A-Za-z])+([0-9A-Za-z\-\_])+)$)";
+
+/// `DeploymentPatternVersionFilterValue`'s `@pattern`, verbatim as the model spells it:
+/// a dotted version, which is what an `updateFromVersion` filter value names.
+const DEPLOYMENT_PATTERN_VERSION_FILTER_VALUE_PATTERN: &str =
+    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$";
+
+
+/// The element shape of the list member `trail` names, as THIS report identifies it, or
+/// `None` when the model constrains that member's elements not at all.
+///
+/// A trail can cover several element shapes ([`LIST_ELEMENT_CONSTRAINTS`]) and the
+/// refusal has to state constraints that hold of the request, so the shape is read off
+/// the report: the expression the walk judged an element by names it outright
+/// ([`judged_pattern`]), because the walk read that expression off the element shape of
+/// the list the request carried.
+///
+/// Where the report names none of them — a length failure says nothing about which of
+/// those lists it came from — the answer is what every shape the trail covers declares
+/// ALIKE ([`shared_constraints`]): a requirement they agree on is true of the request
+/// whichever list carried it, and one they disagree on is not known to be, and a refusal
+/// must not state a rule the request may not have been judged by at all. A trail
+/// covering one shape is the same statement over one candidate, so it answers that
+/// shape's whole set.
+fn element_constraints(trail: &str, report: &[Violation]) -> Option<ElementConstraints> {
+    let at_trail: Vec<ElementConstraints> = LIST_ELEMENT_CONSTRAINTS
         .iter()
-        .find(|(member, _)| *member == trail)
+        .filter(|(member, _)| *member == trail)
         .map(|(_, constraints)| *constraints)
+        .collect();
+    if let Some(judged) = judged_pattern(trail, report) {
+        let named = at_trail
+            .iter()
+            .find(|constraints| constraints.pattern.is_some_and(|declared| declared == judged));
+        if let Some(named) = named {
+            return Some(*named);
+        }
+    }
+    shared_constraints(&at_trail)
+}
+
+/// The constraints every one of `candidates` declares alike, and `None` when there are
+/// no candidates at all.
+///
+/// A constraint they do not agree on is dropped rather than picked from one of them: the
+/// composed requirement is what the caller is told to satisfy, so it may hold only what
+/// is true of the request whichever of those shapes judged it.
+fn shared_constraints(candidates: &[ElementConstraints]) -> Option<ElementConstraints> {
+    let mut shared = *candidates.first()?;
+    for other in candidates.iter().skip(1) {
+        if other.max_length != shared.max_length {
+            shared.max_length = None;
+        }
+        if other.min_length != shared.min_length {
+            shared.min_length = None;
+        }
+        if other.pattern != shared.pattern {
+            shared.pattern = None;
+        }
+    }
+    Some(shared)
 }
 
 /// `path` with every collection step removed, leaving the trail of MEMBER names:

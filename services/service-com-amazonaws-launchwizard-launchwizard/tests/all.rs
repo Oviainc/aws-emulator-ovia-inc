@@ -41,6 +41,8 @@ mod dry_run_preflight;
 mod empty_collection_members;
 #[path = "all/filter_name_rule_single_source.rs"]
 mod filter_name_rule_single_source;
+#[path = "all/filter_value_element_expressions.rs"]
+mod filter_value_element_expressions;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/list_deployment_events_pagination.rs"]

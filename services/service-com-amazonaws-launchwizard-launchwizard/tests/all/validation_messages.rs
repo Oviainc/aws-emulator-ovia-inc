@@ -11,7 +11,9 @@
 //!    `^`/`$` the model spells "whole value" with.
 //! 2. A scalar ELEMENT of a list that failed the element shape's constraints is
 //!    reported at the COLLECTION member's path, with that shape's complete constraint
-//!    set composed into one requirement.
+//!    set composed into one requirement — or, where the report names none of the
+//!    element shapes a member path covers, with what those shapes declare alike
+//!    (`tests/all/filter_value_element_expressions.rs` owns that rule).
 //! 3. A `nextToken` this service cannot use is refused with one fixed sentence, because
 //!    the token is opaque.
 //!
@@ -46,7 +48,15 @@ fn conforming_specifications() -> Value {
 }
 
 /// The `Message` of a refusal, after requiring the modelled status and code.
-async fn refusal_message(harness: &Harness, case: &str, path: &str, body: Value) -> String {
+///
+/// `pub(crate)` so a suite about one of these rules drives the refusal through the same
+/// two requirements rather than restating them.
+pub(crate) async fn refusal_message(
+    harness: &Harness,
+    case: &str,
+    path: &str,
+    body: Value,
+) -> String {
     let reply = harness.refused(case, path, body, STATUS, CODE).await;
     message_of(case, &reply)
 }
@@ -217,9 +227,13 @@ fn scalar_clause(member: &str, requirement: &str) -> String {
 /// The composed requirement for an element of `DeploymentFilter$values`
 /// (`DeploymentFilterValues` of `DeploymentFilterValue`: @length 1..100, @pattern
 /// `(^(([A-Za-z])+([0-9A-Za-z\-\_])+)$)`).
-const FILTER_VALUE_CONSTRAINTS: &str = "[Member must have length less than or equal to 100, \
-     Member must have length greater than or equal to 1, Member must satisfy regular expression \
-     pattern: .*(^(([A-Za-z])+([0-9A-Za-z\\-\\_])+)$).*]";
+///
+/// `pub(crate)` so the one test-side statement of this constraint set is reachable from
+/// the other suites in this crate rather than restated in each of them.
+pub(crate) const FILTER_VALUE_CONSTRAINTS: &str =
+    "[Member must have length less than or equal to 100, Member must have length greater \
+     than or equal to 1, Member must satisfy regular expression pattern: \
+     .*(^(([A-Za-z])+([0-9A-Za-z\\-\\_])+)$).*]";
 
 /// The composed requirement for an element of `UntagResourceInput$tagKeys` (`TagKeyList`
 /// of `TagKey`: @length 1..128, @pattern `^[a-zA-Z0-9 _.:/=+@-]+$`) — an entry the issue
@@ -228,8 +242,25 @@ const TAG_KEY_CONSTRAINTS: &str = "[Member must have length less than or equal t
      Member must have length greater than or equal to 1, Member must satisfy regular expression \
      pattern: .*^[a-zA-Z0-9 _.:/=+@-]+$.*]";
 
+/// The composed requirement for an element of a `filters[].values` list the report does
+/// not name the element SHAPE of: the `@length` bounds `DeploymentFilterValue` and
+/// `DeploymentPatternVersionFilterValue` BOTH declare, and no expression, because the
+/// two shapes declare different ones and only one of them judged the request.
+///
+/// Reached by a value that breaks the length bounds alone: `ListDeployments$filters[]
+/// .values` and `ListDeploymentPatternVersions$filters[].values` are the same member
+/// path, and a length failure names neither list. `tests/all/
+/// filter_value_element_expressions.rs` is the suite about that rule; this constant is
+/// the row of this table that reaches it.
+pub(crate) const SHARED_FILTER_VALUE_CONSTRAINTS: &str =
+    "[Member must have length less than or equal to 100, Member must have length greater \
+     than or equal to 1]";
+
 /// The whole message for an element of the list at `collection`.
-fn composed_clause(collection: &str, constraints: &str) -> String {
+///
+/// `pub(crate)` so the one test-side statement of this wording is reachable from the
+/// other suites in this crate rather than restated in each of them.
+pub(crate) fn composed_clause(collection: &str, constraints: &str) -> String {
     format!(
         "1 validation error detected: Value at '{collection}' failed to satisfy constraint: \
          Member must satisfy constraint: {constraints}"
@@ -255,20 +286,26 @@ async fn a_list_element_is_reported_at_its_collection_with_the_composed_element_
     let too_long_value = "A".repeat(101);
     // Rows differ in which filter key carries the offending value, in the position of
     // the element inside its list, in the position of the list's own filter, and in
-    // WHICH of the element shape's three constraints the value broke — the composed
-    // requirement is the same every time, because it is the element shape's whole
-    // declared constraint set.
-    let rows: Vec<(&str, Value, &str)> = vec![
+    // WHICH of the element shape's three constraints the value broke. Each row states
+    // the constraints the REPORT names — the element shape's whole declared set where
+    // the value broke the expression the walk judged it by (which names that shape), and
+    // the set the two lists sharing this member path declare alike where it broke the
+    // length bounds alone (which names neither of them, since both declare 1..100 and
+    // different expressions). `tests/all/filter_value_element_expressions.rs` is the
+    // suite about that rule.
+    let rows: Vec<(&str, Value, &str, &str)> = vec![
         (
             "a DEPLOYMENT_STATUS value breaks the element pattern",
             json!({"filters": [{"name": "DEPLOYMENT_STATUS", "values": ["not a valid status!!"]}],
                    "maxResults": 10}),
             "filters.1.member.values",
+            FILTER_VALUE_CONSTRAINTS,
         ),
         (
             "a WORKLOAD_NAME value breaks the element pattern",
             json!({"filters": [{"name": "WORKLOAD_NAME", "values": ["not a valid name!!"]}]}),
             "filters.1.member.values",
+            FILTER_VALUE_CONSTRAINTS,
         ),
         (
             "the offending value is the second of two, in the second of two filters",
@@ -277,21 +314,28 @@ async fn a_list_element_is_reported_at_its_collection_with_the_composed_element_
                 {"name": "DEPLOYMENT_STATUS", "values": ["COMPLETED", "not a valid status!!"]},
             ]}),
             "filters.2.member.values",
+            FILTER_VALUE_CONSTRAINTS,
         ),
         (
+            // An empty element breaks the element EXPRESSION as well as the length
+            // floor, so the report names the element shape and the whole set is stated.
             "an element below the element length floor",
             json!({"filters": [{"name": "WORKLOAD_NAME", "values": [""]}]}),
             "filters.1.member.values",
+            FILTER_VALUE_CONSTRAINTS,
         ),
         (
+            // This one is inside both expressions, so only the ceiling is reported and
+            // the report names neither of the two lists.
             "an element one past the element length ceiling",
             json!({"filters": [{"name": "WORKLOAD_NAME", "values": [too_long_value.clone()]}]}),
             "filters.1.member.values",
+            SHARED_FILTER_VALUE_CONSTRAINTS,
         ),
     ];
 
-    for (case, body, collection) in rows {
-        let expected = composed_clause(collection, FILTER_VALUE_CONSTRAINTS);
+    for (case, body, collection, constraints) in rows {
+        let expected = composed_clause(collection, constraints);
         let message = refusal_message(&harness, case, "/listDeployments", body).await;
         assert_eq!(
             message, expected,
