@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEventSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEventSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEventSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports a stored EventSource from `crate::state`.
 //!
 //! ## Shape of an operation
 //!
@@ -110,9 +102,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // here — hence the `DescribeEventSourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridgev2#DescribeEventSource")]
+//
+// `InternalException` is widened in with `extra_errors`: this service declares it
+// as a common error for every operation (`AWSEventsV2`'s `errors` list), so it is
+// the modelled answer when the engine cannot hand back this service's store, but
+// the scaffold generated the enum from the OPERATION's own `errors` list only.
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridgev2#DescribeEventSource",
+    extra_errors = ["InternalException"]
+)]
 #[derive(Debug)]
 pub enum DescribeEventSourceErrorModeled {
+    InternalException(InternalException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
 
@@ -167,18 +168,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEventSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEventSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEventSource"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeEventSourceErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the event bus store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = store.lock();
+        // Reporting only: the sole write is materialising the bus lifecycle
+        // transitions the clock already made due, which is also what retires an
+        // EventSource whose bus has finished disappearing.
+        state.settle_lifecycles(now);
+
+        let Some(source) = state.event_source(&input.event_source_arn) else {
+            return Err(DescribeEventSourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "event source {} does not exist",
+                        input.event_source_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeEventSourceOutput {
+            event_source_arn: Some(source.arn.clone()),
+            name: Some(source.name.clone()),
+            event_bus_arn: Some(source.event_bus_arn.clone()),
+            configuration: Some(source.configuration.clone()),
+            description: source.description.clone(),
+            state: Some(source.state.wire_value().to_string()),
+            // `Revoked` reports that the bus owner has withdrawn this source.
+            // It is omitted while nobody has: the member carries the fact of a
+            // revocation, so a source that has not been revoked reports none.
+            revoked: source.revoked.then_some(true),
+            creation_time: Some(crate::state::to_date_time(source.creation_time)),
+            last_modified_time: Some(crate::state::to_date_time(source.last_modified_time)),
+        })
     }
 }

@@ -7,6 +7,14 @@
 //! `ListEventBuses` project it, `PutEvents` appends to its event log and
 //! `DeleteEventBus` retires it. Nothing in a handler is computed from the
 //! request alone — every field a response carries is read back out of here.
+//!
+//! The resources that hang off a bus live in their own modules, re-exported
+//! here so every handler reaches one store: [`event_sources`] holds the
+//! EventSource registry.
+
+mod event_sources;
+
+pub use event_sources::*;
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -271,6 +279,14 @@ pub struct ComAmazonawsEventbridgev2Awseventsv2State {
     /// token minted, which is what makes a retry replay the original bus
     /// instead of minting a second one.
     pub idempotency: BTreeMap<String, String>,
+    /// EventSources keyed by `EventSourceArn`, so an ARN-addressed read is
+    /// O(log n) and enumeration is in a stable order.
+    pub event_sources: BTreeMap<String, EventSource>,
+    /// [`idempotency_key`] -> the `EventSourceArn` the create carrying that
+    /// client token minted. Kept apart from [`Self::idempotency`] because a
+    /// client token is scoped to the request that carried it: the same token
+    /// used for a bus and for an EventSource names two different resources.
+    pub event_source_idempotency: BTreeMap<String, String>,
     /// How many service-assigned identifiers this store has handed out.
     ///
     /// This is what makes every minted id UNIQUE: [`Self::next_id_seed`] hands
@@ -317,6 +333,8 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
         for arn in completed_deletions {
             self.event_buses.remove(&arn);
             self.idempotency.retain(|_, minted| *minted != arn);
+            // An EventSource forwards onto one bus, so it goes with the bus.
+            self.forget_event_sources_of_bus(&arn);
         }
     }
 

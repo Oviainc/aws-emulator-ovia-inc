@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/event_bus_lifecycle.rs"]
 mod event_bus_lifecycle;
+#[path = "all/event_source_lifecycle.rs"]
+mod event_source_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

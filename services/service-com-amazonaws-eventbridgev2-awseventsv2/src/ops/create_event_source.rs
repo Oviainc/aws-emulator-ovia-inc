@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEventSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEventSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEventSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: attaches an EventSource to an ACTIVE event bus in `crate::state` and
+//! reports it back.
 //!
 //! ## Shape of an operation
 //!
@@ -123,11 +116,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // here — hence the `CreateEventSourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridgev2#CreateEventSource")]
+//
+// `InternalException` is widened in with `extra_errors`: this service declares it
+// as a common error for every operation (`AWSEventsV2`'s `errors` list), so it is
+// the modelled answer when the engine cannot hand back this service's store, but
+// the scaffold generated the enum from the OPERATION's own `errors` list only.
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridgev2#CreateEventSource",
+    extra_errors = ["InternalException"]
+)]
 #[derive(Debug)]
 pub enum CreateEventSourceErrorModeled {
     ConcurrentModificationException(ConcurrentModificationException),
     IdempotentParameterMismatchException(IdempotentParameterMismatchException),
+    InternalException(InternalException),
     InvalidStateException(InvalidStateException),
     LimitExceededException(LimitExceededException),
     ResourceAlreadyExistsException(ResourceAlreadyExistsException),
@@ -185,18 +187,186 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEventSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEventSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEventSource"))
+        // An EventSource lives in the region and account of the bus it forwards
+        // onto, which the request names by ARN, so nothing here is read from the
+        // request's own credential scope.
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateEventSourceErrorModeled::InternalException(InternalException {
+                message: Some("the event bus store is unavailable on this engine".to_string()),
+            })
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = store.lock();
+        state.settle_lifecycles(now);
+
+        // The bus the source forwards onto has to exist, and "The bus must be
+        // ACTIVE": a bus that is still provisioning or on its way out cannot
+        // take on a new source.
+        let Some(bus) = state.bus(&input.event_bus_arn) else {
+            return Err(CreateEventSourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("event bus {} does not exist", input.event_bus_arn)),
+                },
+            )
+            .into());
+        };
+        if bus.state != crate::state::BusLifecycleState::Active {
+            return Err(CreateEventSourceErrorModeled::InvalidStateException(
+                InvalidStateException {
+                    message: Some(format!(
+                        "event bus {} is in state {} and cannot accept an event source",
+                        bus.arn,
+                        bus.state.wire_value()
+                    )),
+                },
+            )
+            .into());
+        }
+        let bus_arn = bus.arn.clone();
+        let region = bus.region.clone();
+
+        // A retry carrying the same ClientToken replays the EventSource that
+        // token minted — identical parameters only; different ones are the
+        // mismatch the model names. The record is per region, because an
+        // EventSource belongs to the region of its bus.
+        if let Some(token) = input.client_token.as_deref() {
+            let replay_key = crate::state::idempotency_key(&region, token);
+            if let Some(arn) = state.event_source_idempotency.get(&replay_key).cloned() {
+                if let Some(source) = state.event_source(&arn) {
+                    if !matches_stored(source, &input) {
+                        return Err(
+                            CreateEventSourceErrorModeled::IdempotentParameterMismatchException(
+                                IdempotentParameterMismatchException {
+                                    message: Some(format!(
+                                        "ClientToken {token} was already used to create event \
+                                         source {arn} with different parameters"
+                                    )),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                    return Ok(created_response(source));
+                }
+                // The source that token minted is gone, so the token no longer
+                // replays anything and the name is free again.
+                state.event_source_idempotency.remove(&replay_key);
+            }
+        }
+
+        // An EventSource name is unique per account AND region, the way a bus
+        // name is, so only a source in the region of this request's bus can
+        // collide with it.
+        if let Some(existing) = state.event_source_by_name(&region, &input.name) {
+            return Err(CreateEventSourceErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!(
+                        "event source {} already exists as {}",
+                        input.name, existing.arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The EMULATOR's own bound on the registry, reported through the quota
+        // error this operation models: without it any caller could grow one
+        // process's heap without limit.
+        if state.event_sources.len() >= crate::state::MAX_EVENT_SOURCES_PER_EMULATOR {
+            return Err(CreateEventSourceErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this emulator holds the maximum of {} event sources; delete an event \
+                         source before creating another",
+                        crate::state::MAX_EVENT_SOURCES_PER_EMULATOR
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The ARN's type segment is set by the service from the configuration
+        // variant, and its id segment is minted from the store's own counter so
+        // no two sources can share one.
+        let arn = crate::state::event_source_arn(
+            &region,
+            crate::state::origin_type_of(&input.configuration),
+            &input.name,
+            &crate::state::new_event_source_id(state.next_id_seed(), now),
+        );
+        let source = crate::state::EventSource {
+            arn: arn.clone(),
+            name: input.name.clone(),
+            event_bus_arn: bus_arn,
+            account_id: ::engine::emulator_account_id().to_string(),
+            region: region.clone(),
+            configuration: input.configuration.clone(),
+            description: input.description.clone(),
+            // Provisioning is synchronous for an EventSource, so it is
+            // operational as soon as this call returns.
+            state: crate::state::EventSourceLifecycleState::Active,
+            revoked: false,
+            creation_time: now,
+            last_modified_time: now,
+            tags: input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<::std::collections::BTreeMap<_, _>>(),
+            client_token: input.client_token.clone(),
+        };
+
+        if let Some(token) = input.client_token.as_deref() {
+            let replay_key = crate::state::idempotency_key(&region, token);
+            state
+                .event_source_idempotency
+                .insert(replay_key, arn.clone());
+        }
+        state.event_sources.insert(arn.clone(), source);
+        let stored = state
+            .event_source(&arn)
+            .expect("the event source just inserted is in the store");
+        Ok(created_response(stored))
     }
 }
+
+/// Project a stored EventSource into `CreateEventSourceResponse`. Every member
+/// is read back out of the store, including `State`, which is the source's own
+/// lifecycle state.
+fn created_response(source: &crate::state::EventSource) -> CreateEventSourceOutput {
+    CreateEventSourceOutput {
+        event_source_arn: Some(source.arn.clone()),
+        name: Some(source.name.clone()),
+        event_bus_arn: Some(source.event_bus_arn.clone()),
+        state: Some(source.state.wire_value().to_string()),
+        creation_time: Some(crate::state::to_date_time(source.creation_time)),
+    }
+}
+
+/// Whether a repeat create describes exactly the EventSource already stored,
+/// which is what separates an idempotent replay from an
+/// `IdempotentParameterMismatchException`. Presence is compared as well as
+/// value, so an omitted member and a present-but-empty one are not the same
+/// request.
+fn matches_stored(source: &crate::state::EventSource, input: &CreateEventSourceInput) -> bool {
+    let requested_tags: ::std::collections::BTreeMap<String, String> = input
+        .tags
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    source.name == input.name
+        && source.event_bus_arn == input.event_bus_arn
+        && source.description == input.description
+        && source.tags == requested_tags
+        && crate::state::same_event_source_configuration(
+            &source.configuration,
+            &input.configuration,
+        )
+}
+
