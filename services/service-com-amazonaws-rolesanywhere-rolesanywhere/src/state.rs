@@ -4,7 +4,8 @@
 //!
 //! The trust-anchor, profile and certificate-revocation-list lifecycles
 //! (`CreateTrustAnchor`, `UpdateTrustAnchor`, `GetTrustAnchor`, `ListTrustAnchors`,
-//! `DeleteTrustAnchor`, `PutNotificationSettings`, `ResetNotificationSettings`,
+//! `DeleteTrustAnchor`, `DisableTrustAnchor`, `PutNotificationSettings`,
+//! `ResetNotificationSettings`,
 //! `CreateProfile`, `GetProfile`, `ListProfiles`, `DeleteProfile`, `ImportCrl`,
 //! `GetCrl`, `ListCrls`) are backed entirely by the maps below, so a write is visible to the next
 //! request on the same engine. The record types and their projections live here rather

@@ -29,5 +29,7 @@ mod resource_tagging;
 mod state_roundtrip;
 #[path = "all/trust_anchor_and_profile_lifecycle.rs"]
 mod trust_anchor_and_profile_lifecycle;
+#[path = "all/trust_anchor_enablement.rs"]
+mod trust_anchor_enablement;
 #[path = "all/trust_anchor_source_replacement.rs"]
 mod trust_anchor_source_replacement;

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableTrustAnchor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableTrustAnchor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableTrustAnchor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Clears the addressed trust anchor's `enabled` flag in this service's state and
+//! answers with the whole record as it now stands, so the next `GetTrustAnchor` or
+//! `ListTrustAnchors` reads back exactly what this call wrote. An id no stored trust
+//! anchor carries is the modelled `ResourceNotFoundException` (404) rather than a
+//! success that lands nowhere.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +136,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableTrustAnchor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableTrustAnchorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableTrustAnchor"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut store = state.lock();
+
+        // An id no stored trust anchor carries — never created, or already deleted — is
+        // a 404, never a disable that lands nowhere.
+        let record = store
+            .trust_anchors
+            .get_mut(&input.trust_anchor_id)
+            .ok_or_else(|| {
+                DisableTrustAnchorErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::addressed_trust_anchor_not_found_message()),
+                    },
+                )
+            })?;
+
+        // The whole effect of the operation: this anchor is no longer authorized for
+        // trust validation. It writes the flag rather than toggling it, so a second call
+        // on an already-disabled anchor is a success reporting the same state, and the
+        // instant the record was last updated moves because the call wrote to it.
+        record.enabled = false;
+        record.updated_at = ::std::time::SystemTime::now();
+
+        Ok(DisableTrustAnchorOutput {
+            trust_anchor: record.to_detail(),
+        })
     }
 }
