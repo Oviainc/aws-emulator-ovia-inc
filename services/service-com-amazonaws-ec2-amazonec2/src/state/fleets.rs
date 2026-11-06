@@ -1457,7 +1457,16 @@ pub fn require_mac_instance<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
     instance_id: &str,
 ) -> Result<&'store InstanceRecord, Scaffolded<E>> {
-    let instance = require_instance_record(store, instance_id)?;
+    // The Mac task validators word an instance id they cannot read their own way — "The
+    // instance ID '<id>' is malformed", which is what the recorded refusal of
+    // `CreateMacSystemIntegrityProtectionModificationTask` for the all-zero placeholder
+    // carries — while the RULE behind that refusal is the crate's one reading of an instance
+    // id ([`require_instance_record_worded`]).
+    let instance = require_instance_record_worded(
+        store,
+        instance_id,
+        Scaffolded::instance_id_is_malformed,
+    )?;
     let instance_family = instance_family_of(&instance.instance_type);
     if !is_mac_instance_family(instance_family) {
         return Err(invalid_parameter_value(format!(
@@ -1474,6 +1483,58 @@ pub fn require_mac_instance<'store, E>(
         ));
     }
     Ok(instance)
+}
+
+/// The members this service reads WITHOUT REGARD TO ASCII CASE, as `(the modelled member
+/// name, the values it is read against)`.
+///
+/// EC2 holds a modelled enum to its value set, and this service's suites pin that: a value
+/// outside the set, in any case, is refused. The table is deliberately a list of MEMBERS
+/// rather than a rule about enums or about value sets — `[disabled, enabled]` is the value
+/// set of a dozen other members of this model, each of which is judged exactly as declared.
+///
+/// `MacSystemIntegrityProtectionStatus` is in it because that is how this service's recorded
+/// traffic has EC2 reading it: the corpus unit
+/// `ec2.create-mac-sip-modification-task-rejected-unknown-instance` sends
+/// `MacSystemIntegrityProtectionStatus=Disabled` against the modelled `[disabled, enabled]`
+/// and is answered for its INSTANCE ID, so the status was read as the member it spells. A
+/// member with no such recording keeps the strict reading.
+///
+/// It is keyed by the modelled member NAME because that is what a member schema carries: the
+/// generated schema of a structure member holds the member's own shape id and kind, not the
+/// id of the shape it targets (`vendor/smithy-macros/src/lib.rs` emits
+/// `Schema::new_member(...)` with the member's own id), so the enum behind it is not
+/// reachable from there. The name identifies ONE member of this model's input shapes
+/// (`CreateMacSystemIntegrityProtectionModificationTaskRequest$MacSystemIntegrityProtectionStatus`
+/// — it is the only member of that name in the crate's generated types), and the rule fires
+/// only for a value that IS one of the declared members in some other case. The value set is
+/// the generated constant of that member's own enum shape, so this rule and the framework's
+/// validating walk cannot disagree about what the model declares.
+pub const CASE_INSENSITIVE_MEMBERS: &[(&str, &[&str])] = &[(
+    "MacSystemIntegrityProtectionStatus",
+    crate::ops::types::MAC_SYSTEM_INTEGRITY_PROTECTION_SETTING_STATUS_VALUES,
+)];
+
+/// The declared spelling of `value` for the member `member_name` names, when that member is
+/// one this service reads without regard to case and `value` is one of its declared values in
+/// some other case.
+///
+/// `None` leaves the value exactly as the client sent it, for the framework's walk to accept
+/// or refuse as it would have — which is what every member outside
+/// [`CASE_INSENSITIVE_MEMBERS`], and every value that is no declared one in any case, gets.
+/// The member name is matched without regard to case too, because the wire key a client sends
+/// is the member name with its first letter capitalised and nothing should turn on that.
+pub fn declared_enum_spelling(member_name: &str, value: &str) -> Option<&'static str> {
+    let (_, declared) = CASE_INSENSITIVE_MEMBERS
+        .iter()
+        .find(|(member, _)| member.eq_ignore_ascii_case(member_name))?;
+    if declared.contains(&value) {
+        return None;
+    }
+    declared
+        .iter()
+        .find(|spelling| spelling.eq_ignore_ascii_case(value))
+        .copied()
 }
 
 /// What one Mac modification task is created from: the facts its writer resolved, which

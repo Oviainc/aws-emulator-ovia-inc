@@ -304,14 +304,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Supported with io1 and io2 volumes only"
-        // (`CopyVolumesRequest$MultiAttachEnabled`).
+        // (`CopyVolumesRequest$MultiAttachEnabled`). Each member is a value the service
+        // accepts alone, so the request's fault is the PAIR:
+        // `InvalidParameterCombination`, the same reading the create and the modify of a
+        // volume give it.
         let multi_attach_enabled = input.multi_attach_enabled.unwrap_or(false);
         if multi_attach_enabled && !PROVISIONED_IOPS_VOLUME_TYPES.contains(&volume_type.as_str()) {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "multiAttachEnabled is supported with {} volumes only, \
-                 not with a {volume_type} volume",
-                PROVISIONED_IOPS_VOLUME_TYPES.join(" and ")
-            )));
+            return Err(Scaffolded::invalid_parameter_combination(
+                crate::state::multi_attach_unsupported_message(&volume_type),
+            ));
         }
 
         // "If the source volume is encrypted, the service always encrypts the copy

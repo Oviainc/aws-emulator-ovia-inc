@@ -572,7 +572,7 @@ async fn iops_and_throughput_follow_the_published_per_type_rules() {
             volume_type: "gp3",
             extra: vec![p("MultiAttachEnabled", "true")],
             status: 400,
-            code: "InvalidParameterValue",
+            code: "InvalidParameterCombination",
             iops: None,
             throughput: None,
         },

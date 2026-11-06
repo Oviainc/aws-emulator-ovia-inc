@@ -375,11 +375,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .or(current.multi_attach_enabled)
             .unwrap_or(false);
         if target_multi_attach && !PROVISIONED_IOPS_VOLUME_TYPES.contains(&target_type.as_str()) {
-            return Err(Scaffolded::invalid_parameter_combination(format!(
-                "multiAttachEnabled is supported with {} volumes only, so it cannot be \
-                 enabled on a {target_type} volume",
-                PROVISIONED_IOPS_VOLUME_TYPES.join(" and ")
-            )));
+            return Err(Scaffolded::invalid_parameter_combination(
+                crate::state::multi_attach_unsupported_message(&target_type),
+            ));
         }
 
         let now = ::std::time::Instant::now();

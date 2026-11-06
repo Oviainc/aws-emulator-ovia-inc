@@ -1402,12 +1402,14 @@ mod security_group_rule_prefix_lists;
 // Declared at the tail of this file, which is where every new ec2 suite inserts its lines.
 #[path = "all/modify_ipam.rs"]
 mod modify_ipam;
-// What a SUCCESSFUL delete makes observable on the Network Access Scope, Traffic Mirror filter
-// and route server surfaces: an id that stops resolving for every read of a resource whose
-// shape carries no state, and the `deleting` -> `deleted` states a route server is described
-// in. Declared at the tail of this file, which is where every new ec2 suite inserts its lines.
-#[path = "all/deleted_resources_stop_resolving.rs"]
-mod deleted_resources_stop_resolving;
+// How this service classifies a refusal: a long-form resource id whose identifier it issued
+// to another kind of resource is no id of the kind a member declares (that kind's malformed
+// class, before any lookup), a pair of members that cannot hold together is a parameter
+// COMBINATION, a launch template's Systems Manager alias must resolve when the version is
+// created, and a modelled enum value EC2 reads without regard to case is served rather than
+// refused. Declared at the tail of this file, which is where every new ec2 suite inserts its
+#[path = "all/refusal_classes_and_unreadable_ids.rs"]
+mod refusal_classes_and_unreadable_ids;
 // What `MonitorInstances` turns on: the `pending` -> `enabled` move it starts for every
 // distinct instance it names, read back through `DescribeInstances`, and the PARAMETER layer
 // both halves of the monitoring move read their `InstanceIds` list in — a value outside the
@@ -1415,3 +1417,9 @@ mod deleted_resources_stop_resolving;
 // of this file, which is where every new ec2 suite inserts its lines.
 #[path = "all/monitor_instances.rs"]
 mod monitor_instances;
+// What a SUCCESSFUL delete makes observable on the Network Access Scope, Traffic Mirror filter
+// and route server surfaces: an id that stops resolving for every read of a resource whose
+// shape carries no state, and the `deleting` -> `deleted` states a route server is described
+// in. Declared at the tail of this file, which is where every new ec2 suite inserts its lines.
+#[path = "all/deleted_resources_stop_resolving.rs"]
+mod deleted_resources_stop_resolving;

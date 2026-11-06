@@ -302,9 +302,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The image IDs" (`DescribeImagesRequest$ImageIds`): an id that is not an image
         // id at all is malformed, and a well-formed one the account can see no image for
-        // does not exist — neither is an absent row.
+        // does not exist — neither is an absent row. A LONG-form id whose identifier names
+        // another of this service's resources is in the FIRST class, not the second: EC2's
+        // long id form is an identifier the service decodes before it looks anything up, so
+        // a value that decodes to something which is no AMI is no AMI id
+        // (`image_id_identifies_another_resource`) — the same answer this operation already
+        // gives a value in another resource's printed prefix.
         for image_id in requested_ids {
-            if !image_id_is_well_formed(image_id) {
+            if !image_id_is_well_formed(image_id)
+                || store.image_id_identifies_another_resource(image_id)
+            {
                 return Err(invalid_ami_id_malformed(image_id));
             }
             if !store

@@ -57,7 +57,9 @@ use aws_smithy_schema::serde::{
     SerdeError, SerializableStruct, ShapeDeserializer, ShapeSerializer,
 };
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
-use aws_smithy_schema_server::{ProtocolError, QueryServerProtocol, ServerProtocol};
+use aws_smithy_schema_server::{
+    ProtocolError, QueryServerProtocol, QueryShapeDeserializer, ServerProtocol,
+};
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
@@ -495,6 +497,19 @@ impl ServerProtocol for Ec2QueryEnvelope {
         request: &'a RtRequest,
         input_schema: &Schema,
     ) -> Result<Box<dyn ShapeDeserializer + 'a>, ProtocolError> {
+        // EC2 reads a value of a modelled enum without regard to ASCII case, so a request
+        // that spells one of the catalog's values in another case is SERVED rather than
+        // refused — and the parameters a handler would have refused it for are reached. The
+        // body is rewritten here, in the one place this service reads a request, so the
+        // reading is the same for every operation; a request that carries no such value is
+        // handed to the framework's own reader untouched ([`enum_cased_body`]).
+        if let Some(rewritten) = request
+            .body()
+            .bytes()
+            .and_then(|body| enum_cased_body(body, input_schema))
+        {
+            return Ok(Box::new(QueryShapeDeserializer::new(&rewritten, true)));
+        }
         self.inner.deserialize_input(request, input_schema)
     }
 
@@ -539,11 +554,107 @@ impl ServerProtocol for Ec2QueryEnvelope {
     }
 }
 
+// =============================================================================
+// Reading a modelled enum value in the case the caller sent it
+// =============================================================================
+
+/// `body` with every value of a member this service reads WITHOUT REGARD TO CASE re-spelled
+/// as the model declares it, or `None` when nothing needed re-spelling.
+///
+/// EC2 reads SOME members' modelled values without regard to ASCII case: the recorded traffic
+/// has it SERVING a request whose value differs from the declared spelling only in case —
+/// `Disabled` for `MacSystemIntegrityProtectionStatus`, whose shape declares `[disabled,
+/// enabled]` — and going on to validate the rest of the request, so a resource id it cannot
+/// resolve is what such a call is refused for. Enforcing the value set as case-sensitive
+/// equality instead refuses the request at the boundary, before any handler runs, with a code
+/// that is not EC2's.
+///
+/// WHICH members are read that way is a fact of the MEMBER, recorded with it
+/// ([`crate::state::CASE_INSENSITIVE_MEMBERS`]) — not of a value set, which a dozen members of
+/// this model share, and not of enums in general: every other member is judged by its value
+/// set exactly as declared, which is what this service's suites pin.
+///
+/// The value set is still ENFORCED: a value outside it, in any case, is left exactly as the
+/// request sent it and refused by the framework's constraint walk as before. Only the
+/// SPELLING of a declared value is changed, and only under the key that names such a member —
+/// a free-text member whose value happens to read like one (a tag value, a name) is never
+/// touched.
+///
+/// The body is form-urlencoded (`<key>=<value>&…`), and a pair is rewritten only when its
+/// value needs no decoding to match a declared one — every value of this table is a bare
+/// token — so a percent-encoded or `+`-escaped value is left to the framework's reader
+/// untouched.
+fn enum_cased_body(body: &[u8], input_schema: &Schema) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(body).ok()?;
+    let mut rewritten = String::with_capacity(text.len());
+    let mut changed = false;
+    for (index, pair) in text.split('&').enumerate() {
+        if index > 0 {
+            rewritten.push('&');
+        }
+        let respelled = pair.split_once('=').and_then(|(key, value)| {
+            let member = member_at(input_schema, key)?;
+            let spelled = crate::state::declared_enum_spelling(member, value)?;
+            Some(format!("{key}={spelled}"))
+        });
+        match respelled {
+            Some(pair) => {
+                changed = true;
+                rewritten.push_str(&pair);
+            }
+            None => rewritten.push_str(pair),
+        }
+    }
+    changed.then_some(rewritten.into_bytes())
+}
+
+/// The modelled MEMBER NAME a request key names, or `None` when the key names no member of
+/// `input_schema` — including a member of a NESTED structure, whose name the input shape's
+/// own members do not carry.
+///
+/// A key is the member's own name with its first letter capitalised
+/// (`MacSystemIntegrityProtectionStatus`), or its `@xmlName`, with an index for an element of
+/// a list (`ReasonCode.1`) — the key conventions the framework's query reader resolves. The
+/// name is matched without regard to case, so a client's spelling of the KEY cannot decide
+/// whether the VALUE is read, and the name answered is the MODEL's, which is what
+/// [`crate::state::declared_enum_spelling`] is keyed by.
+///
+/// A member schema carries its own id and kind rather than the shape it targets, so nothing
+/// here can descend into a nested structure's members: such a key is answered `None` and its
+/// value is left exactly as it was sent.
+fn member_at<'schema>(input_schema: &'schema Schema, key: &str) -> Option<&'schema str> {
+    let mut segments = key.split('.');
+    let name = segments.next()?;
+    for segment in segments {
+        // The index of a list element, and the wrapper segment a wrapped list writes: both
+        // position a value WITHIN the member the first segment named.
+        if segment == "member" || segment.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        return None;
+    }
+    input_schema
+        .members()
+        .iter()
+        .find(|member| member_is_named(member, name))
+        .and_then(|member| member.member_name())
+}
+
+/// Does the request key segment `name` name `member` — its `@xmlName` or its member name,
+/// compared without regard to ASCII case (the ec2Query key capitalises the first letter of
+/// either)?
+fn member_is_named(member: &Schema, name: &str) -> bool {
+    member
+        .xml_name()
+        .map(|xml_name| xml_name.value())
+        .is_some_and(|xml_name| xml_name.eq_ignore_ascii_case(name))
+        || member
+            .member_name()
+            .is_some_and(|member_name| member_name.eq_ignore_ascii_case(name))
+}
+
 /// The generated operation the model's routing key names for `req`, or `None` when the
 /// key names no operation of this service.
-///
-/// The SAME lookup the router's own table does, through the model-derived protocol, so
-/// the operation claimed here and the operation the router would have resolved are one.
 ///
 /// Called twice per request on purpose — once by `override_operation`, to decide whether
 /// this service claims the request at all, and once by [`FinishedEnvelope::run`], which

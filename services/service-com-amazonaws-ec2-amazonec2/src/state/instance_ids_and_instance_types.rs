@@ -230,6 +230,66 @@ pub fn instance_id_reads_as_one(id: &str) -> bool {
     prefixed_id_is_well_formed(INSTANCE_ID_PREFIX, id)
 }
 
+/// The identifier a LONG-form EC2 resource id carries, or `None` for a value in any other
+/// form.
+///
+/// A long-form id is `<prefix>-` and [`LONG_RESOURCE_ID_DIGITS`] lowercase hexadecimal
+/// digits, which EC2 hands out as an OBFUSCATED identifier: the service decodes it back to
+/// the resource it names before it looks anything up, which is why a value it cannot decode
+/// is answered `Invalid<Kind>.Malformed` and not as a resource that does not exist. The
+/// digits are what this service's own mints count in
+/// ([`ComAmazonawsEc2Amazonec2State::next_id`],
+/// [`ComAmazonawsEc2Amazonec2State::mint_instance_id`]), so reading them back is how this
+/// emulator decodes one.
+///
+/// The all-zero identifier is `None`: no mint counts from zero, so it is no identifier at
+/// all and the id-form readers already refuse it.
+pub fn long_form_identifier(id: &str) -> Option<u128> {
+    let (_prefix, suffix) = id.rsplit_once('-')?;
+    if suffix.len() != LONG_RESOURCE_ID_DIGITS {
+        return None;
+    }
+    if !suffix
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    u128::from_str_radix(suffix, 16).ok().filter(|id| *id != 0)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether `instance_id` is a LONG-form id whose identifier this service has already
+    /// issued to a resource of a DIFFERENT kind — a value that is no instance id at all.
+    ///
+    /// EC2's long id form is an OBFUSCATED identifier, decoded by the service before it
+    /// looks anything up: the digits are not free text a caller may compose, they name a
+    /// resource ("Unable to unobfuscate ID." is the sentence EC2 words for one it cannot
+    /// decode, [`crate::scaffolded::Scaffolded::instance_id_could_not_be_unobfuscated`]).
+    /// So a value in another resource's PRINTED prefix is not an id of the kind a member
+    /// declares (`i-…` sent as an `ImageId` is `InvalidAMIID.Malformed`), and neither is one
+    /// whose IDENTIFIER names another resource — the same answer for the same reason, one
+    /// step further in.
+    ///
+    /// The identifiers this service has issued are the ones its mints have counted:
+    /// [`Self::mint_instance_id`] counts INSTANCES, so an identifier at or below it is an
+    /// instance's own, whatever became of the instance; [`Self::next_id`] counts every other
+    /// kind, so an identifier at or below THAT one and above the instance mint was spent on
+    /// another resource. An identifier neither mint has reached is one this service has
+    /// issued to nothing at all, which is left to the lookup — the same conservative
+    /// direction [`Self::id_was_issued`] takes: a value the service may yet issue is
+    /// reported as a resource that does not exist rather than as an id it cannot read.
+    ///
+    /// The retired SHORT form carries no identifier to decode (EC2 reads it without
+    /// unobfuscation, [`instance_id_is_well_formed`]), so it is never refused here: a
+    /// short-form id the account holds no instance for is simply absent.
+    pub fn instance_id_identifies_another_resource(&self, instance_id: &str) -> bool {
+        long_form_identifier(instance_id).is_some_and(|identifier| {
+            identifier > u128::from(self.next_instance) && identifier <= u128::from(self.id_counter)
+        })
+    }
+}
+
 /// Refuse an instance id the request named that this service cannot resolve: a
 /// malformed one before an unknown one, the way the service orders the two.
 pub fn require_known_instance<E>(
@@ -247,13 +307,41 @@ pub fn require_instance_record<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
     instance_id: &str,
 ) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
+    require_instance_record_worded(
+        store,
+        instance_id,
+        crate::scaffolded::Scaffolded::invalid_instance_id_malformed,
+    )
+}
+
+/// [`require_instance_record`] with the MALFORMED half worded by `malformed`.
+///
+/// EC2's per-operation validators do not agree about how they WORD an instance id they
+/// cannot read — the two sentences are [`crate::scaffolded::Scaffolded`]'s
+/// `invalid_instance_id_malformed` and `instance_id_is_malformed`, and which one an
+/// operation answers is a fact of that operation, recorded by its caller. The RULE those
+/// refusals follow is one, so it lives here once and the sentence is passed in: an id
+/// outside the form EC2 issues, and a long-form id whose identifier this service spent on
+/// another kind of resource, are malformed before any lookup; anything else that resolves to
+/// no instance is the not-found half.
+pub fn require_instance_record_worded<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    instance_id: &str,
+    malformed: impl Fn(&str) -> crate::scaffolded::Scaffolded<E>,
+) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
     if !instance_id_is_well_formed(instance_id) {
-        return Err(crate::scaffolded::Scaffolded::invalid_instance_id_malformed(
-            instance_id,
-        ));
+        return Err(malformed(instance_id));
     }
     store.instances.get(instance_id).ok_or_else(|| {
-        crate::scaffolded::Scaffolded::invalid_instance_id_not_found(instance_id)
+        // The long form is an identifier the service DECODES before it looks anything up, so
+        // one it spent on another kind of resource is no instance id and is refused as
+        // malformed; one it has issued to nothing, or issued as an instance's own, names an
+        // instance that is not there, which is the not-found half.
+        if store.instance_id_identifies_another_resource(instance_id) {
+            malformed(instance_id)
+        } else {
+            crate::scaffolded::Scaffolded::invalid_instance_id_not_found(instance_id)
+        }
     })
 }
 

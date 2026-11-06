@@ -737,9 +737,11 @@ async fn an_id_or_a_name_that_names_no_template_is_refused() {
             "InvalidLaunchTemplateName.NotFoundException",
             "case {case:?}: expected the name's own not-found code, got {body}"
         );
-        assert!(
-            error_message(&body).contains("no.such.template"),
-            "case {case:?}: the refusal must name the name it could not resolve, got {body}"
+        assert_eq!(
+            error_message(&body),
+            "At least one of the launch templates specified in the request does not exist.",
+            "case {case:?}: expected EC2's own sentence for a name it could not resolve, \
+             which names none of the request's values, got {body}"
         );
     }
 

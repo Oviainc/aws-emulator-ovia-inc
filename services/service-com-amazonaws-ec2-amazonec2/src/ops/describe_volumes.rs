@@ -162,7 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             decode_page_token, invalid_id_parameter_value, invalid_pagination_token_for,
-            invalid_volume_id_not_found, require_service_state, volume_id_is_well_formed,
+            invalid_volume_id_not_found, issued_id_is_well_formed, require_service_state,
             CompiledFilter, MatchBudget, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES,
             MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE, MAX_RESOURCE_IDS, VOLUME_ID_PREFIX,
             VOLUME_IDS_PARAMETER,
@@ -181,15 +181,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Each entry's own FORM, as a PARAMETER of the request and before the store is
         // reached: this operation's id list is validated at the parameter layer, so an entry
-        // that is not a volume id at all is `InvalidParameterValue` naming the parameter and
-        // the form it expects ("Value (…) for parameter volumes is invalid. Expected:
-        // 'vol-...'."), not the resource-level `InvalidVolumeID.Malformed` that an operation
-        // acting on ONE named volume answers. Either way it is a different answer from
-        // `InvalidVolume.NotFound`, which is for a well-formed id the account holds no volume
-        // for.
+        // that is not a volume id EC2 could have ISSUED is `InvalidParameterValue` naming the
+        // parameter and the form it expects ("Value (…) for parameter volumes is invalid.
+        // Expected: 'vol-...'."), not the resource-level `InvalidVolumeID.Malformed` that an
+        // operation acting on ONE named volume answers. Either way it is a different answer
+        // from `InvalidVolume.NotFound`, which is for an id INSIDE that form the account
+        // holds no volume for.
+        //
+        // The ISSUED form, not merely the printed one: EC2's long id form carries 68 digits'
+        // worth of a 64-bit identifier, so an issued id always reads `vol-0…` and is never
+        // the all-zero placeholder ([`crate::state::issued_id_is_well_formed`]), and a value
+        // outside that — the `vol-1234567890abcdef0` shape documentation examples and
+        // hand-written probes reach for — is a parameter EC2 cannot read rather than a volume
+        // it cannot find.
         if let Some(malformed) = requested_ids
             .iter()
-            .find(|volume_id| !volume_id_is_well_formed(volume_id))
+            .find(|volume_id| !issued_id_is_well_formed(VOLUME_ID_PREFIX, volume_id))
         {
             return Err(invalid_id_parameter_value(
                 VOLUME_IDS_PARAMETER,

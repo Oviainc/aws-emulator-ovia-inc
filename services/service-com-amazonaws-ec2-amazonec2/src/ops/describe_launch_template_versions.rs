@@ -395,7 +395,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             TemplateSelector::Name(name) => {
                 let id = store
                     .launch_template_id_for_name(name)
-                    .ok_or_else(|| invalid_launch_template_name_not_found(name))?;
+                    .ok_or_else(invalid_launch_template_name_not_found)?;
                 let record = store.launch_templates.get(&id).ok_or_else(|| {
                     Scaffolded::internal_error(format!("launch template '{id}' is not stored"))
                 })?;

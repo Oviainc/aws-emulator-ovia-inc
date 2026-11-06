@@ -305,6 +305,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every remaining check is READ-ONLY, and a replay clears them all by storing
         // nothing.
         if replayed.is_none() {
+            // "The Systems Manager parameter will resolve to an AMI ID on launch"
+            // (`RequestLaunchTemplateData$ImageId`) — and EC2 resolves it HERE, when the
+            // version is created, so a template that could never launch is refused where the
+            // caller can still correct the value. The one reader both template writers share.
+            store.require_resolvable_image_alias(
+                input.launch_template_data.image_id.as_deref(),
+            )?;
             if store.launch_template_id_for_name(&spec.name).is_some() {
                 return Err(launch_template_name_already_exists(&spec.name));
             }

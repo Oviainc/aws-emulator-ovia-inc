@@ -287,11 +287,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .values()
                 .map(|record| record.launch_template_name())
                 .collect();
-            if let Some(unknown) = requested_names
+            if requested_names
                 .iter()
-                .find(|name| !stored_names.contains(name.as_str()))
+                .any(|name| !stored_names.contains(name.as_str()))
             {
-                return Err(invalid_launch_template_name_not_found(unknown));
+                return Err(invalid_launch_template_name_not_found());
             }
         }
 

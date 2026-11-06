@@ -501,7 +501,7 @@ async fn iops_throughput_and_multi_attach_follow_the_copy_types_rules() {
             case: "a gp2 copy with Multi-Attach",
             extra: vec![p("VolumeType", "gp2"), p("MultiAttachEnabled", "true")],
             status: 400,
-            code: "InvalidParameterValue",
+            code: "InvalidParameterCombination",
             iops: None,
             throughput: None,
         },

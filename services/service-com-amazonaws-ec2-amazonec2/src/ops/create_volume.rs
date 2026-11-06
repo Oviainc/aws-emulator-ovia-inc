@@ -367,14 +367,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "This parameter is supported with io1 and io2 volumes only"
-        // (`CreateVolumeRequest$MultiAttachEnabled`).
+        // (`CreateVolumeRequest$MultiAttachEnabled`). The flag and the volume type are each
+        // a value the service accepts on its own — a gp3 volume is creatable and
+        // Multi-Attach is enablable — so what the request got wrong is the PAIR, which EC2
+        // answers `InvalidParameterCombination` rather than `InvalidParameterValue`; the
+        // same reading `crate::ops::modify_volume` gives the same pair.
         let multi_attach_enabled = input.multi_attach_enabled.unwrap_or(false);
         if multi_attach_enabled && !PROVISIONED_IOPS_VOLUME_TYPES.contains(&volume_type.as_str()) {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "multiAttachEnabled is supported with {} volumes only, \
-                 not with a {volume_type} volume",
-                PROVISIONED_IOPS_VOLUME_TYPES.join(" and ")
-            )));
+            return Err(Scaffolded::invalid_parameter_combination(
+                crate::state::multi_attach_unsupported_message(&volume_type),
+            ));
         }
 
         // "If KmsKeyId is specified, the encrypted state must be true"

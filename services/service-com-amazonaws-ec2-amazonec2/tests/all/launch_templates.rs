@@ -2112,15 +2112,55 @@ mod describe_launch_template_versions {
             );
         }
 
-        // A parameter no image publishes resolves to nothing: whether or not the request asks
-        // for the alias to be resolved, the version reports the parameter the caller stored —
-        // a template whose alias resolves to no AMI is still a valid template, so it never
-        // hides the other versions a request asked for.
+        // A parameter no image publishes resolves to nothing. Such an alias is refused at
+        // CREATE — "the Systems Manager parameter will resolve to an AMI ID on launch", so a
+        // template that could never launch is not stored at all — while a version ALREADY
+        // stored under one (the parameter having gone since) reports the parameter the caller
+        // stored, whether or not the request asks for the alias to be resolved.
         let unresolvable = format!("{SSM_IMAGE_ALIAS_PREFIX}/aws/service/no/such/parameter");
-        let launch_template_id =
-            create_template(&router, "alias.unresolvable", &[data("ImageId", &unresolvable)]).await;
+        let (status, body) = api(
+            &router,
+            "CreateLaunchTemplate",
+            &[
+                p("LaunchTemplateName", "alias.unresolvable"),
+                data("ImageId", &unresolvable),
+            ],
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "SsmInvalidParameter"),
+            "a create whose alias resolves to no AMI must be refused, got {status} with body \
+             {body}"
+        );
+
+        let (resolvable_parameter, resolvable_image) = published
+            .first()
+            .cloned()
+            .expect("the image catalog publishes at least one parameter");
+        let alias = format!("{SSM_IMAGE_ALIAS_PREFIX}{resolvable_parameter}");
+        let resolvable_template =
+            create_template(&router, "alias.beside.unresolvable", &[data("ImageId", &alias)]).await;
+        // Written into the store the way a version whose parameter has since gone reads, which
+        // is the only way one can be there now that the create resolves the alias.
+        seed_versions(
+            &engine,
+            &resolvable_template,
+            &[(
+                2,
+                0,
+                RequestLaunchTemplateData {
+                    image_id: Some(unresolvable.clone()),
+                    ..RequestLaunchTemplateData::default()
+                },
+            )],
+            1,
+        );
         for asked in [None, Some("false"), Some("true")] {
-            let mut params = vec![p("LaunchTemplateId", launch_template_id.clone())];
+            let mut params = vec![
+                p("LaunchTemplateId", resolvable_template.clone()),
+                ("LaunchTemplateVersion.1".to_string(), "2".to_string()),
+            ];
             if let Some(value) = asked {
                 params.push(p("ResolveAlias", value));
             }
@@ -2138,28 +2178,20 @@ mod describe_launch_template_versions {
             );
         }
 
-        // One unresolvable alias does not hide the versions that do resolve: both templates are
-        // described in one account-wide call, each reporting its own image id.
-        let (resolvable_parameter, resolvable_image) = published
-            .first()
-            .cloned()
-            .expect("the image catalog publishes at least one parameter");
-        let alias = format!("{SSM_IMAGE_ALIAS_PREFIX}{resolvable_parameter}");
-        let resolvable_template =
-            create_template(&router, "alias.beside.unresolvable", &[data("ImageId", &alias)]).await;
+        // One unresolvable alias does not hide the versions that do resolve: both versions are
+        // described in one call, each reporting its own image id.
         let (status, body) = api(
             &router,
             "DescribeLaunchTemplateVersions",
             &[
                 p("ResolveAlias", "true"),
-                ("LaunchTemplateVersion.1".to_string(), "$Latest".to_string()),
+                p("LaunchTemplateId", resolvable_template.clone()),
             ],
         )
         .await;
         assert_eq!(
             status, 200,
-            "an account-wide describe must survive an unresolvable alias, got {status} \
-             with body {body}"
+            "a describe must survive an unresolvable alias, got {status} with body {body}"
         );
         let reported = elements(&body, "imageId");
         assert!(

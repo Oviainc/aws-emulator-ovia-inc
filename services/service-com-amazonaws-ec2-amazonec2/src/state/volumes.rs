@@ -608,6 +608,20 @@ pub fn volume_id_is_well_formed(id: &str) -> bool {
     prefixed_id_is_well_formed(VOLUME_ID_PREFIX, id)
 }
 
+/// The sentence EC2 words for a request that asks for Multi-Attach on a volume type that
+/// does not support it.
+///
+/// "This parameter is supported with io1 and io2 volumes only"
+/// (`CreateVolumeRequest$MultiAttachEnabled`), and the refusal EC2 answers names the
+/// PARAMETER as the wire spells it and the type that cannot carry it: the fixed text is
+/// `The parameter multi-attach-enabled is not supported for ` and ` volumes.`, with the
+/// volume type taken from the request (or, for a modify, from the volume the request would
+/// leave it at). One sentence for the one refusal, so the create, the copy and the modify of
+/// a volume cannot word it three ways.
+pub fn multi_attach_unsupported_message(volume_type: &str) -> String {
+    format!("The parameter multi-attach-enabled is not supported for {volume_type} volumes.")
+}
+
 /// Refuse a volume id the request named that this service cannot resolve: a malformed
 /// one before an unknown one, the way the service orders the two.
 ///

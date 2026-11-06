@@ -1423,6 +1423,28 @@ impl ComAmazonawsEc2Amazonec2State {
         inserted
     }
 
+    /// Whether `image_id` is a long-form id whose identifier names a resource this service
+    /// issued that is no AMI of this account at all.
+    ///
+    /// The AMI counterpart of [`Self::instance_id_identifier_was_never_issued`], read
+    /// against the record this store keeps of the AMI ids it issued rather than against a
+    /// counter: every resource kind but the instance draws its identifiers from the ONE
+    /// [`Self::next_id`] counter, so the identifiers spent on AMIs are the ones the
+    /// catalogue holds or the Recycle Bin still holds — "it can be restored before its
+    /// retention period expires" (`DeregisterImage`), so a recycled AMI's id is its own
+    /// however invisible the image is, and either is looked up and reported as an image the
+    /// account cannot see. A long-form value whose identifier the mint HAS reached while no
+    /// AMI ever carried it names another kind of resource, so it is no AMI id and is refused
+    /// before any lookup; one the mint has not reached is left to the lookup.
+    pub fn image_id_identifies_another_resource(&self, image_id: &str) -> bool {
+        if self.images.contains_key(image_id) || self.images_in_recycle_bin.contains_key(image_id)
+        {
+            return false;
+        }
+        long_form_identifier(image_id)
+            .is_some_and(|identifier| identifier <= u128::from(self.id_counter))
+    }
+
     /// Every public Systems Manager parameter name this account can resolve, and the id of
     /// the AMI it resolves to.
     ///
@@ -1484,6 +1506,62 @@ pub fn ssm_image_alias_parameter(image_id: &str) -> Option<&str> {
     image_id
         .strip_prefix(SSM_IMAGE_ALIAS_PREFIX)
         .filter(|parameter| !parameter.is_empty())
+}
+
+/// The code EC2 answers a request whose `ImageId` names Systems Manager parameters that
+/// resolve to no AMI (EC2 error codes, `SsmInvalidParameter`).
+pub const SSM_INVALID_PARAMETER: &str = "SsmInvalidParameter";
+
+/// Refuse a launch template whose `ImageId` alias resolves to no AMI: HTTP 400
+/// [`SSM_INVALID_PARAMETER`].
+///
+/// "The Systems Manager parameter will resolve to an AMI ID on launch"
+/// (`RequestLaunchTemplateData$ImageId`), and EC2 resolves it when the template VERSION is
+/// created, not only when an instance is launched: a template whose alias names no parameter
+/// is refused there and then, so the client learns of it where it can still fix the value.
+///
+/// The sentence is EC2's: the fixed text `The following aliases are invalid: ` followed by
+/// the parameter names it could not resolve, which are the request's own values with the
+/// `resolve:ssm:` prefix stripped — the names the alias NAMES, not the aliases as written.
+/// The plural is EC2's too: the service reports the set it could not resolve, which for a
+/// launch template's one `ImageId` is one name. Each is bounded the way every echoed id of
+/// this crate is ([`echoed_resource_id`]), the member carrying no modelled length of its own.
+pub fn ssm_aliases_are_invalid<E>(parameters: &[&str]) -> Scaffolded<E> {
+    let named = parameters
+        .iter()
+        .map(|parameter| echoed_resource_id(parameter))
+        .collect::<Vec<String>>()
+        .join(", ");
+    Scaffolded::service_error(
+        SSM_INVALID_PARAMETER,
+        400,
+        format!("The following aliases are invalid: {named}"),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Refuse a launch template `ImageId` whose `resolve:ssm:` alias this account resolves to
+    /// no AMI, leaving every other value — a literal `ami-` id, or no `ImageId` at all — to
+    /// the launch that will read it.
+    ///
+    /// The ONE reading both template writers share, so `CreateLaunchTemplate` and
+    /// `CreateLaunchTemplateVersion` cannot disagree about which alias a stored version may
+    /// carry. The parameter is resolved against the image catalogue
+    /// ([`Self::public_ssm_parameter_image_ids`]), the one place this emulator records which
+    /// AMI a parameter names, so a template is refused exactly when a launch from it could
+    /// not have resolved its AMI.
+    pub fn require_resolvable_image_alias<E>(&self, image_id: Option<&str>) -> Result<(), Scaffolded<E>> {
+        let Some(parameter) = image_id.and_then(ssm_image_alias_parameter) else {
+            return Ok(());
+        };
+        if self
+            .public_ssm_parameter_image_ids(::engine::emulator_account_id())
+            .contains_key(parameter)
+        {
+            return Ok(());
+        }
+        Err(ssm_aliases_are_invalid(&[parameter]))
+    }
 }
 
 /// A public AMI Amazon publishes: owned by Amazon's publishing account

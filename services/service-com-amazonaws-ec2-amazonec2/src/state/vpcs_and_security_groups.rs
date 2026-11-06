@@ -2519,7 +2519,7 @@ pub fn resolve_launch_template_id<E>(
         }
         (None, Some(name)) => store
             .launch_template_id_for_name(name)
-            .ok_or_else(|| invalid_launch_template_name_not_found(name)),
+            .ok_or_else(invalid_launch_template_name_not_found),
         (None, None) => Err(crate::scaffolded::Scaffolded::missing_parameter(
             "The request must contain either the parameter LaunchTemplateId or the \
              parameter LaunchTemplateName",
@@ -2585,11 +2585,20 @@ pub fn launch_template_ids_malformed<E>(ids: &[&str]) -> crate::scaffolded::Scaf
 
 /// Refuse a request that named a launch template name no launch template of the account
 /// carries: HTTP 400 `InvalidLaunchTemplateName.NotFoundException`.
-pub fn invalid_launch_template_name_not_found<E>(name: &str) -> crate::scaffolded::Scaffolded<E> {
+/// Refuse a request that named a launch template name no launch template of the account
+/// carries: HTTP 400 `InvalidLaunchTemplateName.NotFoundException`.
+///
+/// The sentence is EC2's, and it is FIXED: `At least one of the launch templates specified
+/// in the request does not exist.` names neither the request's values nor how many of them
+/// could not be resolved — a request may name several, and the service reports that at least
+/// one of them is absent rather than which. Recorded by the corpus unit
+/// `ec2.asgeni-launch-template-with-unknown-ssm-alias-rejected`, which describes the name a
+/// refused create did not store and reads this answer back.
+pub fn invalid_launch_template_name_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(
         INVALID_LAUNCH_TEMPLATE_NAME_NOT_FOUND,
         400,
-        format!("The launch template name '{name}' does not exist"),
+        "At least one of the launch templates specified in the request does not exist.",
     )
 }
 
