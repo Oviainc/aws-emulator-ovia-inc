@@ -2291,15 +2291,21 @@ static DEPLOYMENT_NAME_SCHEMA: ::std::sync::LazyLock<::aws_smithy_schema::Schema
         )
     });
 
-/// Whether `value` satisfies every constraint `schema` carries, judged by the
-/// framework's own constraint walk.
-fn satisfies(schema: &::aws_smithy_schema::Schema, value: &str) -> bool {
+/// The constraint violations `value` raises against `schema`, judged by the framework's
+/// own constraint walk — the one place this crate drives that walk over a string.
+fn violations_of(schema: &::aws_smithy_schema::Schema, value: &str) -> Vec<Violation> {
     use ::aws_smithy_schema::serde::ShapeSerializer as _;
 
     let mut validator = ::aws_smithy_schema_server::constraints::ValidatingSerializer::new();
     // Infallible: the validator accumulates violations instead of failing.
     let _ = validator.write_string(schema, value);
-    validator.into_violations().is_empty()
+    validator.into_violations()
+}
+
+/// Whether `value` satisfies every constraint `schema` carries — [`violations_of`] for a
+/// rule whose refusal is worded from the rule itself rather than from the violation.
+fn satisfies(schema: &::aws_smithy_schema::Schema, value: &str) -> bool {
+    violations_of(schema, value).is_empty()
 }
 
 /// The refusal message for the map keys that break the shape `schema` carries, or
@@ -2318,15 +2324,10 @@ fn map_key_refusal<'a>(
     schema: &::aws_smithy_schema::Schema,
     keys: impl Iterator<Item = &'a str>,
 ) -> Option<String> {
-    use ::aws_smithy_schema::serde::ShapeSerializer as _;
-
     let mut violations: Vec<Violation> = Vec::new();
     let mut stated: BTreeSet<String> = BTreeSet::new();
     for key in keys {
-        let mut validator = ::aws_smithy_schema_server::constraints::ValidatingSerializer::new();
-        // Infallible: the validator accumulates violations instead of failing.
-        let _ = validator.write_string(schema, key);
-        for violation in validator.into_violations() {
+        for violation in violations_of(schema, key) {
             // A clause this report already states is not a second error, so the key it
             // came from is not kept either. A map KEY is judged on its own, against the
             // one restated member schema this walk ran, so the clause it renders is read
@@ -2681,7 +2682,7 @@ pub fn deployment_update_refusal(deployment: &Deployment) -> Option<&'static str
 pub fn validation_findings_report(findings: &[String]) -> String {
     findings
         .iter()
-        .map(|finding| format!("{}.", finding.trim_end_matches('.')))
+        .map(|finding| format!("{}.", finding.strip_suffix('.').unwrap_or(finding)))
         .collect::<Vec<String>>()
         .join(", ")
 }

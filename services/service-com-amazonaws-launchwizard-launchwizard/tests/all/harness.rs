@@ -185,6 +185,11 @@ impl Harness {
 /// rule comes back unchanged — so this is idempotent and a builder may apply it to a
 /// name a caller already built. `tests/all/create_deployment_finding_report.rs` is the
 /// suite that drives the rule itself.
+///
+/// A label long enough to reach `DeploymentName`'s modelled ceiling PANICS rather than
+/// being truncated to it: two long labels sharing a prefix would otherwise collapse onto
+/// one name, and a suite that then asserts on a stored name would be comparing one
+/// deployment against another. Name the case shorter.
 pub fn deployment_name(label: &str) -> String {
     let mut name = String::with_capacity(label.len() + 1);
     let mut starts_word = false;
@@ -211,9 +216,16 @@ pub fn deployment_name(label: &str) -> String {
         name.push('x');
     }
     // `DeploymentName` is @length(min: 1, max: 50).
-    name.truncate(50);
+    assert!(
+        name.len() <= MAX_DEPLOYMENT_NAME_LEN,
+        "case {label:?}: a case label must fit {MAX_DEPLOYMENT_NAME_LEN} characters as a \
+         deployment name, got {name:?}"
+    );
     name
 }
+
+/// `DeploymentName`'s modelled length ceiling (`@length(min: 1, max: 50)`).
+const MAX_DEPLOYMENT_NAME_LEN: usize = 50;
 
 /// The short name of a wire error code (`com.example#Boom` -> `Boom`).
 pub fn short_code(raw: &str) -> String {
