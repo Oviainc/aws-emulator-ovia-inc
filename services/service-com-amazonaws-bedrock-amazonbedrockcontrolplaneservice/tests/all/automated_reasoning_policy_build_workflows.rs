@@ -18,10 +18,11 @@
 //!    `AutomatedReasoningPolicyBuildWorkflowId` admits, and every start mints a fresh one.
 //!    (Which status such a row reports depends on how long the request took, which rule 2
 //!    pins on its own, so this one only requires one the model admits.)
-//! 2. **A workflow a start has just accepted is not built yet**: it reports the
-//!    non-terminal status until the clock makes its completion due, and the terminal one
-//!    afterwards — and a read never moves it, so two reads after the span report ONE
-//!    instant.
+//! 2. **A workflow a start has just accepted is not built yet**: it reports the status the
+//!    start accepted until the clock makes its next move due, and the terminal one once the
+//!    whole progression has elapsed — and a read never moves it, so two reads after the span
+//!    report ONE instant. (The processing statuses the progression passes through on the way
+//!    there are pinned by `automated_reasoning_policy_build_workflow_progression.rs`.)
 //! 3. **One build at a time per policy**: a second start for a policy a workflow is still
 //!    working on is refused with `ResourceInUseException`, while the same start is
 //!    accepted once that workflow is terminal.
@@ -58,7 +59,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 
 use crate::support::{
-    date_time_seconds, emulator, label, seed_build_workflow, Emulator, Reply, ACCOUNT, REGION,
+    age_build_workflow, arm_build_workflow, date_time_seconds, emulator, label,
+    seed_build_workflow, Emulator, Reply, ACCOUNT, REGION,
 };
 
 /// Every `AutomatedReasoningPolicyBuildWorkflowType` the model admits
@@ -104,10 +106,11 @@ const WORKFLOW_ID_LENGTH: usize = 36;
 /// `policy rules`.
 const DOCUMENT_BLOB: &str = "cG9saWN5IHJ1bGVz";
 
-/// Long enough that a workflow a start accepted is past the completion the clock owes it:
-/// the emulator makes that transition due a fraction of a second after the start, so a
-/// caller that waits this long must see the terminal status.
-const PAST_THE_BUILD: Duration = Duration::from_millis(900);
+/// How far a workflow a start accepted must be aged to be past the completion the clock
+/// owes it: the whole progression the start arms, and a little more, so a workflow aged this
+/// much must hold the terminal status.
+const PAST_THE_BUILD: Duration = bedrock::state::BUILD_WORKFLOW_COMPLETE_AFTER
+    .saturating_add(Duration::from_millis(150));
 
 /// Long enough that a workflow a cancel took over is past the cancellation the clock owes
 /// it, for the same reason [`PAST_THE_BUILD`] is long enough for the completion.
@@ -492,6 +495,9 @@ async fn a_started_workflow_reaches_its_terminal_status_on_the_clock() {
     ];
 
     let emu = emulator();
+    // Every row is started first and read afterwards, so the suite waits through the
+    // progression the clock owes a build ONCE rather than once per row.
+    let mut started_rows: Vec<(&str, String, String, f64)> = Vec::new();
     for (index, (case, workflow_type, source)) in rows.iter().enumerate() {
         let policy_arn = policy(&emu, &format!("clock policy {index}")).await;
         let started = start(&emu, &policy_arn, workflow_type, source.clone()).await;
@@ -510,16 +516,18 @@ async fn a_started_workflow_reaches_its_terminal_status_on_the_clock() {
              status the start accepted, got {:?}",
             before.get("status")
         );
-        let created_at = before.instant("createdAt");
+        started_rows.push((case, policy_arn, id, before.instant("createdAt")));
+    }
 
-        tokio::time::sleep(PAST_THE_BUILD).await;
+    tokio::time::sleep(PAST_THE_BUILD).await;
 
-        let after = get_workflow(&emu, &policy_arn, &id).await;
+    for (case, policy_arn, id, created_at) in &started_rows {
+        let after = get_workflow(&emu, policy_arn, id).await;
         assert_eq!(
             after.text("status"),
             COMPLETED,
-            "case {case:?}: the workflow is owed its completion a fraction of a second \
-             after the start, got {:?}",
+            "case {case:?}: the workflow is owed its completion once the whole progression \
+             the start armed has elapsed, got {:?}",
             after.get("status")
         );
         assert!(
@@ -529,14 +537,14 @@ async fn a_started_workflow_reaches_its_terminal_status_on_the_clock() {
         );
         let settled_at = after.instant("updatedAt");
         assert!(
-            settled_at > created_at,
+            settled_at > *created_at,
             "case {case:?}: the completion must move updatedAt past createdAt, got \
              createdAt={created_at} updatedAt={settled_at}"
         );
 
         // A read reports; it must not move anything a later caller sees.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let again = get_workflow(&emu, &policy_arn, &id).await;
+        let again = get_workflow(&emu, policy_arn, id).await;
         assert_eq!(
             again.text("status"),
             COMPLETED,
@@ -620,8 +628,14 @@ async fn a_policy_a_workflow_is_still_building_is_in_use() {
             );
         }
 
-        // Once the first workflow is terminal the policy is free again.
-        tokio::time::sleep(PAST_THE_BUILD).await;
+        // Once the first workflow is terminal the policy is free again: the workflow is
+        // aged past the progression the start armed instead of sleeping through it.
+        age_build_workflow(
+            &emu,
+            &policy_arn,
+            &first.text("buildWorkflowId"),
+            PAST_THE_BUILD,
+        );
         let third = start(
             &emu,
             &policy_arn,
@@ -991,7 +1005,7 @@ async fn a_cancel_with_nothing_left_to_stop_changes_nothing() {
 
         let expected_status = match reached {
             Reached::Completion => {
-                tokio::time::sleep(PAST_THE_BUILD).await;
+                age_build_workflow(&emu, &policy_arn, &id, PAST_THE_BUILD);
                 COMPLETED
             }
             Reached::CancelRequested => {
@@ -1302,7 +1316,7 @@ async fn a_listed_build_workflow_agrees_with_a_read_of_it() {
         let id = started.text("buildWorkflowId");
         // Past the completion the clock owes the workflow, so the read and the listing
         // below both report the terminal status rather than racing the transition.
-        tokio::time::sleep(PAST_THE_BUILD).await;
+        age_build_workflow(&emu, &policy_arn, &id, PAST_THE_BUILD);
 
         let read = get_workflow(&emu, &policy_arn, &id).await;
         assert_eq!(
@@ -1524,53 +1538,61 @@ async fn a_pagination_token_this_listing_never_issued_is_refused() {
 #[tokio::test]
 async fn a_listing_reports_the_status_the_clock_owes_and_changes_nothing() {
     // Rows span every state a stored workflow can be in when a listing reads it: the two
-    // the clock has already made due, and the two it has not.
+    // the clock has already made due, and the two it has not. Each row fixes how long ago
+    // its build was started, so the status is the one the elapsed time owes it.
     #[allow(clippy::type_complexity)]
     let rows: Vec<(
         &str,
         &str,
+        Duration,
         Box<dyn FnOnce(&mut bedrock::state::AutomatedReasoningPolicyBuildWorkflowRecord)>,
     )> = vec![
         (
             "a completion the clock has made due",
             COMPLETED,
+            PAST_THE_BUILD,
             Box::new(|_| {}),
         ),
         (
             "a build the clock has not finished",
             SCHEDULED,
+            Duration::from_secs(5),
             Box::new(|record| {
-                record.completed_due_at = Some(SystemTime::now() + Duration::from_secs(60));
+                // A build whose every stage is still ahead of it: the progression is
+                // re-armed on a start a minute from now.
+                arm_build_workflow(record, SystemTime::now() + Duration::from_secs(60));
             }),
         ),
         (
             "a cancellation the clock has made due",
             CANCELLED,
+            Duration::from_secs(5),
             Box::new(|record| {
+                record.forget_owed_transitions();
                 record.status = bedrock::state::BUILD_WORKFLOW_STATUS_CANCEL_REQUESTED;
-                record.completed_due_at = None;
                 record.cancelled_due_at = Some(record.created_at);
             }),
         ),
         (
             "a cancellation still winding down",
             CANCEL_REQUESTED,
+            Duration::from_secs(5),
             Box::new(|record| {
+                record.forget_owed_transitions();
                 record.status = bedrock::state::BUILD_WORKFLOW_STATUS_CANCEL_REQUESTED;
-                record.completed_due_at = None;
                 record.cancelled_due_at = Some(SystemTime::now() + Duration::from_secs(60));
             }),
         ),
     ];
 
     let emu = emulator();
-    for (index, (case, expected, tweak)) in rows.into_iter().enumerate() {
+    for (index, (case, expected, created_ago, tweak)) in rows.into_iter().enumerate() {
         let policy_arn = policy(&emu, &format!("settled policy {index}")).await;
         let id = seed_build_workflow(
             &emu,
             &policy_arn,
             WORKFLOW_TYPES[index % WORKFLOW_TYPES.len()],
-            Duration::from_secs(5),
+            created_ago,
             tweak,
         );
 

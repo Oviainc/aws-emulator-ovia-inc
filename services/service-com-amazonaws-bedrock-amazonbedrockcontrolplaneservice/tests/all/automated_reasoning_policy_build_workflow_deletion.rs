@@ -45,8 +45,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 
 use crate::support::{
-    at_millis, emulator, epoch_millis, label, seed_build_workflow, Emulator, Reply, ACCOUNT,
-    REGION,
+    age_build_workflow, at_millis, emulator, epoch_millis, label, seed_build_workflow, Emulator,
+    Reply, ACCOUNT, REGION,
 };
 
 /// The status `DeleteAutomatedReasoningPolicyBuildWorkflow` answers a delete it accepted with
@@ -74,13 +74,15 @@ const DOCUMENT_BLOB: &str = "cG9saWN5IHJ1bGVz";
 /// (`AutomatedReasoningPolicyBuildWorkflowType$INGEST_CONTENT`).
 const INGEST_CONTENT: &str = "INGEST_CONTENT";
 
-/// Long enough that a workflow a start accepted is past the completion the clock owes it:
-/// the emulator makes that transition due a fraction of a second after the start, so a
-/// caller that waits this long must see the terminal status.
-const PAST_THE_BUILD: Duration = Duration::from_millis(900);
+/// How far a workflow a start accepted must be aged to be past the completion the clock
+/// owes it: the whole progression the start arms, and a little more, so a workflow aged this
+/// much must hold the terminal status.
+const PAST_THE_BUILD: Duration =
+    bedrock::state::BUILD_WORKFLOW_COMPLETE_AFTER.saturating_add(Duration::from_millis(150));
 
 /// Long enough that the test runs a test workflow scheduled are past the completion the
-/// clock owes them, for the same reason [`PAST_THE_BUILD`] is long enough for the build.
+/// clock owes them: the emulator makes that transition due a fraction of a second after the
+/// run was scheduled, so a caller that waits this long must see the terminal status.
 const PAST_THE_TEST_RUN: Duration = Duration::from_millis(900);
 
 /// A `buildWorkflowId` nothing has started: one `AutomatedReasoningPolicyBuildWorkflowId`
@@ -88,13 +90,12 @@ const PAST_THE_TEST_RUN: Duration = Duration::from_millis(900);
 /// it is refused on the store holding no such workflow rather than on its spelling.
 const UNSTARTED_WORKFLOW_ID: &str = "00000000-0000-4000-8000-000000000000";
 
-/// The three in-flight values `AutomatedReasoningPolicyBuildWorkflowStatus` admits that no
-/// span of this emulator's clock leaves a workflow in, so the service names no constant for
-/// them (`smithy_query(query="shape",shape="AutomatedReasoningPolicyBuildWorkflowStatus")`);
-/// the rest of the enum is named by `bedrock::state`, and a row uses those constants.
-const PREPROCESSING: &str = "PREPROCESSING";
-const BUILDING: &str = "BUILDING";
-const TESTING: &str = "TESTING";
+/// The three in-flight values `AutomatedReasoningPolicyBuildWorkflowStatus` admits while a
+/// build is running, named by `bedrock::state` as the rest of the enum is
+/// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyBuildWorkflowStatus")`).
+const PREPROCESSING: &str = bedrock::state::BUILD_WORKFLOW_STATUS_PREPROCESSING;
+const BUILDING: &str = bedrock::state::BUILD_WORKFLOW_STATUS_BUILDING;
+const TESTING: &str = bedrock::state::BUILD_WORKFLOW_STATUS_TESTING;
 
 /// Create a policy and hand back the `policyArn` it minted.
 async fn policy(emu: &Emulator, name: &str) -> String {
@@ -317,10 +318,10 @@ fn assert_not_found_with(case: &str, reply: &Reply, message: &str) {
 ///
 /// Seeded through the ONE harness every suite of this crate seeds this record with
 /// ([`seed_build_workflow`]), so a seeded workflow is the workflow a start would have left.
-/// Seeding is what lets a row fix the STATUS the delete finds the workflow in, including the
-/// statuses the enum admits that no span of this emulator's clock leaves a workflow in,
-/// without sleeping for any of them: the workflow is owed no transition, so neither due
-/// instant is set and its `updatedAt` stays where the baseline put it.
+/// Seeding is what lets a row fix the STATUS the delete finds the workflow in — every value
+/// the enum admits, including the one no span of this emulator's clock leaves a workflow in
+/// (`FAILED`) — without sleeping for any of them: the workflow is left owing no transition,
+/// so no due instant is set and its `updatedAt` stays where the baseline put it.
 fn seed_workflow(
     emu: &Emulator,
     policy_arn: &str,
@@ -330,8 +331,7 @@ fn seed_workflow(
 ) -> String {
     seed_build_workflow(emu, policy_arn, workflow_type, created_ago, |record| {
         record.status = status;
-        record.completed_due_at = None;
-        record.cancelled_due_at = None;
+        record.forget_owed_transitions();
     })
 }
 
@@ -748,7 +748,9 @@ async fn a_deleted_build_workflow_takes_its_artifacts_with_it() {
     };
 
     let built = started_workflow(&emu, &policy_arn, INGEST_CONTENT).await;
-    tokio::time::sleep(PAST_THE_BUILD).await;
+    // A test workflow runs only against a COMPLETED build, so the build is aged past the
+    // progression the start armed instead of sleeping through it.
+    age_build_workflow(&emu, &policy_arn, &built, PAST_THE_BUILD);
     let scheduled = emu
         .call(
             "POST",
@@ -847,8 +849,9 @@ async fn a_deleted_build_workflow_takes_its_artifacts_with_it() {
     let freed_id = freed.text("buildWorkflowId");
 
     // The `clientRequestToken` of a deleted workflow no longer names it: a replay mints a
-    // NEW workflow rather than answering with the one that is gone.
-    tokio::time::sleep(PAST_THE_BUILD).await;
+    // NEW workflow rather than answering with the one that is gone. The freed policy's
+    // workflow is aged past its build first, so the replay is not refused on it.
+    age_build_workflow(&emu, &policy_arn, &freed_id, PAST_THE_BUILD);
     let replay = start(&emu, &policy_arn, INGEST_CONTENT, Some("build-token-1")).await;
     assert_eq!(
         replay.status, 200,

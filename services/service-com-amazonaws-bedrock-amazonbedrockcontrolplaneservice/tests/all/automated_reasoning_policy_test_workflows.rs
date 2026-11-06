@@ -43,8 +43,11 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 
-use crate::support::{emulator, label, wall_clock_seconds, Emulator, Reply, ACCOUNT, REGION};
+use crate::support::{
+    age_build_workflow, emulator, label, wall_clock_seconds, Emulator, Reply, ACCOUNT, REGION,
+};
 
 /// Every `AutomatedReasoningPolicyTestRunStatus` the model admits
 /// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyTestRunStatus")`).
@@ -86,17 +89,18 @@ const INGEST_CONTENT: &str = "INGEST_CONTENT";
 /// `policy rules`.
 const DOCUMENT_BLOB: &str = "cG9saWN5IHJ1bGVz";
 
-/// Long enough that a build workflow a start accepted is past the completion the clock owes
-/// it: the emulator makes that transition due a fraction of a second after the start, so a
-/// caller that waits this long must see the terminal status.
-const PAST_THE_BUILD: Duration = Duration::from_millis(900);
+/// How far a build workflow a start accepted must be aged to be past the completion the
+/// clock owes it: the whole progression the start arms, and a little more, so a workflow
+/// aged this much must hold the terminal status.
+const PAST_THE_BUILD: Duration =
+    bedrock::state::BUILD_WORKFLOW_COMPLETE_AFTER.saturating_add(Duration::from_millis(150));
 
 /// Long enough that a build workflow a cancel took over is past the cancellation the clock
-/// owes it, for the same reason [`PAST_THE_BUILD`] is long enough for the completion.
+/// owes it: the emulator makes that transition due a fraction of a second after the cancel.
 const PAST_THE_CANCELLATION: Duration = Duration::from_millis(900);
 
 /// Long enough that a test run a test workflow scheduled is past the completion the clock
-/// owes it, for the same reason [`PAST_THE_BUILD`] is long enough for a build.
+/// owes it, for the same reason [`PAST_THE_CANCELLATION`] is long enough for a cancellation.
 const PAST_THE_TEST_RUN: Duration = Duration::from_millis(900);
 
 /// The `ResourceNotFoundException` message the TEST surface answers for a build workflow a
@@ -203,10 +207,11 @@ async fn start_build_workflow(emu: &Emulator, policy_arn: &str) -> String {
 }
 
 /// A build workflow of `policy_arn` the clock has already completed: the one state a test
-/// workflow may run against.
+/// workflow may run against. The workflow is aged past the progression its start armed
+/// rather than slept through.
 async fn completed_build_workflow(emu: &Emulator, policy_arn: &str) -> String {
     let id = start_build_workflow(emu, policy_arn).await;
-    tokio::time::sleep(PAST_THE_BUILD).await;
+    age_build_workflow(emu, policy_arn, &id, PAST_THE_BUILD);
     id
 }
 
@@ -636,7 +641,7 @@ async fn tests_run_only_against_a_completed_build_workflow() {
                 false
             }
             Reached::Completed => {
-                tokio::time::sleep(PAST_THE_BUILD).await;
+                age_build_workflow(&emu, &policy_arn, &build_workflow_id, PAST_THE_BUILD);
                 true
             }
         };

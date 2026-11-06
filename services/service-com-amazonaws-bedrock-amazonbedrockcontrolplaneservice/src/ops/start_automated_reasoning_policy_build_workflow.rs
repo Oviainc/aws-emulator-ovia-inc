@@ -9,9 +9,11 @@
 //! stored record, so what this answers is exactly what
 //! `GetAutomatedReasoningPolicyBuildWorkflow` finds.
 //!
-//! A workflow starts `SCHEDULED` and the clock owes it `COMPLETED`
-//! ([`crate::state::BUILD_WORKFLOW_COMPLETE_AFTER`]), so a caller reading straight after
-//! the start still sees the status the start accepted.
+//! A workflow starts `SCHEDULED` and the clock owes it the whole progression a build runs
+//! through — `PREPROCESSING`, `BUILDING`, `TESTING` and then `COMPLETED`
+//! ([`crate::state::AutomatedReasoningPolicyBuildWorkflowClock`]) — so a caller reading
+//! straight after the start still sees the status the start accepted, and one polling the
+//! workflow while it builds reads each processing status in turn.
 //!
 //! An ARN naming no policy of this account is refused with `ResourceNotFoundException`, a
 //! policy one build workflow is still working on is refused with `ResourceInUseException`
@@ -257,14 +259,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let id = store.mint_build_workflow_id(now);
         let document = source_document(&input.source_content);
+        // The build runs after this call returns, so the workflow is reported as scheduled
+        // now and the start arms every later transition at once: each status of the
+        // progression is owed at an instant fixed HERE, on this start's own timeline, so the
+        // status the workflow holds is the one the time since this call owes it — a polling
+        // caller observes each processing status in turn, and one that waits and reads once
+        // is answered with the status that elapsed time owes it.
+        let clock = crate::state::AutomatedReasoningPolicyBuildWorkflowClock::armed_at(now);
         let record = crate::state::AutomatedReasoningPolicyBuildWorkflowRecord {
             policy_arn: input.policy_arn.clone(),
             id: id.clone(),
             workflow_type: input.build_workflow_type,
             // A workflow this call has just accepted has not been built yet, and the
-            // clock owes it its completion.
+            // clock owes it every status of its build.
             status: crate::state::BUILD_WORKFLOW_STATUS_SCHEDULED,
-            completed_due_at: Some(now + crate::state::BUILD_WORKFLOW_COMPLETE_AFTER),
+            preprocessing_due_at: Some(clock.preprocessing_at),
+            building_due_at: Some(clock.building_at),
+            testing_due_at: Some(clock.testing_at),
+            completed_due_at: Some(clock.completed_at),
             // Nothing has asked for this workflow to stop, so it is owed no cancellation.
             cancelled_due_at: None,
             document_name: document.map(|document| document.document_name.clone()),

@@ -8,10 +8,10 @@
 //! of the read, and the instants it was started and last changed. A pair naming no stored
 //! workflow of this account is refused with `ResourceNotFoundException`.
 //!
-//! A REPORTING operation (`@readonly`): the only write it makes is materialising the move
-//! to `COMPLETED` the clock had already made due
-//! ([`crate::state::AutomatedReasoningPolicyBuildWorkflowRecord::settle`]), which was owed
-//! at that instant even if nobody had called.
+//! A REPORTING operation (`@readonly`): the only write it makes is materialising the status
+//! moves of the build's progression the clock had already made due
+//! ([`crate::state::AutomatedReasoningPolicyBuildWorkflowRecord::settle`]), each of which was
+//! owed at its own instant even if nobody had called.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!

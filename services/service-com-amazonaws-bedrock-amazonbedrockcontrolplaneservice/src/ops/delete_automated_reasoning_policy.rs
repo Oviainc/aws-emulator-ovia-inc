@@ -12,10 +12,11 @@
 //! ([`crate::state::AUTOMATED_REASONING_POLICY_NOT_FOUND_ON_WRITE`]).
 //!
 //! A policy removal takes every artifact that hangs off the policy with it, which `force`
-//! governs: a request that did not force it is refused while the policy still holds one. A
+//! governs: a request that did not force it is refused with the modelled
+//! `ValidationException` while the policy still holds one, naming the kind of artifact in
+//! the way ([`crate::state::automated_reasoning_policy_artifact_not_deleted_message`]). A
 //! revision another resource is using — a guardrail that checks against it — is refused
-//! whichever way `force` was sent. Both of those refusals carry this emulator's own wording
-//! rather than a recorded sentence; see [`in_use`].
+//! with `ResourceInUseException` whichever way `force` was sent; see [`in_use`].
 //!
 //! ## Shape of an operation
 //!
@@ -222,16 +223,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `force` false: "Amazon Bedrock validates if all artifacts have been
                 // deleted (e.g. policy version, test case, test result) for a policy before
                 // deletion", so a policy still holding one is refused rather than taking it
-                // with the policy.
+                // with the policy — a validation of the request against the state the
+                // policy is in, which is the error class Amazon Bedrock answers it with.
                 if !input.force {
-                    let held = held_artifacts(&store, &base_arn);
-                    if !held.is_empty() {
-                        return Err(in_use(format!(
-                            "automated reasoning policy {} still has {} that have not been \
-                             deleted; delete them or retry the request with force set to true",
-                            input.policy_arn,
-                            held.join(", ")
-                        )));
+                    if let Some(kind) = held_artifact(&store, &base_arn) {
+                        return Err(validation(
+                            crate::state::automated_reasoning_policy_artifact_not_deleted_message(
+                                kind,
+                            ),
+                        ));
                     }
                 }
 
@@ -277,42 +277,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The artifacts of the policy `base_arn` this store still holds, named as the refusal of an
-/// unforced delete names them.
+/// The kind of artifact of the policy `base_arn` an unforced delete is refused on, or `None`
+/// when the policy holds none.
 ///
 /// The kinds `force` itself lists — "policy version, test case, test result" — plus the
 /// build workflows those results were produced by, which hang off the policy the same way.
-/// Reported as names rather than counts, so the sentence a caller is refused with is the
-/// same however many of each the policy holds.
-fn held_artifacts(
+/// ONE kind, because the refusal names one
+/// ([`crate::state::automated_reasoning_policy_artifact_not_deleted_message`]), and the kinds
+/// are walked in the order a caller must clear them: deleting a build workflow takes the test
+/// results it produced with it, and a test can only be deleted once no run of it is left, so
+/// the workflow is named before the results and the results before the tests.
+fn held_artifact(
     store: &crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState,
     base_arn: &str,
-) -> Vec<&'static str> {
-    let versions = store
-        .automated_reasoning_policy(base_arn)
-        .is_some_and(|policy| !policy.versions.is_empty());
+) -> Option<&'static str> {
     let build_workflows = store
         .automated_reasoning_policy_build_workflows
-        .keys()
-        .any(|(policy_arn, _)| policy_arn == base_arn);
-    let test_cases = store
-        .automated_reasoning_policy_test_cases
         .keys()
         .any(|(policy_arn, _)| policy_arn == base_arn);
     let test_results = store
         .automated_reasoning_policy_test_runs
         .keys()
         .any(|(policy_arn, _, _)| policy_arn == base_arn);
+    let test_cases = store
+        .automated_reasoning_policy_test_cases
+        .keys()
+        .any(|(policy_arn, _)| policy_arn == base_arn);
+    let versions = store
+        .automated_reasoning_policy(base_arn)
+        .is_some_and(|policy| !policy.versions.is_empty());
 
     [
-        (versions, "policy versions"),
-        (build_workflows, "build workflows"),
-        (test_cases, "test cases"),
-        (test_results, "test results"),
+        (build_workflows, "build workflow"),
+        (test_results, "test result"),
+        (test_cases, "test case"),
+        (versions, "policy version"),
     ]
     .into_iter()
-    .filter_map(|(held, kind)| held.then_some(kind))
-    .collect()
+    .find_map(|(held, kind)| held.then_some(kind))
 }
 
 /// The identifier of a guardrail whose Automated Reasoning policy configuration names a
@@ -362,16 +364,28 @@ fn not_found(message: String) -> DeleteAutomatedReasoningPolicyError {
     .into()
 }
 
-/// The modelled 400 this operation answers for a policy another resource is using, and for
-/// one whose own artifacts an unforced delete may not take with it.
+/// The modelled 400 `ResourceInUseException` this operation answers for a policy ANOTHER
+/// resource is using — the case that error documents, "trying to delete an Automated
+/// Reasoning policy that is referenced by an active guardrail".
 ///
-/// Both sentences are the EMULATOR's own wording: no recording of this service covers either
-/// refusal, unlike the two 404 sentences in `crate::state`, which are recorded. Each states
-/// what is in the way and takes its variable parts — the ARN the request carried, the
-/// guardrail using it, the artifact kinds the policy still holds — from the request and the
-/// store, so a later recording can correct the fixed text and nothing else.
+/// The sentence is the EMULATOR's own wording: no recording of this service covers this
+/// refusal, unlike the 404 sentences and the unforced-delete sentence in `crate::state`,
+/// which are recorded. It states what is in the way and takes its variable parts — the ARN
+/// the request carried and the guardrail using it — from the request and the store, so a
+/// later recording can correct the fixed text and nothing else.
 fn in_use(message: String) -> DeleteAutomatedReasoningPolicyError {
     DeleteAutomatedReasoningPolicyErrorModeled::ResourceInUseException(ResourceInUseException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 400 `ValidationException` this operation answers for an unforced delete of a
+/// policy whose own artifacts it may not take with it — the validation `force` documents,
+/// worded as Amazon Bedrock words it
+/// ([`crate::state::automated_reasoning_policy_artifact_not_deleted_message`]).
+fn validation(message: String) -> DeleteAutomatedReasoningPolicyError {
+    DeleteAutomatedReasoningPolicyErrorModeled::ValidationException(ValidationException {
         message: Some(message),
     })
     .into()

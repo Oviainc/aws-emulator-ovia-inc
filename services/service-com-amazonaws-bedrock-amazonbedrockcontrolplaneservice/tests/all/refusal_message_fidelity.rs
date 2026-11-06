@@ -58,11 +58,14 @@
 //!   request WITH a role and a model package source that needs none.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 
 use crate::automated_reasoning_policy_test_cases::{
     create_policy, create_test_case, get_test_case, CHECK_RESULTS,
 };
-use crate::support::{at_millis, emulator, epoch_millis, label, Emulator, Reply, ACCOUNT, REGION};
+use crate::support::{
+    age_build_workflow, at_millis, emulator, epoch_millis, label, Emulator, Reply, ACCOUNT, REGION,
+};
 
 // ---------------------------------------------------------------------------------------
 // The sentences under test, written out here rather than read off the crate so this suite
@@ -871,9 +874,11 @@ async fn a_definition_hash_that_is_not_the_drafts_is_refused_in_one_fixed_senten
 const INGEST_CONTENT: &str = "INGEST_CONTENT";
 const DOCUMENT_BLOB: &str = "cG9saWN5IHJ1bGVz";
 
-/// How long after the start a build workflow is owed its terminal status, as the service
-/// states it — the suite waits past it so the tests have a completed build to run against.
-const PAST_THE_BUILD: std::time::Duration = std::time::Duration::from_millis(900);
+/// How far a build workflow must be aged to be past the terminal status the clock owes it,
+/// as the service states that progression — the suite ages it so the tests have a completed
+/// build to run against without sleeping through the build.
+const PAST_THE_BUILD: std::time::Duration = bedrock::state::BUILD_WORKFLOW_COMPLETE_AFTER
+    .saturating_add(std::time::Duration::from_millis(150));
 
 #[tokio::test]
 async fn a_test_workflow_started_while_one_runs_is_refused_in_one_fixed_sentence() {
@@ -918,7 +923,7 @@ async fn a_test_workflow_started_while_one_runs_is_refused_in_one_fixed_sentence
         started.status, started.body
     );
     let build_workflow_id = started.text("buildWorkflowId");
-    tokio::time::sleep(PAST_THE_BUILD).await;
+    age_build_workflow(&emu, &policy_arn, &build_workflow_id, PAST_THE_BUILD);
 
     let test_workflows = format!(
         "/automated-reasoning-policies/{}/build-workflows/{build_workflow_id}/test-workflows",

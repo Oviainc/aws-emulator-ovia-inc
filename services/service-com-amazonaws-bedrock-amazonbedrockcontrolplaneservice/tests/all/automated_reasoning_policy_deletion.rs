@@ -23,8 +23,9 @@
 //!    "specifies whether to force delete the automated reasoning policy even if it has
 //!    active resources. When false, Amazon Bedrock validates if all artifacts have been
 //!    deleted (e.g. policy version, test case, test result) for a policy before deletion",
-//!    so a delete that did not force it is `ResourceInUseException` for each kind of
-//!    artifact the policy can hold, leaves everything readable, and the forced delete takes
+//!    so a delete that did not force it is `ValidationException` for each kind of artifact
+//!    the policy can hold — in the one sentence Amazon Bedrock words that validation with,
+//!    naming the kind in the way — leaves everything readable, and the forced delete takes
 //!    the policy and that artifact with it.
 //! 4. **An ARN naming no revision is refused**: `404 ResourceNotFoundException` over
 //!    well-formed ARNs whose policy id, whose region or whose version number names nothing,
@@ -38,13 +39,15 @@
 //! (`smithy_query(query="operation",operation="DeleteAutomatedReasoningPolicy")`:
 //! `@http(code: 202, method: "DELETE", uri: "/automated-reasoning-policies/{policyArn}")`,
 //! `force` bound to the `force` query parameter with `@default(false)`,
-//! `ResourceInUseException` 400, `ResourceNotFoundException` 404), and from its
+//! `ValidationException` 400, `ResourceInUseException` 400, `ResourceNotFoundException`
+//! 404), and from its
 //! documentation. The requests go through `crate::support` — the ONE harness every suite in
 //! this crate drives the emulator with.
 
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 
 use crate::automated_reasoning_policy_test_cases::{create_test_case, get_test_case, CHECK_RESULTS};
 use crate::support::{emulator, label, seed_build_workflow, Emulator, Reply, ACCOUNT, REGION};
@@ -73,9 +76,11 @@ const POLICY_VERSION_NOT_FOUND: &str = "Policy version does not exist";
 const INGEST_CONTENT: &str = "INGEST_CONTENT";
 
 /// How far in the past a seeded build workflow was started, so the clock has already owed it
-/// its completion by the time a test workflow is run against it — the one state a test
-/// workflow may run against, reached without sleeping for it.
-const LONG_BUILT: Duration = Duration::from_secs(5);
+/// its completion — the whole progression a build runs through, and a little more — by the
+/// time a test workflow is run against it: the one state a test workflow may run against,
+/// reached without sleeping for it.
+const LONG_BUILT: Duration =
+    bedrock::state::BUILD_WORKFLOW_COMPLETE_AFTER.saturating_add(Duration::from_millis(150));
 
 /// How `force` is spelled on the wire.
 #[derive(Debug, Clone, Copy)]
@@ -500,17 +505,21 @@ async fn seed_test_case(emu: &Emulator, case: &str, policy_arn: &str) -> String 
 #[tokio::test]
 async fn an_unforced_delete_is_refused_while_the_policy_holds_an_artifact() {
     // One row per kind of artifact a policy can hold — the kinds `force` names (a policy
-    // version, a test, a test result) and the build workflow a result is produced by.
-    let kinds = [
-        "policy versions",
-        "test cases",
-        "build workflows",
-        "test results",
+    // version, a test, a test result) and the build workflow a result is produced by — each
+    // with the artifact kind the refusal must name. A test result only exists under a build
+    // workflow, so the policy of that row holds a workflow too and the refusal names the
+    // workflow: the kind a caller must delete FIRST, because deleting it takes the results it
+    // produced with it.
+    let rows = [
+        ("policy versions", "policy version"),
+        ("test cases", "test case"),
+        ("build workflows", "build workflow"),
+        ("test results", "build workflow"),
     ];
 
     let emu = emulator();
 
-    for (index, kind) in kinds.iter().enumerate() {
+    for (index, (kind, expected_noun)) in rows.iter().enumerate() {
         let case = *kind;
         let (policy_arn, hash) =
             policy(&emu, case, json!({ "name": format!("artifact policy {index}") })).await;
@@ -563,17 +572,18 @@ async fn an_unforced_delete_is_refused_while_the_policy_holds_an_artifact() {
             let spelled = format!("{case}, force {unforced:?}");
             assert_eq!(
                 (refused.status, refused.error.as_deref()),
-                (400, Some("ResourceInUseException")),
+                (400, Some("ValidationException")),
                 "case {spelled:?}: a policy still holding an artifact must be refused, got {} \
                  {:?}",
                 refused.status,
                 refused.body
             );
             let message = message_of(&spelled, &refused);
-            assert!(
-                message.contains(kind),
-                "case {spelled:?}: the refusal must name the artifact kind in the way, got \
-                 {message:?}"
+            assert_eq!(
+                message,
+                format!("There are {expected_noun} that have not been deleted."),
+                "case {spelled:?}: the refusal must be the service's sentence naming the \
+                 artifact kind in the way, got {message:?}"
             );
             let read = get_policy(&emu, &policy_arn).await;
             assert_eq!(
@@ -628,7 +638,7 @@ async fn an_unforced_delete_takes_a_policy_whose_artifacts_are_gone() {
     let refused = delete_policy(&emu, &policy_arn, Force::False).await;
     assert_eq!(
         (refused.status, refused.error.as_deref()),
-        (400, Some("ResourceInUseException")),
+        (400, Some("ValidationException")),
         "case \"holding a version\": the unforced delete must be refused, got {} {:?}",
         refused.status,
         refused.body

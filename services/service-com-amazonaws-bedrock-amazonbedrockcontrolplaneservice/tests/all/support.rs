@@ -387,7 +387,10 @@ pub fn seed_build_workflow(
         id: id.clone(),
         workflow_type: workflow_type.to_string(),
         status: bedrock::state::BUILD_WORKFLOW_STATUS_SCHEDULED,
-        completed_due_at: Some(created_at + bedrock::state::BUILD_WORKFLOW_COMPLETE_AFTER),
+        preprocessing_due_at: None,
+        building_due_at: None,
+        testing_due_at: None,
+        completed_due_at: None,
         cancelled_due_at: None,
         document_name: None,
         document_content_type: None,
@@ -395,11 +398,63 @@ pub fn seed_build_workflow(
         created_at,
         updated_at: created_at,
     };
+    // The whole progression the start arms, on the timeline of the instant this workflow is
+    // seeded as having been started at — so a workflow seeded long enough ago is as terminal
+    // as one a start left that long ago, and one seeded moments ago is as scheduled.
+    arm_build_workflow(&mut record, created_at);
     tweak(&mut record);
     store
         .automated_reasoning_policy_build_workflows
         .insert((policy_arn.to_string(), id.clone()), record);
     id
+}
+
+/// Arm every status transition the clock owes `record`, as though its build had been started
+/// at `start_time` — the very clock
+/// `StartAutomatedReasoningPolicyBuildWorkflow` arms
+/// ([`bedrock::state::AutomatedReasoningPolicyBuildWorkflowClock`]), so a seeded workflow
+/// progresses exactly as a started one does.
+pub fn arm_build_workflow(
+    record: &mut bedrock::state::AutomatedReasoningPolicyBuildWorkflowRecord,
+    start_time: SystemTime,
+) {
+    let clock = bedrock::state::AutomatedReasoningPolicyBuildWorkflowClock::armed_at(start_time);
+    record.preprocessing_due_at = Some(clock.preprocessing_at);
+    record.building_due_at = Some(clock.building_at);
+    record.testing_due_at = Some(clock.testing_at);
+    record.completed_due_at = Some(clock.completed_at);
+}
+
+/// Age the stored build workflow `(policy_arn, build_workflow_id)` names by `by`, as though
+/// it had been started that much earlier: its own timeline is untouched and only how much of
+/// it has elapsed changes, so a rule about a span of wall-clock time needs no sleep.
+///
+/// Here rather than in one suite because four of them carry a workflow past a stage of its
+/// build, and ONE shift of its instants is what keeps them from drifting apart when
+/// [`bedrock::state::AutomatedReasoningPolicyBuildWorkflowRecord`] gains another due instant.
+pub fn age_build_workflow(emu: &Emulator, policy_arn: &str, build_workflow_id: &str, by: Duration) {
+    let state = bedrock::state::service_state(&*emu.engine)
+        .expect("the shared engine carries this service's store");
+    let mut store = state.lock();
+    let record = store
+        .automated_reasoning_policy_build_workflows
+        .get_mut(&(policy_arn.to_string(), build_workflow_id.to_string()))
+        .unwrap_or_else(|| {
+            panic!("the store must hold the build workflow {build_workflow_id} of {policy_arn}")
+        });
+    record.created_at -= by;
+    record.updated_at -= by;
+    for due in [
+        &mut record.preprocessing_due_at,
+        &mut record.building_due_at,
+        &mut record.testing_due_at,
+        &mut record.completed_due_at,
+        &mut record.cancelled_due_at,
+    ] {
+        if let Some(instant) = due.as_mut() {
+            *instant -= by;
+        }
+    }
 }
 
 /// Age the stored model customization job `arn` names by `by`, as though it had been

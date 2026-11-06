@@ -4,7 +4,8 @@
 //!
 //! Asks a stored Automated Reasoning policy build workflow to stop, and PERSISTS that ask
 //! in [`crate::state`]: a workflow that is still working moves to `CANCEL_REQUESTED`, is
-//! owed no completion any more, and the clock owes it `CANCELLED`
+//! owed neither the rest of its build's progression nor its completion any more, and the
+//! clock owes it `CANCELLED`
 //! ([`crate::state::BUILD_WORKFLOW_CANCELLED_AFTER`]) — so a caller reading straight after
 //! the cancel still sees the status this call recorded, and
 //! `GetAutomatedReasoningPolicyBuildWorkflow` reports exactly what this call wrote.
