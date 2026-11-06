@@ -1341,6 +1341,34 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`Self::insert_local_gateway`] is the one way a gateway is stored, and
     /// [`require_known_local_gateway`] the one way an id is resolved against this map.
     pub local_gateways: BTreeMap<String, crate::ops::types::LocalGateway>,
+    /// Every Outpost link aggregation group (LAG) the account holds, by `OutpostLagId`, as the
+    /// modelled [`crate::ops::types::OutpostLag`] shape itself — so a member a writer sets
+    /// round-trips through `DescribeOutpostLags` without a field-by-field copy that can
+    /// silently drop one. Ordered by id, which is the order that describe reports and pages
+    /// over.
+    ///
+    /// Starts EMPTY, for the reason the local gateway store above it does: "LAGs are only
+    /// available for second-generation Outposts racks" (`DescribeOutpostLags`) and no EC2 call
+    /// racks an Outpost, so an account without one has no LAG to report.
+    /// [`Self::insert_outpost_lag`] is the one way a LAG is stored, and the virtual interfaces
+    /// one reports are kept in step by [`Self::insert_local_gateway_virtual_interface`] — see
+    /// [`outpost_lags`].
+    pub outpost_lags: BTreeMap<String, crate::ops::types::OutpostLag>,
+    /// Every service link virtual interface the account holds, by
+    /// `ServiceLinkVirtualInterfaceId`, as the modelled
+    /// [`crate::ops::types::ServiceLinkVirtualInterface`] shape itself — so a member a writer
+    /// sets round-trips through every reader without a field-by-field copy that can silently
+    /// drop one. Ordered by id, the stable order a report of them pages over.
+    ///
+    /// Starts EMPTY, for the reason [`Self::outpost_lags`] does: a service link virtual
+    /// interface "establish[es] connectivity between Amazon Web Services Outpost and
+    /// on-premises networks" (`ServiceLinkVirtualInterface`) and no EC2 call racks an Outpost.
+    /// [`Self::insert_service_link_virtual_interface`] is the one way one is stored, and it is
+    /// what the `ServiceLinkVirtualInterfaceIds` of the LAG it runs over are kept in step with.
+    /// This is also the store the Outpost LAG filters that select on an interface's own
+    /// attributes are read against — see [`outpost_lags`].
+    pub service_link_virtual_interfaces:
+        BTreeMap<String, crate::ops::types::ServiceLinkVirtualInterface>,
     /// Every Client VPN endpoint the account holds, by `ClientVpnEndpointId`, as the
     /// modelled [`crate::ops::types::ClientVpnEndpoint`] shape itself — so a member a writer
     /// sets round-trips through `DescribeClientVpnEndpoints` without a field-by-field copy
@@ -2982,6 +3010,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             local_gateway_virtual_interface_available_at: BTreeMap::new(),
             // A local gateway is part of an Outpost rack, which no EC2 call creates.
             local_gateways: BTreeMap::new(),
+            // An Outpost LAG comes with a second-generation Outposts rack, which no EC2 call
+            // racks either.
+            outpost_lags: BTreeMap::new(),
+            service_link_virtual_interfaces: BTreeMap::new(),
             // A fresh account has created no Client VPN endpoint, so it holds none and no
             // target network is associated with one either.
             client_vpn_endpoints: BTreeMap::new(),

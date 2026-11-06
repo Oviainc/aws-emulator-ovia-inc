@@ -109,6 +109,15 @@
 //! recorded ([`ComAmazonawsEc2Amazonec2State::local_gateway_virtual_interface_available_at`],
 //! the way [`ComAmazonawsEc2Amazonec2State::vpc_available_at`] records a `pending` VPC's).
 //!
+//! [`ComAmazonawsEc2Amazonec2State::outpost_lags`] holds the Outpost link aggregation groups of
+//! that same Outpost, keyed by `OutpostLagId`, and
+//! [`ComAmazonawsEc2Amazonec2State::service_link_virtual_interfaces`] the service link virtual
+//! interfaces that run over them, keyed by `ServiceLinkVirtualInterfaceId` — both as the
+//! modelled shape itself, both starting EMPTY because no EC2 call racks an Outpost, and both
+//! written through the one seam the [`outpost_lags`] submodule documents. A LAG's lists of the
+//! virtual interfaces over it are kept in step by the inserts that store those interfaces, so
+//! `DescribeOutpostLags` and the interface stores cannot report one association differently.
+//!
 //! [`ComAmazonawsEc2Amazonec2State::local_gateway_route_table_vpc_associations`] holds the
 //! associations between a local gateway route table of
 //! [`ComAmazonawsEc2Amazonec2State::local_gateway_route_tables`] and a VPC, keyed by
@@ -2199,6 +2208,7 @@ mod images_and_zone_facts;
 mod import_image_tasks_and_verified_access;
 mod volumes;
 mod local_gateways_and_filter_patterns;
+pub mod outpost_lags;
 mod instance_ids_and_instance_types;
 mod instances_and_filters;
 mod vpcs_and_security_groups;
@@ -2208,6 +2218,7 @@ pub use vpcs_and_security_groups::*;
 pub use instances_and_filters::*;
 pub use instance_ids_and_instance_types::*;
 pub use local_gateways_and_filter_patterns::*;
+pub use outpost_lags::*;
 pub use volumes::*;
 pub use import_image_tasks_and_verified_access::*;
 pub use images_and_zone_facts::*;

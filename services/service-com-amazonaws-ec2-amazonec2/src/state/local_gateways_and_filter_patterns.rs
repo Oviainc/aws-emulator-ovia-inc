@@ -2947,7 +2947,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// (`LocalGatewayVirtualInterfaceGroup$LocalGatewayVirtualInterfaceIds`), so when the spec
     /// names a group this store holds, the minted id is added to that group's list HERE, in
     /// the one place an interface is stored: a second writer cannot leave the group reporting
-    /// a different set from this store.
+    /// a different set from this store. An interface created ON an Outpost LAG is likewise one
+    /// of "The IDs of the local gateway virtual interfaces associated with the Outpost LAG"
+    /// (`OutpostLag$LocalGatewayVirtualInterfaceIds`), so the same is done for a LAG this store
+    /// holds — see [`outpost_lags`].
     pub fn insert_local_gateway_virtual_interface(
         &mut self,
         spec: LocalGatewayVirtualInterfaceSpec,
@@ -2958,6 +2961,7 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         let virtual_interface_id = self.next_id(LOCAL_GATEWAY_VIF_ID_PREFIX);
         let group_id = spec.local_gateway_virtual_interface_group_id.clone();
+        let outpost_lag_id = spec.outpost_lag_id.clone();
         let virtual_interface = crate::ops::types::LocalGatewayVirtualInterface {
             local_gateway_virtual_interface_id: Some(virtual_interface_id.clone()),
             local_gateway_id: Some(spec.local_gateway_id),
@@ -2986,6 +2990,20 @@ impl ComAmazonawsEc2Amazonec2State {
             .and_then(|group_id| self.local_gateway_virtual_interface_groups.get_mut(group_id))
         {
             group
+                .local_gateway_virtual_interface_ids
+                .get_or_insert_with(Vec::new)
+                .push(virtual_interface_id.clone());
+        }
+        // "The IDs of the local gateway virtual interfaces associated with the Outpost LAG"
+        // (`OutpostLag$LocalGatewayVirtualInterfaceIds`), kept in step in this same one place
+        // and on the same terms: a spec naming a LAG this store does not hold leaves the lists
+        // it has alone, so `DescribeOutpostLags` cannot report a different set of interfaces
+        // from the interface store.
+        if let Some(outpost_lag) = outpost_lag_id
+            .as_deref()
+            .and_then(|outpost_lag_id| self.outpost_lags.get_mut(outpost_lag_id))
+        {
+            outpost_lag
                 .local_gateway_virtual_interface_ids
                 .get_or_insert_with(Vec::new)
                 .push(virtual_interface_id.clone());

@@ -875,6 +875,8 @@ mod local_gateway_route_tables;
 mod local_gateway_virtual_interface_groups;
 #[path = "all/local_gateway_virtual_interfaces.rs"]
 mod local_gateway_virtual_interfaces;
+#[path = "all/outpost_lags.rs"]
+mod outpost_lags;
 #[path = "all/mac_dedicated_hosts.rs"]
 mod mac_dedicated_hosts;
 #[path = "all/mac_modification_tasks.rs"]
