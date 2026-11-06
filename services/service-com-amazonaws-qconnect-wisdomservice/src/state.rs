@@ -340,6 +340,44 @@ pub const BUILT_IN_AI_AGENTS: [BuiltInAiAgent; 8] = [
     },
 ];
 
+/// The binding an assistant reports for one `AIAgentType` while no caller has configured
+/// an agent of its own for it: the SERVICE's built-in agent for the type, named by its
+/// published id and the revision of it the service binds (see [`qualified_ai_agent_id`]).
+///
+/// `None` when the service publishes no built-in agent for the label — the `ORCHESTRATION`
+/// type, and any string that is no `AIAgentType` this model declares — so a type with no
+/// default is reported by no binding at all until a caller configures one.
+///
+/// The one place a default binding is built, so the bindings a create provisions
+/// ([`default_ai_agents`]) and the binding a `RemoveAssistantAIAgent` falls back to are
+/// the same value.
+pub fn default_ai_agent_binding(agent_type: &str) -> Option<AIAgentConfigurationData> {
+    BUILT_IN_AI_AGENTS
+        .into_iter()
+        .find(|agent| agent.r#type == agent_type)
+        .map(built_in_ai_agent_binding)
+}
+
+/// The binding that names one built-in agent, which is what every default binding is:
+/// taken from the agent's own record, so neither the id nor the revision is materialised
+/// here.
+fn built_in_ai_agent_binding(agent: BuiltInAiAgent) -> AIAgentConfigurationData {
+    AIAgentConfigurationData {
+        // The binding names the agent by its id AND the version of it that runs — the
+        // model's own wording for the member is "The ID of the AI Agent to be configured",
+        // and the map it lives in maps an AI agent type "to AI Agent version" — so what an
+        // assistant reports is the id of the service's agent for the type, qualified by the
+        // revision of it the service publishes for that type.
+        ai_agent_id: qualified_ai_agent_id(agent.ai_agent_id, agent.revision),
+        // The model's own wording: "Indicates whether the AI Agent configured for this AI
+        // Agent type is enabled … Setting this value to false is currently supported only
+        // for the `ANSWER_RECOMMENDATION` AI Agent type" — see
+        // [`AI_AGENT_TYPE_ANSWER_RECOMMENDATION`] for why that one default is bound
+        // disabled and why no other type reports the member.
+        enabled: (agent.r#type == AI_AGENT_TYPE_ANSWER_RECOMMENDATION).then_some(false),
+    }
+}
+
 /// The AI agent types an assistant gets a default `SYSTEM` AI agent for when the service
 /// creates it, read off [`BUILT_IN_AI_AGENTS`] so the two cannot drift apart.
 pub const DEFAULT_AI_AGENT_TYPES: [&str; BUILT_IN_AI_AGENTS.len()] = [
@@ -387,6 +425,33 @@ pub fn message_ai_agent_quota() -> String {
 /// type the request itself carried.
 pub fn message_configuration_type_mismatch(agent_type: &str) -> String {
     format!("The configuration must be the AI Agent configuration for type {agent_type}.")
+}
+
+/// The sentence a request that would bind an AI agent to an `AIAgentType` the agent is
+/// not of is refused with. It states the RULE — a type runs an agent OF that type — and
+/// names the type the request itself carried.
+///
+/// An AI agent's `type` is fixed when it is created and an assistant's binding map is
+/// documented as mapping an AI agent type "to AI Agent version"
+/// (`smithy_query(query="shape",shape="AssistantData")`, member `aiAgentConfiguration`),
+/// so an agent of another type is one the named type cannot run. The class is the modelled
+/// `ValidationException` (HTTP 400), which the model declares for a request the service's
+/// own constraints refuse.
+pub fn message_ai_agent_type_mismatch(agent_type: &str) -> String {
+    format!("The AI Agent configured for AI Agent type {agent_type} must be an AI Agent of that type.")
+}
+
+/// The sentence a request that would turn a binding off for a type whose binding cannot
+/// be turned off is refused with, stating the rule the model's own
+/// `AIAgentConfigurationData$enabled` doc states: "Setting this value to false is
+/// currently supported only for the `ANSWER_RECOMMENDATION` AI Agent type; other requests
+/// to set it to false are rejected with a validation error" — see
+/// [`AI_AGENT_TYPE_ANSWER_RECOMMENDATION`].
+pub fn message_ai_agent_not_disableable() -> String {
+    format!(
+        "Setting enabled to false is supported only for the \
+         {AI_AGENT_TYPE_ANSWER_RECOMMENDATION} AI Agent type."
+    )
 }
 
 /// The sentence an update addressed to a built-in ([`AI_AGENT_ORIGIN_SYSTEM`]-origin) AI
@@ -525,6 +590,32 @@ pub fn ai_agent_configuration_entries(configuration: &AIAgentConfiguration) -> u
         | AIAgentConfiguration::noteTakingAIAgentConfiguration(_)
         | AIAgentConfiguration::caseSummarizationAIAgentConfiguration(_) => 0,
     }
+}
+
+/// The most orchestrator use cases one assistant may carry a configuration for at a time,
+/// which is what keeps this part of the store finite: an entry is released only by
+/// `RemoveAssistantAIAgent` naming its use case, or by the delete of its assistant.
+///
+/// It is a HEAP GUARD rather than a published quota — AWS does not publish a figure — and
+/// the same one [`MAX_AI_GUARDRAILS_PER_ASSISTANT`] states for the other family with a
+/// per-assistant ceiling: a use case is a caller-chosen string of up to the modelled
+/// `NonEmptyString` length, so without a ceiling one caller could leave an arbitrarily
+/// long list in this process's heap. `UpdateAssistantAIAgent` models no quota error, so
+/// the refusal past it is the operation's `ValidationException` (HTTP 400). Reconfiguring
+/// a use case the assistant already carries is never refused by it: that entry is
+/// replaced, so the list does not grow.
+pub const MAX_ORCHESTRATOR_CONFIGURATIONS_PER_ASSISTANT: usize = 100;
+
+/// The sentence a configure past [`MAX_ORCHESTRATOR_CONFIGURATIONS_PER_ASSISTANT`] is
+/// refused with, stating the RULE — the ceiling and what to do about it — and carrying
+/// nothing from the request, the way [`message_ai_guardrail_quota`] does for the other
+/// family with a per-assistant ceiling.
+pub fn message_orchestrator_configuration_quota() -> String {
+    format!(
+        "The maximum number of orchestrator configurations \
+         ({MAX_ORCHESTRATOR_CONFIGURATIONS_PER_ASSISTANT}) in this assistant has been \
+         reached. Remove an orchestrator configuration before adding another."
+    )
 }
 
 /// The fixed text for a request addressed to an AI guardrail its named assistant does
@@ -1194,22 +1285,9 @@ pub fn default_ai_agents(
         );
         bindings.insert(
             agent.r#type.to_string(),
-            AIAgentConfigurationData {
-                // The binding names the agent by its id AND the version of it that runs
-                // — the model's own wording for the member is "The ID of the AI Agent to
-                // be configured", and the map it lives in maps an AI agent type "to AI
-                // Agent version" — so what this assistant reports is the id of the
-                // service's agent for the type, qualified by the revision of it the
-                // service publishes for that type. See [`qualified_ai_agent_id`].
-                ai_agent_id: qualified_ai_agent_id(agent.ai_agent_id, agent.revision),
-                // The model's own wording: "Indicates whether the AI Agent
-                // configured for this AI Agent type is enabled … Setting this value
-                // to false is currently supported only for the
-                // `ANSWER_RECOMMENDATION` AI Agent type" — see
-                // [`AI_AGENT_TYPE_ANSWER_RECOMMENDATION`] for why that one default
-                // is bound disabled and why no other type reports the member.
-                enabled: (agent.r#type == AI_AGENT_TYPE_ANSWER_RECOMMENDATION).then_some(false),
-            },
+            // The binding a fresh assistant reports for the type, built where every
+            // default binding is built — see [`default_ai_agent_binding`].
+            built_in_ai_agent_binding(agent),
         );
     }
     (agents, bindings)
@@ -1922,6 +2000,75 @@ impl Assistant {
             Some(qualifier) if qualifier != VERSION_QUALIFIER_LATEST => None,
             _ => self.ai_agents.get_mut(id),
         }
+    }
+
+    /// Bind `agent_type` to the agent `binding` names, which is the write
+    /// `UpdateAssistantAIAgent` makes: from here on every read of this assistant reports
+    /// this binding for the type, in place of the default it reported before.
+    ///
+    /// The binding is stored EXACTLY as the caller sent it — the caller already chose
+    /// which agent and, through the qualifier, which revision of it runs for the type — so
+    /// nothing about it is materialised here.
+    pub fn configure_ai_agent(&mut self, agent_type: &str, binding: AIAgentConfigurationData) {
+        self.ai_agent_configuration
+            .insert(agent_type.to_string(), binding);
+    }
+
+    /// Drop the caller's binding for `agent_type`, which is the write
+    /// `RemoveAssistantAIAgent` makes.
+    ///
+    /// What the type reports afterwards is what it reported before any caller configured
+    /// it: the SERVICE's default binding for the type ([`default_ai_agent_binding`]), which
+    /// a removal cannot take away because it belongs to the service and not to this
+    /// assistant — and no binding at all for a type the service publishes no default for.
+    pub fn remove_configured_ai_agent(&mut self, agent_type: &str) {
+        match default_ai_agent_binding(agent_type) {
+            Some(default) => self.configure_ai_agent(agent_type, default),
+            None => {
+                self.ai_agent_configuration.remove(agent_type);
+            }
+        }
+    }
+
+    /// Bind the agent `ai_agent_id` names to one ORCHESTRATOR USE CASE of this assistant,
+    /// replacing the entry that use case already had. `false` — nothing stored — when this
+    /// assistant already carries [`MAX_ORCHESTRATOR_CONFIGURATIONS_PER_ASSISTANT`] use
+    /// cases and this is another one.
+    ///
+    /// A use case identifies the entry — the model makes `orchestratorUseCase` the
+    /// required member of an `OrchestratorConfigurationEntry` and the `aiAgentId` the
+    /// optional one (`smithy_query(query="shape",shape="OrchestratorConfigurationEntry")`)
+    /// — so one use case carries one agent, and configuring it again replaces it rather
+    /// than listing it twice. Entries are kept in the order they were first configured, so
+    /// a read reports a stable list.
+    pub fn configure_orchestrator(&mut self, orchestrator_use_case: &str, ai_agent_id: &str) -> bool {
+        let entry = OrchestratorConfigurationEntry {
+            ai_agent_id: Some(ai_agent_id.to_string()),
+            orchestrator_use_case: orchestrator_use_case.to_string(),
+        };
+        match self
+            .orchestrator_configuration_list
+            .iter_mut()
+            .find(|existing| existing.orchestrator_use_case == orchestrator_use_case)
+        {
+            Some(existing) => *existing = entry,
+            None => {
+                if self.orchestrator_configuration_list.len()
+                    >= MAX_ORCHESTRATOR_CONFIGURATIONS_PER_ASSISTANT
+                {
+                    return false;
+                }
+                self.orchestrator_configuration_list.push(entry);
+            }
+        }
+        true
+    }
+
+    /// Forget this assistant's entry for one orchestrator use case. The service publishes
+    /// no default orchestrator entry, so the use case is reported by nothing afterwards.
+    pub fn remove_orchestrator(&mut self, orchestrator_use_case: &str) {
+        self.orchestrator_configuration_list
+            .retain(|entry| entry.orchestrator_use_case != orchestrator_use_case);
     }
 
     /// How many AI agents a CALLER has created under this assistant, which is what

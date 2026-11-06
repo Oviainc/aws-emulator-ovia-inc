@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveAssistantAIAgent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveAssistantAIAgent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveAssistantAIAgent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Forgets the AI agent a caller configured for one `AIAgentType` on the assistant, so
+//! every later read of that assistant reports the service's default agent for the type
+//! again (nothing at all for a type the service publishes no default for), then answers
+//! HTTP 204 with an empty body. A request naming an orchestrator use case forgets that
+//! use case's entry of the assistant's orchestrator list instead.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +144,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveAssistantAIAgent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveAssistantAIAgentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveAssistantAIAgent"))
+        // Modeled constraints (the `aiAgentType` enumeration, `orchestratorUseCase`'s
+        // length and the label's pattern) are already refused BEFORE this handler runs, so
+        // reaching here means the input satisfies every one of them.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("RemoveAssistantAIAgent")
+        })?;
+        let mut store = state.lock();
+
+        // The configuration lives on the assistant, so a request naming one this account
+        // does not hold is not found.
+        let Some(assistant) = store.assistant_mut(&input.assistant_id) else {
+            return Err(
+                RemoveAssistantAIAgentErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::MESSAGE_ASSISTANT_NOT_FOUND.to_string()),
+                        resource_name: Some(input.assistant_id.clone()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The operation is modelled `@idempotent`, so removing what a type no longer
+        // carries is the same success as removing what it does: either way the type is
+        // afterwards configured by nothing of the caller's.
+        match input.orchestrator_use_case.as_deref() {
+            // An orchestrator agent is configured per USE CASE rather than per AI agent
+            // type, so that is what a request carrying one removes — the write
+            // `UpdateAssistantAIAgent` made under the same use case.
+            Some(orchestrator_use_case) => assistant.remove_orchestrator(orchestrator_use_case),
+            None => assistant.remove_configured_ai_agent(&input.ai_agent_type),
+        }
+
+        Ok(RemoveAssistantAIAgentOutput {})
     }
 }
