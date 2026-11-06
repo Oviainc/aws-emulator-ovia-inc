@@ -407,6 +407,25 @@ pub struct WirelessGatewayTaskDefinition {
     pub tags: Vec<Tag>,
 }
 
+/// The `ResourceNotFoundException` body for a resource kind this service addresses by an
+/// `Id` the account does not hold: the sentence the service words for this error class,
+/// with the resource kind and the requested id interpolated, and both optional members
+/// carrying those same two values.
+///
+/// One function, so every resource whose refusal takes this form words it identically;
+/// the kinds whose refusal is a different fixed sentence (a wireless gateway, a
+/// destination, a wireless device) keep their own.
+pub fn resource_not_found(resource_type: &str, resource_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Cannot complete the step because resource is not found, with resource type \
+             {resource_type}, resource Id {resource_id}"
+        )),
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
+    }
+}
+
 /// The `ResourceNotFoundException` body for a wireless gateway task definition the
 /// account does not hold.
 ///
@@ -414,11 +433,61 @@ pub struct WirelessGatewayTaskDefinition {
 /// reader, and the task operations that reference one — refuses a missing one with the
 /// same body.
 pub fn wireless_gateway_task_definition_not_found(id: &str) -> ResourceNotFoundException {
+    resource_not_found("WirelessGatewayTaskDefinition", id)
+}
+
+/// A wireless gateway task: the task definition one wireless gateway was asked to apply.
+///
+/// `GetWirelessGatewayTask` and `DeleteWirelessGatewayTask` address a task by the
+/// gateway's `WirelessGatewayId` alone, so a gateway holds at most ONE task; the store
+/// keys them by that id for exactly that reason.
+#[derive(Debug, Clone)]
+pub struct WirelessGatewayTask {
+    /// The gateway the task applies to; also this record's key in the store.
+    pub wireless_gateway_id: String,
+    /// The task definition the task applies, which the create resolved in the store.
+    pub wireless_gateway_task_definition_id: String,
+    /// `WirelessGatewayTaskStatus`, as [`WIRELESS_GATEWAY_TASK_STATUS_PENDING`]
+    /// documents the value a created task carries.
+    pub status: String,
+    /// When the task was created, reported as `GetWirelessGatewayTask`'s `TaskCreatedAt`.
+    pub created_at: SystemTime,
+}
+
+/// The `WirelessGatewayTaskStatus` a created gateway task carries: the gateway has not
+/// picked the firmware update up yet.
+///
+/// One of the modelled values
+/// [`crate::ops::types::WIRELESS_GATEWAY_TASK_STATUS_VALUES`] lists. The gateway side of
+/// the firmware transfer is a physical radio this emulator does not run, so nothing
+/// moves the task off this status: a later value would be progress no engine made.
+pub const WIRELESS_GATEWAY_TASK_STATUS_PENDING: &str = "PENDING";
+
+/// The `ResourceNotFoundException` body for a wireless gateway the account does not
+/// hold.
+///
+/// Unlike the resource kinds [`resource_not_found`] serves, this refusal is one wholly
+/// fixed sentence that interpolates nothing and leaves both optional members unset. One
+/// function, so every operation that addresses a gateway — the task operations among
+/// them — refuses a missing one with the same body.
+pub fn wireless_gateway_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("No wireless gateway task definition with Id {id}")),
-        resource_id: Some(id.to_string()),
-        resource_type: Some("WirelessGatewayTaskDefinition".to_string()),
+        message: Some("Wireless Gateway doesn't exist".to_string()),
+        resource_id: None,
+        resource_type: None,
     }
+}
+
+/// A stored instant as the `ISODateTimeString` this service's string date-time members
+/// carry (`GetWirelessGatewayTask`'s `TaskCreatedAt` among them).
+///
+/// `aws_smithy_types` formats it, so the emulator hand-writes no calendar arithmetic;
+/// `Format::DateTime` is the RFC-3339 form the modelled `ISODateTimeString` pattern
+/// admits. `None` only for an instant that format cannot represent.
+pub fn iso_date_time(at: SystemTime) -> Option<String> {
+    ::aws_smithy_types::DateTime::from(at)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
 }
 
 /// A multicast group: the LoRaWAN downlink settings a set of wireless devices shares.
@@ -675,7 +744,8 @@ pub const MAX_WIRELESS_GATEWAY_TOKENS: usize = MAX_WIRELESS_GATEWAYS;
 /// [`MAX_MULTICAST_GROUPS`] / [`MAX_FUOTA_TASKS`] /
 /// [`MAX_WIRELESS_GATEWAYS`] / [`MAX_WIRELESS_GATEWAY_TASK_DEFINITIONS`] (the
 /// creates refuse once full), `dev_eui_index` by one entry per stored device,
-/// `gateway_eui_index` by one entry per stored gateway, and the
+/// `gateway_eui_index` and `wireless_gateway_tasks` by one entry per stored gateway,
+/// and the
 /// token maps by [`MAX_DESTINATION_TOKENS`] / [`MAX_WIRELESS_DEVICE_TOKENS`] /
 /// [`MAX_DEVICE_PROFILE_TOKENS`] / [`MAX_SERVICE_PROFILE_TOKENS`] /
 /// [`MAX_MULTICAST_GROUP_TOKENS`] / [`MAX_FUOTA_TASK_TOKENS`] /
@@ -707,6 +777,11 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
     /// Wireless gateway task definitions by `Id`. Bounded by
     /// [`MAX_WIRELESS_GATEWAY_TASK_DEFINITIONS`].
     pub wireless_gateway_task_definitions: BTreeMap<String, WirelessGatewayTaskDefinition>,
+    /// The task each wireless gateway is running, by `WirelessGatewayId`. A gateway holds
+    /// at most one task and the create resolves the gateway first, so this map is bounded
+    /// by [`MAX_WIRELESS_GATEWAYS`] — one entry per stored gateway — rather than by a
+    /// ceiling of its own.
+    pub wireless_gateway_tasks: BTreeMap<String, WirelessGatewayTask>,
     /// `GatewayEui` -> gateway id, so `GetWirelessGateway?identifierType=GatewayEui`
     /// resolves without scanning and a duplicate `GatewayEui` is refusable. At most one
     /// entry per stored gateway.
