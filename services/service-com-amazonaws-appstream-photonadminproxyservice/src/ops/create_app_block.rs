@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAppBlock
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAppBlock`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAppBlock::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: persists a [`crate::state::AppBlockRecord`] in this service's store and
+//! returns the modelled `AppBlock` rendered FROM that record, so a later
+//! `DescribeAppBlocks` answers with the same ARN, `CreatedTime`, packaging and state. A
+//! second create of the same `Name` answers `ResourceAlreadyExistsException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +154,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAppBlock` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAppBlockErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAppBlock"))
+        // "The packaging type of the app block" decides which script members the request
+        // may carry and the state the app block starts in, and the resource always
+        // reports one, so a request that names none gets this service's default.
+        let packaging_type = input
+            .packaging_type
+            .clone()
+            .unwrap_or_else(|| crate::state::PACKAGING_TYPE_CUSTOM.to_string());
+
+        // `SetupScriptDetails` "must be provided for the CUSTOM PackagingType": a custom
+        // app block's setup script is what says how to mount its virtual hard disk, so a
+        // create without one describes no usable app block. The model expresses neither
+        // rule below, so each is refused as an invalid request rather than with one of
+        // this operation's modelled errors.
+        if packaging_type == crate::state::PACKAGING_TYPE_CUSTOM
+            && input.setup_script_details.is_none()
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::setup_script_details_required_message(),
+            ));
+        }
+        // `PostSetupScriptDetails` "can only be provided for the APPSTREAM2
+        // PackagingType", which is the packaging whose application package an app block
+        // builder produces.
+        if packaging_type != crate::state::PACKAGING_TYPE_APPSTREAM2
+            && input.post_setup_script_details.is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::post_setup_script_details_not_permitted_message(&packaging_type),
+            ));
+        }
+
+        // The shared store, reached through the constructor-injected engine. See
+        // `create_stack.rs` for why an engine without this service's store answers "not
+        // written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("CreateAppBlock"))?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = state.lock();
+
+        if state.app_blocks.contains_key(&input.name) {
+            return Err(CreateAppBlockErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(crate::state::resource_already_exists_message(
+                        crate::state::APP_BLOCK_KIND,
+                        &input.name,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store must not grow per request without a ceiling.
+        if state.app_blocks.len() >= crate::state::MAX_RECORDS_PER_STORE {
+            return Err(CreateAppBlockErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::limit_exceeded_message("app blocks")),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::AppBlockRecord {
+            arn: crate::state::app_block_arn(&region, &input.name),
+            name: input.name.clone(),
+            description: input.description,
+            display_name: input.display_name,
+            state: crate::state::app_block_state_created(
+                &packaging_type,
+                &input.source_s3_location,
+            )
+            .to_string(),
+            source_s3_location: input.source_s3_location,
+            setup_script_details: input.setup_script_details,
+            post_setup_script_details: input.post_setup_script_details,
+            packaging_type,
+            created_time: crate::state::now(),
+            // A freshly created app block carries no errors.
+            app_block_errors: Vec::new(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        let app_block = record.to_app_block();
+        state.app_blocks.insert(record.name.clone(), record);
+        Ok(CreateAppBlockOutput {
+            app_block: Some(app_block),
+        })
     }
 }

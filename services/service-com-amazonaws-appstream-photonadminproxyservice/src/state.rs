@@ -20,6 +20,10 @@
 //! this struct holds and `DescribeUsageReportSubscriptions` renders that same record
 //! back.
 //!
+//! App blocks live here too: `CreateAppBlock` writes one [`AppBlockRecord`] under the
+//! name it is created with, and `DescribeAppBlocks` renders the stored records the ARNs it
+//! is asked about name back, a page at a time.
+//!
 //! The user pool lives here as well: `CreateUser` writes a [`UserRecord`] under the
 //! `(AuthenticationType, UserName)` identity it allocates, and `DescribeUsers` renders
 //! the stored records of one authentication type back, a page at a time.
@@ -42,11 +46,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
-    AccessEndpoint, AgentAccessConfig, ApplicationSettingsResponse, ComputeCapacityStatus,
-    ContentRedirection, DomainJoinInfo, Fleet, FleetError, LastReportGenerationExecutionError,
-    S3Location, Stack, StackError, StorageConnector, StreamingExperienceSettings, Theme,
-    ThemeFooterLink, UsageReportSubscription, User, UserSetting, UserStackAssociation,
-    UserStackAssociationError, VolumeConfig, VpcConfig,
+    AccessEndpoint, AgentAccessConfig, AppBlock, ApplicationSettingsResponse,
+    ComputeCapacityStatus, ContentRedirection, DomainJoinInfo, ErrorDetails, Fleet, FleetError,
+    LastReportGenerationExecutionError, S3Location, ScriptDetails, Stack, StackError,
+    StorageConnector, StreamingExperienceSettings, Theme, ThemeFooterLink, UsageReportSubscription,
+    User, UserSetting, UserStackAssociation, UserStackAssociationError, VolumeConfig, VpcConfig,
 };
 
 /// The ARN namespace this service stamps on every resource ARN
@@ -105,6 +109,10 @@ pub const STACK_KIND: &str = "stack";
 
 /// The word AWS's refusal sentences use for a fleet.
 pub const FLEET_KIND: &str = "fleet";
+
+/// The words AWS's refusal sentences use for an app block, the `<kind>` slot of
+/// [`resource_not_found_message`] and [`resource_already_exists_message`].
+pub const APP_BLOCK_KIND: &str = "app block";
 
 /// The words AWS's refusal sentences use for a stack's custom branding theme.
 ///
@@ -267,6 +275,10 @@ pub const STACK_ARN_RESOURCE_TYPE: &str = "stack";
 /// The ARN `resource-type` segment of a fleet.
 pub const FLEET_ARN_RESOURCE_TYPE: &str = "fleet";
 
+/// The ARN `resource-type` segment of an app block, the segment before the app block's
+/// name in `arn:aws:appstream:<region>:<account>:app-block/<name>`.
+pub const APP_BLOCK_ARN_RESOURCE_TYPE: &str = "app-block";
+
 /// The `<kind>` word a refusal uses for an ARN whose resource part carries no
 /// `<resource-type>/<resource-id>` to name a kind with.
 pub const UNTYPED_RESOURCE_KIND: &str = "resource";
@@ -304,6 +316,7 @@ pub fn tagged_resource_not_found_message(resource_arn: &str) -> String {
     let kind = match resource_type.as_str() {
         STACK_ARN_RESOURCE_TYPE => STACK_KIND.to_string(),
         FLEET_ARN_RESOURCE_TYPE => FLEET_KIND.to_string(),
+        APP_BLOCK_ARN_RESOURCE_TYPE => APP_BLOCK_KIND.to_string(),
         other => other.replace('-', " "),
     };
     resource_not_found_message(&kind, &resource_id)
@@ -331,6 +344,15 @@ pub fn stack_arn(region: &str, name: &str) -> String {
 /// `arn:aws:appstream:<region>:<account>:fleet/<name>`.
 pub fn fleet_arn(region: &str, name: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("fleet/{name}"))
+}
+
+/// `arn:aws:appstream:<region>:<account>:app-block/<name>`.
+pub fn app_block_arn(region: &str, name: &str) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{APP_BLOCK_ARN_RESOURCE_TYPE}/{name}"),
+    )
 }
 
 /// `arn:aws:appstream:<region>:<account>:user/<user pool type>/<user name>`.
@@ -557,6 +579,119 @@ impl FleetRecord {
     }
 }
 
+/// The `PackagingType` an app block created without one carries.
+///
+/// The packaging type is what decides which script members a create may carry
+/// (`SetupScriptDetails` "must be provided for the CUSTOM PackagingType",
+/// `PostSetupScriptDetails` "can only be provided for the APPSTREAM2 PackagingType") and
+/// the state the app block starts in, so the resource always reports one. `CUSTOM` is the
+/// packaging that needs no app block builder to produce its application package: a
+/// request that names no packaging type is one whose virtual hard disk the caller brings
+/// itself. The value is `PackagingType`'s (`PACKAGING_TYPE_VALUES` in
+/// `ops/types/shared_types.rs`).
+pub const PACKAGING_TYPE_CUSTOM: &str = "CUSTOM";
+
+/// The packaging an app block whose application package an app block builder produces
+/// carries, the other `PackagingType` value.
+pub const PACKAGING_TYPE_APPSTREAM2: &str = "APPSTREAM2";
+
+/// The `AppBlockState` of an app block that can be used as it stands, one of
+/// `APP_BLOCK_STATE_VALUES` (`ops/types/shared_types.rs`).
+pub const APP_BLOCK_STATE_ACTIVE: &str = "ACTIVE";
+
+/// The `AppBlockState` of an app block that has no application package yet.
+pub const APP_BLOCK_STATE_INACTIVE: &str = "INACTIVE";
+
+/// The state a freshly created app block carries.
+///
+/// `AppBlock.State`'s documentation states the rule: an app block with WorkSpaces
+/// Applications packaging "will be in the INACTIVE state if no application package (VHD)
+/// is assigned to it" and becomes ACTIVE once an app block builder has created one, while
+/// "Custom app blocks are always in the ACTIVE state". What assigns a package at create
+/// time is the source location's `S3Key`, which `S3Location.S3Key`'s documentation
+/// describes as referring to the VHD file when an existing application package is used
+/// and as not required when a new one is to be built. So the only app block created
+/// INACTIVE is an APPSTREAM2 one whose source names no object yet — and it leaves that
+/// state when a builder produces the package, which no clock makes due.
+pub fn app_block_state_created(packaging_type: &str, source: &S3Location) -> &'static str {
+    let has_application_package = source.s3_key.as_deref().is_some_and(|key| !key.is_empty());
+    if packaging_type == PACKAGING_TYPE_APPSTREAM2 && !has_application_package {
+        APP_BLOCK_STATE_INACTIVE
+    } else {
+        APP_BLOCK_STATE_ACTIVE
+    }
+}
+
+/// The sentence a create refused for carrying no setup script where the packaging needs
+/// one carries: `SetupScriptDetails` "must be provided for the CUSTOM PackagingType", and
+/// a custom app block's setup script is what says how to mount its virtual hard disk.
+pub fn setup_script_details_required_message() -> String {
+    format!("SetupScriptDetails must be provided for the {PACKAGING_TYPE_CUSTOM} PackagingType")
+}
+
+/// The sentence a create refused for carrying a post setup script where the packaging
+/// admits none carries: `PostSetupScriptDetails` "can only be provided for the APPSTREAM2
+/// PackagingType". The only variable part is the packaging type the request asked for.
+pub fn post_setup_script_details_not_permitted_message(packaging_type: &str) -> String {
+    format!(
+        "PostSetupScriptDetails can only be provided for the {PACKAGING_TYPE_APPSTREAM2} \
+         PackagingType, was {packaging_type}"
+    )
+}
+
+/// A persisted AppStream app block — the virtual hard disk an elastic fleet's
+/// applications are served from, written by `CreateAppBlock` and rendered back by
+/// `DescribeAppBlocks`.
+#[derive(Debug, Clone)]
+pub struct AppBlockRecord {
+    pub arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub display_name: Option<String>,
+    pub source_s3_location: S3Location,
+    pub setup_script_details: Option<ScriptDetails>,
+    pub post_setup_script_details: Option<ScriptDetails>,
+    /// One of `PACKAGING_TYPE_VALUES`; [`PACKAGING_TYPE_CUSTOM`] for a create that named
+    /// none.
+    pub packaging_type: String,
+    /// One of `APP_BLOCK_STATE_VALUES`, as [`app_block_state_created`] decided it.
+    pub state: String,
+    pub created_time: ::aws_smithy_types::DateTime,
+    /// The errors of the app block; empty for one nothing has gone wrong with.
+    pub app_block_errors: Vec<ErrorDetails>,
+    pub tags: BTreeMap<String, String>,
+}
+
+/// Render a stored text attribute the way the resource reports it: the modelled
+/// `AppBlock.Description` and `AppBlock.DisplayName` members are `@length` 1.., so a
+/// value a create was given as the empty string is an attribute the resource does not
+/// have rather than one it reports empty.
+fn reported_text(text: Option<&str>) -> Option<String> {
+    text.filter(|value| !value.is_empty())
+        .map(::std::string::ToString::to_string)
+}
+
+impl AppBlockRecord {
+    /// Render the stored record as the modelled `AppBlock` every reader returns.
+    pub fn to_app_block(&self) -> AppBlock {
+        AppBlock {
+            name: self.name.clone(),
+            arn: self.arn.clone(),
+            description: reported_text(self.description.as_deref()),
+            display_name: reported_text(self.display_name.as_deref()),
+            source_s3_location: Some(self.source_s3_location.clone()),
+            setup_script_details: self.setup_script_details.clone(),
+            created_time: Some(self.created_time),
+            post_setup_script_details: self.post_setup_script_details.clone(),
+            packaging_type: Some(self.packaging_type.clone()),
+            state: Some(self.state.clone()),
+            // An app block with nothing wrong with it has no errors to report, so the
+            // member is ABSENT rather than present-and-empty.
+            app_block_errors: reported(&self.app_block_errors),
+        }
+    }
+}
+
 /// The account's usage report subscription: the daily usage reports it has enabled, and
 /// where they are written.
 ///
@@ -699,6 +834,10 @@ pub struct ComAmazonawsAppstreamPhotonadminproxyserviceState {
     pub themes: BTreeMap<String, ThemeRecord>,
     /// Fleets by `Name`.
     pub fleets: BTreeMap<String, FleetRecord>,
+    /// App blocks by `Name` — the name a `CreateAppBlock` mints the resource under, which
+    /// is also what a `DeleteAppBlock` names. `BTreeMap` so every page of a read walks a
+    /// stable order.
+    pub app_blocks: BTreeMap<String, AppBlockRecord>,
     /// `(FleetName, StackName)` edges written by `AssociateFleet`.
     pub fleet_stack_associations: BTreeSet<(String, String)>,
     /// The account's usage report subscription, once one has been created; `None` while
@@ -737,6 +876,21 @@ impl ComAmazonawsAppstreamPhotonadminproxyserviceState {
             .any(|(_, stack)| stack == stack_name)
     }
 
+    /// The app block stored under the ARN asked about; `None` when this service holds
+    /// none under it.
+    ///
+    /// An app block is addressed by ARN rather than by name on a read, and the stored ARN
+    /// must match in full, so an ARN naming another Region or account addresses no app
+    /// block here. The name in the ARN is what the record is keyed by, so the lookup is
+    /// one map probe rather than a scan.
+    pub fn app_block_by_arn(&self, arn: &str) -> Option<&AppBlockRecord> {
+        let (resource_type, name) = arn_resource(arn);
+        (resource_type == APP_BLOCK_ARN_RESOURCE_TYPE)
+            .then(|| self.app_blocks.get(&name))
+            .flatten()
+            .filter(|record| record.arn == arn)
+    }
+
     /// The tags the resource with this ARN carries, for reading; `None` when this
     /// service holds no resource under that ARN.
     ///
@@ -755,6 +909,11 @@ impl ComAmazonawsAppstreamPhotonadminproxyserviceState {
                 .map(|record| &record.tags),
             FLEET_ARN_RESOURCE_TYPE => self
                 .fleets
+                .get(&name)
+                .filter(|record| record.arn == resource_arn)
+                .map(|record| &record.tags),
+            APP_BLOCK_ARN_RESOURCE_TYPE => self
+                .app_blocks
                 .get(&name)
                 .filter(|record| record.arn == resource_arn)
                 .map(|record| &record.tags),
@@ -777,6 +936,11 @@ impl ComAmazonawsAppstreamPhotonadminproxyserviceState {
                 .map(|record| &mut record.tags),
             FLEET_ARN_RESOURCE_TYPE => self
                 .fleets
+                .get_mut(&name)
+                .filter(|record| record.arn == resource_arn)
+                .map(|record| &mut record.tags),
+            APP_BLOCK_ARN_RESOURCE_TYPE => self
+                .app_blocks
                 .get_mut(&name)
                 .filter(|record| record.arn == resource_arn)
                 .map(|record| &mut record.tags),
@@ -942,6 +1106,16 @@ fn decode_association_cursor(token: &str) -> Option<UserStackAssociationKey> {
 /// Cut `all` (sorted, deduplicated record names) into the page that resumes at
 /// `next_token`. `None` means the token is not one this service minted.
 pub fn paginate(all: &BTreeSet<String>, next_token: Option<&str>) -> Option<DescribePage> {
+    paginate_sized(all, next_token, DESCRIBE_PAGE_SIZE)
+}
+
+/// The same cut, for a read whose `MaxResults` sizes the page: at most `page_size`
+/// records, and never fewer than one, so following the token always advances.
+pub fn paginate_sized(
+    all: &BTreeSet<String>,
+    next_token: Option<&str>,
+    page_size: usize,
+) -> Option<DescribePage> {
     let cursor = match next_token {
         Some(token) => Some(decode_cursor(token)?),
         None => None,
@@ -954,7 +1128,7 @@ pub fn paginate(all: &BTreeSet<String>, next_token: Option<&str>) -> Option<Desc
                 .is_none_or(|resume_at| name.as_str() >= resume_at)
         })
         .cloned();
-    let names: Vec<String> = remaining.by_ref().take(DESCRIBE_PAGE_SIZE).collect();
+    let names: Vec<String> = remaining.by_ref().take(page_size.max(1)).collect();
     Some(DescribePage {
         next_token: remaining.next().map(|name| encode_cursor(&name)),
         names,
