@@ -222,7 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // second application cannot take a name that is already in use.
         if let Some(existing_arn) = store.app_name_index.get(&input.name) {
             return Err(conflict(
-                format!("an application named {} already exists", input.name),
+                crate::state::duplicate_app_name_message(&input.name),
                 existing_arn.clone(),
             ));
         }
@@ -231,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // DescribeApp report a policy DescribeResiliencyPolicy cannot find.
         if let Some(policy_arn) = input.policy_arn.as_deref() {
             if !store.policies.contains_key(policy_arn) {
-                return Err(policy_not_found(policy_arn));
+                return Err(policy_not_attachable(policy_arn, &input.name));
             }
         }
 
@@ -320,10 +320,13 @@ fn conflict(message: impl Into<String>, app_arn: String) -> CreateAppError {
 }
 
 /// A 404 `ResourceNotFoundException` for a `policyArn` no `CreateResiliencyPolicy`
-/// ever minted.
-fn policy_not_found(policy_arn: &str) -> CreateAppError {
+/// ever minted: the policy this create asked to attach cannot be attached, so the
+/// refusal names the application being created alongside the policy ARN.
+fn policy_not_attachable(policy_arn: &str, app_name: &str) -> CreateAppError {
     CreateAppErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("ResiliencyPolicy {policy_arn} not found")),
+        message: Some(crate::state::policy_attachment_not_found_message(
+            policy_arn, app_name,
+        )),
         resource_id: Some(policy_arn.to_string()),
         resource_type: Some("ResiliencyPolicy".to_string()),
     })

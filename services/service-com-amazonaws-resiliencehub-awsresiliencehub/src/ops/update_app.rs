@@ -190,10 +190,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.apps.contains_key(&input.app_arn) {
             return Err(app_not_found(&input.app_arn));
         }
-        // A policy reference must resolve, exactly as it must on CreateApp.
+        // A policy reference must resolve, exactly as it must on CreateApp — and
+        // the refusal states the same attach failure, naming the application it
+        // was being attached to by the name that application answers to.
         if let Some(policy_arn) = input.policy_arn.as_deref() {
             if !store.policies.contains_key(policy_arn) {
-                return Err(policy_not_found(policy_arn));
+                let app_name = store
+                    .apps
+                    .get(&input.app_arn)
+                    .map(|app| app.name.clone())
+                    .unwrap_or_default();
+                return Err(policy_not_attachable(policy_arn, &app_name));
             }
         }
 
@@ -254,7 +261,7 @@ fn internal_failure() -> UpdateAppError {
 /// deleted.
 fn app_not_found(app_arn: &str) -> UpdateAppError {
     UpdateAppErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("application {app_arn} does not exist")),
+        message: Some(crate::state::app_not_found_message(app_arn)),
         resource_id: Some(app_arn.to_string()),
         resource_type: Some("App".to_string()),
     })
@@ -262,10 +269,13 @@ fn app_not_found(app_arn: &str) -> UpdateAppError {
 }
 
 /// A 404 `ResourceNotFoundException` for a `policyArn` no `CreateResiliencyPolicy`
-/// ever minted.
-fn policy_not_found(policy_arn: &str) -> UpdateAppError {
+/// ever minted: the policy this update asked to attach cannot be attached, so the
+/// refusal names the application alongside the policy ARN.
+fn policy_not_attachable(policy_arn: &str, app_name: &str) -> UpdateAppError {
     UpdateAppErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("ResiliencyPolicy {policy_arn} not found")),
+        message: Some(crate::state::policy_attachment_not_found_message(
+            policy_arn, app_name,
+        )),
         resource_id: Some(policy_arn.to_string()),
         resource_type: Some("ResiliencyPolicy".to_string()),
     })

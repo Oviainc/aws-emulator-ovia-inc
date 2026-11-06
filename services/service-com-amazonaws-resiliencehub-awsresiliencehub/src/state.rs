@@ -1189,3 +1189,116 @@ fn elided(text: &str) -> String {
 pub fn now() -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now())
 }
+
+// =============================================================================
+// Refusal wording
+//
+// The message of a refusal is part of the contract — a client branches on it —
+// so each sentence this service states is written ONCE here and interpolated
+// with values taken from the request and from what is stored, never from one
+// recorded run. Every handler that refuses for one of these reasons calls the
+// matching builder, so two operations cannot word the same refusal differently.
+// =============================================================================
+
+/// The `ResourceNotFoundException` message for an `appArn` this service holds no
+/// application under — never created, or deleted since.
+///
+/// The ONE sentence for that refusal, whichever operation resolved the ARN: an
+/// application is addressed by `appArn` by every operation that takes one
+/// (`smithy_query query="digest"`), so the refusal names the member that did not
+/// resolve and the value it carried.
+pub fn app_not_found_message(app_arn: &str) -> String {
+    format!("App not found for appArn {app_arn}")
+}
+
+/// The `ResourceNotFoundException` message for a `policyArn` this service holds no
+/// resiliency policy under.
+///
+/// The ONE sentence for that refusal, whichever operation resolved the ARN — the
+/// entity is named as the model names its shape (`ResiliencyPolicy`).
+pub fn policy_not_found_message(policy_arn: &str) -> String {
+    format!("ResiliencyPolicy {policy_arn} not found")
+}
+
+/// The `ResourceNotFoundException` message for a request that cannot ATTACH the
+/// resiliency policy it names to an application, because no policy is stored
+/// under that ARN.
+///
+/// Distinct from [`policy_not_found_message`]: the request's subject is the
+/// application, not the policy, so the refusal states what it could not do and
+/// names BOTH the policy ARN the request carried and the application it was being
+/// attached to — without which a client batching such calls cannot tell which one
+/// failed from the error alone.
+pub fn policy_attachment_not_found_message(policy_arn: &str, app_name: &str) -> String {
+    format!("Cannot attach policy {policy_arn} to app {app_name}. Policy {policy_arn} does not exist.")
+}
+
+/// The `ConflictException` message for a `CreateApp` whose `name` another
+/// application of this account already answers to.
+///
+/// An application's name identifies it within the account, so the refusal names
+/// the NAME the request asked for rather than the ARN of the application holding
+/// it: the name is what the caller has to change.
+pub fn duplicate_app_name_message(name: &str) -> String {
+    format!("App with name {name} already exists.")
+}
+
+/// The `ConflictException` message for a resource the app template being composed
+/// already holds.
+///
+/// The refusal names the duplicated resource by the id the template addresses it
+/// by and states the remediation — editing the template — because that, and not a
+/// retry, is what clears it. The id is [`elided`] first: it is a caller-supplied
+/// value of up to 255 characters (`LogicalResourceId$identifier` targets
+/// `String255`), so echoing it whole would amplify one request into a larger
+/// refusal.
+pub fn duplicate_template_resource_message(resource_id: &str) -> String {
+    format!(
+        "Resource with id {} exists in the current app template. \
+         Please update the the app template to remove the duplicated resource.",
+        elided(resource_id)
+    )
+}
+
+/// The wire error code this service refuses an invalid request with — the
+/// client-input error its model declares for every operation (`ValidationException`,
+/// `httpError` 400).
+pub const VALIDATION_EXCEPTION_CODE: &str = "ValidationException";
+
+/// This service's constraint report for a request whose values do not satisfy the
+/// `@pattern` of the members they were sent for: a BRACKETED LIST with one entry
+/// per violated member, `None` when the refusal is about something else.
+///
+/// The service reports a pattern violation as the regular-expression engine states
+/// it — the expression the value had to match, evaluated as an ECMA-262 one, and
+/// the value that did not match it — rather than in the common AWS framework form
+/// that counts the errors and names the member. Both come from this request: the
+/// expression from the model member the value was sent for, the value from the
+/// request itself (already elided by the framework before it reaches here).
+///
+/// Only the pattern class is reworded. A violation of any OTHER modelled
+/// constraint keeps the framework's own wording, which is also what this service's
+/// handler-side refusals state (see [`enum_violation`] and
+/// [`additional_info_violation`]), so a request that breaks a non-pattern rule
+/// reads the same whichever layer judged it.
+pub fn pattern_constraint_report(violations: &[::smithy_server_runtime::Violation]) -> Option<String> {
+    if violations.is_empty() {
+        return None;
+    }
+    let entries: Vec<String> = violations.iter().map(pattern_report_entry).collect::<Option<_>>()?;
+    Some(format!("[{}]", entries.join(", ")))
+}
+
+/// One entry of [`pattern_constraint_report`], or `None` when `violation` is not a
+/// `@pattern` violation.
+fn pattern_report_entry(violation: &::smithy_server_runtime::Violation) -> Option<String> {
+    let ::smithy_server_runtime::ViolationKind::Pattern(pattern) = &violation.kind else {
+        return None;
+    };
+    // A `@sensitive` member's value is withheld by the framework, which leaves the
+    // entry stating the expression alone rather than echoing anything.
+    let shown = violation.value.as_deref().unwrap_or_default();
+    Some(format!(
+        "ECMA 262 regex \"{pattern}\" does not match input string \"{shown}\""
+    ))
+}

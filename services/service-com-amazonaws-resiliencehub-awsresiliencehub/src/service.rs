@@ -138,15 +138,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // This service does not state a constraint violation in the common AWS
+        // framework form that counts the errors and names the member: a value the
+        // model's own regular expression for its member does not admit is reported
+        // as a bracketed constraint report, one entry per violated member, naming
+        // the expression and the value — whichever operation and whichever member
+        // carried it. `crate::state::pattern_constraint_report` is where that
+        // report is built; it answers `None` for every other kind of violation, so
+        // those keep the framework's wording, which is what this service's
+        // handler-side refusals state too.
+        //
+        // The CODE is restated with the message, because a message without its
+        // matching code is worse than leaving both alone: this service models
+        // `ValidationException` (HTTP 400) as the client-input error of every
+        // operation, and that is the code the framework's own default names here.
+        let Refusal::Invalid(violations) = refusal else {
+            // An authentication refusal is the framework's 403 to word, not ours.
+            return None;
+        };
+        let message = crate::state::pattern_constraint_report(violations)?;
+        Some(Refused {
+            code: crate::state::VALIDATION_EXCEPTION_CODE.to_string(),
+            message,
+        })
     }
 
     fn override_routing_error(

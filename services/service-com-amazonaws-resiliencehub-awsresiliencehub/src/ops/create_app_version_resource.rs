@@ -297,17 +297,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A resource is addressed within the app template by its NAME — that is how
+        // an Application Component references it (`AppComponent$resourceNames`) —
+        // so the name the request asks for, or the logical identifier it would be
+        // named by when it asks for none, is the id the template holds it under and
+        // the id a refusal reports.
+        let template_resource_id = input
+            .resource_name
+            .as_deref()
+            .unwrap_or(input.logical_resource_id.identifier.as_str());
+
         // The `logicalResourceId` identifies the resource within the app version,
         // so a second resource cannot take one that is already in use.
         if draft.is_some_and(|draft| draft.resources.contains_key(&resource_key)) {
             return Err(conflict(
-                format!(
-                    "a resource with logicalResourceId {} already exists in the {} version of \
-                     application {}",
-                    input.logical_resource_id.identifier,
-                    crate::state::DRAFT_APP_VERSION,
-                    input.app_arn
-                ),
+                crate::state::duplicate_template_resource_message(template_resource_id),
                 input.logical_resource_id.identifier.clone(),
                 "PhysicalResource",
             ));
@@ -320,12 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(resource_name) = input.resource_name.as_deref() {
             if draft.is_some_and(|draft| draft.resource_by_name(resource_name).is_some()) {
                 return Err(conflict(
-                    format!(
-                        "a resource named {resource_name} already exists in the {} version of \
-                         application {}",
-                        crate::state::DRAFT_APP_VERSION,
-                        input.app_arn
-                    ),
+                    crate::state::duplicate_template_resource_message(resource_name),
                     resource_name.to_string(),
                     "PhysicalResource",
                 ));
@@ -661,7 +660,7 @@ fn invalid_request(message: String) -> CreateAppVersionResourceError {
 /// deleted.
 fn app_not_found(app_arn: &str) -> CreateAppVersionResourceError {
     CreateAppVersionResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("application {app_arn} does not exist")),
+        message: Some(crate::state::app_not_found_message(app_arn)),
         resource_id: Some(app_arn.to_string()),
         resource_type: Some("App".to_string()),
     })

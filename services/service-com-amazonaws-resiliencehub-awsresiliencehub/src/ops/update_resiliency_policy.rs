@@ -266,7 +266,7 @@ fn internal_failure() -> UpdateResiliencyPolicyError {
 /// ever minted, or one a `DeleteResiliencyPolicy` has since removed.
 fn policy_not_found(policy_arn: &str) -> UpdateResiliencyPolicyError {
     UpdateResiliencyPolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("ResiliencyPolicy {policy_arn} not found")),
+        message: Some(crate::state::policy_not_found_message(policy_arn)),
         resource_id: Some(policy_arn.to_string()),
         resource_type: Some("ResiliencyPolicy".to_string()),
     })

@@ -179,7 +179,7 @@ fn internal_failure() -> DescribeResiliencyPolicyError {
 /// A 404 `ResourceNotFoundException` for a `policyArn` that was never created.
 fn policy_not_found(policy_arn: &str) -> DescribeResiliencyPolicyError {
     DescribeResiliencyPolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("ResiliencyPolicy {policy_arn} not found")),
+        message: Some(crate::state::policy_not_found_message(policy_arn)),
         resource_id: Some(policy_arn.to_string()),
         resource_type: Some("ResiliencyPolicy".to_string()),
     })

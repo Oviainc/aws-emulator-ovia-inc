@@ -177,7 +177,7 @@ fn internal_failure() -> DescribeAppError {
 /// deleted — never a 200 carrying a synthesised application.
 fn app_not_found(app_arn: &str) -> DescribeAppError {
     DescribeAppErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("application {app_arn} does not exist")),
+        message: Some(crate::state::app_not_found_message(app_arn)),
         resource_id: Some(app_arn.to_string()),
         resource_type: Some("App".to_string()),
     })

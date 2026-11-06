@@ -224,7 +224,7 @@ fn internal_failure() -> DescribeAppVersionResourcesResolutionStatusError {
 fn app_not_found(app_arn: &str) -> DescribeAppVersionResourcesResolutionStatusError {
     DescribeAppVersionResourcesResolutionStatusErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: Some(format!("App not found for appArn {app_arn}")),
+            message: Some(crate::state::app_not_found_message(app_arn)),
             resource_id: Some(app_arn.to_string()),
             resource_type: Some("App".to_string()),
         },
