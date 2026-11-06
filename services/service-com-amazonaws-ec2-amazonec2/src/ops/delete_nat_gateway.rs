@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNatGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteNatGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: moves the stored NAT gateway into `deleting` — disassociating the Elastic IP
+//! addresses it held without releasing them, and giving its private addresses back to its
+//! subnet — and the clock owes it `deleted`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteNatGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +131,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteNatGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteNatGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            require_known_nat_gateway, require_service_state, system_time_to_date_time,
+            NAT_GATEWAY_STATE_DELETED, NAT_GATEWAY_STATE_DELETING, PendingStateMove,
+        };
+
+        // `ctx` carries request metadata only, and a NAT gateway is named by its own id, so
+        // this operation reads none of it. The store is reached through the engine on `self`.
+        let _ = ctx;
+
+        let state_handle = require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first: a gateway whose move has fallen due is already in the state it was
+        // owed, so what this call does is decided from the state the gateway is ACTUALLY in.
+        store.materialize_due_transitions();
+
+        // "Deletes the specified NAT gateway" (`DeleteNatGateway`): an id this account holds
+        // no gateway for is a refusal, not a no-op, and an id that is not shaped like a NAT
+        // gateway id is refused as malformed first — the one place this crate asks those two
+        // questions, in that order.
+        let gateway = require_known_nat_gateway(&store, &input.nat_gateway_id)?;
+        let already_going = matches!(
+            gateway.state.as_deref(),
+            Some(NAT_GATEWAY_STATE_DELETING) | Some(NAT_GATEWAY_STATE_DELETED)
+        );
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "Deleting a public NAT gateway disassociates its Elastic IP address, but does not
+        // release the address from your account" (`DeleteNatGateway`): the association is
+        // taken off BOTH sides — the gateway's own address list and the stored address every
+        // `DescribeAddresses` reads — so the address is free to be associated again or
+        // released, and the allocation itself stays in the account.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteNatGateway"))
+        // A gateway already on its way out is left exactly as it is: the deletion this call
+        // asks for is the one already under way, so repeating the call neither disassociates
+        // twice nor postpones the first by restarting its due instant.
+        if !already_going {
+            let associated: Vec<String> = store
+                .nat_gateways
+                .get(&input.nat_gateway_id)
+                .and_then(|gateway| gateway.nat_gateway_addresses.as_ref())
+                .map(|addresses| {
+                    addresses
+                        .iter()
+                        .filter_map(|address| address.allocation_id.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for allocation_id in associated {
+                if let Some(address) = store.addresses.get_mut(&allocation_id) {
+                    address.association_id = None;
+                    address.network_interface_id = None;
+                    address.network_interface_owner_id = None;
+                    address.private_ip_address = None;
+                }
+            }
+            // The private addresses the gateway's interface held go back to its subnet, so
+            // another resource of that subnet can be given them.
+            let private_ips: Vec<String> = store
+                .nat_gateways
+                .get(&input.nat_gateway_id)
+                .and_then(|gateway| gateway.nat_gateway_addresses.as_ref())
+                .map(|addresses| {
+                    addresses
+                        .iter()
+                        .filter_map(|address| address.private_ip.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for private_ip in private_ips {
+                store.release_private_ip(&private_ip);
+            }
+            let deleted_at = system_time_to_date_time(::std::time::SystemTime::now());
+            if let Some(gateway) = store.nat_gateways.get_mut(&input.nat_gateway_id) {
+                // `NatGatewayState` carries `deleting` and `deleted` beside `pending` and
+                // `available`, so a gateway a delete has been asked for is still a gateway
+                // the API reports: the delete moves it into the non-terminal `deleting`
+                // state and the clock owes it `deleted` rather than making the record
+                // vanish.
+                gateway.state = Some(NAT_GATEWAY_STATE_DELETING.to_string());
+                // "The date and time the NAT gateway was deleted, if applicable"
+                // (`NatGateway$DeleteTime`).
+                gateway.delete_time = Some(deleted_at);
+                for address in gateway.nat_gateway_addresses.iter_mut().flatten() {
+                    address.allocation_id = None;
+                    address.association_id = None;
+                    address.public_ip = None;
+                }
+            }
+            store.nat_gateway_moves.insert(
+                input.nat_gateway_id.clone(),
+                PendingStateMove::starting_now(NAT_GATEWAY_STATE_DELETED),
+            );
+        }
+
+        // "The ID of the NAT gateway" (`DeleteNatGatewayResult$NatGatewayId`): the gateway
+        // the deletion is under way for.
+        Ok(DeleteNatGatewayOutput {
+            nat_gateway_id: Some(input.nat_gateway_id.clone()),
+        })
     }
 }

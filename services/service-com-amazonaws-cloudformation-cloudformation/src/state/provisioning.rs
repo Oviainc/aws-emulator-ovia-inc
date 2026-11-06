@@ -542,9 +542,10 @@ pub(super) enum Owner {
     /// `AWS::Lambda::Permission`, whose arms are [`lambda_permission`]'s.
     LambdaPermission,
     /// One of the Amazon EC2 VPC-network types [`ec2_vpc_network`] creates: the route table,
-    /// the subnet association that puts a subnet on one, and the VPC endpoint reached
-    /// through it. Which of them it is travels with the owner, so the algorithm resolves the
-    /// type once and every call below is about that same resource.
+    /// the subnet association that puts a subnet on one, the VPC endpoint reached through it,
+    /// the internet and virtual private gateways, the attachment that puts one of those on a
+    /// VPC, and the Elastic IP address. Which of them it is travels with the owner, so the
+    /// algorithm resolves the type once and every call below is about that same resource.
     Ec2VpcNetwork(ec2_vpc_network::Kind),
 }
 
@@ -623,11 +624,12 @@ impl Owner {
             // The statement is in force the moment `AddPermission` answers.
             Self::LambdaPermission => Ok(Readiness::Ready),
             // Each of these resources EXISTS from the moment its create answers: the table
-            // takes its routes, the association holds, and the endpoint's own route is in
-            // the tables the create named. The `pending` window Amazon EC2 reports a new
-            // endpoint in is that service's own transition, not a resource that has yet to
-            // come into being — the case [`lambda_function::readiness`] states for a function
-            // and an `AWS::RDS::DBInstance` for a database.
+            // takes its routes, the association holds, the gateway is there to be attached,
+            // the attachment is in force, the address is allocated, and the endpoint's own
+            // route is in the tables the create named. The `pending` window Amazon EC2
+            // reports a new endpoint in is that service's own transition, not a resource that
+            // has yet to come into being — the case [`lambda_function::readiness`] states for
+            // a function and an `AWS::RDS::DBInstance` for a database.
             Self::Ec2VpcNetwork(_) => Ok(Readiness::Ready),
         }
     }
@@ -656,8 +658,9 @@ impl Owner {
             // A table's `Arn` and `StreamArn` are the ones its own `CreateTable` answered
             // with, so there is nothing left to read once the resource is up.
             Self::DynamodbTable => Ok(BTreeMap::new()),
-            // Each of these types publishes its own identifier and nothing else, and the
-            // create answered it, so there is nothing to read once the resource is up.
+            // Each of these types publishes its own identifier (an Elastic IP address its
+            // address and allocation id, an attachment nothing at all), and the create
+            // answered it, so there is nothing to read once the resource is up.
             Self::Ec2VpcNetwork(_) => Ok(BTreeMap::new()),
         }
     }
@@ -683,8 +686,9 @@ impl Owner {
             // `RemovePermission` takes the statement away, so there is nothing to wait for.
             Self::LambdaPermission => Ok(Removal::Gone),
             // Each of these deletes takes the resource away as it answers — Amazon EC2
-            // reports no state a deleted route table, association or endpoint is still being
-            // removed in — so there is nothing to wait for either.
+            // reports no state a deleted route table, association, endpoint, gateway,
+            // attachment or address is still being removed in — so there is nothing to wait
+            // for either.
             Self::Ec2VpcNetwork(_) => Ok(Removal::Gone),
         }
     }
@@ -718,10 +722,11 @@ impl Owner {
             Self::LambdaPermission => Ok(None),
             // Neither an association nor a route table has a property that can change on the
             // resource that exists (both of an association's are its identity, and a route
-            // table's VPC is create-only), and the members of an endpoint that can are
-            // `ModifyVpcEndpoint`'s, which this emulator does not serve yet — so a changed
-            // declaration is reported as not applied rather than as a success that dropped
-            // the caller's change.
+            // table's VPC is create-only), every property of a gateway, of an attachment and
+            // of an Elastic IP address requires the resource to be replaced, and the members
+            // of an endpoint that can change are `ModifyVpcEndpoint`'s, which this emulator
+            // does not serve yet — so a changed declaration is reported as not applied
+            // rather than as a success that dropped the caller's change.
             Self::Ec2VpcNetwork(_) => Ok(None),
         }
     }
@@ -789,8 +794,9 @@ impl Owner {
             }
             Self::LambdaPermission => lambda_permission::delete(ctx, region, resource).await,
             // Amazon EC2 takes no snapshot of any of these on the way out: there is no such
-            // call, so a `Snapshot` deletion policy on one of them deletes the resource with
-            // no snapshot invented for it.
+            // call for a route table, an association, an endpoint, a gateway, an attachment
+            // or an address, so a `Snapshot` deletion policy on one of them deletes the
+            // resource with no snapshot invented for it.
             Self::Ec2VpcNetwork(kind) => {
                 ec2_vpc_network::delete(ctx, region, kind, resource).await
             }
@@ -828,7 +834,7 @@ impl Owner {
             // statement belongs to is read by the function's own drift read, so a statement
             // reports no configuration of its own to compare either.
             Self::LambdaLayerVersion | Self::LambdaPermission => Ok(None),
-            // These three report no configuration of their own to compare either: every
+            // These types report no configuration of their own to compare either: every
             // property each one has is part of its identity or of the call that made it, so
             // there is no member a later read could find changed.
             Self::Ec2VpcNetwork(_) => Ok(None),

@@ -2636,6 +2636,21 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// which has no member for when a transient `NatGatewayAddressStatus` resolves. An
     /// address whose status is terminal has no entry here.
     pub nat_gateway_address_transitions: BTreeMap<String, NatGatewayAddressTransition>,
+    /// The state the clock owes one NAT GATEWAY, by `NatGatewayId` — the gateway's own
+    /// counterpart of [`Self::nat_gateway_address_transitions`]: `CreateNatGateway` hands a
+    /// gateway back `pending` and `DeleteNatGateway` leaves it `deleting`, and each of those
+    /// still owes the move to its terminal state ([`PendingStateMove`]).
+    ///
+    /// Beside the gateway store for the same reason the address moves are: that store holds
+    /// the modelled shape itself, which carries no member for when a transient
+    /// `NatGatewayState` resolves. A gateway whose state is terminal has no entry here.
+    pub nat_gateway_moves: BTreeMap<String, PendingStateMove>,
+    /// A `CreateNatGateway` `ClientToken` and the `NatGatewayId` it minted, so a repeat of
+    /// the same request answers with that gateway instead of creating a second one —
+    /// "Unique, case-sensitive identifier that you provide to ensure the idempotency of the
+    /// request" (`CreateNatGatewayRequest$ClientToken`). The same contract as
+    /// [`Self::capacity_reservation_fleet_client_tokens`].
+    pub nat_gateway_client_tokens: HashMap<String, String>,
     /// Every Capacity Reservation Fleet the account holds, by `CapacityReservationFleetId`,
     /// as a [`CapacityReservationFleetRecord`] — see the module docs. Ordered by id, which
     /// is the order `DescribeCapacityReservationFleets` reports and pages over.
@@ -3135,6 +3150,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             conversion_task_cancelled_at: BTreeMap::new(),
             nat_gateways: BTreeMap::new(),
             nat_gateway_address_transitions: BTreeMap::new(),
+            nat_gateway_moves: BTreeMap::new(),
+            nat_gateway_client_tokens: HashMap::new(),
             capacity_reservation_fleets: BTreeMap::new(),
             capacity_reservation_fleet_client_tokens: HashMap::new(),
             spot_instance_requests: BTreeMap::new(),

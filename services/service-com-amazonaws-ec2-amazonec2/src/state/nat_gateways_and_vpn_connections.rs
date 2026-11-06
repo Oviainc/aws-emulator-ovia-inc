@@ -794,10 +794,31 @@ pub const NAT_GATEWAY_ID_PREFIX: &str = "nat";
 /// one state of the `NatGatewayState` enum in which a NAT gateway is serving, and so the
 /// one in which its addresses can be changed.
 ///
-/// The other members of that enum (`pending`, `failed`, `deleting`, `deleted`) are not
-/// spelled here: nothing in this module needs to name one, and the generated
-/// `crate::ops::types::NAT_GATEWAY_STATE_VALUES` is the catalog of them.
+/// The enum's `failed` member is not spelled here: nothing in this emulator fails a gateway
+/// it created, and the generated `crate::ops::types::NAT_GATEWAY_STATE_VALUES` is the catalog
+/// of them all.
 pub const NAT_GATEWAY_STATE_AVAILABLE: &str = "available";
+
+/// "`pending`: The NAT gateway is being created and is not ready to process traffic"
+/// (`NatGateway$State`): the NON-TERMINAL state `CreateNatGateway` answers with, which the
+/// clock owes [`NAT_GATEWAY_STATE_AVAILABLE`].
+pub const NAT_GATEWAY_STATE_PENDING: &str = "pending";
+
+/// "`deleting`: The NAT gateway is in the process of being terminated and may still be
+/// processing traffic" (`NatGateway$State`): the non-terminal state `DeleteNatGateway` leaves
+/// a gateway in, which the clock owes [`NAT_GATEWAY_STATE_DELETED`].
+pub const NAT_GATEWAY_STATE_DELETING: &str = "deleting";
+
+/// "`deleted`: The NAT gateway has been terminated and is no longer processing traffic"
+/// (`NatGateway$State`): the terminal state of a deletion. The RECORD stays — that state is
+/// what a caller polling a gateway it deleted is shown — and a gateway in it serves nothing.
+pub const NAT_GATEWAY_STATE_DELETED: &str = "deleted";
+
+/// The one `ResourceType` a `CreateNatGateway` tag specification may name: "The tags to
+/// assign to the NAT gateway" (`CreateNatGatewayRequest$TagSpecifications`), spelled as the
+/// modelled `ResourceType` enum spells it (`natgateway`, from
+/// `crate::ops::types::RESOURCE_TYPE_VALUES`).
+pub const NAT_GATEWAY_TAGGABLE_RESOURCE: &str = "natgateway";
 
 /// A NAT gateway that reaches the internet: the `ConnectivityType` enum's `public` member
 /// (`NatGateway$ConnectivityType`). Only such a gateway has Elastic IP addresses —
@@ -836,6 +857,16 @@ pub const NAT_GATEWAY_NOT_FOUND: &str = "NatGatewayNotFound";
 /// `NatGatewayMalformed` (HTTP 400): the request named something that is not a NAT gateway
 /// id at all, so there is nothing to look up.
 pub const NAT_GATEWAY_MALFORMED: &str = "NatGatewayMalformed";
+
+/// EC2's quota code for one NAT gateway too many (EC2 API "Error codes":
+/// `NatGatewayLimitExceeded`).
+pub const NAT_GATEWAY_LIMIT_EXCEEDED: &str = "NatGatewayLimitExceeded";
+
+/// Refuse a NAT gateway create this emulator has no room for: HTTP 400
+/// [`NAT_GATEWAY_LIMIT_EXCEEDED`], naming what is full.
+pub fn nat_gateway_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(NAT_GATEWAY_LIMIT_EXCEEDED, 400, message.into())
+}
 
 // `Resource.AlreadyAssociated` — "one of the failures `NatGateway$FailureCode` itself
 // names" for this family of requests — is the SAME code an Elastic IP address already

@@ -1623,6 +1623,21 @@ impl ComAmazonawsEc2Amazonec2State {
                 // The move is applied once; nothing is owed on this address any more.
                 false
             });
+        // The end of the `pending` a `CreateNatGateway` answers with, and of the `deleting` a
+        // `DeleteNatGateway` leaves: the gateway reaches its terminal `NatGatewayState` once
+        // its instant has passed, whether or not anybody called again — the same contract, on
+        // the same clock, as the address moves above.
+        let nat_gateways = &mut self.nat_gateways;
+        self.nat_gateway_moves.retain(|nat_gateway_id, pending| {
+            if now < pending.due_at {
+                return true;
+            }
+            if let Some(gateway) = nat_gateways.get_mut(nat_gateway_id) {
+                gateway.state = Some(pending.to.clone());
+            }
+            // The move is applied once; nothing is owed on this gateway any more.
+            false
+        });
         // An Elastic IP address transfer the clock has taken past the end of what the
         // source account is shown: the offer expired and ownership returned to that
         // account, or an accepted transfer's 14 days of visibility ran out. Both were due

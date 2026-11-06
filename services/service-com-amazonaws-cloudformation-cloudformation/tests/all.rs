@@ -89,6 +89,8 @@ mod ec2_network_identifiers_feed_rds;
 mod ec2_network_stack_resources;
 #[path = "all/ec2_security_group_stack_resources.rs"]
 mod ec2_security_group_stack_resources;
+#[path = "all/ec2_vpc_gateway_stack_resources.rs"]
+mod ec2_vpc_gateway_stack_resources;
 #[path = "all/ecs_elbv2_stack_identifiers.rs"]
 mod ecs_elbv2_stack_identifiers;
 // An EMPTY, moved-out suite: its rows now live in `all/nested_resource_outputs.rs` and

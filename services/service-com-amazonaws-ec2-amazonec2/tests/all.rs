@@ -889,6 +889,8 @@ mod modify_route_server;
 mod modify_subnet_attribute;
 #[path = "all/nat_gateway_addresses.rs"]
 mod nat_gateway_addresses;
+#[path = "all/nat_gateway_lifecycle.rs"]
+mod nat_gateway_lifecycle;
 #[path = "all/network_insights_access_scope_analyses.rs"]
 mod network_insights_access_scope_analyses;
 #[path = "all/network_insights_access_scopes.rs"]

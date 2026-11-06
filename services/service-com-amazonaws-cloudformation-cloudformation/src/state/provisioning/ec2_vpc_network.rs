@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The Amazon EC2 route table a stack declares, the subnet association that puts a subnet on
-//! it, and the VPC endpoint reached through it — each created in Amazon EC2 itself.
+//! it, the VPC endpoint reached through it, the internet and virtual private gateways that
+//! give the network a way out, the attachment that puts one of those on a VPC, and the
+//! Elastic IP address the network reaches the internet by — each created in Amazon EC2
+//! itself.
 //!
 //! ## The rule this module carries
 //!
@@ -10,10 +13,12 @@
 //! `Fn::GetAtt` and an `Outputs` entry resolve to — is the identifier that service minted,
 //! and the resource is readable through that service's own API. A route table the stack only
 //! RECORDED would publish an `rtb-…` id `DescribeRouteTables` reports nothing for, a subnet
-//! would go on using its VPC's main table, and a gateway endpoint's route would be in no
-//! table at all: the deployed network would report success and route nothing.
+//! would go on using its VPC's main table, an internet gateway would publish an `igw-…` id
+//! `DescribeInternetGateways` reports nothing for and attach to nothing, and a gateway
+//! endpoint's route would be in no table at all: the deployed network would report success
+//! and route nothing.
 //!
-//! These three types are the rest of the VPC network a deploy-then-operate template declares
+//! These types are the rest of the VPC network a deploy-then-operate template declares
 //! beside the VPC, the subnet and the security group [`super::super::provisioner`] already
 //! creates. They live in their own module beside the algorithm that drives them because that
 //! file is far past the length a change to this repository may touch, so a type added now
@@ -32,6 +37,21 @@
 //! * `AWS::EC2::VPCEndpoint`'s are `CreateVpcEndpoint`'s own members under the same names,
 //!   with the tag set again applied by the tagging call, and `PolicyDocument` written as the
 //!   JSON text that call takes (a template states it as an object).
+//! * `AWS::EC2::InternetGateway`'s only property is its tag set: `CreateInternetGateway`
+//!   takes nothing else, and "Ref returns the ID of the internet gateway" — the `igw-…` id
+//!   EC2 assigns.
+//! * `AWS::EC2::VPNGateway`'s are `CreateVpnGateway`'s own `Type` and `AmazonSideAsn` beside
+//!   the tag set, and "Ref returns the VPN gateway ID" — the `vgw-…` id EC2 assigns.
+//! * `AWS::EC2::VPCGatewayAttachment`'s are the VPC and the ONE gateway it puts on it, which
+//!   is `AttachInternetGateway`'s pair for an internet gateway and `AttachVpnGateway`'s for a
+//!   virtual private one. EC2 mints no identifier for the attachment — both detaches address
+//!   it by the gateway and the VPC — and "Ref returns the name of the VPC gateway
+//!   attachment", so this resource keeps the identity CloudFormation computed for it.
+//! * `AWS::EC2::EIP`'s are `AllocateAddress`'s own members under the same names, with the tag
+//!   set applied by the same tagging call. "Ref returns the Elastic IP address", which is the
+//!   address EC2 allocated, and the allocation id it answers beside that address is the
+//!   type's `AllocationId` attribute — the value every VPC use of the address is made with,
+//!   and the one the release this module sends on the way out names.
 //!
 //! Each create carries only members of the call it is made with: a declared property this
 //! module does not apply is REFUSED ([`refuse_unmapped_properties`]), so a resource is never
@@ -50,6 +70,10 @@ pub(super) const EC2_ROUTE_TABLE: &str = "AWS::EC2::RouteTable";
 pub(super) const EC2_SUBNET_ROUTE_TABLE_ASSOCIATION: &str =
     "AWS::EC2::SubnetRouteTableAssociation";
 pub(super) const EC2_VPC_ENDPOINT: &str = "AWS::EC2::VPCEndpoint";
+pub(super) const EC2_INTERNET_GATEWAY: &str = "AWS::EC2::InternetGateway";
+pub(super) const EC2_VPN_GATEWAY: &str = "AWS::EC2::VPNGateway";
+pub(super) const EC2_VPC_GATEWAY_ATTACHMENT: &str = "AWS::EC2::VPCGatewayAttachment";
+pub(super) const EC2_EIP: &str = "AWS::EC2::EIP";
 
 /// Amazon EC2's signing name and the API version a request names beside the action, from its
 /// model (`sigv4Name: ec2`, `version: 2016-11-15`) — the same pair the VPC and subnet arms of
@@ -59,12 +83,22 @@ const EC2_API_VERSION: &str = "2016-11-15";
 
 /// The suffix of every Amazon EC2 error code that says the resource a request named is not
 /// there (`InvalidRouteTableID.NotFound`, `InvalidAssociationID.NotFound`,
-/// `InvalidVpcEndpointId.NotFound`): a delete asking for a state that service is already in.
+/// `InvalidVpcEndpointId.NotFound`, `InvalidInternetGatewayID.NotFound`,
+/// `InvalidAllocationID.NotFound`, `InvalidAttachment.NotFound`): a delete asking for a state
+/// that service is already in.
 ///
 /// Judged on the CODE, never on a message, which carries the request's own name.
 const NOT_FOUND_SUFFIX: &str = ".NotFound";
 
-/// Which of the three types one resource is.
+/// Amazon EC2's code for a detach of a gateway and a VPC that are not attached to each other
+/// (`Gateway.NotAttached`).
+///
+/// It says the same thing [`NOT_FOUND_SUFFIX`] says of a resource — the delete is asking for
+/// the state that service is already in — so a detach refused with it is treated the same
+/// way, and only a detach can ever answer it.
+const GATEWAY_NOT_ATTACHED: &str = "Gateway.NotAttached";
+
+/// Which of this module's types one resource is.
 ///
 /// Visible to the whole of this service's state module, because it travels with
 /// [`super::Owner`], which is: the algorithm resolves a type's owner once and passes it
@@ -77,6 +111,14 @@ pub(in crate::state) enum Kind {
     SubnetRouteTableAssociation,
     /// `AWS::EC2::VPCEndpoint`.
     VpcEndpoint,
+    /// `AWS::EC2::InternetGateway`.
+    InternetGateway,
+    /// `AWS::EC2::VPNGateway`.
+    VpnGateway,
+    /// `AWS::EC2::VPCGatewayAttachment`.
+    VpcGatewayAttachment,
+    /// `AWS::EC2::EIP`.
+    ElasticIp,
 }
 
 /// The kind `resource_type` names, or `None` for a type this module does not own.
@@ -85,6 +127,10 @@ pub(super) fn kind_of(resource_type: &str) -> Option<Kind> {
         EC2_ROUTE_TABLE => Some(Kind::RouteTable),
         EC2_SUBNET_ROUTE_TABLE_ASSOCIATION => Some(Kind::SubnetRouteTableAssociation),
         EC2_VPC_ENDPOINT => Some(Kind::VpcEndpoint),
+        EC2_INTERNET_GATEWAY => Some(Kind::InternetGateway),
+        EC2_VPN_GATEWAY => Some(Kind::VpnGateway),
+        EC2_VPC_GATEWAY_ATTACHMENT => Some(Kind::VpcGatewayAttachment),
+        EC2_EIP => Some(Kind::ElasticIp),
         _ => None,
     }
 }
@@ -95,6 +141,52 @@ const ROUTE_TABLE_PROPERTIES: &[&str] = &["Tags", "VpcId"];
 
 /// Every property `AWS::EC2::SubnetRouteTableAssociation` publishes, from the same reference.
 const ASSOCIATION_PROPERTIES: &[&str] = &["RouteTableId", "SubnetId"];
+
+/// Every property `AWS::EC2::InternetGateway` publishes, from the same reference: a gateway
+/// of this account is described by nothing but its tags.
+const INTERNET_GATEWAY_PROPERTIES: &[&str] = &["Tags"];
+
+/// Every property `AWS::EC2::VPNGateway` publishes, from the same reference.
+///
+/// `Type` and `AmazonSideAsn` are `CreateVpnGateway`'s own members under those names
+/// (`smithy_query(query="operation",operation="CreateVpnGateway")`); the type's published
+/// `AvailabilityZone` was withdrawn from the resource reference and is not one of them.
+const VPN_GATEWAY_PROPERTIES: &[&str] = &["AmazonSideAsn", "Tags", "Type"];
+
+/// The `AWS::EC2::VPNGateway` properties that are `CreateVpnGateway`'s own SCALAR members
+/// under the same name, each travelling as that member's own `ec2Query` parameter.
+const VPN_GATEWAY_MEMBERS: &[&str] = &["AmazonSideAsn", "Type"];
+
+/// Every property `AWS::EC2::VPCGatewayAttachment` publishes, from the same reference: the
+/// VPC, and the one gateway the attachment puts on it.
+const GATEWAY_ATTACHMENT_PROPERTIES: &[&str] = &["InternetGatewayId", "VpcId", "VpnGatewayId"];
+
+/// Every property `AWS::EC2::EIP` publishes, from the same reference read against
+/// `AllocateAddress`'s member list
+/// (`smithy_query(query="operation",operation="AllocateAddress")`).
+///
+/// `InstanceId` and `TransferAddress` are not among them HERE: associating an address with an
+/// instance is `AssociateAddress` and accepting a transferred one is `AcceptAddressTransfer`,
+/// neither of which this module makes, so a declaration carrying either is refused rather
+/// than created without it.
+const ELASTIC_IP_PROPERTIES: &[&str] = &[
+    "Address",
+    "Domain",
+    "IpamPoolId",
+    "NetworkBorderGroup",
+    "PublicIpv4Pool",
+    "Tags",
+];
+
+/// The `AWS::EC2::EIP` properties that are `AllocateAddress`'s own SCALAR members under the
+/// same name, each travelling as that member's own `ec2Query` parameter.
+const ELASTIC_IP_MEMBERS: &[&str] = &[
+    "Address",
+    "Domain",
+    "IpamPoolId",
+    "NetworkBorderGroup",
+    "PublicIpv4Pool",
+];
 
 /// Every property `AWS::EC2::VPCEndpoint` publishes, from the same reference read against
 /// `CreateVpcEndpoint`'s member list
@@ -159,6 +251,12 @@ pub(super) async fn create(
         Kind::RouteTable => create_route_table(ctx, region, resource, propagated).await,
         Kind::SubnetRouteTableAssociation => create_association(ctx, region, resource).await,
         Kind::VpcEndpoint => create_vpc_endpoint(ctx, region, resource, propagated).await,
+        Kind::InternetGateway => {
+            create_internet_gateway(ctx, region, resource, propagated).await
+        }
+        Kind::VpnGateway => create_vpn_gateway(ctx, region, resource, propagated).await,
+        Kind::VpcGatewayAttachment => attach_gateway(ctx, region, resource).await,
+        Kind::ElasticIp => allocate_address(ctx, region, resource, propagated).await,
     }
 }
 
@@ -236,6 +334,64 @@ pub(super) async fn delete(
                 }
             }
             Ok(())
+        }
+        Kind::InternetGateway => forgiving(
+            call_query(
+                ctx,
+                EC2_SIGNING_NAME,
+                region,
+                EC2_API_VERSION,
+                "DeleteInternetGateway",
+                &[("InternetGatewayId".to_string(), id)],
+            )
+            .await,
+        )
+        .map(|_| ()),
+        Kind::VpnGateway => forgiving(
+            call_query(
+                ctx,
+                EC2_SIGNING_NAME,
+                region,
+                EC2_API_VERSION,
+                "DeleteVpnGateway",
+                &[("VpnGatewayId".to_string(), id)],
+            )
+            .await,
+        )
+        .map(|_| ()),
+        // The attachment is addressed by the pair that was attached, not by an id: EC2 mints
+        // none for it, so the detach reads the gateway and the VPC off the declaration this
+        // resource was created from — which carries the identifiers their own services
+        // minted, the deployment having re-pointed every reference at them.
+        Kind::VpcGatewayAttachment => detach_gateway(ctx, region, resource).await,
+        Kind::ElasticIp => {
+            // The release names the address by the allocation id EC2 answered the create
+            // with — "[EC2-VPC] The allocation ID" (`ReleaseAddressRequest$AllocationId`),
+            // kept as this resource's `AllocationId` attribute — and falls back to the
+            // address itself, which is this resource's physical id, for a record that
+            // carries no such attribute.
+            let named = match resource
+                .attributes
+                .get("AllocationId")
+                .filter(|allocation_id| !allocation_id.is_empty())
+            {
+                Some(allocation_id) => {
+                    ("AllocationId".to_string(), allocation_id.clone())
+                }
+                None => ("PublicIp".to_string(), id),
+            };
+            forgiving(
+                call_query(
+                    ctx,
+                    EC2_SIGNING_NAME,
+                    region,
+                    EC2_API_VERSION,
+                    "ReleaseAddress",
+                    &[named],
+                )
+                .await,
+            )
+            .map(|_| ())
         }
     }
 }
@@ -386,6 +542,261 @@ async fn create_vpc_endpoint(
     })
 }
 
+/// Create the internet gateway an `AWS::EC2::InternetGateway` declares, in Amazon EC2.
+///
+/// "Ref returns the ID of the internet gateway" — the `igw-…` id EC2 assigns, which is what
+/// this answers as the resource's physical id, so a client that deployed the stack and then
+/// calls `ec2 describe-internet-gateways` with the id the stack published reads it back.
+/// `CreateInternetGateway` takes no member but the tag set
+/// (`smithy_query(query="operation",operation="CreateInternetGateway")`), and the gateway
+/// comes up detached: what puts it on a VPC is the attachment resource a template declares
+/// beside it ([`attach_gateway`]).
+async fn create_internet_gateway(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    refuse_unmapped_properties(resource, INTERNET_GATEWAY_PROPERTIES)?;
+    let answered = call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "CreateInternetGateway",
+        &[],
+    )
+    .await?;
+    let internet_gateway_id = reported(&answered, "internetGateway", "internetGatewayId")?;
+    tag_resource(
+        ctx,
+        region,
+        &internet_gateway_id,
+        &tags_of(&resource.properties, propagated),
+    )
+    .await?;
+    // The one attribute the type publishes beside its `Ref`: "Fn::GetAtt InternetGatewayId —
+    // the ID of the internet gateway", which IS the id EC2 assigned.
+    let mut attributes = BTreeMap::new();
+    attributes.insert(
+        "InternetGatewayId".to_string(),
+        internet_gateway_id.clone(),
+    );
+    Ok(Created {
+        physical_resource_id: Some(internet_gateway_id),
+        attributes,
+    })
+}
+
+/// Create the virtual private gateway an `AWS::EC2::VPNGateway` declares, in Amazon EC2.
+///
+/// "Ref returns the VPN gateway ID" — the `vgw-…` id EC2 assigns. `Type` is required by both
+/// sides (the type's own property and `CreateVpnGateway$Type`), so a declaration that states
+/// none is refused rather than sent without it.
+async fn create_vpn_gateway(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    refuse_unmapped_properties(resource, VPN_GATEWAY_PROPERTIES)?;
+    required(resource, "Type")?;
+    let mut parameters: Vec<(String, String)> = Vec::new();
+    for member in VPN_GATEWAY_MEMBERS {
+        if let Some(value) = scalar(resource, member) {
+            parameters.push(((*member).to_string(), value));
+        }
+    }
+    let answered = call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "CreateVpnGateway",
+        &parameters,
+    )
+    .await?;
+    let vpn_gateway_id = reported(&answered, "vpnGateway", "vpnGatewayId")?;
+    tag_resource(
+        ctx,
+        region,
+        &vpn_gateway_id,
+        &tags_of(&resource.properties, propagated),
+    )
+    .await?;
+    // "Fn::GetAtt VPNGatewayId — the ID of the VPN gateway", which IS the id EC2 assigned.
+    let mut attributes = BTreeMap::new();
+    attributes.insert("VPNGatewayId".to_string(), vpn_gateway_id.clone());
+    Ok(Created {
+        physical_resource_id: Some(vpn_gateway_id),
+        attributes,
+    })
+}
+
+/// Attach the gateway an `AWS::EC2::VPCGatewayAttachment` declares to the VPC it declares, in
+/// Amazon EC2 — so the VPC really has a way out and a route may point at that gateway.
+///
+/// One attachment attaches ONE gateway: the type publishes `InternetGatewayId` and
+/// `VpnGatewayId` as alternatives, and the call each one is made with is its own
+/// (`AttachInternetGateway`, `AttachVpnGateway`), so a declaration naming both or neither is
+/// refused rather than guessed at.
+///
+/// EC2 assigns no identifier to the attachment — both detaches address it by the gateway and
+/// the VPC — and "Ref returns the name of the VPC gateway attachment", so this answers no
+/// physical id and the resource keeps the one CloudFormation computed.
+async fn attach_gateway(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    refuse_unmapped_properties(resource, GATEWAY_ATTACHMENT_PROPERTIES)?;
+    let vpc_id = required(resource, "VpcId")?;
+    let (action, gateway_member, gateway_id) = attached_gateway(resource)?;
+    call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        action,
+        &[
+            (gateway_member.to_string(), gateway_id),
+            ("VpcId".to_string(), vpc_id),
+        ],
+    )
+    .await?;
+    Ok(Created::default())
+}
+
+/// Take the attachment an `AWS::EC2::VPCGatewayAttachment` made back off its VPC.
+///
+/// The counterpart of [`attach_gateway`], addressed the same way and with the same pair; a
+/// gateway and VPC that are not attached are already in the state this asks for
+/// ([`GATEWAY_NOT_ATTACHED`]), as is a gateway or VPC EC2 no longer holds.
+async fn detach_gateway(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let vpc_id = required(resource, "VpcId")?;
+    let (attach, gateway_member, gateway_id) = attached_gateway(resource)?;
+    let action = match attach {
+        "AttachInternetGateway" => "DetachInternetGateway",
+        _ => "DetachVpnGateway",
+    };
+    forgiving(
+        call_query(
+            ctx,
+            EC2_SIGNING_NAME,
+            region,
+            EC2_API_VERSION,
+            action,
+            &[
+                (gateway_member.to_string(), gateway_id),
+                ("VpcId".to_string(), vpc_id),
+            ],
+        )
+        .await,
+    )
+    .map(|_| ())
+}
+
+/// The gateway one `AWS::EC2::VPCGatewayAttachment` is for: the ATTACH action it is attached
+/// with, the member that call names the gateway under, and the identifier the declaration
+/// carries for it.
+///
+/// Read off the declaration rather than kept on the resource, so the attach and the detach
+/// cannot disagree about which gateway the attachment is of.
+fn attached_gateway(resource: &StoredResource) -> Result<(&'static str, &'static str, String), Refusal> {
+    let internet_gateway = scalar(resource, "InternetGatewayId");
+    let vpn_gateway = scalar(resource, "VpnGatewayId");
+    match (internet_gateway, vpn_gateway) {
+        (Some(internet_gateway_id), None) => Ok((
+            "AttachInternetGateway",
+            "InternetGatewayId",
+            internet_gateway_id,
+        )),
+        (None, Some(vpn_gateway_id)) => {
+            Ok(("AttachVpnGateway", "VpnGatewayId", vpn_gateway_id))
+        }
+        // "You must specify either InternetGatewayId or VpnGatewayId, but not both"
+        // (`AWS::EC2::VPCGatewayAttachment`): either way the declaration does not say which
+        // gateway the attachment is of, so nothing is attached under a guess.
+        _ => Err(Refusal {
+            code: "InvalidRequest".to_string(),
+            message: format!(
+                "{} requires exactly one of the InternetGatewayId and VpnGatewayId \
+                 properties",
+                resource.resource_type
+            ),
+        }),
+    }
+}
+
+/// Allocate the Elastic IP address an `AWS::EC2::EIP` declares, in Amazon EC2.
+///
+/// "Ref returns the Elastic IP address" — the address EC2 allocated, which is what this
+/// answers as the resource's physical id, and the allocation id it answers beside that
+/// address is the type's `AllocationId` attribute: the value a NAT gateway or an association
+/// of the same template is created with, and the one the release names on the way out.
+async fn allocate_address(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    refuse_unmapped_properties(resource, ELASTIC_IP_PROPERTIES)?;
+    let mut parameters: Vec<(String, String)> = Vec::new();
+    for member in ELASTIC_IP_MEMBERS {
+        if let Some(value) = scalar(resource, member) {
+            parameters.push(((*member).to_string(), value));
+        }
+    }
+    let answered = call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "AllocateAddress",
+        &parameters,
+    )
+    .await?;
+    // `AllocateAddress` answers its members at the top of the document rather than inside a
+    // structure of its own (`smithy_query(query="operation",operation="AllocateAddress")`:
+    // `publicIp`, `allocationId`), so both are read as the answer's own elements.
+    let public_ip = answered_element(&answered, "publicIp")?;
+    let allocation_id = answered_element(&answered, "allocationId")?;
+    tag_resource(
+        ctx,
+        region,
+        &allocation_id,
+        &tags_of(&resource.properties, propagated),
+    )
+    .await?;
+    // The two attributes the type publishes: "AllocationId — the ID that represents the
+    // allocation of the Elastic IP address" and "PublicIp — the Elastic IP address".
+    let mut attributes = BTreeMap::new();
+    attributes.insert("AllocationId".to_string(), allocation_id);
+    attributes.insert("PublicIp".to_string(), public_ip.clone());
+    Ok(Created {
+        physical_resource_id: Some(public_ip),
+        attributes,
+    })
+}
+
+/// One element of an `ec2Query` answer's own members, as the non-empty text it holds.
+///
+/// The counterpart of [`reported`] for a call that answers its members at the top of the
+/// document rather than inside a structure; an answer that reports none is a refusal rather
+/// than an empty identifier.
+fn answered_element(document: &str, member: &str) -> Result<String, Refusal> {
+    xml_element(document, member)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Refusal {
+            code: "InvalidRequest".to_string(),
+            message: format!("Amazon EC2 answered no {member}"),
+        })
+}
+
 /// Tag one EC2 resource with the set CloudFormation gives it.
 ///
 /// Through `CreateTags` rather than a create's own `TagSpecifications`, for the reason the VPC
@@ -422,10 +833,18 @@ async fn tag_resource(
 
 /// A call whose NOT-FOUND refusal is the state it asked for: `Ok(None)` for that case, and the
 /// answer document for a call that went through.
+///
+/// A detach of a gateway and VPC EC2 does not hold attached to each other is the same case
+/// ([`GATEWAY_NOT_ATTACHED`]): the state the call asks for is the one that service is in.
 fn forgiving(answered: Result<String, Refusal>) -> Result<Option<String>, Refusal> {
     match answered {
         Ok(document) => Ok(Some(document)),
-        Err(refusal) if refusal.code.ends_with(NOT_FOUND_SUFFIX) => Ok(None),
+        Err(refusal)
+            if refusal.code.ends_with(NOT_FOUND_SUFFIX)
+                || refusal.code == GATEWAY_NOT_ATTACHED =>
+        {
+            Ok(None)
+        }
         Err(refusal) => Err(refusal),
     }
 }
@@ -549,6 +968,20 @@ mod tests {
                  {EC2_VPC_ENDPOINT}, got none"
             );
         }
+        for member in VPN_GATEWAY_MEMBERS {
+            assert!(
+                VPN_GATEWAY_PROPERTIES.contains(member),
+                "case {member:?}: expected the sent member to be a published property of \
+                 {EC2_VPN_GATEWAY}, got none"
+            );
+        }
+        for member in ELASTIC_IP_MEMBERS {
+            assert!(
+                ELASTIC_IP_PROPERTIES.contains(member),
+                "case {member:?}: expected the sent member to be a published property of \
+                 {EC2_EIP}, got none"
+            );
+        }
         for (property, _) in VPC_ENDPOINT_LIST_MEMBERS {
             assert!(
                 VPC_ENDPOINT_PROPERTIES.contains(property),
@@ -568,8 +1001,16 @@ mod tests {
                 Some(Kind::SubnetRouteTableAssociation),
             ),
             (EC2_VPC_ENDPOINT, Some(Kind::VpcEndpoint)),
+            (EC2_INTERNET_GATEWAY, Some(Kind::InternetGateway)),
+            (EC2_VPN_GATEWAY, Some(Kind::VpnGateway)),
+            (
+                EC2_VPC_GATEWAY_ATTACHMENT,
+                Some(Kind::VpcGatewayAttachment),
+            ),
+            (EC2_EIP, Some(Kind::ElasticIp)),
             ("AWS::EC2::VPC", None),
             ("AWS::EC2::Route", None),
+            ("AWS::EC2::EIPAssociation", None),
         ];
         for (resource_type, expected) in cases {
             let answered = kind_of(resource_type);
@@ -619,6 +1060,76 @@ mod tests {
             "case \"an endpoint with DnsOptions\": expected a refusal naming the property, got \
              {unmapped:?}"
         );
+        let associated = refuse_unmapped_properties(
+            &declared(EC2_EIP, serde_json::json!({ "InstanceId": "i-0123456789abcdef0" })),
+            ELASTIC_IP_PROPERTIES,
+        );
+        assert!(
+            associated.is_err(),
+            "case \"an address declared onto an instance\": expected a refusal naming the \
+             property, got {associated:?}"
+        );
+    }
+
+    /// One attachment attaches ONE gateway: the call it is made with follows from which of
+    /// the two alternatives the declaration names, and a declaration naming both or neither
+    /// is refused rather than guessed at.
+    #[test]
+    fn an_attachment_names_one_gateway() {
+        /// The attach one declaration resolves to: the action, the member it names the
+        /// gateway under and that gateway's id, or `None` for a declaration that is refused.
+        type Attach = Option<(&'static str, &'static str, &'static str)>;
+        let cases: &[(&str, Value, Attach)] = &[
+            (
+                "an internet gateway",
+                serde_json::json!({
+                    "VpcId": "vpc-0123456789abcdef0",
+                    "InternetGatewayId": "igw-0123456789abcdef0",
+                }),
+                Some((
+                    "AttachInternetGateway",
+                    "InternetGatewayId",
+                    "igw-0123456789abcdef0",
+                )),
+            ),
+            (
+                "a virtual private gateway",
+                serde_json::json!({
+                    "VpcId": "vpc-0123456789abcdef0",
+                    "VpnGatewayId": "vgw-0123456789abcdef0",
+                }),
+                Some((
+                    "AttachVpnGateway",
+                    "VpnGatewayId",
+                    "vgw-0123456789abcdef0",
+                )),
+            ),
+            (
+                "both gateways at once",
+                serde_json::json!({
+                    "VpcId": "vpc-0123456789abcdef0",
+                    "InternetGatewayId": "igw-0123456789abcdef0",
+                    "VpnGatewayId": "vgw-0123456789abcdef0",
+                }),
+                None,
+            ),
+            (
+                "no gateway at all",
+                serde_json::json!({ "VpcId": "vpc-0123456789abcdef0" }),
+                None,
+            ),
+        ];
+        for (case, properties, expected) in cases {
+            let resource = declared(EC2_VPC_GATEWAY_ATTACHMENT, properties.clone());
+            let resolved = attached_gateway(&resource).ok();
+            let answered = resolved
+                .as_ref()
+                .map(|(action, member, gateway_id)| (*action, *member, gateway_id.as_str()));
+            assert_eq!(
+                answered, *expected,
+                "case {case:?}: expected {expected:?}, got {answered:?}"
+            );
+        }
     }
 
     /// A declared value reaches a parameter as the text that protocol carries: a string as
