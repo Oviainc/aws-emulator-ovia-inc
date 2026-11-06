@@ -976,6 +976,54 @@ pub const MAX_MULTICAST_GROUP_TOKENS: usize = MAX_MULTICAST_GROUPS;
 /// Bounded for the same reason as [`MAX_DESTINATION_TOKENS`].
 pub const MAX_WIRELESS_GATEWAY_TOKENS: usize = MAX_WIRELESS_GATEWAYS;
 
+/// The resource kinds a log-level override addresses.
+///
+/// `ResourceType` is an unconstrained string in the model
+/// (`smithy_query(query="shape", shape="ResourceType")`), so this set comes from the
+/// member's own documentation — "The type of resource, which can be WirelessDevice,
+/// WirelessGateway, or FuotaTask" — and is listed in that order.
+pub const LOG_LEVEL_RESOURCE_TYPES: &[&str] = &["WirelessDevice", "WirelessGateway", "FuotaTask"];
+
+/// The most log-level overrides one account holds, as `PutResourceLogLevel`'s own
+/// documentation states the limit: "A limit of 200 log level override can be set per
+/// account."
+pub const MAX_RESOURCE_LOG_LEVEL_OVERRIDES: usize = 200;
+
+/// The `ValidationException` body for a `ResourceType` outside
+/// [`LOG_LEVEL_RESOURCE_TYPES`].
+///
+/// The model leaves `ResourceType` unconstrained, so the boundary validator cannot
+/// refuse a value outside the documented set and every log-level operation refuses it
+/// here, through this one function, with the sentence template this service words a
+/// refused member value with.
+pub fn unsupported_log_level_resource_type(resource_type: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "1 validation error detected: Value '{resource_type}' at 'resourceType' failed to \
+             satisfy constraint: Member must satisfy enum value set: [{}]",
+            LOG_LEVEL_RESOURCE_TYPES.join(", ")
+        )),
+    }
+}
+
+/// The `ResourceNotFoundException` body for the resource a log-level override would
+/// apply to, when the account holds no such resource.
+///
+/// Each resource kind keeps the refusal its own operations already word, so a log-level
+/// call refuses a missing wireless device, wireless gateway or FUOTA task exactly as the
+/// operations that address it directly do.
+pub fn log_level_resource_not_found(
+    resource_type: &str,
+    resource_identifier: &str,
+) -> ResourceNotFoundException {
+    match resource_type {
+        "WirelessDevice" => wireless_device_not_found(resource_identifier),
+        "WirelessGateway" => wireless_gateway_not_found(),
+        "FuotaTask" => fuota_task_not_found(resource_identifier),
+        other => resource_not_found(other, resource_identifier),
+    }
+}
+
 /// Per-service state for com-amazonaws-iotwireless-iotwireless. A handler reaches it through [`service_state`].
 ///
 /// The resource maps are `BTreeMap`s so every list enumerates in one stable, sorted key
@@ -1000,7 +1048,8 @@ pub const MAX_WIRELESS_GATEWAY_TOKENS: usize = MAX_WIRELESS_GATEWAYS;
 /// [`Self::record_multicast_group_token`] / [`Self::record_fuota_task_token`] /
 /// [`Self::record_wireless_gateway_token`] /
 /// [`Self::record_wireless_gateway_task_definition_token`] and
-/// cannot bypass the cap.
+/// cannot bypass the cap. The log-level override map is bounded by
+/// [`MAX_RESOURCE_LOG_LEVEL_OVERRIDES`] and private for the same reason.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotwirelessIotwirelessState {
     /// Destinations by `Name`. Bounded by [`MAX_DESTINATIONS`].
@@ -1076,6 +1125,15 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
     wireless_gateway_task_definition_tokens: HashMap<String, IdempotentCreate>,
     /// Write order for [`Self::wireless_gateway_task_definition_tokens`].
     wireless_gateway_task_definition_token_order: VecDeque<String>,
+    /// The log-level override each resource carries: `ResourceType` -> that type's
+    /// `ResourceIdentifier` -> `LogLevel`. Nested so a lookup resolves a pair without
+    /// building a key, and bounded by [`MAX_RESOURCE_LOG_LEVEL_OVERRIDES`] across every
+    /// type.
+    ///
+    /// Private: read through [`Self::resource_log_level`] and write through
+    /// [`Self::set_resource_log_level`] / [`Self::clear_resource_log_level`], so nothing
+    /// bypasses that ceiling or leaves an emptied type behind.
+    resource_log_levels: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// Record `token` in `tokens`, evicting the oldest recorded token first if that would
@@ -1425,6 +1483,85 @@ impl ComAmazonawsIotwirelessIotwirelessState {
                 .find(|gateway| gateway.thing_name.as_deref() == Some(identifier)),
             _ => None,
         }
+    }
+
+    /// Whether the account holds the resource a log-level override would apply to.
+    ///
+    /// The override is an attribute OF a resource, so the three kinds
+    /// [`LOG_LEVEL_RESOURCE_TYPES`] names are resolved against the stores that hold
+    /// them; a type outside that set resolves to nothing (every log-level operation
+    /// refuses one before it gets here).
+    pub fn holds_log_level_resource(&self, resource_type: &str, resource_identifier: &str) -> bool {
+        match resource_type {
+            "WirelessDevice" => self.wireless_devices.contains_key(resource_identifier),
+            "WirelessGateway" => self.wireless_gateways.contains_key(resource_identifier),
+            "FuotaTask" => self.fuota_tasks.contains_key(resource_identifier),
+            _ => false,
+        }
+    }
+
+    /// The `LogLevel` override held for `resource_type`/`resource_identifier`, or `None`
+    /// when that pair carries none.
+    pub fn resource_log_level(
+        &self,
+        resource_type: &str,
+        resource_identifier: &str,
+    ) -> Option<&str> {
+        self.resource_log_levels
+            .get(resource_type)
+            .and_then(|by_identifier| by_identifier.get(resource_identifier))
+            .map(String::as_str)
+    }
+
+    /// How many log-level overrides the account holds, across every resource type.
+    pub fn resource_log_level_count(&self) -> usize {
+        self.resource_log_levels
+            .values()
+            .map(BTreeMap::len)
+            .sum::<usize>()
+    }
+
+    /// Set `resource_type`/`resource_identifier`'s override to `log_level`, answering
+    /// `false` — storing nothing — when a NEW override would push the account past
+    /// [`MAX_RESOURCE_LOG_LEVEL_OVERRIDES`].
+    ///
+    /// Replacing an existing override is always accepted: it adds no entry, so the
+    /// ceiling cannot bind on it.
+    pub fn set_resource_log_level(
+        &mut self,
+        resource_type: &str,
+        resource_identifier: &str,
+        log_level: &str,
+    ) -> bool {
+        let fresh = self
+            .resource_log_level(resource_type, resource_identifier)
+            .is_none();
+        if fresh && self.resource_log_level_count() >= MAX_RESOURCE_LOG_LEVEL_OVERRIDES {
+            return false;
+        }
+        self.resource_log_levels
+            .entry(resource_type.to_string())
+            .or_default()
+            .insert(resource_identifier.to_string(), log_level.to_string());
+        true
+    }
+
+    /// Drop `resource_type`/`resource_identifier`'s override, answering whether one was
+    /// held. A resource type left with no overrides is pruned, so the outer map holds
+    /// no empty entries.
+    pub fn clear_resource_log_level(
+        &mut self,
+        resource_type: &str,
+        resource_identifier: &str,
+    ) -> bool {
+        let Some(by_identifier) = self.resource_log_levels.get_mut(resource_type) else {
+            return false;
+        };
+        let removed = by_identifier.remove(resource_identifier).is_some();
+        if by_identifier.is_empty() {
+            self.resource_log_levels.remove(resource_type);
+        }
+        removed
     }
 
     /// The resource an event-configuration identifier addresses and the event
