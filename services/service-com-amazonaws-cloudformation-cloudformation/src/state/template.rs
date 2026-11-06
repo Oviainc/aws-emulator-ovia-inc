@@ -2311,8 +2311,57 @@ fn physical_name(
         // the template asked for.
         Some(name) => name,
         // A GENERATED name is held to the naming rules of the service that owns the type,
-        // because a name that service would refuse could not be provisioned at all.
-        None => generated_name(&declared.resource_type, &declared.logical_id, naming.stack),
+        // because a name that service would refuse could not be provisioned at all — the
+        // suffix the declared VARIANT's name has to carry among them.
+        None => generated_name(
+            &declared.resource_type,
+            &declared.logical_id,
+            naming.stack,
+            required_name_suffix(declared, naming, budget),
+        ),
+    }
+}
+
+/// The suffix Amazon SNS and Amazon SQS require on the name of a FIFO resource: "For a
+/// FIFO (first-in-first-out) topic, the name must end with the .fifo suffix"
+/// (`CreateTopicInput$Name`) and "A FIFO queue name must end with the .fifo suffix"
+/// (`CreateQueueInput$QueueName`).
+const FIFO_NAME_SUFFIX: &str = ".fifo";
+
+/// The property a declaration asks for the FIFO variant of its type with, for the types
+/// whose owning service requires [`FIFO_NAME_SUFFIX`] on such a resource's name:
+/// `AWS::SNS::Topic`'s `FifoTopic` and `AWS::SQS::Queue`'s `FifoQueue`, each named
+/// identically to the topic/queue attribute that asks for it.
+fn fifo_variant_property(resource_type: &str) -> Option<&'static str> {
+    match resource_type {
+        SNS_TOPIC => Some("FifoTopic"),
+        SQS_QUEUE => Some("FifoQueue"),
+        _ => None,
+    }
+}
+
+/// The suffix the owning service REQUIRES on the name of the variant this declaration asks
+/// for, which a name CloudFormation generates therefore ends with — `""` where the type has
+/// no such variant, or where the declaration does not ask for it.
+///
+/// A generated name without it is a name the owning service refuses, so the resource could
+/// not be provisioned at all; a name the template DECLARED is the caller's and is passed
+/// through as written ([`physical_name`]), refusal included. The flag is the EVALUATED
+/// property, so a variant a parameter or a condition decides is still the variant the name
+/// is built for.
+fn required_name_suffix(
+    declared: &DeclaredResource,
+    naming: &Scope<'_>,
+    budget: &mut Budget,
+) -> &'static str {
+    let asked_for_fifo = fifo_variant_property(&declared.resource_type)
+        .and_then(|property| declared.properties.get(property))
+        .and_then(|value| text(value, naming, 0, budget))
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    if asked_for_fifo {
+        FIFO_NAME_SUFFIX
+    } else {
+        ""
     }
 }
 
@@ -2745,7 +2794,17 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
 /// A type's minimum name length needs nothing here: the unique segment alone is
 /// [`GENERATED_NAME_DIGEST_CHARS`] characters, longer than any of the minimums in
 /// [`naming_rules`] (3 for a bucket or a table, 2 for a repository), and it is kept whole.
-fn generated_name(resource_type: &str, logical_id: &str, scope: StackScope<'_>) -> String {
+///
+/// `suffix` is what the owning service requires on the name of the variant the declaration
+/// asked for ([`required_name_suffix`]). It is part of the name, so the limit is fitted
+/// around it, and it is appended after the character set is applied — a suffix the owning
+/// service publishes is spelled the way that service spells it.
+fn generated_name(
+    resource_type: &str,
+    logical_id: &str,
+    scope: StackScope<'_>,
+    suffix: &str,
+) -> String {
     let unique = derived_digits(
         scope.stack_id,
         logical_id,
@@ -2753,22 +2812,23 @@ fn generated_name(resource_type: &str, logical_id: &str, scope: StackScope<'_>) 
         Alphabet::Upper,
     );
     let Some(rules) = naming_rules(resource_type) else {
-        return format!("{}-{logical_id}-{unique}", scope.stack_name);
+        return format!("{}-{logical_id}-{unique}{suffix}", scope.stack_name);
     };
-    // The room the stack name and the logical id have BETWEEN them: the limit, less the
+    // The characters the limit leaves for the generated name itself, the required suffix
+    // taken off it first.
+    let limit = rules.max_characters.saturating_sub(suffix.chars().count());
+    // The room the stack name and the logical id have BETWEEN them: that limit, less the
     // unique segment and the two hyphens that join the three segments.
-    let room = rules
-        .max_characters
-        .saturating_sub(unique.chars().count() + GENERATED_NAME_SEPARATORS);
+    let room = limit.saturating_sub(unique.chars().count() + GENERATED_NAME_SEPARATORS);
     let name = if room < 2 {
         // No owning service publishes a limit with no room for both segments; the unique
         // segment is what keeps the name unique, so it is what a limit that small leaves.
-        unique.chars().take(rules.max_characters).collect()
+        unique.chars().take(limit).collect()
     } else {
         let (stack_name, shortened) = shortened_to(scope.stack_name, logical_id, room);
         format!("{stack_name}-{shortened}-{unique}")
     };
-    within(name, rules.characters)
+    format!("{}{suffix}", within(name, rules.characters))
 }
 
 /// The two hyphens that join the three segments of a [`generated_name`].

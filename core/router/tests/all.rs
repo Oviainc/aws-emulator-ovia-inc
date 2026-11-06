@@ -15,6 +15,8 @@
 // are where concurrently landing suites add their line, so a declaration placed there
 // collides with every one of them. The head of the list is the one region nothing
 // else appends to.
+#[path = "all/cloudformation_fifo_resource_generated_names.rs"]
+mod cloudformation_fifo_resource_generated_names;
 #[path = "all/greengrass_deployment_iot_job.rs"]
 mod greengrass_deployment_iot_job;
 // Declared here, in this same head region, for the reason the entry above records.
