@@ -53,6 +53,11 @@ pub struct DbClusterRecord {
     /// `MasterUsername`. The password is never stored: the member is `@sensitive` and RDS
     /// reports nothing carrying it.
     pub master_username: Option<String>,
+    /// `MasterUserSecret`: the secret RDS manages for this cluster's master user
+    /// password, for a cluster created or modified with `ManageMasterUserPassword` turned
+    /// on; `None` for one whose password the caller supplied, which has no managed secret
+    /// to report.
+    pub master_user_secret: Option<ManagedMasterSecret>,
     /// `Port`: the port the instances in the cluster accept connections on.
     pub port: i32,
     /// `AvailabilityZones`: where instances in the cluster can be created.
@@ -410,6 +415,13 @@ impl DbClusterRecord {
             engine_mode: Some(self.engine_mode.clone()),
             database_name: self.database_name.clone(),
             master_username: self.master_username.clone(),
+            // `MasterUserSecret`: reported for a cluster whose master user password RDS
+            // manages, and only for one — a cluster whose password the caller supplied
+            // has no secret of RDS's own, which is what reporting nothing says.
+            master_user_secret: self
+                .master_user_secret
+                .as_ref()
+                .map(ManagedMasterSecret::to_wire),
             port: Some(self.port),
             endpoint: Some(self.endpoint()),
             reader_endpoint: Some(self.reader_endpoint()),

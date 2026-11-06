@@ -207,20 +207,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tags = input.tags.unwrap_or_default();
         crate::state::check_tags(&tags)
             .map_err(CreateTenantDatabaseError::invalid_parameter_value)?;
-        // `ManageMasterUserPassword` has RDS generate and manage the password in Amazon Web
-        // Services Secrets Manager and report the secret it created as `MasterUserSecret`;
-        // this service mints no such secret, so the request is answered naming the member
-        // rather than with a tenant database whose managed secret does not exist.
-        if input.manage_master_user_password == Some(true) {
-            return Err(crate::scaffolded::Scaffolded::NotImplemented(
-                crate::scaffolded::NotImplemented {
-                    message: "CreateTenantDatabase$ManageMasterUserPassword is not implemented \
-                              in this emulator: it has RDS generate the master user password \
-                              in Amazon Web Services Secrets Manager and report that secret \
-                              as MasterUserSecret, and this service mints no such secret. \
-                              Name MasterUserPassword instead."
-                        .to_string(),
-                },
+        // `ManageMasterUserPassword` has RDS "generate and manage the master user password
+        // with Amazon Web Services Secrets Manager" for this tenant database and report the
+        // secret it created as `MasterUserSecret`. Its one documented constraint is that the
+        // request may not also carry the password itself — "Can't be specified when
+        // ManageMasterUserPassword is enabled" — and `MasterUserSecretKmsKeyId` is valid
+        // only when that management is on. The secret itself is minted below, once every
+        // refusal is answered.
+        let manage_master_user_password = input.manage_master_user_password == Some(true);
+        if manage_master_user_password && input.master_user_password.is_some() {
+            return Err(CreateTenantDatabaseError::invalid_parameter_combination(
+                crate::state::manage_master_user_password_conflict_message("MasterUserPassword"),
+            ));
+        }
+        if !manage_master_user_password && input.master_user_secret_kms_key_id.is_some() {
+            return Err(CreateTenantDatabaseError::invalid_parameter_combination(
+                crate::state::master_user_secret_kms_key_without_management_message(
+                    "ManageMasterUserPassword",
+                ),
             ));
         }
 
@@ -229,6 +233,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // 501 is the honest answer, never a fabricated tenant database.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        // Minting the managed secret is a call to Secrets Manager, which cannot be made
+        // while this store's guard is held — so what it needs is read under a guard of its
+        // own first, and only for a tenant database the create below will really admit: a
+        // request naming no DB instance, an instance whose engine holds no tenant
+        // databases, one that cannot take a new tenant database, or a name already taken
+        // mints no secret, and each of those refusals is answered below from the same
+        // store.
+        let master_user_secret = if manage_master_user_password {
+            let subject = {
+                let mut store = state.lock();
+                store.settle_due_transitions(&region);
+                let taken = store.tenant_databases.contains_key(&(
+                    region.clone(),
+                    crate::state::tenant_database_key(&identifier, &tenant_db_name),
+                ));
+                store
+                    .db_instances
+                    .get(&(region.clone(), identifier.clone()))
+                    .filter(|instance| {
+                        !taken
+                            && crate::state::is_multi_tenant_engine(&instance.engine)
+                            && instance.status == crate::state::DB_INSTANCE_STATUS_AVAILABLE
+                            && store.tenant_databases_of(&region, &identifier).len()
+                                < crate::state::TENANT_DATABASE_QUOTA_PER_INSTANCE
+                    })
+                    .map(|instance| (instance.engine.clone(), instance.dbi_resource_id.clone()))
+            };
+            match subject {
+                Some((instance_engine, dbi_resource_id)) => Some(
+                    crate::state::mint_master_user_secret(
+                        ctx,
+                        &region,
+                        &crate::state::MasterSecretRequest {
+                            name: &crate::state::tenant_database_master_user_secret_name(
+                                &dbi_resource_id,
+                                &tenant_db_name,
+                            ),
+                            username: Some(&input.master_username),
+                            engine: &instance_engine,
+                            kms_key_id: input.master_user_secret_kms_key_id.as_deref(),
+                        },
+                    )
+                    .await
+                    .map_err(CreateTenantDatabaseError::internal_failure)?
+                    .secret,
+                ),
+                None => None,
+            }
+        } else {
+            None
         };
         let mut store = state.lock();
         store.settle_due_transitions(&region);
@@ -324,8 +379,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resource_id: crate::state::mint_tenant_database_resource_id(mint),
             dbi_resource_id,
             // `MasterUserPassword` is `@sensitive` and RDS reports no member carrying it:
-            // it is accepted and neither stored nor returned. The username is.
+            // it is accepted and neither stored nor returned. The username is, and so is
+            // the secret RDS manages for the password when the request asked it to.
             master_username: input.master_username,
+            master_user_secret,
             character_set_name: input.character_set_name,
             nchar_character_set_name: input.nchar_character_set_name,
             status: crate::state::TENANT_DATABASE_STATUS_CREATING.to_string(),

@@ -371,8 +371,13 @@ struct ClusterGroupCase {
 /// cluster parameter group", and the groups RDS provides per engine-version family
 /// (`default.<family>`) are there without any request having created them. The rows span a
 /// group this region holds, two of RDS's own groups, two absent names and no group at all,
-/// each against both of the members this emulator answers `NotImplemented` for, so what is
-/// asserted is which guard answers first.
+/// each against a member this emulator answers `NotImplemented` for, so what is asserted
+/// is which guard answers first.
+///
+/// `ManageMasterUserPassword` is SERVED (the secret RDS manages is minted in Secrets
+/// Manager — see `managed_master_user_password.rs`), so the rows that carry it are the
+/// ones where another refusal must come first: the group the request names resolves to
+/// nothing, and no secret is minted for a create that is refused.
 const CLUSTER_GROUP_CASES: &[ClusterGroupCase] = &[
     ClusterGroupCase {
         case: "an absent group beside ManageMasterUserPassword",
@@ -396,16 +401,16 @@ const CLUSTER_GROUP_CASES: &[ClusterGroupCase] = &[
         code: "DBClusterParameterGroupNotFound",
     },
     ClusterGroupCase {
-        case: "a group this region holds, beside ManageMasterUserPassword",
+        case: "a group this region holds, beside WithExpressConfiguration",
         group: Some("emu-held-cpg"),
-        unsupported: Some("ManageMasterUserPassword"),
+        unsupported: Some("WithExpressConfiguration"),
         status: 501,
         code: "NotImplemented",
     },
     ClusterGroupCase {
-        case: "a group RDS provides itself, beside ManageMasterUserPassword",
+        case: "a group RDS provides itself, beside WithExpressConfiguration",
         group: Some("default.aurora-mysql8.0"),
-        unsupported: Some("ManageMasterUserPassword"),
+        unsupported: Some("WithExpressConfiguration"),
         status: 501,
         code: "NotImplemented",
     },
@@ -417,9 +422,9 @@ const CLUSTER_GROUP_CASES: &[ClusterGroupCase] = &[
         code: "NotImplemented",
     },
     ClusterGroupCase {
-        case: "no group named at all, beside ManageMasterUserPassword",
+        case: "no group named at all, beside WithExpressConfiguration",
         group: None,
-        unsupported: Some("ManageMasterUserPassword"),
+        unsupported: Some("WithExpressConfiguration"),
         status: 501,
         code: "NotImplemented",
     },

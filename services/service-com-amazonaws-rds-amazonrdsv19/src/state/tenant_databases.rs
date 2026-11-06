@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use super::{PendingChange, PendingStatus, ARN_NAMESPACE};
+use super::{ManagedMasterSecret, PendingChange, PendingStatus, ARN_NAMESPACE};
 use crate::ops::types::{Tag, TenantDatabase};
 
 /// How many tenant databases one DB instance holds. Amazon RDS publishes a per-instance
@@ -54,6 +54,17 @@ pub fn mint_tenant_database_resource_id(mint: u64) -> String {
     format!("tdb-{}", super::base36(mint, 26))
 }
 
+/// The name of the secret RDS manages for a TENANT DATABASE's master user password: the
+/// tenant database is addressed by its DB instance and its own name, which is what names
+/// the secret, carrying the instance's immutable `DbiResourceId`; see
+/// [`super::cluster_master_user_secret_name`] for the form these names share.
+pub fn tenant_database_master_user_secret_name(
+    dbi_resource_id: &str,
+    tenant_db_name: &str,
+) -> String {
+    format!("rds-tenantdb-{dbi_resource_id}-{tenant_db_name}")
+}
+
 /// A persisted tenant database.
 #[derive(Debug, Clone)]
 pub struct TenantDatabaseRecord {
@@ -70,6 +81,10 @@ pub struct TenantDatabaseRecord {
     pub dbi_resource_id: String,
     /// `MasterUsername`.
     pub master_username: String,
+    /// `MasterUserSecret`: the secret RDS manages for this tenant database's master user
+    /// password, for one created with `ManageMasterUserPassword` turned on; `None` for one
+    /// whose password the caller supplied, which has no managed secret to report.
+    pub master_user_secret: Option<ManagedMasterSecret>,
     /// `CharacterSetName`.
     pub character_set_name: Option<String>,
     /// `NcharCharacterSetName`.
@@ -126,9 +141,10 @@ impl TenantDatabaseRecord {
     /// INSTANCE" — a property of the instance this tenant database lives in, so it is
     /// passed in from that record rather than stored a second time here.
     ///
-    /// `PendingModifiedValues` and `MasterUserSecret` are left out rather than invented:
-    /// nothing here defers a change to a maintenance window, and this service mints no
-    /// Secrets Manager secret.
+    /// `PendingModifiedValues` is left out rather than invented: nothing here defers a
+    /// change to a maintenance window. `MasterUserSecret` is reported for a tenant database
+    /// whose master user password RDS manages, and only for one — one whose password the
+    /// caller supplied has no secret of RDS's own.
     pub fn to_wire(&self, deletion_protection: bool) -> TenantDatabase {
         TenantDatabase {
             tenant_database_create_time: Some(self.create_time),
@@ -143,7 +159,10 @@ impl TenantDatabaseRecord {
             nchar_character_set_name: self.nchar_character_set_name.clone(),
             deletion_protection: Some(deletion_protection),
             pending_modified_values: None,
-            master_user_secret: None,
+            master_user_secret: self
+                .master_user_secret
+                .as_ref()
+                .map(ManagedMasterSecret::to_wire),
             tag_list: Some(self.tags.clone()),
         }
     }

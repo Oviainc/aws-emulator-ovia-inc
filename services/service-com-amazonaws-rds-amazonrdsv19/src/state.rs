@@ -78,7 +78,8 @@ use crate::ops::types::{
     DBClusterSnapshotAttributesResult, DBInstance, DBParameterGroup, DBParameterGroupStatus,
     DBSecurityGroup, DBSecurityGroupMembership, DBSnapshot, DBSubnetGroup,
     DomainMembership, EC2SecurityGroup, Endpoint, EventCategoriesMap, EventSubscription,
-    GlobalCluster, GlobalClusterMember, IPRange, Option2, OptionGroup, OptionGroupMembership,
+    GlobalCluster, GlobalClusterMember, IPRange, MasterUserSecret, Option2, OptionGroup,
+    OptionGroupMembership,
     OptionSetting, Outpost, Parameter, PendingModifiedValues, RestoreWindow,
     ScalingConfigurationInfo,
     ServerlessV2ScalingConfigurationInfo, SourceNotFoundFault, Subnet, Tag,
@@ -197,7 +198,8 @@ pub use tags::{
 };
 pub use tenant_databases::{
     is_multi_tenant_engine, mint_tenant_database_resource_id, tenant_database_key,
-    TenantDatabaseRecord, TENANT_DATABASE_QUOTA_PER_INSTANCE, TENANT_DATABASE_STATUS_AVAILABLE,
+    tenant_database_master_user_secret_name, TenantDatabaseRecord,
+    TENANT_DATABASE_QUOTA_PER_INSTANCE, TENANT_DATABASE_STATUS_AVAILABLE,
     TENANT_DATABASE_STATUS_CREATING, TENANT_DATABASE_STATUS_DELETING,
 };
 
@@ -208,6 +210,10 @@ pub use tenant_databases::{
 pub mod data_plane;
 mod instances;
 mod clusters;
+// The Secrets Manager secret RDS manages for a resource's master user password: the
+// record a resource stores for it, and the minting a request that turns
+// `ManageMasterUserPassword` on depends on.
+mod managed_master_secret;
 mod published_values;
 mod minted_values;
 mod engine_defaults;
@@ -223,6 +229,7 @@ pub use minted_values::*;
 pub use published_values::*;
 pub use clusters::*;
 pub use instances::*;
+pub use managed_master_secret::*;
 pub use data_plane::{
     capture_instance_storage, engine_wire, open_engine_endpoint, DbEngineEndpoint, EngineWire,
     ServedEndpoint,

@@ -467,6 +467,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_master_user_password(&input.engine, password)
                 .map_err(CreateDBClusterError::invalid_parameter_value)?;
         }
+        // `ManageMasterUserPassword` has RDS "generate and manage the master user password
+        // with Amazon Web Services Secrets Manager" and report the secret it created as
+        // `MasterUserSecret`. The ONE constraint it documents is that the request may not
+        // also carry the password itself — "Can't manage the master user password with
+        // Amazon Web Services Secrets Manager if MasterUserPassword is specified" — so
+        // that is the only refusal a request turning it on is answered with; the secret
+        // itself is minted below, once every value is validated.
+        let manage_master_user_password = input.manage_master_user_password == Some(true);
+        if manage_master_user_password && input.master_user_password.is_some() {
+            return Err(CreateDBClusterError::invalid_parameter_combination(
+                crate::state::manage_master_user_password_conflict_message("MasterUserPassword"),
+            ));
+        }
+        // `MasterUserSecretKmsKeyId` "is valid only if the master user password is managed
+        // by RDS in Amazon Web Services Secrets Manager for the DB cluster": naming a key
+        // for a secret this request creates none of names nothing.
+        if !manage_master_user_password && input.master_user_secret_kms_key_id.is_some() {
+            return Err(CreateDBClusterError::invalid_parameter_combination(
+                crate::state::master_user_secret_kms_key_without_management_message(
+                    "ManageMasterUserPassword",
+                ),
+            ));
+        }
         if let Some(port) = input.port {
             if !crate::state::PORT_RANGE.contains(&port) {
                 return Err(CreateDBClusterError::invalid_parameter_value(format!(
@@ -719,202 +742,272 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
-        let mut store = state.lock();
-        store.settle_due_transitions(&region);
-
-        // Every resource this request REFERENCES by name is resolved in the store before
-        // the cluster is inserted, and a name that resolves to nothing is that resource
-        // type's modelled not-found fault: a create AWS would never have accepted must
-        // leave no cluster behind for a later call to find.
-        //
         // `DBSubnetGroupName`: "Must match the name of an existing DB subnet group." It is
-        // folded the way `CreateDBSubnetGroup` stores it.
+        // folded the way `CreateDBSubnetGroup` stores it, and resolved in the store below.
         let db_subnet_group_name = input
             .db_subnet_group_name
             .as_ref()
             .map(|name| name.to_ascii_lowercase());
-        let mut named_subnet_group = None;
-        if let Some(name) = &db_subnet_group_name {
-            let Some(group) = store.resolve_db_subnet_group(&region, name) else {
-                return Err(CreateDBClusterErrorModeled::DBSubnetGroupNotFoundFault(
-                    DBSubnetGroupNotFoundFault {
-                        message: Some(crate::state::db_subnet_group_does_not_exist_message(
-                            name,
+        let key = (region.clone(), identifier.clone());
+        // What this create is REFUSED for, and what resolving the request's references
+        // produced, decided under the store's guard — which is then released, because
+        // minting the managed master user secret below is a call to another service of
+        // this emulator and cannot be made while the guard is held.
+        let (mint, global_cluster_identifier, replication_source_arn) = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+
+            // Every resource this request REFERENCES by name is resolved in the store
+            // before the cluster is inserted, and a name that resolves to nothing is that
+            // resource type's modelled not-found fault: a create AWS would never have
+            // accepted must leave no cluster behind for a later call to find.
+            let mut named_subnet_group = None;
+            if let Some(name) = &db_subnet_group_name {
+                let Some(group) = store.resolve_db_subnet_group(&region, name) else {
+                    return Err(CreateDBClusterErrorModeled::DBSubnetGroupNotFoundFault(
+                        DBSubnetGroupNotFoundFault {
+                            message: Some(crate::state::db_subnet_group_does_not_exist_message(
+                                name,
+                            )),
+                        },
+                    )
+                    .into());
+                };
+                named_subnet_group = Some(group);
+            }
+            // A Multi-AZ DB cluster is placed across the zones its DB subnet group covers,
+            // so the group a request NAMES has to cover enough of them before anything
+            // about the cluster's own settings is answered
+            // ([`check_multi_az_subnet_coverage`]).
+            if multi_az_cluster {
+                if let Some(group) = &named_subnet_group {
+                    if let Err(message) = check_multi_az_subnet_coverage(&region, group) {
+                        return Err(CreateDBClusterErrorModeled::InvalidVPCNetworkStateFault(
+                            InvalidVPCNetworkStateFault {
+                                message: Some(message),
+                            },
+                        )
+                        .into());
+                    }
+                }
+                // The four settings this cluster type is required to carry, and the two
+                // constraints the values of two of them state.
+                if !multi_az_missing.is_empty() {
+                    return Err(CreateDBClusterError::invalid_parameter_combination(format!(
+                        "{} {} required to create a Multi-AZ DB cluster (engine {})",
+                        multi_az_missing.join(", "),
+                        if multi_az_missing.len() == 1 { "is" } else { "are" },
+                        input.engine
+                    )));
+                }
+                crate::state::check_db_instance_class(
+                    input
+                        .db_cluster_instance_class
+                        .as_deref()
+                        .expect("checked just above"),
+                )
+                .map_err(CreateDBClusterError::invalid_parameter_value)?;
+                // `Iops`: "Must be a multiple between .5 and 50 of the storage amount for
+                // the DB cluster."
+                let storage = input.allocated_storage.expect("checked just above");
+                let iops = input.iops.expect("checked just above");
+                let ratio = f64::from(iops) / f64::from(storage.max(1));
+                if storage <= 0
+                    || !(IOPS_STORAGE_RATIO_MIN..=IOPS_STORAGE_RATIO_MAX).contains(&ratio)
+                {
+                    return Err(CreateDBClusterError::invalid_parameter_combination(format!(
+                        "invalid value {iops} for Iops: must be a multiple between \
+                         {IOPS_STORAGE_RATIO_MIN} and {IOPS_STORAGE_RATIO_MAX} of \
+                         AllocatedStorage ({storage})"
+                    )));
+                }
+            }
+            // `GlobalClusterIdentifier`: "the global cluster ID of an Aurora cluster that
+            // becomes the primary cluster in the new global database cluster." A global
+            // cluster is account-scoped, so it is looked up by identifier alone — and a
+            // cluster that joins one becomes a member of it, which is what
+            // `DescribeGlobalClusters` reports.
+            let global_cluster_identifier = match &input.global_cluster_identifier {
+                None => None,
+                Some(named) => {
+                    let folded = named.to_ascii_lowercase();
+                    if !store.global_clusters.contains_key(&folded) {
+                        return Err(CreateDBClusterErrorModeled::GlobalClusterNotFoundFault(
+                            GlobalClusterNotFoundFault {
+                                message: Some(format!("GlobalCluster {named} not found.")),
+                            },
+                        )
+                        .into());
+                    }
+                    Some(folded)
+                }
+            };
+            // `ReplicationSourceIdentifier`: "the Amazon Resource Name (ARN) of the source
+            // DB instance or DB cluster if this DB cluster is created as a read replica."
+            // Stored as the ARN of the record it resolves to, so the reference cannot name
+            // something this service does not hold; a value that resolves to neither is
+            // the modelled `DBClusterNotFoundFault`.
+            let replication_source_arn = match &input.replication_source_identifier {
+                None => None,
+                Some(named) => {
+                    let source = store
+                        .resolve_db_cluster(&region, named)
+                        .map(crate::state::DbClusterRecord::arn)
+                        .or_else(|| {
+                            let instance = crate::state::db_cluster_identifier_of(named)
+                                .to_ascii_lowercase();
+                            store
+                                .db_instances
+                                .get(&(region.clone(), instance))
+                                .map(crate::state::DbInstanceRecord::arn)
+                        });
+                    match source {
+                        Some(arn) => Some(arn),
+                        None => {
+                            return Err(CreateDBClusterErrorModeled::DBClusterNotFoundFault(
+                                DBClusterNotFoundFault {
+                                    message: Some(
+                                        crate::state::db_cluster_cannot_be_accessed_message(named),
+                                    ),
+                                },
+                            )
+                            .into())
+                        }
+                    }
+                }
+            };
+            // `DBClusterParameterGroupName`: "Must match the name of an existing DB cluster
+            // parameter group." A name that matches none is the modelled not-found fault —
+            // the same resolution `ModifyDBCluster` gives the group it moves a cluster to.
+            // The groups RDS provides itself are there without any request having created
+            // them ([`crate::state::is_default_parameter_group_name`]), so a name of that
+            // form resolves even though this store holds no record of it.
+            if let Some(named) = &input.db_cluster_parameter_group_name {
+                if !store.db_cluster_parameter_group_exists(&region, named) {
+                    return Err(
+                        CreateDBClusterErrorModeled::DBClusterParameterGroupNotFoundFault(
+                            DBClusterParameterGroupNotFoundFault {
+                                message: Some(
+                                    crate::state::db_cluster_parameter_group_not_found_message(
+                                        named,
+                                    ),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+            // `OptionGroupName` is NOT resolved the same way, and deliberately: alongside
+            // every engine major version AWS creates a DEFAULT option group
+            // (`default:aurora-mysql-8-0`) that no request creates and this service does
+            // not hold, and its name is not drawn from the parameter groups' `default.`
+            // form, so refusing every name this store has no record of would refuse the
+            // groups AWS itself provides. It is stored as given, as `CreateDBInstance`
+            // stores its own.
+
+            // What this EMULATOR cannot serve is answered only once every value the
+            // request carries has been validated and every resource it names resolved: a
+            // request AWS refuses as a client error gets that client error, never a
+            // server-fault class that hides it.
+            //
+            // `WithExpressConfiguration` creates "an Aurora DB Cluster with express
+            // configuration", which provisions the cluster's writer DB INSTANCE as part of
+            // this call. This operation stores a cluster and no instance, so a cluster
+            // created for it would come back without the writer the member asks for: it is
+            // answered the same way, naming the member.
+            if input.with_express_configuration == Some(true) {
+                return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                    crate::scaffolded::NotImplemented {
+                        message: "CreateDBCluster$WithExpressConfiguration is not implemented \
+                                  in this emulator: express configuration creates the \
+                                  cluster's writer DB instance as part of this call, and this \
+                                  operation creates no DB instance. Create the cluster without \
+                                  it and add the writer with CreateDBInstance."
+                            .to_string(),
+                    },
+                ));
+            }
+
+            if store.db_clusters.contains_key(&key) {
+                return Err(CreateDBClusterErrorModeled::DBClusterAlreadyExistsFault(
+                    DBClusterAlreadyExistsFault {
+                        message: Some(crate::state::DB_CLUSTER_ALREADY_EXISTS_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+            // The region's DB cluster quota, and the number of regions this store keeps
+            // records for at all: a store that grows without bound is not what the real
+            // service does, and the modelled fault says exactly this.
+            if store.clusters_in(&region).len() >= crate::state::DB_CLUSTER_QUOTA_PER_REGION
+                || !store.has_room_for_region(&region)
+            {
+                return Err(CreateDBClusterErrorModeled::DBClusterQuotaExceededFault(
+                    DBClusterQuotaExceededFault {
+                        message: Some(format!(
+                            "the request would exceed the allowed number of DB clusters ({} per \
+                             region, in at most {} regions)",
+                            crate::state::DB_CLUSTER_QUOTA_PER_REGION,
+                            crate::state::MAX_REGIONS
                         )),
                     },
                 )
                 .into());
-            };
-            named_subnet_group = Some(group);
-        }
-        // A Multi-AZ DB cluster is placed across the zones its DB subnet group covers, so
-        // the group a request NAMES has to cover enough of them before anything about the
-        // cluster's own settings is answered ([`check_multi_az_subnet_coverage`]).
-        if multi_az_cluster {
-            if let Some(group) = &named_subnet_group {
-                if let Err(message) = check_multi_az_subnet_coverage(&region, group) {
-                    return Err(CreateDBClusterErrorModeled::InvalidVPCNetworkStateFault(
-                        InvalidVPCNetworkStateFault {
-                            message: Some(message),
-                        },
-                    )
-                    .into());
-                }
             }
-            // The four settings this cluster type is required to carry, and the two
-            // constraints the values of two of them state.
-            if !multi_az_missing.is_empty() {
-                return Err(CreateDBClusterError::invalid_parameter_combination(format!(
-                    "{} {} required to create a Multi-AZ DB cluster (engine {})",
-                    multi_az_missing.join(", "),
-                    if multi_az_missing.len() == 1 { "is" } else { "are" },
-                    input.engine
-                )));
-            }
-            crate::state::check_db_instance_class(
-                input
-                    .db_cluster_instance_class
-                    .as_deref()
-                    .expect("checked just above"),
+
+            // The mint the cluster's own identities are drawn from, taken last so a create
+            // this scope refused draws none.
+            (
+                store.next_mint(),
+                global_cluster_identifier,
+                replication_source_arn,
             )
-            .map_err(CreateDBClusterError::invalid_parameter_value)?;
-            // `Iops`: "Must be a multiple between .5 and 50 of the storage amount for the
-            // DB cluster."
-            let storage = input.allocated_storage.expect("checked just above");
-            let iops = input.iops.expect("checked just above");
-            let ratio = f64::from(iops) / f64::from(storage.max(1));
-            if storage <= 0 || !(IOPS_STORAGE_RATIO_MIN..=IOPS_STORAGE_RATIO_MAX).contains(&ratio) {
-                return Err(CreateDBClusterError::invalid_parameter_combination(format!(
-                    "invalid value {iops} for Iops: must be a multiple between \
-                     {IOPS_STORAGE_RATIO_MIN} and {IOPS_STORAGE_RATIO_MAX} of \
-                     AllocatedStorage ({storage})"
-                )));
-            }
-        }
-        // `GlobalClusterIdentifier`: "the global cluster ID of an Aurora cluster that
-        // becomes the primary cluster in the new global database cluster." A global cluster
-        // is account-scoped, so it is looked up by identifier alone — and a cluster that
-        // joins one becomes a member of it, which is what `DescribeGlobalClusters` reports.
-        let global_cluster_identifier = match &input.global_cluster_identifier {
-            None => None,
-            Some(named) => {
-                let folded = named.to_ascii_lowercase();
-                if !store.global_clusters.contains_key(&folded) {
-                    return Err(CreateDBClusterErrorModeled::GlobalClusterNotFoundFault(
-                        GlobalClusterNotFoundFault {
-                            message: Some(format!("GlobalCluster {named} not found.")),
-                        },
-                    )
-                    .into());
-                }
-                Some(folded)
-            }
         };
-        // `ReplicationSourceIdentifier`: "the Amazon Resource Name (ARN) of the source DB
-        // instance or DB cluster if this DB cluster is created as a read replica." Stored
-        // as the ARN of the record it resolves to, so the reference cannot name something
-        // this service does not hold; a value that resolves to neither is the modelled
-        // `DBClusterNotFoundFault`.
-        let replication_source_arn = match &input.replication_source_identifier {
-            None => None,
-            Some(named) => {
-                let source = store
-                    .resolve_db_cluster(&region, named)
-                    .map(crate::state::DbClusterRecord::arn)
-                    .or_else(|| {
-                        let instance = crate::state::db_cluster_identifier_of(named)
-                            .to_ascii_lowercase();
-                        store
-                            .db_instances
-                            .get(&(region.clone(), instance))
-                            .map(crate::state::DbInstanceRecord::arn)
-                    });
-                match source {
-                    Some(arn) => Some(arn),
-                    None => {
-                        return Err(CreateDBClusterErrorModeled::DBClusterNotFoundFault(
-                            DBClusterNotFoundFault {
-                                message: Some(
-                                    crate::state::db_cluster_cannot_be_accessed_message(named),
-                                ),
-                            },
-                        )
-                        .into())
-                    }
-                }
-            }
+        let resource_id = crate::state::mint_db_cluster_resource_id(mint);
+        // `MasterUsername`: what the request named, or — where the engine's own control
+        // plane cannot be given one — the username it ASSIGNS the cluster
+        // ([`crate::state::assigned_master_username`]). Resolved here because it is also
+        // the user the managed secret below holds the password OF.
+        let master_username = input.master_username.clone().or_else(|| {
+            crate::state::assigned_master_username(&input.engine).map(str::to_string)
+        });
+        // The secret RDS manages for this cluster's master user password, for a request
+        // that asked it to: generated, stored in Secrets Manager and reported as
+        // `MasterUserSecret` ([`crate::state::mint_master_user_secret`]). The store's
+        // guard is NOT held here — see the decision scope above.
+        let master_user_secret = if manage_master_user_password {
+            let minted = crate::state::mint_master_user_secret(
+                ctx,
+                &region,
+                &crate::state::MasterSecretRequest {
+                    name: &crate::state::cluster_master_user_secret_name(&resource_id),
+                    username: master_username.as_deref(),
+                    engine: &input.engine,
+                    kms_key_id: input.master_user_secret_kms_key_id.as_deref(),
+                },
+            )
+            .await
+            .map_err(CreateDBClusterError::internal_failure)?;
+            Some(minted.secret)
+        } else {
+            None
         };
-        // `DBClusterParameterGroupName`: "Must match the name of an existing DB cluster
-        // parameter group." A name that matches none is the modelled not-found fault — the
-        // same resolution `ModifyDBCluster` gives the group it moves a cluster to. The
-        // groups RDS provides itself are there without any request having created them
-        // ([`crate::state::is_default_parameter_group_name`]), so a name of that form
-        // resolves even though this store holds no record of it.
-        if let Some(named) = &input.db_cluster_parameter_group_name {
-            if !store.db_cluster_parameter_group_exists(&region, named) {
-                return Err(
-                    CreateDBClusterErrorModeled::DBClusterParameterGroupNotFoundFault(
-                        DBClusterParameterGroupNotFoundFault {
-                            message: Some(
-                                crate::state::db_cluster_parameter_group_not_found_message(named),
-                            ),
-                        },
-                    )
-                    .into(),
-                );
+        // The identifier is answered against what the store holds NOW: the guard was
+        // released while the secret was minted, so a create that raced another one for the
+        // same identifier is still refused rather than overwriting it — and the secret this
+        // call minted is deleted rather than left behind, since the cluster that would have
+        // reported it is not created.
+        let taken = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+            store.db_clusters.contains_key(&key)
+        };
+        if taken {
+            if let Some(secret) = &master_user_secret {
+                crate::state::release_orphaned_master_user_secret(ctx, &region, &secret.secret_arn)
+                    .await;
             }
-        }
-        // `OptionGroupName` is NOT resolved the same way, and deliberately: alongside every
-        // engine major version AWS creates a DEFAULT option group
-        // (`default:aurora-mysql-8-0`) that no request creates and this service does not
-        // hold, and its name is not drawn from the parameter groups' `default.` form, so
-        // refusing every name this store has no record of would refuse the groups AWS
-        // itself provides. It is stored as given, as `CreateDBInstance` stores its own.
-
-        // What this EMULATOR cannot serve is answered only once every value the request
-        // carries has been validated and every resource it names resolved: a request AWS
-        // refuses as a client error gets that client error, never a server-fault class that
-        // hides it.
-        //
-        // `ManageMasterUserPassword` has RDS "generate and manage the master user password
-        // in Amazon Web Services Secrets Manager" and report the secret it created as
-        // `MasterUserSecret`. This service mints no Secrets Manager secret, so there is no
-        // managed secret to report: the request is answered with the scaffold's
-        // `NotImplemented` naming the member, rather than with a cluster whose managed
-        // secret does not exist. A request that carries its own `MasterUserPassword` is
-        // served normally.
-        if input.manage_master_user_password == Some(true) {
-            return Err(crate::scaffolded::Scaffolded::NotImplemented(
-                crate::scaffolded::NotImplemented {
-                    message: "CreateDBCluster$ManageMasterUserPassword is not implemented in \
-                              this emulator: it has RDS generate the master user password in \
-                              Amazon Web Services Secrets Manager and report that secret as \
-                              MasterUserSecret, and this service mints no such secret. Name \
-                              MasterUserPassword instead."
-                        .to_string(),
-                },
-            ));
-        }
-        // `WithExpressConfiguration` creates "an Aurora DB Cluster with express
-        // configuration", which provisions the cluster's writer DB INSTANCE as part of
-        // this call. This operation stores a cluster and no instance, so a cluster created
-        // for it would come back without the writer the member asks for: it is answered the
-        // same way, naming the member.
-        if input.with_express_configuration == Some(true) {
-            return Err(crate::scaffolded::Scaffolded::NotImplemented(
-                crate::scaffolded::NotImplemented {
-                    message: "CreateDBCluster$WithExpressConfiguration is not implemented in \
-                              this emulator: express configuration creates the cluster's \
-                              writer DB instance as part of this call, and this operation \
-                              creates no DB instance. Create the cluster without it and add \
-                              the writer with CreateDBInstance."
-                        .to_string(),
-                },
-            ));
-        }
-
-        let key = (region.clone(), identifier.clone());
-        if store.db_clusters.contains_key(&key) {
             return Err(CreateDBClusterErrorModeled::DBClusterAlreadyExistsFault(
                 DBClusterAlreadyExistsFault {
                     message: Some(crate::state::DB_CLUSTER_ALREADY_EXISTS_MESSAGE.to_string()),
@@ -922,26 +1015,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // The region's DB cluster quota, and the number of regions this store keeps records
-        // for at all: a store that grows without bound is not what the real service does,
-        // and the modelled fault says exactly this.
-        if store.clusters_in(&region).len() >= crate::state::DB_CLUSTER_QUOTA_PER_REGION
-            || !store.has_room_for_region(&region)
-        {
-            return Err(CreateDBClusterErrorModeled::DBClusterQuotaExceededFault(
-                DBClusterQuotaExceededFault {
-                    message: Some(format!(
-                        "the request would exceed the allowed number of DB clusters ({} per \
-                         region, in at most {} regions)",
-                        crate::state::DB_CLUSTER_QUOTA_PER_REGION,
-                        crate::state::MAX_REGIONS
-                    )),
-                },
-            )
-            .into());
-        }
-
-        let mint = store.next_mint();
+        let mut store = state.lock();
         // The version the cluster runs, and the DB cluster parameter group family its
         // default parameter group is named after: both come from the catalogue entry
         // resolved above, so the two cannot disagree.
@@ -954,7 +1028,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::DbClusterRecord {
             identifier: identifier.clone(),
             region: region.clone(),
-            resource_id: crate::state::mint_db_cluster_resource_id(mint),
+            resource_id,
             endpoint_host: crate::state::mint_endpoint_host(mint),
             // A newly created DB cluster is not yet usable: RDS answers `creating`, and the
             // cluster reaches `available` on its own. The due instant is stored on the
@@ -968,13 +1042,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             engine_mode,
             database_name: input.database_name,
             // `MasterUserPassword` is `@sensitive` and RDS reports no member carrying it,
-            // so it is validated above, never stored or returned. The username is — and
-            // where the engine's own control plane cannot be given one, the username it
-            // ASSIGNS the cluster is what the cluster carries
-            // ([`crate::state::assigned_master_username`]).
-            master_username: input.master_username.or_else(|| {
-                crate::state::assigned_master_username(&input.engine).map(str::to_string)
-            }),
+            // so it is validated above, never stored or returned. The username resolved
+            // above is stored, and so is the secret RDS manages for the password when the
+            // request asked it to: those two are what a caller reads the cluster's master
+            // user credential from.
+            master_username,
+            master_user_secret,
             port: input
                 .port
                 .unwrap_or_else(|| crate::state::default_port(&input.engine)),

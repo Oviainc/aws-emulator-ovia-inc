@@ -468,34 +468,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         }
-        // `ManageMasterUserPassword` has RDS "generate and manage the master user password
-        // in Amazon Web Services Secrets Manager" and report the secret it created; this
-        // service mints no such secret, so the request is answered naming the member
-        // rather than with a cluster whose managed secret does not exist. The same goes for
-        // rotating one that was never created.
-        for (member, asked) in [
-            (
-                "ManageMasterUserPassword",
-                input.manage_master_user_password == Some(true),
-            ),
-            (
-                "RotateMasterUserPassword",
-                input.rotate_master_user_password == Some(true),
-            ),
-        ] {
-            if asked {
-                return Err(crate::scaffolded::Scaffolded::NotImplemented(
-                    crate::scaffolded::NotImplemented {
-                        message: format!(
-                            "ModifyDBCluster${member} is not implemented in this emulator: it \
-                             has RDS manage the master user password in Amazon Web Services \
-                             Secrets Manager and report that secret as MasterUserSecret, and \
-                             this service mints no such secret. Name MasterUserPassword \
-                             instead."
-                        ),
-                    },
-                ));
-            }
+        // `ManageMasterUserPassword` turns RDS's management of the master user password ON
+        // for a cluster that does not manage it — "In this case, you can't specify
+        // MasterUserPassword" — which is a constraint on the REQUEST alone. Turning it OFF
+        // is conditioned on what the cluster manages NOW, so that refusal is answered
+        // below, where the record is in hand.
+        if input.manage_master_user_password == Some(true) && input.master_user_password.is_some() {
+            return Err(ModifyDBClusterError::invalid_parameter_combination(
+                crate::state::manage_master_user_password_conflict_message("MasterUserPassword"),
+            ));
         }
 
         // No store means this service was mounted on an engine it has no state in, so it
@@ -504,11 +485,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
+        // RDS is regional: only the region the request was signed for is in scope.
+        let key = (region.clone(), identifier.clone());
+
+        // Everything this modification is REFUSED for is decided here, under the state
+        // lock, and the lock is released at the end of this block: the managed master user
+        // secret is minted, rotated or deleted through Secrets Manager below, and a state
+        // guard cannot be held across an await. NOTHING is written in this scope, so a
+        // modification refused here changes nothing — neither in this store nor in Secrets
+        // Manager. (The same shape `CreateDBInstance` decides its own refusals in.)
+        let accepted = {
         let mut store = state.lock();
         store.settle_due_transitions(&region);
 
-        // RDS is regional: only the region the request was signed for is in scope.
-        let key = (region.clone(), identifier.clone());
         let Some(current) = store.db_clusters.get(&key) else {
             // The wording is the one this front door gives the fault where the call
             // MODIFIES the cluster's configuration: one fixed sentence with no variable
@@ -527,6 +516,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let engine = current.engine.clone();
         let current_engine_version = current.engine_version.clone();
         let status = current.status.clone();
+        // What the Secrets Manager calls below need, read from the SAME record every
+        // refusal here was decided against: the master user the secret holds the password
+        // of, the secret the cluster manages now, and the immutable id a new secret is
+        // named after.
+        let master_username = current.master_username.clone();
+        let current_master_user_secret = current.master_user_secret.clone();
+        let resource_id = current.resource_id.clone();
 
         // `MasterUserPassword` carries the engine's master-password policy, and the bound
         // is per engine ([`crate::state::master_user_password_len`]), so the value is
@@ -678,10 +674,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
         }
 
-        let mut record = store
-            .db_clusters
-            .remove(&key)
-            .expect("the cluster was found above and the store is locked");
+        // `RotateMasterUserPassword` "is valid only if the master user password is managed
+        // by RDS in Amazon Web Services Secrets Manager for the DB cluster", so a cluster
+        // with no managed secret has nothing to rotate. `MasterUserSecretKmsKeyId` is valid
+        // only there too: it names the key of a secret this cluster would have to have. And
+        // "you must specify MasterUserPassword" is conditioned on the cluster ALREADY
+        // managing the password — "If the DB cluster already manages the master user
+        // password … then you must specify MasterUserPassword" — so a cluster that manages
+        // none is not refused for turning management off it never had on.
+        let manages_master_user_password = current_master_user_secret.is_some();
+        if input.rotate_master_user_password == Some(true) && !manages_master_user_password {
+            return Err(ModifyDBClusterError::invalid_parameter_combination(
+                crate::state::rotate_without_managed_secret_message("DB cluster"),
+            ));
+        }
+        if input.master_user_secret_kms_key_id.is_some()
+            && input.manage_master_user_password != Some(true)
+            && !manages_master_user_password
+        {
+            return Err(ModifyDBClusterError::invalid_parameter_combination(
+                crate::state::master_user_secret_kms_key_without_management_message(
+                    "ManageMasterUserPassword",
+                ),
+            ));
+        }
+        if input.manage_master_user_password == Some(false)
+            && manages_master_user_password
+            && input.master_user_password.is_none()
+        {
+            return Err(ModifyDBClusterError::invalid_parameter_combination(
+                crate::state::master_user_password_required_to_stop_management_message(
+                    "MasterUserPassword",
+                ),
+            ));
+        }
+
+        AcceptedModification {
+            engine,
+            resolved_engine_version,
+            master_username,
+            current_master_user_secret,
+            resource_id,
+        }
+        };
+
+        // The managed master user secret, changed now that every refusal above has been
+        // answered and the store's guard released: a request that turned management ON gets
+        // a secret minted for the cluster, one that turned it OFF has RDS "delete the
+        // secret", and a rotation stakes a new password in the secret already there.
+        let mut minted_master_user_secret = None;
+        let mut rotated_master_user_secret = false;
+        let mut released_master_user_secret = false;
+        match (
+            input.manage_master_user_password,
+            &accepted.current_master_user_secret,
+        ) {
+            (Some(true), None) => {
+                let minted = crate::state::mint_master_user_secret(
+                    ctx,
+                    &region,
+                    &crate::state::MasterSecretRequest {
+                        name: &crate::state::cluster_master_user_secret_name(
+                            &accepted.resource_id,
+                        ),
+                        username: accepted.master_username.as_deref(),
+                        engine: &accepted.engine,
+                        kms_key_id: input.master_user_secret_kms_key_id.as_deref(),
+                    },
+                )
+                .await
+                .map_err(ModifyDBClusterError::internal_failure)?;
+                minted_master_user_secret = Some(minted.secret);
+            }
+            (Some(false), Some(secret)) => {
+                crate::state::release_master_user_secret(ctx, &region, &secret.secret_arn)
+                    .await
+                    .map_err(ModifyDBClusterError::internal_failure)?;
+                released_master_user_secret = true;
+            }
+            _ => {}
+        }
+        if input.rotate_master_user_password == Some(true) {
+            if let Some(secret) = &accepted.current_master_user_secret {
+                crate::state::rotate_master_user_secret(
+                    ctx,
+                    &region,
+                    &secret.secret_arn,
+                    accepted.master_username.as_deref(),
+                    &accepted.engine,
+                )
+                .await
+                .map_err(ModifyDBClusterError::internal_failure)?;
+                rotated_master_user_secret = true;
+            }
+        }
+
+        // The cluster is answered against what the store holds NOW: the guard was released
+        // while the secret was changed, so a cluster another request deleted in the
+        // meantime is the not-found fault rather than a record this call puts back — and a
+        // secret minted for it is deleted rather than left behind, since no cluster would
+        // ever report it.
+        let gone = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+            !store.db_clusters.contains_key(&key)
+        };
+        if gone {
+            if let Some(secret) = &minted_master_user_secret {
+                crate::state::release_orphaned_master_user_secret(ctx, &region, &secret.secret_arn)
+                    .await;
+            }
+            return Err(ModifyDBClusterErrorModeled::DBClusterNotFoundFault(
+                DBClusterNotFoundFault {
+                    message: Some(crate::state::MODIFY_DB_CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        let mut store = state.lock();
+        let resolved_engine_version = accepted.resolved_engine_version;
+        // The record is TAKEN OUT and put back under this one guard, so nothing can see the
+        // cluster missing while the modification is written onto it. Its absence is
+        // answered rather than asserted: a delete that landed between the scope above and
+        // this guard leaves nothing to modify, and the fault this operation words for a
+        // cluster it cannot find is the answer — the secret the release above could not
+        // know about is the only thing that call left behind.
+        let Some(mut record) = store.db_clusters.remove(&key) else {
+            return Err(ModifyDBClusterErrorModeled::DBClusterNotFoundFault(
+                DBClusterNotFoundFault {
+                    message: Some(crate::state::MODIFY_DB_CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
 
         // Which modifications take the cluster OUT OF SERVICE while they are applied, and
         // so move its reported `Status`.
@@ -879,6 +1004,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `MasterUserPassword` is `@sensitive` and RDS reports no member carrying it: it is
         // accepted and neither stored nor returned.
         changed |= input.master_user_password.is_some();
+        // What the Secrets Manager calls above did, recorded on the cluster: the secret a
+        // request that turned management ON minted is what the cluster reports as
+        // `MasterUserSecret` from now on; turning management OFF leaves the cluster with
+        // none, since RDS deleted it; and a rotation leaves the same secret reporting
+        // `rotating` until it settles.
+        if let Some(secret) = minted_master_user_secret {
+            changed = true;
+            record.master_user_secret = Some(secret);
+        }
+        if released_master_user_secret {
+            changed = true;
+            record.master_user_secret = None;
+        }
+        if rotated_master_user_secret {
+            changed = true;
+            if let Some(secret) = &mut record.master_user_secret {
+                secret.rotating();
+            }
+        }
 
         if changed && takes_the_cluster_out_of_service {
             // The cluster is out of service while this change is applied: RDS answers
@@ -899,4 +1043,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             db_cluster: Some(db_cluster),
         })
     }
+}
+
+/// What the scope that decides this modification's refusals hands on: the values the
+/// modification is applied FROM, read from the record every refusal was decided against.
+///
+/// It exists because the Secrets Manager calls that change the cluster's managed master
+/// user secret cannot be made while the store's guard is held, so the guard is released
+/// between deciding the modification and applying it — and what the two halves share
+/// travels in one value rather than as a row of loose locals.
+struct AcceptedModification {
+    /// The engine the cluster runs, which the generated password's own rules come from.
+    engine: String,
+    /// `EngineVersion`, resolved against the engine-version catalogue, for the record.
+    resolved_engine_version: Option<String>,
+    /// `MasterUsername`: the user the managed secret holds the password of.
+    master_username: Option<String>,
+    /// The secret the cluster manages NOW, which decides whether this call mints one,
+    /// rotates it or deletes it.
+    current_master_user_secret: Option<crate::state::ManagedMasterSecret>,
+    /// `DbClusterResourceId`, which a newly minted secret is named after.
+    resource_id: String,
 }

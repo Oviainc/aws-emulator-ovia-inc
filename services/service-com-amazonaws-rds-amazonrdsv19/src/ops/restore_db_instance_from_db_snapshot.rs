@@ -378,6 +378,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(RestoreDBInstanceFromDBSnapshotError::invalid_parameter_value)?;
         let identifier = input.db_instance_identifier.to_ascii_lowercase();
 
+        // `MasterUserSecretKmsKeyId` "is valid only if the master user password is managed
+        // by RDS in Amazon Web Services Secrets Manager for the DB instance": naming a key
+        // for a secret this restore creates none of names nothing. This operation publishes
+        // no `MasterUserPassword` member, so the mutual exclusion the create answers has
+        // nothing to refuse here.
+        if input.manage_master_user_password != Some(true)
+            && input.master_user_secret_kms_key_id.is_some()
+        {
+            return Err(
+                RestoreDBInstanceFromDBSnapshotError::invalid_parameter_combination(
+                    crate::state::master_user_secret_kms_key_without_management_message(
+                        "ManageMasterUserPassword",
+                    ),
+                ),
+            );
+        }
         // Which snapshot the restore reads: exactly one of the two members names it —
         // `DBSnapshotIdentifier` "Can't be specified when DBClusterSnapshotIdentifier is
         // specified. Must be specified when DBClusterSnapshotIdentifier isn't specified."
@@ -678,6 +694,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // password — because the restore mints no new one.
                 master_user_password: source.master_user_password.clone(),
                 master_username: source.master_username.clone(),
+                // The secret RDS manages for the master user password is minted once this
+                // scope has released the store's guard (`ManageMasterUserPassword` below),
+                // so a record built here carries none yet.
+                master_user_secret: None,
                 endpoint_port,
                 // Filled in below, once the core has assigned the engine listener its
                 // port.
@@ -818,6 +838,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.served_endpoint = endpoint
             .as_ref()
             .map(|endpoint| endpoint.endpoint.clone());
+        // `ManageMasterUserPassword` has RDS "generate and manage the master user password
+        // with Amazon Web Services Secrets Manager" for the instance this call creates, and
+        // report the secret it created as `MasterUserSecret` — a NEW secret of the restored
+        // instance's own, which is why the restored record carries the generated credential
+        // rather than the source's. Minted with the store's guard released and after every
+        // refusal has been answered, exactly as `CreateDBInstance` mints one.
+        if input.manage_master_user_password == Some(true) {
+            let minted = crate::state::mint_master_user_secret(
+                ctx,
+                &region,
+                &crate::state::MasterSecretRequest {
+                    name: &crate::state::instance_master_user_secret_name(
+                        &record.dbi_resource_id,
+                    ),
+                    username: record.master_username.as_deref(),
+                    engine: &record.engine,
+                    kms_key_id: input.master_user_secret_kms_key_id.as_deref(),
+                },
+            )
+            .await
+            .map_err(RestoreDBInstanceFromDBSnapshotError::internal_failure)?;
+            record.master_user_password = record.master_username.as_deref().map(|username| {
+                crate::state::data_plane::wire_session::MasterPasswordHash::new(
+                    username,
+                    &minted.password,
+                )
+            });
+            record.master_user_secret = Some(minted.secret);
+        }
         // THE RESTORE ITSELF: the data the snapshot holds is loaded into the new
         // instance's own storage, by the engine, before the endpoint is published — so the
         // first session a client opens on it finds the snapshot's rows and not an empty
@@ -844,10 +893,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })?;
         }
 
-        let mut store = state.lock();
         // Another request may have created this identifier while this one was binding, so
-        // the conflict is answered again here rather than overwriting a stored instance.
-        if store.db_instances.contains_key(&key) {
+        // the conflict is answered again here rather than overwriting a stored instance —
+        // and a secret minted for this instance is deleted rather than left behind, since
+        // the instance that would have reported it is not created.
+        let taken = {
+            let store = state.lock();
+            store.db_instances.contains_key(&key)
+        };
+        if taken {
+            if let Some(secret) = &record.master_user_secret {
+                crate::state::release_orphaned_master_user_secret(ctx, &region, &secret.secret_arn)
+                    .await;
+            }
             return Err(
                 RestoreDBInstanceFromDBSnapshotErrorModeled::DBInstanceAlreadyExistsFault(
                     DBInstanceAlreadyExistsFault {
@@ -859,6 +917,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        let mut store = state.lock();
 
         let db_instance = record.to_wire();
         let dbi_resource_id = record.dbi_resource_id.clone();

@@ -66,6 +66,14 @@ getrandom = "0.3"
 # the decimal AWS renders one as, which every operation of this front door is served behind
 # (`src/service/management_events.rs`).
 service-common = { path = "../common" }
+# `ManageMasterUserPassword` has RDS generate the master user password and manage it in
+# Amazon Web Services Secrets Manager: this is the Secrets Manager client the create and
+# the rotation of that secret go out over the in-process callback with
+# (`src/state/managed_master_secret.rs`).
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The same module reports WHICH KMS key that secret is encrypted under, resolved through
+# KMS so the key's own ARN is reported rather than an alias that may be re-targeted.
+aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # `state::new_request_id`'s digest: a maintained hash, so the per-response request id in
 # an awsQuery `<ErrorResponse>` envelope is shaped by library code rather than by hand.
 sha2 = { workspace = true }
@@ -82,6 +90,12 @@ emulator-core-build-support = { workspace = true }
 sha1 = "0.10"
 rustls = { workspace = true }
 tokio-rustls = "0.26"
+# The managed-master-password suite mounts Secrets Manager (and KMS, which encrypts a
+# secret's value) beside this service on one engine, exactly as the assembled router
+# mounts them, so the secret a cluster or instance reports is a real secret of this
+# emulator, read back through Secrets Manager's own operations.
+service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
+service-com-amazonaws-kms-trentservice = { workspace = true }
 
 [lints]
 workspace = true

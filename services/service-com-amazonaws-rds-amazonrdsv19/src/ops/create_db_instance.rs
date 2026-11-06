@@ -423,6 +423,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_master_user_password(&input.engine, password)
                 .map_err(CreateDBInstanceError::invalid_parameter_value)?;
         }
+        // `ManageMasterUserPassword` has RDS "generate and manage the master user password
+        // with Amazon Web Services Secrets Manager" and report the secret it created as
+        // `MasterUserSecret`. Its one documented constraint is that the request may not
+        // also carry the password itself — "Can't be specified if ManageMasterUserPassword
+        // is turned on" — and `MasterUserSecretKmsKeyId` "is valid only if the master user
+        // password is managed by RDS in Amazon Web Services Secrets Manager for the DB
+        // instance". The secret itself is minted below, once every refusal is answered.
+        let manage_master_user_password = input.manage_master_user_password == Some(true);
+        if manage_master_user_password && input.master_user_password.is_some() {
+            return Err(CreateDBInstanceError::invalid_parameter_combination(
+                crate::state::manage_master_user_password_conflict_message("MasterUserPassword"),
+            ));
+        }
+        if !manage_master_user_password && input.master_user_secret_kms_key_id.is_some() {
+            return Err(CreateDBInstanceError::invalid_parameter_combination(
+                crate::state::master_user_secret_kms_key_without_management_message(
+                    "ManageMasterUserPassword",
+                ),
+            ));
+        }
         // Resolved against the published catalogue here, before the store is touched. A
         // value it cannot resolve is NOT refused yet: an engine version the account MINTED
         // (a CEV) lives in this service's store rather than in that catalogue, and is a
@@ -688,6 +708,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the DIGESTS a login on the instance's own engine endpoint is verified
             // against. The username is stored as given.
             master_user_password: master_user_password_hash,
+            // The secret RDS manages for the master user password is minted once this
+            // scope has released the store's guard (`ManageMasterUserPassword` below), so
+            // a record built here carries none yet.
+            master_user_secret: None,
             master_username: input.master_username,
             endpoint_port,
             // Filled in below, once the core has assigned the engine listener its port.
@@ -786,6 +810,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record
         };
 
+        // The secret RDS manages for this instance's master user password, for a request
+        // that asked it to: generated, stored in Secrets Manager and reported as
+        // `MasterUserSecret` ([`crate::state::mint_master_user_secret`]). It is minted with
+        // the store's guard released — minting is a call to another service of this
+        // emulator — and after every refusal above has been answered, so a create that was
+        // going to fail mints no secret.
+        if manage_master_user_password {
+            let minted = crate::state::mint_master_user_secret(
+                ctx,
+                &region,
+                &crate::state::MasterSecretRequest {
+                    name: &crate::state::instance_master_user_secret_name(
+                        &record.dbi_resource_id,
+                    ),
+                    username: record.master_username.as_deref(),
+                    engine: &record.engine,
+                    kms_key_id: input.master_user_secret_kms_key_id.as_deref(),
+                },
+            )
+            .await
+            .map_err(CreateDBInstanceError::internal_failure)?;
+            // The generated password is the master user's, so a login on this instance's
+            // own engine endpoint is verified against it exactly as it is against a
+            // password the request carried: it is digested here, while both halves are in
+            // hand, and the password itself goes nowhere.
+            record.master_user_password = record.master_username.as_deref().map(|username| {
+                crate::state::data_plane::wire_session::MasterPasswordHash::new(
+                    username,
+                    &minted.password,
+                )
+            });
+            record.master_user_secret = Some(minted.secret);
+        }
         // The instance's own ENGINE ENDPOINT, opened with the state lock released:
         // binding is asynchronous and the core owns the socket, the bind interface and
         // the port. It is opened AFTER every refusal above has been answered — so nothing
@@ -815,10 +872,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .map(|endpoint| endpoint.endpoint.clone());
 
-        let mut store = state.lock();
         // Another request may have created this identifier while this one was binding, so
-        // the conflict is answered again here rather than overwriting a stored instance.
-        if store.db_instances.contains_key(&key) {
+        // the conflict is answered again here rather than overwriting a stored instance —
+        // and a secret minted for this instance is deleted rather than left behind, since
+        // the instance that would have reported it is not created.
+        let taken = {
+            let store = state.lock();
+            store.db_instances.contains_key(&key)
+        };
+        if taken {
+            if let Some(secret) = &record.master_user_secret {
+                crate::state::release_orphaned_master_user_secret(ctx, &region, &secret.secret_arn)
+                    .await;
+            }
             return Err(CreateDBInstanceErrorModeled::DBInstanceAlreadyExistsFault(
                 DBInstanceAlreadyExistsFault {
                     message: Some(crate::state::DB_INSTANCE_ALREADY_EXISTS_MESSAGE.to_string()),
@@ -826,6 +892,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        let mut store = state.lock();
 
         let db_instance = record.to_wire();
         let dbi_resource_id = record.dbi_resource_id.clone();

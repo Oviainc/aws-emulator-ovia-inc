@@ -32,6 +32,11 @@ pub struct DbInstanceRecord {
     /// [`data_plane::wire_session::MasterPasswordHash`]). `None` for an instance created
     /// without one, which no engine session can then authenticate against.
     pub master_user_password: Option<data_plane::wire_session::MasterPasswordHash>,
+    /// `MasterUserSecret`: the secret RDS manages for this instance's master user
+    /// password, for an instance created or modified with `ManageMasterUserPassword`
+    /// turned on; `None` for one whose password the caller supplied, which has no managed
+    /// secret to report.
+    pub master_user_secret: Option<ManagedMasterSecret>,
     pub endpoint_port: i32,
     /// Where the instance's own engine listener accepts connections, for the engines
     /// whose wire this emulator speaks: what the modelled `Endpoint` publishes, because
@@ -315,6 +320,13 @@ impl DbInstanceRecord {
             engine: Some(self.engine.clone()),
             db_instance_status: Some(self.status.clone()),
             master_username: self.master_username.clone(),
+            // `MasterUserSecret`: reported for an instance whose master user password RDS
+            // manages, and only for one — an instance whose password the caller supplied
+            // has no secret of RDS's own, which is what reporting nothing says.
+            master_user_secret: self
+                .master_user_secret
+                .as_ref()
+                .map(ManagedMasterSecret::to_wire),
             db_name: self.db_name.clone(),
             endpoint: Some(Endpoint {
                 address: Some(self.endpoint_address()),
