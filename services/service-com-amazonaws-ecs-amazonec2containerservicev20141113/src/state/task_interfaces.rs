@@ -291,6 +291,17 @@ impl AttachmentRecord {
         last_step
     }
 
+    /// Start this attachment's progression over from `now`, for a task Amazon ECS is only
+    /// now placing: nothing was attaching an interface for a task that had nowhere to run,
+    /// so the first step is owed one span from the placement rather than from the instant
+    /// the task was accepted. An attachment that is already in place, or whose progression
+    /// an agent has ended, is left alone.
+    pub fn begin_attaching(&mut self, now: SystemTime) {
+        if self.next_status_due_at.is_some() {
+            self.next_status_due_at = Some(now + INTERFACE_STEP_SPAN);
+        }
+    }
+
     /// The private IPv4 address this attachment reports, or `None` while the interface has
     /// not been attached yet — read off the stored details rather than recomputed, so it is
     /// the value a caller of `DescribeTasks` sees.

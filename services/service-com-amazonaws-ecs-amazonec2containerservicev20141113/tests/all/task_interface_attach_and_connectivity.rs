@@ -39,8 +39,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    awsvpc_network_configuration, cluster_with_capacity, list, ok, register_capacity, service,
-    string, AWSVPC_START,
+    awsvpc_network_configuration, cluster_with_capacity, create_cluster, list, ok,
+    register_capacity, service, string, AWSVPC_START,
 };
 use crate::task_lifecycle::container;
 
@@ -57,6 +57,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How long a poll keeps trying before it gives up: the whole start of an `awsvpc` task
 /// ([`AWSVPC_START`]) and one more second of margin.
 const POLL_BUDGET: Duration = AWSVPC_START.saturating_add(Duration::from_secs(1));
+
+/// Long enough that the FIRST step of an interface's progression would have fallen due
+/// (`state::INTERFACE_STEP_SPAN`), with margin for a loaded test machine — what a task
+/// nothing is attaching an interface for is read after.
+const PAST_THE_FIRST_ATTACH_STEP: Duration =
+    service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::INTERFACE_STEP_SPAN
+        .saturating_add(Duration::from_millis(600));
 
 /// The statuses the interface of a task that is coming up passes through, in order — three
 /// of the values `Attachment$status` lists.
@@ -507,4 +514,114 @@ async fn an_agent_report_moves_the_interface_and_amazon_ecs_carries_on_from_ther
             "case {case:?}: connectivity follows the interface the task holds, got {settled}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_task_that_is_not_placed_yet_is_given_no_interface_and_is_on_no_network() {
+    // A task whose capacity its provider still has to ACQUIRE has not been placed anywhere
+    // ("PROVISIONING: Amazon ECS has to perform additional steps before the task is
+    // launched"), so nothing is creating or attaching an interface for it and it is on no
+    // network — however long it waits. The attach begins when the placement does: the
+    // capacity registering is what starts it, and from there the task passes through the
+    // documented statuses like any other.
+    let case = "a task parked on an empty managed-scaling provider";
+    let router = service();
+    create_cluster(&router, CLUSTER, case).await;
+    register(&router, "parkediface", "awsvpc", case).await;
+    ok(
+        &router,
+        "CreateCapacityProvider",
+        json!({
+            "name": "parkedscaled",
+            "autoScalingGroupProvider": {
+                "autoScalingGroupArn": "asg-parkedscaled",
+                "managedScaling": { "status": "ENABLED", "targetCapacity": 100 },
+            },
+        }),
+        case,
+    )
+    .await;
+    ok(
+        &router,
+        "PutClusterCapacityProviders",
+        json!({
+            "cluster": CLUSTER,
+            "capacityProviders": ["parkedscaled"],
+            "defaultCapacityProviderStrategy": [],
+        }),
+        case,
+    )
+    .await;
+    let body = ok(
+        &router,
+        "RunTask",
+        json!({
+            "cluster": CLUSTER,
+            "taskDefinition": "parkediface",
+            "capacityProviderStrategy": [{ "capacityProvider": "parkedscaled", "weight": 1 }],
+            "networkConfiguration": awsvpc_network_configuration(),
+        }),
+        case,
+    )
+    .await;
+    let task_arn = string(&list(&body, "tasks", case)[0], "taskArn", case);
+
+    // Time alone attaches nothing: the first step of an attach would have been due long
+    // before now, and the interface is still the one Amazon ECS created, with the task on no
+    // network.
+    tokio::time::sleep(PAST_THE_FIRST_ATTACH_STEP).await;
+    let parked = describe(&router, &task_arn, case).await;
+    assert_eq!(
+        (
+            parked["lastStatus"].as_str(),
+            only_attachment(&parked, case)["status"].as_str(),
+            parked["connectivity"].as_str(),
+            parked["connectivityAt"].as_f64(),
+        ),
+        (
+            Some(TASK_STATUSES[0]),
+            Some(ATTACH_STATUSES[0]),
+            None,
+            None
+        ),
+        "case {case:?}: expected a parked task to hold the interface Amazon ECS created and \
+         to be on no network, got {parked}"
+    );
+
+    // The capacity arrives, and from there the attach runs: the interface reaches ATTACHED,
+    // the task is CONNECTED, and only then does it run.
+    register_capacity(&router, CLUSTER, case).await;
+    let mut attach_seen: Vec<String> = Vec::new();
+    // The placement itself is owed a span before the attach even begins, so this poll waits
+    // out one more span than a launch onto capacity that already exists.
+    let deadline = Instant::now() + POLL_BUDGET + AWSVPC_START;
+    loop {
+        let task = describe(&router, &task_arn, case).await;
+        let attachment = only_attachment(&task, case);
+        observe(&mut attach_seen, &string(&attachment, "status", case));
+        if string(&task, "lastStatus", case) == "RUNNING" {
+            assert_eq!(
+                (
+                    attachment["status"].as_str(),
+                    task["connectivity"].as_str()
+                ),
+                (Some("ATTACHED"), Some(CONNECTED)),
+                "case {case:?}: a task that ran once its capacity arrived holds an attached \
+                 interface and is CONNECTED, got {task}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the registered capacity to place and start the task; \
+             observed {attach_seen:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    assert_eq!(
+        attach_seen,
+        ATTACH_STATUSES.map(String::from).to_vec(),
+        "case {case:?}: expected the attach to begin with the placement and pass through \
+         every documented status, observed {attach_seen:?}"
+    );
 }

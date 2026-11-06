@@ -3439,6 +3439,20 @@ impl TaskRecord {
         self.last_status != STATUS_STOPPED
     }
 
+    /// Whether this task is one Amazon ECS has accepted but not PLACED: its capacity
+    /// provider still has to acquire the capacity to place it on, so nothing is owed on it
+    /// at all ([`awaits_provisioned_capacity`]).
+    ///
+    /// Read off what the clock owes rather than off a flag: a task that has been placed is
+    /// owed either its `PENDING` ([`Self::pending_due_at`]) or its start
+    /// ([`Self::running_due_at`]), and one that has already reached a later status is past
+    /// the question.
+    pub fn is_awaiting_placement(&self) -> bool {
+        self.last_status == STATUS_PROVISIONING
+            && self.pending_due_at.is_none()
+            && self.running_due_at.is_none()
+    }
+
     /// Whether this task is one the `PENDING` task counts count: Amazon ECS has accepted
     /// it and is still bringing it up, so it has not started.
     ///

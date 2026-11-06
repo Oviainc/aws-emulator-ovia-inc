@@ -29,8 +29,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // whether or not anybody called to look. A task whose interface has just been
             // attached is on the network from that instant
             // ([`TaskRecord::report_connected`]).
+            //
+            // Only a task that has been PLACED is being given its interface: a task whose
+            // capacity a provider still has to acquire has not been placed anywhere
+            // ([`TaskRecord::is_awaiting_placement`]), so nothing is attaching an interface
+            // for it and it is on no network — the attach begins when the placement does
+            // ([`Self::place_tasks_awaiting_capacity`]).
             let mut attached_at = None;
-            if task.desired_status == STATUS_RUNNING {
+            if task.desired_status == STATUS_RUNNING && !task.is_awaiting_placement() {
                 for attachment in &mut task.attachments {
                     if let Some(at) = attachment.advance_interface(now) {
                         attached_at =
@@ -1555,23 +1561,26 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     ///
     /// The transition falls due [`TRANSITION_SPAN`] from `now` and
     /// [`Self::advance_clock`] materialises it, so nothing here moves a status that is not
-    /// owed yet — and a task that cannot be launched before the interface it was allocated
-    /// is in place waits for that too ([`AttachmentRecord::attached_due_at`]), whichever
-    /// of the two is later. A task the caller has already asked to stop is not placed: its
+    /// owed yet. A task that cannot be launched before the interface it was allocated is in
+    /// place waits for that too: the attach of such an interface BEGINS with the placement
+    /// — nothing was attaching one while the task had nowhere to run
+    /// ([`AttachmentRecord::begin_attaching`]) — so the placement falls due at the later of
+    /// the two instants. A task the caller has already asked to stop is not placed: its
     /// placement was cancelled, not merely overtaken.
     pub fn place_tasks_awaiting_capacity(&mut self, cluster_name: &str, now: SystemTime) {
         for task in self.tasks.values_mut() {
             if task.cluster_name == cluster_name
-                && task.last_status == STATUS_PROVISIONING
                 && task.desired_status == STATUS_RUNNING
-                && task.pending_due_at.is_none()
+                && task.is_awaiting_placement()
             {
                 let placed_at = now + TRANSITION_SPAN;
-                let attached_at = task
-                    .attachments
-                    .iter()
-                    .filter_map(AttachmentRecord::attached_due_at)
-                    .max();
+                let mut attached_at: Option<SystemTime> = None;
+                for attachment in &mut task.attachments {
+                    attachment.begin_attaching(now);
+                    if let Some(at) = attachment.attached_due_at() {
+                        attached_at = Some(attached_at.map_or(at, |seen: SystemTime| seen.max(at)));
+                    }
+                }
                 task.pending_due_at = Some(attached_at.unwrap_or(placed_at).max(placed_at));
             }
         }
