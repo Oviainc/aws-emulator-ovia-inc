@@ -501,9 +501,11 @@ async fn a_second_create_of_one_triple_is_a_conflict() {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        assert!(
-            message.contains(name) && message.contains("default") && message.contains(&instance_id),
-            "case {case}: the refusal must name the dataset it refused, got {message:?}"
+        assert_eq!(
+            message,
+            format!("Dataset {name} already exist in namespace default"),
+            "case {case}: the refusal must carry the service's conflict sentence for this \
+             dataset and namespace, got {message:?}"
         );
 
         let (status, body) = emulator.get_dataset(&instance_id, "default", name).await;

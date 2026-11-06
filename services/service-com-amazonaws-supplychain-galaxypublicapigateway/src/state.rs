@@ -357,6 +357,31 @@ pub fn is_predefined_namespace(namespace: &str) -> bool {
     PREDEFINED_NAMESPACES.contains(&namespace)
 }
 
+/// How a dataset operation refuses a dataset this instance's data lake does not hold
+/// (`ResourceNotFoundException`, HTTP 404).
+///
+/// Its SOURCE is the recorded wire response of such a read. The FIXED text is
+/// "Dataset " and " not exist in namespace " — the service capitalises the resource noun
+/// and writes the uninflected "not exist", not "does not exist" — and the only
+/// interpolated parts are the dataset name and the namespace name, the two `@httpLabel`
+/// members of the dataset URI. The `instanceId`, though part of the resource identity, is
+/// NOT part of the sentence. Stated once, here, so the dataset operations cannot drift
+/// into several sentences for one refusal.
+pub fn dataset_not_found_message(name: &str, namespace: &str) -> String {
+    format!("Dataset {name} not exist in namespace {namespace}")
+}
+
+/// How a dataset create refuses a `(instanceId, namespace, name)` triple the data lake
+/// already holds (`ConflictException`, HTTP 409).
+///
+/// Its SOURCE is the recorded refusal of a second create for a triple that already holds
+/// a dataset: the same shape as [`dataset_not_found_message`] — the capitalised resource
+/// noun, the dataset name and its namespace from the request, nothing after the namespace
+/// and no instance id — with the service's "already exist" in place of "not exist".
+pub fn dataset_conflict_message(name: &str, namespace: &str) -> String {
+    format!("Dataset {name} already exist in namespace {namespace}")
+}
+
 /// The number of datasets one instance holds, across all of its namespaces.
 ///
 /// Same reasoning as [`MAX_INSTANCES`]: the store keeps its records for the life of the

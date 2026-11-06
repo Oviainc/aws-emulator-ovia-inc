@@ -249,9 +249,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a repeat creates again.)
         if store.datasets.contains_key(&key) {
             return Err(CreateDataLakeDatasetErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "dataset {} already exists in namespace {} of instance {}",
-                    input.name, input.namespace, input.instance_id
+                message: Some(crate::state::dataset_conflict_message(
+                    &input.name,
+                    &input.namespace,
                 )),
             })
             .into());

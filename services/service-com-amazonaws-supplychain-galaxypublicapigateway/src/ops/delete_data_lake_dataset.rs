@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDataLakeDataset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDataLakeDataset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation removes the dataset its URI addresses from the shared
+//! store ([`crate::state`]) and answers with the triple it removed, so a dataset a
+//! caller deleted is no longer readable through `GetDataLakeDataset`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDataLakeDataset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The triple names the resource, so a delete for a triple the store does not hold —
+//! including a repeat of a delete that already succeeded — is the modelled
+//! `ResourceNotFoundException` (HTTP 404): the `@idempotent` trait comes from the
+//! `delete` lifecycle binding Smithy requires it on, not from a promise that a repeat
+//! succeeds.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +164,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDataLakeDataset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDataLakeDatasetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDataLakeDataset"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteDataLakeDatasetErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the supplychain instance store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // ONE lock for the whole take-then-answer, so concurrent deletes of the same
+        // triple serialize: exactly one of them removes the record, and every other one
+        // finds nothing and is refused as a not-found.
+        let mut store = state.lock();
+        // The transition the clock owed at `now`, which was due whether or not anybody
+        // called this operation.
+        store.materialize_due_transitions(now);
+
+        let key = crate::state::dataset_key(&input.instance_id, &input.namespace, &input.name);
+        if store.datasets.remove(&key).is_none() {
+            return Err(DeleteDataLakeDatasetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::dataset_not_found_message(
+                        &input.name,
+                        &input.namespace,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The response names the dataset this call removed, from the triple that
+        // addressed it.
+        Ok(DeleteDataLakeDatasetOutput {
+            instance_id: input.instance_id,
+            namespace: input.namespace,
+            name: input.name,
+        })
     }
 }

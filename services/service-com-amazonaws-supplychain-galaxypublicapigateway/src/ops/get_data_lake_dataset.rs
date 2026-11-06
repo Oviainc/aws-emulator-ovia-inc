@@ -177,9 +177,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             None => Err(GetDataLakeDatasetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "dataset {} does not exist in namespace {} of instance {}",
-                        input.name, input.namespace, input.instance_id
+                    message: Some(crate::state::dataset_not_found_message(
+                        &input.name,
+                        &input.namespace,
                     )),
                 },
             )
