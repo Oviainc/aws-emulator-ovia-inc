@@ -150,6 +150,10 @@ fn model_id_of(model_arn: &str) -> String {
 
 /// The `inferenceProfileArn`s `ListInferenceProfiles` reports in `region` for the profiles
 /// Amazon Bedrock publishes there — what a router's target must be one of.
+///
+/// The base `modelId` behind one of those ARNs is read with `crate::support`'s
+/// [`profile_model_id`], which this suite and `tests/all/default_prompt_routers.rs` share,
+/// so the two cannot drift on how a published profile names its model.
 async fn published_profile_arns(emu: &Emulator, region: &str) -> Vec<String> {
     let listed = list_profiles(emu, region, &format!("type={SYSTEM_DEFINED}")).await;
     assert_eq!(
@@ -162,10 +166,6 @@ async fn published_profile_arns(emu: &Emulator, region: &str) -> Vec<String> {
         .map(|row| text(row, "inferenceProfileArn"))
         .collect()
 }
-
-// The base `modelId` a published `inference-profile` ARN routes to lives in
-// `crate::support` (`profile_model_id`), so both published-catalogue suites read a profile
-// ARN the same way.
 
 /// The summaries a listing reported.
 fn rows(reply: &Reply, member: &str) -> Vec<Value> {

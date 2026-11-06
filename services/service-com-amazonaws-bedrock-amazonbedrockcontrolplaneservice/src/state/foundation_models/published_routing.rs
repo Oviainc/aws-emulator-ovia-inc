@@ -40,12 +40,14 @@ pub struct DefaultPromptRouter {
     pub label: &'static str,
     /// The `modelId`s the router routes between, in the order the summary reports them —
     /// the smaller model first, because the criteria are what sends a prompt UP to the
-    /// larger one. The set AWS publishes for the router, which is a line's smaller model
-    /// and the stronger model a prompt is routed up to; the stronger one is the fallback,
-    /// and its published family ([`FoundationModel::model_family`]) is the line the
-    /// router's description names. Every id is a row of [`FOUNDATION_MODELS`] that also
-    /// carries a cross-region profile ([`CROSS_REGION_MODELS`]), because that profile is
-    /// what a target is reported as.
+    /// larger one. The set AWS publishes for the router; the last of them is the fallback,
+    /// the strongest model a prompt is routed up to, and ITS published family
+    /// ([`FoundationModel::model_family`]) is the line the router's description names — the
+    /// line a caller gets when the criteria are not met. The two need not share a family:
+    /// AWS publishes a router across two generations of a provider's line as readily as
+    /// within one. Every id is a row of [`FOUNDATION_MODELS`] that also carries a
+    /// cross-region profile ([`CROSS_REGION_MODELS`]), because that profile is what a
+    /// target is reported as.
     pub models: &'static [&'static str],
     /// The `modelId` of the model the router falls back to when the criteria are not met;
     /// one of [`DefaultPromptRouter::models`].
@@ -56,10 +58,11 @@ pub struct DefaultPromptRouter {
 /// their ARNs sort in, which is the order a listing pages through.
 ///
 /// The ids, brands and model sets are the ones AWS publishes in "Intelligent prompt
-/// routing": one router per model family, routing between a smaller model of that family
-/// and the stronger model it falls back to. The model ids are the rows
-/// [`FOUNDATION_MODELS`] carries for those families, so the two catalogs agree about which
-/// models exist.
+/// routing": one router per provider line, routing a prompt from a smaller model to the
+/// stronger model it falls back to — which AWS publishes ACROSS two generations of a line
+/// as readily as within one, so a row's two models need not share a `modelFamily`. The
+/// model ids are the rows [`FOUNDATION_MODELS`] carries, so the two catalogs agree about
+/// which models exist.
 pub const DEFAULT_PROMPT_ROUTERS: &[DefaultPromptRouter] = &[
     DefaultPromptRouter {
         id: "amazon.nova:1",
@@ -98,8 +101,8 @@ pub fn default_prompt_router_name(router: &DefaultPromptRouter) -> String {
     format!("{} Prompt Router", router.label)
 }
 
-/// The `description` a published router reports: the model FAMILY it routes a prompt
-/// within.
+/// The `description` a published router reports: the published family of the model it
+/// routes a prompt UP to.
 ///
 /// `PromptRouterDescription` is modelled (len 1..200, `^([0-9a-zA-Z:.][ _-]?)+$`) and a
 /// published router carries one, so it is stated for every row by ONE rule rather than
