@@ -17,10 +17,11 @@
 //! the page size the filtered list is walked at.
 //!
 //! The refusals belong to the same rule: both ends of the association are resolved
-//! against real state (an absent group or device is a 404), the membership is
-//! single-valued (a second group for the same device is a 409), and asking for a
-//! membership that already holds is the same success again, counted once. A refused call
-//! persists nothing.
+//! against real state (an absent group or device is a 404 whose `ResourceType`/
+//! `ResourceId` say WHICH end could not be resolved), the membership is single-valued (a
+//! second group for the same device is a 409 naming the device and the group it is
+//! already in), and asking for a membership that already holds is the same success
+//! again, counted once. A refused call persists nothing.
 //!
 //! The wire harness is the one the sibling destination/device suite already has:
 //! `tests/all/*.rs` are modules of ONE test target, so `router`, `call` and
@@ -439,6 +440,29 @@ async fn a_device_already_in_a_group_cannot_join_a_second_one() {
             "ConflictException",
             "case {case:?}: expected ConflictException, got {answered}"
         );
+        // The refusal says WHICH resource is in the inconsistent state (the device whose
+        // membership is already taken) and names the group it is already in, both taken
+        // from the request and the store rather than fixed in the body.
+        assert_eq!(
+            answered["ResourceType"].as_str(),
+            Some("WirelessDevice"),
+            "case {case:?}: expected ResourceType WirelessDevice, got {answered}"
+        );
+        assert_eq!(
+            answered["ResourceId"].as_str(),
+            Some(device_id.as_str()),
+            "case {case:?}: expected ResourceId {device_id}, got {answered}"
+        );
+        let message = answered["Message"].as_str().unwrap_or_default();
+        assert_eq!(
+            message,
+            format!(
+                "Wireless device {device_id} is already associated with multicast group \
+                 {first}"
+            ),
+            "case {case:?}: the whole message must be the template filled from the request \
+             and the store, got {message:?}"
+        );
 
         // The refusal changed nothing: the device is still in the first group and in no
         // other, and only the first group counts it.
@@ -476,41 +500,48 @@ async fn an_absent_group_or_device_is_not_found() {
     )
     .await;
 
-    // (case, the group the call names, the device it names)
-    let cases: Vec<(&str, String, String)> = vec![
+    // (case, the group the call names, the device it names, the end that is missing — the
+    // group is resolved first, so a call naming neither reports the group).
+    let cases: Vec<(&str, String, String, &str)> = vec![
         (
             "absent group, real device",
             "00000000-0000-4000-8000-000000000000".to_string(),
             device_id.clone(),
+            "MulticastGroup",
         ),
         (
             "group id in the wrong case",
             group_id.to_uppercase(),
             device_id.clone(),
+            "MulticastGroup",
         ),
         (
             "real group, absent device",
             group_id.clone(),
             "11111111-1111-4111-8111-111111111111".to_string(),
+            "WirelessDevice",
         ),
         (
             "real group, device id in the wrong case",
             group_id.clone(),
             device_id.to_uppercase(),
+            "WirelessDevice",
         ),
         (
             "real group, device id that is not a uuid",
             group_id.clone(),
             "not-a-device".to_string(),
+            "WirelessDevice",
         ),
         (
             "neither end exists",
             "mc-nope".to_string(),
             "wd-nope".to_string(),
+            "MulticastGroup",
         ),
     ];
 
-    for (case, group, device) in cases {
+    for (case, group, device, missing) in cases {
         let (status, answered) = associate(&router, &group, &device).await;
         assert_eq!(
             status,
@@ -521,6 +552,35 @@ async fn an_absent_group_or_device_is_not_found() {
             error_code(&answered),
             "ResourceNotFoundException",
             "case {case:?}: expected ResourceNotFoundException, got {answered}"
+        );
+        // The refusal says WHICH end of the association could not be resolved, and names
+        // the id the request supplied for it.
+        assert_eq!(
+            answered["ResourceType"].as_str(),
+            Some(missing),
+            "case {case:?}: expected ResourceType {missing}, got {answered}"
+        );
+        let missing_id = if missing == "MulticastGroup" {
+            group.as_str()
+        } else {
+            device.as_str()
+        };
+        assert_eq!(
+            answered["ResourceId"].as_str(),
+            Some(missing_id),
+            "case {case:?}: expected ResourceId {missing_id}, got {answered}"
+        );
+        // The whole message is the template for the end that could not be resolved,
+        // filled with the id the request supplied, so a reworded prefix fails too.
+        let expected_message = if missing == "MulticastGroup" {
+            format!("MulticastGroup {missing_id} not found")
+        } else {
+            format!("No wireless device with WirelessDeviceId {missing_id}")
+        };
+        assert_eq!(
+            answered["Message"].as_str(),
+            Some(expected_message.as_str()),
+            "case {case:?}: expected the {missing} not-found message, got {answered}"
         );
         assert_eq!(
             group_counts(&router, &group_id).await,
