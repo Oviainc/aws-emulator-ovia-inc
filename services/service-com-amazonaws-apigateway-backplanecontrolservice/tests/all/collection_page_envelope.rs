@@ -100,6 +100,20 @@ async fn stand_up(gateway: &Gateway, collection: &str, count: usize) -> Listing 
         }
         "GetModels" => {
             let (api, _root) = create_api(gateway, "envelope-models").await;
+            // A REST API is CREATED holding the models API Gateway seeds it with, so the
+            // collection is emptied first: this suite is about the page envelope, and a
+            // row that asks for `count` elements has to get a collection of exactly that
+            // many — including the empty one.
+            for name in crate::models::default_model_names() {
+                let answer = gateway
+                    .call("DELETE", &format!("/restapis/{api}/models/{name}"), None)
+                    .await;
+                assert_eq!(
+                    answer.status, 202,
+                    "case DeleteModel({name}): expected 202, got {} with {:?}",
+                    answer.status, answer.body
+                );
+            }
             let mut cursors = Vec::new();
             for index in 0..count {
                 let case = format!("CreateModel(#{index})");

@@ -563,11 +563,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // API created from a request.
             stages: BTreeMap::new(),
             deployments: BTreeMap::new(),
-            // Nor with a documentation part, a documentation version, an authorizer, a
-            // request validator or a model: each is written by the operation that owns
-            // it. An imported definition's schemas are left to the issue that owns
-            // importing them. The gateway responses the definition customizes ARE
-            // imported, by `materialise_definition` below.
+            // Nor with a documentation part, a documentation version, an authorizer or a
+            // request validator: each is written by the operation that owns it. An
+            // imported definition's schemas are left to the issue that owns importing
+            // them. The gateway responses the definition customizes ARE imported, by
+            // `materialise_definition` below, and the models every created API already
+            // holds are seeded after it.
             gateway_responses: BTreeMap::new(),
             documentation_parts: BTreeMap::new(),
             documentation_versions: BTreeMap::new(),
@@ -588,6 +589,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &sequences,
         )
         .map_err(|_| crate::state::state_unavailable())?;
+
+        // An imported API is an API Gateway REST API like any other, so it is created
+        // with the same two default models — seeded after the definition has been
+        // materialised, so a name the definition itself declared stands.
+        crate::state::default_models::seed(&mut entry, &mut store);
 
         store.rest_apis.insert(id.clone(), entry);
         let stored = store

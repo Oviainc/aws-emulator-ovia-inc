@@ -7,7 +7,9 @@
 //! `apiKeySource`, `endpointConfiguration` (its endpoint types and its IP address type)
 //! and `securityPolicy` — are defaulted into that record, so the create answer and
 //! every later read of the API report the same values; see `crate::state`'s
-//! `DEFAULT_*` constants and `defaulted_endpoint_configuration`.
+//! `DEFAULT_*` constants and `defaulted_endpoint_configuration`. The API is also created
+//! with the two default models every API Gateway REST API holds, see
+//! `crate::state::default_models`.
 //!
 //! ## Shape of an operation
 //!
@@ -551,8 +553,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nor with any request validator: `CreateRequestValidator` is what adds one,
             // and a clone copies the source's resource tree only.
             request_validators: BTreeMap::new(),
-            // Nor with any model: `CreateModel` is what adds one, and a clone copies the
-            // source's resource tree only.
+            // The models API Gateway creates every API with are seeded below, once the
+            // store is held again: minting an id and a creation rank for each takes the
+            // store, and nothing a caller sent decides them.
             models: BTreeMap::new(),
             sequence,
         };
@@ -605,6 +608,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // Every API API Gateway creates already holds its two default models, so they are
+        // stored on the record BEFORE it is inserted: no read can see an API without them.
+        crate::state::default_models::seed(&mut entry, &mut store);
         store.rest_apis.insert(id.clone(), entry);
         let stored = store
             .rest_apis

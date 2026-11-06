@@ -883,6 +883,10 @@ mod opensearch_vpc_endpoint_vpc_membership;
 // landing router suite adds its line to.
 #[path = "all/apigatewayv2_vpc_link_subnets_resolve_in_ec2.rs"]
 mod apigatewayv2_vpc_link_subnets_resolve_in_ec2;
+// Declared here, in this quiet span, for the reason the entry above gives: the IAM role an
+// API Gateway account may write its logs under.
+#[path = "all/apigateway_account_cloudwatch_role.rs"]
+mod apigateway_account_cloudwatch_role;
 #[path = "all/zz_probe_whole_emulator.rs"]
 mod zz_probe_whole_emulator;
 #[path = "all/cloudformation_provisions_cognito_identity_pools.rs"]

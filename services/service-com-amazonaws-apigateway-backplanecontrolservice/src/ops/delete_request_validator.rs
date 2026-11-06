@@ -3,7 +3,9 @@
 //! @op DeleteRequestValidator
 //! IMPLEMENTED: removes the `RequestValidator` stored under `requestValidatorId` on the
 //! API named by `restApiId`, so a later `GetRequestValidator` for that id no longer finds
-//! one and `GetRequestValidators` no longer lists it.
+//! one and `GetRequestValidators` no longer lists it. A validator a `Method` of the same
+//! API still names in its `requestValidatorId` is REFERENCED, and the delete is refused
+//! with the modelled `ConflictException` while that reference stands.
 //!
 //! ## Shape of an operation
 //!
@@ -179,20 +181,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Removing the record under the id `CreateRequestValidator` minted is what makes a
         // later read answer `NotFoundException` — including a second delete of the same
         // id, which names no validator once the first one has taken it away.
-        //
-        // A `Method` naming this validator in its `requestValidatorId` is left as the
-        // caller wrote it: nothing documents this call as rewriting the methods of the
-        // API, and `PutMethod` does not require the `requestValidatorId` it stores to
-        // resolve, so the modelled `ConflictException` has no documented rule to answer
-        // for here.
-        if api.request_validators.remove(&input.request_validator_id).is_none() {
-            return Err(DeleteRequestValidatorErrorModeled::NotFoundException(
-                NotFoundException {
+        let validator_name = api
+            .request_validators
+            .get(&input.request_validator_id)
+            .ok_or_else(|| {
+                DeleteRequestValidatorErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::NO_SUCH_REQUEST_VALIDATOR.to_string()),
+                })
+            })?
+            .name
+            .clone();
+        // A `Method` of this API that still names the validator in its
+        // `requestValidatorId` is a REFERENCE to it, and a reference is what blocks the
+        // delete: taking the validator away would leave that method pointing at a record
+        // that no longer exists, which is the state the modelled `ConflictException`
+        // keeps out. The refusal names the validator and the referencing method, so a
+        // caller is told which method has to be updated first; clearing the reference is
+        // what frees the delete.
+        if let Some(referencing) =
+            api.method_referencing_request_validator(&input.request_validator_id)
+        {
+            return Err(DeleteRequestValidatorErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::request_validator_in_use(
+                        validator_name.as_deref(),
+                        &referencing,
+                    )),
                 },
             )
             .into());
         }
+        api.request_validators.remove(&input.request_validator_id);
         // The store lock is released before the access record is written: the critical
         // section covers the state change only.
         drop(store);

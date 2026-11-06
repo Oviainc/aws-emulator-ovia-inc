@@ -10,21 +10,22 @@
 //!
 //! The cases assert RULES over SETS of inputs rather than one recorded call: that the
 //! report is exactly the models stored under the named API, in CREATION order (over a
-//! table of collection sizes from empty to past the default page size, each spanning the
-//! content-type families and optional members a model can carry, and named so that
-//! creation order is the REVERSE of name order); that each listed item is member for
-//! member what `GetModel` reports for the same model; that `limit`/`position` walk that
-//! sequence exactly once for every page size, including sizes outside the published
-//! window; that a model is reported only through the API that holds it; that an
-//! unresolvable cursor and an unknown API are refused; and that listing changes nothing a
-//! later caller sees.
+//! table of collection sizes from none created at all to past the default page size, each
+//! spanning the content-type families and optional members a model can carry, and named so
+//! that creation order is the REVERSE of name order); that an API's listing opens with the
+//! models it was CREATED with, which precede anything a caller created; that each listed
+//! item is member for member what `GetModel` reports for the same model; that
+//! `limit`/`position` walk that sequence exactly once for every page size, including sizes
+//! outside the published window; that a model is reported only through the API that holds
+//! it; that an unresolvable cursor and an unknown API are refused; and that listing changes
+//! nothing a later caller sees.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
     DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT,
 };
 
-use crate::models::{created_model, get_model};
+use crate::models::{created_model, default_model_names, get_model};
 use crate::rest_api_lifecycle::{
     assert_failure, create_api, page_items, string_member, Answer, Gateway,
 };
@@ -99,11 +100,14 @@ fn model_of_each_shape(index: usize) -> Value {
     request
 }
 
-/// Create `count` models on a fresh API, answering the API id and the model names in the
-/// order they were created.
+/// Create `count` models on a fresh API, answering the API id and the names of EVERY model
+/// the API then holds, in the order they were created.
+///
+/// A created API already holds the models API Gateway seeds it with, and those were created
+/// with the API, so they lead the sequence a listing reports.
 async fn api_with_models(gateway: &Gateway, name: &str, count: usize) -> (String, Vec<String>) {
     let (api, _root) = create_api(gateway, name).await;
-    let mut names: Vec<String> = Vec::new();
+    let mut names: Vec<String> = default_model_names();
     for index in 0..count {
         let case = format!("{name}: CreateModel(#{index})");
         let created = created_model(gateway, &api, &case, model_of_each_shape(index)).await;
@@ -264,20 +268,31 @@ async fn a_model_is_reported_only_through_the_api_that_holds_it() {
     }
 
     // Two APIs may each hold a model of ONE name, and each listing reports its own
-    // record: the id and the content type the model was created with under that API.
+    // record: the id and the content type the model was created with under that API. The
+    // name is one the first API's CALLER created, so the collision is between two created
+    // records rather than between a create and a seeded default.
+    let shared_name = first_names[default_model_names().len()].clone();
     let (third, _root) = create_api(&gateway, "model-listing-shared-name").await;
     let shared = created_model(
         &gateway,
         &third,
         "the third API's model of a name the first API also holds",
-        json!({ "name": first_names[0].clone(), "contentType": "text/plain" }),
+        json!({ "name": shared_name.clone(), "contentType": "text/plain" }),
     )
     .await;
     let (items, _) = listed_models(&gateway, &third, "limit=500", "the third API").await;
+    let listed: Vec<String> = items
+        .iter()
+        .map(|item| string_member(item, "name", "the third API"))
+        .collect();
     assert_eq!(
-        items,
-        vec![shared.clone()],
-        "case the third API: expected only its own model {shared:?}, got {items:?}"
+        listed,
+        crate::models::with_default_models(std::slice::from_ref(&shared_name)),
+        "case the third API: expected its own models only, got {listed:?}"
+    );
+    assert!(
+        items.contains(&shared),
+        "case the third API: expected its own record {shared:?} in {items:?}"
     );
     let (first_items, _) = listed_models(
         &gateway,
@@ -286,8 +301,12 @@ async fn a_model_is_reported_only_through_the_api_that_holds_it() {
         "the first API after the shared name",
     )
     .await;
+    let held_here = first_items
+        .iter()
+        .find(|item| string_member(item, "name", "the first API's model") == shared_name)
+        .unwrap_or_else(|| panic!("case the shared name: the first API still holds {shared_name}"));
     assert_ne!(
-        string_member(&first_items[0], "id", "the first API's model"),
+        string_member(held_here, "id", "the first API's model"),
         string_member(&shared, "id", "the third API's model"),
         "case the shared name: expected each API's model to carry its own id"
     );
@@ -395,12 +414,17 @@ async fn a_position_naming_nothing_in_this_apis_sequence_is_refused() {
         );
     }
 
-    // The refused cursors took nothing away: the other API still reports its own record.
+    // The refused cursors took nothing away: the other API still reports its own records —
+    // the one its caller created, beside the defaults it was created with.
     let (items, _) = listed_models(&gateway, &other, "limit=500", "the other API").await;
+    let listed: Vec<String> = items
+        .iter()
+        .map(|item| string_member(item, "name", "the other API"))
+        .collect();
     assert_eq!(
-        items.len(),
-        1,
-        "case the other API: expected 1 model, got {items:?}"
+        listed,
+        crate::models::with_default_models(&[elsewhere]),
+        "case the other API: expected its own models, got {listed:?}"
     );
 }
 

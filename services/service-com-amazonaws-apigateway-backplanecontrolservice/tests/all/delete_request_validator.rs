@@ -35,7 +35,10 @@ use crate::rest_api_lifecycle::{
 };
 
 /// `DeleteRequestValidator` for `validator` of `api`.
-async fn delete_validator(gateway: &Gateway, api: &str, validator: &str) -> Answer {
+///
+/// `pub(crate)` so the sibling `request_validator_in_use` suite drives the delete through
+/// the same wire helper rather than keeping its own copy of the URI.
+pub(crate) async fn delete_validator(gateway: &Gateway, api: &str, validator: &str) -> Answer {
     gateway
         .call(
             "DELETE",
@@ -46,7 +49,9 @@ async fn delete_validator(gateway: &Gateway, api: &str, validator: &str) -> Answ
 }
 
 /// `DeleteRequestValidator`, asserting the modelled 202 and an empty body.
-async fn deleted_validator(gateway: &Gateway, api: &str, validator: &str, case: &str) {
+///
+/// `pub(crate)` for the reason [`delete_validator`] is.
+pub(crate) async fn deleted_validator(gateway: &Gateway, api: &str, validator: &str, case: &str) {
     let answer = delete_validator(gateway, api, validator).await;
     assert_eq!(
         answer.status, 202,

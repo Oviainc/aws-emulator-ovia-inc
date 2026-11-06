@@ -420,6 +420,24 @@ impl RestApiEntry {
         self.referencing_method(|method| method.authorizer_id.as_deref() == Some(authorizer_id))
     }
 
+    /// The method of this API that names `request_validator_id` in its
+    /// `requestValidatorId`, or `None` when none does.
+    ///
+    /// A method names the validator its requests are validated by in
+    /// `Method$requestValidatorId`, so a method carrying that identifier is a reference to
+    /// the validator — the same kind of reference
+    /// [`Self::method_referencing_authorizer`] finds, through the same walk, so every
+    /// operation that has to know whether a validator is referenced reads the same
+    /// records.
+    pub fn method_referencing_request_validator(
+        &self,
+        request_validator_id: &str,
+    ) -> Option<MethodReference> {
+        self.referencing_method(|method| {
+            method.request_validator_id.as_deref() == Some(request_validator_id)
+        })
+    }
+
     /// The place in this API that still names `model_name` as a data schema, or `None`
     /// when nothing does.
     ///
@@ -4754,6 +4772,24 @@ pub fn vpc_link_target_is_not_a_load_balancer(target_arn: &str) -> String {
 /// request validator of the API, in the shape of the sibling identifier messages above.
 pub const NO_SUCH_REQUEST_VALIDATOR: &str = "Invalid Request Validator identifier specified";
 
+/// The `ConflictException` message for a request validator a `Method` of the same API
+/// still names in its `requestValidatorId`, which is what `DeleteRequestValidator` refuses
+/// while the reference stands (see
+/// [`RestApiEntry::method_referencing_request_validator`]).
+///
+/// BUILT FROM STATE: the fixed text names the condition and the variable parts are the
+/// validator's own name and the referencing method, so tooling parsing the refusal can
+/// find which method still has to be updated or deleted. A validator stored without a name
+/// has none to name, so the quoted name is empty for it — `name` is optional on
+/// `CreateRequestValidator`, and nothing invents one per refusal.
+pub fn request_validator_in_use(
+    validator_name: Option<&str>,
+    referencing: &MethodReference,
+) -> String {
+    let validator_name = validator_name.unwrap_or_default();
+    format!("Cannot delete Request Validator '{validator_name}' referenced in method: {referencing}")
+}
+
 /// The `NotFoundException` message for a `responseType` the API carries no CUSTOMIZED
 /// gateway response for — the record `DeleteGatewayResponse` clears and
 /// `PutGatewayResponse` writes. Every modelled type always has the response API Gateway
@@ -4953,3 +4989,6 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// Declared here, at the end of the file, because it is the one surface another crate
 /// uses and nothing in this module depends on it.
 pub mod tag_index;
+
+/// The `Model` records every created REST API already holds; see that module.
+pub mod default_models;

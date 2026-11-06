@@ -137,7 +137,7 @@ fn rows() -> Vec<Row> {
             }),
             expected_body: [
                 "{",
-                "  \"id\" : \"string\",",
+                "  \"id\" : \"foo\",",
                 "  \"paid\" : true,",
                 "  \"quantity\" : 0,",
                 "  \"total\" : 0.0",
@@ -173,7 +173,7 @@ fn rows() -> Vec<Row> {
             expected_body: [
                 "{",
                 "  \"customer\" : {",
-                "    \"name\" : \"string\"",
+                "    \"name\" : \"foo\"",
                 "  },",
                 "  \"total\" : 0.0",
                 "}",
@@ -197,7 +197,7 @@ fn rows() -> Vec<Row> {
             }),
             expected_body: [
                 "[ {",
-                "  \"class\" : \"string\",",
+                "  \"class\" : \"foo\",",
                 "  \"number\" : 0",
                 "} ]",
             ]
@@ -207,7 +207,7 @@ fn rows() -> Vec<Row> {
             case: "an array of strings",
             content_type: "application/json",
             schema: json!({ "type": "array", "items": { "type": "string" } }),
-            expected_body: "[ \"string\" ]".to_string(),
+            expected_body: "[ \"foo\" ]".to_string(),
         },
         Row {
             case: "an array of arrays",
@@ -242,7 +242,7 @@ fn rows() -> Vec<Row> {
             expected_body: [
                 "{",
                 "  \"items\" : [ {",
-                "    \"sku\" : \"string\"",
+                "    \"sku\" : \"foo\"",
                 "  } ]",
                 "}",
             ]
@@ -267,7 +267,7 @@ fn rows() -> Vec<Row> {
             expected_body: [
                 "{",
                 "  \"pet\" : {",
-                "    \"name\" : \"string\"",
+                "    \"name\" : \"foo\"",
                 "  }",
                 "}",
             ]
@@ -285,7 +285,7 @@ fn rows() -> Vec<Row> {
                     "note": { "type": ["string", "null"] }
                 }
             }),
-            expected_body: ["{", "  \"count\" : 0,", "  \"note\" : \"string\"", "}"].join("\n"),
+            expected_body: ["{", "  \"count\" : 0,", "  \"note\" : \"foo\"", "}"].join("\n"),
         },
         Row {
             // A schema that RESTRICTS its instance to a set of values (section 5.5.1) has
@@ -328,7 +328,7 @@ fn rows() -> Vec<Row> {
             case: "an object typed only by declaring properties",
             content_type: "application/json",
             schema: json!({ "properties": { "name": { "type": "string" } } }),
-            expected_body: ["{", "  \"name\" : \"string\"", "}"].join("\n"),
+            expected_body: ["{", "  \"name\" : \"foo\"", "}"].join("\n"),
         },
         Row {
             // And an array is what `items` applies to (section 5.3.1).
@@ -369,7 +369,7 @@ fn rows() -> Vec<Row> {
             expected_body: [
                 "{",
                 r#"  "o'rder \"x\"" : 0,"#,
-                r#"  "order id" : "string""#,
+                r#"  "order id" : "foo""#,
                 "}",
             ]
             .join("\n"),
@@ -400,9 +400,9 @@ fn rows() -> Vec<Row> {
             }),
             expected_body: [
                 "{",
-                "  \"createdBy\" : \"string\",",
+                "  \"createdBy\" : \"foo\",",
                 "  \"quantity\" : 0,",
-                "  \"sku\" : \"string\"",
+                "  \"sku\" : \"foo\"",
                 "}",
             ]
             .join("\n"),
@@ -423,7 +423,7 @@ fn rows() -> Vec<Row> {
             expected_body: [
                 "{",
                 "  \"amount\" : 0.0,",
-                "  \"tag\" : \"string\"",
+                "  \"tag\" : \"foo\"",
                 "}",
             ]
             .join("\n"),
@@ -438,7 +438,7 @@ fn rows() -> Vec<Row> {
                 "type": "object",
                 "properties": { "sku": { "type": "string" } }
             }),
-            expected_body: ["{", "  \"sku\" : \"string\"", "}"].join("\n"),
+            expected_body: ["{", "  \"sku\" : \"foo\"", "}"].join("\n"),
         },
     ]
 }
@@ -766,7 +766,7 @@ async fn a_model_declaring_no_json_schema_has_no_generated_template() {
     let value = generated_template(&gateway, &api, &name, "a JSON model beside them").await;
     assert_eq!(
         value,
-        template(&["{", "  \"id\" : \"string\"", "}"].join("\n")),
+        template(&["{", "  \"id\" : \"foo\"", "}"].join("\n")),
         "case a JSON model beside them: expected the sample its schema declares, got {value:?}"
     );
 }
@@ -959,7 +959,7 @@ async fn a_schema_whose_sample_would_not_fit_the_bounds_is_refused_not_expanded(
     let value = generated_template(&gateway, &api, "AfterTheRefusals", "after the refusals").await;
     assert_eq!(
         value,
-        template(&["{", "  \"id\" : \"string\"", "}"].join("\n")),
+        template(&["{", "  \"id\" : \"foo\"", "}"].join("\n")),
         "case after the refusals: expected the sample its schema declares, got {value:?}"
     );
 }

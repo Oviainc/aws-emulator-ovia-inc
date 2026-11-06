@@ -374,6 +374,14 @@ mod delete_usage_plan_key;
 // signed with credentials whose principal is allowed no `execute-api:Invoke`.
 #[path = "all/stage_invoke_identity_policy.rs"]
 mod stage_invoke_identity_policy;
+// Appended for the reason the note above gives: the `Model` records every REST API is
+// CREATED with, over every create path.
+#[path = "all/default_models.rs"]
+mod default_models;
+// Appended for the reason the note above gives: the `DeleteRequestValidator` a `Method` of
+// the same API blocks while it still names the validator.
+#[path = "all/request_validator_in_use.rs"]
+mod request_validator_in_use;
 // Appended for the reason the note above gives: the ORDER one `patchOperations` entry is
 // judged in — the path before the op — and the sentence each verdict is worded with.
 #[path = "all/patch_entry_precedence.rs"]

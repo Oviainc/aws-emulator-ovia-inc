@@ -189,7 +189,7 @@ async fn a_model_a_methods_request_models_still_names_cannot_be_deleted() {
         );
         assert_eq!(
             list_models(&gateway, &api, row.case).await,
-            vec!["Order".to_string(), "Spare".to_string()],
+            crate::models::with_default_models(&["Order", "Spare"]),
             "case {}: expected both models in creation order",
             row.case
         );
@@ -236,9 +236,10 @@ async fn a_model_a_methods_request_models_still_names_cannot_be_deleted() {
             "case {}: expected the deleted model to be gone",
             row.case
         );
-        assert!(
-            list_models(&gateway, &api, row.case).await.is_empty(),
-            "case {}: expected no model left in the collection",
+        assert_eq!(
+            list_models(&gateway, &api, row.case).await,
+            crate::models::default_model_names(),
+            "case {}: expected no created model left in the collection",
             row.case
         );
     }
@@ -365,7 +366,7 @@ async fn a_model_a_method_responses_response_models_still_names_cannot_be_delete
         );
         assert_eq!(
             list_models(&gateway, &api, row.case).await,
-            vec!["Order".to_string(), "Spare".to_string()],
+            crate::models::with_default_models(&["Order", "Spare"]),
             "case {}: expected both models in creation order",
             row.case
         );
@@ -417,9 +418,10 @@ async fn a_model_a_method_responses_response_models_still_names_cannot_be_delete
             "case {}: expected the deleted model to be gone",
             row.case
         );
-        assert!(
-            list_models(&gateway, &api, row.case).await.is_empty(),
-            "case {}: expected no model left in the collection",
+        assert_eq!(
+            list_models(&gateway, &api, row.case).await,
+            crate::models::default_model_names(),
+            "case {}: expected no created model left in the collection",
             row.case
         );
     }
@@ -625,11 +627,12 @@ async fn a_refused_delete_leaves_the_model_in_the_collection() {
     for name in created {
         create_model(&gateway, &api, name).await;
     }
-    let expected: Vec<String> = created.iter().map(|name| (*name).to_string()).collect();
+    let expected: Vec<String> = crate::models::with_default_models(&created);
     assert_eq!(
         list_models(&gateway, &api, "before any delete").await,
         expected,
-        "case before any delete: expected both models in creation order"
+        "case before any delete: expected both models in creation order, after the ones the \
+         API was created with"
     );
 
     // Every listed model reports exactly what the single reader reports for it.
@@ -651,7 +654,7 @@ async fn a_refused_delete_leaves_the_model_in_the_collection() {
     );
     assert_eq!(
         list_models(&gateway, &api, "after one delete").await,
-        vec!["Bravo".to_string()],
+        crate::models::with_default_models(&["Bravo"]),
         "case after one delete: expected only the model that was not deleted"
     );
 }

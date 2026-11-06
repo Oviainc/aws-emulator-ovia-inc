@@ -7,7 +7,9 @@
 //! The one member a caller sets is the CloudWatch role
 //! ([`crate::state::ACCOUNT_CLOUDWATCH_ROLE_PATH`]); the account's request limits, its
 //! features and its API key version are the service's own, so a patch naming them is
-//! refused rather than applied.
+//! refused rather than applied. A role the account is given has to be one API Gateway can
+//! assume to write the account's logs: a role this account's IAM does not hold, or whose
+//! trust policy withholds that assume, is refused rather than stored.
 //!
 //! ## Shape of an operation
 //!
@@ -116,6 +118,21 @@ const IAM_VENDOR: &str = "iam";
 /// See [`IAM_VENDOR`].
 const ROLE_RESOURCE_TYPE: &str = "role";
 
+/// The service principal that has to be able to assume an account's CloudWatch role:
+/// API Gateway writes the account's logs under that role, so the role's trust policy has
+/// to grant the assume to API Gateway itself.
+const SERVICE_PRINCIPAL: &str = "apigateway.amazonaws.com";
+
+/// The `BadRequestException` message for a `cloudwatchRoleArn` naming a role API Gateway
+/// cannot assume and write logs under.
+///
+/// Entirely fixed text: it names what is missing — the trust permission for API Gateway and
+/// the role policy that lets it write — and quotes back neither the ARN nor the role name,
+/// which is how the service words this refusal.
+const ROLE_WITHOUT_REQUIRED_PERMISSIONS: &str =
+    "The role ARN does not have required permissions configured. Please grant trust \
+     permission for API Gateway and add the required role policy.";
+
 /// Refuse a `cloudwatchRoleArn` this service cannot read as an ARN AT ALL.
 ///
 /// The member is "the ARN of an Amazon CloudWatch role for the current Account", so a
@@ -206,6 +223,39 @@ fn apply_patch(account: &mut crate::state::AccountEntry, patch: &Patch) -> Resul
     }
 }
 
+/// The CloudWatch role ARN this patch list SETS on the account, if any: the value of the
+/// last `replace` of the role path that carries a non-empty one.
+///
+/// Read off the REQUEST, so the role can be resolved against IAM with no store lock held.
+/// A later op wins because the list is applied in order, and an empty value sets no role —
+/// it clears the member — so neither names a role to resolve.
+fn role_arn_set_by(patches: &[Patch]) -> Option<&str> {
+    patches
+        .iter()
+        .rev()
+        .find(|patch| {
+            patch.member() == crate::state::ACCOUNT_CLOUDWATCH_ROLE_PATH
+                && matches!(patch.op, PatchOpKind::Replace)
+        })
+        .and_then(|patch| patch.value.as_deref())
+        .filter(|role_arn| !role_arn.is_empty())
+}
+
+/// Apply every patch of a list, in order, to one copy of the account record.
+///
+/// Called twice: once to JUDGE the list, before the role it sets is resolved against IAM,
+/// and once to apply the judged list to the record as it stands then. The refusals are a
+/// function of the ops themselves, so both passes refuse exactly the same lists.
+fn apply_all(
+    account: &mut crate::state::AccountEntry,
+    patches: &[Patch],
+) -> Result<(), PatchFailure> {
+    for patch in patches {
+        apply_patch(account, patch)?;
+    }
+    Ok(())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -288,13 +338,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::parse_patches_refused_with(input.patch_operations.as_ref(), INVALID_PATH)
                 .map_err(patch_failure)?;
 
-        let mut store = state.lock();
-        // Patched on a COPY: a list whose later op is refused leaves the stored account
-        // untouched, rather than keeping the ops before it.
-        let mut updated = store.account.clone();
-        for patch in &patches {
-            apply_patch(&mut updated, patch).map_err(patch_failure)?;
+        // The list is JUDGED on a copy of the record first: a list whose later op is
+        // refused leaves the stored account untouched, rather than keeping the ops before
+        // it, and the judging has to finish before the role is resolved against IAM — the
+        // member's narrower rule is the last thing a value earns, after the path, the op
+        // and the ARN itself. The store is held for the copy only, and the guard is
+        // released before the question below leaves this service.
+        let mut judged = state.lock().account.clone();
+        apply_all(&mut judged, &patches).map_err(patch_failure)?;
+
+        // The role this list sets has to be one API Gateway can actually assume to write
+        // the account's logs: a role IAM holds nothing under, and one whose trust policy
+        // does not grant the assume to this service, is one no log could ever be written
+        // under, so it is refused rather than stored. Asked of IAM with NO store lock
+        // held, because the question leaves this service; an answer this emulator could
+        // not get grounds no refusal, which is what that reading answers for it.
+        if let Some(role_arn) = role_arn_set_by(&patches) {
+            let region = crate::state::request_region(ctx.parts());
+            if ::service_common::iam_role::role_is_unassumable(
+                ctx,
+                &region,
+                role_arn,
+                SERVICE_PRINCIPAL,
+            )
+            .await
+            {
+                return Err(UpdateAccountErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(ROLE_WITHOUT_REQUIRED_PERMISSIONS.to_string()),
+                    },
+                )
+                .into());
+            }
         }
+
+        let mut store = state.lock();
+        // Applied to a COPY of the record as it stands now, and stored only once the whole
+        // list went on: the judging above already refused every list this cannot apply.
+        let mut updated = store.account.clone();
+        apply_all(&mut updated, &patches).map_err(patch_failure)?;
         store.account = updated;
 
         // Reported through the one `Account` body this crate builds, so the update

@@ -51,9 +51,11 @@ const INPUT_ROOT: &str = "$inputRoot";
 /// One indentation step of a generated document's nested lines.
 const INDENT: &str = "  ";
 
-/// The example value a declared `string` carries in a generated sample payload: the name of
-/// the type the schema declares, which is what a caller replaces with a value of their own.
-const SAMPLE_STRING: &str = "string";
+/// The example value a declared `string` carries in a generated sample payload: the
+/// placeholder string the gateway fills a string leaf with, which a caller replaces with a
+/// value of their own. A recorded generation shows it as `foo` — the sample is an EXAMPLE
+/// payload, so a string leaf carries an example string rather than the name of its type.
+const SAMPLE_STRING: &str = "foo";
 
 /// The example value a declared `integer` carries — an integer literal, so the generated
 /// document carries the JSON type the schema declares rather than a near one.

@@ -74,6 +74,25 @@ pub async fn get_model(gateway: &Gateway, api: &str, name: &str, flatten: bool) 
     gateway.call("GET", &uri, None).await
 }
 
+/// The names of the models API Gateway creates every REST API WITH, in creation order,
+/// read FROM the service rather than copied, so a suite listing an API's models cannot
+/// drift from what a create seeds.
+///
+/// `pub(crate)` because every suite that asserts a `GetModels` page has to account for
+/// them: they are stored models of the API from the moment it exists, so they precede
+/// whatever the suite created.
+pub(crate) fn default_model_names() -> Vec<String> {
+    service_com_amazonaws_apigateway_backplanecontrolservice::state::default_models::default_model_names()
+}
+
+/// `created` prefixed by [`default_model_names`]: the model names an API holds in creation
+/// order when a suite has created `created` on it.
+pub(crate) fn with_default_models<T: AsRef<str>>(created: &[T]) -> Vec<String> {
+    let mut names = default_model_names();
+    names.extend(created.iter().map(|name| name.as_ref().to_string()));
+    names
+}
+
 /// A JSON Schema document of `properties` named properties, as a caller writes one.
 ///
 /// `pub(crate)` for the reason [`MAX_SCHEMA_CHARS`] is: one spelling of a schema document
