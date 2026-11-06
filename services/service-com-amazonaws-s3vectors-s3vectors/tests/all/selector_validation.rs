@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::vector_lifecycle::{
-    call, error_code, expected_bucket_arn, expected_index_arn, ok, router,
+    call, error_code, expected_bucket_arn, expected_index_arn, message_of, ok, router,
 };
 
 /// The sentence the real service answered for a bucket selector that is not exactly
@@ -44,15 +44,6 @@ const RECORDED_BUCKET_SELECTOR: &str =
 /// which the service words in terms of the ARN first.
 const RECORDED_INDEX_SELECTOR: &str =
     "Must specify either indexArn or both vectorBucketName and indexName";
-
-/// The `message` member of a refusal body, whichever casing the protocol rendered.
-fn message_of(body: &Value) -> String {
-    body.get("message")
-        .or_else(|| body.get("Message"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
 
 /// The dimension and distance metric every fixture index is created with, both
 /// inside the members' modelled bounds (`Dimension` is `range 1..4096`,

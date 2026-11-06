@@ -29,7 +29,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::vector_lifecycle::{call, error_code, expected_index_arn, ok, router};
+use crate::vector_lifecycle::{call, error_code, expected_index_arn, message_of, ok, router};
 
 /// The sentence the real service answered for an index it does not hold, as the
 /// recorded response carried it. A LITERAL, not the handler's own constant: a suite
@@ -48,15 +48,6 @@ const RECORDED_BUCKET_NOT_FOUND: &str = "The specified vector bucket could not b
 const DIMENSION: usize = 8;
 /// See [`DIMENSION`].
 const METRIC: &str = "cosine";
-
-/// The `message` member of a refusal body, whichever casing the protocol rendered.
-fn message_of(body: &Value) -> String {
-    body.get("message")
-        .or_else(|| body.get("Message"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
 
 /// `DIMENSION` float32 values an index of that dimension accepts.
 fn data(seed: f32) -> Value {

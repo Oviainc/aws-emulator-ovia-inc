@@ -40,38 +40,15 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::vector_lifecycle::{call, call_reporting_errortype, encode_label, error_code, ok, router};
+use crate::vector_lifecycle::{
+    call, call_reporting_errortype, encode_label, error_code, field_list, message_of, ok, router,
+};
 
 /// The wire error code every refusal in this suite carries, and the status the shape's
 /// `@httpError` declares.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// See [`VALIDATION_EXCEPTION`].
 const BAD_REQUEST: u16 = 400;
-
-/// The `message` member of a refusal body, whichever casing the protocol rendered.
-fn message_of(body: &Value) -> String {
-    body.get("message")
-        .or_else(|| body.get("Message"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// The `fieldList` of a refusal body as (path, message) pairs.
-fn field_list(body: &Value) -> Vec<(String, String)> {
-    body.get("fieldList")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default()
-        .iter()
-        .map(|field| {
-            (
-                field["path"].as_str().unwrap_or_default().to_string(),
-                field["message"].as_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect()
-}
 
 /// A `CreateIndex` request body for `index` in `bucket`, inside every modelled bound.
 fn create_index_request(bucket: &str, index: &str) -> Value {

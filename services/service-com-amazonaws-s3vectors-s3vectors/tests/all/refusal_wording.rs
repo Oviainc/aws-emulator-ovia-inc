@@ -31,7 +31,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::vector_lifecycle::{
-    call, error_code, expected_bucket_arn, expected_index_arn, list_tags, ok, router, tag,
+    call, error_code, expected_bucket_arn, expected_index_arn, list_tags, message_of, ok, router,
+    tag,
 };
 
 /// The sentence the real service answered for an index it does not hold, as the
@@ -54,15 +55,6 @@ const RECORDED_BUCKET_EXISTS: &str = "A vector bucket with the specified name al
 /// The sentence the service answers for deleting a vector bucket that still holds
 /// vector indexes — the other conflict a vector bucket's own state can raise.
 const RECORDED_BUCKET_NOT_EMPTY: &str = "The specified vector bucket is not empty";
-
-/// The `message` member of a refusal body, whichever casing the protocol rendered.
-fn message_of(body: &Value) -> String {
-    body.get("message")
-        .or_else(|| body.get("Message"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
 
 /// The dimension and distance metric every fixture index is created with. Both are
 /// inside the members' modelled bounds (`Dimension` is `range 1..4096`,

@@ -237,8 +237,45 @@ pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Valu
     response
 }
 
+/// The `message` member of a refusal body, whichever casing the protocol rendered.
+///
+/// Shared by every suite that asserts a refusal's SENTENCE, so the reading of the
+/// member is written once and each suite carries only its own expectations.
+pub(crate) fn message_of(body: &Value) -> String {
+    body.get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The `fieldList` of a refusal body as (path, message) pairs. Shared for the same
+/// reason as [`message_of`].
+pub(crate) fn field_list(body: &Value) -> Vec<(String, String)> {
+    body.get("fieldList")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|field| {
+            (
+                field["path"].as_str().unwrap_or_default().to_string(),
+                field["message"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
 /// Create a vector bucket and a vector index in it, and return the router.
-async fn with_index(bucket: &str, index: &str, dimension: u32, metric: &str) -> MultiServiceRouter {
+///
+/// Shared with the other suites in this target: one fixture builder for the
+/// bucket -> index pair every data-plane and refusal case starts from.
+pub(crate) async fn with_index(
+    bucket: &str,
+    index: &str,
+    dimension: u32,
+    metric: &str,
+) -> MultiServiceRouter {
     let router = router();
     ok(
         &router,

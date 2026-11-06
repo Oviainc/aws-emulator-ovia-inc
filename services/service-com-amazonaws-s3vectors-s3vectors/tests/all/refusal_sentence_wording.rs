@@ -35,7 +35,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::vector_lifecycle::{
-    call, error_code, expected_bucket_arn, expected_index_arn, keys, ok, router, tag, untag,
+    call, error_code, expected_bucket_arn, expected_index_arn, field_list, keys, message_of, ok,
+    router, tag, untag, with_index,
 };
 
 /// The wire error code and status of an input refusal on these operations.
@@ -63,70 +64,24 @@ const SEGMENT_SENTENCE: &str = "Segment index is zero-indexed and must be smalle
 const TAG_CONFLICT_SENTENCE: &str =
     "The resource tags were modified by another request. Please retry the operation.";
 
-/// The `message` member of a refusal body, whichever casing the protocol rendered.
-fn message_of(body: &Value) -> String {
-    body.get("message")
-        .or_else(|| body.get("Message"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// The `fieldList` of a refusal body as (path, message) pairs.
-fn field_list(body: &Value) -> Vec<(String, String)> {
-    body.get("fieldList")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default()
-        .iter()
-        .map(|field| {
-            (
-                field["path"].as_str().unwrap_or_default().to_string(),
-                field["message"].as_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect()
-}
-
 /// The sentence a refusal about ONE record of a batch carries: the service names the
 /// record by the `key` the caller submitted it under, then states the defect.
 fn record_sentence(key: &str, defect: &str) -> String {
     format!("Invalid record for key '{key}': {defect}")
 }
 
-/// A router holding `bucket` with a `dimension`-wide `metric` index called `index`.
-async fn with_index(
-    bucket: &str,
-    index: &str,
-    dimension: usize,
-    metric: &str,
-) -> MultiServiceRouter {
-    let router = router();
-    ok(
-        &router,
-        "CreateVectorBucket",
-        &json!({ "vectorBucketName": bucket }),
-    )
-    .await;
-    ok(
-        &router,
-        "CreateIndex",
-        &json!({
-            "vectorBucketName": bucket,
-            "indexName": index,
-            "dataType": "float32",
-            "dimension": dimension,
-            "distanceMetric": metric,
-        }),
-    )
-    .await;
-    router
-}
-
 /// The bucket and index every vector suite below creates.
 const VECTOR_BUCKET: &str = "zero-norm-bucket";
 /// See [`VECTOR_BUCKET`].
 const VECTOR_INDEX: &str = "zero-norm-index";
+
+/// The shared fixture of [`crate::vector_lifecycle::with_index`], with this suite's
+/// bucket and index names and a row's `dimension` counted as the rows count it.
+async fn vector_index(dimension: usize, metric: &str) -> MultiServiceRouter {
+    let dimension =
+        u32::try_from(dimension).expect("a row's dimension is inside the modelled range");
+    with_index(VECTOR_BUCKET, VECTOR_INDEX, dimension, metric).await
+}
 
 /// A zero-norm vector written to a `cosine` index is refused as the RECORD it is: the
 /// top-level message names the record by its own `key` and then states the zero-norm
@@ -166,7 +121,7 @@ async fn a_zero_norm_vector_reports_the_metrics_own_rule_named_by_the_records_ke
             .collect();
 
         // The cosine index refuses it.
-        let router = with_index(VECTOR_BUCKET, VECTOR_INDEX, dimension, "cosine").await;
+        let router = vector_index(dimension, "cosine").await;
         let (status, body) = call(
             &router,
             "PutVectors",
@@ -220,7 +175,7 @@ async fn a_zero_norm_vector_reports_the_metrics_own_rule_named_by_the_records_ke
 
         // The positive control: the same payload into a euclidean index is stored, and
         // reads back through GetVectors as the vector that was sent.
-        let euclidean = with_index(VECTOR_BUCKET, VECTOR_INDEX, dimension, "euclidean").await;
+        let euclidean = vector_index(dimension, "euclidean").await;
         ok(
             &euclidean,
             "PutVectors",
@@ -257,7 +212,7 @@ async fn a_zero_norm_vector_reports_the_metrics_own_rule_named_by_the_records_ke
 async fn a_zero_norm_query_vector_reports_the_same_rule_named_by_its_member() {
     for dimension in [1_usize, 3, 8] {
         let case = format!("a {dimension}-dimension cosine index");
-        let router = with_index(VECTOR_BUCKET, VECTOR_INDEX, dimension, "cosine").await;
+        let router = vector_index(dimension, "cosine").await;
         let (status, body) = call(
             &router,
             "QueryVectors",
@@ -293,7 +248,7 @@ async fn a_zero_norm_query_vector_reports_the_same_rule_named_by_its_member() {
 #[tokio::test]
 async fn the_degenerate_and_mis_sized_vector_refusals_are_different_sentences() {
     let dimension = 4_usize;
-    let router = with_index(VECTOR_BUCKET, VECTOR_INDEX, dimension, "cosine").await;
+    let router = vector_index(dimension, "cosine").await;
     let key = "probe";
     // (case, the submitted data, the sentence the refusal must carry)
     let rows: Vec<(&str, Vec<f32>, String)> = vec![
