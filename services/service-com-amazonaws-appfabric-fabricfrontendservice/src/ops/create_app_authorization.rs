@@ -7,19 +7,24 @@
 //! `GetAppAuthorization` and `ListAppAuthorizations` answer from the same bytes
 //! this call wrote.
 //!
-//! Three rules this handler owns beyond persisting the record:
+//! Two rules this handler owns beyond persisting the record:
 //!
-//! * `app` must name an application AppFabric supports
-//!   ([`crate::state::SUPPORTED_APPS`]) — the model types it as a plain
-//!   `String255`, so the boundary validator cannot refuse it;
 //! * `credential` must match `authType`, which the model's own documentation of
 //!   the member requires ("Specify credentials that match the authorization type
 //!   for your request");
 //! * a bundle holds AT MOST ONE authorization per (`app`, `tenant`) pair, and
-//!   the check is taken under the SAME state lock as the insert, so concurrent
-//!   racers for one pair produce exactly one winner and modelled conflicts.
+//!   the check is taken under the SAME state lock as the insert, so a second
+//!   create for a pair the bundle already holds is refused with the modelled
+//!   `ValidationException` and concurrent racers for one pair produce exactly
+//!   one winner.
 //!
-//! None of them is judged before `appBundleIdentifier` is resolved: the bundle
+//! `app` is NOT one of them: the model types it as a plain `String255` with no
+//! `@enum`, and the value list its documentation gives is a snapshot of the
+//! applications AppFabric supported when the model was published rather than a
+//! wire constraint, so an application name outside that list is stored as the
+//! caller gave it instead of being refused.
+//!
+//! Neither rule is judged before `appBundleIdentifier` is resolved: the bundle
 //! the URI names is the scope this call is made in, so an identifier naming
 //! nothing stored is refused as the app bundle (`ResourceNotFoundException`)
 //! whatever else the request carries — the same order every sibling of this
@@ -252,14 +257,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // sibling on this chain applies.
         //
         // `authType` is closed by the model (`AUTH_TYPE_VALUES`), so the
-        // boundary validator has already refused anything outside it; `app` is
-        // not, so the supported-application set is checked here.
-        if !crate::state::is_supported_app(&input.app) {
-            return Err(CreateAppAuthorizationErrorModeled::ValidationException(
-                crate::state::app_not_supported(&input.app),
-            )
-            .into());
-        }
+        // boundary validator has already refused anything outside it. `app` is
+        // an open `String255`: the model constrains its length, not its value,
+        // so no application name is refused here.
 
         // The credential must be the one the chosen authorization type uses.
         // Only the KIND is read: the secret inside it is never stored, logged or
@@ -335,18 +335,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // At most ONE authorization per (bundle, app, tenant) triple. A second
         // create for a triple the bundle already holds — a retry without a
-        // token, or the loser of a race — is the modelled conflict, and the
-        // winner's ARN is what the refusal names.
-        if let Some(held) = store
+        // token, or the loser of a race — is refused with the modelled
+        // `ValidationException` (HTTP 400): the request cannot succeed as
+        // written while the first authorization stands, which is a fault of the
+        // request rather than a conflict that settles on its own (see
+        // [`crate::state::app_authorization_already_exists`]).
+        if store
             .app_bundles
             .get(&bundle_key)
             .and_then(|bundle| {
                 bundle.authorization_for(&input.app, &input.tenant.tenant_identifier)
             })
-            .map(|authorization| authorization.arn.clone())
+            .is_some()
         {
-            return Err(CreateAppAuthorizationErrorModeled::ConflictException(
-                crate::state::app_authorization_already_exists(&held),
+            return Err(CreateAppAuthorizationErrorModeled::ValidationException(
+                crate::state::app_authorization_already_exists(),
             )
             .into());
         }

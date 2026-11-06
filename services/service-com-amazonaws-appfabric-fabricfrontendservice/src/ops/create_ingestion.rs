@@ -231,16 +231,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `app` is a plain `String255` in the model (no `@enum`), so the
-        // boundary validator cannot refuse an application AppFabric does not
-        // support: the set is the server's to check, and it is the same set
-        // `CreateAppAuthorization` checks.
-        if !crate::state::is_supported_app(&input.app) {
-            return Err(CreateIngestionErrorModeled::ValidationException(
-                crate::state::app_not_supported(&input.app),
-            )
-            .into());
-        }
+        // `app` is a plain `String255` in the model (no `@enum`): the member's
+        // constraint is its length, not its value, and the value list the
+        // documentation gives is a snapshot of the applications AppFabric
+        // supported when the model was published. An application name is
+        // therefore never refused on the name itself — what this operation
+        // requires of the (application, tenant) pair is a CONNECTED app
+        // authorization, which the guard further down judges.
 
         // The PARENT is one of this request's parameters, so it belongs in the
         // fingerprint: the same token under a different bundle is a different

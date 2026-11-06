@@ -9,9 +9,9 @@
 //! * an app authorization is PERSISTED under its bundle, starts `PendingConnect`
 //!   and is reported identically by `GetAppAuthorization` and
 //!   `ListAppAuthorizations` for either identifier form;
-//! * an `app` outside the set the model documents is refused with the modelled
-//!   `ValidationException` by every operation that names one, and nothing is
-//!   written;
+//! * an `app` is an OPEN string: a name outside the value list the model's
+//!   documentation gives is stored as the caller gave it, by every operation
+//!   that names one;
 //! * a bundle holds AT MOST ONE authorization per (app, tenant) pair, however
 //!   many callers race for it;
 //! * an ingestion exists only for a pair whose authorization has completed the
@@ -41,13 +41,12 @@ use crate::app_bundle_ingestion_lifecycle::{
     Emulator,
 };
 
-/// The applications AppFabric supports, as the model's own documentation of the
-/// `app` member lists them (`smithy_query(query="doc",
-/// shape="CreateAppAuthorizationRequest", member="app")`: "Valid values are:
-/// SLACK ASANA JIRA M365 M365AUDITLOGS ZOOM ZENDESK OKTA GOOGLE DROPBOX
-/// SMARTSHEET CISCO"). The tables below walk entries the issue did not cite
-/// rather than repeating one value.
-const SUPPORTED_APPS: &[&str] = &[
+/// Applications the model's own documentation of the `app` member lists
+/// (`smithy_query(query="doc", shape="CreateAppAuthorizationRequest",
+/// member="app")`: "Valid values are: SLACK ASANA JIRA M365 M365AUDITLOGS ZOOM
+/// ZENDESK OKTA GOOGLE DROPBOX SMARTSHEET CISCO"). The tables below walk entries
+/// the issue did not cite rather than repeating one value.
+const DOCUMENTED_APPS: &[&str] = &[
     "SLACK",
     "ASANA",
     "JIRA",
@@ -468,59 +467,79 @@ async fn an_app_authorization_round_trips_and_starts_pending_connect() {
     );
 }
 
-/// RULE: an `app` outside the set the model documents is refused with the
-/// modelled `ValidationException` (HTTP 400) by every operation that names one,
-/// the refusal names the application that was asked for, and nothing is written;
-/// an application IN that set is accepted.
+/// RULE: `app` is an OPEN string in the model (`String255`, no enum trait), so
+/// no operation refuses an application name for being outside the value list the
+/// model's documentation gives: `CreateAppAuthorization` stores and reports back
+/// the name the request carried, and what `CreateIngestion` requires of an
+/// (application, tenant) pair is a CONNECTED app authorization — which is what
+/// its refusal states, naming neither the application nor the tenant.
 ///
-/// `app` targets `String255` with no enum trait, so this is a server-side check
-/// rather than a boundary one — the table therefore spans values that differ from
-/// a supported one only in case, in spacing or by one character.
+/// The table spans the names the documentation lists and names outside it: the
+/// one the recorded run carried, another vendor's, a lower-case spelling of a
+/// listed value, a near miss of one and a name at the member's own length bound.
 #[tokio::test]
-async fn an_unsupported_app_is_refused_and_writes_nothing() {
-    let unsupported = [
-        "NOT_A_REAL_SUPPORTED_APP",
-        "slack",
-        "Slack",
-        "SLACK ",
-        " SLACK",
-        "M365AUDITLOG",
-        "DISCORD",
+async fn an_application_name_outside_the_documented_list_is_accepted_and_persisted() {
+    let at_the_length_bound = "A".repeat(255);
+    let mut apps: Vec<&str> = DOCUMENTED_APPS.to_vec();
+    apps.extend_from_slice(&[
+        "PAGERDUTY",
         "SALESFORCE",
-    ];
+        "DISCORD",
+        "slack",
+        "M365AUDITLOG",
+        at_the_length_bound.as_str(),
+    ]);
 
-    for app in unsupported {
+    for (index, app) in apps.iter().enumerate() {
         let emulator = Emulator::new();
         let bundle = arn_of(
             &emulator.create_app_bundle(json!({})).await.body,
             "appBundle",
         );
+        let tenant = format!("tenant-{index}");
 
-        let refused = create_authorization(&emulator, &bundle, app, "oauth2", "tenant-1").await;
+        let created = create_authorization(&emulator, &bundle, app, "apiKey", &tenant).await;
         assert_eq!(
-            refused.status, 400,
-            "case {app:?}: expected HTTP 400 from CreateAppAuthorization, got {} with body {}",
-            refused.status, refused.body
+            created.status, 201,
+            "case {app:?}: expected HTTP 201 from CreateAppAuthorization, got {} with body {}",
+            created.status, created.body
         );
         assert_eq!(
-            refused.error_code(),
-            "ValidationException",
-            "case {app:?}: expected ValidationException, got {}",
-            refused.body
+            authorization_member(&created, "app"),
+            &json!(app),
+            "case {app:?}: expected the application name the request carried, got {}",
+            created.body
         );
-        assert!(
-            message(&refused).contains(app),
-            "case {app:?}: the refusal must name the application asked for, got {:?}",
-            message(&refused)
-        );
+
+        // PERSISTED: the bundle holds exactly that authorization and the reader
+        // reports the same application name back.
+        let arn = authorization_member(&created, "appAuthorizationArn")
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         let listed = list_authorizations(&emulator, &bundle, "").await;
-        assert!(
-            listed_authorization_arns(&listed).is_empty(),
-            "case {app:?}: a refused create must write nothing, got {}",
+        assert_eq!(
+            listed_authorization_arns(&listed),
+            vec![arn.clone()],
+            "case {app:?}: expected the bundle to hold exactly the created authorization, got {}",
             listed.body
         );
+        let read = get_authorization(&emulator, &bundle, &arn).await;
+        assert_eq!(
+            read.status, 200,
+            "case {app:?}: expected the authorization to be readable, got {} with body {}",
+            read.status, read.body
+        );
+        assert_eq!(
+            authorization_member(&read, "app"),
+            &json!(app),
+            "case {app:?}: expected the stored application name on the read, got {}",
+            read.body
+        );
 
-        let refused = create_ingestion_unauthorized(&emulator, &bundle, app, "tenant-1").await;
+        // The ingestion of that pair is refused for the connect handshake the
+        // authorization has not completed, never for the application's name.
+        let refused = create_ingestion_unauthorized(&emulator, &bundle, app, &tenant).await;
         assert_eq!(
             refused.status, 400,
             "case {app:?}: expected HTTP 400 from CreateIngestion, got {} with body {}",
@@ -532,27 +551,18 @@ async fn an_unsupported_app_is_refused_and_writes_nothing() {
             "case {app:?}: expected ValidationException from CreateIngestion, got {}",
             refused.body
         );
-        assert!(
-            message(&refused).contains(app),
-            "case {app:?}: the CreateIngestion refusal must name the application, got {:?}",
+        assert_eq!(
+            message(&refused),
+            "The app authorization for the specified application and tenant was not connected. \
+             Connect the app authorization for the application and tenant before creating an \
+             ingestion.",
+            "case {app:?}: expected the connect-the-authorization sentence, got {:?}",
             message(&refused)
         );
-    }
-
-    // The control rows: every application the model documents is accepted.
-    for (index, app) in SUPPORTED_APPS.iter().enumerate() {
-        let emulator = Emulator::new();
-        let bundle = arn_of(
-            &emulator.create_app_bundle(json!({})).await.body,
-            "appBundle",
-        );
-        let created =
-            create_authorization(&emulator, &bundle, app, "apiKey", &format!("tenant-{index}"))
-                .await;
-        assert_eq!(
-            created.status, 201,
-            "case {app:?}: expected a supported application to be accepted, got {} with body {}",
-            created.status, created.body
+        assert!(
+            !message(&refused).contains(app.trim()),
+            "case {app:?}: the refusal must not echo the application name, got {:?}",
+            message(&refused)
         );
     }
 }

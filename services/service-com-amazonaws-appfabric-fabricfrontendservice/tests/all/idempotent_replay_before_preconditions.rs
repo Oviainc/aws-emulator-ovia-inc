@@ -360,7 +360,8 @@ enum Create {
     /// Region quota, so a non-retry is the quota error.
     AppBundle,
     /// `CreateAppAuthorization`: the created authorization itself occupies its
-    /// (bundle, app, tenant) triple, so a non-retry is the conflict.
+    /// (bundle, app, tenant) triple, so a non-retry is the validation refusal of
+    /// a second authorization for that triple.
     AppAuthorization,
     /// `CreateIngestion`: the authorization the ingestion depends on is re-pended
     /// by an applied update, so a non-retry is the validation refusal.
@@ -371,8 +372,8 @@ enum Create {
 /// with the same parameters replays its resource BEFORE any state-dependent
 /// precondition is judged, while a fresh token with those parameters is refused
 /// with the error that operation models for the precondition — a quota for the
-/// bundle, a conflict for the at-most-one authorization per triple, a validation
-/// refusal for the ingestion's authorization dependency.
+/// bundle, the validation refusal for the at-most-one authorization per triple,
+/// a validation refusal for the ingestion's authorization dependency.
 #[tokio::test]
 async fn every_create_replays_its_resource_before_judging_its_state_precondition() {
     for (index, create) in [
@@ -433,8 +434,8 @@ async fn every_create_replays_its_resource_before_judging_its_state_precondition
                 }),
                 "appAuthorization",
                 "appAuthorizationArn",
-                409,
-                "ConflictException",
+                400,
+                "ValidationException",
             ),
             Create::Ingestion => (
                 format!(

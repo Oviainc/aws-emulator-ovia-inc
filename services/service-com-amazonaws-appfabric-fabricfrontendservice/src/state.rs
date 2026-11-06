@@ -150,32 +150,6 @@ pub const AUTH_TYPE_OAUTH2: &str = "oauth2";
 /// model's `Persona` values (`PERSONA_VALUES`).
 pub const APP_AUTHORIZATION_PERSONA_ADMIN: &str = "admin";
 
-/// The applications AppFabric supports, as the model's own documentation of
-/// `app` lists them (`CreateAppAuthorization$app` and `CreateIngestion$app`:
-/// "Valid values are: SLACK ASANA JIRA M365 M365AUDITLOGS ZOOM ZENDESK OKTA
-/// GOOGLE DROPBOX SMARTSHEET CISCO"). The member targets `String255` with no
-/// `@enum`, so this set is NOT boundary-validated: a handler that mints a
-/// resource for an application checks it ([`app_not_supported`]).
-pub const SUPPORTED_APPS: &[&str] = &[
-    "SLACK",
-    "ASANA",
-    "JIRA",
-    "M365",
-    "M365AUDITLOGS",
-    "ZOOM",
-    "ZENDESK",
-    "OKTA",
-    "GOOGLE",
-    "DROPBOX",
-    "SMARTSHEET",
-    "CISCO",
-];
-
-/// Whether `app` names an application AppFabric supports — see [`SUPPORTED_APPS`].
-pub fn is_supported_app(app: &str) -> bool {
-    SUPPORTED_APPS.contains(&app)
-}
-
 /// The number of tags ONE resource may hold.
 ///
 /// Not a resource guard but the model's own bound: a `TagList` is
@@ -2086,30 +2060,22 @@ pub fn app_authorization_not_connected(owed: OwedAuthorizationStep) -> Validatio
     )
 }
 
-/// A modelled `ValidationException` refusing an `app` outside the set of
-/// applications AppFabric supports ([`SUPPORTED_APPS`]).
+/// A modelled `ValidationException` for a create call that would be the SECOND
+/// app authorization of one (app bundle, app, tenant) triple.
 ///
-/// The model types `app` as a plain `String255` with no `@enum`, so the
-/// boundary validator cannot refuse it: the check is the server's, and its
-/// message is BUILT FROM THE REQUEST — it names the application that was asked
-/// for, which is the only way a caller can tell which of its values was wrong.
-pub fn app_not_supported(app: &str) -> ValidationException {
-    field_validation_failed("app", &format!("app {app} is not supported"))
-}
-
-/// A modelled `ConflictException` for a create call that would be the SECOND app
-/// authorization of one (app bundle, app, tenant) triple.
-///
-/// AppFabric holds at most one authorization per triple, so the second create
-/// — whether it follows the first or races it — is the conflict
-/// `ConflictException` states ("the request has created a conflict, check the
-/// request parameters and try again").
-pub fn app_authorization_already_exists(arn: &str) -> ConflictException {
-    ConflictException {
-        message: "An app authorization already exists for this application and tenant".to_string(),
-        resource_id: arn.to_string(),
-        resource_type: "AppAuthorization".to_string(),
-    }
+/// AppFabric holds at most one authorization per triple, so the second create —
+/// whether it follows the first or races it — cannot be carried out. It is the
+/// VALIDATION error of the two client errors `CreateAppAuthorization` models:
+/// the request can never succeed as written while the first authorization
+/// stands, so it is not a conflict that settles on its own and a retry of it is
+/// pointless. The sentence is AppFabric's own and has no variable part — it
+/// states the tenant and the authorization type generically rather than echoing
+/// either — so `reason` is `other` and no member is faulted (see
+/// [`precondition_not_met`]).
+pub fn app_authorization_already_exists() -> ValidationException {
+    precondition_not_met(
+        "An AppAuthorization already exists for this tenant and this authType.".to_string(),
+    )
 }
 
 /// A modelled `ValidationException` refusing an update that would move an app

@@ -19,6 +19,8 @@ mod app_authorization_auth_url;
 mod app_authorization_connect_validation;
 #[path = "all/app_authorization_deletion.rs"]
 mod app_authorization_deletion;
+#[path = "all/app_authorization_refusal_error_class.rs"]
+mod app_authorization_refusal_error_class;
 #[path = "all/app_authorization_tenant_move_precondition.rs"]
 mod app_authorization_tenant_move_precondition;
 #[path = "all/app_bundle_delete_precondition.rs"]

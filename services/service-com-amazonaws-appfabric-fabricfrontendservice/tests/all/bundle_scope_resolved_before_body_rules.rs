@@ -13,12 +13,13 @@
 //! `ValidationException`).
 //!
 //! The table spans the whole class rather than one recorded call: every
-//! implemented operation on this chain that owns such a rule (the supported-`app`
-//! set on `CreateAppAuthorization` and `CreateIngestion`, the
+//! implemented operation on this chain that owns such a rule (the
 //! `credential`/`authType` pairing on `CreateAppAuthorization` for each of the
-//! model's two `AuthType` values and on `UpdateAppAuthorization`), crossed with
-//! four unsupported application names and with three identifier forms that name
-//! no stored bundle.
+//! model's two `AuthType` values and on `UpdateAppAuthorization`, and the
+//! connected-authorization dependency `CreateIngestion` owns), crossed with four
+//! application names — two the model's `app` documentation lists and two outside
+//! it, because `app` is an open `String255` and the application's NAME is never
+//! what refuses — and with three identifier forms that name no stored bundle.
 //!
 //! The harness (the router, `encode`, `arn_of`) is the one
 //! `app_bundle_ingestion_lifecycle` already builds.
@@ -33,16 +34,26 @@ use crate::app_bundle_ingestion_lifecycle::{
 /// see `app_bundle_refusal_wording`, which is where that wording is pinned.
 const BUNDLE_NOT_VALID_MESSAGE: &str = "The specified app bundle ID is not valid";
 
-/// Application names OUTSIDE the set the model's own documentation of `app`
-/// lists ("Valid values are: SLACK ASANA JIRA M365 M365AUDITLOGS ZOOM ZENDESK
-/// OKTA GOOGLE DROPBOX SMARTSHEET CISCO" —
-/// `smithy_query(query="doc",shape="CreateAppAuthorizationInput",member="app")`):
-/// another SaaS product, one the issue did not cite, the lower-case spelling of
-/// a listed value and a near miss of one.
-const UNSUPPORTED_APPS: &[&str] = &["DISCORD", "NOTION", "slack", "M365AUDITLOG"];
+/// Application names the rows below carry: two the model's own documentation of
+/// `app` lists ("Valid values are: SLACK ASANA JIRA M365 M365AUDITLOGS ZOOM
+/// ZENDESK OKTA GOOGLE DROPBOX SMARTSHEET CISCO" —
+/// `smithy_query(query="doc",shape="CreateAppAuthorizationRequest",member="app")`)
+/// and two outside it, since the member is an open `String255` whose value the
+/// model does not constrain.
+const APPS: &[&str] = &["SLACK", "M365AUDITLOGS", "PAGERDUTY", "NOTION"];
+
+/// The sentence `CreateIngestion` refuses an (application, tenant) pair whose
+/// app bundle holds no app authorization for it with — see
+/// `ingestion_authorization_refusal_wording`, which is where that wording is
+/// pinned.
+const AUTHORIZATION_NOT_FOUND_MESSAGE: &str =
+    "The app authorization for the specified application and tenant was not found. \
+     Create an app authorization for the application and tenant before creating an ingestion.";
 
 /// An application the documented set above DOES hold, for the rows whose fault
-/// is the credential rather than the application.
+/// is the credential rather than the state of the store. It is NOT one of
+/// `APPS`, so the authorization the set-up stores for it is not the one an
+/// ingestion row asks about.
 const SUPPORTED_APP: &str = "ASANA";
 
 /// The tenant every row below authorizes.
@@ -104,14 +115,12 @@ fn member(answer: &Answer, name: &str) -> String {
 /// parent but the bundle (where a row names one) resolves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Faulty {
-    /// `CreateAppAuthorization` naming an application AppFabric does not support.
-    CreateAuthorizationApp(&'static str),
     /// `CreateAppAuthorization` whose `credential` is not the kind the
     /// `authType` it names uses.
     CreateAuthorizationCredential(&'static str),
-    /// `CreateIngestion` naming an application AppFabric does not support — the
-    /// co-owner of the same supported-`app` rule.
-    CreateIngestionApp(&'static str),
+    /// `CreateIngestion` for an (application, tenant) pair the bundle holds no
+    /// app authorization for — the state-dependent rule that handler owns.
+    CreateIngestionWithoutAuthorization(&'static str),
     /// `UpdateAppAuthorization` whose `credential` is not the kind the STORED
     /// authorization's `authType` uses.
     UpdateAuthorizationCredential(&'static str),
@@ -129,10 +138,12 @@ impl Faulty {
     /// that names an existing authorization.
     fn uri(self, bundle: &str, authorization: &str) -> String {
         match self {
-            Self::CreateAuthorizationApp(_) | Self::CreateAuthorizationCredential(_) => {
+            Self::CreateAuthorizationCredential(_) => {
                 format!("/appbundles/{}/appauthorizations", encode(bundle))
             }
-            Self::CreateIngestionApp(_) => format!("/appbundles/{}/ingestions", encode(bundle)),
+            Self::CreateIngestionWithoutAuthorization(_) => {
+                format!("/appbundles/{}/ingestions", encode(bundle))
+            }
             Self::UpdateAuthorizationCredential(_) => format!(
                 "/appbundles/{}/appauthorizations/{}",
                 encode(bundle),
@@ -143,19 +154,13 @@ impl Faulty {
 
     fn body(self) -> Value {
         match self {
-            Self::CreateAuthorizationApp(app) => json!({
-                "app": app,
-                "authType": "apiKey",
-                "credential": credential_of("apiKeyCredential"),
-                "tenant": {"tenantIdentifier": TENANT, "tenantDisplayName": "scope order"},
-            }),
             Self::CreateAuthorizationCredential(auth_type) => json!({
                 "app": SUPPORTED_APP,
                 "authType": auth_type,
                 "credential": mismatched_credential(auth_type),
                 "tenant": {"tenantIdentifier": TENANT, "tenantDisplayName": "scope order"},
             }),
-            Self::CreateIngestionApp(app) => json!({
+            Self::CreateIngestionWithoutAuthorization(app) => json!({
                 "app": app,
                 "tenantId": TENANT,
                 "ingestionType": "auditLog",
@@ -167,12 +172,13 @@ impl Faulty {
     }
 
     /// The sentence the operation refuses this body with INSIDE a bundle that
-    /// resolves: the application that was asked for for the `app` rule, and the
-    /// credential kind the authorization type requires for the pairing rule.
+    /// resolves: the credential kind the authorization type requires for the
+    /// pairing rule, and the value-free precondition sentence for the ingestion
+    /// whose pair is not authorized.
     fn expected_validation_message(self) -> String {
         match self {
-            Self::CreateAuthorizationApp(app) | Self::CreateIngestionApp(app) => {
-                format!("app {app} is not supported")
+            Self::CreateIngestionWithoutAuthorization(_) => {
+                AUTHORIZATION_NOT_FOUND_MESSAGE.to_string()
             }
             Self::CreateAuthorizationCredential(auth_type)
             | Self::UpdateAuthorizationCredential(auth_type) => format!(
@@ -182,26 +188,25 @@ impl Faulty {
         }
     }
 
-    /// The member the refusal names in its `fieldList`.
-    fn expected_field(self) -> &'static str {
+    /// The member the refusal names in its `fieldList`, where a member of the
+    /// request is what is at fault; a refusal the STORE decides faults none.
+    fn expected_field(self) -> Option<&'static str> {
         match self {
-            Self::CreateAuthorizationApp(_) | Self::CreateIngestionApp(_) => "app",
+            Self::CreateIngestionWithoutAuthorization(_) => None,
             Self::CreateAuthorizationCredential(_) | Self::UpdateAuthorizationCredential(_) => {
-                "credential"
+                Some("credential")
             }
         }
     }
 }
 
-/// Every faulty request the table spans: each unsupported application name
-/// against both owners of the `app` rule, and the credential pairing for each of
-/// the model's two `AuthType` values plus the update that judges it against the
-/// stored record.
+/// Every faulty request the table spans: the credential pairing for each of the
+/// model's two `AuthType` values plus the update that judges it against the
+/// stored record, and an unauthorized ingestion for each application name.
 fn faulty_requests(stored_auth_type: &'static str) -> Vec<Faulty> {
     let mut rows = Vec::new();
-    for app in UNSUPPORTED_APPS {
-        rows.push(Faulty::CreateAuthorizationApp(app));
-        rows.push(Faulty::CreateIngestionApp(app));
+    for app in APPS {
+        rows.push(Faulty::CreateIngestionWithoutAuthorization(app));
     }
     for auth_type in ["apiKey", "oauth2"] {
         rows.push(Faulty::CreateAuthorizationCredential(auth_type));
@@ -427,10 +432,9 @@ async fn inside_a_resolving_app_bundle_the_body_rule_is_what_refuses() {
                 .and_then(|list| list.first())
                 .and_then(|entry| entry.get("name"))
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
+                .map(str::to_string);
             assert_eq!(
-                field,
+                field.as_deref(),
                 faulty.expected_field(),
                 "case {case:?}: expected the refusal to name {:?}, got {field:?} in body {}",
                 faulty.expected_field(),

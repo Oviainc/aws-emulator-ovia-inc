@@ -6,15 +6,17 @@
 //! delete is a write against the same store `CreateAppAuthorization` wrote the
 //! record into.
 //!
-//! The operation is `@idempotent`, so a delete of an authorization the bundle no
-//! longer holds changes nothing and still answers 204 — the end state the caller
-//! asked for is already the state of the store. That is this service's recorded
-//! answer on a delete path whose target it does not hold (the sibling
-//! `DeleteIngestion`, whose recorded no-op this mirrors), so the modelled
-//! `ResourceNotFoundException` is reserved for the PARENT of the path: an app
-//! bundle that does not exist is a resource in its own right, and this operation
-//! declares that error (the sibling `GetAppAuthorization` and
-//! `ListAppAuthorizations` answer an unknown bundle the same way).
+//! The operation is `@idempotent`, which makes a REPEATED delete of one record
+//! have the effect of one delete — it does not make a target the bundle never
+//! held a success: an app-authorization identifier this bundle does not hold
+//! resolves to no resource, so the call is refused with the modelled
+//! `ResourceNotFoundException` (HTTP 404) reporting the `AppAuthorization`, the
+//! same way the sibling `GetAppAuthorization` and `UpdateAppAuthorization`
+//! refuse it, and a caller can tell a delete it performed from one it did not.
+//! The PARENT of the path refuses first and on its own terms: an app bundle that
+//! does not exist is a resource in its own right, so an identifier naming no
+//! stored bundle is refused as the `AppBundle` whatever the authorization
+//! identifier beside it names.
 //!
 //! AWS documents one precondition for this call — "You must delete the associated
 //! ingestion before you can delete an app authorization" — so an authorization
@@ -190,20 +192,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // ONE lookup of the record, by either `Identifier` form. @idempotent: a
-        // target this bundle does not hold leaves the store in exactly the state
-        // the request asks for, so nothing is written and the call succeeds.
+        // ONE lookup of the record, by either `Identifier` form. An identifier
+        // this bundle holds no authorization for resolves to no resource, so
+        // nothing is written and the call is refused as that resource — being
+        // `@idempotent` makes a repeat of a delete that DID happen harmless, not
+        // a target that never existed deleted.
         let Some(authorization) =
             bundle.resolve_app_authorization(&input.app_authorization_identifier)
         else {
-            crate::state::audit_resource_change(
-                ctx.parts(),
-                Self::NAME,
-                "AppAuthorization",
-                &input.app_authorization_identifier,
-                "already absent",
-            );
-            return Ok(DeleteAppAuthorizationOutput {});
+            return Err(DeleteAppAuthorizationErrorModeled::ResourceNotFoundException(
+                crate::state::app_authorization_not_found(&input.app_authorization_identifier),
+            )
+            .into());
         };
         // Read off the record the lookup resolved: its own key, so the remove
         // below cannot name anything else, and the (application, tenant) pair

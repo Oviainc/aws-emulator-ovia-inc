@@ -15,8 +15,8 @@
 //! identically.
 //!
 //! The table spans the class rather than one recorded call: applications from
-//! the model's own `app` list (`state::SUPPORTED_APPS`, which the issue's own
-//! application is only one row of), tenant identifiers of several forms and
+//! the model's own `app` list (of which the issue's own application is only one
+//! row), tenant identifiers of several forms and
 //! sizes (a word, a uuid, a host name, and one near the modelled 1024-character
 //! bound), crossed with every way a pair can lack a connected authorization —
 //! nothing authorized at all, a connected authorization for another tenant of
@@ -28,7 +28,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_appfabric_fabricfrontendservice::state::{
-    APP_AUTHORIZATION_STATUS_CONNECTED, APP_AUTHORIZATION_STATUS_PENDING_CONNECT, SUPPORTED_APPS,
+    APP_AUTHORIZATION_STATUS_CONNECTED, APP_AUTHORIZATION_STATUS_PENDING_CONNECT,
 };
 
 use crate::app_bundle_ingestion_lifecycle::{arn_of, encode, uuid_of, Answer, Emulator};
@@ -304,8 +304,8 @@ async fn the_ingestion_dependency_refusal_carries_the_services_fixed_sentence() 
         ),
         (
             // The application the recorded run carried is ONE row of this table.
-            "the first supported application, nothing authorized",
-            SUPPORTED_APPS[0],
+            "an application the model's own `app` list names, nothing authorized",
+            "SLACK",
             "tenant-first",
             Setup::Nothing,
         ),

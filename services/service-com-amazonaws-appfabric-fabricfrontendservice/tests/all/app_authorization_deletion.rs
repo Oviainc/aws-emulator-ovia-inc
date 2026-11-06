@@ -6,9 +6,11 @@
 //! Each test states a RULE over a TABLE of inputs rather than one recorded call:
 //!
 //! * a delete removes exactly the app authorization its identifier names from
-//!   the bundle that owns it, in either identifier form, and repeating the call
-//!   changes nothing further (`@idempotent`);
-//! * a delete of a target the named bundle does not hold is a no-op success;
+//!   the bundle that owns it, in either identifier form, and the repeat of that
+//!   call finds the target gone (`@idempotent` makes the repeat harmless, not
+//!   silent);
+//! * a delete of a target the named bundle does not hold is the modelled
+//!   `ResourceNotFoundException`;
 //! * an app bundle that does not exist is the modelled `ResourceNotFoundException`;
 //! * the one precondition the operation documents — the associated ingestion must
 //!   be deleted first — is refused with the modelled `ValidationException`, and
@@ -284,8 +286,10 @@ pub(crate) async fn bundle_with_authorizations(
 
 /// RULE: deleting an app authorization removes exactly the record its identifier
 /// names from the bundle that owns it — the reader no longer reports it, every
-/// sibling survives in creation order — and, the operation being `@idempotent`,
-/// repeating the call answers HTTP 204 again without changing anything further.
+/// sibling survives in creation order — and the SAME call repeated finds nothing
+/// left to delete, so it is refused HTTP 404 `ResourceNotFoundException` and
+/// still changes nothing (`@idempotent` bounds the EFFECT of a repeat, it does
+/// not report an absent target as deleted).
 ///
 /// The table spans how many authorizations the bundle holds, which one is deleted
 /// (first, middle, last), whether they completed the connect handshake and the
@@ -374,9 +378,15 @@ async fn deleting_an_app_authorization_removes_exactly_that_authorization() {
         )
         .await;
         assert_eq!(
-            again.status, 204,
-            "case {case:?}: a repeated delete is idempotent, got {} with body {}",
+            again.status, 404,
+            "case {case:?}: a repeated delete must find the target gone, got {} with body {}",
             again.status, again.body
+        );
+        assert_eq!(
+            again.error_code(),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException on the repeat, got {}",
+            again.body
         );
         let listed = authorization_arns(&emulator, &bundle, case).await;
         assert_eq!(
@@ -386,12 +396,15 @@ async fn deleting_an_app_authorization_removes_exactly_that_authorization() {
     }
 }
 
-/// RULE: a delete whose target the named bundle does not hold is a SUCCESS that
-/// changes nothing (`@idempotent`: the store is already in the state the request
-/// asks for), whichever form the absent identifier takes and whether it is
-/// unknown altogether or names a resource living under a different parent.
+/// RULE: a delete whose target the named bundle does not hold resolves to no
+/// resource, so it is refused with the modelled `ResourceNotFoundException`
+/// (HTTP 404) reporting the `AppAuthorization` — the identifier the caller
+/// supplied in `resourceId`, the service's fixed not-found sentence as the
+/// message — and changes nothing, whichever form the absent identifier takes and
+/// whether it is unknown altogether or names a resource living under a different
+/// parent.
 #[tokio::test]
-async fn deleting_an_app_authorization_the_bundle_does_not_hold_is_a_noop_success() {
+async fn deleting_an_app_authorization_the_bundle_does_not_hold_is_not_found() {
     let emulator = Emulator::new();
     let (bundle, authorizations) =
         bundle_with_authorizations(&emulator, 0, 2, false, "set-up").await;
@@ -428,16 +441,32 @@ async fn deleting_an_app_authorization_the_bundle_does_not_hold_is_a_noop_succes
         let answer =
             delete_authorization(&emulator, &bundle_identifier, &authorization_identifier).await;
         assert_eq!(
-            answer.status, 204,
-            "case {case:?}: expected HTTP 204, got {} with body {}",
+            answer.status, 404,
+            "case {case:?}: expected HTTP 404, got {} with body {}",
             answer.status, answer.body
         );
-        assert!(
-            answer
-                .body
-                .as_object()
-                .is_none_or(serde_json::Map::is_empty),
-            "case {case:?}: a 204 carries no response members, got {}",
+        assert_eq!(
+            answer.error_code(),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {}",
+            answer.body
+        );
+        assert_eq!(
+            answer.body.get("message").and_then(Value::as_str),
+            Some("The app authorization was not found."),
+            "case {case:?}: expected the service's fixed not-found sentence, got {}",
+            answer.body
+        );
+        assert_eq!(
+            answer.body.get("resourceType").and_then(Value::as_str),
+            Some("AppAuthorization"),
+            "case {case:?}: expected resourceType AppAuthorization, got {}",
+            answer.body
+        );
+        assert_eq!(
+            answer.body.get("resourceId").and_then(Value::as_str),
+            Some(authorization_identifier.as_str()),
+            "case {case:?}: expected the supplied identifier in resourceId, got {}",
             answer.body
         );
 
@@ -733,8 +762,8 @@ async fn deleting_an_app_authorization_with_an_associated_ingestion_is_refused()
 /// resource and the outcome — and no caller-supplied content (a tenant
 /// identifier, a tenant display name).
 ///
-/// The two outcomes a successful delete has are both covered: the removal of a
-/// stored record, and the idempotent no-op for a target the bundle does not hold.
+/// A call it REFUSES carries nothing out, so it writes no record: the records
+/// this test reads back are the deletes that happened.
 #[tokio::test]
 async fn deleting_an_app_authorization_writes_an_audit_record() {
     let captured = audit_capture();
@@ -764,8 +793,8 @@ async fn deleting_an_app_authorization_writes_an_audit_record() {
     );
     let again = delete_authorization(&emulator, &bundle, &absent).await;
     assert_eq!(
-        again.status, 204,
-        "case {case:?}: expected HTTP 204 for an absent target, got {} with body {}",
+        again.status, 404,
+        "case {case:?}: expected HTTP 404 for an absent target, got {} with body {}",
         again.status, again.body
     );
 
@@ -781,10 +810,8 @@ async fn deleting_an_app_authorization_writes_an_audit_record() {
         .collect();
 
     // (case, the resource id the record names, the outcome)
-    let cases: Vec<(&str, &str, &str)> = vec![
-        ("a deleted app authorization", &authorization_id, "deleted"),
-        ("a delete of an absent one", &absent, "already absent"),
-    ];
+    let cases: Vec<(&str, &str, &str)> =
+        vec![("a deleted app authorization", &authorization_id, "deleted")];
     for (row, resource_id, outcome) in &cases {
         let matching: Vec<&String> = records
             .iter()
@@ -808,7 +835,8 @@ async fn deleting_an_app_authorization_writes_an_audit_record() {
     assert_eq!(
         records.len(),
         cases.len(),
-        "case {case:?}: expected one audit record per delete, got {records:?}"
+        "case {case:?}: expected one audit record for the delete that happened and none for the \
+         refused one, got {records:?}"
     );
     for record in &records {
         assert!(
