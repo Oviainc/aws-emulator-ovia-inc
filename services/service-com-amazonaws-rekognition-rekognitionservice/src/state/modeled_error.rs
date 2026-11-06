@@ -149,3 +149,36 @@ pub fn resource_arn_not_found(resource_arn: &str) -> ResourceNotFoundException {
 pub fn no_face_in_image() -> InvalidParameterException {
     InvalidParameterException::with_message(NO_FACE_IN_IMAGE_MESSAGE)
 }
+
+/// A `UserId` the named collection already holds, as `CreateUser` refuses it: the
+/// request's own id between two pieces of fixed text, worded the way this service words
+/// the same class for a collection id a create repeats ("The collection id: … already
+/// exists"), since both say "the id you asked to create is taken".
+///
+/// The class is `ConflictException`, which this API models for exactly this: "A User
+/// with the same Id already exists within the collection"
+/// (`smithy_query(query="doc",shape="ConflictException")`).
+pub fn user_id_already_exists(user_id: &str) -> ConflictException {
+    ConflictException::with_message(format!("The user id: {user_id} already exists"))
+}
+
+/// The fixed text an idempotency-token reuse is refused with.
+///
+/// It describes none of the request, and it does not restate the rule — "a
+/// `ClientRequestToken` input parameter was reused with an operation, but at least one
+/// of the other input parameters is different from the previous call" is what the
+/// exception SHAPE documents
+/// (`smithy_query(query="doc",shape="IdempotentParameterMismatchException")`), not what
+/// the service puts in `Message`. This is the `Message` a recorded AWS `CreateUser`
+/// refusal of a reused token carries verbatim (the recorded exchange this refusal was
+/// implemented against, `rekognition.create-user-idempotent-token-mismatch-rejected`),
+/// and the wire message is part of the contract, so the service answers what AWS
+/// answers rather than a better-worded sentence of its own. It interpolates nothing:
+/// the caller sent both requests and so already holds every value that differs.
+pub const IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE: &str = "Service Unavailable";
+
+/// A `ClientRequestToken` reused for a request that differs from the one it already
+/// committed; one wording for every operation that takes one, since the rule is one.
+pub fn idempotent_parameter_mismatch() -> IdempotentParameterMismatchException {
+    IdempotentParameterMismatchException::with_message(IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE)
+}

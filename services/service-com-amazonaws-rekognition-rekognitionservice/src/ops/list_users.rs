@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListUsers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListUsers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the users of an existing collection of this service's store, a page at a
+//! time: what `CreateUser` recorded is all this answers with, so a user that was never
+//! created is never reported.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListUsers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The page is cut out of the collection's own total order over its user ids, which is
+//! deterministic and is what lets a `NextToken` resume exactly where the previous page
+//! ended whatever is created or deleted in between. (The documented "system generated
+//! primary key ID" the real service sorts by is reported by no operation of this API —
+//! a `UserId` aliases it — so the order a caller can observe is the one over the ids
+//! themselves.) `MaxResults` caps the page; a token this list did not mint names no
+//! position and is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +165,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListUsers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListUsersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListUsers"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListUsersErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
+        })?;
+        let state = state.lock();
+
+        let collection = state.collections.get(&input.collection_id).ok_or_else(|| {
+            ListUsersErrorModeled::ResourceNotFoundException(
+                crate::state::modeled_error::collection_id_does_not_exist(&input.collection_id),
+            )
+        })?;
+
+        // A cursor carries the id of the first user of the page it names, so a page
+        // resumes at the right position whatever was created or deleted in between.
+        let start_at = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                crate::state::decode_cursor(crate::state::USERS_CURSOR_SCOPE, token).ok_or_else(
+                    || {
+                        ListUsersErrorModeled::InvalidPaginationTokenException(
+                            crate::state::modeled_error::invalid_pagination_token(),
+                        )
+                    },
+                )?,
+            ),
+        };
+
+        let page_size = crate::state::users_page_size(input.max_results);
+        // The store is ordered by user id, so a cursor resumes by SEEKING to the id it
+        // names rather than walking past the users before it.
+        let mut remaining = collection
+            .users
+            .range(start_at.unwrap_or_default()..)
+            .map(|(_, user)| user);
+
+        let page: Vec<User> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::StoredUser::modeled)
+            .collect();
+
+        // A `NextToken` only where a further page exists, so a caller following the
+        // tokens stops exactly once every user has been reported.
+        let next_token = remaining
+            .next()
+            .map(|user| crate::state::encode_cursor(crate::state::USERS_CURSOR_SCOPE, &user.user_id));
+
+        Ok(ListUsersOutput {
+            users: Some(page),
+            next_token,
+        })
     }
 }

@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Records a new user in an existing collection of this service's store, keyed by the
+//! `UserId` the caller supplied, and answers with nothing — the stored record is what
+//! `ListUsers` reports and what `DescribeCollection` counts, so nothing is answered
+//! here without being persisted first.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The call is IDEMPOTENT on its `ClientRequestToken`: the token is remembered beside
+//! the request it committed (see [`crate::state::idempotency`]), so the same token sent
+//! again with the same collection and user completes the create only once, and the same
+//! token sent with a different request is refused with the modelled
+//! `IdempotentParameterMismatchException`. A token is remembered only once the request
+//! has been carried out, so a refused create leaves the caller free to send it again.
+//!
+//! A `UserId` the collection already holds, reached WITHOUT the token that committed
+//! it, is a duplicate rather than an update: it is refused with `ConflictException`,
+//! leaving the live user and the faces associated with it alone.
 //!
 //! ## Shape of an operation
 //!
@@ -93,6 +99,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// Every modelled error this handler answers with is built through this trait, so each
+// one carries its `Code` member beside its `Message`.
+use crate::state::modeled_error::ModeledError;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -169,18 +179,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUser"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateUserErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+
+        // A user lives IN a collection, so the collection has to exist before anything
+        // about the user is read or written; this is the wording the operations on the
+        // contents of a collection refuse an absent one with.
+        if !state.collections.contains_key(&input.collection_id) {
+            return Err(CreateUserErrorModeled::ResourceNotFoundException(
+                crate::state::modeled_error::collection_id_does_not_exist(&input.collection_id),
+            )
+            .into());
+        }
+
+        // What the token committed, if it committed anything: the request's own
+        // parameters beyond the token itself, which is what a reuse is compared against.
+        let parameters = [
+            ("CollectionId", input.collection_id.as_str()),
+            ("UserId", input.user_id.as_str()),
+        ];
+        let token_use = input.client_request_token.as_deref().map_or(
+            crate::state::idempotency::TokenUse::First,
+            |token| {
+                state
+                    .client_request_tokens
+                    .classify(Self::NAME, token, &parameters)
+            },
+        );
+        if token_use == crate::state::idempotency::TokenUse::Mismatch {
+            return Err(CreateUserErrorModeled::IdempotentParameterMismatchException(
+                crate::state::modeled_error::idempotent_parameter_mismatch(),
+            )
+            .into());
+        }
+
+        let Some(collection) = state.collections.get_mut(&input.collection_id) else {
+            // The collection was there a moment ago, under this same lock, so this
+            // cannot be reached; resolving it again rather than unwrapping keeps the
+            // handler free of any construct a request could panic on.
+            return Err(CreateUserErrorModeled::ResourceNotFoundException(
+                crate::state::modeled_error::collection_id_does_not_exist(&input.collection_id),
+            )
+            .into());
+        };
+
+        // A create the caller is RETRYING under the token that committed it completes
+        // only once: it is not a second create of the same id, so it is not the
+        // conflict below, and the user it already recorded is left exactly as it is.
+        // Should that user have been removed since, the retry records it again rather
+        // than answering a success nothing in the store backs.
+        let retried = token_use == crate::state::idempotency::TokenUse::Retry;
+        if !retried && collection.users.contains_key(&input.user_id) {
+            return Err(CreateUserErrorModeled::ConflictException(
+                crate::state::modeled_error::user_id_already_exists(&input.user_id),
+            )
+            .into());
+        }
+
+        if !collection.users.contains_key(&input.user_id) {
+            // The store is held in memory, so a collection has a user capacity: past it
+            // a create is refused with the modelled quota error rather than allowed to
+            // grow the process without limit. The check precedes the write, so a
+            // refused request stores nothing and commits no token.
+            if collection.users.len() >= crate::state::MAX_USERS_PER_COLLECTION {
+                return Err(CreateUserErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException::with_message(format!(
+                        "The maximum number of users ({}) in collection {} has been reached",
+                        crate::state::MAX_USERS_PER_COLLECTION, input.collection_id
+                    )),
+                )
+                .into());
+            }
+            collection.users.insert(
+                input.user_id.clone(),
+                crate::state::StoredUser::new(input.user_id.clone()),
+            );
+        }
+
+        if let Some(token) = input.client_request_token.as_deref() {
+            state
+                .client_request_tokens
+                .commit(Self::NAME, token, &parameters);
+        }
+
+        // `CreateUserResponse` models no members: the answer to a create that was
+        // carried out is the bare success, and the user itself is read back through
+        // `ListUsers`.
+        Ok(CreateUserOutput {})
     }
 }

@@ -47,6 +47,7 @@
 //! graded score — see its own module docs.
 
 pub mod face_detection;
+pub mod idempotency;
 pub mod image_source;
 pub mod modeled_error;
 
@@ -56,7 +57,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::{BoundingBox, Face, Image, ProjectDescription};
+use crate::ops::types::{BoundingBox, Face, Image, ProjectDescription, User};
 
 /// The region an emulated request is treated as having been made in when its
 /// SigV4 credential scope does not name one (an unsigned or anonymous request).
@@ -137,6 +138,25 @@ pub const PROJECT_STATUS_CREATED: &str = "CREATED";
 pub const MAX_COLLECTIONS: usize = 100;
 pub const MAX_FACES_PER_COLLECTION: usize = 1_000;
 
+/// How many users one collection will hold before a create is refused with the
+/// modelled `ServiceQuotaExceededException`. The same reasoning as
+/// [`MAX_FACES_PER_COLLECTION`]: this store is the emulator's memory, so a caller
+/// repeating `CreateUser` is refused rather than allowed to grow the process without
+/// limit, and the modelled error is the one AWS answers past its own quota.
+pub const MAX_USERS_PER_COLLECTION: usize = 1_000;
+
+/// The `UserStatus` a user carries from the moment `CreateUser` records it.
+///
+/// `UserStatus` "communicates if the UserID has been updated with latest set of faces
+/// to be associated with the UserID"
+/// (`smithy_query(query="shape",shape="User")`), and its values are
+/// ACTIVE | UPDATING | CREATING | CREATED
+/// (`smithy_query(query="shape",shape="UserStatus")`). A user `CreateUser` has just
+/// recorded is created and has no face associated with it yet, which is `CREATED`; the
+/// other values belong to transitions `AssociateFaces` and `DisassociateFaces` start,
+/// and neither is implemented yet.
+pub const USER_STATUS_CREATED: &str = "CREATED";
+
 /// How many tags one resource of this store will hold: the top of the modelled `TagMap`
 /// length range (`length 0..200`,
 /// `smithy_query(query="operation",operation="TagResource")`), which is also AWS's own
@@ -173,8 +193,8 @@ pub struct StoredFace {
     /// The user this face is associated with, set by `AssociateFaces` (not yet
     /// implemented), so it is `None` for every face this slice stores. It is carried
     /// here, and honoured by `ListFaces`' `UserId` filter and `DeleteFaces`'
-    /// `ASSOCIATED_TO_AN_EXISTING_USER` refusal, as pre-wiring for the user slice:
-    /// those two paths cannot be reached until `CreateUser`/`AssociateFaces` exist.
+    /// `ASSOCIATED_TO_AN_EXISTING_USER` refusal, as pre-wiring for the rest of the user
+    /// slice: a user exists (`CreateUser`) but nothing associates a face with one yet.
     pub user_id: Option<String>,
     /// The digest of the image content this face was indexed from: what lets
     /// `SearchFaces` tell whether two stored faces came from the same image.
@@ -205,13 +225,39 @@ impl StoredFace {
 }
 
 /// One user of a collection, as created by `CreateUser` and populated by
-/// `AssociateFaces` — neither implemented yet, so `DescribeCollection` computes a
-/// `UserCount` of zero from this map rather than reporting a constant.
+/// `AssociateFaces` (not implemented yet, so `face_ids` is empty for every user this
+/// slice stores).
 #[derive(Debug, Clone)]
 pub struct StoredUser {
+    /// `CreateUser.UserId` — the caller's own id for the user and the collection's key
+    /// for it, unique within the collection.
     pub user_id: String,
+    /// The user's `UserStatus`; see [`USER_STATUS_CREATED`].
     pub user_status: String,
+    /// The faces `AssociateFaces` has associated with this user, by their `FaceId`.
     pub face_ids: Vec<String>,
+}
+
+impl StoredUser {
+    /// A user as `CreateUser` records it: created, with no face associated with it,
+    /// since a face is associated by its own operation.
+    pub fn new(user_id: String) -> Self {
+        Self {
+            user_id,
+            user_status: USER_STATUS_CREATED.to_string(),
+            face_ids: Vec::new(),
+        }
+    }
+
+    /// This user as the modelled `User`: the id it was created under and the status it
+    /// currently carries, which are the only two members the shape has
+    /// (`smithy_query(query="shape",shape="User")`).
+    pub fn modeled(&self) -> User {
+        User {
+            user_id: Some(self.user_id.clone()),
+            user_status: Some(self.user_status.clone()),
+        }
+    }
 }
 
 /// One stored face collection: what `CreateCollection` was given, the ARN and
@@ -226,6 +272,9 @@ pub struct Collection {
     /// Insertion-ordered: `FaceCount` is its length and `ListFaces` reports it in
     /// this order.
     pub faces: Vec<StoredFace>,
+    /// Every user of the collection, keyed by its `UserId`. A `BTreeMap` so
+    /// `ListUsers`' order, and therefore its pagination, is deterministic. Bounded by
+    /// [`MAX_USERS_PER_COLLECTION`].
     pub users: BTreeMap<String, StoredUser>,
     /// The sequence number the next indexed face takes.
     pub next_sequence: u64,
@@ -341,6 +390,11 @@ pub struct ComAmazonawsRekognitionRekognitionserviceState {
     /// `collections`: `DescribeProjects`' order, and therefore its pagination, is
     /// deterministic. Bounded by [`MAX_PROJECTS`].
     pub projects: BTreeMap<String, Project>,
+    /// What each idempotency token this service has seen committed, so a retried
+    /// request completes only once and a token reused for a different request is
+    /// refused. Service-wide rather than per collection: a token names a REQUEST, and
+    /// the request's own collection is one of the parameters compared.
+    pub client_request_tokens: idempotency::TokenLedger,
 }
 
 impl ComAmazonawsRekognitionRekognitionserviceState {
@@ -498,6 +552,7 @@ pub fn project_arn(region: &str, project_name: &str, creation_timestamp: SystemT
 pub const FACES_CURSOR_SCOPE: &str = "faces";
 pub const COLLECTIONS_CURSOR_SCOPE: &str = "collections";
 pub const PROJECTS_CURSOR_SCOPE: &str = "projects";
+pub const USERS_CURSOR_SCOPE: &str = "users";
 
 /// The pagination cursor of the `scope` list for a page that starts at `key`.
 ///
@@ -568,6 +623,22 @@ pub fn projects_page_size(requested: Option<i32>) -> usize {
         usize::try_from(max)
             .unwrap_or(1)
             .clamp(1, PROJECTS_PAGE_SIZE_MAX)
+    })
+}
+
+/// The largest page `ListUsers` serves, and the one it serves when the caller sends no
+/// `MaxResults`: the top of the modelled `MaxUserResults` range (`range 1..500`,
+/// `smithy_query(query="operation",operation="ListUsers")`). The model documents no
+/// other default, and the range's floor of 1 means a users page is never empty while
+/// users remain.
+pub const USERS_PAGE_SIZE_MAX: usize = 500;
+
+/// The page size a `MaxResults` of `requested` asks `ListUsers` for, held inside the
+/// modelled range — which the boundary validator has already enforced, so this only
+/// keeps the page size a page size for a value that reached here anyway.
+pub fn users_page_size(requested: Option<i32>) -> usize {
+    requested.map_or(USERS_PAGE_SIZE_MAX, |max| {
+        usize::try_from(max).unwrap_or(1).clamp(1, USERS_PAGE_SIZE_MAX)
     })
 }
 
