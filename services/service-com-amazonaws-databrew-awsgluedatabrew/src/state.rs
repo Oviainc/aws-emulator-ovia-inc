@@ -18,7 +18,8 @@ use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Dataset, FormatOptions, Input, JobRun, Output, PathOptions, RecipeReference, RecipeStep, Sample,
+    Dataset, FormatOptions, Input, JobRun, Output, PathOptions, Recipe, RecipeReference, RecipeStep,
+    Sample,
 };
 
 /// The resource kinds DataBrew states a refusal about in its SHORT form: the kind, the
@@ -854,6 +855,85 @@ impl RecipeRecord {
         self.published
             .retain(|held| !versions.contains(&held.version));
         self.renumber_working();
+    }
+
+    /// The version `held` of this recipe as the modelled `Recipe` a listing carries.
+    ///
+    /// A `Recipe` item is one VERSION of a recipe (model: `Recipe$RecipeVersion`), so
+    /// the definition members and the audit are the version's own — the same values
+    /// `DescribeRecipe` answers for that version — while the members that belong to the
+    /// recipe as a whole (its name, its ARN, its tags and the project it is attached to)
+    /// are the record's, whichever of its versions is reported.
+    pub fn version_to_wire(&self, held: &RecipeVersionRecord) -> Recipe {
+        Recipe {
+            created_by: Some(held.audit.created_by.clone()),
+            create_date: Some(wire_date(held.audit.create_date)),
+            // Absent until a mutating operation has modified this version.
+            last_modified_by: held.audit.wire_last_modified_by(),
+            last_modified_date: held.audit.wire_last_modified_date(),
+            project_name: self.project_name.clone(),
+            // Absent on a version no publish has frozen.
+            published_by: held.published_by.clone(),
+            published_date: held.published_date.map(wire_date),
+            description: held.description.clone(),
+            name: self.name.clone(),
+            resource_arn: Some(self.resource_arn.clone()),
+            steps: Some(held.steps.clone()),
+            tags: wire_tags(&self.tags),
+            recipe_version: Some(held.version.clone()),
+        }
+    }
+
+    /// One page of the versions this recipe holds PUBLISHED, oldest first, from
+    /// `resume_after` onwards.
+    ///
+    /// The published history is kept oldest first and numbered by increasing major
+    /// version ([`RecipeRecord::publish`]), so the page walks it in version order and
+    /// the returned token names the version this page ENDED on — the same contract
+    /// [`page_map`] gives a name-keyed store, so a resumed call carries on at the next
+    /// version rather than restarting. A token naming a version a later delete removed
+    /// still resumes at the next version held, because the walk compares version
+    /// numbers rather than positions.
+    pub fn page_published_versions(
+        &self,
+        resume_after: Option<&str>,
+        page_size: usize,
+    ) -> Page<Recipe> {
+        let after = resume_after.map(version_order);
+        let mut remaining = self
+            .published
+            .iter()
+            .filter(|held| after.is_none_or(|after| version_order(&held.version) > after));
+
+        let mut items = Vec::new();
+        let mut last_version: Option<String> = None;
+        for held in remaining.by_ref().take(page_size) {
+            items.push(self.version_to_wire(held));
+            last_version = Some(held.version.clone());
+        }
+
+        Page {
+            items,
+            next_token: match (remaining.next().is_some(), last_version) {
+                (true, Some(version)) => Some(encode_page_token(&version)),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// A version identifier as the pair that ORDERS it against another: the major and
+/// minor halves of a numeric `X.Y` version (model: `Recipe$RecipeVersion`).
+///
+/// An identifier that is not numeric — an alias, or a half too long to be a version
+/// number — orders after every numeric one, so it never silently sorts among them.
+fn version_order(version: &str) -> (u64, u64) {
+    match version.split_once('.') {
+        Some((major, minor)) => (
+            major.parse().unwrap_or(u64::MAX),
+            minor.parse().unwrap_or(u64::MAX),
+        ),
+        None => (u64::MAX, u64::MAX),
     }
 }
 

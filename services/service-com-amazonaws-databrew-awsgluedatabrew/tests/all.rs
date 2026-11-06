@@ -35,6 +35,8 @@ mod recipe_lifecycle;
 mod recipe_publishing;
 #[path = "all/recipe_version_batch_delete.rs"]
 mod recipe_version_batch_delete;
+#[path = "all/recipe_version_listing.rs"]
+mod recipe_version_listing;
 #[path = "all/recipe_version_resolution.rs"]
 mod recipe_version_resolution;
 #[path = "all/recipe_working_update.rs"]
