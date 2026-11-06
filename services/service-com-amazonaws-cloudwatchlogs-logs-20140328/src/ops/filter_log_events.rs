@@ -4,7 +4,9 @@
 //! Implemented: answers the stored events of one log group that a `filterPattern`, a time
 //! range and a log-stream selector all admit, interleaved across the group's streams in the
 //! store's own event order, each one carrying the SAME `eventId` a subscription filter
-//! delivers it under ([`crate::state::subscription_delivery::event_id`]).
+//! delivers it under ([`crate::state::subscription_delivery::event_id`]), beside the
+//! `searchedLogStreams` the search reports and the `searchStatistics` counts of it
+//! ([`SearchStatistics`]), resumable from a `nextToken` while a page still carries events.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -194,24 +196,15 @@ const CURSOR_KIND: &str = "FilterLogEvents";
 /// separators the wire form adds around them belong to no event.
 const MAX_PAGE_BYTES: usize = 1_048_576;
 
-/// The instant a descending scan is supported from: "Setting startFromHead to false is
-/// supported only when startTime is on or after Jan 1, 2024 00:00:00 UTC", which is that
-/// instant in the milliseconds every timestamp member here is expressed in.
-const DESCENDING_SCAN_EPOCH_MS: i64 = 1_704_067_200_000;
-
 /// The refusal for a request that names both log-stream selectors: "If you specify a value
 /// for both logStreamNames and logStreamNamePrefix, the action returns an
-/// InvalidParameterException error" (`FilterLogEventsRequest$logStreamNames`). Worded like
-/// the service's other exclusive-pair sentence
-/// ([`crate::state::LOG_GROUP_SELECTORS_EXCLUSIVE`]), naming the two members the request
-/// spells.
+/// InvalidParameterException error" (`FilterLogEventsRequest$logStreamNames`). The service
+/// words this one as a call it cannot make, naming the operation and the two members the
+/// request spelled — not as the exclusive-pair sentence its log-group selectors use
+/// ([`crate::state::LOG_GROUP_SELECTORS_EXCLUSIVE`]) — which is how the recorded refusal of
+/// this pair reads.
 const STREAM_SELECTORS_EXCLUSIVE: &str =
-    "logStreamNames and logStreamNamePrefix are mutually exclusive parameters.";
-
-/// The refusal for a descending scan started before [`DESCENDING_SCAN_EPOCH_MS`], as
-/// `FilterLogEventsRequest$startFromHead` states the rule.
-const DESCENDING_SCAN_UNSUPPORTED: &str = "Setting startFromHead to false is supported only \
-     when startTime is on or after Jan 1, 2024 00:00:00 UTC.";
+    "Cannot call FilterLogEvents with both logStreamNames and logStreamNamePrefix";
 
 /// The SCAN a page belongs to: the log group, the streams it covers, the time range, the
 /// pattern and the direction. Every page of one pagination walks the same scan, so a
@@ -270,9 +263,10 @@ impl Scan {
 
     /// Whether this scan covers the stream `name`: the named set when the request named
     /// one, the prefixed set when it named a prefix, and every stream of the group when it
-    /// named neither. Both selectors FILTER the results ("Filters the results to only logs
-    /// from the log streams in this list"), so a name the group does not hold simply
-    /// selects nothing.
+    /// named neither. A `logStreamNamePrefix` FILTERS the results ("only events from log
+    /// streams that have names starting with this prefix"), so one no stream carries selects
+    /// nothing; a `logStreamNames` entry NAMES a stream of the group, and one the group does
+    /// not hold is refused before the walk gets here.
     fn covers(&self, name: &str) -> bool {
         if !self.log_stream_names.is_empty() {
             return self.log_stream_names.iter().any(|named| named == name);
@@ -367,7 +361,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for FilterLogEvents<Eng>
 {
     type Input = FilterLogEventsInput;
-    type Output = FilterLogEventsOutput;
+    type Output = FilterLogEventsResult;
     type Error = FilterLogEventsError;
 
     const NAME: &'static str = "FilterLogEvents";
@@ -446,18 +440,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
             ));
         }
-        // "A request with startFromHead set to false and a startTime before this date
-        // returns an InvalidParameterException": the refusal is of the `startTime` the
-        // request CARRIES, so a descending scan that bounds its start at or after that
-        // instant is supported and one that names no `startTime` at all carries no value to
-        // refuse — the sentence names a startTime before the date, not the absence of one.
-        if !scan.forward
-            && scan
-                .start_time
-                .is_some_and(|start| start < DESCENDING_SCAN_EPOCH_MS)
-        {
-            return Err(invalid(DESCENDING_SCAN_UNSUPPORTED.to_string()));
-        }
+        // `FilterLogEventsRequest$startFromHead` documents a descending scan as "supported
+        // only when startTime is on or after Jan 1, 2024 00:00:00 UTC", a restriction the
+        // service does not hold a request to: the recorded answer to exactly that request
+        // shape is the (possibly empty) page over the range the request names. So the
+        // direction is taken as given and no `startTime` is refused for it.
 
         // The pattern is parsed before anything is looked up: a `filterPattern` that does
         // not parse is a bad request, not a search that matches nothing.
@@ -475,6 +462,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // "Filters the results to only logs from the log streams in this list": the list
+        // NAMES log streams of that group, so a name the group does not hold names no log
+        // stream and the search is refused rather than answered over the rest. A
+        // `logStreamNamePrefix` states no name — it selects whichever streams carry it, and
+        // one that selects none simply selects nothing.
+        if scan
+            .log_stream_names
+            .iter()
+            .any(|named| !group.streams.contains_key(named))
+        {
+            return Err(FilterLogEventsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message("log stream")),
+                },
+            )
+            .into());
+        }
 
         // "The returned log events are sorted by event timestamp, the timestamp when the
         // event was ingested by CloudWatch Logs, and the ID of the PutLogEvents request":
@@ -550,25 +555,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "If the results include a nextToken, there might be more log events available
-        // [...] If the results don't include a nextToken, then pagination is finished": the
-        // token resumes at the last event this page carried.
-        let next_token = matched
-            .get(events.len())
-            .and(matched.get(events.len().saturating_sub(1)))
-            .map(|(at, _, _)| {
+        // [...] If the results don't include a nextToken, then pagination is finished", and
+        // "A returned page might only be partially full, or even empty. [...] Partially full
+        // or empty pages don't necessarily mean that pagination is finished": a page that
+        // CARRIED events stopped at the last one it reported and says nothing about what
+        // lies past it, so the search is reported as resumable from there — whether or not
+        // this store already holds a further matched event. A page that carried none has
+        // walked the scan to its end and finishes pagination, which is what ends the walk.
+        let next_token = match events.len() {
+            0 => None,
+            served => matched.get(served - 1).map(|(at, _, _)| {
                 Cursor {
                     scan: scan.clone(),
                     at: *at,
                 }
                 .encode()
-            });
+            }),
+        };
 
-        Ok(FilterLogEventsOutput {
-            events: Some(events),
-            // "As of May 15, 2020, this parameter is no longer supported. This parameter
-            // returns an empty list."
-            searched_log_streams: Some(Vec::new()),
-            next_token,
+        // What the search reports about the log streams it searched: "Indicates which log
+        // streams have been searched and whether each has been searched completely", which
+        // "As of May 15, 2020 [...] is no longer supported. This parameter returns an empty
+        // list." The two counts beside it SUMMARISE that same reporting — how many streams
+        // the search was spread over, and how many of those were searched to completion — so
+        // they are counted off it rather than off the scan, and say what it says: a search
+        // that reports no searched stream reports no count of one either, which is what
+        // every recorded search answers, whatever streams its selection covered. Restoring
+        // the per-stream reporting here is all it would take for both counts to follow it.
+        let searched_log_streams: Vec<SearchedLogStream> = Vec::new();
+        let searched_at_all = searched_log_streams.len();
+        let searched_completely = searched_log_streams
+            .iter()
+            .filter(|searched| searched.searched_completely.unwrap_or(false))
+            .count();
+
+        Ok(FilterLogEventsResult {
+            response: FilterLogEventsOutput {
+                events: Some(events),
+                searched_log_streams: Some(searched_log_streams),
+                next_token,
+            },
+            search_statistics: Some(SearchStatistics {
+                approximate_total_log_stream_count: i32::try_from(searched_at_all)
+                    .unwrap_or(i32::MAX),
+                completed_log_stream_count: i32::try_from(searched_completely)
+                    .unwrap_or(i32::MAX),
+            }),
         })
     }
 }

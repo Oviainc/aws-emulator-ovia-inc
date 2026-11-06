@@ -22,9 +22,12 @@
 //!   exactly N fields; `...` stands for any number of fields, so a list using it matches an
 //!   event of at least as many fields as it names.
 //! * anything else — an unstructured pattern: the terms the message has to carry. A term is
-//!   a bare word, a `"…"` string (which may carry spaces) or a `%…%` regular expression; a
-//!   term prefixed `-` must NOT appear, and a term prefixed `?` is one of the alternatives
-//!   at least one of which must appear. The empty pattern matches every event.
+//!   a bare word of the syntax's word characters, a `"…"` string (which may carry any
+//!   character, including spaces) or a `%…%` regular expression; a term prefixed `-` must
+//!   NOT appear, and a term prefixed `?` is one of the alternatives at least one of which
+//!   must appear. A bare term carrying any other character is invalid rather than text —
+//!   such a term is spelled as a string or an expression. The empty pattern matches every
+//!   event.
 //!
 //! A matching event also yields the values the pattern EXTRACTED from it, keyed the way a
 //! metric filter's dimension values select them (`super::is_log_event_field_reference`): a
@@ -111,6 +114,37 @@ const ELLIPSIS: &str = "...";
 /// answering the same question about the same member.
 const INVALID_PATTERN: &str = "Invalid filter pattern";
 
+/// How the service refuses a TERM of an unstructured pattern that carries a character the
+/// pattern grammar admits nowhere in it: the fixed sentence, naming the term the request
+/// spells. The `"` of a quoted string delimits one — it is not a character a term may
+/// carry — so a quote that opens no quoted string makes the term it sits in unreadable.
+fn invalid_characters_in_term(term: &str) -> String {
+    format!("Invalid character(s) in term '{term}'")
+}
+
+/// The whitespace-delimited run of `characters` starting at `at`: the TERM a `"…"` string
+/// that does not close spells, which is what a refusal names for it — the request's own
+/// text, rather than whatever the reader got through.
+fn term_text(characters: &[char], at: usize) -> String {
+    characters
+        .iter()
+        .skip(at)
+        .take_while(|character| !character.is_whitespace())
+        .collect()
+}
+
+/// Whether `character` may appear in a BARE term of an unstructured pattern: the syntax's
+/// own word characters, which are the alphanumerics and `_`. Everything else — a delimiter,
+/// a punctuation mark, a path separator — is spelled inside a `"…"` string or a `%…%`
+/// regular expression, which is what the syntax gives a term carrying one: the filter and
+/// pattern syntax the `filterPattern` members point at states that a term including
+/// characters other than these is enclosed in double quotes, and the service refuses the
+/// ones that are not (recorded for a quote, a colon and a slash alike). A letter outside
+/// ASCII is still a letter and so is admitted: what the refusals name is the punctuation.
+fn is_term_character(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
 /// A `filterPattern` parsed into the form it is RUN in.
 #[derive(Debug)]
 pub enum FilterPattern {
@@ -189,17 +223,23 @@ impl TermPattern {
         let characters: Vec<char> = pattern.chars().collect();
         let mut parsed = Self::default();
         let mut at = 0usize;
+        // `?` and `-` each PREFIX a term, which is what they are where one starts; inside
+        // a term they are characters the syntax does not admit, so a term that ends before
+        // the whitespace-delimited run it sits in does not make the next character a prefix.
+        let mut starts_a_term = true;
         while let Some(character) = characters.get(at).copied() {
             if character.is_whitespace() {
                 at += 1;
+                starts_a_term = true;
                 continue;
             }
-            let optional = character == '?';
-            let excluded = character == '-';
+            let optional = starts_a_term && character == '?';
+            let excluded = starts_a_term && character == '-';
             if optional || excluded {
                 at += 1;
             }
             let term = read_term(&characters, &mut at)?;
+            starts_a_term = false;
             if optional {
                 parsed.optional.push(term);
             } else if excluded {
@@ -248,33 +288,63 @@ impl Term {
 /// Read one term's body, with `at` on its first character. A `?` or `-` whose body is
 /// EMPTY — at the end of the pattern, or because whitespace follows it — prefixes no term,
 /// and is refused rather than read as a term that every message carries.
+///
+/// A term is a BARE word of the syntax's word characters ([`is_term_character`]), a `"…"`
+/// string or a `%…%` regular expression. A character the syntax admits in none of them — a
+/// punctuation mark, or a quote that opens no string — makes a term of its own, which is
+/// refused as [`invalid_characters_in_term`] naming the run of such characters, because the
+/// syntax spells a term carrying one inside a string or an expression instead.
 fn read_term(characters: &[char], at: &mut usize) -> Result<Term, String> {
     let dangling = || {
         format!("{INVALID_PATTERN}: '?' and '-' each prefix a term, and this one prefixes nothing")
     };
-    match characters.get(*at) {
+    match characters.get(*at).copied() {
+        // Only reachable through a `?` or `-` that prefixes nothing: the pattern's own
+        // walk skips whitespace before reading a term.
         None => Err(dangling()),
-        Some('"') => Ok(Term::Text(read_delimited(
-            characters,
-            at,
-            '"',
-            Escapes::Unescape,
-        )?)),
+        Some(character) if character.is_whitespace() => Err(dangling()),
+        Some('"') => {
+            // A quoted string carries its content straight after the opening delimiter and
+            // closes with another one, so a quote with whitespace or the end of the pattern
+            // after it, and one that never closes, delimit no string: the term at fault is
+            // then the run the pattern spells from that quote on.
+            let opens = *at;
+            if characters
+                .get(*at + 1)
+                .is_none_or(|next| next.is_whitespace())
+            {
+                return Err(invalid_characters_in_term(&term_text(characters, opens)));
+            }
+            read_delimited(characters, at, '"', Escapes::Unescape)
+                .map(Term::Text)
+                .map_err(|_| invalid_characters_in_term(&term_text(characters, opens)))
+        }
         Some('%') => {
             let source = read_delimited(characters, at, '%', Escapes::Keep)?;
             Ok(Term::Expression(compile(&source)?))
         }
-        Some(_) => {
-            let mut text = String::new();
-            while let Some(character) = characters.get(*at) {
-                if character.is_whitespace() {
+        Some(character) if !is_term_character(character) => {
+            let mut offending = String::new();
+            while let Some(found) = characters.get(*at).copied() {
+                if found.is_whitespace()
+                    || is_term_character(found)
+                    || matches!(found, '"' | '%')
+                {
                     break;
                 }
-                text.push(*character);
+                offending.push(found);
                 *at += 1;
             }
-            if text.is_empty() {
-                return Err(dangling());
+            Err(invalid_characters_in_term(&offending))
+        }
+        Some(_) => {
+            let mut text = String::new();
+            while let Some(found) = characters.get(*at).copied() {
+                if !is_term_character(found) {
+                    break;
+                }
+                text.push(found);
+                *at += 1;
             }
             Ok(Term::Text(text))
         }
@@ -1306,6 +1376,15 @@ const WORD_BREAKS: [char; 12] = [
     '(', ')', '&', '|', '=', '!', '<', '>', '"', '%', ',', '$',
 ];
 
+/// Whether `character` may appear in a bare WORD of a condition: the alphanumerics and `_`
+/// a name or a keyword is spelled with, the `-`, `+` and `.` a number carries, and the `*`
+/// of a wildcard literal — which is also what spells the `...` a space-delimited field list
+/// stands any number of fields for with. A value carrying any other character is spelled as
+/// a `"…"` string or a `%…%` regular expression.
+fn is_word_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '-' | '+' | '.' | '*')
+}
+
 /// The characters a `$…` selector may carry after its `$`: a path of member names, the
 /// array indices applied to them, and the name of a space-delimited slot.
 fn is_selector_character(character: char) -> bool {
@@ -1394,18 +1473,36 @@ fn lex(source: &str) -> Result<Vec<Token>, String> {
                 tokens.push(Token::Selector(selector));
             }
             _ => {
+                // A bare word of a condition is a run of the characters a word carries
+                // ([`is_word_character`]): a name, a keyword, a number or a `*` wildcard.
+                // A character the syntax admits nowhere makes a term of its own, which is
+                // refused rather than read into a word — the value carrying it is spelled
+                // as a `"…"` string or a `%…%` expression instead.
+                if !is_word_character(character) {
+                    let mut offending = String::new();
+                    while let Some(found) = characters.get(at).copied() {
+                        if found.is_whitespace()
+                            || WORD_BREAKS.contains(&found)
+                            || is_word_character(found)
+                        {
+                            break;
+                        }
+                        offending.push(found);
+                        at += 1;
+                    }
+                    return Err(invalid_characters_in_term(&offending));
+                }
                 let mut word = String::new();
-                while let Some(found) = characters.get(at) {
-                    if found.is_whitespace() || WORD_BREAKS.contains(found) {
+                while let Some(found) = characters.get(at).copied() {
+                    if !is_word_character(found) {
                         break;
                     }
-                    word.push(*found);
+                    word.push(found);
                     at += 1;
                 }
-                // Every character in [`WORD_BREAKS`] has an arm of its own above, so this
-                // one reads at least one character. Refusing an empty word is what keeps
-                // that true — and keeps this loop making progress — if a break character is
-                // ever added to that list without an arm.
+                // The arm above consumed every character a word does not admit, so this one
+                // reads at least one. Refusing an empty word is what keeps that true — and
+                // keeps this loop making progress — if that ever stops holding.
                 if word.is_empty() {
                     return Err(format!("{INVALID_PATTERN}: the condition does not parse"));
                 }

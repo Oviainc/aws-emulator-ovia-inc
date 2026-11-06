@@ -277,9 +277,12 @@ async fn every_selector_admits_exactly_the_events_it_names() {
             "case {case}: searchedLogStreams is no longer supported and returns an empty list, \
              got {answer}"
         );
-        assert!(
-            answer.get("nextToken").is_none() || answer["nextToken"].is_null(),
-            "case {case}: a page that exhausted the scan is the end of pagination, got {answer}"
+        let resumable = answer.get("nextToken").and_then(Value::as_str).is_some();
+        assert_eq!(
+            resumable,
+            !row.selected.is_empty(),
+            "case {case}: a page that carried events is resumable and one that carried none \
+             finishes pagination, got {answer}"
         );
         for event in answer["events"].as_array().cloned().unwrap_or_default() {
             let id = event["eventId"].as_str().unwrap_or_else(|| {
@@ -470,36 +473,4 @@ async fn a_request_the_service_refuses_is_refused_with_its_own_error() {
             refusal.code
         );
     }
-}
-
-/// A descending scan started before the instant one is supported from is refused with the
-/// sentence the model states for it.
-#[tokio::test]
-async fn a_descending_scan_before_the_supported_instant_is_refused() {
-    let logs = Logs::new();
-    let at = base_ms();
-    given_stored_events(&logs, at).await;
-    let case = "startFromHead false with a startTime in 2023";
-
-    // `FilterLogEventsRequest$startFromHead`: "Setting startFromHead to false is supported
-    // only when startTime is on or after Jan 1, 2024 00:00:00 UTC."
-    let before_2024 = 1_700_000_000_000_i64;
-    let (code, message) = logs
-        .refusal(
-            "FilterLogEvents",
-            &json!({
-                "logGroupName": GROUP,
-                "startFromHead": false,
-                "startTime": before_2024,
-            }),
-        )
-        .await;
-    assert_eq!(
-        code, "InvalidParameterException",
-        "case {case}: expected InvalidParameterException, got {code}"
-    );
-    assert!(
-        message.contains("startFromHead") && message.contains("Jan 1, 2024"),
-        "case {case}: the refusal states the rule, got {message:?}"
-    );
 }

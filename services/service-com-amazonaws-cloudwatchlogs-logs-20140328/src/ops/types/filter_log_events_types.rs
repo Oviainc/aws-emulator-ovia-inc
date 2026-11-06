@@ -53,3 +53,115 @@ pub struct SearchedLogStream {
     pub searched_completely: Option<bool>,
 }
 
+/// What a successful search reports about the log streams it SEARCHED: how many it was
+/// spread over, and how many of those it searched to completion.
+///
+/// Both counts are counts of the [`SearchedLogStream`] reporting the same response carries
+/// ("Indicates which log streams have been searched and whether each has been searched
+/// completely"), which the model documents as withdrawn — "As of May 15, 2020, this
+/// parameter is no longer supported. This parameter returns an empty list." A search that
+/// reports no searched stream therefore reports both counts as zero, which is what every
+/// recorded search answers, including ones that answer events from several streams; were
+/// that reporting restored, the counts would follow it without a change here.
+///
+/// Not a shape of this model snapshot — `FilterLogEventsResponse` declares only `events`,
+/// `searchedLogStreams` and `nextToken` — and the snapshot is kept exactly as shipped, so
+/// the shape is declared here with its own member schemas and rides on
+/// [`FilterLogEventsResult`], which is where a successful response carries it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchStatistics {
+    /// How many log streams the search was spread over: the streams it reports as searched.
+    pub approximate_total_log_stream_count: i32,
+    /// How many of those were searched to completion: the streams it reports as searched
+    /// completely.
+    pub completed_log_stream_count: i32,
+}
+
+/// The namespace every shape and member schema here names, as the model spells it.
+const LOGS_NAMESPACE: &str = "com.amazonaws.cloudwatchlogs";
+
+/// `searchStatistics$approximateTotalLogStreamCount`, the first member of the object.
+const M_APPROXIMATE_TOTAL_LOG_STREAM_COUNT: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.cloudwatchlogs#SearchStatistics$approximateTotalLogStreamCount",
+            LOGS_NAMESPACE,
+            "approximateTotalLogStreamCount",
+        ),
+        ::aws_smithy_schema::ShapeType::Integer,
+        "approximateTotalLogStreamCount",
+        0,
+    );
+
+/// `searchStatistics$completedLogStreamCount`, the second member of the object.
+const M_COMPLETED_LOG_STREAM_COUNT: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.cloudwatchlogs#SearchStatistics$completedLogStreamCount",
+            LOGS_NAMESPACE,
+            "completedLogStreamCount",
+        ),
+        ::aws_smithy_schema::ShapeType::Integer,
+        "completedLogStreamCount",
+        1,
+    );
+
+impl ::aws_smithy_schema::serde::SerializableStruct for SearchStatistics {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        serializer.write_integer(
+            &M_APPROXIMATE_TOTAL_LOG_STREAM_COUNT,
+            self.approximate_total_log_stream_count,
+        )?;
+        serializer.write_integer(&M_COMPLETED_LOG_STREAM_COUNT, self.completed_log_stream_count)
+    }
+}
+
+/// The schema of the `searchStatistics` member a successful response adds: the same member
+/// schema the generated code emits for a structure member of `FilterLogEventsResponse`. Its
+/// index follows the three members the snapshot's shape declares, so it collides with none
+/// of them.
+///
+/// What this relies on is the SERIALIZE contract: a struct writes its members by handing
+/// the serializer each member's own schema (the awsJson body's member key is read from that
+/// schema), so a member schema carried beside the generated ones is written exactly like
+/// them. It is NOT in the containing struct's member array, so a codec that resolved a
+/// member by looking it up there would not find it — nothing writes this shape that way
+/// today, and this comment is the place to read if one ever does.
+const M_SEARCH_STATISTICS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+    ::aws_smithy_schema::ShapeId::from_static(
+        "com.amazonaws.cloudwatchlogs#FilterLogEventsResponse$searchStatistics",
+        LOGS_NAMESPACE,
+        "searchStatistics",
+    ),
+    ::aws_smithy_schema::ShapeType::Structure,
+    "searchStatistics",
+    3,
+);
+
+/// What one successful `FilterLogEvents` search answers: every member
+/// `FilterLogEventsResponse` declares, plus the [`SearchStatistics`] a search reports beside
+/// them.
+#[derive(Debug, Clone, Default)]
+pub struct FilterLogEventsResult {
+    /// Every member the model snapshot's `FilterLogEventsResponse` shape declares.
+    pub response: FilterLogEventsOutput,
+    /// The member it does not declare, computed from the streams the search covered.
+    pub search_statistics: Option<SearchStatistics>,
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for FilterLogEventsResult {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        self.response.serialize_members(serializer)?;
+        if let Some(statistics) = &self.search_statistics {
+            serializer.write_struct(&M_SEARCH_STATISTICS, statistics)?;
+        }
+        Ok(())
+    }
+}
+

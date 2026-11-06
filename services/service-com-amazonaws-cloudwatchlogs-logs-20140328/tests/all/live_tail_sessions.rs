@@ -702,7 +702,7 @@ const REFUSALS: [Refusal; 10] = [
         code: "InvalidParameterException",
         message: "1 validation error detected: Value at 'logGroupIdentifiers.1.member' failed to \
                   satisfy constraint: Member must satisfy regular expression pattern: \
-                  ^[\\w#+=/:,.@-]*$",
+                  [\\w#+=/:,.@-]*",
     },
     Refusal {
         case: "a filter pattern that opens a bracketed form it does not close",

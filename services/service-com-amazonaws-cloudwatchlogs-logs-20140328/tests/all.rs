@@ -93,6 +93,8 @@ mod export_time_windows;
 mod field_indexes;
 #[path = "all/filter_log_events.rs"]
 mod filter_log_events;
+#[path = "all/filter_log_events_search_reporting.rs"]
+mod filter_log_events_search_reporting;
 #[path = "all/fixed_text_refusals.rs"]
 mod fixed_text_refusals;
 #[path = "all/harness.rs"]

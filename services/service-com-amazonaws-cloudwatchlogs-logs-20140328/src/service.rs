@@ -356,6 +356,12 @@ const PUBLISHED_PATTERNS: &[(&str, &str)] = &[
     // `logStreamNamePrefix` of the reads and the export, and by the `logStreamNames` list of
     // the filtering reads. Published UNANCHORED like the log group name it sits beside.
     (r"^[^:*]*$", r"[^:*]*"),
+    // `LogGroupIdentifier` (`@length` 1..2048, `@pattern ^[\w#+=/:,.@-]*$`), reached by the
+    // `logGroupIdentifier` member of every operation that names a log group by name or ARN,
+    // and by the ARN shapes the model gives the same expression (`LogGroupArn`,
+    // `AnomalyDetectorArn`). Published UNANCHORED, as the recorded `logGroupIdentifier`
+    // refusal states it — the same way the log group name beside it is published.
+    (r"^[\w#+=/:,.@-]*$", r"[\w#+=/:,.@-]*"),
 ];
 
 /// The expression this service states for the `@pattern` the model spells `pattern`: the
