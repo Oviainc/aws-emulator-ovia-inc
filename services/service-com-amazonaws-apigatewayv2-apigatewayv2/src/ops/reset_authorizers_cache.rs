@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetAuthorizersCache
-//! IMPLEMENTED: answers 204 for a stage of an api this service holds, and the modelled 404
-//! for an `ApiId` or a `StageName` that names nothing.
+//! IMPLEMENTED: answers 204 for a stage of an HTTP api this service holds, and the modelled
+//! 404 for an `ApiId`, a `StageName` or a stage whose api carries no authorizer cache at all.
 //!
 //! ## What a reset removes
 //!
@@ -29,7 +29,9 @@
 //! What IS computed from persisted state is the refusal: the `ApiId` and the `StageName`
 //! address a stage of an api, and a label that resolves to nothing is the modelled
 //! `NotFoundException` (404), worded the way every other reader and writer of that level
-//! words one.
+//! words one. The LAST path label addresses a resource too — that stage's authorizer cache,
+//! "Supported only for HTTP APIs" — so a stage of an api of any other `ProtocolType` carries
+//! none and is the same 404 ([`NO_AUTHORIZERS_CACHE_MESSAGE`]).
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +89,15 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The `NotFoundException` message the service answers when the stage the request
+/// addressed carries no authorizer cache at all, which is every stage of an api whose
+/// `ProtocolType` is not `HTTP`: "Resets all authorizer cache entries on a stage.
+/// Supported only for HTTP APIs", so the sub-resource the URI names exists on no other
+/// kind of api. A fixed sentence that names the kind of resource and nothing from the
+/// request, the form this service reports a sub-resource addressed by its kind with
+/// ([`crate::state::ROUTE_RESPONSE_NOT_FOUND_MESSAGE`] is the same shape).
+const NO_AUTHORIZERS_CACHE_MESSAGE: &str = "Invalid authorizers cache specified";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -184,6 +195,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Which stage's cache is reset is decided by the two path labels alone, so nothing
         // else of the request is read.
         let _ = ctx;
+        let not_found = |message: String| -> Self::Error {
+            ResetAuthorizersCacheErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+                resource_type: ::std::option::Option::None,
+            })
+            .into()
+        };
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in the assembled emulator — see the note in `create_api`.
             return Err(crate::scaffolded::Scaffolded::not_implemented(
@@ -200,24 +219,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled 404, reported the way every other reader and writer of that level
         // reports one.
         let Some(api) = store.apis.get(&input.api_id) else {
-            return Err(ResetAuthorizersCacheErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(crate::state::invalid_api_identifier_message(&input.api_id)),
-                    resource_type: ::std::option::Option::None,
-                },
-            )
-            .into());
+            return Err(not_found(crate::state::invalid_api_identifier_message(
+                &input.api_id,
+            )));
         };
         if !api.stages.contains_key(&input.stage_name) {
-            return Err(ResetAuthorizersCacheErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(crate::state::invalid_identifier_message(
-                        crate::state::STAGE_RESOURCE,
-                    )),
-                    resource_type: ::std::option::Option::None,
-                },
-            )
-            .into());
+            return Err(not_found(crate::state::invalid_identifier_message(
+                crate::state::STAGE_RESOURCE,
+            )));
+        }
+        // And the LAST label addresses a resource of its own: that stage's authorizer cache.
+        // "Supported only for HTTP APIs", so a stage of an api of any other `ProtocolType`
+        // carries no such cache and the request addresses something that does not exist —
+        // the same reading `delete_route_request_parameter` applies to a member bound to one
+        // protocol, reported with the operation's modelled `NotFoundException` rather than
+        // with a success for work the api has no surface for.
+        if api.protocol_type != crate::state::HTTP_PROTOCOL_TYPE {
+            return Err(not_found(NO_AUTHORIZERS_CACHE_MESSAGE.to_string()));
         }
 
         // The stage exists and holds no cache entry, which is the state this call asks

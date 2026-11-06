@@ -29,10 +29,8 @@ mod cloudformation_refuses_s3vectors_vector_buckets;
 // regions concurrently landing suites add their line to.
 #[path = "all/apigateway_cognito_user_pools_authorizer.rs"]
 mod apigateway_cognito_user_pools_authorizer;
-// Declared here, in this same head region, for the reason the entry above records.
 #[path = "all/apigateway_iam_authorized_invoke.rs"]
 mod apigateway_iam_authorized_invoke;
-// Declared here, in this same head region, for the reason the entry above records: the
 // appended tail and the sorted `e…` span are both regions concurrently landing suites add
 // their line to.
 #[path = "all/ebs_start_snapshot_resolves_its_kms_key.rs"]
@@ -175,7 +173,6 @@ mod cloudformation_provisions_route53_health_checks;
 mod cloudformation_provisions_kms_aliases;
 // Declared beside the entry above, at the head, for the same reason: the appended tail and
 // the sorted `c…` span (where the other cloudwatch/cloudformation suites land) are both
-// regions concurrently landing suites add their line to.
 #[path = "all/cloudwatch_alarm_action_reaches_its_subscribed_queue.rs"]
 mod cloudwatch_alarm_action_reaches_its_subscribed_queue;
 #[path = "all/cloudwatch_breaching_alarm_fires_through_the_whole_router.rs"]
@@ -864,7 +861,11 @@ mod cloudformation_updates_lambda_functions;
 mod cloudformation_sam_http_api_definitions;
 #[path = "all/opensearch_vpc_endpoint_vpc_membership.rs"]
 mod opensearch_vpc_endpoint_vpc_membership;
-#[path = "all/cloudformation_provisions_cognito_identity_pools.rs"]
-mod cloudformation_provisions_cognito_identity_pools;
+// Declared here, in this quiet span rather than in the appended tail every concurrently
+// landing router suite adds its line to.
+#[path = "all/apigatewayv2_vpc_link_subnets_resolve_in_ec2.rs"]
+mod apigatewayv2_vpc_link_subnets_resolve_in_ec2;
 #[path = "all/zz_probe_whole_emulator.rs"]
 mod zz_probe_whole_emulator;
+#[path = "all/cloudformation_provisions_cognito_identity_pools.rs"]
+mod cloudformation_provisions_cognito_identity_pools;

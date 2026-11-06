@@ -23,6 +23,7 @@
 //! service that owns them in [`ec2_subnets`].
 
 pub mod ec2_subnets;
+mod network;
 pub mod paging;
 pub mod selection_expression;
 pub mod wire_status;

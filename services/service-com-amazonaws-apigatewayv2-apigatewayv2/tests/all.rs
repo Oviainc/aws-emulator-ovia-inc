@@ -167,6 +167,8 @@ mod quick_create_servable_set;
 mod refusal_message_text;
 #[path = "all/refusal_resource_identity.rs"]
 mod refusal_resource_identity;
+#[path = "all/reset_authorizers_cache.rs"]
+mod reset_authorizers_cache;
 #[path = "all/route_deletion.rs"]
 mod route_deletion;
 #[path = "all/route_request_parameter.rs"]
@@ -207,6 +209,8 @@ mod stage_lifecycle;
 mod stage_pagination;
 #[path = "all/stage_update.rs"]
 mod stage_update;
+#[path = "all/stage_variable_invoke_url_value.rs"]
+mod stage_variable_invoke_url_value;
 #[path = "all/stage_variable_values.rs"]
 mod stage_variable_values;
 #[path = "all/state_roundtrip.rs"]
