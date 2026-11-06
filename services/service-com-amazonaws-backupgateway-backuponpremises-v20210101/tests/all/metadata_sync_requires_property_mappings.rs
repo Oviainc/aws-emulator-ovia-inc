@@ -83,7 +83,10 @@ pub(crate) async fn listed_arns(
 
 /// Everything a refusal of this precondition states: the status, the error shape, the
 /// required `ErrorCode` and the sentence.
-fn refusal(reply: &Reply) -> (u16, Option<&str>, Option<&str>, Option<&str>) {
+///
+/// Shared with the sibling `fixed_refusal_sentences` suite, so one refusal is read one way
+/// in both.
+pub(crate) fn refusal(reply: &Reply) -> (u16, Option<&str>, Option<&str>, Option<&str>) {
     (
         reply.status,
         reply.code.as_deref(),

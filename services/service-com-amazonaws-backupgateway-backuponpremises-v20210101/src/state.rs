@@ -355,7 +355,9 @@ pub const MAPPINGS_NOT_FOUND: &str = "HypervisorPropertyMappingsNotFound";
 
 /// See [`MAPPINGS_NOT_FOUND`]: the sentence AWS states for that refusal, entirely fixed
 /// text — including its number disagreement, which is part of the fixed string — with no
-/// part taken from the request.
+/// part taken from the request. The wording is a REQUIREMENT of the error class and not
+/// this crate's choice, so `tests/all/fixed_refusal_sentences.rs` pins it written out,
+/// rather than read off this constant.
 pub const MAPPINGS_NOT_FOUND_MESSAGE: &str = "The hypervisor property mappings is not found.";
 
 /// `AccessDeniedException$ErrorCode` for a metadata sync asked for a `HypervisorArn` this
@@ -382,7 +384,11 @@ pub const MAPPINGS_NOT_FOUND_MESSAGE: &str = "The hypervisor property mappings i
 pub const MAPPINGS_NOT_CONFIGURED: &str = "MappingsNotConfigured";
 
 /// See [`MAPPINGS_NOT_CONFIGURED`]: the sentence AWS is recorded stating for that refusal,
-/// entirely fixed text with no part taken from the request.
+/// entirely fixed text with no part taken from the request — no trailing period included.
+/// It names the condition the caller has to remedy (the hypervisor's property mappings),
+/// not the generic permissions wording `AccessDeniedException`'s own documentation carries;
+/// `tests/all/fixed_refusal_sentences.rs` pins it written out, rather than read off this
+/// constant.
 pub const MAPPINGS_NOT_CONFIGURED_MESSAGE: &str =
     "HypervisorPropertyMappings is not configured for the Hypervisor";
 
