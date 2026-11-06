@@ -1064,9 +1064,9 @@ pub fn resource_not_found(arn: &str) -> ResourceNotFoundException {
 /// The three tagging operations are served by the front end in front of this service,
 /// which answers an ARN that names no resource with its own refusal — the error code
 /// `NotFoundException`, which no operation of this service models, and this one fixed
-/// string — rather than with the control plane's modelled `ResourceNotFoundException`
-/// and [`resource_not_found`]. It names no identifier, so the refusal echoes nothing
-/// the caller sent.
+/// string, as the behavioural recordings of these operations show — rather than with the
+/// control plane's modelled `ResourceNotFoundException` and [`resource_not_found`]. It
+/// names no identifier, so the refusal echoes nothing the caller sent.
 pub const TAGGED_RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
 
 /// The tagging path's refusal for an ARN that names no persisted resource.

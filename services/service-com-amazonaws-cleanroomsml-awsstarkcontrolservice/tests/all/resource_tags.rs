@@ -7,8 +7,10 @@
 //! it was, `UntagResource` removes the keys it names and nothing else, and
 //! `ListTagsForResource` reports exactly the tag set that record currently holds — for
 //! every kind of resource a `TaggableArn` names, in the region whose endpoint holds it. An
-//! ARN this endpoint holds no resource for is refused as `ResourceNotFoundException` (404)
-//! by all three operations rather than answered with an empty tag set.
+//! ARN this endpoint holds no resource for is refused by the tagging path's own
+//! `NotFoundException` (404) by all three operations, rather than answered with an empty
+//! tag set — while the resource's own control-plane read keeps its modelled
+//! `ResourceNotFoundException`, which the last case pins side by side.
 //!
 //! Every assertion goes through the router, so each case exercises routing,
 //! deserialization, the handler, the persisted state and serialization — the same path a
