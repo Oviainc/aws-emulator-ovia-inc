@@ -9,9 +9,11 @@
 //!
 //! The suite asserts the RULES rather than one recorded exchange:
 //!
-//! * a `body` is a dashboard DEFINITION — a JSON object whose `panels` member is a list
-//!   of panel objects. A body that is not one is refused with the modelled
-//!   `ValidationException` (400) and nothing is persisted, whatever shape it has;
+//! * a `body` is a dashboard DEFINITION — a JSON object, closed at the top level, whose
+//!   `panels` member is a list of panel objects. A body that violates that schema is
+//!   refused with the modelled `ValidationException` (400) and nothing is persisted,
+//!   whatever shape it has, and the refusal names EVERY constraint the document
+//!   violates, one clause per violation;
 //! * a body that IS one is persisted verbatim and read back verbatim;
 //! * `CreateOmniDashboard` mints the dashboard in an EXISTING space and
 //!   `GetOmniDashboard` answers from that same store;
@@ -39,12 +41,18 @@ use smithy_server_runtime::{
 use service_com_amazonaws_cloudwatchomni_cloudwatchomnifrontend as omni;
 
 use omni::ops::create_domain::CreateDomain;
-use omni::ops::create_omni_dashboard::{CreateOmniDashboard, CreateOmniDashboardError};
+use omni::ops::create_omni_dashboard::{
+    CreateOmniDashboard, CreateOmniDashboardError, CreateOmniDashboardErrorModeled,
+};
 use omni::ops::create_space::CreateSpace;
+use omni::ops::delete_omni_dashboard::{DeleteOmniDashboard, DeleteOmniDashboardError};
+use omni::ops::list_omni_dashboards::{ListOmniDashboards, ListOmniDashboardsError};
 use omni::ops::get_omni_dashboard::{GetOmniDashboard, GetOmniDashboardError};
+use omni::scaffolded::Scaffolded;
 use omni::ops::types::{
     CreateDomainInput, CreateOmniDashboardInput, CreateOmniDashboardOutput, CreateSpaceInput,
-    GetOmniDashboardInput, GetOmniDashboardOutput, OmniDashboard,
+    DeleteOmniDashboardInput, DeleteOmniDashboardOutput, GetOmniDashboardInput,
+    GetOmniDashboardOutput, ListOmniDashboardsInput, ListOmniDashboardsOutput, OmniDashboard,
     CREATE_OMNI_DASHBOARD_INPUT_SCHEMA, GET_OMNI_DASHBOARD_INPUT_SCHEMA,
 };
 
@@ -216,6 +224,31 @@ impl Omni {
             .await
     }
 
+    async fn list_dashboards(
+        &self,
+        input: &ListOmniDashboardsInput,
+    ) -> Result<ListOmniDashboardsOutput, ListOmniDashboardsError> {
+        ListOmniDashboards::new(Arc::clone(&self.engine))
+            .handle(input.clone(), &self.ctx())
+            .await
+    }
+
+    async fn delete_dashboard(
+        &self,
+        space_id: &str,
+        dashboard_id: &str,
+    ) -> Result<DeleteOmniDashboardOutput, DeleteOmniDashboardError> {
+        DeleteOmniDashboard::new(Arc::clone(&self.engine))
+            .handle(
+                DeleteOmniDashboardInput {
+                    space_id: space_id.to_string(),
+                    dashboard_id: dashboard_id.to_string(),
+                },
+                &self.ctx(),
+            )
+            .await
+    }
+
     /// Dispatch one rpcv2Cbor request over HTTP and return the status and body.
     async fn over_the_wire<I: SerializableStruct>(
         &self,
@@ -295,7 +328,7 @@ struct DashboardCase {
 }
 
 /// The rows span what the rule generalises over: a `panels` list that is empty, has one
-/// panel and has many; a definition carrying members beyond `panels`; whitespace and
+/// panel and has many; whitespace and
 /// non-ASCII text inside the document; `name` over the whole
 /// `@length(1..256)`/`^[a-zA-Z0-9_.@~()-]+$` class; a `description` absent and at
 /// `@length(max: 1024)`; and `tags` absent, one and at `@length(max: 50)`.
@@ -317,10 +350,10 @@ fn dashboard_cases() -> Vec<DashboardCase> {
             tags: Some(HashMap::from([("team".to_string(), "sre".to_string())])),
         },
         DashboardCase {
-            case: "many panels beside other definition members, non-ASCII text",
+            case: "many panels, non-ASCII text",
             name: "many-panels".to_string(),
             body: format!(
-                r#"{{"version":"2026-01-01","variables":{{"env":"prod"}},"panels":[{}]}}"#,
+                r#"{{"panels":[{}]}}"#,
                 (0..24)
                     .map(|index| format!(
                         r#"{{"id":{index},"title":"café ☕ {index}","query":{{"language":"sql","expression":"SELECT 1"}}}}"#
@@ -348,8 +381,9 @@ fn dashboard_cases() -> Vec<DashboardCase> {
 
 /// Bodies that are NOT a dashboard definition, spanning the ways a body can fail the
 /// rule: text that is not JSON at all, a JSON value that is not an object, an object
-/// with no `panels`, a `panels` member that is not a list, and a list whose entries are
-/// not panel objects.
+/// with no `panels`, a `panels` member that is not a list, a list whose entries are
+/// not panel objects, and a document carrying a top-level member the closed schema does
+/// not declare.
 fn rejected_bodies() -> Vec<(&'static str, &'static str)> {
     vec![
         ("not JSON at all", "panels"),
@@ -372,6 +406,14 @@ fn rejected_bodies() -> Vec<(&'static str, &'static str)> {
         (
             "a panel that is a list, after a valid one",
             r#"{"panels":[{"type":"logs"},[]]}"#,
+        ),
+        (
+            "a conforming panels list beside an undeclared top-level member",
+            r#"{"panels":[],"widgets":[]}"#,
+        ),
+        (
+            "a conforming panels list beside several undeclared members",
+            r#"{"version":"2026-01-01","panels":[],"variables":{"env":"prod"}}"#,
         ),
     ]
 }
@@ -882,4 +924,507 @@ async fn the_dashboard_lifecycle_over_the_rpcv2cbor_wire() {
             "case {case:?}: the wire refusal does not name ValidationException: {rendered:?}"
         );
     }
+}
+
+/// One clause of a dashboard-body refusal: the location of the violation, then the
+/// schema constraint violated there, in the fixed wording the refusal uses.
+fn clause(location: &str, constraint: &str) -> String {
+    format!("{location}: does not satisfy the '{constraint}' constraint of the dashboard body schema")
+}
+
+/// What joins one clause to the next.
+const CLAUSE_SEPARATOR: &str = "; ";
+
+/// The location a constraint on the whole document is reported at.
+const DOCUMENT_ROOT: &str = "$";
+
+/// The message the operation's modelled `ValidationException` carries.
+fn validation_message(
+    case: &str,
+    result: Result<CreateOmniDashboardOutput, CreateOmniDashboardError>,
+) -> String {
+    match result {
+        Ok(output) => {
+            panic!("case {case:?}: expected a ValidationException, got Ok({output:?})")
+        }
+        Err(Scaffolded::Modeled(CreateOmniDashboardErrorModeled::ValidationException(error))) => {
+            error.message
+        }
+        Err(other) => panic!(
+            "case {case:?}: expected the modelled ValidationException, got {other:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn the_refusal_names_every_schema_constraint_the_body_violates() {
+    let omni = Omni::new();
+    let space_id = omni.space("schema", "dashboard-schema").await;
+
+    // Rows span the schema's constraints and the number of them one document can
+    // violate at once: the document's own type (text that is not JSON, and every JSON
+    // type that is not an object), the required `panels` member, its type, its entries,
+    // and the closedness of the top level — each alone and in combination. The clause
+    // list is the schema's own order: the root's type, then `panels`, then closedness.
+    let cases: Vec<(&str, String, Vec<String>)> = vec![
+        (
+            "no panels member, one undeclared member",
+            r#"{"widgets":[]}"#.to_string(),
+            vec![
+                clause("panels", "required"),
+                clause(DOCUMENT_ROOT, "additionalProperties"),
+            ],
+        ),
+        (
+            "an empty document",
+            "{}".to_string(),
+            vec![clause("panels", "required")],
+        ),
+        (
+            "panels spelled with another case, so it is an undeclared member",
+            r#"{"Panels":[]}"#.to_string(),
+            vec![
+                clause("panels", "required"),
+                clause(DOCUMENT_ROOT, "additionalProperties"),
+            ],
+        ),
+        (
+            "a conforming panels list beside one undeclared member",
+            r#"{"panels":[],"widgets":[]}"#.to_string(),
+            vec![clause(DOCUMENT_ROOT, "additionalProperties")],
+        ),
+        (
+            "a conforming panels list beside several undeclared members",
+            r#"{"version":"2026-01-01","panels":[{"type":"logs"}],"variables":{"env":"prod"}}"#
+                .to_string(),
+            vec![clause(DOCUMENT_ROOT, "additionalProperties")],
+        ),
+        (
+            "panels as an object",
+            r#"{"panels":{"0":{"type":"logs"}}}"#.to_string(),
+            vec![clause("panels", "type")],
+        ),
+        (
+            "panels as a string, beside an undeclared member",
+            r#"{"panels":"none","widgets":[]}"#.to_string(),
+            vec![
+                clause("panels", "type"),
+                clause(DOCUMENT_ROOT, "additionalProperties"),
+            ],
+        ),
+        (
+            "panels as null",
+            r#"{"panels":null}"#.to_string(),
+            vec![clause("panels", "type")],
+        ),
+        (
+            "a panel that is a number, after a conforming one",
+            r#"{"panels":[{"type":"logs"},1]}"#.to_string(),
+            vec![clause("panels", "items")],
+        ),
+        (
+            "several panels that are not objects, beside an undeclared member",
+            r#"{"panels":["a",2],"layout":{}}"#.to_string(),
+            vec![
+                clause("panels", "items"),
+                clause(DOCUMENT_ROOT, "additionalProperties"),
+            ],
+        ),
+        (
+            "a JSON array",
+            r#"[{"type":"logs"}]"#.to_string(),
+            vec![clause(DOCUMENT_ROOT, "type")],
+        ),
+        (
+            "a JSON string",
+            r#""{\"panels\":[]}""#.to_string(),
+            vec![clause(DOCUMENT_ROOT, "type")],
+        ),
+        (
+            "a JSON number",
+            "7".to_string(),
+            vec![clause(DOCUMENT_ROOT, "type")],
+        ),
+        (
+            "JSON null",
+            "null".to_string(),
+            vec![clause(DOCUMENT_ROOT, "type")],
+        ),
+        (
+            "not JSON at all",
+            "panels".to_string(),
+            vec![clause(DOCUMENT_ROOT, "type")],
+        ),
+        (
+            "truncated JSON",
+            r#"{"panels":[{"type":"logs"}"#.to_string(),
+            vec![clause(DOCUMENT_ROOT, "type")],
+        ),
+    ];
+
+    for (index, (case, body, clauses)) in cases.into_iter().enumerate() {
+        let refused = omni
+            .create_dashboard(&create_input(
+                &space_id,
+                &format!("schema-{index}"),
+                &body,
+            ))
+            .await;
+        if let Err(error) = &refused {
+            assert_eq!(
+                (error.shape_name(), error.http_status()),
+                ("ValidationException", 400),
+                "case {case:?}: expected ValidationException (400), got {error:?}"
+            );
+        }
+        let actual = validation_message(case, refused);
+        let expected = clauses.join(CLAUSE_SEPARATOR);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected the message {expected:?}, got {actual:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_conforming_body_is_not_refused_however_its_panels_are_laid_out() {
+    let omni = Omni::new();
+    let space_id = omni.space("conforming", "dashboard-conforming").await;
+
+    // Rows span what the schema admits: `panels` alone, empty and holding one, many and
+    // deeply nested panel objects, with whitespace and non-ASCII text in the document.
+    let bodies = [
+        ("no panel yet", EMPTY_PANELS_BODY.to_string()),
+        (
+            "one panel, pretty-printed",
+            "{\n  \"panels\": [\n    {}\n  ]\n}".to_string(),
+        ),
+        (
+            "a panel carrying any members it likes",
+            r#"{"panels":[{"type":"timeSeries","title":"café ☕","query":{"sql":"SELECT 1"}}]}"#
+                .to_string(),
+        ),
+        (
+            "many panels",
+            format!(
+                r#"{{"panels":[{}]}}"#,
+                (0..16)
+                    .map(|index| format!(r#"{{"id":{index}}}"#))
+                    .collect::<Vec<String>>()
+                    .join(",")
+            ),
+        ),
+    ];
+
+    for (index, (case, body)) in bodies.into_iter().enumerate() {
+        let created = omni
+            .create_dashboard(&create_input(
+                &space_id,
+                &format!("conforming-{index}"),
+                &body,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: the body was refused: {error:?}"))
+            .omni_dashboard;
+        // The definition round-trips verbatim through the reader that answers from the
+        // same store, so acceptance is backed by persisted state.
+        let fetched = omni
+            .get_dashboard(&space_id, &created.dashboard_id)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: GetOmniDashboard failed: {error:?}"))
+            .omni_dashboard;
+        assert_eq!(
+            (created.body.as_str(), fetched.body.as_str()),
+            (body.as_str(), body.as_str()),
+            "case {case:?}: expected the body {body:?} back, got {:?} and {:?}",
+            created.body,
+            fetched.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_schema_refusal_carries_its_clauses_over_the_wire() {
+    let omni = Omni::new();
+    let space_id = omni.space("wire-schema", "dashboard-wire-schema").await;
+
+    // One body violating two constraints: the message a client reads off the wire is
+    // the same clause list the handler rendered.
+    let (status, body) = omni
+        .over_the_wire(
+            "CreateOmniDashboard",
+            CREATE_OMNI_DASHBOARD_INPUT_SCHEMA,
+            &create_input(&space_id, "wire-schema", r#"{"widgets":[]}"#),
+        )
+        .await;
+    let rendered = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(
+        status, 400,
+        "the wire answered {status} rather than 400: {rendered:?}"
+    );
+    let expected = [
+        clause("panels", "required"),
+        clause(DOCUMENT_ROOT, "additionalProperties"),
+    ]
+    .join(CLAUSE_SEPARATOR);
+    assert!(
+        rendered.contains(&expected),
+        "the wire refusal does not carry the message {expected:?}: {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_omni_dashboards_pages_one_space_in_creation_order() {
+    let omni = Omni::new();
+    let space_id = omni.space("list", "dashboard-list").await;
+    let other_space = omni.space("list-other", "dashboard-list-other").await;
+
+    // Rows: the names created in this space, in creation order, plus one dashboard in
+    // ANOTHER space that no page of this space may carry.
+    let names = ["alpha", "alpine", "beta", "gamma", "delta"];
+    let mut created: Vec<String> = Vec::new();
+    for name in names {
+        created.push(
+            omni.create_dashboard(&create_input(&space_id, name, EMPTY_PANELS_BODY))
+                .await
+                .unwrap_or_else(|error| panic!("creating {name:?} failed: {error:?}"))
+                .omni_dashboard
+                .dashboard_id,
+        );
+    }
+    let elsewhere = omni
+        .create_dashboard(&create_input(&other_space, "alpha", EMPTY_PANELS_BODY))
+        .await
+        .expect("the other space's dashboard is created")
+        .omni_dashboard
+        .dashboard_id;
+
+    // One page holding everything: the listing is the store's creation order, and the
+    // summary projection carries every member of the dashboard but its definition.
+    let page = omni
+        .list_dashboards(&ListOmniDashboardsInput {
+            space_id: space_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .expect("the space lists");
+    assert_eq!(
+        (
+            page.items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<&str>>(),
+            page.next_token.clone(),
+        ),
+        (names.to_vec(), None),
+        "expected the space's dashboards in creation order, got {:?}",
+        page.items
+    );
+    for (index, item) in page.items.iter().enumerate() {
+        let full = omni
+            .get_dashboard(&space_id, &created[index])
+            .await
+            .expect("the dashboard reads back")
+            .omni_dashboard;
+        assert_eq!(
+            (
+                item.dashboard_id.as_str(),
+                item.arn.as_str(),
+                item.name.as_str(),
+                item.created_by.as_str(),
+                millis(item.created_at),
+                millis(item.updated_at),
+            ),
+            (
+                full.dashboard_id.as_str(),
+                full.arn.as_str(),
+                full.name.as_str(),
+                full.created_by.as_str(),
+                millis(full.created_at),
+                millis(full.updated_at),
+            ),
+            "case {:?}: the summary disagrees with the dashboard {full:?}",
+            item.name
+        );
+    }
+
+    // Paging: every page size from 1 up to past the collection walks the SAME order and
+    // yields every dashboard exactly once, following `nextToken` while it is present.
+    for page_size in [1, 2, 4, 5, 100] {
+        let mut walked: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let page = omni
+                .list_dashboards(&ListOmniDashboardsInput {
+                    space_id: space_id.clone(),
+                    max_results: Some(page_size),
+                    next_token: token.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_or_else(|error| panic!("case {page_size}: the page failed: {error:?}"));
+            assert!(
+                page.items.len() <= page_size as usize,
+                "case {page_size}: a page carried {} items",
+                page.items.len()
+            );
+            walked.extend(page.items.iter().map(|item| item.name.clone()));
+            token = page.next_token;
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            walked, names,
+            "case {page_size}: walking the pages gave {walked:?}"
+        );
+    }
+
+    // `namePrefix`'s model doc: "Filter to dashboards whose name starts with this
+    // prefix." Rows span a prefix matching several names, one name, and none.
+    for (prefix, expected) in [
+        ("alp", vec!["alpha", "alpine"]),
+        ("alpha", vec!["alpha"]),
+        ("beta", vec!["beta"]),
+        ("zeta", vec![]),
+    ] {
+        let page = omni
+            .list_dashboards(&ListOmniDashboardsInput {
+                space_id: space_id.clone(),
+                name_prefix: Some(prefix.to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_else(|error| panic!("case {prefix:?}: the filtered page failed: {error:?}"));
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<&str>>(),
+            expected,
+            "case {prefix:?}: the filtered page is {:?}",
+            page.items
+        );
+    }
+
+    // A listing is scoped to the space it names: the other space lists its own
+    // dashboard and nothing of this one's.
+    let other = omni
+        .list_dashboards(&ListOmniDashboardsInput {
+            space_id: other_space.clone(),
+            ..Default::default()
+        })
+        .await
+        .expect("the other space lists");
+    assert_eq!(
+        other
+            .items
+            .iter()
+            .map(|item| item.dashboard_id.as_str())
+            .collect::<Vec<&str>>(),
+        vec![elsewhere.as_str()],
+        "the other space listed {:?}",
+        other.items
+    );
+
+    // A space the store does not hold is a miss rather than an empty page, and a token
+    // this service did not mint is a bad request.
+    expect_modelled_error(
+        "an unknown space",
+        omni.list_dashboards(&ListOmniDashboardsInput {
+            space_id: MISSING_SPACE_ID.to_string(),
+            ..Default::default()
+        })
+        .await,
+        404,
+        "ResourceNotFoundException",
+    );
+    for token in ["not-a-token", "6e6f7065"] {
+        expect_modelled_error(
+            token,
+            omni.list_dashboards(&ListOmniDashboardsInput {
+                space_id: space_id.clone(),
+                next_token: Some(token.to_string()),
+                ..Default::default()
+            })
+            .await,
+            400,
+            "ValidationException",
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_deleted_dashboard_is_gone_from_get_and_from_the_listing() {
+    let omni = Omni::new();
+    let space_id = omni.space("delete", "dashboard-delete").await;
+    let other_space = omni.space("delete-other", "dashboard-delete-other").await;
+
+    let mut ids: Vec<String> = Vec::new();
+    for name in ["kept", "removed"] {
+        ids.push(
+            omni.create_dashboard(&create_input(&space_id, name, EMPTY_PANELS_BODY))
+                .await
+                .unwrap_or_else(|error| panic!("creating {name:?} failed: {error:?}"))
+                .omni_dashboard
+                .dashboard_id,
+        );
+    }
+    let (kept, removed) = (ids[0].clone(), ids[1].clone());
+
+    // A dashboard is addressed by its space AND its id, so a delete naming another
+    // space removes nothing: the record is still readable.
+    omni.delete_dashboard(&other_space, &removed)
+        .await
+        .expect("a delete under another space succeeds without removing anything");
+    assert!(
+        omni.get_dashboard(&space_id, &removed).await.is_ok(),
+        "the delete under another space removed the dashboard"
+    );
+
+    omni.delete_dashboard(&space_id, &removed)
+        .await
+        .expect("the delete succeeds");
+    expect_modelled_error(
+        "a deleted dashboard",
+        omni.get_dashboard(&space_id, &removed).await,
+        404,
+        "ResourceNotFoundException",
+    );
+
+    // @idempotent, and the model declares no not-found error for the delete: deleting
+    // an id that is already gone, and one that never existed, both succeed.
+    for (case, dashboard_id) in [
+        ("an already deleted dashboard", removed.as_str()),
+        ("a dashboard that never existed", MISSING_DASHBOARD_ID),
+    ] {
+        omni.delete_dashboard(&space_id, dashboard_id)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: the delete failed: {error:?}"));
+    }
+
+    // The listing answers from the same store, so the removed dashboard is gone from it
+    // and the one left behind still lists.
+    let page = omni
+        .list_dashboards(&ListOmniDashboardsInput {
+            space_id: space_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .expect("the space lists");
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|item| item.dashboard_id.as_str())
+            .collect::<Vec<&str>>(),
+        vec![kept.as_str()],
+        "the listing after the delete is {:?}",
+        page.items
+    );
+
+    // The name the deleted dashboard held is free again, which is observable only
+    // because the record really is gone from the store.
+    omni.create_dashboard(&create_input(&space_id, "removed", EMPTY_PANELS_BODY))
+        .await
+        .expect("the freed name can identify a new dashboard");
 }

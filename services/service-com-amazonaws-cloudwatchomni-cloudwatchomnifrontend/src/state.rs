@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use crate::ops::types::{
     AccessGrant, AccessProfile, Domain, EncryptionConfiguration, IdentityProviderConfiguration,
-    OmniDashboard, Space, SpaceSummary,
+    OmniDashboard, OmniDashboardSummary, Space, SpaceSummary,
 };
 
 /// The region a resource is recorded in when the request carries no SigV4
@@ -286,6 +286,30 @@ impl ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
             .values()
             .filter(|stored| stored.seq > after_seq)
             .filter(|stored| domain_id.is_none_or(|id| stored.domain_id == id))
+            .collect();
+        selected.sort_by_key(|stored| stored.seq);
+        selected
+    }
+
+    /// Every stored dashboard of one space in creation order, restricted to the names
+    /// starting with `name_prefix` when the request carries one, and skipping
+    /// everything at or before `after_seq`.
+    ///
+    /// Linear in the number of stored dashboards, which [`OMNI_DASHBOARD_QUOTA`] bounds.
+    pub fn omni_dashboards_after(
+        &self,
+        space_id: &str,
+        name_prefix: Option<&str>,
+        after_seq: u64,
+    ) -> Vec<&StoredOmniDashboard> {
+        let mut selected: Vec<&StoredOmniDashboard> = self
+            .omni_dashboards
+            .values()
+            .filter(|stored| stored.space_id == space_id)
+            .filter(|stored| stored.seq > after_seq)
+            .filter(|stored| {
+                name_prefix.is_none_or(|prefix| stored.dashboard.name.starts_with(prefix))
+            })
             .collect();
         selected.sort_by_key(|stored| stored.seq);
         selected
@@ -655,68 +679,76 @@ pub fn access_profile_view(stored: &StoredAccessProfile) -> AccessProfile {
     }
 }
 
-/// The member of a dashboard body that carries the dashboard's panels.
-pub const DASHBOARD_BODY_PANELS: &str = "panels";
+/// The dashboard-body schema a `body` is validated against, and the refusal text a
+/// violated schema renders. It lives beside the store because several operations take a
+/// dashboard definition and all of them validate it the same way.
+mod dashboard_body;
 
-/// Why `body` is not a dashboard definition, or `None` when it is one.
+pub use dashboard_body::{
+    dashboard_body_rejection, dashboard_body_violations, DashboardBodyViolation,
+    DASHBOARD_BODY_PANELS, DOCUMENT_ROOT,
+};
+
+/// Project a stored dashboard into the `OmniDashboardSummary` the list operation
+/// returns.
 ///
-/// `body`'s model doc is "The dashboard definition, as a JSON document": a definition
-/// is a JSON OBJECT, and the panels it lays out are its `panels` member — a list whose
-/// entries are panel objects. Anything else (text that is not JSON at all, a JSON
-/// scalar or array, a document with no panels, or a `panels` member that is not a list
-/// of objects) is not a dashboard definition, so an operation that takes one refuses it
-/// rather than persisting a body no reader can lay out.
-///
-/// The returned text names the member and what was wrong with it, which is all a
-/// caller has to fix the request from.
-pub fn dashboard_body_rejection(body: &str) -> Option<String> {
-    let document: ::serde_json::Value = match ::serde_json::from_str(body) {
-        Ok(document) => document,
-        Err(_) => {
-            return Some("The dashboard body is not a valid JSON document.".to_string());
-        }
-    };
-    let Some(members) = document.as_object() else {
-        return Some(format!(
-            "The dashboard body must be a JSON object with a '{DASHBOARD_BODY_PANELS}' array."
-        ));
-    };
-    let Some(panels) = members.get(DASHBOARD_BODY_PANELS) else {
-        return Some(format!(
-            "The dashboard body must contain a '{DASHBOARD_BODY_PANELS}' array."
-        ));
-    };
-    let Some(panels) = panels.as_array() else {
-        return Some(format!(
-            "The dashboard body member '{DASHBOARD_BODY_PANELS}' must be an array of panel \
-             objects."
-        ));
-    };
-    panels
-        .iter()
-        .position(|panel| !panel.is_object())
-        .map(|index| {
-            format!(
-                "The dashboard body member '{DASHBOARD_BODY_PANELS}[{index}]' must be a panel \
-                 object."
-            )
-        })
+/// Every `OmniDashboardSummary` member is a member of `OmniDashboard` with the same
+/// name except `body` — the summary's doc reads "Summary of a dashboard. Call
+/// GetOmniDashboard for the full dashboard" — so the projection is a copy with the
+/// definition left out, and a summary never reports a value the full dashboard does not.
+pub fn omni_dashboard_summary(dashboard: &OmniDashboard) -> OmniDashboardSummary {
+    OmniDashboardSummary {
+        dashboard_id: dashboard.dashboard_id.clone(),
+        arn: dashboard.arn.clone(),
+        name: dashboard.name.clone(),
+        created_by: dashboard.created_by.clone(),
+        description: dashboard.description.clone(),
+        tags: dashboard.tags.clone(),
+        created_at: dashboard.created_at,
+        updated_at: dashboard.updated_at,
+    }
 }
 
 /// The prefix a space-list page token carries, so a token minted for one collection
 /// cannot be replayed against another.
 const SPACE_PAGE_TOKEN_PREFIX: &str = "spaces:";
 
+/// The prefix a dashboard-list page token carries, for the same reason.
+const OMNI_DASHBOARD_PAGE_TOKEN_PREFIX: &str = "omni-dashboards:";
+
+/// Mint the opaque `nextToken` that resumes a listing of `prefix`'s collection after
+/// `seq`.
+fn encode_page_token(prefix: &str, seq: u64) -> String {
+    ::hex::encode(format!("{prefix}{seq}"))
+}
+
+/// Read a `nextToken` back, or `None` when it is not one this service minted for
+/// `prefix`'s collection.
+fn decode_page_token(prefix: &str, token: &str) -> Option<u64> {
+    let decoded = ::hex::decode(token).ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    text.strip_prefix(prefix)?.parse().ok()
+}
+
 /// Mint the opaque `nextToken` that resumes a space listing after `seq`.
 pub fn encode_space_page_token(seq: u64) -> String {
-    ::hex::encode(format!("{SPACE_PAGE_TOKEN_PREFIX}{seq}"))
+    encode_page_token(SPACE_PAGE_TOKEN_PREFIX, seq)
 }
 
 /// Read a space-list `nextToken` back, or `None` when it is not one this service minted.
 pub fn decode_space_page_token(token: &str) -> Option<u64> {
-    let decoded = ::hex::decode(token).ok()?;
-    let text = String::from_utf8(decoded).ok()?;
-    text.strip_prefix(SPACE_PAGE_TOKEN_PREFIX)?.parse().ok()
+    decode_page_token(SPACE_PAGE_TOKEN_PREFIX, token)
+}
+
+/// Mint the opaque `nextToken` that resumes a dashboard listing after `seq`.
+pub fn encode_omni_dashboard_page_token(seq: u64) -> String {
+    encode_page_token(OMNI_DASHBOARD_PAGE_TOKEN_PREFIX, seq)
+}
+
+/// Read a dashboard-list `nextToken` back, or `None` when it is not one this service
+/// minted for a dashboard listing.
+pub fn decode_omni_dashboard_page_token(token: &str) -> Option<u64> {
+    decode_page_token(OMNI_DASHBOARD_PAGE_TOKEN_PREFIX, token)
 }
 
 #[cfg(test)]

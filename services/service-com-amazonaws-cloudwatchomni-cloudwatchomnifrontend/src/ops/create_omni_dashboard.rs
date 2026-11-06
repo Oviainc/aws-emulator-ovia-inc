@@ -5,10 +5,11 @@
 //! Mints a dashboard inside an existing space, persists it in [`crate::state`] and
 //! returns the persisted record. `GetOmniDashboard` answers from the same store.
 //!
-//! The `body` a request carries is a dashboard DEFINITION, so it is checked against
-//! [`crate::state::dashboard_body_rejection`] before anything is persisted: a body
-//! that is not a JSON object laying panels out is refused with the modelled
-//! `ValidationException` rather than stored.
+//! The `body` a request carries is a dashboard DEFINITION, so it is validated against
+//! the dashboard-body schema ([`crate::state::dashboard_body_rejection`]) before
+//! anything is persisted: a body that violates it is refused with the modelled
+//! `ValidationException`, whose message names EVERY constraint the document violates,
+//! rather than stored.
 //!
 //! Each outcome — the create, the idempotent replay and every refusal — is recorded as
 //! one structured event ([`audit`]), the way the other services' creates record a state
@@ -176,9 +177,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `body` is the dashboard DEFINITION, a JSON document laying panels out. The
-        // model can express only its length, so the document itself is checked here —
-        // before the parent lookup, because a malformed definition is wrong whatever
-        // space it names — and a body that is not one is refused rather than persisted.
+        // model can express only its length, so the document is validated against the
+        // dashboard-body schema here — before the parent lookup, because a
+        // non-conforming definition is wrong whatever space it names — and the refusal
+        // carries one clause per violated constraint rather than only the first.
         if let Some(reason) = crate::state::dashboard_body_rejection(&input.body) {
             audit(ctx, &input.space_id, &input.name, "", "refused_invalid_body");
             return Err(
