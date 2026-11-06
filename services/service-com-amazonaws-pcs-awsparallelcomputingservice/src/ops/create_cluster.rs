@@ -260,6 +260,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A resource holds at most `MAX_TAGS_PER_RESOURCE` tags on EVERY path that writes
+        // them, so a create carrying more is refused the way a `TagResource` past the
+        // ceiling is; `RequestTagMap`'s modelled maximum bounds one request, not the
+        // resource.
+        let requested_tags = input.tags.as_ref().map_or(0, std::collections::HashMap::len);
+        if requested_tags > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateClusterErrorModeled::ServiceQuotaExceededException(
+                crate::state::tag_quota_exceeded(crate::state::CLUSTER, &input.cluster_name),
+            )
+            .into());
+        }
+
         let mut state = state.lock();
         state.settle();
 

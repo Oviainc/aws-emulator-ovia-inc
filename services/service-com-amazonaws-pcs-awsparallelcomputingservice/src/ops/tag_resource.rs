@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds or edits the tags of the cluster, compute node group or queue the request's
+//! `resourceArn` names: every key in `tags` is written to that resource's stored tag
+//! set, replacing the value of a key it already carries, so a later
+//! `ListTagsForResource` reads back exactly what was written. An ARN no stored resource
+//! carries is refused with `ResourceNotFoundException`, and a write that would leave the
+//! resource holding more than [`crate::state::MAX_TAGS_PER_RESOURCE`] tags is refused
+//! whole with `ServiceQuotaExceededException`, persisting nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +145,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        // What the ARN names, for the modelled required members of a refusal. Read off
+        // the request, so an ARN naming nothing still reports what it named.
+        let (kind, resource_id) = crate::state::arn_resource(&input.resource_arn);
+        let not_found = || {
+            TagResourceErrorModeled::ResourceNotFoundException(crate::state::not_found(
+                kind,
+                &resource_id,
+            ))
+        };
+
+        // This operation models no server error, and an engine holding no PCS state
+        // holds no resource that ARN could name, which is what not-found states.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(not_found().into());
+        };
+        let mut state = state.lock();
+        state.settle();
+
+        let Some(stored) = state.tags_by_arn_mut(&input.resource_arn) else {
+            return Err(not_found().into());
+        };
+
+        // A key the resource already carries is EDITED, so only new keys grow the set.
+        // The ceiling is checked on the set the write would LEAVE BEHIND and refused
+        // before anything is written: a rejected call changes no tag.
+        let resulting = crate::state::tag_count_after_merge(stored, &input.tags);
+        if resulting > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                crate::state::tag_quota_exceeded(kind, &resource_id),
+            )
+            .into());
+        }
+
+        for (key, value) in input.tags {
+            stored.insert(key, value);
+        }
+        Ok(TagResourceOutput {})
     }
 }

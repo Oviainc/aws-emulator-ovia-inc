@@ -31,10 +31,13 @@
 //!   refuses the overflowing call with the modelled `ServiceQuotaExceededException`
 //!   ([`quota_exceeded`]).
 //! * record SIZE — the caller-sized lists a create persists are capped at
-//!   [`MAX_STORED_LIST_ENTRIES`] ([`stored_list_violation`]); `tags` needs no check
-//!   here because `RequestTagMap` is modelled `@length(min: 1, max: 200)` with
-//!   `TagKey` `@length(..128)` and `TagValue` `@length(..256)`, all enforced at the
-//!   boundary before a handler runs.
+//!   [`MAX_STORED_LIST_ENTRIES`] ([`stored_list_violation`]); the key and value LENGTHS
+//!   of a tag need no check here because `TagKey` is modelled `@length(..128)` and
+//!   `TagValue` `@length(..256)`, both enforced at the boundary before a handler runs.
+//! * tag COUNT — a resource's stored tag set is capped at [`MAX_TAGS_PER_RESOURCE`]
+//!   ([`tag_quota_exceeded`]) on every path that writes tags, a create carrying `tags`
+//!   as much as a later `TagResource`; `RequestTagMap`'s modelled
+//!   `@length(min: 1, max: 200)` bounds one request only.
 //! * the idempotency index — [`MAX_REMEMBERED_CLIENT_TOKENS`] entries, evicted
 //!   oldest-first, and every entry pointing into a cluster is dropped when that
 //!   cluster is removed ([`ComAmazonawsPcsAwsparallelcomputingserviceState::settle`]),
@@ -165,6 +168,13 @@ pub const MAX_QUEUES_PER_CLUSTER: usize = 50;
 /// record arbitrarily; the ceiling matches the 200 the model allows for `RequestTagMap`,
 /// the one caller-sized collection it does bound.
 pub const MAX_STORED_LIST_ENTRIES: usize = 200;
+
+/// The most tags one PCS resource holds, matching AWS's resource-tagging limit of 50
+/// tags per resource. Checked on every path that writes tags — the `tags` a create
+/// carries, and the set a `TagResource` would LEAVE BEHIND, so repeated tag writes cannot
+/// grow a record past it either — and the overflowing call is refused with the modelled
+/// `ServiceQuotaExceededException` ([`tag_quota_exceeded`]) and persists nothing.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// The most `@idempotencyToken` values remembered at once. Beyond this the oldest entry
 /// is evicted, so a caller minting fresh tokens cannot grow the index without bound; a
@@ -560,6 +570,53 @@ impl ComAmazonawsPcsAwsparallelcomputingserviceState {
         self.clusters.get_mut(&id)
     }
 
+    /// The tags of the resource `arn` names — a cluster, or a compute node group or a
+    /// queue inside one — or `None` when no stored resource carries that ARN.
+    ///
+    /// Tags live on the record they belong to (see [`ClusterRecord::tags`]), so a create
+    /// that carried tags, a later tag write and a tag read all see one set. The ARN is
+    /// matched against the one the create MINTED, so a resource is reachable by exactly
+    /// the ARN the service handed out for it.
+    pub fn tags_by_arn(&self, arn: &str) -> Option<&HashMap<String, String>> {
+        for cluster in self.clusters.values() {
+            if cluster.arn == arn {
+                return Some(&cluster.tags);
+            }
+            if let Some(group) = cluster
+                .compute_node_groups
+                .values()
+                .find(|group| group.arn == arn)
+            {
+                return Some(&group.tags);
+            }
+            if let Some(queue) = cluster.queues.values().find(|queue| queue.arn == arn) {
+                return Some(&queue.tags);
+            }
+        }
+        None
+    }
+
+    /// [`Self::tags_by_arn`], mutably: the one write path the tagging operations take,
+    /// so no two of them can disagree about where a resource's tags live.
+    pub fn tags_by_arn_mut(&mut self, arn: &str) -> Option<&mut HashMap<String, String>> {
+        for cluster in self.clusters.values_mut() {
+            if cluster.arn == arn {
+                return Some(&mut cluster.tags);
+            }
+            if let Some(group) = cluster
+                .compute_node_groups
+                .values_mut()
+                .find(|group| group.arn == arn)
+            {
+                return Some(&mut group.tags);
+            }
+            if let Some(queue) = cluster.queues.values_mut().find(|queue| queue.arn == arn) {
+                return Some(&mut queue.tags);
+            }
+        }
+        None
+    }
+
     /// The id of the cluster `identifier` names.
     pub fn cluster_id_for(&self, identifier: &str) -> Option<String> {
         if self.clusters.contains_key(identifier) {
@@ -842,6 +899,14 @@ pub const COMPUTE_NODE_GROUP: ResourceKind = ResourceKind {
     noun: "compute node group",
 };
 
+/// The kind an ARN names when its resource part is none of the three above: the service
+/// defines no fourth type, so a refusal about such an ARN names the resource generically
+/// rather than claiming a type PCS does not have ([`arn_resource`]).
+pub const UNNAMED_RESOURCE: ResourceKind = ResourceKind {
+    resource_type: "resource",
+    noun: "resource",
+};
+
 /// The modelled `ResourceNotFoundException` (HTTP 404) for a resource the service cannot
 /// find.
 ///
@@ -981,6 +1046,58 @@ pub fn quota_exceeded(resource_type: &str, limit: usize) -> ServiceQuotaExceeded
         resource_type: Some(resource_type.to_string()),
         quota_code: None,
     }
+}
+
+/// The resource kind a PCS ARN names, and the resource id at its tail.
+///
+/// A PCS ARN's resource part is `cluster/<id>`, `cluster/<id>/computenodegroup/<id>` or
+/// `cluster/<id>/queue/<id>` (see [`cluster_arn`], [`compute_node_group_arn`] and
+/// [`queue_arn`]), so the kind is the segment ahead of the trailing id. Read from the
+/// REQUEST, not from state, so an ARN that names nothing still reports what it named.
+pub fn arn_resource(arn: &str) -> (ResourceKind, String) {
+    let resource_part = arn.splitn(6, ':').nth(5).unwrap_or(arn);
+    let mut segments = resource_part.rsplit('/');
+    let resource_id = segments.next().unwrap_or_default();
+    let kind = match segments.next().unwrap_or_default() {
+        segment if segment == CLUSTER.resource_type => CLUSTER,
+        segment if segment == QUEUE.resource_type => QUEUE,
+        segment if segment == COMPUTE_NODE_GROUP.resource_type => COMPUTE_NODE_GROUP,
+        _ => UNNAMED_RESOURCE,
+    };
+    (kind, resource_id.to_string())
+}
+
+/// The modelled `ServiceQuotaExceededException` (HTTP 402) for a tag set past
+/// [`MAX_TAGS_PER_RESOURCE`] — the ceiling every path that writes tags checks, a create
+/// carrying `tags` as much as a later `TagResource`.
+///
+/// AWS states the resulting-set rule and the ceiling, and names neither the request's
+/// keys nor the resource, so the only variable part of the sentence is the ceiling
+/// itself. `quota_code` is left absent rather than invented: the emulator stands in for
+/// the quota, it does not reproduce Service Quotas' codes.
+pub fn tag_quota_exceeded(kind: ResourceKind, resource_id: &str) -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: format!(
+            "The resultant tag set must not have more than {MAX_TAGS_PER_RESOURCE} user tags."
+        ),
+        service_code: "pcs".to_string(),
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(kind.resource_type.to_string()),
+        quota_code: None,
+    }
+}
+
+/// How many tags a resource holding `stored` would hold once `requested` is merged in: a
+/// key the resource already carries is EDITED, not added, so only new keys grow the set.
+pub fn tag_count_after_merge(
+    stored: &HashMap<String, String>,
+    requested: &HashMap<String, String>,
+) -> usize {
+    stored.len()
+        + requested
+            .keys()
+            .filter(|key| !stored.contains_key(*key))
+            .count()
 }
 
 /// The page size a list serves for this `maxResults`.
