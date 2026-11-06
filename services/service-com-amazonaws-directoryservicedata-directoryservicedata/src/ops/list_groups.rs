@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the groups of a directory, as [`crate::state`] holds them: one page of
+//! `GroupSummary` in `SAMAccountName` order, no more than `MaxResults` of them, and a
+//! `NextToken` only when the directory holds more. A token resumes the walk just
+//! after the last group the previous page reported. The inventory is every group the
+//! directory holds — the built-in groups the domain was created with as much as the
+//! groups `CreateGroup` stored.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +166,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGroups"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListGroupsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the directory object store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let page_size = crate::state::page_size(input.max_results);
+
+        // A read NEVER materialises a directory: a `DirectoryId` nothing has written
+        // to holds no groups.
+        let store = state.lock();
+        let directory = store.directories.get(&input.directory_id);
+        let realm = crate::state::resolved_realm(
+            input.realm.as_deref(),
+            directory.map_or(crate::state::DEFAULT_REALM, |held| held.realm.as_str()),
+        );
+
+        // The cursor is stamped with what decides which records are walked, so a token
+        // issued for another listing, or built by a client, is refused rather than
+        // read as a position in this one.
+        let scope = crate::state::list_scope(&[&input.directory_id, &realm.to_ascii_lowercase()]);
+        let after = match input.next_token.as_deref() {
+            Some(token) => {
+                match crate::state::decode_cursor(token, crate::state::GROUPS_PAGE, &scope) {
+                    Some(after) => Some(after),
+                    None => {
+                        return Err(ListGroupsErrorModeled::ValidationException(
+                            crate::state::invalid_next_token(),
+                        )
+                        .into());
+                    }
+                }
+            }
+            None => None,
+        };
+
+        // `Realm` names the domain to read from; this directory holds groups only in
+        // its own realm, so another realm reports none of them.
+        let visible = directory
+            .filter(|held| crate::state::realm_matches(input.realm.as_deref(), &held.realm));
+
+        let page = match visible {
+            Some(held) => crate::state::page_of(&held.groups, page_size, after.as_deref()),
+            None => crate::state::Page::empty(),
+        };
+        let groups = page
+            .records
+            .iter()
+            .map(|group| group.to_summary())
+            .collect();
+        let next_token = page
+            .resume_after
+            .map(|key| crate::state::encode_cursor(crate::state::GROUPS_PAGE, &scope, &key));
+
+        Ok(ListGroupsOutput {
+            directory_id: Some(input.directory_id.clone()),
+            realm: Some(realm),
+            groups: Some(groups),
+            next_token,
+        })
     }
 }

@@ -209,26 +209,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let visible = directory
             .filter(|held| crate::state::realm_matches(input.realm.as_deref(), &held.realm));
 
-        let mut users = Vec::new();
-        let mut next_token = None;
-        let mut last_key = String::new();
-        for (key, user) in visible.into_iter().flat_map(|held| &held.users) {
-            // Resume strictly after the key the previous page ended on, so a user
-            // deleted meanwhile cannot hide the users that follow it.
-            if after.as_deref().is_some_and(|after| key.as_str() <= after) {
-                continue;
-            }
-            if users.len() == page_size {
-                next_token = Some(crate::state::encode_cursor(
-                    crate::state::USERS_PAGE,
-                    &scope,
-                    &last_key,
-                ));
-                break;
-            }
-            users.push(user.to_summary());
-            last_key = key.clone();
-        }
+        let page = match visible {
+            Some(held) => crate::state::page_of(&held.users, page_size, after.as_deref()),
+            None => crate::state::Page::empty(),
+        };
+        let users = page.records.iter().map(|user| user.to_summary()).collect();
+        let next_token = page
+            .resume_after
+            .map(|key| crate::state::encode_cursor(crate::state::USERS_PAGE, &scope, &key));
 
         Ok(ListUsersOutput {
             directory_id: Some(input.directory_id.clone()),

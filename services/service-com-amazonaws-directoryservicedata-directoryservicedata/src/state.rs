@@ -14,12 +14,17 @@
 //! * [`User`] / [`Group`] — keyed by the case-folded `SAMAccountName`, because AD
 //!   treats that name as case insensitive. A `BTreeMap` keyed that way is also the
 //!   total order the paginated list operations index into, so a page boundary is
-//!   stable across calls.
+//!   stable across calls. A directory's groups include the built-in groups every AD
+//!   domain is created with ([`builtin_groups`]), which is why its inventory is never
+//!   empty.
 //! * [`Membership`] — a group's members, plus the reverse index that answers "which
 //!   groups is this member in" without walking every group.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Bound;
 use std::time::{Duration, SystemTime};
+
+mod builtin_groups;
 
 use sha2::Digest;
 
@@ -75,6 +80,9 @@ pub const GROUP_MEMBER_TYPE: &str = "GROUP";
 
 /// The page kind [`encode_cursor`] stamps on a `ListUsers` token.
 pub const USERS_PAGE: &str = "users";
+
+/// The page kind [`encode_cursor`] stamps on a `ListGroups` token.
+pub const GROUPS_PAGE: &str = "groups";
 
 /// The page kind [`encode_cursor`] stamps on a `ListGroupMembers` token.
 pub const GROUP_MEMBERS_PAGE: &str = "group-members";
@@ -271,6 +279,18 @@ pub struct Group {
     pub members: BTreeMap<String, Membership>,
 }
 
+impl Group {
+    /// The `GroupSummary` projection `ListGroups` serves.
+    pub fn to_summary(&self) -> crate::ops::types::GroupSummary {
+        crate::ops::types::GroupSummary {
+            sid: self.sid.clone(),
+            sam_account_name: self.sam_account_name.clone(),
+            group_type: self.group_type.clone(),
+            group_scope: self.group_scope.clone(),
+        }
+    }
+}
+
 /// One member of a group: which object is in it, and what kind of object that is.
 ///
 /// The member's SID is NOT copied here; it is read from the member's own record, so
@@ -308,14 +328,18 @@ impl Directory {
     /// `directory_id` so it is stable for that directory and distinct across
     /// directories.
     fn new(directory_id: &str) -> Self {
-        Self {
+        let mut directory = Self {
             realm: DEFAULT_REALM.to_string(),
             domain_sid: domain_sid(directory_id),
             next_rid: FIRST_RID,
             users: BTreeMap::new(),
             groups: BTreeMap::new(),
             groups_by_member: HashMap::new(),
-        }
+        };
+        // A domain holds its built-in groups from the moment it exists, so they are
+        // part of the record rather than something a reader adds.
+        builtin_groups::seed(&mut directory);
+        directory
     }
 
     /// Mint the SID of a new object of this directory: the domain SID plus the next
@@ -339,8 +363,16 @@ impl Directory {
     /// The distinguished name of an object created in this directory's default
     /// container: `CN=<name>,CN=Users,DC=…`.
     pub fn distinguished_name(&self, sam_account_name: &str) -> String {
+        self.distinguished_name_in("Users", sam_account_name)
+    }
+
+    /// The distinguished name of an object of this directory sitting in `container`:
+    /// `CN=<name>,CN=<container>,DC=…`. An object's container is part of where it IS,
+    /// so a group of the domain's `BUILTIN` authority does not report itself under the
+    /// container a created object goes in.
+    pub fn distinguished_name_in(&self, container: &str, sam_account_name: &str) -> String {
         format!(
-            "CN={sam_account_name},CN=Users,{}",
+            "CN={sam_account_name},CN={container},{}",
             self.domain_components()
         )
     }
@@ -449,6 +481,10 @@ impl ComAmazonawsDirectoryservicedataDirectoryservicedataState {
     /// The directory `directory_id` names, creating the record if this is the first
     /// write to it. Only a MUTATING operation may call this: a read uses
     /// [`Self::directories`] directly, so reporting never materialises a directory.
+    ///
+    /// One call materialises at most one directory, and a new record holds a fixed
+    /// set of objects — the domain's built-in groups, a catalogue fixed at compile
+    /// time — so nothing in a request decides how much a materialisation allocates.
     pub fn directory_for_write(&mut self, directory_id: &str) -> &mut Directory {
         self.directories
             .entry(directory_id.to_string())
@@ -639,6 +675,60 @@ pub fn page_size(max_results: Option<i32>) -> usize {
         "MaxResults {requested} should have been refused at the boundary"
     );
     usize::try_from(requested.clamp(1, MAX_PAGE_SIZE)).expect("a page size clamped into 1..=250")
+}
+
+/// One page of a keyed set of records, as a list operation reports it.
+#[derive(Debug)]
+pub struct Page<'a, V> {
+    /// The records this page reports, in key order.
+    pub records: Vec<&'a V>,
+    /// The key the next page resumes after, set only when another record follows the
+    /// last one reported — which is exactly when the answer carries a `NextToken`.
+    pub resume_after: Option<String>,
+}
+
+impl<'a, V> Page<'a, V> {
+    /// The page of a set this request reports nothing from: no records, no next page.
+    pub fn empty() -> Self {
+        Self {
+            records: Vec::new(),
+            resume_after: None,
+        }
+    }
+}
+
+/// The page of `records` that follows the key `after`, at most `page_size` long.
+///
+/// The walk SEEKS to `after` in the map's order rather than scanning past the records
+/// earlier pages reported, and stops at the first record beyond the page, so one call
+/// reads at most `page_size + 1` records — bounded by `MaxResults`'s modelled ceiling
+/// however many records the set holds, and so is the page it allocates.
+pub fn page_of<'a, V>(
+    records: &'a BTreeMap<String, V>,
+    page_size: usize,
+    after: Option<&str>,
+) -> Page<'a, V> {
+    let start = match after {
+        // Strictly after the key the previous page ended on, so a record deleted
+        // meanwhile cannot hide the records that follow it.
+        Some(after) => Bound::Excluded(after),
+        None => Bound::Unbounded,
+    };
+    let mut page = Page::empty();
+    let mut last_key: Option<&String> = None;
+    for (index, (key, record)) in records
+        .range::<str, _>((start, Bound::Unbounded))
+        .enumerate()
+    {
+        if index == page_size {
+            // One record past the page is what proves another follows it.
+            page.resume_after = last_key.cloned();
+            break;
+        }
+        page.records.push(record);
+        last_key = Some(key);
+    }
+    page
 }
 
 /// True when a request's `Realm` names the realm of the directory it is addressed to.

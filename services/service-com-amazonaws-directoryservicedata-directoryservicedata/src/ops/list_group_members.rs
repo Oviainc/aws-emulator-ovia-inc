@@ -242,33 +242,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        let mut members = Vec::new();
-        let mut next_token = None;
-        let mut last_key = String::new();
-        if members_visible {
-            for (key, membership) in &group.members {
-                // Resume strictly after the key the previous page ended on, so a
-                // member removed meanwhile cannot hide the members that follow it.
-                if after.as_deref().is_some_and(|after| key.as_str() <= after) {
-                    continue;
-                }
-                if members.len() == page_size {
-                    next_token = Some(crate::state::encode_cursor(
-                        crate::state::GROUP_MEMBERS_PAGE,
-                        &scope,
-                        &last_key,
-                    ));
-                    break;
-                }
-                // A membership whose object is gone has nothing to report: the
-                // deletes that remove an object remove its memberships with it, so
-                // this is unreachable rather than a hole in the page.
-                if let Some(member) = directory.member_view(membership) {
-                    members.push(member);
-                }
-                last_key = key.clone();
-            }
-        }
+        let page = if members_visible {
+            crate::state::page_of(&group.members, page_size, after.as_deref())
+        } else {
+            crate::state::Page::empty()
+        };
+        // A membership whose object is gone has nothing to report: the deletes that
+        // remove an object remove its memberships with it, so this filter is an
+        // invariant rather than a hole in the page.
+        let members = page
+            .records
+            .iter()
+            .filter_map(|membership| directory.member_view(membership))
+            .collect();
+        let next_token = page
+            .resume_after
+            .map(|key| crate::state::encode_cursor(crate::state::GROUP_MEMBERS_PAGE, &scope, &key));
 
         Ok(ListGroupMembersOutput {
             directory_id: Some(input.directory_id.clone()),
