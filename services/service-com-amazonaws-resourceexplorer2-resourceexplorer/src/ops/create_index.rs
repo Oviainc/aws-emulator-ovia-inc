@@ -210,11 +210,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `ClientToken` is an @idempotencyToken: replaying the token that created this
-        // Region's index returns that index instead of creating a second one.
+        // Region's index returns that index instead of creating a second one. A record
+        // left behind by a finished deletion is not an index the Region holds, so a
+        // token replay cannot resurrect it.
         if let Some(token) = input.client_token.as_deref() {
             if let Some(existing) = guard
-                .indexes
-                .get(&region)
+                .present_index(&region)
                 .filter(|index| index.client_token.as_deref() == Some(token))
             {
                 return Ok(CreateIndexOutput {
@@ -225,8 +226,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // "You can create only one index in a Region."
-        if guard.indexes.contains_key(&region) {
+        // "You can create only one index in a Region." An index whose deletion finished
+        // no longer occupies its Region, so the Region can be given a new one and the
+        // new record replaces the terminal one.
+        if guard.present_index(&region).is_some() {
             return Err(CreateIndexErrorModeled::ConflictException(ConflictException {
                 message: format!(
                     "An index already exists in Region {region}. You can create only one \

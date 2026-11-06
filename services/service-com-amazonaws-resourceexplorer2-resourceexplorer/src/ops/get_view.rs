@@ -8,6 +8,11 @@
 //! one view wherever it is read from. (`AssociateDefaultView` is the one operation that
 //! does compare the two, because the default view is per-Region by definition.)
 //!
+//! An ARN that resolves to no view this account holds is refused with the modelled 401
+//! `UnauthorizedException`: authorization matches the ARN before anything reads it, so
+//! an ARN it cannot match is an authorization failure — and the answer therefore says
+//! nothing about whether a view by that ARN exists.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -164,9 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.settle(now);
 
         let Some(view) = guard.views.get(&input.view_arn) else {
-            return Err(GetViewErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("View not found: {}", input.view_arn)),
+            return Err(GetViewErrorModeled::UnauthorizedException(
+                UnauthorizedException {
+                    message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
                 },
             )
             .into());

@@ -2,7 +2,12 @@
 
 //! @op DeleteIndex
 //! IMPLEMENTED: moves the stored index into `DELETING`; when the clock settles it the
-//! index and its Region's views are gone from `crate::state`.
+//! Region's views are gone from `crate::state` and the index record is left in the
+//! terminal `DELETED` state.
+//!
+//! A second call against an index whose deletion already finished is refused with the
+//! modelled 400 `ValidationException` NAMING that state: the record exists and cannot
+//! change state again, which is a different thing to say than "no such index".
 //!
 //! ## Shape of an operation
 //!
@@ -173,11 +178,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(DeleteIndexErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Index not found: {}", input.arn)),
+                    message: Some(crate::state::resource_not_found_message(&input.arn)),
                 },
             )
             .into());
         };
+        // A deletion that already finished leaves the record in its terminal state, and a
+        // terminal state cannot be left: the refusal says which state the record is in,
+        // rather than reporting the index as absent.
+        if index.state.is_deleted() {
+            return Err(DeleteIndexErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "The index {} is in the {} state and can't be deleted.",
+                    index.arn,
+                    index.state.as_wire()
+                ),
+                field_list: None,
+            })
+            .into());
+        }
         // "These actions occur as asynchronous background tasks": the index is reported
         // DELETING, and the clock owes its removal — along with the Region's views.
         // @idempotent, so deleting an index that is ALREADY deleting reports the same

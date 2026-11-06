@@ -9,6 +9,11 @@
 //! one view wherever it is deleted from. (`AssociateDefaultView` is the one operation
 //! that does compare the two, because the default view is per-Region by definition.)
 //!
+//! An ARN that resolves to no view this account holds is refused with the modelled 401
+//! `UnauthorizedException`, for the same reason `GetView` does: authorization matches
+//! the ARN before anything acts on it, so an ARN it cannot match never reaches the
+//! store.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -166,9 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.settle(now);
 
         let Some(removed) = guard.views.remove(&input.view_arn) else {
-            return Err(DeleteViewErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("View not found: {}", input.view_arn)),
+            return Err(DeleteViewErrorModeled::UnauthorizedException(
+                UnauthorizedException {
+                    message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
                 },
             )
             .into());

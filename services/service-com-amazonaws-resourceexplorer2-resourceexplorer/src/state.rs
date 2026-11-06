@@ -11,9 +11,8 @@
 //! from a sibling:
 //!
 //! * [`ComAmazonawsResourceexplorer2ResourceexplorerState::settle`] — the
-//! * [`ComAmazonawsResourceexplorer2ResourceexplorerState::settle`] — the
 //!   clock-owed index lifecycle transitions (`CREATING` -> `ACTIVE`, `UPDATING` ->
-//!   `ACTIVE`, `DELETING` -> gone, taking the Region's views with it), and the
+//!   `ACTIVE`, `DELETING` -> `DELETED`, taking the Region's views with it), and the
 //!   setup-task steps that wait on them.
 //! * [`ComAmazonawsResourceexplorer2ResourceexplorerState::insert_index`] /
 //!   [`ComAmazonawsResourceexplorer2ResourceexplorerState::insert_view`] — the ONE
@@ -32,8 +31,10 @@
 //!   `Filters.FilterString`.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
+use regex::Regex;
 use sha2::{Digest, Sha256};
 
 mod setup_tasks;
@@ -99,9 +100,10 @@ pub fn is_servable_region(region: &str) -> bool {
 
 /// The lifecycle of an index, as the `IndexState` enum names it on the wire.
 ///
-/// `DELETED` is the one `IndexState` value with no variant here: it is never
-/// observable, because a settled deletion removes the index rather than leaving a
-/// deleted one behind.
+/// Every one of the model's five `IndexState` values is reachable here. `DELETED` is
+/// TERMINAL: the record of a deleted index keeps it instead of disappearing, so an
+/// operation naming that index afterwards is answered from a record in a terminal state
+/// rather than from nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexLifecycle {
     /// The index was just created and has not finished coming up.
@@ -110,6 +112,10 @@ pub enum IndexLifecycle {
     Active,
     /// The index is being torn down, along with the Region's views.
     Deleting,
+    /// The deletion finished: "Resource Explorer successfully deleted the index"
+    /// (`IndexState$DELETED`). The index holds nothing and backs nothing, and the
+    /// Region is free to hold a new one.
+    Deleted,
     /// The index's type is being switched between `LOCAL` and `AGGREGATOR`, which is
     /// what starts or stops replication with the account's other Regions.
     Updating,
@@ -122,8 +128,20 @@ impl IndexLifecycle {
             Self::Creating => "CREATING",
             Self::Active => "ACTIVE",
             Self::Deleting => "DELETING",
+            Self::Deleted => "DELETED",
             Self::Updating => "UPDATING",
         }
+    }
+
+    /// Whether this is the terminal state a deleted index keeps.
+    pub fn is_deleted(self) -> bool {
+        matches!(self, Self::Deleted)
+    }
+
+    /// Whether an index in this state still occupies its Region — anything but the
+    /// terminal `DELETED`, which leaves the Region free to hold a new index.
+    pub fn occupies_region(self) -> bool {
+        !self.is_deleted()
     }
 }
 
@@ -452,9 +470,19 @@ impl ComAmazonawsResourceexplorer2ResourceexplorerState {
                 }
                 IndexLifecycle::Deleting => {
                     // "Resource Explorer also deletes all views in that Region."
-                    self.indexes.remove(&region);
                     self.views.retain(|_, view| view.region != region);
                     self.default_view_arns.remove(&region);
+                    // The index itself stops being an index the Region holds, but its
+                    // record stays in the terminal `DELETED` state: a deletion that
+                    // finished is not the same thing as an index that never existed, and
+                    // an operation naming the ARN afterwards has to be able to tell them
+                    // apart.
+                    if let Some(index) = self.indexes.get_mut(&region) {
+                        index.state = IndexLifecycle::Deleted;
+                        index.settles_at = None;
+                        index.last_updated_at = now;
+                        index.tags.clear();
+                    }
                 }
                 IndexLifecycle::Updating => {
                     // "When the asynchronous tasks complete, the Status response of
@@ -465,8 +493,8 @@ impl ComAmazonawsResourceexplorer2ResourceexplorerState {
                         index.last_updated_at = now;
                     }
                 }
-                IndexLifecycle::Active => {
-                    // An Active index is never put on the clock, so nothing is owed.
+                IndexLifecycle::Active | IndexLifecycle::Deleted => {
+                    // Neither state is ever put on the clock, so nothing is owed.
                 }
             }
         }
@@ -541,21 +569,39 @@ impl ComAmazonawsResourceexplorer2ResourceexplorerState {
     }
 
     /// The Region's index when it can back view creation and search — that is,
-    /// when it exists and is not being torn down.
+    /// when it exists and is neither being torn down nor already deleted.
     pub fn live_index(&self, region: &str) -> Option<&IndexEntry> {
-        self.indexes
-            .get(region)
-            .filter(|index| index.state != IndexLifecycle::Deleting)
+        self.indexes.get(region).filter(|index| {
+            !matches!(
+                index.state,
+                IndexLifecycle::Deleting | IndexLifecycle::Deleted
+            )
+        })
     }
 
-    /// The account's aggregator index, when it holds one that is not being torn down.
+    /// The index record that still OCCUPIES `region`, in whatever state.
+    ///
+    /// The one place "this Region already has an index" is decided, so a Region whose
+    /// index was deleted can be given a new one while a Region whose index is merely
+    /// being torn down cannot.
+    pub fn present_index(&self, region: &str) -> Option<&IndexEntry> {
+        self.indexes
+            .get(region)
+            .filter(|index| index.state.occupies_region())
+    }
+
+    /// The account's aggregator index, when it holds one that is still there.
     ///
     /// There is at most one: "You can have only one aggregator index per Amazon Web
-    /// Services account." An index on its way out is not it, for the same reason
-    /// [`Self::live_index`] leaves one out — it is about to stop replicating anything.
+    /// Services account." An index on its way out is not it, and neither is the record of
+    /// one whose deletion finished, for the same reason [`Self::live_index`] leaves both
+    /// out — it has stopped replicating anything.
     pub fn aggregator_index(&self) -> Option<&IndexEntry> {
         self.indexes.values().find(|index| {
-            index.state != IndexLifecycle::Deleting && index.index_type == INDEX_TYPE_AGGREGATOR
+            !matches!(
+                index.state,
+                IndexLifecycle::Deleting | IndexLifecycle::Deleted
+            ) && index.index_type == INDEX_TYPE_AGGREGATOR
         })
     }
 
@@ -612,7 +658,7 @@ impl ComAmazonawsResourceexplorer2ResourceexplorerState {
         }
         self.indexes
             .values()
-            .find(|index| index.arn == arn)
+            .find(|index| index.arn == arn && index.state.occupies_region())
             .map(|index| &index.tags)
     }
 
@@ -623,19 +669,25 @@ impl ComAmazonawsResourceexplorer2ResourceexplorerState {
         }
         self.indexes
             .values_mut()
-            .find(|index| index.arn == arn)
+            .find(|index| index.arn == arn && index.state.occupies_region())
             .map(|index| &mut index.tags)
     }
 
     /// The indexes a `ListIndexes` caller can see, ordered by ARN.
     ///
-    /// An index that is being torn down is left out: `Index` carries no state
-    /// member, so listing one would report a usable index that is not.
+    /// An index that is being torn down, or whose deletion already finished, is left
+    /// out: `Index` carries no state member, so listing one would report a usable index
+    /// that is not.
     pub fn listable_indexes(&self) -> Vec<&IndexEntry> {
         let mut indexes: Vec<&IndexEntry> = self
             .indexes
             .values()
-            .filter(|index| index.state != IndexLifecycle::Deleting)
+            .filter(|index| {
+                !matches!(
+                    index.state,
+                    IndexLifecycle::Deleting | IndexLifecycle::Deleted
+                )
+            })
             .collect();
         indexes.sort_by(|a, b| a.arn.cmp(&b.arn));
         indexes
@@ -732,6 +784,42 @@ pub fn is_own_arn(arn: &str) -> bool {
 /// that the principal is not permitted to perform the operation, so it carries nothing
 /// from the request.
 pub const UNAUTHORIZED_MESSAGE: &str = "Unauthorized";
+
+/// The `ConflictException` message for the view-conflict class, the one the shape's own
+/// documentation describes: "you specified parameters that didn't match the original
+/// request, or you attempted to create a view with a name that already exists in this
+/// Amazon Web Services Region".
+///
+/// WHOLLY FIXED text: the refusal names neither the view, nor the Region, nor the ARN of
+/// the view that is already there — which is also why it cannot disclose a view the
+/// caller was not able to name correctly.
+pub const VIEW_CONFLICT_MESSAGE: &str = "The request failed because either the request \
+                                         parameters didn't match to the original request \
+                                         or a view with the specified name already exists \
+                                         in this AWS Region.";
+
+/// The `ViewName` `@pattern` the model declares
+/// (`smithy_query(query="shape",shape="ViewName")`).
+///
+/// Re-declared here because `CreateViewInput` carries `skip_validation = ["ViewName"]`:
+/// the boundary walk must not refuse a name that cannot produce a matchable view ARN,
+/// because that refusal belongs to the authorization class, which runs first and is
+/// worded differently.
+pub const VIEW_NAME_PATTERN: &str = r"^[a-zA-Z0-9\-]{1,64}$";
+
+/// Whether `name` is a `ViewName` the modelled pattern admits.
+///
+/// Matched with the maintained `regex` engine against [`VIEW_NAME_PATTERN`] itself, so
+/// the rule enforced is the model's and not a re-statement of it. The expression is
+/// anchored, so a find is an anchored match; it is compiled once per process.
+pub fn is_well_formed_view_name(name: &str) -> bool {
+    static COMPILED: OnceLock<Regex> = OnceLock::new();
+    COMPILED
+        .get_or_init(|| {
+            Regex::new(VIEW_NAME_PATTERN).expect("the modelled ViewName pattern compiles")
+        })
+        .is_match(name)
+}
 
 /// The `ResourceNotFoundException` message for an own-namespace ARN that this account
 /// holds no resource for, worded with the kind of resource the ARN names — the two kinds

@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-resourceexplorer2-resourceexplorer.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.resourceexplorer2#CreateViewInput")]
+// `skip_validation = ["ViewName"]`: AWS refuses a `ViewName` outside the modelled
+// `@pattern` in its AUTHORIZATION layer, which resolves the view ARN the request would
+// create before the service validates the request — the answer is 401
+// `UnauthorizedException`, not a 400 constraint report. Dropping only this member's
+// constraint traits from the generated schema is what lets `CreateView::handle` state
+// that refusal; every other member of this input keeps its boundary validation.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.resourceexplorer2#CreateViewInput",
+    skip_validation = ["ViewName"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct CreateViewInput {
     pub client_token: Option<String>,

@@ -146,7 +146,12 @@ fn replication(
     let mut regions: Vec<String> = store
         .indexes
         .values()
-        .filter(|other| other.state != crate::state::IndexLifecycle::Deleting)
+        .filter(|other| {
+            !matches!(
+                other.state,
+                crate::state::IndexLifecycle::Deleting | crate::state::IndexLifecycle::Deleted
+            )
+        })
         .filter(|other| {
             if local {
                 // The aggregator index, wherever it is: the Region a local index
@@ -223,8 +228,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.settle(now);
 
         // Not `live_index`: an index being torn down is still an index a caller can read,
-        // and `DELETING` is one of the states the model's `IndexState` names.
-        let Some(index) = guard.indexes.get(&region) else {
+        // and `DELETING` is one of the states the model's `IndexState` names. A record
+        // whose deletion already FINISHED is not: the Region holds no index then, which
+        // is what `present_index` decides.
+        let Some(index) = guard.present_index(&region) else {
             return Err(GetIndexErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     // The crate's wording for this modelled refusal, keyed on what the

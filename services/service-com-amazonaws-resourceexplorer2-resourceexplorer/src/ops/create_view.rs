@@ -4,6 +4,11 @@
 //! IMPLEMENTED: persists a view in the request's Region in `crate::state` and answers
 //! with the stored structure, which `GetView` reads back unchanged.
 //!
+//! `ViewName` is held to its modelled `@pattern` HERE rather than at the request
+//! boundary (`skip_validation` on `CreateViewInput`): a name outside the pattern cannot
+//! produce a view ARN authorization can match, so the refusal is this operation's
+//! modelled 401 `UnauthorizedException` rather than a 400 parameter validation.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -194,6 +199,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = store.lock();
         guard.settle(now);
 
+        // Authorization resolves the view ARN this request WOULD create before the
+        // service validates the request, and a `ViewName` the modelled pattern does not
+        // admit cannot appear in an ARN any policy can match — so the refusal is the
+        // authorization class, not parameter validation. The member therefore carries
+        // `skip_validation` on `CreateViewInput` (see
+        // `super::types::create_view_types`) and the pattern is judged here, first.
+        if !crate::state::is_well_formed_view_name(&input.view_name) {
+            return Err(CreateViewErrorModeled::UnauthorizedException(
+                UnauthorizedException {
+                    message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // A view is queried through the Region's index, so the Region must have one.
         // This operation models no ResourceNotFoundException, so the refusal is the
         // modelled 400 ValidationException naming the condition.
@@ -257,11 +277,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     && existing.tags == tags;
                 if !same_request {
                     return Err(CreateViewErrorModeled::ConflictException(ConflictException {
-                        message: format!(
-                            "The ClientToken {token} was already used to create view \
-                             {} with different parameters.",
-                            existing.view_arn
-                        ),
+                        // The view-conflict class carries AWS's fixed text, which states
+                        // both halves of the class — mismatched parameters for a replayed
+                        // request, and a name already in use — and nothing from the
+                        // request or the store.
+                        message: crate::state::VIEW_CONFLICT_MESSAGE.to_string(),
                     })
                     .into());
                 }
@@ -272,12 +292,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The name must be unique within its Amazon Web Services Region."
-        if let Some(existing) = guard.view_by_name(&region, &input.view_name) {
+        if guard.view_by_name(&region, &input.view_name).is_some() {
             return Err(CreateViewErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "A view named {} already exists in Region {region}: {}",
-                    input.view_name, existing.view_arn
-                ),
+                message: crate::state::VIEW_CONFLICT_MESSAGE.to_string(),
             })
             .into());
         }

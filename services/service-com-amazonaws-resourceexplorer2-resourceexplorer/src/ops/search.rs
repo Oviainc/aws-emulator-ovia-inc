@@ -209,9 +209,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // then Resource Explorer uses the default view for the Region in which you call
         // this operation."
         let view = match input.view_arn.as_deref() {
+            // An ARN that resolves to no view this account holds is an authorization
+            // failure, not a report that the view is absent: authorization matches the
+            // ARN before the query runs.
             Some(arn) => guard.views.get(arn).ok_or_else(|| {
-                SearchErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!("View not found: {arn}")),
+                SearchErrorModeled::UnauthorizedException(UnauthorizedException {
+                    message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
                 })
             })?,
             None => guard

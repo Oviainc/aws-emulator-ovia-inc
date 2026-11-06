@@ -22,6 +22,8 @@ pub mod create_view_types;
 pub mod delete_index_types;
 pub mod delete_resource_explorer_setup_types;
 pub mod delete_view_types;
+pub mod disassociate_default_view_types;
+pub mod get_default_view_types;
 pub mod get_index_types;
 pub mod get_managed_view_types;
 pub mod get_resource_explorer_setup_types;
@@ -60,6 +62,10 @@ pub use delete_index_types::*;
 pub use delete_resource_explorer_setup_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use delete_view_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use disassociate_default_view_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use get_default_view_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_index_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

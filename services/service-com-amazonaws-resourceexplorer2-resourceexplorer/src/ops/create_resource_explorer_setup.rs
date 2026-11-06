@@ -244,9 +244,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             } else {
                 crate::state::INDEX_TYPE_LOCAL
             };
+            // What the Region HOLDS: the record of an index whose deletion already
+            // finished occupies nothing, so such a Region is one this setup gives a new
+            // index to rather than one that already has it.
             let held = guard
-                .indexes
-                .get(&region)
+                .present_index(&region)
                 .map(|index| (index.state, index.index_type.clone(), index.settles_at));
 
             // What the Region's index step is, and when the Region's index is usable:

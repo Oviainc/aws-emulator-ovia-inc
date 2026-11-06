@@ -315,7 +315,11 @@ impl ComAmazonawsResourceexplorer2ResourceexplorerState {
             .index
             .arn
             .as_deref()
-            .and_then(|arn| self.indexes.values().find(|index| index.arn == arn))
+            .and_then(|arn| {
+                self.indexes
+                    .values()
+                    .find(|index| index.arn == arn && index.state.occupies_region())
+            })
             .map(IndexEntry::to_wire);
         let view = entry
             .view

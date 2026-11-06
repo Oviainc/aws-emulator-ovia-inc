@@ -58,6 +58,16 @@ impl Answer {
             self.body
         );
     }
+
+    /// The error's `Message` member, however the envelope cases it.
+    fn error_message(&self) -> String {
+        self.body
+            .get("Message")
+            .or_else(|| self.body.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
 }
 
 impl Emulator {
@@ -311,7 +321,7 @@ async fn the_index_settles_from_creating_to_active_and_deleting_to_gone() {
     emulator
         .call(region, "GetView", json!({ "ViewArn": view_arn }))
         .await
-        .failed("view of a deleted index", 404, "ResourceNotFoundException");
+        .failed("view of a deleted index", 401, "UnauthorizedException");
 
     // With the index gone a view cannot be created, and a new index can.
     emulator
@@ -486,16 +496,23 @@ async fn every_created_view_round_trips_through_get_view() {
         );
     }
 
-    // An ARN nothing created is a 404, never a 501 and never an empty success.
+    // An ARN nothing created resolves to no view, which is an authorization failure —
+    // never a 501, never an empty success, and never a report that the view is absent.
     for arn in [
         "arn:aws:resource-explorer-2:us-east-1:000000000000:view/nope/00000000-0000-0000-0000-000000000000",
         "arn:aws:resource-explorer-2:eu-west-1:000000000000:view/also-nope/1",
         "not-even-an-arn",
     ] {
-        emulator
+        let answer = emulator
             .call(region, "GetView", json!({ "ViewArn": arn }))
-            .await
-            .failed(arn, 404, "ResourceNotFoundException");
+            .await;
+        answer.failed(arn, 401, "UnauthorizedException");
+        assert_eq!(
+            answer.error_message(),
+            "Unauthorized",
+            "case {arn:?}: the refusal carries nothing from the request, got {}",
+            answer.body
+        );
     }
 }
 
@@ -573,8 +590,9 @@ async fn create_view_replays_its_client_token() {
     );
 }
 
-/// `DeleteView` removes the view from the store: `GetView` then 404s, `ListViews` no
-/// longer carries the ARN, and deleting it again (or deleting anything unknown) 404s.
+/// `DeleteView` removes the view from the store: its ARN stops resolving, so `GetView`
+/// and a second `DeleteView` are both refused as authorization failures, and `ListViews`
+/// no longer carries it.
 #[tokio::test]
 async fn deleting_a_view_removes_it_everywhere() {
     let emulator = Emulator::new();
@@ -597,11 +615,11 @@ async fn deleting_a_view_removes_it_everywhere() {
     emulator
         .call(region, "GetView", json!({ "ViewArn": doomed.clone() }))
         .await
-        .failed("get after delete", 404, "ResourceNotFoundException");
+        .failed("get after delete", 401, "UnauthorizedException");
     emulator
         .call(region, "DeleteView", json!({ "ViewArn": doomed.clone() }))
         .await
-        .failed("delete twice", 404, "ResourceNotFoundException");
+        .failed("delete twice", 401, "UnauthorizedException");
 
     let listed = emulator.call(region, "ListViews", json!({})).await;
     assert_eq!(
@@ -1028,8 +1046,9 @@ async fn search_pages_without_changing_its_count() {
         .failed("token from another query", 400, "ValidationException");
 }
 
-/// A query needs a view: the one the caller names, else the Region's default, else a
-/// 404. A view in another Region cannot be the default for this one.
+/// A query needs a view: the one the caller names, else the Region's default. An ARN
+/// that resolves to nothing is an authorization failure, a Region with no default has
+/// nothing to resolve, and a view in another Region cannot be the default for this one.
 #[tokio::test]
 async fn search_resolves_the_view_it_is_told_to_use() {
     let emulator = Emulator::new();
@@ -1054,7 +1073,7 @@ async fn search_resolves_the_view_it_is_told_to_use() {
             }),
         )
         .await
-        .failed("unknown view", 404, "ResourceNotFoundException");
+        .failed("unknown view", 401, "UnauthorizedException");
     emulator
         .call(region, "AssociateDefaultView", json!({ "ViewArn": foreign }))
         .await

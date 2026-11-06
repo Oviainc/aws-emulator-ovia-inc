@@ -296,9 +296,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // An index on its way out has no type left to switch: its content, and its
-        // Region's views with it, are already being deleted.
-        if state == crate::state::IndexLifecycle::Deleting {
+        // An index on its way out, or one whose deletion already finished, has no type
+        // left to switch: its content, and its Region's views with it, are gone or going.
+        if matches!(
+            state,
+            crate::state::IndexLifecycle::Deleting | crate::state::IndexLifecycle::Deleted
+        ) {
             return Err(conflict(format!(
                 "The index {} is in the {} state, so its type cannot be updated.",
                 input.arn,

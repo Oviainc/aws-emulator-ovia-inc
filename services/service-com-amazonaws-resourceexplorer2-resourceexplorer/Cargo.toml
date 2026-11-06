@@ -25,6 +25,10 @@ tracing = { workspace = true }
 hex = { workspace = true }
 # SHA-256 for the derived UUID-shaped segment of index and view ARNs.
 sha2 = { workspace = true }
+# The modelled `ViewName` @pattern is enforced in `CreateView`'s handler rather than at
+# the request boundary, and a Smithy @pattern is a regular expression, so it is matched
+# with a maintained regex engine instead of a hand-rolled restatement of the class.
+regex = "1.12"
 # `service-common` carries the ONE resource-ARN parse, which the tagging operations read a
 # caller-supplied `resourceArn`'s vendor and resource type through.
 service-common = { path = "../common" }
