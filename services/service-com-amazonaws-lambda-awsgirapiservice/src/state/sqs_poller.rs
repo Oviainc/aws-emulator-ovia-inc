@@ -44,9 +44,11 @@
 //!   function's report of which messages of the batch failed deletes only the messages that
 //!   report leaves out, and leaves the rest where they were — so one message of a batch can
 //!   be retried without the ones beside it being delivered again (see
-//!   [`super::batch_item_failures`]). On a FIFO source a message is held back by a retry of
-//!   an earlier message of its own group too, because that group's messages are handed over
-//!   "one at a time, in strict order" (see [`processed_in_group_order`]).
+//!   [`super::batch_item_failures`]). The report names MESSAGES, so the set deleted is its
+//!   complement whatever `MessageGroupId` each message carries: a message of the same group
+//!   as a reported failure is deleted when the report leaves it out, which is why a function
+//!   on a FIFO source that wants its group's order kept reports the messages after a failure
+//!   as failed too.
 //! * METER. While the mapping's `MetricsConfig` selects `EventCount`, what the pass did with
 //!   its events — how many it polled, how many the filter rejected, how many an invocation
 //!   accepted and how many it deleted — is published for that mapping to CloudWatch (see
@@ -71,7 +73,7 @@
 //! runtime to spawn onto there is no task, and [`poll_due`] — which is the whole of one
 //! wake-up's work and takes the instant it is working at — can be awaited directly instead.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -173,10 +175,6 @@ struct PollTarget {
 struct PolledMessage {
     /// The id the queue holds the message under, which is what a delete names it by.
     message_id: String,
-    /// The `MessageGroupId` the message carries, when it has one: the group a FIFO queue
-    /// hands over "one at a time, in strict order", which is what makes one message of a
-    /// batch ordered against another.
-    message_group_id: Option<String>,
     /// The record envelope, as the function receives it.
     record: Value,
 }
@@ -331,13 +329,11 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
         } else {
             let payload = queue_event(&invoking, &polled);
             // What the attempt came to for the batch's messages: the ones it PROCESSED, or
-            // why it processed none of them. A batch of a FIFO source is cut down to the
-            // messages its group order lets this attempt consume, and an attempt left with
-            // none is one that processed nothing, which is the failure case below.
+            // why it processed none of them. An attempt that processed none of the messages
+            // it was handed is the failure case below.
             let attempt = hand_over_batch(callback, session, &target, &payload, &invoking)
                 .await
                 .and_then(|processed| {
-                    let processed = processed_in_group_order(&polled, &invoking, &processed);
                     if processed.is_empty() {
                         return Err(format!(
                             "{} processed no message of the batch it was handed",
@@ -511,7 +507,6 @@ fn take_batch(
             let message = queue.messages.get(*index)?;
             Some(PolledMessage {
                 message_id: delivered.message_id.clone(),
-                message_group_id: message.message_group_id.clone(),
                 record: queue_record(message, &delivered.receipt_handle, &target.queue_arn, &region),
             })
         })
@@ -686,42 +681,6 @@ fn queue_record(
         record[RECORD_MD5_OF_MESSAGE_ATTRIBUTES] = Value::String(digest);
     }
     record
-}
-
-/// The messages of `processed` this attempt may consume, given the order their queue hands
-/// them over in.
-///
-/// A FIFO queue hands the messages of one `MessageGroupId` over "one at a time, in strict
-/// order", so a message cannot be consumed while an EARLIER message of its own group is
-/// going back for another attempt: deleting it would leave the retry of that earlier message
-/// to be processed after it, which is the order the group exists to keep. A message the
-/// attempt did not process therefore holds back every later message of its group as well,
-/// whatever the report said about those. A message carrying no group id is ordered against
-/// nothing, so nothing holds it back.
-fn processed_in_group_order(
-    polled: &[PolledMessage],
-    invoking: &[String],
-    processed: &[String],
-) -> Vec<String> {
-    let handed: BTreeSet<&str> = invoking.iter().map(String::as_str).collect();
-    let consumed: BTreeSet<&str> = processed.iter().map(String::as_str).collect();
-    let mut held_back: BTreeSet<&str> = BTreeSet::new();
-    let mut consumable: Vec<String> = Vec::new();
-    for message in polled
-        .iter()
-        .filter(|message| handed.contains(message.message_id.as_str()))
-    {
-        let group = message.message_group_id.as_deref();
-        let behind_a_retry = group.is_some_and(|group| held_back.contains(group));
-        if !behind_a_retry && consumed.contains(message.message_id.as_str()) {
-            consumable.push(message.message_id.clone());
-            continue;
-        }
-        if let Some(group) = group {
-            held_back.insert(group);
-        }
-    }
-    consumable
 }
 
 /// Hand one batch to the function and read what became of the messages it held: the ids of
@@ -1019,8 +978,8 @@ mod tests {
     use ::service_com_amazonaws_sqs_amazonsqs::ops::types::shared_types::MessageAttributeValue;
 
     use super::{
-        filter_event, invisible_for_seconds, minute_of, processed_in_group_order, queue_event,
-        queue_record, PolledMessage, RECORD_MD5_OF_MESSAGE_ATTRIBUTES,
+        filter_event, invisible_for_seconds, minute_of, queue_event, queue_record, PolledMessage,
+        RECORD_MD5_OF_MESSAGE_ATTRIBUTES,
     };
 
     /// The queue every envelope row below is built for, and the Region it lives in.
@@ -1329,101 +1288,7 @@ mod tests {
     fn polled(id: &str, body: &str) -> PolledMessage {
         PolledMessage {
             message_id: id.to_string(),
-            message_group_id: None,
             record: json!({ "messageId": id, "body": body }),
-        }
-    }
-
-    /// One polled message of the message group `group`, under the id `id`.
-    fn polled_in_group(id: &str, group: &str) -> PolledMessage {
-        PolledMessage {
-            message_group_id: Some(group.to_string()),
-            ..polled(id, "body")
-        }
-    }
-
-    #[test]
-    fn a_message_behind_a_retry_of_its_own_group_is_not_consumed() {
-        // The rows differ along how the batch is grouped and which of it the report left
-        // behind: a batch with no groups at all (a standard queue, where nothing is ordered
-        // against anything), one group whose first, middle and last message failed, two
-        // groups where only one has a failure, and a grouped message beside an ungrouped one.
-        // One row: the case, the batch as it was handed over, the messages the attempt
-        // processed, and the messages it may then consume.
-        type Row = (
-            &'static str,
-            Vec<PolledMessage>,
-            Vec<&'static str>,
-            Vec<&'static str>,
-        );
-        let rows: [Row; 6] = [
-            (
-                "no message groups, the middle message failed",
-                vec![polled("m-1", "a"), polled("m-2", "b"), polled("m-3", "c")],
-                vec!["m-1", "m-3"],
-                vec!["m-1", "m-3"],
-            ),
-            (
-                "one group, its first message failed",
-                vec![
-                    polled_in_group("m-1", "g-a"),
-                    polled_in_group("m-2", "g-a"),
-                    polled_in_group("m-3", "g-a"),
-                ],
-                vec!["m-2", "m-3"],
-                Vec::new(),
-            ),
-            (
-                "one group, its middle message failed",
-                vec![
-                    polled_in_group("m-1", "g-a"),
-                    polled_in_group("m-2", "g-a"),
-                    polled_in_group("m-3", "g-a"),
-                ],
-                vec!["m-1", "m-3"],
-                vec!["m-1"],
-            ),
-            (
-                "one group, its last message failed",
-                vec![
-                    polled_in_group("m-1", "g-a"),
-                    polled_in_group("m-2", "g-a"),
-                    polled_in_group("m-3", "g-a"),
-                ],
-                vec!["m-1", "m-2"],
-                vec!["m-1", "m-2"],
-            ),
-            (
-                "two groups, only one of them with a failure",
-                vec![
-                    polled_in_group("m-1", "g-a"),
-                    polled_in_group("m-2", "g-b"),
-                    polled_in_group("m-3", "g-a"),
-                    polled_in_group("m-4", "g-b"),
-                ],
-                vec!["m-2", "m-3", "m-4"],
-                vec!["m-2", "m-4"],
-            ),
-            (
-                "a grouped message beside an ungrouped one",
-                vec![polled_in_group("m-1", "g-a"), polled("m-2", "b")],
-                vec!["m-2"],
-                vec!["m-2"],
-            ),
-        ];
-        for (case, batch, processed, expected) in rows {
-            let invoking: Vec<String> = batch
-                .iter()
-                .map(|message| message.message_id.clone())
-                .collect();
-            let processed: Vec<String> = processed.iter().map(|id| (*id).to_string()).collect();
-            let consumable = processed_in_group_order(&batch, &invoking, &processed);
-            let expected: Vec<String> = expected.iter().map(|id| (*id).to_string()).collect();
-            assert_eq!(
-                consumable, expected,
-                "case {case:?}: an attempt that processed {processed:?} may consume \
-                 {expected:?}, got {consumable:?}"
-            );
         }
     }
 

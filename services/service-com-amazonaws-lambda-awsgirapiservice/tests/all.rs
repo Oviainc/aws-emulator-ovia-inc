@@ -247,6 +247,8 @@ mod response_stream_invocation;
 mod runtime_management_config;
 #[path = "all/signing_name_routing.rs"]
 mod signing_name_routing;
+#[path = "all/sqs_event_source_handler_run.rs"]
+mod sqs_event_source_handler_run;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stream_mapping_iterator_age_series.rs"]

@@ -32,3 +32,30 @@ Actual: 'Error: Check timed out after 60.0s' for both checks — no invocation a
 
 ## Steps to Reproduce
 1. CreateQueue (standard with a RedrivePolicy to a DLQ; and separately a FIFO queue), CreateFunction, CreateEventSourceMapping (Enabled, FunctionResponseTypes=['ReportBatchItemFailures'] for the FIFO leg). 2. SendMessage(s), let the failing function exhaust maxReceiveCount, verify the DLQ, fix the function, StartMessageMoveTask, and poll for processing. 3. For FIFO, send ordered messages in one MessageGroupId and have the handler report the first as a batch item failure. Replay both check ids in trace_ids.
+
+## Resolution
+
+The cause's premise — "an enabled SQS event source mapping never invokes its function ... no
+batch is ever delivered" — does not hold any more: an enabled mapping on a queue polls it,
+invokes the mapped function with the `aws:sqs` record batch, reads the function's partial
+batch report and deletes or leaves each message accordingly, and a message no attempt
+processes is dead-lettered by the queue's own `RedrivePolicy` and reprocessed once a move
+task returns it to the source queue. Both legs are driven end to end, over the router and
+through a deployment package that RUNS, by
+`services/service-com-amazonaws-lambda-awsgirapiservice/tests/all/sqs_event_source_handler_run.rs`.
+
+What the recordings did expose in that scope, and what is FIXED here, is the deletion set of a
+partial batch report: the poller intersected the report's complement with a message-group rule
+of its own, so a message the report left out was held back by a reported failure EARLIER in its
+own `MessageGroupId` — which for a single-group batch whose first message was reported left the
+whole batch on the queue. Lambda deletes exactly the messages the report does not name,
+whatever group each carries (`state/sqs_poller.rs`, `processed_in_group_order` removed).
+
+Still OUTSTANDING for the two replayed checks, and filed on its own: their handlers reach
+DynamoDB through the AWS SDK and their assertions poll DynamoDB for the item the handler
+writes, and this emulator's python invoke runtime registers no AWS SDK on a handler's import
+path, so such a handler ends at module import whatever the poller delivers. That capability is
+`20261105T094343Z-events-lambda-sqs-the-lambda-python-runtime-provides.md` (and
+`20261105T081644Z-events-lambda-sqs-stepfunctions-the-lambda-python-runtime.md`), which is the
+invoke runtime rather than the event-source-mapping poller this issue names.
+
