@@ -227,6 +227,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         let tags = input.tags.clone().unwrap_or_default();
 
+        // `IncludedProperty$Name` is a closed set of property names, documented on that
+        // member: the only name this service defines is `tags`. The same catalog bounds
+        // what `UpdateView` can write, so a view can never hold a property name nothing
+        // is able to report.
+        if let Some(unsupported) = included_properties
+            .iter()
+            .find(|name| !crate::state::is_view_property(name))
+        {
+            return Err(CreateViewErrorModeled::ValidationException(ValidationException {
+                message: crate::state::unsupported_property_message(unsupported),
+                field_list: None,
+            })
+            .into());
+        }
+
         // `ClientToken` is an @idempotencyToken. Replaying it with the same parameters
         // returns the view it created; replaying it with different parameters is the
         // ConflictException case the model documents ("you specified parameters that

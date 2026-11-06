@@ -232,7 +232,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // QueryString parameter supplied to this operation and the SearchFilter
         // parameter attached to the view."
         let view_filter = view.filter_string.clone().unwrap_or_default();
-        let include_tags = view.includes_property("tags");
+        let include_tags = view.includes_property(crate::state::TAGS_PROPERTY);
+
+        // A tag filter reads a resource's TAGS, which a view only carries when it
+        // includes the `tags` property — so a search that filters on tags, whether from
+        // the caller's query string or from the view's own filter string, is refused
+        // unless the view includes that property. The refusal names the filter at fault.
+        if !include_tags {
+            if let Some(filter) = crate::state::tags_filter_name(&input.query_string)
+                .or_else(|| crate::state::tags_filter_name(&view_filter))
+            {
+                return Err(SearchErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "The specified filter {filter} is not valid because it uses \
+                         properties that are not included in the view."
+                    ),
+                    field_list: None,
+                })
+                .into());
+            }
+        }
         let mut matched: Vec<crate::state::IndexedResource> = guard
             .indexed_resources(&view.region)
             .into_iter()
@@ -265,7 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // model documents, so a view that does not ask for it gets no properties.
                 properties: include_tags.then(|| {
                     vec![ResourceProperty {
-                        name: Some("tags".to_string()),
+                        name: Some(crate::state::TAGS_PROPERTY.to_string()),
                         last_reported_at: Some(::aws_smithy_types::DateTime::from(
                             resource.last_reported_at,
                         )),

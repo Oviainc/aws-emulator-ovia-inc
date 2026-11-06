@@ -693,6 +693,19 @@ async fn tags_written_through_tag_resource_are_searchable() {
     let region = "us-east-1";
     create_index(&emulator, region, &BTreeMap::new()).await;
     let view_arn = create_view(&emulator, region, "rex-searchable-tags").await;
+    // A tag filter reads a resource's tags, so the view has to include that property
+    // before it can answer one.
+    emulator
+        .call(
+            region,
+            "UpdateView",
+            json!({
+                "ViewArn": view_arn,
+                "IncludedProperties": [{ "Name": "tags" }],
+            }),
+        )
+        .await
+        .ok("including the tags property");
     emulator
         .tag(region, &view_arn, &tag_map(&[("env", "prod")]))
         .await

@@ -696,10 +696,16 @@ async fn search_answers_from_the_index_with_a_count_that_matches() {
     let emulator = Emulator::new();
     let region = "us-east-1";
     let index_arn = create_index(&emulator, region, "searching").await;
+    // The rows below include the documented tag filters, and a view can only answer
+    // those when it includes the `tags` property.
     let alpha = create_view(
         &emulator,
         region,
-        json!({ "ViewName": "alpha-view", "Tags": { "env": "prod" } }),
+        json!({
+            "ViewName": "alpha-view",
+            "Tags": { "env": "prod" },
+            "IncludedProperties": [{ "Name": "tags" }],
+        }),
     )
     .await;
     let beta = create_view(
@@ -821,6 +827,16 @@ async fn search_answers_from_the_index_with_a_count_that_matches() {
         resource["LastReportedAt"].is_string() || resource["LastReportedAt"].is_number(),
         "a searched resource carries when the index last saw it, got {resource}"
     );
+
+    // `beta` includes no optional properties, so a resource it reports carries none.
+    let answer = emulator
+        .call(
+            region,
+            "Search",
+            json!({ "QueryString": "beta", "ViewArn": beta }),
+        )
+        .await;
+    let resource = answer.ok("described through beta")["Resources"][0].clone();
     assert!(
         resource.get("Properties").is_none() || resource["Properties"].is_null(),
         "a view that includes no optional properties returns none, got {resource}"
@@ -835,10 +851,16 @@ async fn search_answers_degenerate_queries() {
     let emulator = Emulator::new();
     let region = "us-east-1";
     let index_arn = create_index(&emulator, region, "degenerate").await;
+    // Some rows below are degenerate TAG filters, which a view can only answer when it
+    // includes the `tags` property.
     let alpha = create_view(
         &emulator,
         region,
-        json!({ "ViewName": "alpha-view", "Tags": { "env": "prod" } }),
+        json!({
+            "ViewName": "alpha-view",
+            "Tags": { "env": "prod" },
+            "IncludedProperties": [{ "Name": "tags" }],
+        }),
     )
     .await;
     let beta = create_view(

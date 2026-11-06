@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateView
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateView`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateView::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the mutable part of a stored view — its `Filters.FilterString`
+//! and its `IncludedProperties` — into `crate::state`, bumps the view's `LastUpdatedAt`,
+//! and answers with the stored structure, which `GetView` reads back unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -163,20 +157,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateView` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateViewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateViewErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Resource Explorer store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut guard = store.lock();
+        guard.settle(now);
+
+        // "You can change the filter string and the list of included properties": the
+        // request carries the whole new value of each, so a member the request omits
+        // leaves the view without one — that is how a filter string or an included
+        // property is REMOVED from a view, there being no other operation that can.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateView"))
+        // The filter string itself is stored verbatim. Its documentation states which
+        // syntax the filter SUPPORTS ("only filter prefixes with optional operators",
+        // not free-form text), not an error the service answers, and `CreateView` writes
+        // the same member of the same view from the same text — so the two accept the
+        // same strings, and how a term is interpreted stays where terms are interpreted,
+        // in the search grammar.
+        let filter_string = input
+            .filters
+            .as_ref()
+            .map(|filters| filters.filter_string.clone());
+        let included_properties: Vec<String> = input
+            .included_properties
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|property| property.name)
+            .collect();
+
+        // `IncludedProperty$Name` is a closed set of property names, documented on that
+        // member: the only name this service defines is `tags`. Resolved after the view,
+        // so a request that names neither an existing view nor a known property is told
+        // about the view first.
+        let unsupported = included_properties
+            .iter()
+            .find(|name| !crate::state::is_view_property(name))
+            .cloned();
+
+        // This operation models no `ResourceNotFoundException`, so an ARN this account
+        // holds no view for is refused with the modelled 400 `ValidationException`
+        // naming it.
+        let Some(view) = guard.views.get_mut(&input.view_arn) else {
+            return Err(UpdateViewErrorModeled::ValidationException(ValidationException {
+                message: crate::state::resource_not_found_message(&input.view_arn),
+                field_list: None,
+            })
+            .into());
+        };
+        if let Some(unsupported) = unsupported {
+            return Err(UpdateViewErrorModeled::ValidationException(ValidationException {
+                message: crate::state::unsupported_property_message(&unsupported),
+                field_list: None,
+            })
+            .into());
+        }
+        view.filter_string = filter_string;
+        view.included_properties = included_properties;
+        // "The date and time when this view was last modified" (`View$LastUpdatedAt`).
+        view.last_updated_at = now;
+        Ok(UpdateViewOutput {
+            view: Some(view.to_wire()),
+        })
     }
 }

@@ -131,6 +131,37 @@ impl IndexLifecycle {
 /// *local* index" (`CreateIndex` documentation).
 pub const INDEX_TYPE_LOCAL: &str = "LOCAL";
 
+/// The optional resource property a view can ask `Search` to report, as
+/// `IncludedProperty$Name` names it.
+pub const TAGS_PROPERTY: &str = "tags";
+
+/// Every value `IncludedProperty$Name` accepts.
+///
+/// A CLOSED set, from that member's own documentation: "You can specify the following
+/// property names for this field: `tags`". A view is caller-supplied, so the names it
+/// carries have to come from this list rather than from the request — an unlisted name
+/// would otherwise be stored as a property that nothing can ever report.
+pub const VIEW_PROPERTY_NAMES: &[&str] = &[TAGS_PROPERTY];
+
+/// Whether `name` is a property name a view may include, compared case-insensitively
+/// like every other Resource Explorer comparison.
+pub fn is_view_property(name: &str) -> bool {
+    VIEW_PROPERTY_NAMES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(name))
+}
+
+/// How a view write refuses an `IncludedProperties` entry outside the catalog: the
+/// message names the member at fault and the values it does accept, so `CreateView` and
+/// `UpdateView` cannot word the same refusal differently.
+pub fn unsupported_property_message(name: &str) -> String {
+    format!(
+        "{name} is not a supported value for IncludedProperties: the supported values \
+         are {}.",
+        VIEW_PROPERTY_NAMES.join(", ")
+    )
+}
+
 /// The `IndexType` value of the one index that collects the account's other Regions:
 /// "You can have only one aggregator index per Amazon Web Services account"
 /// (`UpdateIndexType` documentation). It is the type that "receive[s] replicated
@@ -815,6 +846,50 @@ pub fn query_matches(query: &str, resource: &IndexedResource) -> bool {
         .all(|term| term_matches(term, resource))
 }
 
+/// One term of a query, split the one way the grammar splits it: whether it is negated,
+/// and its filter `name` and `value` when it carries a filter prefix at all.
+///
+/// The split on the FIRST colon only is what lets a filter value carry colons of its own
+/// (`resourcetype:ec2:instance`).
+fn split_term(term: &str) -> (bool, &str, Option<(&str, &str)>) {
+    let (negated, body) = match term.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, term),
+    };
+    (negated, body, body.split_once(':'))
+}
+
+/// The filter names that select on a resource's TAGS: the `tag`, `tag.key` and
+/// `tag.value` filters of the search query syntax reference.
+///
+/// The ONE place those names are listed. [`filter_fields`] reaches them only through
+/// [`is_tag_filter_name`], so the names it resolves and the names a tag filter is
+/// recognised by cannot drift.
+const TAG_FILTER_NAMES: [&str; 3] = ["tag", "tag.key", "tag.value"];
+
+/// Whether a filter name selects on a resource's TAGS, compared case-insensitively like
+/// every other Resource Explorer comparison and without allocating: this runs once per
+/// term of every query.
+fn is_tag_filter_name(name: &str) -> bool {
+    TAG_FILTER_NAMES
+        .iter()
+        .any(|filter| filter.eq_ignore_ascii_case(name))
+}
+
+/// The name of the first term in `query` that filters on a resource's TAGS, written the
+/// way the query wrote it, or `None` when no term does.
+///
+/// A tag filter reads a resource's tags, which a view only carries when it includes the
+/// `tags` property ([`TAGS_PROPERTY`]) — so this is what tells a caller's query, or a
+/// view's own filter string, apart from one a view without that property can answer.
+pub fn tags_filter_name(query: &str) -> Option<&str> {
+    query.split_whitespace().find_map(|term| {
+        let (_, _, filter) = split_term(term);
+        let (name, _) = filter?;
+        is_tag_filter_name(name).then_some(name)
+    })
+}
+
 /// The candidate values of the field a documented filter name selects, or `None`
 /// when the name is not a filter name (so the term is free-form text).
 ///
@@ -822,6 +897,20 @@ pub fn query_matches(query: &str, resource: &IndexedResource) -> bool {
 /// `region`, `service`, `resourcetype`, `globalresourcetype`, `accountid`, `tag`,
 /// `tag.key` and `tag.value`.
 fn filter_fields(name: &str, resource: &IndexedResource) -> Option<Vec<String>> {
+    if is_tag_filter_name(name) {
+        return Some(if name.eq_ignore_ascii_case("tag.key") {
+            resource.tags.keys().cloned().collect()
+        } else if name.eq_ignore_ascii_case("tag.value") {
+            resource.tags.values().cloned().collect()
+        } else {
+            // The `tag` filter matches the whole `key=value` pair.
+            resource
+                .tags
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect()
+        });
+    }
     let fields = match name.to_ascii_lowercase().as_str() {
         "arn" => vec![resource.arn.clone()],
         "id" => vec![resource_id_of_arn(&resource.arn).to_string()],
@@ -838,13 +927,6 @@ fn filter_fields(name: &str, resource: &IndexedResource) -> Option<Vec<String>> 
                 Vec::new()
             }
         }
-        "tag" => resource
-            .tags
-            .iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect(),
-        "tag.key" => resource.tags.keys().cloned().collect(),
-        "tag.value" => resource.tags.values().cloned().collect(),
         _ => return None,
     };
     Some(fields)
@@ -852,16 +934,11 @@ fn filter_fields(name: &str, resource: &IndexedResource) -> Option<Vec<String>> 
 
 /// Whether one term of a query holds for `resource`.
 fn term_matches(term: &str, resource: &IndexedResource) -> bool {
-    let (negated, body) = match term.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, term),
-    };
+    let (negated, body, filter) = split_term(term);
     if body.is_empty() {
         return true;
     }
-    // Split on the FIRST colon only: a filter value may itself contain colons
-    // (`resourcetype:ec2:instance`).
-    let hit = match body.split_once(':') {
+    let hit = match filter {
         Some((name, value)) => match filter_fields(name, resource) {
             Some(fields) => fields.iter().any(|field| value_matches(value, field)),
             // An unrecognized prefix is not a filter, so the whole term is text.

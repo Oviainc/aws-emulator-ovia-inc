@@ -21,5 +21,7 @@ mod index_state_and_resource_tags;
 mod resource_explorer_setup;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_view.rs"]
+mod update_view;
 #[path = "all/update_index_type.rs"]
 mod update_index_type;
