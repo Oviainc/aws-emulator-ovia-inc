@@ -352,11 +352,25 @@ impl Emulator {
     }
 
     /// Store `key` under `algorithm`, naming `kms_key_id` when the algorithm is one that
-    /// takes a key — the write every row's read is of.
-    async fn put_object(&self, case: &str, key: &str, algorithm: &str, kms_key_id: Option<&str>) {
+    /// takes a key, and asking for an S3 Bucket Key when `bucket_key` — the write every
+    /// row's read is of.
+    async fn put_object(
+        &self,
+        case: &str,
+        key: &str,
+        algorithm: &str,
+        kms_key_id: Option<&str>,
+        bucket_key: bool,
+    ) {
         let mut headers: Vec<(&str, &str)> = vec![("x-amz-server-side-encryption", algorithm)];
         if let Some(key_id) = kms_key_id {
             headers.push(("x-amz-server-side-encryption-aws-kms-key-id", key_id));
+        }
+        if bucket_key {
+            headers.push((
+                "x-amz-server-side-encryption-bucket-key-enabled",
+                "true",
+            ));
         }
         let written = self
             .s3(
@@ -476,6 +490,12 @@ fn object_arn(key: &str) -> String {
     format!("arn:aws:s3:::{BUCKET}/{key}")
 }
 
+/// The ARN of [`BUCKET`] itself, which is that entry's value for an object stored under an
+/// S3 Bucket Key.
+fn bucket_arn() -> String {
+    format!("arn:aws:s3:::{BUCKET}")
+}
+
 /// The regional endpoint name of an AWS service, which is the value `kms:ViaService`
 /// carries.
 fn endpoint(service: &str) -> String {
@@ -525,6 +545,9 @@ struct Row {
     object_key: &'static str,
     /// The `ServerSideEncryption` the object is stored under.
     algorithm: &'static str,
+    /// Whether the write asks for an S3 Bucket Key, which binds the data key to the BUCKET
+    /// rather than to the object.
+    bucket_key: bool,
     /// The key policy the object's key carries, built once the roles exist; `None` for a key
     /// carrying its default policy.
     policy: Option<String>,
@@ -563,6 +586,7 @@ async fn an_sse_kms_read_is_served_only_to_a_caller_the_objects_key_permits_the_
             case: "the default key policy and a role whose identity policy allows the decrypt",
             object_key: "delegated-granted",
             algorithm: SSE_KMS,
+            bucket_key: false,
             policy: None,
             reader: as_decryptor.clone(),
             denied: None,
@@ -571,6 +595,7 @@ async fn an_sse_kms_read_is_served_only_to_a_caller_the_objects_key_permits_the_
             case: "the default key policy and a role whose identity policy does not",
             object_key: "delegated-withheld",
             algorithm: SSE_KMS,
+            bucket_key: false,
             policy: None,
             reader: as_reader.clone(),
             denied: Some(Denial::NoIdentityPolicy),
@@ -579,6 +604,7 @@ async fn an_sse_kms_read_is_served_only_to_a_caller_the_objects_key_permits_the_
             case: "a key policy naming the reading session's own role",
             object_key: "named-role",
             algorithm: SSE_KMS,
+            bucket_key: false,
             policy: Some(policy(vec![statement(
                 "Allow",
                 &reader.role_arn,
@@ -592,6 +618,7 @@ async fn an_sse_kms_read_is_served_only_to_a_caller_the_objects_key_permits_the_
             case: "a key policy naming only ANOTHER role",
             object_key: "another-role",
             algorithm: SSE_KMS,
+            bucket_key: false,
             policy: Some(policy(vec![statement(
                 "Allow",
                 &decryptor.role_arn,
@@ -605,6 +632,7 @@ async fn an_sse_kms_read_is_served_only_to_a_caller_the_objects_key_permits_the_
             case: "a key policy naming only one role, read by the account's own credential",
             object_key: "role-only-account-reads",
             algorithm: SSE_KMS,
+            bucket_key: false,
             policy: Some(policy(vec![statement(
                 "Allow",
                 &reader.role_arn,
@@ -618,6 +646,7 @@ async fn an_sse_kms_read_is_served_only_to_a_caller_the_objects_key_permits_the_
             case: "the default key policy, read by the account's own credential",
             object_key: "delegated-account-reads",
             algorithm: SSE_KMS,
+            bucket_key: false,
             policy: None,
             reader: account.clone(),
             denied: None,
@@ -626,6 +655,7 @@ async fn an_sse_kms_read_is_served_only_to_a_caller_the_objects_key_permits_the_
             case: "an explicit deny of the role beside an allow of it",
             object_key: "explicit-deny",
             algorithm: SSE_KMS,
+            bucket_key: false,
             policy: Some(policy(vec![
                 statement("Allow", &reader.role_arn, json!("kms:*"), Value::Null),
                 statement("Deny", &reader.role_arn, json!(DECRYPT_ACTION), Value::Null),
@@ -637,6 +667,7 @@ async fn an_sse_kms_read_is_served_only_to_a_caller_the_objects_key_permits_the_
             case: "a grant confined to THIS service's path to the key",
             object_key: "via-service-s3",
             algorithm: SSE_KMS,
+            bucket_key: false,
             policy: Some(policy(vec![statement(
                 "Allow",
                 &reader.role_arn,
@@ -650,6 +681,7 @@ async fn an_sse_kms_read_is_served_only_to_a_caller_the_objects_key_permits_the_
             case: "a grant confined to ANOTHER service's path to the key",
             object_key: "via-service-dynamodb",
             algorithm: SSE_KMS,
+            bucket_key: false,
             policy: Some(policy(vec![statement(
                 "Allow",
                 &reader.role_arn,
@@ -663,6 +695,7 @@ async fn an_sse_kms_read_is_served_only_to_a_caller_the_objects_key_permits_the_
             case: "a grant scoped to the encryption-context entry of the object being read",
             object_key: "context-in-scope",
             algorithm: SSE_KMS,
+            bucket_key: false,
             policy: Some(policy(vec![statement(
                 "Allow",
                 &reader.role_arn,
@@ -678,6 +711,7 @@ async fn an_sse_kms_read_is_served_only_to_a_caller_the_objects_key_permits_the_
             case: "a grant scoped to the entry of ANOTHER object under the same key",
             object_key: "context-out-of-scope",
             algorithm: SSE_KMS,
+            bucket_key: false,
             policy: Some(policy(vec![statement(
                 "Allow",
                 &reader.role_arn,
@@ -693,9 +727,41 @@ async fn an_sse_kms_read_is_served_only_to_a_caller_the_objects_key_permits_the_
             case: "an SSE-S3 object, which names no key, under a policy that grants nobody",
             object_key: "sse-s3",
             algorithm: SSE_S3,
+            bucket_key: false,
             policy: Some(policy(vec![allow_account()])),
             reader: as_reader.clone(),
             denied: None,
+        },
+        Row {
+            // An S3 Bucket Key binds the data key to the BUCKET, so the entry a statement is
+            // scoped by names the bucket's ARN rather than the object's
+            // (`PutObjectRequest$BucketKeyEnabled`).
+            case: "a Bucket Key object under a grant scoped to the BUCKET's entry",
+            object_key: "bucket-key-in-scope",
+            algorithm: SSE_KMS,
+            bucket_key: true,
+            policy: Some(policy(vec![statement(
+                "Allow",
+                &reader.role_arn,
+                json!(DECRYPT_ACTION),
+                json!({"StringEquals": {"kms:EncryptionContext:aws:s3:arn": bucket_arn()}}),
+            )])),
+            reader: as_reader.clone(),
+            denied: None,
+        },
+        Row {
+            case: "an object with NO Bucket Key under that same bucket-scoped grant",
+            object_key: "bucket-key-absent",
+            algorithm: SSE_KMS,
+            bucket_key: false,
+            policy: Some(policy(vec![statement(
+                "Allow",
+                &reader.role_arn,
+                json!(DECRYPT_ACTION),
+                json!({"StringEquals": {"kms:EncryptionContext:aws:s3:arn": bucket_arn()}}),
+            )])),
+            reader: as_reader.clone(),
+            denied: Some(Denial::NoResourcePolicy),
         },
     ];
 
@@ -709,6 +775,7 @@ async fn an_sse_kms_read_is_served_only_to_a_caller_the_objects_key_permits_the_
                 row.object_key,
                 row.algorithm,
                 names_key.then_some(key_id.as_str()),
+                row.bucket_key,
             )
             .await;
 
@@ -776,6 +843,7 @@ async fn a_key_id_whose_account_segment_is_no_account_opens_nothing() {
             object_key,
             SSE_KMS,
             Some("arn:aws:kms:us-east-1:not-an-account:key/0d8a1e3f-1111-4a1b-9c2d-5e6f70819203"),
+            false,
         )
         .await;
 
@@ -825,7 +893,7 @@ async fn the_refusal_lifts_the_moment_the_key_policy_grants_the_role() {
         .key(case, Some(&policy(vec![allow_account()])))
         .await;
     emulator
-        .put_object(case, "late-grant", SSE_KMS, Some(&key_id))
+        .put_object(case, "late-grant", SSE_KMS, Some(&key_id), false)
         .await;
 
     // Nothing the account wrote reaches this session's role, so the key withholds the
@@ -897,7 +965,9 @@ async fn a_copy_reads_its_source_object_through_that_objects_own_key() {
     let case = "a copy whose source is an SSE-KMS object";
     let (key_id, key_arn) = emulator.key(case, None).await;
     let source = "copy-source";
-    emulator.put_object(case, source, SSE_KMS, Some(&key_id)).await;
+    emulator
+        .put_object(case, source, SSE_KMS, Some(&key_id), false)
+        .await;
 
     // (the operation, how it is driven) — both read the SOURCE object's bytes, so both are
     // authorized by `kms:Decrypt` on the source's key.
