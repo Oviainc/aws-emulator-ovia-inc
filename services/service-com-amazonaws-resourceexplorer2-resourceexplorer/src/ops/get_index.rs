@@ -16,12 +16,11 @@
 //! which was owed at this instant whether or not anybody called. Polling therefore never
 //! moves an index on by itself.
 //!
-//! `ReplicatingFrom`/`ReplicatingTo` are computed from the account's other indexes, but
-//! only the "nothing to report" outcome is reachable in this emulator today: `CreateIndex`
-//! mints a `LOCAL` index and `UpdateIndexType`, the operation that promotes one to
-//! `AGGREGATOR`, is still a stub — so no aggregator index exists for either member to
-//! name. The aggregator forms are what the model documents, and they become observable
-//! with `UpdateIndexType`'s own issue; the tests pin the reachable case.
+//! `ReplicatingFrom`/`ReplicatingTo` are computed from the account's other indexes: an
+//! `AGGREGATOR` index reports the Regions that replicate into it, a `LOCAL` index the
+//! Region of the account's aggregator index, and neither member is present when there is
+//! nothing to report. `UpdateIndexType` is the operation that promotes an index to
+//! `AGGREGATOR`, so that is the call that makes either form observable.
 //!
 //! Hand-authored rather than scaffolded: the op-stub generator declined this operation
 //! because its input is `smithy.api#Unit` (recorded in `src/ops/SKIPPED_STUBS.md`), so it

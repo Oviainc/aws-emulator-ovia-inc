@@ -19,3 +19,5 @@ mod index_and_view_lifecycle;
 mod index_state_and_resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_index_type.rs"]
+mod update_index_type;

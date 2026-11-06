@@ -11,8 +11,8 @@
 //! from a sibling:
 //!
 //! * [`ComAmazonawsResourceexplorer2ResourceexplorerState::settle`] — the
-//!   clock-owed index lifecycle transitions (`CREATING` -> `ACTIVE`, `DELETING` ->
-//!   gone, taking the Region's views with it).
+//!   clock-owed index lifecycle transitions (`CREATING` -> `ACTIVE`, `UPDATING` ->
+//!   `ACTIVE`, `DELETING` -> gone, taking the Region's views with it).
 //! * [`ViewEntry::to_wire`] — the modelled `View` structure, so `CreateView` and
 //!   `GetView` cannot disagree about what a stored view looks like.
 //! * [`paginate`] / [`encode_page_token`] — the opaque `NextToken` cursors the
@@ -35,13 +35,14 @@ pub const SERVICE_NAMESPACE: &str = "resource-explorer-2";
 /// a Region from) is served in. Generated emulators default to `us-east-1`.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// How long after `CreateIndex` / `DeleteIndex` the index's non-terminal state
-/// (`CREATING` / `DELETING`) settles.
+/// How long after `CreateIndex`, `DeleteIndex` or `UpdateIndexType` the index's
+/// non-terminal state (`CREATING` / `DELETING` / `UPDATING`) settles.
 ///
-/// CHOSEN, not documented: AWS gives no duration for index creation or deletion,
-/// only that both are asynchronous background tasks. The span is deliberately
-/// non-zero, so a caller that reads straight after the call still observes the
-/// transient state, and short enough that nothing has to sleep for long.
+/// CHOSEN, not documented: AWS gives no duration for index creation, deletion or a
+/// type change, only that all three are performed by asynchronous background tasks.
+/// The span is deliberately non-zero, so a caller that reads straight after the call
+/// still observes the transient state, and short enough that nothing has to sleep for
+/// long.
 pub const INDEX_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
 /// `Search` returns at most this many resources in total, and `Count` cannot
@@ -86,9 +87,9 @@ pub fn is_servable_region(region: &str) -> bool {
 
 /// The lifecycle of an index, as the `IndexState` enum names it on the wire.
 ///
-/// Only the three states this slice can reach are modelled here; `UPDATING` is
-/// `UpdateIndexType`'s, which is still a stub, and `DELETED` is never observable
-/// because a settled deletion removes the index.
+/// `DELETED` is the one `IndexState` value with no variant here: it is never
+/// observable, because a settled deletion removes the index rather than leaving a
+/// deleted one behind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexLifecycle {
     /// The index was just created and has not finished coming up.
@@ -97,6 +98,9 @@ pub enum IndexLifecycle {
     Active,
     /// The index is being torn down, along with the Region's views.
     Deleting,
+    /// The index's type is being switched between `LOCAL` and `AGGREGATOR`, which is
+    /// what starts or stops replication with the account's other Regions.
+    Updating,
 }
 
 impl IndexLifecycle {
@@ -106,6 +110,7 @@ impl IndexLifecycle {
             Self::Creating => "CREATING",
             Self::Active => "ACTIVE",
             Self::Deleting => "DELETING",
+            Self::Updating => "UPDATING",
         }
     }
 }
@@ -113,6 +118,36 @@ impl IndexLifecycle {
 /// The `IndexType` value `CreateIndex` produces: "This operation creates only a
 /// *local* index" (`CreateIndex` documentation).
 pub const INDEX_TYPE_LOCAL: &str = "LOCAL";
+
+/// The `IndexType` value of the one index that collects the account's other Regions:
+/// "You can have only one aggregator index per Amazon Web Services account"
+/// (`UpdateIndexType` documentation).
+pub const INDEX_TYPE_AGGREGATOR: &str = "AGGREGATOR";
+
+/// The two values the model's `IndexType` enum admits, which are therefore the only
+/// types an index can be switched to.
+pub const INDEX_TYPES: [&str; 2] = [INDEX_TYPE_LOCAL, INDEX_TYPE_AGGREGATOR];
+
+/// How long after the account's aggregator index is demoted to `LOCAL` another index
+/// may be promoted in its place.
+///
+/// DOCUMENTED, not chosen: "After you demote an aggregator index to a local index, you
+/// must wait 24 hours before you can promote another index to be the new aggregator
+/// index for the account" (`UpdateIndexType` documentation).
+pub const AGGREGATOR_PROMOTION_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The account's most recent demotion of its aggregator index back to `LOCAL`.
+///
+/// Kept because [`AGGREGATOR_PROMOTION_WAIT`] runs from that instant: the wait is a
+/// property of the ACCOUNT, not of any one index, so it outlives the index type that
+/// caused it.
+#[derive(Debug, Clone)]
+pub struct AggregatorDemotion {
+    /// The index that was demoted, by ARN.
+    pub index_arn: String,
+    /// When the demotion was requested.
+    pub at: SystemTime,
+}
 
 /// One Region's index.
 #[derive(Debug, Clone)]
@@ -246,6 +281,10 @@ pub struct ComAmazonawsResourceexplorer2ResourceexplorerState {
     /// How many resources this store has minted, so the identifier it derives for the
     /// next one cannot collide with any it has already handed out.
     pub minted_resources: u64,
+    /// The last time the account's aggregator index was demoted to `LOCAL`, if ever:
+    /// what [`Self::aggregator_promotion_blocked_until`] measures the documented wait
+    /// from.
+    pub aggregator_demotion: Option<AggregatorDemotion>,
 }
 
 impl ComAmazonawsResourceexplorer2ResourceexplorerState {
@@ -318,6 +357,15 @@ impl ComAmazonawsResourceexplorer2ResourceexplorerState {
                     self.views.retain(|_, view| view.region != region);
                     self.default_view_arns.remove(&region);
                 }
+                IndexLifecycle::Updating => {
+                    // "When the asynchronous tasks complete, the Status response of
+                    // that operation changes from UPDATING to ACTIVE."
+                    if let Some(index) = self.indexes.get_mut(&region) {
+                        index.state = IndexLifecycle::Active;
+                        index.settles_at = None;
+                        index.last_updated_at = now;
+                    }
+                }
                 IndexLifecycle::Active => {
                     // An Active index is never put on the clock, so nothing is owed.
                 }
@@ -331,6 +379,36 @@ impl ComAmazonawsResourceexplorer2ResourceexplorerState {
         self.indexes
             .get(region)
             .filter(|index| index.state != IndexLifecycle::Deleting)
+    }
+
+    /// The account's aggregator index, when it holds one that is not being torn down.
+    ///
+    /// There is at most one: "You can have only one aggregator index per Amazon Web
+    /// Services account." An index on its way out is not it, for the same reason
+    /// [`Self::live_index`] leaves one out — it is about to stop replicating anything.
+    pub fn aggregator_index(&self) -> Option<&IndexEntry> {
+        self.indexes.values().find(|index| {
+            index.state != IndexLifecycle::Deleting && index.index_type == INDEX_TYPE_AGGREGATOR
+        })
+    }
+
+    /// The instant until which the account may not promote the index `index_arn` names
+    /// to `AGGREGATOR`, when the documented wait after the last demotion is still
+    /// running at `now`.
+    ///
+    /// The wait blocks promoting "another index" than the one that was demoted, so
+    /// re-promoting the index that was itself demoted is not held back by it.
+    pub fn aggregator_promotion_blocked_until(
+        &self,
+        index_arn: &str,
+        now: SystemTime,
+    ) -> Option<SystemTime> {
+        let demotion = self.aggregator_demotion.as_ref()?;
+        if demotion.index_arn == index_arn {
+            return None;
+        }
+        let until = demotion.at + AGGREGATOR_PROMOTION_WAIT;
+        (now < until).then_some(until)
     }
 
     /// The Region's view with this name, if any. View names are unique per Region;
