@@ -6,7 +6,8 @@
 //! (`CreateTrustAnchor`, `UpdateTrustAnchor`, `GetTrustAnchor`, `ListTrustAnchors`,
 //! `DeleteTrustAnchor`, `DisableTrustAnchor`, `PutNotificationSettings`,
 //! `ResetNotificationSettings`,
-//! `CreateProfile`, `GetProfile`, `ListProfiles`, `DeleteProfile`, `ImportCrl`,
+//! `CreateProfile`, `GetProfile`, `ListProfiles`, `DeleteProfile`,
+//! `PutAttributeMapping`, `DeleteAttributeMapping`, `ImportCrl`,
 //! `GetCrl`, `ListCrls`) are backed entirely by the maps below, so a write is visible to the next
 //! request on the same engine. The record types and their projections live here rather
 //! than in a handler because several operations reach each of them.
@@ -22,7 +23,7 @@ use std::time::SystemTime;
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AttributeMapping, CrlDetail, NotificationSetting, NotificationSettingDetail,
+    AttributeMapping, CrlDetail, MappingRule, NotificationSetting, NotificationSettingDetail,
     NotificationSettingKey, ProfileDetail, Source, SourceData, Tag, TrustAnchorDetail,
     NOTIFICATION_EVENT_VALUES, TRUST_ANCHOR_TYPE_VALUES,
 };
@@ -74,6 +75,18 @@ pub const MAX_CRLS: usize = 1_000;
 /// A `TagResource` that would carry a resource past it is refused with that operation's
 /// modelled `TooManyTagsException` instead of storing tags no read could report.
 pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// The most specifiers one profile maps for one certificate field at once.
+///
+/// `MappingRules` carries no `@length`
+/// (`smithy_query(query="shape", shape="MappingRules")`), so this ceiling is this
+/// emulator's own bound rather than a published limit — the same construct
+/// [`MAX_TRUST_ANCHORS`] is, and for the same reason: a profile's mappings live for the
+/// process's lifetime and nothing evicts them. It sits far above the handful of specifiers
+/// an X.509 field actually has, so a caller never meets it by accident, and a
+/// `PutAttributeMapping` that would carry a field past it is refused with that operation's
+/// modelled `ValidationException` rather than storing specifiers.
+pub const MAX_MAPPING_RULES_PER_CERTIFICATE_FIELD: usize = 1_000;
 
 /// The `sourceType` values a trust anchor can carry whose certificate data member the
 /// model names: `x509CertificateData` is "Included for trust anchors of type
@@ -182,10 +195,10 @@ pub struct ProfileRecord {
     pub created_by: String,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
-    /// Certificate-field mappings applied to the authenticating end-entity certificate.
-    /// `PutAttributeMapping` / `DeleteAttributeMapping` are still stubs (each tracked by
-    /// its own gap issue), so nothing can add one yet and the list stays as created —
-    /// empty — rather than being canned.
+    /// Certificate-field mappings applied to the authenticating end-entity certificate:
+    /// at most one entry per `certificateField`, holding every specifier mapped for that
+    /// field. A create starts it empty, and [`put_attribute_mapping`] /
+    /// [`delete_attribute_mapping`] are the only writers.
     pub attribute_mappings: Vec<AttributeMapping>,
     pub tags: Vec<Tag>,
 }
@@ -610,6 +623,115 @@ pub fn reset_notification_settings(
             .unwrap_or(DEFAULT_NOTIFICATION_CHANNEL);
         put_notification_detail(held, default_notification_detail(&key.event, channel));
     }
+}
+
+/// Whether one `AttributeMapping` is the one held for `certificate_field`.
+///
+/// At most ONE entry per certificate field, because a mapping "specifies a certificate
+/// field and one or more specifiers"
+/// (`smithy_query(query="doc", shape="PutAttributeMapping")`): the field is the key and its
+/// `mappingRules` are the value, so two entries for one field could not both be enforced.
+fn maps_field(mapping: &AttributeMapping, certificate_field: &str) -> bool {
+    mapping.certificate_field.as_deref() == Some(certificate_field)
+}
+
+/// Put the submitted rules into the rules a profile enforces for one certificate field:
+/// "Put an entry in the attribute mapping rules that will be enforced by a given profile"
+/// (`PutAttributeMapping` doc), where an entry is "a single mapping entry for each
+/// supported specifier or sub-field" (`MappingRule` doc).
+///
+/// So each submitted specifier joins the specifiers the field already maps; a specifier the
+/// field already maps keeps its single entry, which is what makes the write `@idempotent`
+/// as the model declares it; and the rules of every other certificate field are untouched.
+/// A field is given an entry only once it maps at least one specifier.
+pub fn put_attribute_mapping(
+    held: &mut Vec<AttributeMapping>,
+    certificate_field: &str,
+    submitted: Vec<MappingRule>,
+) {
+    if submitted.is_empty() {
+        return;
+    }
+    if !held
+        .iter()
+        .any(|mapping| maps_field(mapping, certificate_field))
+    {
+        held.push(AttributeMapping {
+            certificate_field: Some(certificate_field.to_string()),
+            mapping_rules: Some(Vec::new()),
+        });
+    }
+    let Some(mapping) = held
+        .iter_mut()
+        .find(|mapping| maps_field(mapping, certificate_field))
+    else {
+        return;
+    };
+    let rules = mapping.mapping_rules.get_or_insert_with(Vec::new);
+    for rule in submitted {
+        if !rules.iter().any(|mapped| mapped.specifier == rule.specifier) {
+            rules.push(rule);
+        }
+    }
+}
+
+/// How many specifiers the field would map after [`put_attribute_mapping`]: the number of
+/// DISTINCT specifiers across what the field already maps and what the request carries,
+/// because the put adds a specifier the field already maps no second time.
+pub fn merged_mapping_rule_count(
+    held: &[AttributeMapping],
+    certificate_field: &str,
+    submitted: &[MappingRule],
+) -> usize {
+    let mapped = held
+        .iter()
+        .find(|mapping| maps_field(mapping, certificate_field))
+        .and_then(|mapping| mapping.mapping_rules.as_deref())
+        .unwrap_or_default();
+    mapped
+        .iter()
+        .chain(submitted)
+        .map(|rule| rule.specifier.as_str())
+        .collect::<BTreeSet<&str>>()
+        .len()
+}
+
+/// Delete rules from the rules a profile enforces for one certificate field: "Delete an
+/// entry from the attribute mapping rules enforced by a given profile"
+/// (`DeleteAttributeMapping` doc).
+///
+/// `specifiers` is optional where `certificateField` is `@required`
+/// (`smithy_query(query="operation", operation="DeleteAttributeMapping")`), so a request
+/// that names specifiers deletes exactly those from the field, and one that names none
+/// deletes everything the field maps. A specifier the field does not map is already absent,
+/// so deleting it changes nothing — the write is `@idempotent`, as the model declares. A
+/// field left mapping no specifier keeps no entry, because a mapping specifies a field AND
+/// one or more specifiers.
+pub fn delete_attribute_mapping(
+    held: &mut Vec<AttributeMapping>,
+    certificate_field: &str,
+    specifiers: Option<&[String]>,
+) {
+    let Some(specifiers) = specifiers.filter(|specifiers| !specifiers.is_empty()) else {
+        held.retain(|mapping| !maps_field(mapping, certificate_field));
+        return;
+    };
+    if let Some(mapping) = held
+        .iter_mut()
+        .find(|mapping| maps_field(mapping, certificate_field))
+    {
+        if let Some(rules) = mapping.mapping_rules.as_mut() {
+            rules.retain(|rule| !specifiers.contains(&rule.specifier));
+        }
+    }
+    // A field left mapping no specifier is no longer a mapping at all.
+    held.retain(|mapping| {
+        !maps_field(mapping, certificate_field)
+            || mapping
+                .mapping_rules
+                .as_ref()
+                .is_some_and(|rules| !rules.is_empty())
+    });
 }
 
 /// The member and the constraint a `Source` fails, or `None` when it describes a
