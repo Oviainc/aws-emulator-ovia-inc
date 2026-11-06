@@ -321,6 +321,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             owner_account_id: account,
             encryption,
             storage_class,
+            // The records of a freshly created table do not expire, and a table
+            // this operation creates takes no expiration configuration at all:
+            // record expiration belongs to the tables Amazon Web Services
+            // manages on an account's behalf.
+            record_expiration: None,
             tags,
         };
 

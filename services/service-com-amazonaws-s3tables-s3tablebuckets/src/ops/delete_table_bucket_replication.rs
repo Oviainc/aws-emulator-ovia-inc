@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTableBucketReplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTableBucketReplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTableBucketReplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -143,6 +134,17 @@ impl From<DeleteTableBucketReplicationErrorModeled> for DeleteTableBucketReplica
     }
 }
 
+/// `NotFoundException` (HTTP 404) — the refusal this operation models for a
+/// table bucket the store does not hold, and for one that has no replication
+/// configuration to delete, each worded with the one sentence this service
+/// states that class with.
+fn not_found(message: &str) -> DeleteTableBucketReplicationError {
+    DeleteTableBucketReplicationErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
 /// The `DeleteTableBucketReplication` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -179,18 +181,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTableBucketReplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTableBucketReplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTableBucketReplication"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteTableBucketReplicationErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+        let bucket = store
+            .table_buckets
+            .get_mut(&input.table_bucket_arn)
+            .ok_or_else(|| not_found(crate::state::BUCKET_NOT_FOUND_MESSAGE))?;
+
+        // There is nothing to delete on a table bucket that has no replication
+        // configuration, and the delete says so rather than answering a silent
+        // success: a caller that has not configured replication learns that no
+        // configuration was there, which is the same refusal the read of one
+        // answers.
+        let configuration = bucket
+            .replication
+            .as_ref()
+            .ok_or_else(|| not_found(crate::state::REPLICATION_CONFIGURATION_NOT_FOUND_MESSAGE))?;
+
+        // `versionToken` is the caller's view of the configuration. When the
+        // request carries one that is not the configuration's current token,
+        // the configuration has been written since the caller read it, which is
+        // the conflict with a previous write the model's `ConflictException`
+        // (HTTP 409) names. A request that carries none deletes whatever is
+        // there.
+        if input
+            .version_token
+            .as_deref()
+            .is_some_and(|presented| presented != configuration.version_token)
+        {
+            return Err(DeleteTableBucketReplicationErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::VERSION_TOKEN_MISMATCH_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        bucket.replication = None;
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+
+        // The access record for a state-changing operation: who, what and the
+        // outcome. Metadata only — never the role or a destination the deleted
+        // configuration named.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            outcome = "deleted",
+            "table bucket replication configuration deleted",
+        );
+
+        Ok(DeleteTableBucketReplicationOutput)
     }
 }

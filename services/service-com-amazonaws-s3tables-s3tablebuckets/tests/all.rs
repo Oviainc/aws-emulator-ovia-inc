@@ -25,5 +25,9 @@ mod table_bucket_encryption;
 mod table_bucket_lifecycle;
 #[path = "all/table_bucket_metrics_configuration.rs"]
 mod table_bucket_metrics_configuration;
+#[path = "all/table_bucket_replication.rs"]
+mod table_bucket_replication;
+#[path = "all/table_record_expiration.rs"]
+mod table_record_expiration;
 #[path = "all/wire_forms.rs"]
 mod wire_forms;

@@ -231,6 +231,153 @@ pub struct MetricsConfiguration {
     pub id: String,
 }
 
+/// `TableRecordExpirationStatus` — whether the records of a table expire.
+/// Values from `com.amazonaws.s3tables#TableRecordExpirationStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordExpirationStatus {
+    /// Records expire and are removed after the configured number of days.
+    Enabled,
+    /// Records never expire.
+    Disabled,
+}
+
+impl RecordExpirationStatus {
+    /// Every modeled value, for exhaustiveness checks.
+    pub const ALL: &'static [Self] = &[Self::Enabled, Self::Disabled];
+
+    /// The value as it goes on the wire.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    /// Parse a wire value, or `None` when it names no modeled value.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.as_wire() == value)
+    }
+}
+
+/// `TableRecordExpirationJobStatus` — the state of the record expiration job of
+/// a table. Values from `com.amazonaws.s3tables#TableRecordExpirationJobStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordExpirationJobStatus {
+    /// The job is configured but has not run yet.
+    NotYetRun,
+    /// The job's last run completed.
+    Successful,
+    /// The job's last run failed.
+    Failed,
+    /// Record expiration is not enabled for the table, so no job runs for it.
+    Disabled,
+}
+
+impl RecordExpirationJobStatus {
+    /// Every modeled value, for exhaustiveness checks.
+    pub const ALL: &'static [Self] = &[
+        Self::NotYetRun,
+        Self::Successful,
+        Self::Failed,
+        Self::Disabled,
+    ];
+
+    /// The value as it goes on the wire.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::NotYetRun => "NotYetRun",
+            Self::Successful => "Successful",
+            Self::Failed => "Failed",
+            Self::Disabled => "Disabled",
+        }
+    }
+}
+
+/// The stored form of the `TableRecordExpirationConfigurationValue` structure:
+/// whether a table's records expire, and after how many days.
+///
+/// Both members are optional on the wire, so both are optional here: what a put
+/// persists is what the caller asked for, and the operations that report it are
+/// where an absent member's meaning is decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordExpiration {
+    pub status: Option<RecordExpirationStatus>,
+    /// How many days a record is retained, the `settings.days` member — a
+    /// `PositiveInteger` the model bounds at `@range(1..2147483647)`, so the
+    /// boundary has already refused a value outside it by the time one is
+    /// stored.
+    pub days: Option<i32>,
+}
+
+/// The record expiration a table has when no configuration was ever put on it:
+/// records do not expire.
+///
+/// A table ALWAYS has an expiration state — the records of one nothing was
+/// configured on are simply kept — so a read reports a status whether or not a
+/// configuration was ever written, as [`DEFAULT_BUCKET_ENCRYPTION`] does for a
+/// bucket's encryption.
+pub const DEFAULT_RECORD_EXPIRATION: RecordExpiration = RecordExpiration {
+    status: Some(RecordExpirationStatus::Disabled),
+    days: None,
+};
+
+/// The record expiration in force for a table: the configuration the store
+/// holds for it, else [`DEFAULT_RECORD_EXPIRATION`].
+pub fn effective_record_expiration(stored: Option<&RecordExpiration>) -> RecordExpiration {
+    stored.cloned().unwrap_or(DEFAULT_RECORD_EXPIRATION)
+}
+
+/// The status of the record expiration job of a table whose stored expiration
+/// configuration is `stored`.
+///
+/// A table whose records do not expire runs no expiration job, which is the
+/// modeled disabled status. Nothing in this emulator runs such a job, so a
+/// table whose records DO expire reports the job as not yet run: a completed or
+/// failed run would be a claim about work nothing performed.
+pub fn record_expiration_job_status(stored: Option<&RecordExpiration>) -> RecordExpirationJobStatus {
+    match effective_record_expiration(stored).status {
+        Some(RecordExpirationStatus::Enabled) => RecordExpirationJobStatus::NotYetRun,
+        _ => RecordExpirationJobStatus::Disabled,
+    }
+}
+
+/// Whether the record expiration operations may be used on `table`.
+///
+/// Record expiration is a feature of the tables Amazon Web Services manages on
+/// an account's behalf; on a table of any other type every one of those calls
+/// is refused with [`RECORD_EXPIRATION_NOT_ALLOWED_MESSAGE`], whatever the
+/// request asks for.
+pub fn allows_record_expiration(table: &Table) -> bool {
+    matches!(table.table_type, TableType::Aws)
+}
+
+/// The stored form of the `TableBucketReplicationConfiguration` structure: the
+/// role S3 Tables replicates with, the rules that say where to, and the token
+/// that names this state of the configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationConfiguration {
+    /// The ARN of the IAM role S3 Tables assumes to replicate tables.
+    pub role: String,
+    /// The configuration's rules. The model bounds the list at exactly one
+    /// (`@length(min: 1, max: 1)`), so the bound is enforced at the boundary
+    /// and what is stored is the list the caller sent.
+    pub rules: Vec<ReplicationRule>,
+    /// Regenerated on every write of the configuration, so a caller holding an
+    /// older token can tell its view is stale — the same rule a table's
+    /// `versionToken` follows.
+    pub version_token: String,
+}
+
+/// One rule of a replication configuration: the destination table buckets the
+/// tables it covers are replicated to, each by its ARN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationRule {
+    pub destinations: Vec<String>,
+}
+
 /// A table bucket, as this emulator stores it.
 ///
 /// `encryption` and `storage_class` are `None` when the create named neither:
@@ -257,6 +404,11 @@ pub struct TableBucket {
     /// a read of a bucket that has none is refused rather than answered with a
     /// default.
     pub metrics: Option<MetricsConfiguration>,
+    /// The bucket's replication configuration, `None` until a put sets one on
+    /// it: a table bucket replicates nothing until one is set, which is why a
+    /// read or a delete of a bucket that has none is refused rather than
+    /// answered with a default.
+    pub replication: Option<ReplicationConfiguration>,
     pub tags: BTreeMap<String, String>,
     /// The namespaces resident in this bucket, keyed by namespace name, so a
     /// list has one stable order to page over.
@@ -309,6 +461,10 @@ pub struct Table {
     pub owner_account_id: String,
     pub encryption: Option<BucketEncryption>,
     pub storage_class: Option<StorageClass>,
+    /// The table's record expiration configuration, `None` until a put sets one
+    /// on it. Only the tables Amazon Web Services manages take one at all, so
+    /// on every other table this stays `None` for the life of the record.
+    pub record_expiration: Option<RecordExpiration>,
     pub tags: BTreeMap<String, String>,
 }
 
@@ -429,6 +585,12 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
         self.mint_id("table-version")
     }
 
+    /// A fresh `versionToken` for a table bucket's replication configuration,
+    /// minted on every write of one.
+    pub fn mint_replication_version_token(&mut self) -> String {
+        self.mint_id("table-bucket-replication-version")
+    }
+
     /// A fresh id for a table's metadata file, which names the file under the
     /// table's warehouse location.
     pub fn mint_metadata_id(&mut self) -> String {
@@ -451,6 +613,17 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
             .get(&location.namespace)?
             .tables
             .get(&location.name)
+    }
+
+    /// The table `table_arn` names, for a caller that is about to change it.
+    pub fn table_by_arn_mut(&mut self, table_arn: &str) -> Option<&mut Table> {
+        let location = self.tables_by_arn.get(table_arn)?.clone();
+        self.table_buckets
+            .get_mut(&location.table_bucket_arn)?
+            .namespaces
+            .get_mut(&location.namespace)?
+            .tables
+            .get_mut(&location.name)
     }
 
     /// Whether the store already holds [`TABLE_BUCKETS_PER_ACCOUNT`] table
@@ -671,11 +844,38 @@ pub const BUCKET_NOT_FOUND_MESSAGE: &str = "The specified bucket does not exist.
 
 /// How this service states a table bucket that has no metrics configuration:
 /// the `NotFoundException` (HTTP 404) the metrics operations model. FIXED
-/// text — it names the CLASS of the failure (the configuration the request
-/// addresses is not there) and takes nothing from the request, as
-/// [`BUCKET_NOT_FOUND_MESSAGE`] does for the bucket itself.
-pub const METRICS_CONFIGURATION_NOT_FOUND_MESSAGE: &str =
-    "The specified metrics configuration does not exist.";
+/// text — it names the CLASS of the failure (there is no such configuration)
+/// and takes nothing from the request, as [`BUCKET_NOT_FOUND_MESSAGE`] does for
+/// the bucket itself. The wording, down to the singular "metric" and the
+/// absent full stop, is the one the recorded response for a bucket whose
+/// metrics are off states, not this service's own phrasing.
+pub const METRICS_CONFIGURATION_NOT_FOUND_MESSAGE: &str = "No such metric configuration exists";
+
+/// How this service states a table bucket that has no replication
+/// configuration: the `NotFoundException` (HTTP 404) the replication operations
+/// model. FIXED text, as [`METRICS_CONFIGURATION_NOT_FOUND_MESSAGE`] — it names
+/// the CLASS of the failure and takes nothing from the request.
+pub const REPLICATION_CONFIGURATION_NOT_FOUND_MESSAGE: &str =
+    "The specified replication configuration does not exist.";
+
+/// How this service states a table the store does not hold: the
+/// `NotFoundException` (HTTP 404) the table operations model. FIXED text, as
+/// [`BUCKET_NOT_FOUND_MESSAGE`] does for a table bucket.
+pub const TABLE_NOT_FOUND_MESSAGE: &str = "The specified table does not exist.";
+
+/// How this service states a presented `versionToken` that is not the one the
+/// configuration it addresses currently carries: the conflict with a previous
+/// write the model's `ConflictException` (HTTP 409) names. FIXED text — the
+/// token is neither echoed nor named.
+pub const VERSION_TOKEN_MISMATCH_MESSAGE: &str =
+    "The specified version token does not match the configuration.";
+
+/// How this service states a record expiration call on a table that takes no
+/// record expiration configuration: the `MethodNotAllowedException` (HTTP 405)
+/// the record expiration operations model. FIXED text — it names the class of
+/// the failure and takes nothing from the request.
+pub const RECORD_EXPIRATION_NOT_ALLOWED_MESSAGE: &str =
+    "Table record expiration configuration API calls to this table are not allowed";
 
 /// How this service states a value that cannot be a taggable resource's ARN at
 /// all — the `resourceArn` member of the tagging operations, which the model

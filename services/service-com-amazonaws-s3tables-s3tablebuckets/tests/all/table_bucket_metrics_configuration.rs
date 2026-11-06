@@ -27,7 +27,7 @@ use super::harness::{expected_bucket_arn, Emulator};
 
 /// The fixed sentence this service states a table bucket that has no metrics
 /// configuration with.
-const NO_METRICS_CONFIGURATION: &str = "The specified metrics configuration does not exist.";
+const NO_METRICS_CONFIGURATION: &str = "No such metric configuration exists";
 
 /// The fixed sentence this service states a table bucket the store does not
 /// hold with.
@@ -385,6 +385,147 @@ async fn a_configuration_belongs_to_the_bucket_it_was_set_on() {
         fresh_id, id,
         "case \"the recreated bucket\": a fresh configuration must carry a fresh id, got \
          {fresh_id:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_delete_turns_metrics_off_again() {
+    let emulator = Emulator::new();
+
+    // The table spans what the rule generalises over: the region, the shape of
+    // the name, and how many times the delete is repeated.
+    let cases: Vec<(&str, &str, usize)> = vec![
+        ("one delete, a plain bucket", "us-east-1", 1),
+        ("the delete repeated, in another region", "eu-west-1", 2),
+        ("the delete repeated three times", "ap-south-1", 3),
+    ];
+
+    for (index, (label, region, deletes)) in cases.iter().enumerate() {
+        let name = format!("metrics-deleted-{index}");
+        let arn = emulator
+            .create_table_bucket(region, &json!({ "name": name }))
+            .await
+            .text("arn");
+
+        // The operation is `@idempotent`: it asks that the bucket collect no
+        // metrics, which a bucket that has no configuration already does, so
+        // the delete succeeds before any put.
+        let before = emulator
+            .delete_table_bucket_metrics_configuration(region, &arn)
+            .await;
+        assert_eq!(
+            before.status, 204,
+            "case {label:?}: the delete before the put must answer the modeled 204, got {status} \
+             {body}",
+            status = before.status,
+            body = before.body
+        );
+        assert_eq!(
+            before.body,
+            Value::Null,
+            "case {label:?}: the delete must carry no body, got {body}",
+            body = before.body
+        );
+
+        let put = emulator
+            .put_table_bucket_metrics_configuration(region, &arn)
+            .await;
+        assert_eq!(
+            put.status, 204,
+            "case {label:?}: the put must succeed, got {status} {body}",
+            status = put.status,
+            body = put.body
+        );
+        reported_id(
+            &emulator
+                .get_table_bucket_metrics_configuration(region, &arn)
+                .await,
+            &arn,
+            label,
+        );
+
+        for attempt in 1..=*deletes {
+            let deleted = emulator
+                .delete_table_bucket_metrics_configuration(region, &arn)
+                .await;
+            assert_eq!(
+                deleted.status, 204,
+                "case {label:?}: delete {attempt} must answer the modeled 204, got {status} \
+                 {body}",
+                status = deleted.status,
+                body = deleted.body
+            );
+            assert_eq!(
+                deleted.body,
+                Value::Null,
+                "case {label:?}: delete {attempt} must carry no body, got {body}",
+                body = deleted.body
+            );
+        }
+
+        // The read reports metrics off again, and the store holds nothing.
+        let read = emulator
+            .get_table_bucket_metrics_configuration(region, &arn)
+            .await;
+        assert_eq!(
+            read.status, 404,
+            "case {label:?}: expected 404 after the delete, got {status} {body}",
+            status = read.status,
+            body = read.body
+        );
+        {
+            let store = emulator.engine.state::<S3TablesState>();
+            let store = store.lock();
+            let persisted = store
+                .table_buckets
+                .get(&arn)
+                .and_then(|bucket| bucket.metrics.clone());
+            assert_eq!(
+                persisted, None,
+                "case {label:?}: the delete must remove the configuration from the store, got \
+                 {persisted:?}"
+            );
+        }
+
+        // And a later put turns metrics on again, under a fresh id.
+        let put = emulator
+            .put_table_bucket_metrics_configuration(region, &arn)
+            .await;
+        assert_eq!(
+            put.status, 204,
+            "case {label:?}: the put after the delete must succeed, got {status} {body}",
+            status = put.status,
+            body = put.body
+        );
+        reported_id(
+            &emulator
+                .get_table_bucket_metrics_configuration(region, &arn)
+                .await,
+            &arn,
+            label,
+        );
+    }
+
+    // A delete against a bucket the store does not hold is the bucket's own
+    // not-found.
+    let absent = emulator
+        .delete_table_bucket_metrics_configuration(
+            "us-east-1",
+            &expected_bucket_arn("us-east-1", "metrics-delete-absent"),
+        )
+        .await;
+    assert_eq!(
+        absent.status, 404,
+        "case \"a bucket that was never created\": expected 404, got {status} {body}",
+        status = absent.status,
+        body = absent.body
+    );
+    assert_eq!(
+        absent.message(),
+        NO_BUCKET,
+        "case \"a bucket that was never created\": expected the fixed not-found sentence, got \
+         {actual:?}",
+        actual = absent.message()
     );
 }
 

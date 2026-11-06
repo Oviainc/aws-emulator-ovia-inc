@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutTableBucketReplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutTableBucketReplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutTableBucketReplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -136,6 +127,25 @@ impl From<PutTableBucketReplicationErrorModeled> for PutTableBucketReplicationEr
     }
 }
 
+/// `NotFoundException` (HTTP 404) — the refusal this operation models for a
+/// table bucket the store does not hold, and for a version precondition on a
+/// bucket that has no replication configuration to precondition.
+fn not_found(message: &str) -> PutTableBucketReplicationError {
+    PutTableBucketReplicationErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// How this service reports the state of the replication configuration a put
+/// has just put in force. The member is an untyped `String` the model
+/// documents as "the status of the replication configuration operation", and a
+/// configuration that was accepted is in force, which is the state this service
+/// words `enabled` — the same word its other configurations' statuses carry.
+/// No recorded response states this member's wording, so this is the service's
+/// own, derived from the state the put leaves and from nothing in the request.
+const CONFIGURATION_IN_FORCE: &str = "enabled";
+
 /// The `PutTableBucketReplication` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -172,18 +182,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutTableBucketReplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutTableBucketReplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutTableBucketReplication"))
+        use crate::state::{ReplicationConfiguration, ReplicationRule};
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutTableBucketReplicationErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+
+        // The configuration belongs to a table bucket, so a put against an ARN
+        // the store holds no bucket for is the modeled not-found.
+        let configured = match store.table_buckets.get(&input.table_bucket_arn) {
+            None => return Err(not_found(crate::state::BUCKET_NOT_FOUND_MESSAGE)),
+            Some(bucket) => bucket.replication.clone(),
+        };
+
+        // `versionToken` is a precondition on the configuration the caller
+        // believes is there. A bucket that has no configuration at all cannot
+        // satisfy one — there is nothing the token could name — so the put is
+        // refused as not-found and creates nothing; a token that is not the
+        // stored configuration's means it was written since the caller read it,
+        // which is the conflict with a previous write the model's
+        // `ConflictException` (HTTP 409) names. A request that carries no token
+        // replaces whatever is there.
+        if let Some(presented) = input.version_token.as_deref() {
+            match &configured {
+                None => {
+                    return Err(not_found(
+                        crate::state::REPLICATION_CONFIGURATION_NOT_FOUND_MESSAGE,
+                    ))
+                }
+                Some(configuration) if presented != configuration.version_token => {
+                    return Err(PutTableBucketReplicationErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(
+                                crate::state::VERSION_TOKEN_MISMATCH_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                Some(_) => {}
+            }
+        }
+
+        // Every write of a configuration gets a fresh token, so a caller
+        // holding the one this call answers with can tell a later write apart
+        // from its own.
+        let version_token = store.mint_replication_version_token();
+        let stored = ReplicationConfiguration {
+            role: input.configuration.role,
+            rules: input
+                .configuration
+                .rules
+                .into_iter()
+                .map(|rule| ReplicationRule {
+                    destinations: rule
+                        .destinations
+                        .into_iter()
+                        .map(|destination| destination.destination_table_bucket_arn)
+                        .collect(),
+                })
+                .collect(),
+            version_token: version_token.clone(),
+        };
+        match store.table_buckets.get_mut(&input.table_bucket_arn) {
+            // The whole configuration is applied as ONE replacement, so a
+            // bucket is never left carrying a mix of two callers' rules.
+            Some(bucket) => bucket.replication = Some(stored),
+            // Unreachable while this call holds the store's lock: the bucket was
+            // resident a few lines above and nothing else can have removed it in
+            // between.
+            None => return Err(not_found(crate::state::BUCKET_NOT_FOUND_MESSAGE)),
+        }
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+
+        // The access record for a state-changing operation: who, what and the
+        // outcome. Metadata only — never the role or a destination the
+        // configuration names.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            outcome = if configured.is_some() { "replaced" } else { "created" },
+            "table bucket replication configuration set",
+        );
+
+        Ok(PutTableBucketReplicationOutput {
+            version_token,
+            status: CONFIGURATION_IN_FORCE.to_string(),
+        })
     }
 }

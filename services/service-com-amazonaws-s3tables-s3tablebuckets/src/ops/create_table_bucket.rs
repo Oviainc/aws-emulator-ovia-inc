@@ -268,6 +268,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A fresh table bucket collects no metrics:
             // `PutTableBucketMetricsConfiguration` is what turns them on.
             metrics: None,
+            // A fresh table bucket replicates nothing:
+            // `PutTableBucketReplication` is what configures replication on it.
+            replication: None,
             tags,
             // A fresh bucket holds no namespaces; `CreateNamespace` is what
             // puts one in it.

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTableRecordExpirationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTableRecordExpirationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTableRecordExpirationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +111,26 @@ impl From<GetTableRecordExpirationConfigurationErrorModeled> for GetTableRecordE
     }
 }
 
+/// `NotFoundException` (HTTP 404) — no table is stored at the ARN the request
+/// addresses.
+fn no_such_table() -> GetTableRecordExpirationConfigurationError {
+    GetTableRecordExpirationConfigurationErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::TABLE_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// `MethodNotAllowedException` (HTTP 405) — the table the request addresses
+/// takes no record expiration configuration, so there is none to report.
+fn not_allowed() -> GetTableRecordExpirationConfigurationError {
+    GetTableRecordExpirationConfigurationErrorModeled::MethodNotAllowedException(
+        MethodNotAllowedException {
+            message: Some(crate::state::RECORD_EXPIRATION_NOT_ALLOWED_MESSAGE.to_string()),
+        },
+    )
+    .into()
+}
+
 /// The `GetTableRecordExpirationConfiguration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +167,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTableRecordExpirationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTableRecordExpirationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTableRecordExpirationConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTableRecordExpirationConfigurationErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // A pure read: what it answers with is reconstructed from the table's
+        // own record, and nothing in the store is touched.
+        let store = state.lock();
+        let table = store
+            .table_by_arn(&input.table_arn)
+            .ok_or_else(no_such_table)?;
+
+        // Record expiration belongs to the tables Amazon Web Services manages:
+        // on every other table the call is refused, which is how a client
+        // learns the table takes no expiration configuration at all.
+        if !crate::state::allows_record_expiration(table) {
+            return Err(not_allowed());
+        }
+
+        // A table always has an expiration state — the records of one nothing
+        // was configured on are kept — so the read reports the configuration
+        // the store holds for it, else the one in force without any.
+        let configuration =
+            crate::state::effective_record_expiration(table.record_expiration.as_ref());
+
+        Ok(GetTableRecordExpirationConfigurationOutput {
+            configuration: TableRecordExpirationConfigurationValue {
+                status: configuration
+                    .status
+                    .map(|status| status.as_wire().to_string()),
+                settings: configuration
+                    .days
+                    .map(|days| TableRecordExpirationSettings { days: Some(days) }),
+            },
+        })
     }
 }

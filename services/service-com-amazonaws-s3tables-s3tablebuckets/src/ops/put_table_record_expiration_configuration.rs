@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutTableRecordExpirationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutTableRecordExpirationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutTableRecordExpirationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -142,6 +133,26 @@ impl From<PutTableRecordExpirationConfigurationErrorModeled> for PutTableRecordE
     }
 }
 
+/// `NotFoundException` (HTTP 404) — no table is stored at the ARN the request
+/// addresses.
+fn no_such_table() -> PutTableRecordExpirationConfigurationError {
+    PutTableRecordExpirationConfigurationErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::TABLE_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// `MethodNotAllowedException` (HTTP 405) — the table the request addresses
+/// takes no record expiration configuration, whatever the request asks for.
+fn not_allowed() -> PutTableRecordExpirationConfigurationError {
+    PutTableRecordExpirationConfigurationErrorModeled::MethodNotAllowedException(
+        MethodNotAllowedException {
+            message: Some(crate::state::RECORD_EXPIRATION_NOT_ALLOWED_MESSAGE.to_string()),
+        },
+    )
+    .into()
+}
+
 /// The `PutTableRecordExpirationConfiguration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -178,18 +189,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutTableRecordExpirationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutTableRecordExpirationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutTableRecordExpirationConfiguration"))
+        use crate::state::{RecordExpiration, RecordExpirationStatus};
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutTableRecordExpirationConfigurationErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+
+        // Record expiration belongs to the tables Amazon Web Services manages:
+        // the table is resolved and gated FIRST, so a call against a table that
+        // takes no expiration configuration is refused for that reason
+        // whatever the configuration it carries, and nothing is persisted.
+        let takes_expiration = match store.table_by_arn(&input.table_arn) {
+            None => return Err(no_such_table()),
+            Some(table) => crate::state::allows_record_expiration(table),
+        };
+        if !takes_expiration {
+            return Err(not_allowed());
+        }
+
+        // The status the request asks for, as the stored form holds it. A value
+        // outside the modeled enum is refused at the boundary, so reaching here
+        // with an unknown one would mean the model changed under us; it is
+        // refused as client input rather than silently stored.
+        let status = match input.value.status.as_deref() {
+            None => None,
+            Some(wire) => Some(RecordExpirationStatus::from_wire(wire).ok_or_else(|| {
+                PutTableRecordExpirationConfigurationErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!(
+                            "The record expiration status {wire} is not supported."
+                        )),
+                    },
+                )
+            })?),
+        };
+        let days = input
+            .value
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.days);
+
+        // The operation is `@idempotent` and its `value` is the whole
+        // configuration, so a put REPLACES whatever the table carried: what a
+        // read reports afterwards is exactly this request's configuration.
+        let table = store
+            .table_by_arn_mut(&input.table_arn)
+            .ok_or_else(no_such_table)?;
+        table.record_expiration = Some(RecordExpiration { status, days });
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+
+        // The access record for a state-changing operation: who, what and the
+        // outcome. Metadata only.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            outcome = "configured",
+            "table record expiration configuration set",
+        );
+
+        Ok(PutTableRecordExpirationConfigurationOutput)
     }
 }

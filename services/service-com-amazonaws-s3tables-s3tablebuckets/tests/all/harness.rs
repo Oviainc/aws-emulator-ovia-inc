@@ -196,6 +196,122 @@ impl Emulator {
         .await
     }
 
+    pub async fn delete_table_bucket_metrics_configuration(
+        &self,
+        region: &str,
+        arn: &str,
+    ) -> Reply {
+        self.call(
+            "DELETE",
+            &format!("/buckets/{}/metrics", encode(arn)),
+            region,
+            None,
+        )
+        .await
+    }
+
+    /// `PutTableBucketReplication`: the bucket's ARN and an optional
+    /// `versionToken` travel as query members, the configuration as the body's
+    /// `configuration`.
+    pub async fn put_table_bucket_replication(
+        &self,
+        region: &str,
+        query: &[(&str, String)],
+        configuration: &Value,
+    ) -> Reply {
+        self.call(
+            "PUT",
+            &format!("/table-bucket-replication{}", query_string(query)),
+            region,
+            Some(&serde_json::json!({ "configuration": configuration })),
+        )
+        .await
+    }
+
+    /// `GetTableBucketReplication`, which addresses the bucket by a query member.
+    pub async fn get_table_bucket_replication(&self, region: &str, arn: &str) -> Reply {
+        self.call(
+            "GET",
+            &format!(
+                "/table-bucket-replication{}",
+                query_string(&[("tableBucketARN", arn.to_string())])
+            ),
+            region,
+            None,
+        )
+        .await
+    }
+
+    /// `DeleteTableBucketReplication` with whichever query members the case
+    /// names, so a suite can present a `versionToken` or leave it out.
+    pub async fn delete_table_bucket_replication(
+        &self,
+        region: &str,
+        query: &[(&str, String)],
+    ) -> Reply {
+        self.call(
+            "DELETE",
+            &format!("/table-bucket-replication{}", query_string(query)),
+            region,
+            None,
+        )
+        .await
+    }
+
+    /// `PutTableRecordExpirationConfiguration`: the table's ARN travels as a
+    /// query member and the configuration as the body's `value`.
+    pub async fn put_table_record_expiration_configuration(
+        &self,
+        region: &str,
+        table_arn: &str,
+        value: &Value,
+    ) -> Reply {
+        self.call(
+            "PUT",
+            &format!(
+                "/table-record-expiration{}",
+                query_string(&[("tableArn", table_arn.to_string())])
+            ),
+            region,
+            Some(&serde_json::json!({ "value": value })),
+        )
+        .await
+    }
+
+    pub async fn get_table_record_expiration_configuration(
+        &self,
+        region: &str,
+        table_arn: &str,
+    ) -> Reply {
+        self.call(
+            "GET",
+            &format!(
+                "/table-record-expiration{}",
+                query_string(&[("tableArn", table_arn.to_string())])
+            ),
+            region,
+            None,
+        )
+        .await
+    }
+
+    pub async fn get_table_record_expiration_job_status(
+        &self,
+        region: &str,
+        table_arn: &str,
+    ) -> Reply {
+        self.call(
+            "GET",
+            &format!(
+                "/table-record-expiration-job-status{}",
+                query_string(&[("tableArn", table_arn.to_string())])
+            ),
+            region,
+            None,
+        )
+        .await
+    }
+
     pub async fn list_table_buckets(&self, region: &str, query: &[(&str, String)]) -> Reply {
         self.call("GET", &format!("/buckets{}", query_string(query)), region, None)
             .await
