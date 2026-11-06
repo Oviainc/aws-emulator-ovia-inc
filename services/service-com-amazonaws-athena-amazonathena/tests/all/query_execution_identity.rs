@@ -19,25 +19,12 @@
 //! in, and how tokens are spread over the submits.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::DEFAULT_WORK_GROUP;
-use service_com_amazonaws_athena_amazonathena::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The `x-amz-target` prefix of this service: the local name of the Smithy service
-/// shape (`com.amazonaws.athena#AmazonAthena`), which is how the awsJson protocols
-/// build that header.
-const TARGET_PREFIX: &str = "AmazonAthena";
-
-/// The router picks a service by the SigV4 credential scope's service field, so every
-/// request carries one naming `athena` (this service's `sigv4Name`). Neither the key id
-/// nor the signature is a credential: the harness turns request authentication off
-/// below, so nothing here is verified.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDEXAMPLE/20260101/us-east-1/athena/aws4_request, \
-     SignedHeaders=host;x-amz-target, Signature=not-verified";
+// The wire harness is shared by the suites of this test binary.
+use crate::harness::{create_work_group, execution, history, request_token, router, start};
 
 /// Where the queries in these tests write their results: a query has to name a location
 /// or inherit one. Nothing is written to it.
@@ -46,100 +33,6 @@ const OUTPUT_LOCATION: &str = "s3://athena-results/identity/";
 /// The modelled bound on `QueryExecutionId` ("len 1..128, pattern ^\S+$", from the
 /// `QueryExecutionId` shape of this service's model).
 const MAX_ID_CHARS: usize = 128;
-
-/// One service mounted on its own engine, reached the way the production router reaches
-/// it.
-fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Pinned off so the suite does not depend on how the emulator process was started;
-    // these tests assert Athena's behaviour, not the emulator's SigV4 check.
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// Invoke one operation and return `(status, body)`.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("host", "athena.us-east-1.amazonaws.com")
-        .header("authorization", AUTHORIZATION)
-        .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
-        .header("content-type", "application/x-amz-json-1.1")
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("the request body serializes"),
-        ))
-        .expect("a well-formed request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    (status, parsed)
-}
-
-/// Start one query and return the `QueryExecutionId` it minted.
-async fn start(router: &MultiServiceRouter, body: &Value) -> String {
-    let (status, answer) = call(router, "StartQueryExecution", body).await;
-    assert_eq!(
-        status, 200,
-        "StartQueryExecution({body}) must be accepted, got {status} with {answer:?}"
-    );
-    answer["QueryExecutionId"]
-        .as_str()
-        .unwrap_or_else(|| panic!("StartQueryExecution must answer with an id, got {answer:?}"))
-        .to_string()
-}
-
-/// The stored `QueryExecution` of `id`.
-async fn execution(router: &MultiServiceRouter, id: &str) -> Value {
-    let (status, body) = call(router, "GetQueryExecution", &json!({ "QueryExecutionId": id })).await;
-    assert_eq!(
-        status, 200,
-        "GetQueryExecution({id}) must answer 200, got {status} with {body:?}"
-    );
-    body["QueryExecution"].clone()
-}
-
-/// The ids `work_group`'s history holds.
-async fn history(router: &MultiServiceRouter, work_group: &str) -> Vec<String> {
-    let (status, listed) = call(
-        router,
-        "ListQueryExecutions",
-        &json!({ "WorkGroup": work_group, "MaxResults": 50 }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "ListQueryExecutions({work_group}) must answer 200, got {status} with {listed:?}"
-    );
-    listed["QueryExecutionIds"]
-        .as_array()
-        .unwrap_or(&Vec::new())
-        .iter()
-        .filter_map(|id| id.as_str().map(str::to_string))
-        .collect()
-}
-
-/// Create the workgroup `name`, with no configuration of its own.
-async fn create_work_group(router: &MultiServiceRouter, name: &str) {
-    let (status, created) = call(router, "CreateWorkGroup", &json!({ "Name": name })).await;
-    assert_eq!(
-        status, 200,
-        "the workgroup {name} must be created, got {status} with {created:?}"
-    );
-}
-
-/// A `ClientRequestToken` of the modelled length (32 to 128 characters), built from
-/// `seed` so each caller carries its own.
-fn request_token(seed: &str) -> String {
-    format!("{seed:-<32}")
-}
 
 /// Assert `id` satisfies the modelled `QueryExecutionId` constraints.
 fn assert_well_formed(case: &str, id: &str) {
