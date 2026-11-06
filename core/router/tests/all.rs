@@ -863,6 +863,8 @@ mod events_lambda_target_runs_the_handler;
 mod cloudformation_provisions_lambda_functions;
 #[path = "all/cloudformation_updates_lambda_functions.rs"]
 mod cloudformation_updates_lambda_functions;
+#[path = "all/cloudformation_provisions_lambda_event_source_mappings.rs"]
+mod cloudformation_provisions_lambda_event_source_mappings;
 // Declared here, in the sorted block, for the reason the entries above give: the appended
 // tail of this file is the contended region every other new suite lands in.
 #[path = "all/cloudformation_sam_http_api_definitions.rs"]

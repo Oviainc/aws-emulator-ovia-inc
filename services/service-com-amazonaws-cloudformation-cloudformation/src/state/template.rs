@@ -3440,12 +3440,7 @@ fn intrinsic(
         // another value if the specified condition evaluates to false":
         // [condition_name, value_if_true, value_if_false].
         "Fn::If" => {
-            let branches = argument.as_array()?;
-            if branches.len() != 3 {
-                return None;
-            }
-            let holds = condition_holds(branches[0].as_str()?, scope, depth + 1, budget)?;
-            let chosen = if holds { &branches[1] } else { &branches[2] };
+            let chosen = chosen_branch(argument, scope, depth, budget)?;
             evaluate(chosen, scope, depth + 1, budget)
         }
         // "Fn::Length returns the number of elements within an array or an intrinsic
@@ -4657,4 +4652,6 @@ fn rendered_item(item: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests;
 mod return_values;
+mod conditions;
+use conditions::chosen_branch;
 pub use return_values::*;

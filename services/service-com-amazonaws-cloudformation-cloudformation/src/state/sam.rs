@@ -990,10 +990,11 @@ fn event_source_mapping(
     event_properties: &Map<String, Value>,
 ) -> Option<Map<String, Value>> {
     let mut mapping = Map::new();
-    mapping.insert(
-        "FunctionName".to_string(),
-        json!({ "Fn::GetAtt": [function, "Arn"] }),
-    );
+    // `AWS::Lambda::EventSourceMapping$FunctionName` is "the name or ARN of the Lambda
+    // function", and the generated mapping names the function by the reference that resolves
+    // to the identifier CloudFormation gives it: "Ref returns the function name" for an
+    // `AWS::Lambda::Function`, which is the form the expanded mapping carries.
+    mapping.insert("FunctionName".to_string(), json!({ "Ref": function }));
     // The event states its source under its own name (`Queue`, `Stream`, `Broker`); the
     // mapping spells every one of them `EventSourceArn`.
     mapping.insert(

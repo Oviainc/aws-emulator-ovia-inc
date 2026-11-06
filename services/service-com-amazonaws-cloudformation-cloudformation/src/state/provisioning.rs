@@ -201,6 +201,8 @@ use super::StoredResource;
 mod cognito_identity_pool;
 mod dynamodb_table;
 mod ec2_vpc_network;
+mod iam_policy;
+mod lambda_event_source_mapping;
 mod lambda_function;
 mod lambda_layer_version;
 mod lambda_permission;
@@ -536,6 +538,13 @@ pub(super) enum Owner {
     Builtin(Provisioner),
     /// `AWS::DynamoDB::Table`, whose arms are [`dynamodb_table`]'s.
     DynamodbTable,
+    /// One of the inline-policy types [`iam_policy`] embeds in IAM (`AWS::IAM::Policy` and
+    /// the per-entity `AWS::IAM::RolePolicy`, `UserPolicy` and `GroupPolicy`). Which of them
+    /// it is travels with the owner, so the algorithm resolves the type once.
+    IamPolicy(iam_policy::Kind),
+    /// `AWS::Lambda::EventSourceMapping`, whose arms are
+    /// [`lambda_event_source_mapping`]'s.
+    LambdaEventSourceMapping,
     /// `AWS::Lambda::Function`, whose arms are [`lambda_function`]'s.
     LambdaFunction,
     /// `AWS::Lambda::LayerVersion`, whose arms are [`lambda_layer_version`]'s.
@@ -559,6 +568,12 @@ pub(super) enum Owner {
 pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     if resource_type == dynamodb_table::DYNAMODB_TABLE {
         return Some(Owner::DynamodbTable);
+    }
+    if let Some(kind) = iam_policy::kind_of(resource_type) {
+        return Some(Owner::IamPolicy(kind));
+    }
+    if resource_type == lambda_event_source_mapping::LAMBDA_EVENT_SOURCE_MAPPING {
+        return Some(Owner::LambdaEventSourceMapping);
     }
     if resource_type == lambda_function::LAMBDA_FUNCTION {
         return Some(Owner::LambdaFunction);
@@ -594,6 +609,14 @@ impl Owner {
             }
             Self::DynamodbTable => {
                 dynamodb_table::create(ctx, region, resource, propagated).await
+            }
+            // An inline policy carries no tags of its own: it is not a resource, so
+            // CloudFormation propagates none to it.
+            Self::IamPolicy(kind) => iam_policy::create(ctx, region, kind, resource)
+                .await
+                .map(|()| Created::default()),
+            Self::LambdaEventSourceMapping => {
+                lambda_event_source_mapping::create(ctx, region, resource, propagated).await
             }
             Self::LambdaFunction => {
                 lambda_function::create(ctx, region, resource, propagated).await
@@ -637,6 +660,9 @@ impl Owner {
             Self::DynamodbTable => {
                 Ok(dynamodb_table::readiness(ctx, region, physical_resource_id, declared).await)
             }
+            // The document is embedded in every entity it names the moment the put answers.
+            Self::IamPolicy(_) => Ok(Readiness::Ready),
+            Self::LambdaEventSourceMapping => Ok(lambda_event_source_mapping::readiness()),
             Self::LambdaFunction => Ok(lambda_function::readiness()),
             // The version exists, and a function may name it, the moment
             // `PublishLayerVersion` answers.
@@ -675,9 +701,14 @@ impl Owner {
             // A function's `Arn` is the one its create answered with, so a resource this
             // owner created has every attribute it publishes already, and neither a layer
             // version nor a policy statement publishes one at all.
-            Self::LambdaFunction | Self::LambdaLayerVersion | Self::LambdaPermission => {
-                Ok(BTreeMap::new())
-            }
+            // A mapping publishes the id its own create answered, which the resource already
+            // carries as its physical id, so there is nothing left to read for it either; and
+            // an inline policy publishes no attribute at all.
+            Self::IamPolicy(_)
+            | Self::LambdaEventSourceMapping
+            | Self::LambdaFunction
+            | Self::LambdaLayerVersion
+            | Self::LambdaPermission => Ok(BTreeMap::new()),
             // A table's `Arn` and `StreamArn` are the ones its own `CreateTable` answered
             // with, so there is nothing left to read once the resource is up.
             Self::DynamodbTable => Ok(BTreeMap::new()),
@@ -705,6 +736,12 @@ impl Owner {
                 provisioner.removal(ctx, region, physical_resource_id).await
             }
             Self::DynamodbTable => Ok(dynamodb_table::removal()),
+            // `Delete<entity>Policy` takes the embedded document away, so there is nothing
+            // to wait for.
+            Self::IamPolicy(_) => Ok(Removal::Gone),
+            Self::LambdaEventSourceMapping => {
+                lambda_event_source_mapping::removal(ctx, region, physical_resource_id).await
+            }
             Self::LambdaFunction => {
                 lambda_function::removal(ctx, region, physical_resource_id).await
             }
@@ -738,6 +775,12 @@ impl Owner {
             }
             Self::DynamodbTable => {
                 dynamodb_table::update(ctx, region, resource, declared).await
+            }
+            Self::IamPolicy(kind) => iam_policy::update(ctx, region, kind, resource, declared)
+                .await
+                .map(|()| Some(Created::default())),
+            Self::LambdaEventSourceMapping => {
+                lambda_event_source_mapping::update(ctx, region, resource, declared).await
             }
             Self::LambdaFunction => lambda_function::update(ctx, region, resource, declared)
                 .await
@@ -787,9 +830,14 @@ impl Owner {
             // as for every type whose arm states no `retag` ([`Provisioner::retag`]'s own
             // default) — so nothing is asked about them.
             Self::DynamodbTable => Ok(()),
-            // Neither a layer version nor a policy statement is taggable, so nothing is
-            // asked about their tags.
-            Self::LambdaLayerVersion | Self::LambdaPermission => Ok(()),
+            // Neither a layer version nor a policy statement is taggable, and neither is an
+            // inline policy, so nothing is asked about their tags; the tags of a mapping that
+            // already exists are reconciled by no arm here yet ([`Provisioner::retag`]'s own
+            // default).
+            Self::IamPolicy(_)
+            | Self::LambdaEventSourceMapping
+            | Self::LambdaLayerVersion
+            | Self::LambdaPermission => Ok(()),
             // The tags of an Amazon EC2 resource that already exists are reconciled by no arm
             // here yet — as for every other type of that service ([`Provisioner::retag`]'s
             // own default) — so nothing is asked about them.
@@ -823,6 +871,16 @@ impl Owner {
             // Lambda's `DeleteFunction` takes no snapshot of a function on the way out:
             // there is no such call, so a `Snapshot` deletion policy on this type deletes
             // the function with no snapshot invented for it.
+            // IAM takes no snapshot of an embedded policy on the way out: there is no such
+            // call, so a `Snapshot` deletion policy on this type deletes it with no snapshot
+            // invented for it.
+            Self::IamPolicy(kind) => iam_policy::delete(ctx, region, kind, resource).await,
+            // Lambda takes no snapshot of a mapping on the way out either: there is no such
+            // call, so a `Snapshot` deletion policy on this type deletes the mapping with no
+            // snapshot invented for it.
+            Self::LambdaEventSourceMapping => {
+                lambda_event_source_mapping::delete(ctx, region, resource).await
+            }
             Self::LambdaFunction => lambda_function::delete(ctx, region, resource).await,
             // `DeleteLayerVersion` takes no snapshot of a version on the way out either.
             Self::LambdaLayerVersion => {
@@ -862,6 +920,17 @@ impl Owner {
             // nothing back for drift detection, so nothing of it is reported as drifted
             // rather than guessed at.
             Self::DynamodbTable => Ok(None),
+            // An embedded policy reports no configuration of its own to compare: the
+            // document is read by the entity's own drift read, as a policy statement's is.
+            Self::IamPolicy(_) => Ok(None),
+            Self::LambdaEventSourceMapping => {
+                lambda_event_source_mapping::actual_configuration(
+                    ctx,
+                    region,
+                    &resource.physical_resource_id,
+                )
+                .await
+            }
             Self::LambdaFunction => {
                 lambda_function::actual_configuration(
                     ctx,
@@ -891,10 +960,13 @@ impl Owner {
     fn handler_message(self, class: &str, message: &str) -> String {
         match self {
             Self::Builtin(provisioner) => provisioner.handler_message(class, message),
+            // AWS IAM's resource provider reports the service's own message as it came.
+            Self::IamPolicy(_) => message.to_string(),
             // AWS Lambda's resource provider reports the service's own message as it came.
-            Self::LambdaFunction | Self::LambdaLayerVersion | Self::LambdaPermission => {
-                message.to_string()
-            }
+            Self::LambdaEventSourceMapping
+            | Self::LambdaFunction
+            | Self::LambdaLayerVersion
+            | Self::LambdaPermission => message.to_string(),
             // Amazon DynamoDB's does the same.
             Self::DynamodbTable => message.to_string(),
             // Amazon EC2's does the same.
@@ -2991,7 +3063,8 @@ const UNNAMED_CODE_PREFIX: &str = "HTTP ";
 ///
 /// One entry per service whose reported wording this emulator pins; a service with no entry
 /// has its message reported exactly as it worded it, with no diagnostic invented for it.
-const SDK_SERVICE_NAMES: &[(&str, &str)] = &[("es", "OpenSearch"), ("iam", "Iam")];
+const SDK_SERVICE_NAMES: &[(&str, &str)] =
+    &[("es", "OpenSearch"), ("iam", "Iam"), ("lambda", "Lambda")];
 
 /// The diagnostic an AWS SDK appends to the message of the exception it raises for a refused
 /// call: which service refused it, the HTTP status it answered with, the id of the call and

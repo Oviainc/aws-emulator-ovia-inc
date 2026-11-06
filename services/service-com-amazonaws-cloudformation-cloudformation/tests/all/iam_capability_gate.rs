@@ -168,12 +168,30 @@ fn cases() -> Vec<Case> {
         },
         // A catalogued type with NO custom-name property: `PolicyName` is the name of the
         // inline policy, not of an IAM identity, so the unnamed acknowledgement is enough.
+        // The declaration carries what the type requires of one — the policy's name and its
+        // document — because an `AWS::IAM::Policy` the stack deploys is really embedded in
+        // the identities it names, in IAM; the user it names is declared here (with a
+        // generated name, so the case still acknowledges only the unnamed capability).
         Case {
             case: "an inline policy, a type with no custom-name property, acknowledged as unnamed",
-            template: template(json!({"Inline": {
-                "Type": "AWS::IAM::Policy",
-                "Properties": {"PolicyName": "gate-inline-policy", "Users": ["someone"]},
-            }})),
+            template: template(json!({
+                "Someone": {"Type": "AWS::IAM::User"},
+                "Inline": {
+                    "Type": "AWS::IAM::Policy",
+                    "Properties": {
+                        "PolicyName": "gate-inline-policy",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [{
+                                "Effect": "Allow",
+                                "Action": "sqs:ReceiveMessage",
+                                "Resource": "*"
+                            }]
+                        },
+                        "Users": [{"Ref": "Someone"}],
+                    },
+                },
+            })),
             capabilities: &[IAM],
             refused_for: None,
         },

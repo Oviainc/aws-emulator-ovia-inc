@@ -2843,6 +2843,18 @@ pub(super) fn resolved_value(
             // An intrinsic function is a single-member object whose name is the
             // function's; anything else is a property map.
             if let Some((name, argument)) = sole_intrinsic(members) {
+                // `Fn::If` "returns one value if the specified condition evaluates to true
+                // and another value if the specified condition evaluates to false", and
+                // EITHER value may be a structure rather than a scalar — a whole property
+                // map, a list of policy statements, a nested list — so the branch the
+                // condition chooses ([`super::chosen_branch`]) is resolved HERE, as a value,
+                // keeping the objects and arrays inside it. Resolving it as an expression
+                // instead would yield no value for every branch that is not text, which
+                // drops the property the condition chose.
+                if name == FN_IF {
+                    let chosen = super::conditions::chosen_branch(argument, scope, depth, budget)?;
+                    return resolved_value(chosen, scope, depth + 1, budget);
+                }
                 // Through the SAME guard the output path uses: the value's size is held
                 // to `MAX_RESOLVED_TEXT_BYTES` and its bytes are charged against the
                 // deployment's budget, so evaluating a property cannot amplify what
