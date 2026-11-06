@@ -17,6 +17,11 @@
 // else appends to.
 #[path = "all/greengrass_deployment_iot_job.rs"]
 mod greengrass_deployment_iot_job;
+// Declared here, in this same head region, for the reason the entry above records.
+// What S3's two address forms — path-style and virtual-hosted — mean to the router, which is
+// the rule every cross-service suite that stages an S3 object addresses its setup calls by.
+#[path = "all/s3_address_forms.rs"]
+mod s3_address_forms;
 #[path = "all/cloudformation_refuses_s3vectors_vector_buckets.rs"]
 mod cloudformation_refuses_s3vectors_vector_buckets;
 // Declared here, in this same head region, for the reason the entry above records: the

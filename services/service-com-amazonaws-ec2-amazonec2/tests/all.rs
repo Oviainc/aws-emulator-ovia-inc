@@ -807,6 +807,11 @@ mod ipam_lifecycle;
 // how `Filters` narrow it and how `MaxResults` pages it.
 #[path = "all/ipam_discovered_public_addresses.rs"]
 mod ipam_discovered_public_addresses;
+// Which Amazon Web Services accounts an IPAM resource discovery reports as monitored in a
+// Region, what each discovered account carries, how `Filters` narrow the report and how
+// `MaxResults` pages it.
+#[path = "all/ipam_discovered_accounts.rs"]
+mod ipam_discovered_accounts;
 // Creating the association between an IPAM and a Regional Internet Registry.
 #[path = "all/ipam_internet_registry_association_creation.rs"]
 mod ipam_internet_registry_association_creation;

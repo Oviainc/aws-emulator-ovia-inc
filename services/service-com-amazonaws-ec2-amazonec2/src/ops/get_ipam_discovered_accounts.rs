@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIpamDiscoveredAccounts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIpamDiscoveredAccounts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIpamDiscoveredAccounts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the Amazon Web Services accounts one of the account's IPAM resource
+//! discoveries monitors in a Region, DERIVED from [`crate::state`] — the discovery must be one
+//! this store holds, and it monitors the Regions it operates in, so a Region it does not
+//! operate in has no discovered account of its own — narrowed by the request's `Filters` and
+//! answered one `MaxResults`-sized page at a time. A reporting operation: it stores nothing of
+//! its own, and the only write it makes is to materialise the state transitions the clock has
+//! ALREADY made due (an IPAM resource discovery's `create-in-progress` ->
+//! `create-complete`), which were owed at the same instant whether or not anybody called.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +146,299 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIpamDiscoveredAccounts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIpamDiscoveredAccountsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIpamDiscoveredAccounts"))
+        // `ctx` carries request metadata only, and this operation reads none of it: the Region
+        // the account information is returned from is the one the request's own
+        // `DiscoveryRegion` member names, not the one its credential scope was signed for. The
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state::{
+            CompiledFilter, MatchBudget, PageTokenRule, MAX_FILTERS, MAX_FILTER_MATCH_STEPS,
+            MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE,
+        };
+
+        // "Specify the pagination token from a previous request to retrieve the next page of
+        // results" (`GetIpamDiscoveredAccountsRequest$NextToken`) — anything else is refused
+        // rather than read as a position, and it is refused before any other member is looked
+        // at, so whether a bogus token is caught never depends on the rest of the request.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // "A resource discovery ID"
+        // (`GetIpamDiscoveredAccountsRequest$IpamResourceDiscoveryId`, required): something
+        // that is not an id of that kind at all is a fact about the request, so it is refused
+        // before the account's own discoveries are looked at.
+        crate::state::require_well_formed_ipam_resource_discovery_id(
+            &input.ipam_resource_discovery_id,
+        )?;
+
+        // "The Amazon Web Services Region that the account information is returned from"
+        // (`GetIpamDiscoveredAccountsRequest$DiscoveryRegion`, required): the Region this call
+        // reports the discovery's accounts for, so a value that names no Region at all names
+        // no discovery of one either.
+        if input.discovery_region.is_empty() {
+            return Err(crate::state::missing_parameter(
+                "The request must contain the parameter DiscoveryRegion",
+            ));
+        }
+
+        // Matching cost is filters x values x held values x discovered accounts and the model
+        // bounds none of them (`Filters` is a plain `FilterList`), so the request-controlled
+        // factors are capped here, before any work proportional to them is done — and their
+        // PRODUCT is charged to one [`MatchBudget`] below, which is the bound the per-factor
+        // caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not resolve is refused whether or not any account
+        // would have matched it, so an unsupported filter can never read as "no results". Each
+        // filter's values are parsed into their wildcard patterns ONCE here, not once per
+        // candidate.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !is_documented_filter(name) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is bounded
+            // too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "A check for whether you have the required permissions for the action without
+        // actually making the request" (`GetIpamDiscoveredAccountsRequest$DryRun`). Every
+        // caller of this emulator is permitted, so a dry run reports that outcome and reads
+        // nothing. It sits AFTER every parameter has been validated: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused is refused with
+        // that reason instead.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // The clock-owed transitions this read is allowed to apply — the same call
+        // `DescribeIpamResourceDiscoveries` makes: a resource discovery answered as
+        // `create-in-progress` is `create-complete` once its due instant has passed, whether
+        // or not anybody called, so applying it here changes nothing a later caller would not
+        // have seen anyway.
+        store.materialize_due_transitions();
+
+        // A discovery id the account holds no resource discovery for is an error, not an empty
+        // report: there is no discovery to report the monitored accounts of.
+        let Some(discovery) = store
+            .ipam_resource_discoveries
+            .get(&input.ipam_resource_discovery_id)
+        else {
+            return Err(crate::state::invalid_ipam_resource_discovery_id_not_found(
+                &input.ipam_resource_discovery_id,
+            ));
+        };
+        // "The operating Regions for the resource discovery"
+        // (`IpamResourceDiscovery$OperatingRegions`): a discovery monitors the Regions it
+        // operates in, so a Region it does not operate in is discovered in by nothing — and
+        // "an account can be discovered in multiple Regions and will have a separate
+        // discovered account for each Region" (`IpamDiscoveredAccount$DiscoveryRegion`), so
+        // that Region's report is empty rather than another Region's.
+        let monitors_region = discovery
+            .operating_regions
+            .iter()
+            .flatten()
+            .any(|operating| operating.region_name.as_deref() == Some(&*input.discovery_region));
+
+        // The accounts the discovery monitors in that Region. "A discovered account is an
+        // Amazon Web Services account that is monitored under a resource discovery. If you
+        // have integrated IPAM with Amazon Web Services Organizations, all accounts in the
+        // organization are discovered accounts" (`IpamDiscoveredAccount`): this emulator holds
+        // the resources of ONE account and is integrated with no organization, so the only
+        // account any discovery of it monitors is that account itself.
+        let mut selected: Vec<IpamDiscoveredAccount> = Vec::new();
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        if monitors_region {
+            let discovered = discovered_account(&input.discovery_region);
+            if crate::state::matches_every_filter(&selectors, &mut budget, &|name| {
+                filter_values(&discovered, name)
+            }) {
+                selected.push(discovered);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as a
+        // result: the request asked for more filtering than one call will do, and is told so
+        // rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                     comparisons to evaluate; narrow them or page with MaxResults"
+                ),
+            ));
+        }
+
+        // Page in account order. Every discovered account carries "the account ID"
+        // (`IpamDiscoveredAccount$AccountId`), and one call reports one Region, so the account
+        // id is a total order over the report and the cursor below always advances.
+        selected.sort_by(|left, right| left.account_id.cmp(&right.account_id));
+
+        // "The maximum number of discovered accounts to return in one page of results"
+        // (`GetIpamDiscoveredAccountsRequest$MaxResults`). A request that names none gets the
+        // largest page this service serves, so the `NextToken` path below behaves the same
+        // whether or not a page size was asked for. The model's `range 5..1000` has already
+        // refused anything outside it, so the only value that cannot convert is one the
+        // boundary validator would have rejected.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .min(MAX_PAGE_SIZE);
+
+        // "Specify the pagination token from a previous request to retrieve the next page of
+        // results" (`GetIpamDiscoveredAccountsResult$NextToken`): a token only when an account
+        // follows this page.
+        let (page, next_token) = crate::state::page_from_cursor(
+            &selected,
+            cursor.as_deref(),
+            Some(limit),
+            PageTokenRule::WhenAnotherItemFollows,
+            |discovered| discovered.account_id.as_deref().unwrap_or_default(),
+        );
+
+        Ok(GetIpamDiscoveredAccountsOutput {
+            ipam_discovered_accounts: Some(page.to_vec()),
+            next_token,
+        })
     }
 }
+
+/// The IPAM-discovered report of ONE account this emulator's resource discoveries monitor in
+/// `discovery_region`.
+///
+/// The account is the one this emulator holds every resource of
+/// ([`::engine::emulator_account_id`]), so what a discovery reports as monitored and what every
+/// other operation reports as the owner of a resource cannot disagree.
+///
+/// A discovery of this emulator reaches the account it is monitoring on every attempt — nothing
+/// here assumes a role, is throttled or is unauthorized, which is every failure
+/// `IpamDiscoveryFailureCode` names (`smithy_query(query="shape",shape="IpamDiscoveryFailureCode")`)
+/// — so "the last attempted resource discovery time" and "the last successful resource discovery
+/// time" (`IpamDiscoveredAccount$LastAttemptedDiscoveryTime` / `$LastSuccessfulDiscoveryTime`) are
+/// both the instant this discovery ran, and "the resource discovery failure reason"
+/// (`$FailureReason`) is absent because nothing failed. "The ID of an Organizational Unit in
+/// Amazon Web Services Organizations" (`$OrganizationalUnitId`) is absent for the same reason the
+/// account is the only one reported: it belongs to no organization, which is also why no
+/// `IpamResourceDiscovery$OrganizationalUnitExclusions` entry can name a path it sits under.
+fn discovered_account(discovery_region: &str) -> IpamDiscoveredAccount {
+    let discovered_at = crate::state::system_time_to_date_time(::std::time::SystemTime::now());
+    IpamDiscoveredAccount {
+        account_id: Some(::engine::emulator_account_id().to_string()),
+        discovery_region: Some(discovery_region.to_string()),
+        failure_reason: None,
+        last_attempted_discovery_time: Some(discovered_at),
+        last_successful_discovery_time: Some(discovered_at),
+        organizational_unit_id: None,
+    }
+}
+
+/// The filter names this operation resolves.
+///
+/// `GetIpamDiscoveredAccountsRequest$Filters` documents no list of its own — "Discovered account
+/// filters" is all of it
+/// (`smithy_query(query="doc",shape="GetIpamDiscoveredAccountsRequest",member="Filters")`) — so
+/// the names are the ones EC2's filtering convention gives: each member of the resource the
+/// operation reports, spelled in kebab-case. This list is therefore derived mechanically from the
+/// `IpamDiscoveredAccount` shape
+/// (`smithy_query(query="shape",shape="IpamDiscoveredAccount")`), one entry per SCALAR member;
+/// `FailureReason` is a STRUCTURE, which has no single value to compare a filter value against, so
+/// its own two members are named instead, the way `security-group-id` names a member of one of
+/// `GetIpamDiscoveredPublicAddresses`'s structures. A discovered account carries no `Tags` member,
+/// so the `tag-key` / `tag-value` / `tag:<key>` set an EC2 describe of a TAGGABLE resource accepts
+/// has nothing to read here and is not among these. Every entry must be answered by
+/// [`filter_values`].
+const IPAM_DISCOVERED_ACCOUNT_FILTERS: [&str; 7] = [
+    "account-id",
+    "discovery-region",
+    "failure-reason-code",
+    "failure-reason-message",
+    "last-attempted-discovery-time",
+    "last-successful-discovery-time",
+    "organizational-unit-id",
+];
+
+/// Is `name` a filter this operation resolves? "Filter names are case-sensitive"
+/// (`Filter$Name`), so the comparison is exact.
+fn is_documented_filter(name: &str) -> bool {
+    IPAM_DISCOVERED_ACCOUNT_FILTERS.contains(&name)
+}
+
+/// The values the EC2 filter `name` compares against one discovered account.
+///
+/// A filter naming an attribute this account does not carry compares against NO values, so it
+/// selects nothing — the same answer AWS gives for, say, `failure-reason-code` on a discovery that
+/// has not failed. A timestamp is compared as the wire spells it
+/// ([`crate::state::filter_timestamp_values`]), which is how a client would send the filter value.
+fn filter_values<'a>(
+    discovered: &'a IpamDiscoveredAccount,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    let failure = discovered.failure_reason.as_ref();
+    match name {
+        "account-id" => text(discovered.account_id.as_deref()),
+        "discovery-region" => text(discovered.discovery_region.as_deref()),
+        "failure-reason-code" => text(failure.and_then(|reason| reason.code.as_deref())),
+        "failure-reason-message" => text(failure.and_then(|reason| reason.message.as_deref())),
+        "last-attempted-discovery-time" => {
+            crate::state::filter_timestamp_values(discovered.last_attempted_discovery_time)
+        }
+        "last-successful-discovery-time" => {
+            crate::state::filter_timestamp_values(discovered.last_successful_discovery_time)
+        }
+        "organizational-unit-id" => text(discovered.organizational_unit_id.as_deref()),
+        // Unreachable: `is_documented_filter` has already refused every other name. An
+        // unresolvable name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+// The AND/OR evaluation of the whole `Filters` member is
+// `crate::state::matches_every_filter`, the one place this crate defines it: "if you specify
+// multiple filters, the filters are joined with an AND" (`Filter`), and within one filter "if you
+// specify multiple values for a filter, the values are joined with an OR" (`Filter$Values`), each
+// value matched case-sensitively with EC2's `*`/`?` wildcards and every comparison charged to the
+// call's one `crate::state::MatchBudget`. Only the per-operation lookup differs, which is
+// `filter_values` above.
