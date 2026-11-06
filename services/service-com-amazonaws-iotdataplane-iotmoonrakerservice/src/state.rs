@@ -216,6 +216,49 @@ pub fn addressed_shadow_name<'a>(thing_name: &'a str, shadow_name: Option<&'a st
     }
 }
 
+/// The first character of the RESERVED shadow-name namespace. This service keeps every
+/// shadow name beginning with `$` for its own use, exactly as it keeps the `$` topic
+/// namespace (`crate::ops::publish::RESERVED_TOPIC_PREFIX`), and refuses a request that
+/// addresses one — even though the modelled `shadowName` pattern admits `$` as a
+/// character, which makes the namespace the service's rule rather than the model's. Only
+/// the FIRST character is reserved: a `$` later in the name (`fleet$a`) is ordinary.
+pub const RESERVED_SHADOW_PREFIX: char = '$';
+
+/// The service's rejection of a shadow name in the reserved namespace, naming the shadow
+/// the request addressed — which is the one thing the caller has to change.
+pub fn invalid_shadow_name(name: &str) -> String {
+    format!("Invalid shadow name : {name}")
+}
+
+/// Why this service will not address the shadow `shadow_name`, or `None` when the name is
+/// one it will.
+///
+/// The rule is the shadow-NAME rule, and it holds wherever a request names one shadow —
+/// a write and a read alike, so a name the write path refuses is never reported by the
+/// read path as a shadow that merely holds nothing: a name in the reserved namespace
+/// ([`RESERVED_SHADOW_PREFIX`]) is not a name a client may address. A request that names
+/// no shadow addresses the unnamed ("classic") shadow, which is never refused here.
+/// Every other bound on the name — its length and its character set — is the MODEL's, and
+/// is weighed at this service's front door before a handler runs (see [`BAD_REQUEST`]).
+pub fn shadow_name_refusal(shadow_name: Option<&str>) -> Option<String> {
+    let name = shadow_name?;
+    if name.starts_with(RESERVED_SHADOW_PREFIX) {
+        return Some(invalid_shadow_name(name));
+    }
+    None
+}
+
+/// The service's fixed refusal of a request its front door will not take at all: a value
+/// outside a bound the model declares, or a required member the request left out.
+///
+/// Terse on purpose. Unlike the conditions a handler reports — each of which names the
+/// node, the shadow or the limit at fault — the front-door refusal carries NOTHING of the
+/// request: not the member, not the bound it crossed, and not the value the caller sent.
+/// It is one sentence a client can match on whichever member of whichever operation was
+/// at fault. See `crate::service::EmulatedService::override_refusal`, which is where this
+/// service answers such a refusal.
+pub const BAD_REQUEST: &str = "Bad Request";
+
 /// The shadow-name key of the unnamed ("classic") shadow — the shadow a request that
 /// carries no `name` query parameter addresses. The model constrains `shadowName` to
 /// 1..64 characters, so the empty string can never collide with a named shadow.
@@ -266,10 +309,13 @@ pub const MAX_SHADOWS: usize = 1024;
 /// `SendDirectMessage` alike.
 pub const MAX_PUBLISH_PAYLOAD_BYTES: usize = 128 * 1024;
 
-/// The service's rejection of a message payload over [`MAX_PUBLISH_PAYLOAD_BYTES`],
-/// built from the request: the size the request carried and the limit it crossed.
-pub fn payload_too_large(size: usize, max_allowed: usize) -> String {
-    format!("the payload is {size} bytes; the maximum message payload size is {max_allowed} bytes")
+/// The service's rejection of a message payload over [`MAX_PUBLISH_PAYLOAD_BYTES`]:
+/// fixed text naming the CEILING the message crossed and nothing else. The size the
+/// request carried is deliberately absent — the broker states the one limit a publisher
+/// has to shrink to, not the request it just refused, so the sentence is the same for
+/// every over-size message and a caller parsing it reads one number.
+pub fn payload_too_large(max_allowed: usize) -> String {
+    format!("payload larger than {max_allowed} bytes")
 }
 
 /// How many topics may hold a retained message at once. Emulator-chosen: the real

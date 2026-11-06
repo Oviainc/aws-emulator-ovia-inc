@@ -761,8 +761,14 @@ async fn send_direct_message_delivers_into_the_session() {
         );
         assert_eq!(
             answer.message(),
-            payload_too_large(size, MAX_PUBLISH_PAYLOAD_BYTES),
-            "case {case:?}: expected the refusal naming the size and the limit, got {:?}",
+            payload_too_large(MAX_PUBLISH_PAYLOAD_BYTES),
+            "case {case:?}: expected the refusal naming the ceiling, got {:?}",
+            answer.message()
+        );
+        assert!(
+            !answer.message().contains(&size.to_string()),
+            "case {case:?}: expected the refusal to carry nothing of the request's {size} \
+             bytes, got {:?}",
             answer.message()
         );
         assert_eq!(

@@ -510,11 +510,13 @@ async fn named_and_classic_shadows_of_one_thing_are_separate_documents() {
     let harness = Harness::new();
 
     // The same thing, three shadows, three different payloads: a per-shadow document,
-    // not one document per thing.
+    // not one document per thing. The third name exercises the pattern's `$` and `:` —
+    // with the `$` after the first character, since a LEADING `$` names the service's
+    // own reserved namespace, which no request may address.
     for (shadow, value) in [
         (None, 10),
         (Some("cfg"), 20),
-        (Some("$metrics:v1_a-b"), 30),
+        (Some("metrics$:v1_a-b"), 30),
     ] {
         let answer = harness
             .update(
@@ -536,7 +538,7 @@ async fn named_and_classic_shadows_of_one_thing_are_separate_documents() {
     for (shadow, value) in [
         (None, 10),
         (Some("cfg"), 20),
-        (Some("$metrics:v1_a-b"), 30),
+        (Some("metrics$:v1_a-b"), 30),
     ] {
         let read = harness.get_shadow("sharedThing", shadow).await;
         assert_eq!(

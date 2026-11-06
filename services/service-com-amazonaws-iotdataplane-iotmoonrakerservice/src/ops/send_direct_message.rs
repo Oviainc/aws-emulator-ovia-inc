@@ -242,7 +242,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if payload.len() > crate::state::MAX_PUBLISH_PAYLOAD_BYTES {
             return Err(SendDirectMessageErrorModeled::RequestEntityTooLargeException(
                 RequestEntityTooLargeException::new(crate::state::payload_too_large(
-                    payload.len(),
                     crate::state::MAX_PUBLISH_PAYLOAD_BYTES,
                 )),
             )

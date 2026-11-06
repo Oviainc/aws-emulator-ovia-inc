@@ -9,12 +9,15 @@
 //!   quota is refused as an entity too large — `RequestEntityTooLargeException` (HTTP
 //!   413), which tells a publisher to split or shrink the message — and not as a
 //!   malformed request. The quota is measured inclusively: a payload of exactly the
-//!   quota is taken, one byte more is refused, and a refused publish stores nothing.
+//!   quota is taken, one byte more is refused, and a refused publish stores nothing. The
+//!   refusal names the CEILING and nothing of the request that crossed it.
 //! * A topic name is weighed against two INDEPENDENT ceilings, each refused with
 //!   `InvalidRequestException` (HTTP 400) carrying its own message naming its own limit:
 //!   how many `/`-separated parts the name carries, and how many BYTES the whole name is
 //!   (measured on the UTF-8 name, so a multi-byte character costs its bytes and not
-//!   one). A name of legal depth is still weighed against the byte ceiling.
+//!   one). A name of legal depth is still weighed against the byte ceiling, and the
+//!   same verdict is reached on the READ path: a name the broker will not publish to is
+//!   malformed when a retained-message read names it too, not merely absent.
 //!
 //! Every limit is named by the crate (`state::MAX_PUBLISH_PAYLOAD_BYTES`,
 //! `state::MAX_TOPIC_PARTS`, `state::MAX_TOPIC_BYTES`) and every message by the crate's
@@ -251,15 +254,32 @@ async fn a_publish_topic_is_weighed_against_the_part_and_the_byte_ceiling() {
                     case.name,
                     message(&answer)
                 );
-                // A refused publish reaches neither the broker nor the store.
+                // A refused topic name is refused on the READ path with the same verdict:
+                // the name identifies no single message on either side of the broker.
                 let read = harness.get_retained_message(&encoded).await;
                 assert_eq!(
                     read.status,
-                    404,
-                    "case {:?}: a refused publish must retain nothing, got {} with body {}",
+                    400,
+                    "case {:?}: expected the read of a malformed topic name to be refused \
+                     400, got {} with body {}",
                     case.name,
                     read.status,
                     String::from_utf8_lossy(&read.body)
+                );
+                assert_eq!(
+                    read.error_code(),
+                    "InvalidRequestException",
+                    "case {:?}: expected InvalidRequestException on the read, got {}",
+                    case.name,
+                    String::from_utf8_lossy(&read.body)
+                );
+                assert_eq!(
+                    message(&read),
+                    *expected,
+                    "case {:?}: expected the read to carry the same refusal as the \
+                     publish, got {:?}",
+                    case.name,
+                    message(&read)
                 );
             }
         }
@@ -301,8 +321,16 @@ async fn an_oversize_publish_payload_is_refused_as_an_entity_too_large() {
             );
             assert_eq!(
                 message(&answer),
-                payload_too_large(size, MAX_PUBLISH_PAYLOAD_BYTES),
-                "case {case:?}: expected the refusal naming the size and the limit, got {:?}",
+                payload_too_large(MAX_PUBLISH_PAYLOAD_BYTES),
+                "case {case:?}: expected the refusal naming the ceiling, got {:?}",
+                message(&answer)
+            );
+            // The ceiling is the only number in it: the size the request carried is not
+            // part of the sentence the broker answers with.
+            assert!(
+                !message(&answer).contains(&size.to_string()),
+                "case {case:?}: expected the refusal to carry nothing of the request's \
+                 {size} bytes, got {:?}",
                 message(&answer)
             );
             // Nothing was stored for the refused publish.

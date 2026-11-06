@@ -160,6 +160,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        // The shadow name is weighed before the store is consulted, so a name this
+        // service will not address is refused as malformed on the read path exactly as it
+        // is on the write path rather than reported as a shadow that merely holds nothing
+        // — see `crate::state::shadow_name_refusal`, the one place that rule lives.
+        if let Some(refusal) = crate::state::shadow_name_refusal(input.shadow_name.as_deref()) {
+            return Err(GetThingShadowErrorModeled::InvalidRequestException(
+                InvalidRequestException::new(refusal),
+            )
+            .into());
+        }
+
         let key = crate::state::shadow_key(&input.thing_name, input.shadow_name.as_deref());
         let guard = state.lock();
         // Reporting only: the document is rendered from what is stored, and nothing

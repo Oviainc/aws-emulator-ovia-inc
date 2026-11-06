@@ -171,6 +171,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // Which shadow the request addresses is decided before what it carries: a name
+        // this service will not address is refused whatever document follows it — see
+        // `crate::state::shadow_name_refusal`, the one place that rule lives. The name's
+        // LENGTH and character set are the model's bounds and are weighed at this
+        // service's front door, before this handler runs (`crate::service`).
+        if let Some(refusal) = crate::state::shadow_name_refusal(input.shadow_name.as_deref()) {
+            return Err(UpdateThingShadowErrorModeled::InvalidRequestException(
+                InvalidRequestException::new(refusal),
+            )
+            .into());
+        }
+
         // A shadow document is UTF-8 JSON: bytes that are not UTF-8 at all are an
         // encoding this service does not support (415), and UTF-8 that is not a JSON
         // document is an invalid request (400). Either way the message is the

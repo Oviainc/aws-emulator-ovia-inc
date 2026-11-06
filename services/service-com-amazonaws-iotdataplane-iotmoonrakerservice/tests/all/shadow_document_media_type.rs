@@ -212,7 +212,9 @@ fn document_cases() -> Vec<DocumentCase> {
         DocumentCase {
             name: "a named shadow whose name uses the pattern's '$' and ':'",
             thing: "robot:arm_7",
-            shadow: Some("$package:v2"),
+            // The `$` sits after the first character: a LEADING `$` names the service's
+            // own reserved namespace, which no request may address.
+            shadow: Some("package$:v2"),
             updates: vec![json!({"state": {"reported": {"zones": [1, 2, 3], "ok": true}}})],
             expected_state: json!({"reported": {"zones": [1, 2, 3], "ok": true}}),
         },

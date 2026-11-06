@@ -19,6 +19,8 @@ mod connection_sessions;
 mod list_retained_messages;
 #[path = "all/publish_topic_and_payload_limits.rs"]
 mod publish_topic_and_payload_limits;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/reserved_topic_namespace.rs"]
 mod reserved_topic_namespace;
 #[path = "all/response_envelope.rs"]

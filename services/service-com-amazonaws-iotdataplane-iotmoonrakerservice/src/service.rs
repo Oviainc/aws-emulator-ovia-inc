@@ -271,17 +271,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // of them — and the status stays the 400 the protocol renders a constraint
         // refusal with.
         //
-        // The MESSAGE stays the framework's envelope: it names the member and the
-        // constraint it broke, built from the request, which is what a caller has to fix
-        // the request from. Only the code is this service's choice.
+        // The MESSAGE is this service's too, and it is the one terse sentence this data
+        // plane answers every front-door refusal with (`crate::state::BAD_REQUEST`) —
+        // whichever member of whichever operation was at fault, and whether the value was
+        // outside a bound or the member was absent. It carries NOTHING of the request:
+        // not the member's name, not the bound it crossed, and not the value the caller
+        // sent. The framework's structural envelope, which states all three, describes a
+        // constraint walk rather than this service's contract, and a client matching the
+        // refusal would not recognise it.
+        //
+        // The conditions a HANDLER reports are a different thing and keep their own
+        // specific text (`crate::state` holds that catalog): they are the service's own
+        // rules, not the front door's.
         //
         // An unauthenticated caller is not a constraint refusal and keeps the
         // framework's 403 wording: this service models `ForbiddenException` with that
         // status for exactly that case.
         match refusal {
-            Refusal::Invalid(violations) => Some(Refused {
+            Refusal::Invalid(_) => Some(Refused {
                 code: INVALID_REQUEST_EXCEPTION.to_string(),
-                message: aws_smithy_schema_server::envelope(violations)?,
+                message: crate::state::BAD_REQUEST.to_string(),
             }),
             _ => None,
         }

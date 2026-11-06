@@ -5,6 +5,12 @@
 //! topic: the payload byte-for-byte as published, its QoS, its user properties and
 //! when it was stored. A topic with no retained message is a 404.
 //!
+//! A request whose topic is not a topic NAME at all — one carrying an MQTT subscription
+//! wildcard, or past the broker's topic-name ceilings — is refused 400 before the store
+//! is consulted, exactly as a `Publish` to that name is: the name identifies no single
+//! message on either side of the broker, so it is malformed rather than absent, and the
+//! 400-vs-404 distinction is what tells a caller which of the two it sent.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -161,6 +167,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 InternalFailureException::new("An unexpected error has occurred."),
             )
         })?;
+
+        // A topic is a topic NAME on this path too, so the name is weighed against the
+        // broker's topic-name rules BEFORE the store is consulted — a name carrying an
+        // MQTT wildcard is a topic FILTER and not the identity of one message, whichever
+        // side of the broker asks for it, so it is refused here exactly as a publish to
+        // it is rather than reported as a name that merely holds no message. The rule
+        // lives in one place: `crate::state::topic_name_refusal`.
+        if let Some(refusal) = crate::state::topic_name_refusal(&input.topic) {
+            return Err(GetRetainedMessageErrorModeled::InvalidRequestException(
+                InvalidRequestException::new(refusal),
+            )
+            .into());
+        }
 
         let guard = state.lock();
         // Reporting only: reading a retained message does not consume it — MQTT keeps
