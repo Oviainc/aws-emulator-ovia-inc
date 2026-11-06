@@ -143,13 +143,57 @@ pub enum MappingDetails {
     },
 }
 
-/// A control mapping: a control, the kind of mapping, and what it maps to.
+impl MappingDetails {
+    /// The `MappingType` of a mapping with these details.
+    ///
+    /// A mapping's kind is not an independent fact about it: the modeled `Mapping` is a
+    /// union, which carries exactly one member, and `ControlMapping.MappingType` is
+    /// documented as "[t]he type of mapping relationship between the control and other
+    /// entities" — so the type names the member the union carries, one `MappingType`
+    /// value per union member. Reading it off the details here is what keeps a mapping
+    /// from ever being reported under a type its details do not match.
+    pub fn mapping_type(&self) -> &'static str {
+        match self {
+            Self::Framework { .. } => "FRAMEWORK",
+            Self::CommonControl { .. } => "COMMON_CONTROL",
+            Self::RelatedControl { .. } => "RELATED_CONTROL",
+        }
+    }
+
+    /// What the mapping maps to, as the text that distinguishes two mappings of one
+    /// control and kind from each other — the framework item, the common control's ARN,
+    /// or the related control's ARN with the relation. Part of the key the catalog
+    /// stores a mapping under (see [`ComAmazonawsControlcatalogControlcatalogState::control_mappings`]).
+    fn target(&self) -> String {
+        match self {
+            Self::Framework { name, item } => format!("{name}/{item}"),
+            Self::CommonControl { common_control_arn } => common_control_arn.clone(),
+            Self::RelatedControl {
+                control_arn,
+                relation_type,
+            } => format!(
+                "{}/{relation_type}",
+                control_arn.clone().unwrap_or_default()
+            ),
+        }
+    }
+}
+
+/// A control mapping: a control, and what it maps to. The kind of mapping is a
+/// function of the latter (see [`MappingDetails::mapping_type`]), so it is not stored
+/// beside it.
 #[derive(Debug, Clone)]
 pub struct ControlMappingRecord {
     pub control_arn: String,
-    /// `MappingType`: `FRAMEWORK`, `COMMON_CONTROL` or `RELATED_CONTROL`.
-    pub mapping_type: String,
     pub mapping: MappingDetails,
+}
+
+impl ControlMappingRecord {
+    /// This mapping's `MappingType`: `FRAMEWORK`, `COMMON_CONTROL` or
+    /// `RELATED_CONTROL`, read off the details it carries.
+    pub fn mapping_type(&self) -> &'static str {
+        self.mapping.mapping_type()
+    }
 }
 
 /// Per-service state for com-amazonaws-controlcatalog-controlcatalog. A handler reaches it through [`service_state`].
@@ -1040,33 +1084,15 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
         }
     }
     for (control_arn, mapping) in mapping_seed {
-        let (mapping_type, target) = match &mapping {
-            MappingDetails::Framework { name, item } => {
-                ("FRAMEWORK".to_string(), format!("{name}/{item}"))
-            }
-            MappingDetails::CommonControl { common_control_arn } => {
-                ("COMMON_CONTROL".to_string(), common_control_arn.clone())
-            }
-            MappingDetails::RelatedControl {
-                control_arn,
-                relation_type,
-            } => (
-                "RELATED_CONTROL".to_string(),
-                format!(
-                    "{}/{relation_type}",
-                    control_arn.clone().unwrap_or_default()
-                ),
-            ),
-        };
-        let key = format!("{control_arn}|{mapping_type}|{target}");
-        control_mappings.insert(
-            key,
-            ControlMappingRecord {
-                control_arn,
-                mapping_type,
-                mapping,
-            },
+        // The key is the control, the kind of mapping and what it maps to — the kind
+        // read off the mapping's own details, so a record cannot be stored under a type
+        // its details do not match.
+        let key = format!(
+            "{control_arn}|{}|{}",
+            mapping.mapping_type(),
+            mapping.target()
         );
+        control_mappings.insert(key, ControlMappingRecord { control_arn, mapping });
     }
 
     ComAmazonawsControlcatalogControlcatalogState {

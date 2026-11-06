@@ -102,7 +102,7 @@ fn recorded_count(
         .values()
         .filter(|record| {
             control_arn.is_none_or(|arn| record.control_arn == arn)
-                && mapping_type.is_none_or(|kind| record.mapping_type == kind)
+                && mapping_type.is_none_or(|kind| record.mapping_type() == kind)
                 && common_control_arn.is_none_or(|arn| match &record.mapping {
                     MappingDetails::CommonControl { common_control_arn } => {
                         common_control_arn == arn

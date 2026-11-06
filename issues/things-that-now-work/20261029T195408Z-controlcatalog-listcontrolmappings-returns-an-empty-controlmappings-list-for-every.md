@@ -35,3 +35,35 @@ Expected status 200, got 200, body empty on the emulator side. Examples: $.Contr
 1. Boot the emulator from this checkout and replay simparity-wire-aws-v1.
 2. Replay fixture controlcatalog-catalog-list-control-mappings step task#1: POST /list-control-mappings with a ControlMappingFilter naming a catalog control ARN -> emulator returns 200 with an empty ControlMappings list; AWS returns that control's FRAMEWORK, COMMON_CONTROL and RELATED_CONTROL mappings.
 3. Repeat for steps task#2 .. task#20 (other control ARNs) - every one returns an empty list.
+
+## Resolution
+
+The mapping dataset IS served: `ListControlMappings` reports, for every control the
+catalog publishes, that control's whole recorded mapping set — the common control it
+implements, each published compliance-framework item it satisfies and each control it
+relates to — selected by the filter's control ARN in either accepted ARN form, by common
+control ARN and by mapping type. The empty page the fixture sees comes from the filter
+naming a control ARN the catalog does not publish, which narrows to nothing.
+
+The part of this report's `Fix` sentence that states a rule — "emitting each mapping with
+the MappingType that matches the populated Mapping union member" — is now implemented as
+that rule rather than as a value stored beside the union. `MappingType` is a function of
+the mapping's own details (`state::MappingDetails::mapping_type`), so the `MappingType` a
+mapping is reported under, the key the catalog stores it under and the value of the
+`MappingTypes` filter that selects it are all one fact and cannot disagree; previously the
+kind was a second `String` carried next to the union. Pinned over the whole catalog by
+`tests/all/mapping_type_agreement.rs`, which also reads every mapping's target back
+through the operation that owns it (`ListCommonControls`, `GetControl`) and checks a
+relation is reported from both sides.
+
+The recorded cause is DECLINED, for the reason the earlier
+`20261023T204557Z-controlcatalog-listcontrolmappings-returns-no-framework-common-control-or`
+issue recorded: each replayed step filters on one of AWS's own opaque published catalog
+identifiers (`control/1038h7d21e6g8i10g6v3xsssi`, …) and expects the 4–44 framework,
+common-control and related-control rows AWS attaches to it. Those identifiers and rows are
+AWS's published catalog CONTENT; no rule derives them from the request or from the model,
+and they exist only in the recording, so seeding them would be fitting the recorded
+instance. The catalog publishes its own controls under identifiers minted deterministically
+from each row's slug, and a well-formed control ARN it does not publish selects no mapping
+(200 with an empty list), which `tests/all/control_mappings.rs` pins. The replay of this
+fixture therefore still diverges on `$.ControlMappings[*]`.

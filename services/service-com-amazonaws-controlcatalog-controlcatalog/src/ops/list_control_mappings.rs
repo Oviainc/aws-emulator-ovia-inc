@@ -82,6 +82,11 @@ use super::types::*;
 const MAX_LIST_CONTROL_MAPPINGS_RESULTS: i32 = 1000;
 
 /// Project a stored mapping into the modeled `ControlMapping`.
+///
+/// `MappingType` is read off the mapping's own details
+/// ([`crate::state::ControlMappingRecord::mapping_type`]) rather than carried beside
+/// them, because the modeled `Mapping` union holds exactly one member and the type
+/// names that member — so the two members of one reported mapping cannot disagree.
 fn control_mapping(record: &crate::state::ControlMappingRecord) -> ControlMapping {
     let mapping = match &record.mapping {
         crate::state::MappingDetails::Framework { name, item } => {
@@ -105,7 +110,7 @@ fn control_mapping(record: &crate::state::ControlMappingRecord) -> ControlMappin
     };
     ControlMapping {
         control_arn: record.control_arn.clone(),
-        mapping_type: record.mapping_type.clone(),
+        mapping_type: record.mapping_type().to_string(),
         mapping,
     }
 }
@@ -176,7 +181,7 @@ impl CanonicalFilter {
             }
         }
         if let Some(mapping_types) = self.mapping_types.as_ref() {
-            if !mapping_types.contains(&record.mapping_type) {
+            if !mapping_types.iter().any(|kind| kind == record.mapping_type()) {
                 return false;
             }
         }

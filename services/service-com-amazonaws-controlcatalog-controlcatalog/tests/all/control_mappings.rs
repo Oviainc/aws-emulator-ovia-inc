@@ -70,7 +70,7 @@ fn wire(record: &ControlMappingRecord) -> Value {
     };
     json!({
         "ControlArn": record.control_arn,
-        "MappingType": record.mapping_type,
+        "MappingType": record.mapping_type(),
         "Mapping": mapping,
     })
 }
@@ -172,7 +172,7 @@ async fn every_mapping_kind_round_trips_through_its_own_filter() {
         let expected: Vec<Value> = catalog
             .control_mappings
             .values()
-            .filter(|record| record.mapping_type == mapping_type)
+            .filter(|record| record.mapping_type() == mapping_type)
             .map(wire)
             .collect();
         let body = format!(r#"{{"Filter":{{"MappingTypes":["{mapping_type}"]}}}}"#);

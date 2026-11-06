@@ -33,6 +33,8 @@ mod filter_arn_reading;
 mod framework_cross_walk;
 #[path = "all/global_catalog_arn_reading.rs"]
 mod global_catalog_arn_reading;
+#[path = "all/mapping_type_agreement.rs"]
+mod mapping_type_agreement;
 #[path = "all/ontology_listing.rs"]
 mod ontology_listing;
 #[path = "all/pagination_token_spelling.rs"]
