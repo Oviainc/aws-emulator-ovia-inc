@@ -25,13 +25,11 @@
 
 use std::collections::BTreeSet;
 
-use aws_smithy_types::date_time::Format;
-use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
 use service_com_amazonaws_s3tables_s3tablebuckets::state::OpenTableFormat;
 use uuid::Uuid;
 
-use crate::harness::{now_seconds, Emulator};
+use crate::harness::{now_seconds, timestamp_seconds, Emulator};
 
 /// One account's worth of S3 Tables resources, as a row of the table below.
 #[derive(Debug, Clone, Copy)]
@@ -101,26 +99,14 @@ fn create_table_request(table: &str, metadata: bool) -> Value {
     request
 }
 
-/// A member of `body` read as the instant it reports, REFUSING any wire form but the
-/// modelled date-time string.
-fn date_time_seconds(body: &Value, member: &str, case: &str) -> f64 {
-    match body.get(member) {
-        Some(Value::String(text)) => DateTime::from_str(text, Format::DateTime)
-            .unwrap_or_else(|error| {
-                panic!("case {case:?}: {member} {text:?} is not an RFC 3339 date-time: {error}")
-            })
-            .as_secs_f64(),
-        actual => panic!(
-            "case {case:?}: expected {member} to be an RFC 3339 date-time string, \
-             got {actual:?}"
-        ),
-    }
-}
-
-/// The text a timestamp member carries, so two reads of one record can be compared on the
+/// The TEXT a timestamp member carries, so two reads of one record can be compared on the
 /// wire form itself and not only on the instant it decodes to.
+///
+/// The form is checked by the harness's ONE reading of a timestamp member
+/// ([`timestamp_seconds`]), which accepts the modelled date-time string and refuses every
+/// other wire form, so what counts as one is stated in a single place for every suite.
 fn date_time_text(body: &Value, member: &str, case: &str) -> String {
-    date_time_seconds(body, member, case);
+    timestamp_seconds(body, member, case);
     body.get(member)
         .and_then(Value::as_str)
         .expect("the member was just read as a string")
@@ -217,7 +203,7 @@ async fn every_reported_instant_is_an_rfc3339_date_time_string() {
             read_namespace.status, 200,
             "case {case:?}: GetNamespace: {read_namespace:?}"
         );
-        let namespace_created = date_time_seconds(&read_namespace.body, "createdAt", case);
+        let namespace_created = timestamp_seconds(&read_namespace.body, "createdAt", case);
 
         // Every table's two instants, in the describe and in the listing row.
         let listed_tables = emulator
@@ -253,11 +239,11 @@ async fn every_reported_instant_is_an_rfc3339_date_time_string() {
         // it and now, which is what tells a reported instant from an invented one.
         let after = now_seconds();
         for (what, seconds) in [
-            ("the bucket's createdAt", date_time_seconds(&read_bucket.body, "createdAt", case)),
+            ("the bucket's createdAt", timestamp_seconds(&read_bucket.body, "createdAt", case)),
             ("the namespace's createdAt", namespace_created),
             (
                 "a table's createdAt",
-                date_time_seconds(summary_of(&rows, fixture.tables[0], case), "createdAt", case),
+                timestamp_seconds(summary_of(&rows, fixture.tables[0], case), "createdAt", case),
             ),
         ] {
             assert!(

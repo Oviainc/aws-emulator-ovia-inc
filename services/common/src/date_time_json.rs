@@ -59,10 +59,12 @@
 //! This correction predates this module and is inlined in the service crates that needed it
 //! before there was anywhere shared to put it —
 //! `grep -rln 'fn date_time_text' services/*/src` lists them (today the Amazon Location,
-//! Amazon MQ and Bedrock Data Automation crates, each carrying a module of its own under
-//! `src/service/`). Those copies are to be MIGRATED onto this module and are left in place
-//! only because this change does not own those services' issues, each being covered by its
-//! own suite. Nothing new should inline the rule again — call this module.
+//! Amazon MQ, Bedrock Data Automation and Multi-party Approval crates, each carrying a
+//! module of its own under `src/service/`, spelling the protocol `DateTimeRestJson`,
+//! `Iso8601TimestampRestJson` or `IsoTimestampRestJson`). Those copies are to be MIGRATED
+//! onto this module and are left in place only because this change does not own those
+//! services' issues, each being covered by its own suite. Nothing new should inline the
+//! rule again — call this module.
 
 use aws_smithy_runtime_api::http::{Request, Response};
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeDeserializer, ShapeSerializer};
