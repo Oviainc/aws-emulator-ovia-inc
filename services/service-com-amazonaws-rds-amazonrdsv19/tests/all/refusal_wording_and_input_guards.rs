@@ -357,15 +357,16 @@ async fn an_engine_that_names_no_published_engine_is_refused() {
 async fn an_event_source_type_outside_the_published_set_is_refused_with_the_fixed_sentence() {
     let router = emulator();
 
-    // Values spanning the ways a source type can be outside the set: a name nothing
-    // publishes, a published name in the wrong case ("the documented values are all
-    // lowercase"), a published name of the SUBSCRIPTION vocabulary that publishes no
-    // category map, and the empty string.
+    // Values spanning the ways a source type can be one this report publishes no category
+    // map for: a name nothing publishes, a name of the published set in the wrong case ("the
+    // documented values are all lowercase"), a near miss of a published one, a name the
+    // front door ACCEPTS but which has no published category map (the "Feature may be
+    // disabled." case), and the empty string.
     for value in [
         "not-a-real-source-type",
         "DB-Instance",
+        "db-instance-group",
         "zero-etl",
-        "blue-green-deployment",
         "",
     ] {
         let case = format!("SourceType {value:?}");
@@ -387,8 +388,14 @@ async fn an_event_source_type_outside_the_published_set_is_refused_with_the_fixe
             ),
             "case {case:?}: expected AWS's fixed prefix, got {message:?}"
         );
+        // The sentence is fixed and names the source types the front door accepts, so it
+        // carries the rejected value only where that value is one of the names it lists
+        // anyway — every other row proves it echoes nothing of the request.
         assert!(
-            value.is_empty() || !message.contains(value),
+            value.is_empty()
+                || ::service_common::rds_event_source_types::EVENT_SOURCE_TYPES
+                    .contains(&value)
+                || !message.contains(value),
             "case {case:?}: the sentence must not echo the offending value, got {message:?}"
         );
         // Each valid type is named, in single quotes, after that prefix.

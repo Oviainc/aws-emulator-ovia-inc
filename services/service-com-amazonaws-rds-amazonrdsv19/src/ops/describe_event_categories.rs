@@ -152,6 +152,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Displays a list of categories for all event source types, or, if specified,
         // for a specified source type."
+        //
+        // A source type this report publishes no category map for is refused with the one
+        // sentence the front door answers a `SourceType` it cannot report with. That
+        // sentence names every source type the front door ACCEPTS, a wider set than the
+        // ones a map is published for — which is what its "Feature may be disabled."
+        // clause says about a type named there and still not reported here.
         let maps = match &input.source_type {
             Some(source_type) => {
                 let categories = crate::state::event_categories_of(source_type).ok_or_else(

@@ -262,11 +262,13 @@ async fn describe_event_categories_reports_the_published_source_types() {
         }
     }
 
-    // A source type outside the published set is refused with the code AWS answers for
-    // a parameter value it does not accept, in the one fixed sentence that names the set
-    // it is not in and does NOT echo the value. `db-shard-group` is a value the model's
-    // `SourceType` enum carries but this operation's own documented valid values do not,
-    // and this front door publishes no categories for it (see `state::EVENT_CATEGORIES`).
+    // A source type this report publishes no categories for is refused with the code AWS
+    // answers for a parameter value it does not accept, in the one fixed sentence that names
+    // the source types the front door accepts (`rds_event_source_types::EVENT_SOURCE_TYPES`,
+    // a wider set than the ones this report carries a map for) and that echoes nothing of
+    // the request. `db-shard-group` is a value the model's `SourceType` enum carries but
+    // this operation's own documented valid values do not, and this front door publishes no
+    // categories for it (see `state::EVENT_CATEGORIES`).
     for case in [
         "db-instances",
         "DB-INSTANCE",
@@ -281,9 +283,17 @@ async fn describe_event_categories_reports_the_published_source_types() {
         );
         let message = text(&body, "Message");
         assert!(
-            message.contains("db-instance") && !message.contains(case),
-            "case {case:?}: expected the refusal to name the published source types and not \
-             the rejected one, got {message:?}"
+            message.contains("db-instance"),
+            "case {case:?}: expected the refusal to name the source types the front door \
+             accepts, got {message:?}"
+        );
+        // The sentence is fixed, so it echoes the rejected value only where that value is
+        // one of the names it lists anyway.
+        assert!(
+            ::service_common::rds_event_source_types::EVENT_SOURCE_TYPES.contains(&case)
+                || !message.contains(case),
+            "case {case:?}: expected the refusal not to echo the rejected value, got \
+             {message:?}"
         );
     }
 

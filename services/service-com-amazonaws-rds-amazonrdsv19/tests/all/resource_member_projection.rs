@@ -680,8 +680,9 @@ async fn every_subnet_group_envelope_projects_its_vpc_and_zones() {
 async fn a_subnet_group_name_already_taken_is_refused_as_the_api_words_it() {
     let router = emulator();
 
-    // The name is "stored as a lowercase string", so the refusal names it in the folded
-    // spelling the group is stored under whichever case the request carried.
+    // The sentence is about the name the REQUEST asked for, so it quotes that name in the
+    // spelling the request carried, whichever case the group was created under ("stored as a
+    // lowercase string" is what the group is keyed by, not what the refusal reports).
     let rows: [(&str, &str, &str); 2] = [
         ("the same name", "emu-proj-dup", "emu-proj-dup"),
         ("the same name in mixed case", "emu-proj-dup-2", "EMU-Proj-Dup-2"),
@@ -709,7 +710,7 @@ async fn a_subnet_group_name_already_taken_is_refused_as_the_api_words_it() {
             "DBSubnetGroupAlreadyExists",
         );
         let message = text(&refused, "Message");
-        let expected = format!("The DB subnet group '{created_as}' already exists.");
+        let expected = format!("The DB subnet group '{taken_as}' already exists.");
         assert_eq!(
             message, expected,
             "case {case:?}: expected {expected:?}, got {message:?}"

@@ -433,30 +433,23 @@ pub fn default_apply_method_for(spec: Option<&ClusterParameterSpec>) -> &'static
 /// from the text alone. A family this emulator publishes no catalog for admits any
 /// parameter and any value; see [`published_parameters`].
 pub fn validate_parameter_setting(family: &str, name: &str, value: &str) -> Result<(), String> {
-    validate_setting_in_catalog(published_parameters(family), family, name, value)
+    validate_setting_in_catalog(published_parameters(family), name, value)
 }
 
 /// [`validate_parameter_setting`] against an explicit catalog that is the family's WHOLE
 /// published list, so a name it does not publish is a parameter that does not exist; see
 /// [`spec_in_catalog`] for why the catalog rather than the family is the argument, and
 /// [`validate_known_setting`] for the rule where a catalog is only a sample of the list.
-/// `family` is carried only to name it in the refusal.
 pub fn validate_setting_in_catalog(
     catalog: Option<&'static [ClusterParameterSpec]>,
-    family: &str,
     name: &str,
     value: &str,
 ) -> Result<(), String> {
-    let Some(published) = catalog else {
+    if catalog.is_none() {
         return Ok(());
-    };
+    }
     if spec_in_catalog(catalog, name).is_none() {
-        let names: Vec<&str> = published.iter().map(|spec| spec.name).collect();
-        return Err(format!(
-            "Invalid parameter name '{name}': the {family} parameter group family \
-             publishes no parameter with that name; its parameters are {}",
-            names.join(", ")
-        ));
+        return Err(parameter_not_found_message(name));
     }
     validate_known_setting(catalog, name, value)
 }
@@ -518,10 +511,31 @@ pub fn validate_parameter_name(family: &str, name: &str) -> Result<(), String> {
     if published_parameters(family).is_none() || published_parameter(family, name).is_some() {
         return Ok(());
     }
-    Err(format!(
-        "Invalid parameter name '{name}': the {family} cluster parameter group family publishes \
-         no parameter with that name"
-    ))
+    Err(parameter_not_found_message(name))
+}
+
+/// How this front door refuses a request that names a parameter the family publishes none
+/// of: it reports that the parameter could not be FOUND and names it, and says nothing
+/// about the family or about the parameters that family does publish.
+///
+/// Everything but the name is fixed text, and the name is the one the request carried,
+/// verbatim. The caller answers it with the Query API's `InvalidParameterValue`.
+pub fn parameter_not_found_message(name: &str) -> String {
+    format!("Could not find parameter with name: {name}")
+}
+
+/// The message a reset refused because a parameter of the group still carries a change that
+/// has not been applied carries.
+///
+/// This front door names ONE parameter, single-quoted, and says only that it has pending
+/// changes: it names neither the group the request addressed nor what has to happen before
+/// the reset is accepted. The parameter's name, from the group's own state, is the only
+/// variable part.
+pub fn parameter_has_pending_changes_message(parameter_name: &str) -> String {
+    format!(
+        "Cannot reset the parameter group because the parameter '{parameter_name}' has \
+         pending changes."
+    )
 }
 
 /// Refuse a `DBClusterParameterGroupName` outside the rule the model states for it.
@@ -570,6 +584,8 @@ pub fn not_a_valid_identifier_message(member: &str) -> String {
 /// that does not name the DocumentDB engine at all belongs to one of the other engines the
 /// shared `rds` front door serves, and is accepted: this catalog publishes nothing for it
 /// (see [`published_parameters`]) and refusing it would invent a constraint.
+///
+/// The refusal is [`parameter_group_family_not_valid_message`].
 pub fn validate_parameter_group_family(value: &str) -> Result<(), String> {
     let lowered = value.to_ascii_lowercase();
     if !lowered.starts_with(DOCDB_PARAMETER_GROUP_FAMILY_PREFIX)
@@ -577,11 +593,18 @@ pub fn validate_parameter_group_family(value: &str) -> Result<(), String> {
     {
         return Ok(());
     }
-    Err(format!(
-        "Invalid value '{value}' for DBParameterGroupFamily: the Amazon DocumentDB families are \
-         {}",
-        DOCDB_PARAMETER_GROUP_FAMILIES.join(", ")
-    ))
+    Err(parameter_group_family_not_valid_message(value))
+}
+
+/// How this front door refuses a `DBParameterGroupFamily` that names no family at all.
+///
+/// The sentence names the PARAMETER (`ParameterGroupFamily`), then the value the request
+/// carried, then states that it is not a valid parameter group family; it enumerates no
+/// families and carries no terminal period. The requested family, verbatim, is the only
+/// variable part — so the refusal cannot become a second, drifting source of truth for
+/// which families the engine publishes.
+pub fn parameter_group_family_not_valid_message(family: &str) -> String {
+    format!("ParameterGroupFamily {family} is not a valid parameter group family")
 }
 
 #[cfg(test)]

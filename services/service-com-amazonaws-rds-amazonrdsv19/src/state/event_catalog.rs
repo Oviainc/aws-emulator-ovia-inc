@@ -99,21 +99,12 @@ pub fn event_categories_of(source_type: &str) -> Option<&'static [&'static str]>
 /// The message the refusal of a `SourceType` that names no published event source type
 /// carries.
 ///
-/// Amazon RDS words this one as a statement about the PARAMETER and not about the value:
-/// the fixed sentence says the source type is not valid and that the feature may be
-/// disabled, then names the types that ARE valid — it does not echo the offending value
-/// back, so neither does this. Each type is named in single quotes, the way the service
-/// writes a list of literal values inside a sentence, and in the order
-/// [`EVENT_CATEGORIES`] publishes them.
+/// The set of source types the front door accepts is wider than the ones this report
+/// publishes a category map for, and the refusal names the whole of it, so it is the shared
+/// `service_common::rds_event_source_types` list — one set for every service view this one
+/// front door serves — that this sentence comes from.
 pub fn invalid_event_source_type_message() -> String {
-    let quoted: Vec<String> = EVENT_CATEGORIES
-        .iter()
-        .map(|(source_type, _)| format!("'{source_type}'"))
-        .collect();
-    format!(
-        "Invalid event source type. Feature may be disabled. Valid types are {}",
-        quoted.join(", ")
-    )
+    ::service_common::rds_event_source_types::invalid_event_source_type_message()
 }
 
 /// One source type's categories as the modelled `EventCategoriesMap`.

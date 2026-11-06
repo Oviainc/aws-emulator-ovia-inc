@@ -246,7 +246,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateDBSubnetGroupErrorModeled::DBSubnetGroupAlreadyExistsFault(
                     DBSubnetGroupAlreadyExistsFault {
-                        message: Some(format!("DB subnet group already exists: {name}")),
+                        // The fault reports "DBSubnetGroupName is already used by an
+                        // existing DB subnet group", and this front door words it as a
+                        // sentence about the group: the resource type, the requested name in
+                        // quotes, then "already exists." The name is the only variable part,
+                        // quoted as the REQUEST spelled it — the sentence is about the name
+                        // the caller asked for, not about the folded key the collision was
+                        // found under.
+                        message: Some(format!(
+                            "The DB subnet group '{}' already exists.",
+                            input.db_subnet_group_name
+                        )),
                     },
                 )
                 .into(),

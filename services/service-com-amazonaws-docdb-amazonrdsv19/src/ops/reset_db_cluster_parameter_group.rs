@@ -200,19 +200,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A change that has not been applied yet is the group's invalid state: it cannot be
-        // reset until the reboot it is waiting for. The message names the parameters the
-        // group is pending on, so the caller knows what to reboot for.
+        // reset while a parameter of it is still waiting. The message names the parameter,
+        // so the caller knows which change stands in the way.
         let pending = group.pending_parameters();
-        if !pending.is_empty() {
+        if let Some(parameter) = pending.first() {
             return Err(
                 ResetDBClusterParameterGroupErrorModeled::InvalidDBParameterGroupStateFault(
                     InvalidDBParameterGroupStateFault {
-                        message: Some(format!(
-                            "DB cluster parameter group {} has pending changes to {} that \
-                             require a reboot before it can be reset",
-                            group.name,
-                            pending.join(", ")
-                        )),
+                        message: Some(docdb::parameter_has_pending_changes_message(parameter)),
                     },
                 )
                 .into(),

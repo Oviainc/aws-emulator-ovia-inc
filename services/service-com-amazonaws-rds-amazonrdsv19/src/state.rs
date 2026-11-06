@@ -90,7 +90,8 @@ use crate::ops::types::{
 // reads them as `crate::state::<name>`.
 pub use service_common::rds_cluster_parameters::{
     change_is_pending, change_is_pending_for, default_apply_method, default_apply_method_for,
-    minimum_engine_version_in_family, not_a_valid_identifier_message, parameter_source_filter,
+    minimum_engine_version_in_family, not_a_valid_identifier_message,
+    parameter_has_pending_changes_message, parameter_source_filter,
     published_parameter,
     published_parameters, spec_in_catalog,
     validate_known_setting, validate_parameter_group_family, validate_parameter_group_name,
@@ -1491,18 +1492,10 @@ pub fn failover_needs_two_instances_message(identifier: &str) -> String {
     )
 }
 
-/// The message an `InvalidDBParameterGroupStateFault` carries for a reset refused because a
-/// parameter of the group still carries a change that has not been applied.
-///
-/// Amazon RDS names ONE parameter, single-quoted, and says only that it has pending
-/// changes: it names neither the group the request addressed nor what has to happen before
-/// the reset is accepted.
-pub fn parameter_has_pending_changes_message(parameter_name: &str) -> String {
-    format!(
-        "Cannot reset the parameter group because the parameter '{parameter_name}' has \
-         pending changes."
-    )
-}
+// The message an `InvalidDBParameterGroupStateFault` carries for a reset refused because a
+// parameter of the group still carries a change that has not been applied is the shared
+// `service_common::rds_cluster_parameters::parameter_has_pending_changes_message` — one
+// sentence for every service view of this front door.
 
 /// The name AWS gives the DB subnet group it creates alongside an account's default
 /// VPC. `CreateDBSubnetGroup$DBSubnetGroupName` refuses it ("Must not be default")
@@ -1510,27 +1503,31 @@ pub fn parameter_has_pending_changes_message(parameter_name: &str) -> String {
 /// documents a default that branches on a request naming it.
 pub const DEFAULT_DB_SUBNET_GROUP: &str = "default";
 
-/// The message the `DBSubnetGroupNotFoundFault` carries for `name` where the call only
-/// LOOKS the group UP — it reports the groups (`DescribeDBSubnetGroups`, a tag read) or
-/// it resolves a group it places another resource in (`CreateDBInstance`,
-/// `CreateDBCluster`). The fault names the group the request could not resolve, in the
-/// folded spelling the group would be stored under.
+/// The message the `DBSubnetGroupNotFoundFault` carries for `name` where the call LOOKS the
+/// group UP in order to REPORT it (`DescribeDBSubnetGroups`, a tag read). The fault names
+/// the group the request could not resolve, in the folded spelling the group would be
+/// stored under.
 ///
-/// Amazon RDS words this one fault by the ROLE the group plays in the call, so the
-/// lookup wording lives here, next to the wording for the calls that ACT on the group
+/// Amazon RDS words this one fault by the CALL that answers it, so the report's wording
+/// lives here, next to the wording the calls that ACT on a group answer
 /// ([`db_subnet_group_does_not_exist_message`]), rather than in each handler.
+///
+/// `CreateDBInstance` still answers this wording for the group it places an instance in:
+/// its own recorded sentence is a THIRD template (`DBSubnetGroup '<name>' not found.`) and
+/// is the subject of its own open issue, so that handler keeps this one until that issue
+/// lands rather than taking the cluster create's.
 pub fn db_subnet_group_not_found_message(name: &str) -> String {
     format!("DB Subnet group '{name}' not found.")
 }
 
-/// The message the `DBSubnetGroupNotFoundFault` carries for `name` where the group is
-/// the SUBJECT of the call and the call changes it — `DeleteDBSubnetGroup` and
-/// `ModifyDBSubnetGroup`, whose whole effect is on that group. RDS words the fault
-/// differently there than in a lookup ([`db_subnet_group_not_found_message`]), so a
-/// caller can tell "there is no such group to report" from "there is no such group to
-/// change"; both still answer the one modelled 404 `DBSubnetGroupNotFoundFault`.
+/// The message the `DBSubnetGroupNotFoundFault` carries where the group is the group the
+/// call ACTS on: `DeleteDBSubnetGroup` and `ModifyDBSubnetGroup`, whose whole effect is on
+/// that group, and `CreateDBCluster`, which places the cluster it creates in it. RDS words
+/// the fault differently there than in the report ([`db_subnet_group_not_found_message`]),
+/// so a caller can tell "there is no such group to report" from "there is no such group to
+/// place anything in"; both still answer the one modelled 404 `DBSubnetGroupNotFoundFault`.
 ///
-/// Like the lookup wording it is parameterized by the requested name, in the folded
+/// Like the report's wording it is parameterized by the requested name, in the folded
 /// spelling the group would be stored under.
 pub fn db_subnet_group_does_not_exist_message(name: &str) -> String {
     format!("DB subnet group '{name}' does not exist.")
@@ -1539,8 +1536,9 @@ pub fn db_subnet_group_does_not_exist_message(name: &str) -> String {
 /// The message the `DBSubnetGroupAlreadyExistsFault` carries for `name`: the fault reports
 /// "`DBSubnetGroupName` is already used by an existing DB subnet group", and RDS words it
 /// as a sentence about the group — the resource type, the requested name in quotes, then
-/// "already exists." — the same shape as the two wordings above, parameterized by the name
-/// the request carried in the folded spelling the group is stored under.
+/// "already exists." — the same shape as the two wordings above. The name is the only
+/// variable part, quoted as the REQUEST spelled it: the sentence is about the name the
+/// caller asked for, not about the folded key the collision was found under.
 pub fn db_subnet_group_already_exists_message(name: &str) -> String {
     format!("The DB subnet group '{name}' already exists.")
 }
@@ -2582,6 +2580,18 @@ pub fn subnet_availability_zone(region: &str, subnet_id: &str) -> String {
 /// How AWS names the Availability Zones of a region: the region's name and a letter.
 pub const AVAILABILITY_ZONE_SUFFIXES: [&str; 3] = ["a", "b", "c"];
 
+/// The Availability Zones of `region`, in the order the region publishes them.
+///
+/// One list, so what a cluster reports as the zones it spans, what a subnet resolves into
+/// ([`subnet_availability_zone`]) and what a refusal names as the zones a DB subnet group
+/// does not cover are all the same set of zones.
+pub fn region_availability_zones(region: &str) -> Vec<String> {
+    AVAILABILITY_ZONE_SUFFIXES
+        .iter()
+        .map(|suffix| format!("{region}{suffix}"))
+        .collect()
+}
+
 /// The network types a DB subnet group of this service supports.
 ///
 /// Source: `DBSubnetGroup$SupportedNetworkTypes` — "Valid values: IPV4 | DUAL … A
@@ -2973,6 +2983,28 @@ pub fn check_identifier(member: &str, value: &str, max_len: usize) -> Result<(),
         Some(subject) => format!("Invalid {subject}:  {value}"),
         None => not_a_valid_identifier_message(member),
     })
+}
+
+/// [`check_identifier`] for a create whose `Engine` names which control plane answers it.
+///
+/// A create of a resource of a SIBLING control plane's engine
+/// ([`is_sibling_control_plane_engine`]) is a create THAT service answers, and it refuses
+/// an identifier with the one sentence pair that names the member and states the rule
+/// ([`not_a_valid_identifier_message`]) rather than with the subject wording Amazon RDS
+/// uses for its own engines ([`identifier_subject`]) — the engine is what selects the
+/// control plane, so it is what selects the wording.
+pub fn check_identifier_for_engine(
+    member: &str,
+    value: &str,
+    max_len: usize,
+    engine: &str,
+) -> Result<(), String> {
+    if !is_sibling_control_plane_engine(engine) {
+        return check_identifier(member, value, max_len);
+    }
+    identifier_is_well_formed(value, max_len)
+        .then_some(())
+        .ok_or_else(|| not_a_valid_identifier_message(member))
 }
 
 /// The constraint walk behind [`check_identifier`]: whether `value` satisfies every clause

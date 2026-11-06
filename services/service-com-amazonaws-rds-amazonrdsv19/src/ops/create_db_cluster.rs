@@ -372,10 +372,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // string", so the folded form is what is stored and echoed and every later lookup
         // folds the same way. The length bound is the one its own constraints give this
         // cluster type.
-        crate::state::check_identifier(
+        crate::state::check_identifier_for_engine(
             "DBClusterIdentifier",
             &input.db_cluster_identifier,
             crate::state::db_cluster_identifier_max_len(&input.engine),
+            &input.engine,
         )
         .map_err(CreateDBClusterError::invalid_parameter_value)?;
         let identifier = input.db_cluster_identifier.to_ascii_lowercase();
@@ -586,49 +587,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ("Iops", input.iops.is_some()),
             ("StorageType", input.storage_type.is_some()),
         ];
-        if multi_az_cluster {
-            let missing: Vec<&str> = multi_az_required
+        // The settings a Multi-AZ DB cluster is REQUIRED to carry are answered after the
+        // network the cluster would be placed in has been resolved: the subnets a named DB
+        // subnet group covers are a precondition of the cluster TYPE itself (see
+        // [`check_multi_az_subnet_coverage`]), so that refusal comes first even for a
+        // request that names none of these four settings. The set is computed here, where
+        // the request is read, and answered below under the store lock.
+        let multi_az_missing: Vec<&str> = multi_az_required
+            .iter()
+            .filter(|(_, named)| !named)
+            .map(|(member, _)| *member)
+            .collect();
+        if !multi_az_cluster {
+            if let Some(member) = multi_az_only
                 .iter()
-                .filter(|(_, named)| !named)
+                .find(|(_, named)| *named)
                 .map(|(member, _)| *member)
-                .collect();
-            if !missing.is_empty() {
+            {
                 return Err(CreateDBClusterError::invalid_parameter_combination(format!(
-                    "{} {} required to create a Multi-AZ DB cluster (engine {})",
-                    missing.join(", "),
-                    if missing.len() == 1 { "is" } else { "are" },
+                    "{member} is valid for Multi-AZ DB clusters only: engine {} creates an \
+                     Aurora DB cluster",
                     input.engine
                 )));
             }
-            crate::state::check_db_instance_class(
-                input
-                    .db_cluster_instance_class
-                    .as_deref()
-                    .expect("checked just above"),
-            )
-            .map_err(CreateDBClusterError::invalid_parameter_value)?;
-            // `Iops`: "Must be a multiple between .5 and 50 of the storage amount for the
-            // DB cluster."
-            let storage = input.allocated_storage.expect("checked just above");
-            let iops = input.iops.expect("checked just above");
-            let ratio = f64::from(iops) / f64::from(storage.max(1));
-            if storage <= 0 || !(IOPS_STORAGE_RATIO_MIN..=IOPS_STORAGE_RATIO_MAX).contains(&ratio) {
-                return Err(CreateDBClusterError::invalid_parameter_combination(format!(
-                    "invalid value {iops} for Iops: must be a multiple between \
-                     {IOPS_STORAGE_RATIO_MIN} and {IOPS_STORAGE_RATIO_MAX} of \
-                     AllocatedStorage ({storage})"
-                )));
-            }
-        } else if let Some(member) = multi_az_only
-            .iter()
-            .find(|(_, named)| *named)
-            .map(|(member, _)| *member)
-        {
-            return Err(CreateDBClusterError::invalid_parameter_combination(format!(
-                "{member} is valid for Multi-AZ DB clusters only: engine {} creates an \
-                 Aurora DB cluster",
-                input.engine
-            )));
         }
         crate::state::check_engine_lifecycle_support(
             input
@@ -752,14 +733,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .db_subnet_group_name
             .as_ref()
             .map(|name| name.to_ascii_lowercase());
+        let mut named_subnet_group = None;
         if let Some(name) = &db_subnet_group_name {
-            if store.resolve_db_subnet_group(&region, name).is_none() {
+            let Some(group) = store.resolve_db_subnet_group(&region, name) else {
                 return Err(CreateDBClusterErrorModeled::DBSubnetGroupNotFoundFault(
                     DBSubnetGroupNotFoundFault {
-                        message: Some(crate::state::db_subnet_group_not_found_message(name)),
+                        message: Some(crate::state::db_subnet_group_does_not_exist_message(
+                            name,
+                        )),
                     },
                 )
                 .into());
+            };
+            named_subnet_group = Some(group);
+        }
+        // A Multi-AZ DB cluster is placed across the zones its DB subnet group covers, so
+        // the group a request NAMES has to cover enough of them before anything about the
+        // cluster's own settings is answered ([`check_multi_az_subnet_coverage`]).
+        if multi_az_cluster {
+            if let Some(group) = &named_subnet_group {
+                if let Err(message) = check_multi_az_subnet_coverage(&region, group) {
+                    return Err(CreateDBClusterErrorModeled::InvalidVPCNetworkStateFault(
+                        InvalidVPCNetworkStateFault {
+                            message: Some(message),
+                        },
+                    )
+                    .into());
+                }
+            }
+            // The four settings this cluster type is required to carry, and the two
+            // constraints the values of two of them state.
+            if !multi_az_missing.is_empty() {
+                return Err(CreateDBClusterError::invalid_parameter_combination(format!(
+                    "{} {} required to create a Multi-AZ DB cluster (engine {})",
+                    multi_az_missing.join(", "),
+                    if multi_az_missing.len() == 1 { "is" } else { "are" },
+                    input.engine
+                )));
+            }
+            crate::state::check_db_instance_class(
+                input
+                    .db_cluster_instance_class
+                    .as_deref()
+                    .expect("checked just above"),
+            )
+            .map_err(CreateDBClusterError::invalid_parameter_value)?;
+            // `Iops`: "Must be a multiple between .5 and 50 of the storage amount for the
+            // DB cluster."
+            let storage = input.allocated_storage.expect("checked just above");
+            let iops = input.iops.expect("checked just above");
+            let ratio = f64::from(iops) / f64::from(storage.max(1));
+            if storage <= 0 || !(IOPS_STORAGE_RATIO_MIN..=IOPS_STORAGE_RATIO_MAX).contains(&ratio) {
+                return Err(CreateDBClusterError::invalid_parameter_combination(format!(
+                    "invalid value {iops} for Iops: must be a multiple between \
+                     {IOPS_STORAGE_RATIO_MIN} and {IOPS_STORAGE_RATIO_MAX} of \
+                     AllocatedStorage ({storage})"
+                )));
             }
         }
         // `GlobalClusterIdentifier`: "the global cluster ID of an Aurora cluster that
@@ -956,10 +985,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Availability Zone"). This emulator picks the region's first three, named the
             // way AWS names a zone of a region.
             availability_zones: if availability_zones.is_empty() {
-                crate::state::AVAILABILITY_ZONE_SUFFIXES
-                    .iter()
-                    .map(|suffix| format!("{region}{suffix}"))
-                    .collect()
+                crate::state::region_availability_zones(&region)
             } else {
                 availability_zones
             },
@@ -1155,3 +1181,61 @@ const IOPS_STORAGE_RATIO_MIN: f64 = 0.5;
 
 /// See [`IOPS_STORAGE_RATIO_MIN`].
 const IOPS_STORAGE_RATIO_MAX: f64 = 50.0;
+
+/// The number of Availability Zones a DB subnet group has to cover before a Multi-AZ DB
+/// cluster can be placed in it, which is also the number of SUBNETS it has to hold: a
+/// subnet lies in exactly one zone.
+///
+/// A Multi-AZ DB cluster is "a writer and two reader DB instances … each in a different
+/// Availability Zone", so its subnet group needs a subnet in three of them — the count the
+/// refusal states in words, which is why the two live together here.
+const MULTI_AZ_CLUSTER_ZONES: usize = 3;
+
+/// Refuse a Multi-AZ DB cluster create whose named DB subnet group cannot cover enough
+/// Availability Zones; `Ok(())` when it can, so this reads like the `check_*` gates of
+/// `crate::state` it sits beside.
+///
+/// What the refusal rests on is what the STORED GROUP settles on its own: a subnet lies in
+/// exactly one Availability Zone, so a group holding fewer than
+/// [`MULTI_AZ_CLUSTER_ZONES`] DISTINCT subnets cannot have one in three zones whichever
+/// zones its subnets are in — the same reading
+/// `crate::state::check_db_subnet_group_subnets` applies to the two-zone rule a group
+/// itself must meet. A group holding three or more is NOT refused: which zones those
+/// subnets lie in is EC2's fact (`service_common::network`), and this service does not hold
+/// it, so a group that could cover three zones is served rather than refused on an
+/// assumption. A group whose subnets this service does not hold at all — the account's
+/// `default` group, which comes with the default VPC — is in the same position and is
+/// served too.
+///
+/// The sentence is fixed but for its last clause, which names the zones of the request's
+/// region the group does not cover: those are the zones a caller can add a subnet in to
+/// make the group placeable, read off the group's own subnets with the SAME resolution
+/// `DescribeDBSubnetGroups` reports each subnet's zone from
+/// (`crate::state::subnet_availability_zone`), so the refusal and the report cannot name
+/// different zones for one group. They come from the stored group and the region, never
+/// from the request.
+fn check_multi_az_subnet_coverage(
+    region: &str,
+    group: &crate::state::DbSubnetGroupRecord,
+) -> Result<(), String> {
+    let distinct: std::collections::BTreeSet<&str> =
+        group.subnet_ids.iter().map(String::as_str).collect();
+    if distinct.is_empty() || distinct.len() >= MULTI_AZ_CLUSTER_ZONES {
+        return Ok(());
+    }
+    let covered: std::collections::BTreeSet<String> = distinct
+        .iter()
+        .map(|subnet| crate::state::subnet_availability_zone(region, subnet))
+        .collect();
+    let uncovered: Vec<String> = crate::state::region_availability_zones(region)
+        .into_iter()
+        .filter(|zone| !covered.contains(zone))
+        .collect();
+    Err(format!(
+        "Can't create a Multi-AZ DB cluster because there aren't enough subnets available. \
+         At least three subnets with available IP addresses in different Availability Zones \
+         are required. You can add subnets to a DB subnet group in the following \
+         Availability Zones: {}.",
+        uncovered.join(", ")
+    ))
+}

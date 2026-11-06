@@ -364,8 +364,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusal quotes what the caller sent rather than something derived from it;
         // "this parameter is stored as a lowercase string", so the folded form is what is
         // stored and echoed, and every later lookup folds the same way.
-        crate::state::check_identifier("DBInstanceIdentifier", &input.db_instance_identifier, 63)
-            .map_err(CreateDBInstanceError::invalid_parameter_value)?;
+        crate::state::check_identifier_for_engine(
+            "DBInstanceIdentifier",
+            &input.db_instance_identifier,
+            63,
+            &input.engine,
+        )
+        .map_err(CreateDBInstanceError::invalid_parameter_value)?;
         let identifier = input.db_instance_identifier.to_ascii_lowercase();
 
         // Documented constraints this operation models no error for: refused as a 400

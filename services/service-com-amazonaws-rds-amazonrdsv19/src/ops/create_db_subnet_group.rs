@@ -221,8 +221,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateDBSubnetGroupErrorModeled::DBSubnetGroupAlreadyExistsFault(
                     DBSubnetGroupAlreadyExistsFault {
+                        // The sentence is about the NAME the request asked for, so it quotes
+                        // that name as the request spelled it; the group it collided with is
+                        // the one the folded name resolves to.
                         message: Some(crate::state::db_subnet_group_already_exists_message(
-                            &name,
+                            &input.db_subnet_group_name,
                         )),
                     },
                 )

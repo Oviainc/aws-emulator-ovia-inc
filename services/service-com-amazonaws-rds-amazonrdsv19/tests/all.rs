@@ -19,6 +19,8 @@ mod already_exists_refusal_sentences;
 mod ca_certificate_material;
 #[path = "all/certificate_override.rs"]
 mod certificate_override;
+#[path = "all/cluster_create_refusal_wording.rs"]
+mod cluster_create_refusal_wording;
 #[path = "all/cluster_parameter_groups.rs"]
 mod cluster_parameter_groups;
 #[path = "all/cluster_parameter_value_range.rs"]

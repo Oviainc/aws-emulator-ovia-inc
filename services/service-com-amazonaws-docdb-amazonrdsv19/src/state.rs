@@ -1089,6 +1089,10 @@ pub fn validate_identifier(member: &str, value: &str) -> Result<(), String> {
 
 /// The identifier rule with an explicit length bound, for the members whose own
 /// documentation states a different one (see [`MAX_SNAPSHOT_IDENTIFIER_LEN`]).
+///
+/// The refusal is [`not_a_valid_identifier_message`]: the ONE sentence pair this front door
+/// words every identifier refusal with — it names the member at fault, states the whole
+/// rule and echoes nothing of the rejected value.
 pub fn validate_identifier_within(member: &str, value: &str, max_len: usize) -> Result<(), String> {
     let well_formed = !value.is_empty()
         && value.chars().count() <= max_len
@@ -1099,11 +1103,7 @@ pub fn validate_identifier_within(member: &str, value: &str, max_len: usize) -> 
     if well_formed {
         return Ok(());
     }
-    Err(format!(
-        "Invalid value '{value}' for {member}: it must contain from 1 to {max_len} \
-         letters, numbers, or hyphens, the first character must be a letter, and it cannot end \
-         with a hyphen or contain two consecutive hyphens"
-    ))
+    Err(not_a_valid_identifier_message(member))
 }
 
 /// The region an ARN names — its fourth `:`-separated field — or `None` for a value that
@@ -1699,8 +1699,9 @@ pub fn instance_to_shape(
 // as `crate::state::<name>` exactly as before.
 pub use service_common::rds_cluster_parameters::{
     change_is_pending, default_apply_method, engine_version_precedes,
-    family_earliest_engine_version, minimum_engine_version_in_family, parameter_source_filter,
-    published_parameter,
+    family_earliest_engine_version, minimum_engine_version_in_family,
+    not_a_valid_identifier_message, parameter_has_pending_changes_message,
+    parameter_source_filter, published_parameter,
     published_parameters, validate_parameter_group_family, validate_parameter_group_name,
     validate_parameter_name, validate_parameter_setting, ClusterParameterSpec,
     ParameterSourceFilter, APPLY_METHOD_IMMEDIATE, APPLY_METHOD_PENDING_REBOOT,
@@ -2112,14 +2113,14 @@ pub fn engine_version_to_shape(version: &str) -> DBEngineVersion {
     }
 }
 
-/// The event source types this service publishes, each with the event categories of that
-/// source type, in the order this front door NAMES them when it refuses a source type that
-/// is none of them (`'db-instance', 'db-security-group', 'db-parameter-group',
-/// 'db-snapshot', 'db-cluster', 'db-cluster-snapshot'`) — the one order the service itself
-/// publishes for these names, and the one
-/// [`invalid_event_source_type_message`] states, so the refusal and the report cannot name
-/// them in two orders. Every name is a value the model's `SourceType` declares
-/// (`smithy_query(query="shape",shape="SourceType")`).
+/// The event source types this service publishes a category map for, each with the event
+/// categories of that source type.
+///
+/// It is NARROWER than the set of source types the shared front door accepts, which
+/// [`invalid_event_source_type_message`] names: a map is published only for a source type
+/// whose categories this emulator can cite. Every name here is a value the model's
+/// `SourceType` declares (`smithy_query(query="shape",shape="SourceType")`), in the order
+/// that front door names them.
 ///
 /// The categories of each are the ones published for this front door's event source types
 /// ("Amazon RDS event categories and event messages", whose tables cover the cluster,
@@ -2202,21 +2203,12 @@ pub fn event_categories_to_shape(source_type: &str, categories: &[&str]) -> Even
 /// The message the refusal of a `SourceType` that names no published event source type
 /// carries.
 ///
-/// The sentence is a statement about the PARAMETER rather than about the value: it says
-/// the source type is not valid and that the feature may be disabled, then names the
-/// types that ARE valid — it echoes no part of the offending value, so neither does this.
-/// Each type is named in single quotes, the way the service writes a list of literal
-/// values inside a sentence, and in the order [`EVENT_CATEGORIES`] publishes them, so the
-/// refusal and the report cannot name different source types.
+/// The set of source types the front door this service shares accepts is wider than the
+/// ones this report publishes a category map for, and the refusal names the whole of it, so
+/// it is the shared `service_common::rds_event_source_types` list — one set for every
+/// service view of that one front door — that this sentence comes from.
 pub fn invalid_event_source_type_message() -> String {
-    let quoted: Vec<String> = EVENT_CATEGORIES
-        .iter()
-        .map(|(source_type, _)| format!("'{source_type}'"))
-        .collect();
-    format!(
-        "Invalid event source type. Feature may be disabled. Valid types are {}",
-        quoted.join(", ")
-    )
+    ::service_common::rds_event_source_types::invalid_event_source_type_message()
 }
 
 /// The sizes the memory-optimised `r5` family is published in, smallest first.

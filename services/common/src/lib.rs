@@ -235,6 +235,9 @@
 //! epoch-seconds number.
 
 pub mod rds_cluster_parameters;
+/// The event source types the one `rds` front door accepts, and the sentence it refuses a
+/// `SourceType` outside them with — one set for the three service views it serves.
+pub mod rds_event_source_types;
 
 /// The directory of which resources of the other services reference an ACM certificate,
 /// written by the service that owns the referencing resource and read by ACM.
