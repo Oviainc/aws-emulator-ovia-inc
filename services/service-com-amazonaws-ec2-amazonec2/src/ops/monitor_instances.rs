@@ -10,6 +10,11 @@
 //! ([`crate::state::ComAmazonawsEc2Amazonec2State::set_instance_monitoring`]), which
 //! `UnmonitorInstances` writes the other direction through.
 //!
+//! The `InstanceIds` list is validated as a request PARAMETER
+//! ([`crate::state::require_instance_record_by_parameter`]), so a value outside the
+//! instance-id form is refused `InvalidParameterValue` naming the parameter and the form
+//! expected, and only a value inside that form is looked up.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -136,8 +141,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            deduplicate_ids, require_instance_record, require_service_state, InstanceStateName,
-            MAX_RESOURCE_IDS, MONITORING_STATE_ENABLED, MONITORING_STATE_PENDING,
+            deduplicate_ids, require_instance_record_by_parameter, require_service_state,
+            InstanceStateName, MAX_RESOURCE_IDS, MONITORING_STATE_ENABLED,
+            MONITORING_STATE_PENDING,
         };
 
         let _ = ctx;
@@ -176,8 +182,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The whole batch is resolved and checked before the first write, so a request
         // naming one instance it cannot act on acts on none of them.
         for instance_id in &instance_ids {
-            // Malformed before unknown, the order this service resolves an instance id in.
-            let instance = require_instance_record(&store, instance_id)?;
+            // Malformed before unknown, the order this service resolves an instance id in —
+            // and malformed at the PARAMETER layer, the layer this operation's id list is
+            // validated in: a value outside the instance-id form is `InvalidParameterValue`
+            // naming the parameter and the form expected, not the resource-level
+            // `InvalidInstanceID.Malformed` an operation resolving ONE named instance
+            // answers.
+            let instance = require_instance_record_by_parameter(&store, instance_id)?;
             // "Enables detailed monitoring for a RUNNING instance": an instance in
             // `pending` is one the clock is about to make `running` and nothing else, so a
             // caller monitoring the instance it has just launched is monitoring a running

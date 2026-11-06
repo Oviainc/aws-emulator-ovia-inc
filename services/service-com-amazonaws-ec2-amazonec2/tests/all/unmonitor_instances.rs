@@ -23,8 +23,10 @@
 //! 4. only an instance that is up — `running`, or `pending` on its way to it — can have
 //!    monitoring turned off; an instance in any other state is refused
 //!    `IncorrectInstanceState`;
-//! 5. an instance id this service cannot resolve is refused, malformed before unknown, and
-//!    a request naming one changes the monitoring of no instance it names;
+//! 5. an instance id this service cannot resolve is refused, the FORM before the lookup —
+//!    a value outside the instance-id form at the parameter layer this operation reads its
+//!    `InstanceIds` list in, a well-formed id nothing was launched for as not found — and a
+//!    request naming one changes the monitoring of no instance it names;
 //! 6. `DryRun` answers whether the call WOULD have succeeded and changes nothing;
 //! 7. a batch above the id ceiling this service takes is refused for the ceiling, while a
 //!    batch AT it is read as a batch and resolved id by id.
@@ -32,8 +34,8 @@
 use std::time::Duration;
 
 use service_com_amazonaws_ec2_amazonec2::state::{
-    invalid_id_message, ComAmazonawsEc2Amazonec2State as Ec2State, InstanceStateName,
-    MAX_RESOURCE_IDS, MONITORING_STATE_DISABLED, MONITORING_STATE_DISABLING,
+    ComAmazonawsEc2Amazonec2State as Ec2State, InstanceStateName, INSTANCE_IDS_PARAMETER,
+    INSTANCE_ID_PREFIX, MAX_RESOURCE_IDS, MONITORING_STATE_DISABLED, MONITORING_STATE_DISABLING,
     MONITORING_STATE_ENABLED,
     TRANSITION_DELAY,
 };
@@ -496,7 +498,7 @@ async fn unmonitor_instances_refuses_what_it_cannot_act_on_and_changes_nothing()
             case: "an id that is not an instance id at all",
             names: Names::Malformed,
             status: 400,
-            code: "InvalidInstanceID.Malformed",
+            code: "InvalidParameterValue",
         },
         RefusalRow {
             case: "one resolvable instance beside one that is not",
@@ -601,7 +603,12 @@ async fn unmonitor_instances_refuses_what_it_cannot_act_on_and_changes_nothing()
             ),
             Names::Malformed => (
                 vec![p("InstanceId.1", NOT_AN_INSTANCE_ID)],
-                Some(invalid_id_message(NOT_AN_INSTANCE_ID)),
+                // The parameter layer this operation's id list is read in words it, naming
+                // the parameter and the id form it expected.
+                Some(format!(
+                    "Value ({NOT_AN_INSTANCE_ID}) for parameter {INSTANCE_IDS_PARAMETER} is \
+                     invalid. Expected: '{INSTANCE_ID_PREFIX}-...'."
+                )),
             ),
             Names::MonitoredBesideUnknown => (
                 vec![

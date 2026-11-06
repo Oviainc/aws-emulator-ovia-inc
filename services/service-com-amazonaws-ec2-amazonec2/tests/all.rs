@@ -1400,3 +1400,10 @@ mod security_group_rule_prefix_lists;
 // Declared at the tail of this file, which is where every new ec2 suite inserts its lines.
 #[path = "all/modify_ipam.rs"]
 mod modify_ipam;
+// What `MonitorInstances` turns on: the `pending` -> `enabled` move it starts for every
+// distinct instance it names, read back through `DescribeInstances`, and the PARAMETER layer
+// both halves of the monitoring move read their `InstanceIds` list in — a value outside the
+// instance-id form refused for the parameter, one inside it looked up. Declared at the tail
+// of this file, which is where every new ec2 suite inserts its lines.
+#[path = "all/monitor_instances.rs"]
+mod monitor_instances;

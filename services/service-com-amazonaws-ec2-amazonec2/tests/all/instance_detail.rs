@@ -1013,11 +1013,16 @@ async fn monitoring_refuses_what_it_cannot_act_on_and_changes_nothing() {
             code: "InvalidInstanceID.NotFound",
         },
         RefusalRow {
+            // The monitoring pair validate their `InstanceIds` list as a request
+            // PARAMETER, so a value outside the instance-id form is refused for the
+            // parameter rather than as an unreadable instance id. The wording and the
+            // forms that reach it are a table of their own in
+            // `tests/all/monitor_instances.rs`.
             case: "an id that is not an instance id at all",
             action: "MonitorInstances",
             params: vec![p("InstanceId.1", "not-an-instance")],
             status: 400,
-            code: "InvalidInstanceID.Malformed",
+            code: "InvalidParameterValue",
         },
         RefusalRow {
             // `InstanceIds` is `@required`, so the boundary validator refuses a request

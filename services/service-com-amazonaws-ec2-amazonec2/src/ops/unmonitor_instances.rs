@@ -135,8 +135,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            deduplicate_ids, require_instance_record, require_service_state, InstanceStateName,
-            MAX_RESOURCE_IDS, MONITORING_STATE_DISABLED, MONITORING_STATE_DISABLING,
+            deduplicate_ids, require_instance_record_by_parameter, require_service_state,
+            InstanceStateName, MAX_RESOURCE_IDS, MONITORING_STATE_DISABLED,
+            MONITORING_STATE_DISABLING,
         };
 
         let _ = ctx;
@@ -166,7 +167,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The whole batch is resolved and checked before the first write.
         for instance_id in &instance_ids {
-            let instance = require_instance_record(&store, instance_id)?;
+            // Read at the PARAMETER layer, the way `MonitorInstances` reads the same member
+            // of the same shape: the pair share one `InstanceIds` list and one validator, so
+            // a value outside the instance-id form is the one parameter-value refusal for
+            // both halves of the monitoring move.
+            let instance = require_instance_record_by_parameter(&store, instance_id)?;
             // "Disables detailed monitoring for a RUNNING instance", read the way
             // `MonitorInstances` reads it: `pending` is on its way to `running`, and every
             // other state has nothing running to stop monitoring.

@@ -210,7 +210,7 @@ pub const SHORT_RESOURCE_ID_DIGITS: usize = 8;
 ///   (cause 1, the same id under `DryRun`), whose cause 7 is also where the
 ///   `eni-00000000000000000` -> `NotFound` counter-example comes from.
 pub fn instance_id_is_well_formed(id: &str) -> bool {
-    issued_id_is_well_formed("i", id)
+    issued_id_is_well_formed(INSTANCE_ID_PREFIX, id)
 }
 
 /// Whether `id` READS as an instance id: `i-` followed by 8 or 17 lowercase hexadecimal
@@ -227,7 +227,7 @@ pub fn instance_id_is_well_formed(id: &str) -> bool {
 /// the one it was recorded answering, and neither reading is generalised to the other's
 /// operations.
 pub fn instance_id_reads_as_one(id: &str) -> bool {
-    prefixed_id_is_well_formed("i", id)
+    prefixed_id_is_well_formed(INSTANCE_ID_PREFIX, id)
 }
 
 /// Refuse an instance id the request named that this service cannot resolve: a
@@ -250,6 +250,50 @@ pub fn require_instance_record<'store, E>(
     if !instance_id_is_well_formed(instance_id) {
         return Err(crate::scaffolded::Scaffolded::invalid_instance_id_malformed(
             instance_id,
+        ));
+    }
+    store.instances.get(instance_id).ok_or_else(|| {
+        crate::scaffolded::Scaffolded::invalid_instance_id_not_found(instance_id)
+    })
+}
+
+/// The id prefix of an EC2 instance, as [`instance_id_is_well_formed`] reads one and as a
+/// refusal that names the form it expected spells it (`Expected: 'i-...'.`).
+pub const INSTANCE_ID_PREFIX: &str = "i";
+
+/// The name EC2 gives an `InstanceIds` list when it refuses one of its entries at the
+/// PARAMETER layer — "Value (…) for parameter instanceId is invalid. Expected: 'i-...'." —
+/// the way [`VOLUME_IDS_PARAMETER`] names a volume-id list there.
+///
+/// The member's wire name is `InstanceId.N` (`InstanceIdStringList`'s `xmlName`), and
+/// `instanceId` is what that layer calls the parameter those values make up.
+pub const INSTANCE_IDS_PARAMETER: &str = "instanceId";
+
+/// The stored instance `instance_id` names, for an operation that validates its
+/// `InstanceIds` list as a request PARAMETER rather than resolving one named instance.
+///
+/// The same two refusals in the same order as [`require_instance_record`], differing only
+/// in the CLASS of the first: a value outside the instance-id form is
+/// [`invalid_id_parameter_value`] — `InvalidParameterValue`, naming the parameter and the
+/// form it expected — where [`require_instance_record`] answers the resource-level
+/// `InvalidInstanceID.Malformed`. WHICH layer an operation validates an id in is a fact of
+/// that operation, recorded by its caller (the split
+/// [`crate::scaffolded::Scaffolded::instance_id_is_malformed`] records for the other
+/// wordings of that code), so an operation reads ids through the one it was recorded
+/// answering. A well-formed id this account holds no instance for is
+/// `InvalidInstanceID.NotFound` either way: the parameter layer refuses the FORM, and only
+/// a value inside it is looked up.
+pub fn require_instance_record_by_parameter<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    instance_id: &str,
+) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
+    if !instance_id_is_well_formed(instance_id) {
+        // The value comes from the request, so the echo is bounded the way every other
+        // echoed resource id here is bounded.
+        return Err(invalid_id_parameter_value(
+            INSTANCE_IDS_PARAMETER,
+            &echoed_resource_id(instance_id),
+            INSTANCE_ID_PREFIX,
         ));
     }
     store.instances.get(instance_id).ok_or_else(|| {
