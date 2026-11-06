@@ -56,9 +56,16 @@ pub const BUILD_WORKFLOW_STAGE_AFTER: Duration = Duration::from_secs(3);
 /// How long after `StartAutomatedReasoningPolicyBuildWorkflow` accepts a build workflow its
 /// `status` is owed its move to [`BUILD_WORKFLOW_STATUS_COMPLETED`] — the whole progression,
 /// one [`BUILD_WORKFLOW_STAGE_AFTER`] per status it passes through on the way there.
-pub const BUILD_WORKFLOW_COMPLETE_AFTER: Duration = Duration::from_secs(
-    4 * BUILD_WORKFLOW_STAGE_AFTER.as_secs(),
-);
+///
+/// Derived from that one span rather than written out, and derived WITHOUT narrowing it to
+/// whole seconds, so the two constants cannot drift and a sub-second stage span stays the
+/// quarter of this one. A span no `Duration` can hold four of would leave this one stage
+/// long, which is a shorter progression rather than a wrapped one.
+pub const BUILD_WORKFLOW_COMPLETE_AFTER: Duration =
+    match BUILD_WORKFLOW_STAGE_AFTER.checked_mul(4) {
+        Some(whole) => whole,
+        None => BUILD_WORKFLOW_STAGE_AFTER,
+    };
 
 /// `AutomatedReasoningPolicyBuildWorkflowStatus$SCHEDULED` — the status a build workflow a
 /// start has just accepted carries, before the clock owes it the first of its processing

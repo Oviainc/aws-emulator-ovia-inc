@@ -287,6 +287,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// are walked in the order a caller must clear them: deleting a build workflow takes the test
 /// results it produced with it, and a test can only be deleted once no run of it is left, so
 /// the workflow is named before the results and the results before the tests.
+///
+/// Every kind is therefore asked about rather than only the first that can be reported: a run
+/// is addressed THROUGH the build workflow it belongs to, so today a policy holding a run
+/// always still holds that workflow and the run's own kind is reported only if a workflow is
+/// ever removed while its runs are not. The row is what keeps this a decision about the
+/// artifacts the store holds rather than one about the order they happen to be removed in.
 fn held_artifact(
     store: &crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState,
     base_arn: &str,
