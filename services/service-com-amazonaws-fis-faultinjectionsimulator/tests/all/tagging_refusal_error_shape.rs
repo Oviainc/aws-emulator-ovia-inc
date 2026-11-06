@@ -169,16 +169,25 @@ async fn an_operation_that_models_a_not_found_error_keeps_the_modelled_shape() {
 
     // The readers that bind `ResourceNotFoundException` at `@httpError 404`
     // (`smithy_query(query="operation", operation="GetExperimentTemplate,GetExperiment")`),
-    // reached with an id naming no record of their own kind.
+    // reached with an id naming no record of their own kind. The third column is the whole
+    // sentence each reader answers: it names that reader's own resource KIND — which is what
+    // makes its refusal kind-specific where the tagging surface's is generic — and the
+    // experiment reader's carries the ID THE REQUEST named, so the row also pins that the
+    // sentence is built from the request rather than fixed text.
     let rows = [
         (
             "GetExperimentTemplate",
             format!("/experimentTemplates/{template_id}"),
+            "ExperimentTemplate not found.".to_string(),
         ),
-        ("GetExperiment", format!("/experiments/{experiment_id}")),
+        (
+            "GetExperiment",
+            format!("/experiments/{experiment_id}"),
+            format!("Experiment with ID {experiment_id} not found."),
+        ),
     ];
 
-    for (operation, uri) in rows {
+    for (operation, uri, sentence) in rows {
         let answer = call(&router, "GET", &uri, None).await;
         assert_eq!(
             answer.status, 404,
@@ -200,6 +209,12 @@ async fn an_operation_that_models_a_not_found_error_keeps_the_modelled_shape() {
         );
         // The modelled refusal was asked for a resource of ONE named kind, so it words the
         // miss after that kind rather than with the tagging surface's generic sentence.
+        assert_eq!(
+            answer.message(),
+            sentence,
+            "case {operation:?}: expected the sentence {sentence:?}, got {:?}",
+            answer.message()
+        );
         assert_ne!(
             answer.message(),
             NOT_FOUND,
