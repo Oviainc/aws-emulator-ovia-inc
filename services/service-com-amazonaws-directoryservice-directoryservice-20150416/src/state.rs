@@ -62,9 +62,11 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     Assessment, AssessmentSummary, Attribute, Certificate, CertificateInfo,
     ClientAuthenticationSettingInfo,
-    ClientCertAuthSettings, Computer, ConditionalForwarder, DirectoryDescription, DirectoryLimits,
+    ClientCertAuthSettings, Computer, ConditionalForwarder, DirectoryConnectSettingsDescription,
+    DirectoryDescription, DirectoryLimits, DirectoryVpcSettings,
     DirectoryVpcSettingsDescription, DomainController, EventTopic, IpRouteInfo, LDAPSSettingInfo,
-    LogSubscription, SchemaExtensionInfo, SharedDirectory, Snapshot, SnapshotLimits, Tag, Trust,
+    LogSubscription, RegionDescription, SchemaExtensionInfo, SettingEntry, SharedDirectory,
+    Snapshot, SnapshotLimits, Tag, Trust,
 };
 
 /// How long a status transition a create owes takes to fall due.
@@ -145,17 +147,92 @@ pub const TYPE_SIMPLE_AD: &str = "SimpleAD";
 /// `DirectoryType` enum.
 pub const TYPE_MICROSOFT_AD: &str = "MicrosoftAD";
 
+/// The smaller of the two directory capacities Directory Service publishes: the `Small`
+/// value of the modelled `DirectorySize` enum
+/// (`smithy_query(query="shape",shape="DirectorySize")` answers `["Small", "Large"]`),
+/// which `DirectoryDescription$Size` ("The directory size") reports.
+pub const DIRECTORY_SIZE_SMALL: &str = "Small";
+
+/// The larger of those two capacities: the `Large` value of the same modelled enum.
+pub const DIRECTORY_SIZE_LARGE: &str = "Large";
+
+/// The `Standard` edition of Managed Microsoft AD, from
+/// `CreateMicrosoftADRequest$Edition`'s own documentation (see [`MICROSOFT_AD_EDITIONS`]).
+pub const MICROSOFT_AD_EDITION_STANDARD: &str = "Standard";
+
 /// The editions a Managed Microsoft AD directory may be created with.
 ///
 /// From `CreateMicrosoftADRequest$Edition`'s own documentation: "Managed Microsoft AD is
 /// available in two editions: `Standard` and `Enterprise`." The third value of the
 /// modelled `DirectoryEdition` enum, `Hybrid`, belongs to a hybrid directory and is
 /// therefore refused by `CreateMicrosoftAD`.
-pub const MICROSOFT_AD_EDITIONS: [&str; 2] = ["Standard", "Enterprise"];
+pub const MICROSOFT_AD_EDITIONS: [&str; 2] =
+    [MICROSOFT_AD_EDITION_STANDARD, DEFAULT_MICROSOFT_AD_EDITION];
 
 /// The edition a Managed Microsoft AD directory is created with when the request names
 /// none, from the same sentence: "`Enterprise` is the default."
 pub const DEFAULT_MICROSOFT_AD_EDITION: &str = "Enterprise";
+
+/// The `DirectorySize` a Managed Microsoft AD directory of `edition` is run at.
+///
+/// `CreateMicrosoftAD` takes no `Size` member, so a Managed Microsoft AD's size is not
+/// echoed from the request: it follows from the edition the directory was created with,
+/// which is what Directory Service sizes the directory by — the `Standard` edition is the
+/// one for small and midsize organizations, and `Enterprise` the one for organizations
+/// with a large directory. The two editions therefore map onto the two values the modelled
+/// `DirectorySize` enum declares.
+pub fn microsoft_ad_size(edition: &str) -> &'static str {
+    if edition == MICROSOFT_AD_EDITION_STANDARD {
+        DIRECTORY_SIZE_SMALL
+    } else {
+        DIRECTORY_SIZE_LARGE
+    }
+}
+
+/// The number of subnets a directory's servers are placed across.
+///
+/// From `DirectoryVpcSettings$SubnetIds`' own documentation: "The identifiers of the
+/// subnets for the directory servers. The two subnets must be in different Availability
+/// Zones. Directory Service creates a directory server and a DNS server in each of these
+/// subnets." `DirectoryConnectSettings$SubnetIds` places an AD Connector's servers the
+/// same way.
+pub const REQUIRED_SUBNETS: usize = 2;
+
+/// Why the `SubnetIds` of a create's settings block cannot carry a directory's servers,
+/// or `None` when they can.
+///
+/// One rule for every create that places directory servers in a VPC, so `CreateDirectory`,
+/// `CreateMicrosoftAD`, `ConnectDirectory` and `AddRegion` cannot disagree about which
+/// settings block is servable: a directory's servers sit in [`REQUIRED_SUBNETS`] subnets in
+/// two different Availability Zones, so a list naming fewer than two DISTINCT subnets
+/// cannot be two zones and is refused before anything is persisted.
+///
+/// Whether two DIFFERENT subnets are in two different zones is a fact about the VPC rather
+/// than about the request, so it is not decided here: this service holds no subnet
+/// topology, and resolving one belongs to the operations that resolve a `VpcId` against
+/// EC2. Both failures are refused with the SAME diagnostic ([`INVALID_SUBNET_IDS`]), which
+/// is the sentence Directory Service states the rule in.
+pub fn subnet_pair_defect(subnet_ids: &[String]) -> Option<String> {
+    // Whether the list names two DIFFERENT subnets, decided by a scan rather than by
+    // collecting the caller's list into a set: nothing caller-sized is allocated to
+    // answer it.
+    let two_distinct = subnet_ids
+        .first()
+        .is_some_and(|first| subnet_ids.iter().any(|subnet_id| subnet_id != first));
+    if two_distinct {
+        return None;
+    }
+    Some(INVALID_SUBNET_IDS.to_string())
+}
+
+/// The diagnostic Directory Service refuses a settings block whose subnets cannot carry a
+/// directory's servers with.
+///
+/// FIXED text, the rule the subnets broke: it quotes none of them, so the message names
+/// neither the ids it rejected nor how many were sent. [`refusal`] appends the request id,
+/// once.
+pub const INVALID_SUBNET_IDS: &str =
+    "Invalid subnet ID(s). The two subnets must be in different Availability Zones.";
 
 /// The number of domain controllers a Managed Microsoft AD directory is created with.
 ///
@@ -222,7 +299,7 @@ pub const MAX_DOMAIN_CONTROLLER_IDS_PER_REQUEST: usize = 100;
 pub const MAX_DOMAIN_CONTROLLERS_PER_DIRECTORY: usize = 20;
 
 /// The `DirectoryType` of an AD Connector: the `ADConnector` value of the modelled
-/// `DirectoryType` enum, which `ConnectDirectory` (still scaffolded) is what persists.
+/// `DirectoryType` enum, which `ConnectDirectory` is what persists.
 pub const TYPE_AD_CONNECTOR: &str = "ADConnector";
 
 /// The DNS suffix a directory's access URL is built on, from the `AccessUrl` member's
@@ -258,7 +335,7 @@ pub const MAX_CLOUD_ONLY_DIRECTORIES: usize = 10;
 pub const MAX_CLOUD_ONLY_MICROSOFT_AD_DIRECTORIES: usize = 20;
 
 /// Directory Service's default quota of AD Connector directories per account per Region,
-/// which `ConnectDirectory` (still scaffolded) would draw on.
+/// which `ConnectDirectory` draws on.
 ///
 /// From the same published quotas — "AD Connector directories: 10" per Region — which is
 /// the limit `GetDirectoryLimits` reports as `ConnectedDirectoriesLimit` ("The maximum
@@ -1394,6 +1471,245 @@ impl DomainControllerRecord {
     }
 }
 
+/// The administrator account name a Simple AD directory is created with.
+///
+/// From `CreateDirectoryRequest$Password`'s own documentation: "The password for the
+/// directory administrator. The directory creation process creates a directory
+/// administrator account with the user name `Administrator` and this password."
+pub const SIMPLE_AD_ADMINISTRATOR: &str = "Administrator";
+
+/// The administrator account name an AWS Managed Microsoft AD directory is created with.
+///
+/// From `CreateMicrosoftADRequest$Password`'s own documentation: "The password for the
+/// default administrative user named `Admin`."
+pub const MICROSOFT_AD_ADMINISTRATOR: &str = "Admin";
+
+/// The directory types whose user accounts live in THIS service's directories, and whose
+/// passwords `ResetUserPassword` can therefore reset.
+///
+/// From `ResetUserPassword`'s own documentation: "Resets the password for any user in your
+/// Managed Microsoft AD or Simple AD directory." An AD Connector holds no accounts of its
+/// own — it connects to a self-managed directory, whose accounts that directory keeps — so
+/// the call is refused for one with the modelled `UnsupportedOperationException`.
+pub const USER_DIRECTORY_TYPES: [&str; 2] = [TYPE_SIMPLE_AD, TYPE_MICROSOFT_AD];
+
+/// The administrator account name a directory of `directory_type` is created with, or
+/// `None` for a type that holds no account of its own ([`USER_DIRECTORY_TYPES`]).
+pub fn administrator_user_name(directory_type: &str) -> Option<&'static str> {
+    match directory_type {
+        TYPE_SIMPLE_AD => Some(SIMPLE_AD_ADMINISTRATOR),
+        TYPE_MICROSOFT_AD => Some(MICROSOFT_AD_ADMINISTRATOR),
+        _ => None,
+    }
+}
+
+/// The accounts a freshly created directory of `directory_type` holds: the administrator
+/// account its create made ([`administrator_user_name`]), and nothing else.
+pub fn initial_users(directory_type: &str, now: SystemTime) -> BTreeMap<String, UserRecord> {
+    let mut users = BTreeMap::new();
+    if let Some(administrator) = administrator_user_name(directory_type) {
+        users.insert(
+            Directory::user_key(administrator),
+            UserRecord {
+                user_name: administrator.to_string(),
+                administrator: true,
+                password_last_set: now,
+            },
+        );
+    }
+    users
+}
+
+/// One user account of a directory: the administrative account the create made, which
+/// `ResetUserPassword` resolves and resets.
+///
+/// The password itself is deliberately NOT a field: `CreateDirectoryRequest$Password` and
+/// `ResetUserPasswordRequest$NewPassword` are both `@sensitive`, no operation reports
+/// either back, and state this emulator does not need is state it must not hold. When the
+/// password was last set IS held, because that is what a reset changes about the account.
+#[derive(Debug, Clone)]
+pub struct UserRecord {
+    /// The account name, spelled the way the account was created with it — the spelling a
+    /// report gives back, even though [`Directory::user_key`] folds the lookup.
+    pub user_name: String,
+    /// Whether this is the directory's own administrative account.
+    pub administrator: bool,
+    /// When this account's password was last set: at the create that made the account,
+    /// and at every `ResetUserPassword` since.
+    pub password_last_set: SystemTime,
+}
+
+/// The `DirectoryConfigurationStatus` a setting nothing has changed carries: the `Default`
+/// value of the modelled enum (`smithy_query(query="shape",
+/// shape="DirectoryConfigurationStatus")` answers `["Requested", "Updating", "Updated",
+/// "Failed", "Default"]`), the status of a setting still at the value the directory was
+/// created with.
+pub const DIRECTORY_CONFIGURATION_STATUS_DEFAULT: &str = "Default";
+
+/// The directory types that carry configurable settings for `DescribeSettings` to report.
+///
+/// The settings this service publishes ([`DIRECTORY_SETTINGS`]) are the security protocol
+/// switches of a directory whose domain controllers Directory Service runs, which is AWS
+/// Managed Microsoft AD alone: a Simple AD directory and an AD Connector expose none, so
+/// the call is refused for them with the modelled `UnsupportedOperationException`, the way
+/// `DescribeDomainControllers` and `EnableLDAPS` refuse a type that does not have the
+/// feature they report on.
+pub const SETTINGS_DIRECTORY_TYPES: [&str; 1] = [TYPE_MICROSOFT_AD];
+
+/// One configurable directory setting: what `DescribeSettings` reports an entry for.
+#[derive(Debug, Clone, Copy)]
+pub struct SettingDefinition {
+    /// The modelled `SettingEntry$Name`.
+    pub name: &'static str,
+    /// The modelled `SettingEntry$Type` — "the type, or category, of a directory setting".
+    pub setting_type: &'static str,
+    /// The modelled `SettingEntry$DataType`, which "is used to define the `AllowedValues`
+    /// of a setting".
+    pub data_type: &'static str,
+    /// The modelled `SettingEntry$AllowedValues`, "the valid range of values for the
+    /// directory setting".
+    pub allowed_values: &'static str,
+    /// The value the setting carries until `UpdateSettings` changes it.
+    pub default_value: &'static str,
+}
+
+/// The `SettingEntry$Type` of the settings below: "Similar settings have the same type.
+/// For example, `Protocol`, `Cipher`, or `Certificate-Based Authentication`" — the
+/// member's own documentation, whose first example is the category a protocol switch
+/// falls in.
+const SETTING_TYPE_PROTOCOL: &str = "Protocol";
+
+/// The `SettingEntry$DataType` of a switch: "The data type of a directory setting. This is
+/// used to define the `AllowedValues` of a setting. For example a data type can be
+/// `Boolean`, `DurationInSeconds`, or `Enum`" — the member's own documentation.
+const SETTING_DATA_TYPE_BOOLEAN: &str = "Boolean";
+
+/// The two values a switch admits, as `AllowedValues` states a range: a comma-separated
+/// list. Both spellings satisfy the modelled `AppliedValue` pattern `^[a-zA-Z0-9_]*$`.
+const SETTING_VALUES_ENABLE_DISABLE: &str = "Enable,Disable";
+
+/// The value a protocol switch of a freshly created directory carries: the protocol is in
+/// service until an administrator turns it off.
+const SETTING_VALUE_ENABLE: &str = "Enable";
+
+/// The configurable settings a Managed Microsoft AD directory of this emulator carries.
+///
+/// One entry per setting this service publishes a NAME for from the model itself:
+/// `SettingEntry$Name`'s own documentation gives `TLS_1_0` as the name of a directory
+/// setting, `SettingEntry$Type`'s gives `Protocol` as the category such a switch falls in,
+/// and `SettingEntry$DataType`'s gives `Boolean` as the data type that defines its
+/// `AllowedValues`. The switch is `Enable` on a fresh directory and `UpdateSettings` is
+/// what requests another value. Every other setting name AWS publishes is a name the model
+/// does not state, so the catalogue grows as a recording confirms one rather than carrying
+/// a name a caller could not use with `UpdateSettings`.
+pub const DIRECTORY_SETTINGS: [SettingDefinition; 1] = [SettingDefinition {
+    name: "TLS_1_0",
+    setting_type: SETTING_TYPE_PROTOCOL,
+    data_type: SETTING_DATA_TYPE_BOOLEAN,
+    allowed_values: SETTING_VALUES_ENABLE_DISABLE,
+    default_value: SETTING_VALUE_ENABLE,
+}];
+
+/// The settings a freshly created directory of `directory_type` carries: every entry of
+/// [`DIRECTORY_SETTINGS`] at its default value, for a type that has settings at all
+/// ([`SETTINGS_DIRECTORY_TYPES`]).
+pub fn initial_settings(
+    directory_type: &str,
+    now: SystemTime,
+) -> BTreeMap<String, DirectorySettingRecord> {
+    if !SETTINGS_DIRECTORY_TYPES.contains(&directory_type) {
+        return BTreeMap::new();
+    }
+    DIRECTORY_SETTINGS
+        .iter()
+        .map(|definition| {
+            (
+                definition.name.to_string(),
+                DirectorySettingRecord {
+                    name: definition.name.to_string(),
+                    setting_type: definition.setting_type.to_string(),
+                    data_type: definition.data_type.to_string(),
+                    allowed_values: definition.allowed_values.to_string(),
+                    applied_value: definition.default_value.to_string(),
+                    status: DIRECTORY_CONFIGURATION_STATUS_DEFAULT.to_string(),
+                    last_updated: now,
+                },
+            )
+        })
+        .collect()
+}
+
+/// One Region a directory is replicated to beside its primary one: what `AddRegion`
+/// persisted and `DescribeRegions` reports.
+#[derive(Debug, Clone)]
+pub struct RegionReplication {
+    /// The Region's name, as the request spelled it.
+    pub region_name: String,
+    /// The VPC the directory's servers in this Region are placed in, from the
+    /// `VPCSettings` the add named.
+    pub vpc_settings: Option<DirectoryVpcSettingsDescription>,
+    /// How many domain controllers this Region holds: `AddRegion` "adds two domain
+    /// controllers in the specified Region", the modelled minimum.
+    pub desired_number_of_domain_controllers: Option<i32>,
+    /// One of the modelled `DirectoryStage` values — "the status of the replication
+    /// process for the specified Region".
+    pub status: String,
+    /// When the status transition the add owes falls due; `None` once there is none left
+    /// to make. See [`TRANSITION_SPAN`].
+    pub status_due_at: Option<SystemTime>,
+    /// "Specifies when the Region replication began."
+    pub launch_time: SystemTime,
+    /// "The date and time that the Region status was last updated."
+    pub status_last_updated: SystemTime,
+}
+
+/// One stored directory setting: what the create persisted and `DescribeSettings` reports.
+#[derive(Debug, Clone)]
+pub struct DirectorySettingRecord {
+    /// The modelled `SettingEntry$Name` this record is the setting for.
+    pub name: String,
+    /// The modelled `SettingEntry$Type`.
+    pub setting_type: String,
+    /// The modelled `SettingEntry$DataType`.
+    pub data_type: String,
+    /// The modelled `SettingEntry$AllowedValues`.
+    pub allowed_values: String,
+    /// "The value of the directory setting that is applied to the directory."
+    pub applied_value: String,
+    /// One of the modelled `DirectoryConfigurationStatus` values:
+    /// [`DIRECTORY_CONFIGURATION_STATUS_DEFAULT`] until `UpdateSettings` requests another
+    /// value for this setting.
+    pub status: String,
+    /// "The date and time when the directory setting was last updated."
+    pub last_updated: SystemTime,
+}
+
+impl DirectorySettingRecord {
+    /// This setting as the modelled `SettingEntry`.
+    ///
+    /// The one place a stored setting is rendered, so every operation that reports one
+    /// reports exactly what was persisted. `RequestedValue` is the applied value while the
+    /// setting rests at its default — nothing else has been requested for it — and
+    /// `RequestDetailedStatus` / `RequestStatusMessage` / `LastRequestedDateTime` stay
+    /// absent for the same reason: they describe an update request this directory has had
+    /// none of.
+    pub fn to_setting_entry(&self) -> SettingEntry {
+        SettingEntry {
+            r#type: Some(self.setting_type.clone()),
+            name: Some(self.name.clone()),
+            allowed_values: Some(self.allowed_values.clone()),
+            applied_value: Some(self.applied_value.clone()),
+            requested_value: Some(self.applied_value.clone()),
+            request_status: Some(self.status.clone()),
+            request_detailed_status: None,
+            request_status_message: None,
+            last_updated_date_time: Some(as_timestamp(self.last_updated)),
+            last_requested_date_time: None,
+            data_type: Some(self.data_type.clone()),
+        }
+    }
+}
+
 /// One stored directory: what `CreateDirectory` persisted and `DescribeDirectories`
 /// reports.
 #[derive(Debug, Clone)]
@@ -1402,9 +1718,11 @@ pub struct Directory {
     pub name: String,
     pub short_name: Option<String>,
     pub description: Option<String>,
-    /// Only a Simple AD directory has a size (`Small`/`Large`), so this stays `None`
-    /// for a Managed Microsoft AD directory, which carries an [`Self::edition`]
-    /// instead.
+    /// The `Size` the create echoed, for a directory type whose create takes one
+    /// (`CreateDirectory`, `ConnectDirectory`). It stays `None` for a Managed Microsoft
+    /// AD directory, whose create takes no `Size` member and which carries an
+    /// [`Self::edition`] the size is derived from instead — see [`Self::reported_size`],
+    /// the one place a directory's reported size is decided.
     pub size: Option<String>,
     /// Only AWS Managed Microsoft AD has an edition, so this stays `None` for a
     /// Simple AD directory and `CreateMicrosoftAD` sets it.
@@ -1424,6 +1742,11 @@ pub struct Directory {
     /// in for it, as the `Alias` member's documentation describes.
     pub alias: Option<String>,
     pub vpc_settings: Option<DirectoryVpcSettingsDescription>,
+    /// The connection settings `ConnectDirectory` persisted for an AD Connector — the
+    /// VPC its connector servers are placed in and the service account it reaches the
+    /// self-managed directory with. `None` for every other directory type, which carries
+    /// [`Self::vpc_settings`] alone.
+    pub connect_settings: Option<DirectoryConnectSettingsDescription>,
     pub network_type: Option<String>,
     pub sso_enabled: bool,
     /// Reported only for AWS Managed Microsoft AD, so it stays `None` for Simple AD:
@@ -1445,9 +1768,10 @@ pub struct Directory {
     /// credential scope, the only Region a request carries.
     pub primary_region: String,
     /// The Regions this directory is replicated to beside [`Self::primary_region`] —
-    /// the `Additional` ones. `AddRegion` (still scaffolded) is what adds one, and
-    /// `RemoveRegion` is what removes one.
-    pub additional_regions: BTreeSet<String>,
+    /// the `Additional` ones — keyed by Region name. `AddRegion` is what adds one, and
+    /// `RemoveRegion` is what removes one; `DescribeRegions` reports them beside the
+    /// primary one.
+    pub additional_regions: BTreeMap<String, RegionReplication>,
     /// The IP address blocks `AddIpRoutes` routed to this directory, keyed by
     /// [`IpRouteRecord::block`].
     pub ip_routes: BTreeMap<String, IpRouteRecord>,
@@ -1492,6 +1816,16 @@ pub struct Directory {
     /// directory takes them with it, and two directories can each hold an account of the
     /// same name.
     pub computers: BTreeMap<String, ComputerRecord>,
+    /// The user accounts this directory holds, keyed by [`Self::user_key`]: the
+    /// administrative account the create made ([`initial_users`]), whose password
+    /// `ResetUserPassword` resets. A directory type that keeps its accounts elsewhere
+    /// ([`USER_DIRECTORY_TYPES`]) holds none.
+    pub users: BTreeMap<String, UserRecord>,
+    /// This directory's configurable settings, keyed by the modelled
+    /// `DirectoryConfigurationSettingName`; `DescribeSettings` reports them and
+    /// `UpdateSettings` is what changes one. A directory type that has no settings
+    /// ([`SETTINGS_DIRECTORY_TYPES`]) carries none.
+    pub settings: BTreeMap<String, DirectorySettingRecord>,
     /// The next RID this directory's domain hands to an account created in it, starting
     /// at [`FIRST_COMPUTER_RID`]. A pool rather than `computers.len()`: a RID a domain has
     /// handed out is never handed out again.
@@ -1664,7 +1998,62 @@ impl Directory {
     /// Whether this directory exists in `region` at all: its primary Region, or one of
     /// the Regions it is replicated to.
     pub fn exists_in_region(&self, region: &str) -> bool {
-        self.primary_region == region || self.additional_regions.contains(region)
+        self.primary_region == region || self.additional_regions.contains_key(region)
+    }
+
+    /// This directory's Regions as the modelled `RegionsDescription` list: its primary
+    /// Region first — the one it was created in — then the Regions it is replicated to, in
+    /// Region-name order, narrowed to `wanted` when the request asked for one Region.
+    ///
+    /// THE one place a directory's Regions are rendered, so `DescribeRegions` reports
+    /// exactly what the create and the adds persisted. The primary Region's description is
+    /// the directory's own: the stage it is in, the VPC settings it was created with and
+    /// the controllers it runs, because that Region IS the directory.
+    pub fn region_list(&self, wanted: Option<&str>) -> Vec<RegionDescription> {
+        let primary = RegionDescription {
+            directory_id: Some(self.directory_id.clone()),
+            region_name: Some(self.primary_region.clone()),
+            region_type: Some(REGION_TYPE_PRIMARY.to_string()),
+            status: Some(self.stage.clone()),
+            vpc_settings: self.requested_vpc_settings(),
+            desired_number_of_domain_controllers: self.desired_number_of_domain_controllers,
+            launch_time: Some(as_timestamp(self.launch_time)),
+            status_last_updated_date_time: Some(as_timestamp(self.stage_last_updated)),
+            last_updated_date_time: Some(as_timestamp(self.stage_last_updated)),
+        };
+        let additional = self
+            .additional_regions
+            .values()
+            .map(|replication| RegionDescription {
+                directory_id: Some(self.directory_id.clone()),
+                region_name: Some(replication.region_name.clone()),
+                region_type: Some(REGION_TYPE_ADDITIONAL.to_string()),
+                status: Some(replication.status.clone()),
+                vpc_settings: replication
+                    .vpc_settings
+                    .as_ref()
+                    .and_then(requested_vpc_settings_of),
+                desired_number_of_domain_controllers: replication
+                    .desired_number_of_domain_controllers,
+                launch_time: Some(as_timestamp(replication.launch_time)),
+                status_last_updated_date_time: Some(as_timestamp(replication.status_last_updated)),
+                last_updated_date_time: Some(as_timestamp(replication.status_last_updated)),
+            });
+        ::std::iter::once(primary)
+            .chain(additional)
+            .filter(|description| {
+                wanted.is_none_or(|region| description.region_name.as_deref() == Some(region))
+            })
+            .collect()
+    }
+
+    /// This directory's own placement as the modelled `DirectoryVpcSettings` a
+    /// `RegionDescription` carries — the VPC and subnets the create named, which is the
+    /// request shape rather than the description shape `DescribeDirectories` reports.
+    fn requested_vpc_settings(&self) -> Option<DirectoryVpcSettings> {
+        self.vpc_settings
+            .as_ref()
+            .and_then(requested_vpc_settings_of)
     }
 
     /// This directory's domain SID: [`DOMAIN_SID_PREFIX`] plus the three sub-authorities
@@ -1722,6 +2111,52 @@ impl Directory {
     /// case, so a lookup agrees with Active Directory's case-insensitive account names.
     pub fn computer_key(computer_name: &str) -> String {
         computer_name.to_lowercase()
+    }
+
+    /// The key [`Self::users`] holds `user_name` under: the name folded to lower case,
+    /// the same fold [`Self::computer_key`] performs and for the same reason — an Active
+    /// Directory account name is compared case-insensitively, so `admin` and `Admin` name
+    /// one account.
+    pub fn user_key(user_name: &str) -> String {
+        user_name.to_lowercase()
+    }
+
+    /// The account `user_name` names in this directory, if it holds one.
+    pub fn user(&self, user_name: &str) -> Option<&UserRecord> {
+        self.users.get(&Self::user_key(user_name))
+    }
+
+    /// Whether this directory's type holds user accounts of its own
+    /// ([`USER_DIRECTORY_TYPES`]) — the types `ResetUserPassword` serves.
+    pub fn holds_users(&self) -> bool {
+        USER_DIRECTORY_TYPES.contains(&self.directory_type.as_str())
+    }
+
+    /// Whether this directory's type carries configurable settings
+    /// ([`SETTINGS_DIRECTORY_TYPES`]) — the types `DescribeSettings` serves.
+    pub fn has_settings(&self) -> bool {
+        SETTINGS_DIRECTORY_TYPES.contains(&self.directory_type.as_str())
+    }
+
+    /// This directory's settings in name order — the order `DescribeSettings` reports
+    /// them in.
+    pub fn settings_in_name_order(&self) -> Vec<&DirectorySettingRecord> {
+        self.settings.values().collect()
+    }
+
+    /// The `Size` this directory reports: "The directory size", one of the two values the
+    /// modelled `DirectorySize` enum declares.
+    ///
+    /// THE one place a directory's size is decided, so every operation that reports a
+    /// directory reports the same one. A directory whose create takes a `Size` reports the
+    /// value it was created with; a Managed Microsoft AD's create takes none, so its size
+    /// is derived from the edition it runs ([`microsoft_ad_size`]) rather than left absent
+    /// — Directory Service reports a size for every directory it runs.
+    pub fn reported_size(&self) -> Option<String> {
+        match self.edition.as_deref() {
+            Some(edition) => Some(microsoft_ad_size(edition).to_string()),
+            None => self.size.clone(),
+        }
     }
 
     /// This directory's domain as the trailing components of a distinguished name in it:
@@ -1789,7 +2224,7 @@ impl Directory {
             directory_id: Some(self.directory_id.clone()),
             name: Some(self.name.clone()),
             short_name: self.short_name.clone(),
-            size: self.size.clone(),
+            size: self.reported_size(),
             edition: self.edition.clone(),
             alias: Some(self.effective_alias().to_string()),
             access_url: Some(self.access_url()),
@@ -1799,12 +2234,37 @@ impl Directory {
             stage_last_updated_date_time: Some(as_timestamp(self.stage_last_updated)),
             r#type: Some(self.directory_type.clone()),
             vpc_settings: self.vpc_settings.clone(),
+            connect_settings: self.connect_settings.clone(),
             sso_enabled: self.sso_enabled,
             desired_number_of_domain_controllers: self.desired_number_of_domain_controllers,
             network_type: self.network_type.clone(),
             ..DirectoryDescription::default()
         }
     }
+}
+
+/// The `RegionType` of the Region a directory was created in: the `Primary` value of the
+/// modelled `RegionType` enum (`smithy_query(query="shape",shape="RegionType")` answers
+/// `["Primary", "Additional"]`).
+pub const REGION_TYPE_PRIMARY: &str = "Primary";
+
+/// The `RegionType` of a Region a directory is replicated to: the `Additional` value of
+/// that same modelled enum.
+pub const REGION_TYPE_ADDITIONAL: &str = "Additional";
+
+/// A stored placement as the modelled `DirectoryVpcSettings`: the VPC and the subnets of
+/// the description, or `None` when the record carries no VPC.
+///
+/// A `RegionDescription` reports the REQUEST shape (`DirectoryVpcSettings`, whose two
+/// members are required) where `DescribeDirectories` reports the description shape, so
+/// this is the one conversion between them.
+fn requested_vpc_settings_of(
+    settings: &DirectoryVpcSettingsDescription,
+) -> Option<DirectoryVpcSettings> {
+    Some(DirectoryVpcSettings {
+        vpc_id: settings.vpc_id.clone()?,
+        subnet_ids: settings.subnet_ids.clone().unwrap_or_default(),
+    })
 }
 
 /// One stored directory assessment: what `StartADAssessment` persisted and
@@ -2443,6 +2903,20 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                     directory.stage_due_at = None;
                 }
             }
+            // The status transition an `AddRegion` owes: the replication it starts answers
+            // while the Region is still being brought up, so the transient `Requested`
+            // settles on `Active` one span later — the same transition the directory's own
+            // Region made when it was created.
+            for replication in directory.additional_regions.values_mut() {
+                let Some(due) = replication.status_due_at else {
+                    continue;
+                };
+                if now >= due {
+                    replication.status = STAGE_ACTIVE.to_string();
+                    replication.status_last_updated = due;
+                    replication.status_due_at = None;
+                }
+            }
             // The status transitions the IP route writes owe: the transient `Adding` an
             // add answers in settles on `Added`, and a block whose removal has fallen
             // due is gone — a block the directory no longer routes is not one
@@ -3013,6 +3487,7 @@ modeled_failures!(
     CertificateInUseException,
     CertificateLimitExceededException,
     ClientException,
+    DirectoryAlreadyInRegionException,
     DirectoryAlreadySharedException,
     DirectoryDoesNotExistException,
     DirectoryInDesiredStateException,
@@ -3028,14 +3503,17 @@ modeled_failures!(
     InvalidLDAPSStatusException,
     InvalidNextTokenException,
     InvalidParameterException,
+    InvalidPasswordException,
     InvalidTargetException,
     IpRouteLimitExceededException,
     NoAvailableCertificateException,
+    RegionLimitExceededException,
     ServiceException,
     ShareLimitExceededException,
     SnapshotLimitExceededException,
     TagLimitExceededException,
     UnsupportedOperationException,
+    UserDoesNotExistException,
 );
 
 /// Refuse the call with one of this service's modelled errors, `message` as its
@@ -3092,6 +3570,31 @@ fn refusal_restating_its_request_id<E: ModeledFailure>(diagnostic: &str) -> E {
 /// caller has to fix, and nothing else. [`refusal`] appends the request id, once.
 pub fn no_such_directory(directory_id: &str) -> String {
     format!("Directory: '{directory_id}' does not exist.")
+}
+
+/// The message an operation that takes a `DirectoryId` as a FILTER refuses an id no
+/// directory is stored under with.
+///
+/// Directory Service answers this failure in two different families, and which one a
+/// caller sees follows from what the id WAS in the request: an operation whose subject is
+/// the directory reports that the directory does not exist ([`no_such_directory`]), while
+/// one that takes the id as a filter over another listing reports the VALUE as an invalid
+/// directory id — unquoted, singular, closed by a period. `DescribeSnapshots`, whose
+/// `DirectoryId` narrows the snapshots it lists, is the latter. [`refusal`] appends the
+/// request id, once.
+pub fn invalid_directory_id(directory_id: &str) -> String {
+    format!("Invalid directory ID: {directory_id}.")
+}
+
+/// The same report for an operation whose filter is a LIST of directory ids
+/// (`DescribeDirectories$DirectoryIds`): every id the store could not resolve, in the
+/// order the filter is scanned, comma-separated, under the plural spelling of the member
+/// the ids arrived in. [`refusal`] appends the request id, once.
+pub fn invalid_directory_ids(directory_ids: &[String]) -> String {
+    format!(
+        "Invalid directory ID(s): {ids}.",
+        ids = directory_ids.join(", ")
+    )
 }
 
 /// The `DirectoryUnavailableException` message for a directory that is stored but is not
@@ -3219,6 +3722,112 @@ pub fn region_from_request(parts: &::http::request::Parts) -> String {
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
+
+/// The `UserDoesNotExistException` message for a name that names no account of the
+/// directory the request asked about.
+///
+/// Directory Service words this one as the kind of entity, a colon, the name the request
+/// sent (unquoted) and "does not exist.", so the message is built from the request and
+/// names what the caller has to fix, and nothing else. It is NOT the quoted form the
+/// directory-lookup family uses ([`no_such_directory`]): the two families are worded
+/// differently, so neither may be built from the other.
+/// [`refusal`] appends the request id.
+pub fn no_such_user(user_name: &str) -> String {
+    format!("User: {user_name} does not exist.")
+}
+
+/// The fewest characters a directory accepts in an account password.
+///
+/// From `CreateDirectoryRequest$Password`'s own documentation, which states the directory
+/// password policy this service enforces: "Length `(?=^.{8,64}$)` - Must be between 8 and
+/// 64 characters".
+pub const MIN_PASSWORD_CHARS: usize = 8;
+
+/// The most characters a directory accepts in an account password, from the other half of
+/// that same sentence. The modelled `UserPassword` admits up to 127 characters, so a
+/// password between the two bounds is one the boundary validator passes and the
+/// directory's own policy refuses.
+pub const MAX_PASSWORD_CHARS: usize = 64;
+
+/// How many of the four Active Directory character classes a password must draw on.
+///
+/// From the same documentation: a password must satisfy the length rule "AND any 3 of the
+/// following password complexity rules required by Active Directory": numbers, upper
+/// case, lower case and special characters, in the four combinations of three it lists,
+/// which is exactly "at least three of the four classes".
+pub const PASSWORD_CHARACTER_CLASSES: usize = 3;
+
+/// Why `password` does not meet the password policy of a directory of this service, or
+/// `None` when it does.
+///
+/// The diagnostic leads with the sentence the modelled `InvalidPasswordException`
+/// documents — "The new password provided by the user does not meet the password
+/// complexity requirements defined in your directory." — and then states which half of
+/// that policy was broken, so a caller can fix the request from the message alone.
+///
+/// The rule is the one `CreateDirectoryRequest$Password`'s documentation states for the
+/// administrator password, which is the directory's own policy and so the policy every
+/// later password of that directory is set under: between [`MIN_PASSWORD_CHARS`] and
+/// [`MAX_PASSWORD_CHARS`] characters, drawn from at least [`PASSWORD_CHARACTER_CLASSES`]
+/// of Active Directory's four character classes. The password ITSELF never appears in the
+/// message: it is `@sensitive`, so the diagnostic states the rule that was broken and
+/// quotes no value.
+pub fn password_policy_defect(password: &str) -> Option<String> {
+    let characters = password.chars().count();
+    if !(MIN_PASSWORD_CHARS..=MAX_PASSWORD_CHARS).contains(&characters) {
+        return Some(format!(
+            "{PASSWORD_COMPLEXITY_REQUIREMENTS} The password must be between \
+             {MIN_PASSWORD_CHARS} and {MAX_PASSWORD_CHARS} characters long."
+        ));
+    }
+    let classes = [
+        password.chars().any(char::is_numeric),
+        password.chars().any(char::is_uppercase),
+        password.chars().any(char::is_lowercase),
+        password
+            .chars()
+            .any(|character| !character.is_alphanumeric() && !character.is_whitespace()),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if classes < PASSWORD_CHARACTER_CLASSES {
+        return Some(format!(
+            "{PASSWORD_COMPLEXITY_REQUIREMENTS} The password must contain characters from \
+             at least {PASSWORD_CHARACTER_CLASSES} of the following four classes: \
+             numbers, upper case letters, lower case letters and special characters."
+        ));
+    }
+    None
+}
+
+/// The sentence the modelled `InvalidPasswordException` states this refusal with: "The new
+/// password provided by the user does not meet the password complexity requirements
+/// defined in your directory." It is the error class's own text, so every refusal of this
+/// family leads with it and then names the half of the policy the password broke.
+const PASSWORD_COMPLEXITY_REQUIREMENTS: &str = "The new password provided by the user does \
+                                                not meet the password complexity \
+                                                requirements defined in your directory.";
+
+/// The sentence the modelled `DirectoryAlreadyInRegionException` states this refusal
+/// with: "The Region you specified is the same Region where the Managed Microsoft AD
+/// directory was created. Specify a different Region and try again."
+///
+/// FIXED text: the error shape's own documentation states it with no variable part, so
+/// neither the Region nor the directory the request named appears in it. [`refusal`]
+/// appends the request id, once.
+pub const DIRECTORY_ALREADY_IN_REGION: &str =
+    "The Region you specified is the same Region where the Managed Microsoft AD directory \
+     was created. Specify a different Region and try again.";
+
+/// The most Regions this emulator replicates one directory to beside its primary one.
+///
+/// NOT an AWS quota: a resource guard. `AddRegion` is a write a caller can repeat with a
+/// fresh Region name forever, so the per-directory set carries its own bound, enforced at
+/// the single insert site in `add_region.rs`, which is what the modelled
+/// `RegionLimitExceededException` ("You have reached the limit for maximum number of
+/// simultaneous Region replications per directory") then refuses.
+pub const MAX_ADDITIONAL_REGIONS: usize = 5;
 
 /// The `EntityDoesNotExistException` message for an id that names no stored snapshot.
 /// Shared so every operation that resolves a snapshot says the same thing about the

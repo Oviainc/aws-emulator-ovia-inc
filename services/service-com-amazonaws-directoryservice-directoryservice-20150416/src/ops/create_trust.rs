@@ -230,13 +230,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already there. The domain is matched case-insensitively and without the trailing
         // root dot the modelled `RemoteDomainName` pattern admits, because those spellings
         // name one DNS domain.
-        if let Some(existing) = store.trust_of(&input.directory_id, &input.remote_domain_name) {
+        //
+        // Directory Service states this refusal as the pairing that already exists: the
+        // directory the trust hangs off and the remote domain it points at, both as the
+        // request named them, and nothing about the stored trust itself (not its id, not
+        // its state). `crate::state::refusal` appends the call's request id.
+        if store.trust_of(&input.directory_id, &input.remote_domain_name).is_some() {
             return Err(CreateTrustErrorModeled::EntityAlreadyExistsException(
                 crate::state::refusal(format!(
-                    "Directory {id} already has a trust relationship with the remote \
-                     domain '{domain}'",
+                    "Trust already exists for directory: {id} and remote domain: {domain}.",
                     id = input.directory_id,
-                    domain = existing.remote_domain_name
+                    domain = input.remote_domain_name
                 )),
             )
             .into());

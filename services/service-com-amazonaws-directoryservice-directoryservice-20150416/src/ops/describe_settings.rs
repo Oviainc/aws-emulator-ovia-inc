@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the configurable settings of one stored directory: the entries
+//! [`crate::state::DIRECTORY_SETTINGS`] publishes, each as the modelled `SettingEntry`
+//! carrying the value that is applied to the directory and the status of the last request
+//! for it.
+//!
+//! Three outcomes follow from what the store holds for the requested id:
+//!
+//! * it names no stored directory — `DirectoryDoesNotExistException`, "The specified
+//!   directory does not exist in the system". This is the operation's OWN not-found class:
+//!   it is the directory itself that could not be resolved, not an entity inside one, so
+//!   it is distinct from the `EntityDoesNotExistException` the reads that resolve
+//!   something WITHIN a directory answer;
+//! * it names a directory of a type that carries no settings
+//!   ([`crate::state::SETTINGS_DIRECTORY_TYPES`]) — `UnsupportedOperationException`, the
+//!   way every other read of a type-specific feature of this service refuses;
+//! * it names a directory that carries settings — they are reported, narrowed to the
+//!   `Status` the request asked for when it asked for one.
+//!
+//! REPORTING: it writes nothing of its own. The whole catalogue fits in one page, so no
+//! `NextToken` is ever issued and a request carrying one is refused with the modelled
+//! `InvalidNextTokenException` — a token this operation did not issue cannot name a page
+//! of it.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +172,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSettings"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // This operation issues no `NextToken` (see the module docs), so any token a
+        // request carries is one it did not issue — refused BEFORE the store is reached,
+        // the way every paginated listing of this service refuses a token of its own it
+        // cannot resolve.
+        if input.next_token.is_some() {
+            return Err(DescribeSettingsErrorModeled::InvalidNextTokenException(
+                crate::state::invalid_next_token(),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        let directory = store.directories.get(&input.directory_id).ok_or_else(|| {
+            DescribeSettingsErrorModeled::DirectoryDoesNotExistException(crate::state::refusal(
+                crate::state::no_such_directory(&input.directory_id),
+            ))
+        })?;
+
+        // The settings this operation reports are a feature of the directory types that
+        // run their own domain controllers, so a request naming a directory of another
+        // type asks for something that type does not have.
+        if !directory.has_settings() {
+            let directory_type = directory.directory_type.clone();
+            return Err(
+                DescribeSettingsErrorModeled::UnsupportedOperationException(
+                    crate::state::refusal(format!(
+                        "DirectoryId {id} names a {directory_type} directory; configurable \
+                         settings are supported for {supported} directories only",
+                        id = input.directory_id,
+                        supported = crate::state::SETTINGS_DIRECTORY_TYPES.join(", ")
+                    )),
+                )
+                .into(),
+            );
+        }
+
+        // `Status`' own documentation: "The status of the directory settings for which to
+        // retrieve information" — a filter over the entries, so a status no stored setting
+        // is in reports an empty list rather than a refusal.
+        let setting_entries: Vec<SettingEntry> = directory
+            .settings_in_name_order()
+            .into_iter()
+            .filter(|setting| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|status| setting.status == status)
+            })
+            .map(crate::state::DirectorySettingRecord::to_setting_entry)
+            .collect();
+
+        Ok(DescribeSettingsOutput {
+            directory_id: Some(directory.directory_id.clone()),
+            setting_entries: Some(setting_entries),
+            // Every entry fits in one page, so there is never a next one to name.
+            next_token: None,
+        })
     }
 }

@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetUserPassword
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetUserPassword`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetUserPassword::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resets the password of one account of a stored directory: resolves the account the
+//! request names in the directory it names and records the reset, so the account's
+//! password was last set at this call and not at the create that made it.
+//!
+//! Four outcomes follow from what the store holds, in the order the service can decide
+//! them — the directory first, because a name can only be resolved inside one:
+//!
+//! * the id names no stored directory — `EntityDoesNotExistException`, "The specified
+//!   entity could not be found" (the only not-found class this operation models for the
+//!   directory itself);
+//! * it names a directory whose accounts are not this service's
+//!   ([`crate::state::USER_DIRECTORY_TYPES`]) — `UnsupportedOperationException`: this
+//!   operation "resets the password for any user in your Managed Microsoft AD or Simple AD
+//!   directory", and an AD Connector's accounts belong to the self-managed directory it
+//!   connects to;
+//! * it names a directory that is not in service yet — `DirectoryUnavailableException`,
+//!   because a password is set in the directory's own domain, which is not serving until
+//!   the transition its create owes falls due;
+//! * the name names no account of that directory — `UserDoesNotExistException`, "The user
+//!   provided a username that does not exist in your directory".
+//!
+//! The `NewPassword` is checked against the directory's password policy
+//! ([`crate::state::password_policy_defect`]) and refused with the modelled
+//! `InvalidPasswordException` when it does not meet it. The password itself is never
+//! stored: it is `@sensitive`, no operation reports it back, and what the reset changes
+//! about the account — when its password was last set — is what the record keeps.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +177,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetUserPassword` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetUserPasswordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetUserPassword"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        let directory = store
+            .directories
+            .get_mut(&input.directory_id)
+            .ok_or_else(|| {
+                ResetUserPasswordErrorModeled::EntityDoesNotExistException(crate::state::refusal(
+                    crate::state::no_such_directory(&input.directory_id),
+                ))
+            })?;
+
+        // The accounts of an AD Connector live in the self-managed directory it connects
+        // to, so this service cannot reset one: the call asks for something that
+        // directory type does not support.
+        if !directory.holds_users() {
+            let directory_type = directory.directory_type.clone();
+            return Err(
+                ResetUserPasswordErrorModeled::UnsupportedOperationException(
+                    crate::state::refusal(format!(
+                        "DirectoryId {id} names a {directory_type} directory; a password reset \
+                         is supported for {supported} directories only",
+                        id = input.directory_id,
+                        supported = crate::state::USER_DIRECTORY_TYPES.join(", ")
+                    )),
+                )
+                .into(),
+            );
+        }
+
+        // A password is set in the directory's own domain, so the reset needs a directory
+        // that is in service: one still being built by the transition its create owes is
+        // unavailable. The diagnostic is this service's shared one for a directory a call
+        // cannot reach.
+        if directory.stage != crate::state::STAGE_ACTIVE {
+            return Err(
+                ResetUserPasswordErrorModeled::DirectoryUnavailableException(
+                    crate::state::refusal(crate::state::directory_unavailable(
+                        &input.directory_id,
+                    )),
+                )
+                .into(),
+            );
+        }
+
+        // The new password is checked against the directory's own policy BEFORE the
+        // account is resolved, so a refused password reports nothing about which accounts
+        // the directory holds.
+        if let Some(defect) = crate::state::password_policy_defect(&input.new_password) {
+            return Err(ResetUserPasswordErrorModeled::InvalidPasswordException(
+                crate::state::refusal(defect),
+            )
+            .into());
+        }
+
+        let user = directory
+            .users
+            .get_mut(&crate::state::Directory::user_key(&input.user_name))
+            .ok_or_else(|| {
+                ResetUserPasswordErrorModeled::UserDoesNotExistException(crate::state::refusal(
+                    crate::state::no_such_user(&input.user_name),
+                ))
+            })?;
+
+        // What the reset changes about the account: its password was last set now. The
+        // password itself is dropped with the request.
+        user.password_last_set = now;
+
+        Ok(ResetUserPasswordOutput {})
     }
 }

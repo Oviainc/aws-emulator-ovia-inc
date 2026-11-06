@@ -17,11 +17,10 @@
 //!   DeleteDirectory API";
 //! * it names a Region the directory is replicated to — the replication is dropped.
 //!
-//! `AccessDeniedException` is modelled for this operation and is NOT reachable here:
-//! the emulator has no authorization boundary to evaluate — it verifies a request's
-//! signature and nothing else, and no member of the request distinguishes one caller's
-//! permissions from another's — so refusing a caller would be a refusal computed from
-//! nothing.
+//! The call is AUTHORIZED first ([`crate::service::authorization`]): this operation
+//! models `AccessDeniedException`, so a caller whose identity-based policies do not permit
+//! `ds:RemoveRegion` on the directory is refused before the store is read, and learns
+//! nothing about whether the directory exists in the Region the call was made against.
 //!
 //! ## Shape of an operation
 //!
@@ -159,6 +158,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
+        // Authorization comes FIRST, on the ARN of the directory the request NAMED, so a
+        // caller IAM does not permit is refused before the store is read and learns
+        // nothing about whether that directory exists.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::service::authorization::directory_arn(ctx, &input.directory_id),
+        )
+        .map_err(RemoveRegionErrorModeled::AccessDeniedException)?;
         // The Region this call acts on: the one it was signed for. `RemoveRegion` takes
         // no Region member, so this is the only place the Region can come from.
         let region = crate::state::region_from_request(ctx.parts());

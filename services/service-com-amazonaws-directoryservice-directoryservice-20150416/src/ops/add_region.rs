@@ -1,15 +1,41 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddRegion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddRegion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddRegion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replicates a stored Managed Microsoft AD directory to another Region: records the
+//! Region on the directory, so the directory exists in it
+//! ([`crate::state::Directory::exists_in_region`]) and `RemoveRegion` can stop the
+//! replication again.
+//!
+//! The call is AUTHORIZED first ([`crate::service::authorization`]): this operation models
+//! `AccessDeniedException`, so a caller whose identity-based policies do not permit
+//! `ds:AddRegion` on the directory is refused before the store is read, and learns nothing
+//! about whether the directory exists. Everything below is the business logic such a
+//! caller never reaches:
+//!
+//! * the id names no stored directory — `DirectoryDoesNotExistException`, "The specified
+//!   directory does not exist in the system";
+//! * it names a directory whose type or edition does not replicate across Regions —
+//!   `UnsupportedOperationException`. Multi-Region replication is a feature of the
+//!   Enterprise edition of AWS Managed Microsoft AD, so a Simple AD directory, an AD
+//!   Connector and a Standard-edition Managed Microsoft AD all lack it;
+//! * it names the directory's own primary Region — `UnsupportedOperationException`: there
+//!   is no replication to add, the directory was created there;
+//! * it names a Region the directory is ALREADY replicated to —
+//!   `DirectoryAlreadyInRegionException`, "The Region you specified is the same Region
+//!   where the … directory was created. Specify a different Region and try again";
+//! * it names a directory that is not in service yet — `DirectoryUnavailableException`;
+//! * its `VPCSettings` name fewer than two distinct subnets, which cannot carry the
+//!   directory's servers in two Availability Zones — `InvalidParameterException`
+//!   ([`crate::state::subnet_pair_defect`]).
+//!
+//! The domain controllers this operation "adds two of in the specified Region" are that
+//! Region's own, and the controllers `DescribeDomainControllers` reports for a directory
+//! are the ones in the Region the call is signed for, so no controller record is placed
+//! here: the replication carries the count of controllers its Region holds, which is what
+//! `DescribeRegions` reports beside its status. What the call records is the replication
+//! itself, which is what `RemoveRegion` removes and what a read in the added Region
+//! resolves the directory through.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +184,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddRegion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddRegionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddRegion"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Authorization comes FIRST, on the ARN of the directory the request NAMED, so a
+        // caller IAM does not permit is refused before the store is reached.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::service::authorization::directory_arn(ctx, &input.directory_id),
+        )
+        .map_err(AddRegionErrorModeled::AccessDeniedException)?;
+
+        // The directory's servers in the added Region are placed one per subnet, in two
+        // Availability Zones, so a settings block naming fewer than two distinct subnets
+        // cannot carry them. Checked before the store is written, so a refused call
+        // records no replication.
+        if let Some(defect) = crate::state::subnet_pair_defect(&input.vpc_settings.subnet_ids) {
+            return Err(AddRegionErrorModeled::InvalidParameterException(
+                crate::state::refusal(defect),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        let directory = store
+            .directories
+            .get_mut(&input.directory_id)
+            .ok_or_else(|| {
+                AddRegionErrorModeled::DirectoryDoesNotExistException(crate::state::refusal(
+                    crate::state::no_such_directory(&input.directory_id),
+                ))
+            })?;
+
+        // Multi-Region replication is a feature of the Enterprise edition of AWS Managed
+        // Microsoft AD: a directory of another type, or of the other edition, does not
+        // replicate across Regions, so the call asks for something it does not support.
+        if directory.edition.as_deref() != Some(crate::state::DEFAULT_MICROSOFT_AD_EDITION) {
+            let described = directory
+                .edition
+                .clone()
+                .unwrap_or_else(|| directory.directory_type.clone());
+            return Err(AddRegionErrorModeled::UnsupportedOperationException(
+                crate::state::refusal(format!(
+                    "DirectoryId {id} names a {described} directory; Region replication is \
+                     supported for {edition} edition {supported} directories only",
+                    id = input.directory_id,
+                    edition = crate::state::DEFAULT_MICROSOFT_AD_EDITION,
+                    supported = crate::state::TYPE_MICROSOFT_AD
+                )),
+            )
+            .into());
+        }
+
+        // The Region the directory was created in is the one it already lives in, so
+        // there is no replication to add to it. Recorded behaviour refuses this as an
+        // operation that is not supported rather than as a Region the directory is
+        // already in: the primary Region is not a replication at all.
+        if directory.primary_region == input.region_name {
+            return Err(AddRegionErrorModeled::UnsupportedOperationException(
+                crate::state::refusal(format!(
+                    "Region {region} is the primary Region of directory {id}; specify a \
+                     different Region and try again",
+                    region = input.region_name,
+                    id = input.directory_id
+                )),
+            )
+            .into());
+        }
+
+        // A Region the directory is already replicated to is one it is already in, which
+        // is exactly what the modelled error states — and that error shape's own sentence
+        // is FIXED text with no interpolated values, so it is stated verbatim.
+        if directory.additional_regions.contains_key(&input.region_name) {
+            return Err(AddRegionErrorModeled::DirectoryAlreadyInRegionException(
+                crate::state::refusal(crate::state::DIRECTORY_ALREADY_IN_REGION),
+            )
+            .into());
+        }
+
+        // Replicating a directory changes the directory itself, so it needs one that is
+        // in service: one still being built by the transition its create owes is
+        // unavailable. The diagnostic is this service's shared one for a directory a call
+        // cannot reach.
+        if directory.stage != crate::state::STAGE_ACTIVE {
+            return Err(AddRegionErrorModeled::DirectoryUnavailableException(
+                crate::state::refusal(crate::state::directory_unavailable(&input.directory_id)),
+            )
+            .into());
+        }
+
+        // The per-directory set of replicated Regions carries its own bound, enforced
+        // here at its single insert site, and the modelled error for that bound is what
+        // refuses the call past it.
+        if directory.additional_regions.len() >= crate::state::MAX_ADDITIONAL_REGIONS {
+            return Err(AddRegionErrorModeled::RegionLimitExceededException(
+                crate::state::refusal(format!(
+                    "This emulator replicates one directory to at most {max} Regions beside \
+                     its primary one",
+                    max = crate::state::MAX_ADDITIONAL_REGIONS
+                )),
+            )
+            .into());
+        }
+
+        // The replication the call starts: the Region, the VPC its servers are placed in,
+        // and the two domain controllers this operation "adds in the specified Region".
+        // It answers while that Region is still being brought up, so the status starts at
+        // the transient stage a create's does and the move to `Active` is owed by the
+        // clock one transition span later — nothing here sleeps for it.
+        let now = ::std::time::SystemTime::now();
+        directory.additional_regions.insert(
+            input.region_name.clone(),
+            crate::state::RegionReplication {
+                region_name: input.region_name,
+                vpc_settings: Some(DirectoryVpcSettingsDescription {
+                    vpc_id: Some(input.vpc_settings.vpc_id),
+                    subnet_ids: Some(input.vpc_settings.subnet_ids),
+                    // The security group and the availability zones are chosen by the VPC
+                    // data plane this emulator does not have, so they stay absent rather
+                    // than invented.
+                    security_group_id: None,
+                    availability_zones: None,
+                }),
+                desired_number_of_domain_controllers: Some(
+                    crate::state::MICROSOFT_AD_DOMAIN_CONTROLLERS,
+                ),
+                status: crate::state::STAGE_REQUESTED.to_string(),
+                status_due_at: Some(now + crate::state::TRANSITION_SPAN),
+                launch_time: now,
+                status_last_updated: now,
+            },
+        );
+
+        Ok(AddRegionOutput {})
     }
 }

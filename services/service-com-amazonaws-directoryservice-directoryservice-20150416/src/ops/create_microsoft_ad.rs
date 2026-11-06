@@ -206,6 +206,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A directory's servers are placed in two subnets in two different Availability
+        // Zones, so a settings block naming fewer than two distinct subnets cannot carry
+        // them. Checked before anything is minted or inserted, so a refused call stores
+        // nothing.
+        if let Some(defect) = crate::state::subnet_pair_defect(&input.vpc_settings.subnet_ids) {
+            return Err(invalid_parameter(defect));
+        }
+
         // Nothing caller-sized reaches the store unchecked: the tag list is bounded
         // before the store lock is taken at all. `CreateMicrosoftAD` models no
         // `TagLimitExceededException`, so the bound is reported as the invalid
@@ -255,7 +263,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name,
             short_name,
             description: input.description,
-            // Only a Simple AD directory has a size; this one reports its edition.
+            // Only a Simple AD directory and an AD Connector echo a `Size`; this one's
+            // follows from the edition it runs (`Directory::reported_size`).
             size: None,
             edition: Some(
                 input
@@ -279,6 +288,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 security_group_id: None,
                 availability_zones: None,
             }),
+            // Only an AD Connector carries connection settings; `ConnectDirectory` is
+            // what persists them.
+            connect_settings: None,
             // `NetworkType`'s own documentation: "The default value is IPv4 or IPv6
             // based on the provided subnet capabilities" — a choice made by the VPC
             // data plane this emulator does not have, so an unspecified network type
@@ -298,9 +310,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The Region this directory is created in — its `Primary` one — is the one
             // the request was signed for.
             primary_region: crate::state::region_from_request(ctx.parts()),
-            // `AddRegion` (still scaffolded) is what replicates a directory to another
+            // `AddRegion` is what replicates a directory to another
             // Region; a fresh directory exists in its primary Region only.
-            additional_regions: ::std::collections::BTreeSet::new(),
+            additional_regions: ::std::collections::BTreeMap::new(),
             // `AddIpRoutes` is what routes an address block to this directory.
             ip_routes: ::std::collections::BTreeMap::new(),
             // `EnableLDAPS` / `EnableClientAuthentication` (both still scaffolded) are
@@ -323,6 +335,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // where Active Directory starts handing them out.
             computers: ::std::collections::BTreeMap::new(),
             next_computer_rid: crate::state::FIRST_COMPUTER_RID,
+            // The create makes the directory's administrator account, the one its
+            // `Password` is the password of; `ResetUserPassword` is what resets it.
+            users: crate::state::initial_users(crate::state::TYPE_MICROSOFT_AD, now),
+            // A Managed Microsoft AD directory carries the configurable settings this
+            // service publishes, each at its default value until `UpdateSettings`
+            // requests another; `DescribeSettings` reports them.
+            settings: crate::state::initial_settings(crate::state::TYPE_MICROSOFT_AD, now),
             // `EnableDirectoryDataAccess` is what opens the directory to the Directory
             // Service Data API; a fresh directory is closed to it.
             data_access_status: crate::state::DATA_ACCESS_DISABLED.to_string(),

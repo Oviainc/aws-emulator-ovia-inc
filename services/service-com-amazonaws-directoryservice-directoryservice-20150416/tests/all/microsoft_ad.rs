@@ -217,19 +217,30 @@ async fn a_created_microsoft_ad_directory_is_reported_from_persisted_state() {
             case.name
         );
         // What makes the record a Managed Microsoft AD rather than a Simple AD: its
-        // type, an edition instead of a size, and the domain controllers the modelled
-        // `DesiredNumberOfDomainControllers` reports "if the directory is Microsoft AD".
+        // type, an edition the request did not have to give, and the domain controllers
+        // the modelled `DesiredNumberOfDomainControllers` reports "if the directory is
+        // Microsoft AD".
         assert_eq!(
             described["Type"],
             json!(TYPE_MICROSOFT_AD),
             "case {:?}: expected Type {TYPE_MICROSOFT_AD}, got {described}",
             case.name
         );
+        // `CreateMicrosoftAD` takes no `Size`, so the reported one is DERIVED from the
+        // edition the directory runs: the Standard edition is the smaller capacity, every
+        // other edition the larger one.
+        let expected_size = if described["Edition"] == json!("Standard") {
+            "Small"
+        } else {
+            "Large"
+        };
         assert_eq!(
             described["Size"],
-            json!(null),
-            "case {:?}: expected no Size on a {TYPE_MICROSOFT_AD} directory, got {described}",
-            case.name
+            json!(expected_size),
+            "case {:?}: expected the Size derived from Edition {} to be {expected_size}, \
+             got {described}",
+            case.name,
+            described["Edition"]
         );
         assert_eq!(
             described["DesiredNumberOfDomainControllers"],

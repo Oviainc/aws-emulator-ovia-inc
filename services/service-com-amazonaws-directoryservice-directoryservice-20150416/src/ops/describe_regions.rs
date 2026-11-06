@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRegions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRegions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRegions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Regions one stored directory lives in: its primary Region — the one it was
+//! created in — and every Region `AddRegion` has replicated it to, each as the modelled
+//! `RegionDescription` carrying that Region's status, VPC placement, controller count and
+//! timestamps.
+//!
+//! Two outcomes follow from what the store holds for the requested id:
+//!
+//! * it names no stored directory — `DirectoryDoesNotExistException`, "The specified
+//!   directory does not exist in the system";
+//! * it names a stored directory — its Regions are reported, narrowed to the `RegionName`
+//!   the request asked for when it asked for one, so a Region the directory does not live
+//!   in reports an empty list rather than a refusal.
+//!
+//! REPORTING: it writes nothing of its own beyond the transitions the clock already made
+//! due, so the status a Region reports is the one its replication reached by itself. The
+//! whole list fits in one page — a directory lives in its primary Region plus at most
+//! [`crate::state::MAX_ADDITIONAL_REGIONS`] others — so no `NextToken` is ever issued and a
+//! request carrying one is refused with the modelled `InvalidNextTokenException`.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +166,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRegions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRegionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRegions"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Authorization comes FIRST, on the ARN of the directory the request NAMED, so a
+        // caller IAM does not permit is refused before the store is reached and learns
+        // nothing about whether that directory exists.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::service::authorization::directory_arn(ctx, &input.directory_id),
+        )
+        .map_err(DescribeRegionsErrorModeled::AccessDeniedException)?;
+
+        // This operation issues no `NextToken` (see the module docs), so any token a
+        // request carries is one it did not issue — refused BEFORE the store is reached,
+        // the way every paginated listing of this service refuses a token of its own it
+        // cannot resolve.
+        if input.next_token.is_some() {
+            return Err(DescribeRegionsErrorModeled::InvalidNextTokenException(
+                crate::state::invalid_next_token(),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        let directory = store.directories.get(&input.directory_id).ok_or_else(|| {
+            DescribeRegionsErrorModeled::DirectoryDoesNotExistException(crate::state::refusal(
+                crate::state::no_such_directory(&input.directory_id),
+            ))
+        })?;
+
+        Ok(DescribeRegionsOutput {
+            regions_description: Some(directory.region_list(input.region_name.as_deref())),
+            // Every Region of a directory fits in one page, so there is never a next one
+            // to name.
+            next_token: None,
+        })
     }
 }

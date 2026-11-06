@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ConnectDirectory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ConnectDirectory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ConnectDirectory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an AD Connector: mints a `DirectoryId`, persists the record (its name, short
+//! name, description, size, connection settings, network type and tags) in
+//! [`crate::state`] and answers with the minted id. The `Password` of the self-managed
+//! service account is `@sensitive` and no operation reports it back, so it is not stored.
+//!
+//! What makes the record an AD Connector rather than a directory this service RUNS:
+//!
+//! * its `Type` is [`crate::state::TYPE_AD_CONNECTOR`] and it counts against the
+//!   connected-directory quota ([`crate::state::MAX_CONNECTED_DIRECTORIES`]), the one
+//!   `GetDirectoryLimits` reports as `ConnectedDirectoriesLimit`;
+//! * the VPC it is placed in and the service account it reaches the self-managed
+//!   directory with are held as the modelled `DirectoryConnectSettingsDescription`, which
+//!   `DescribeDirectories` reports as `ConnectSettings` rather than `VpcSettings`;
+//! * the accounts it serves live in the self-managed directory it connects to, so it
+//!   holds none of its own ([`crate::state::USER_DIRECTORY_TYPES`]) and it runs no domain
+//!   controller of its own either.
+//!
+//! An AD Connector's servers are placed in the subnets the request names, so a
+//! `ConnectSettings` naming fewer than two distinct subnets cannot be placed in the two
+//! Availability Zones a directory of this service lives in and is refused with the
+//! modelled `InvalidParameterException` ([`crate::state::subnet_pair_defect`]) before
+//! anything is persisted.
+//!
+//! The connector is persisted in the modelled `Requested` stage with the move to `Active`
+//! owed by the clock one [`crate::state::TRANSITION_SPAN`] later, so a caller that
+//! describes it immediately still sees the transient stage.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +179,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ConnectDirectory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ConnectDirectoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ConnectDirectory"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The password of the service account in the self-managed directory. It is
+        // modelled `@sensitive`, no operation reports it back, and the self-managed
+        // directory it would be presented to is not something this emulator can reach —
+        // so it is bound here only to be dropped, and never reaches the store.
+        let _ = input.password;
+
+        // An AD Connector's servers are placed one per subnet, in two Availability Zones,
+        // so a settings block naming fewer than two distinct subnets cannot carry them.
+        // Checked before anything is minted or inserted, so a refused call stores nothing.
+        if let Some(defect) =
+            crate::state::subnet_pair_defect(&input.connect_settings.subnet_ids)
+        {
+            return Err(invalid_parameter(defect));
+        }
+
+        // Nothing caller-sized reaches the store unchecked: the tag list is bounded
+        // before the store lock is taken at all. `ConnectDirectory` models no
+        // `TagLimitExceededException`, so the bound is reported as the invalid parameter
+        // it is.
+        let requested_tags = input.tags.unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid_parameter(format!(
+                "Tags may carry at most {max} entries, got {got}",
+                max = crate::state::MAX_TAGS,
+                got = requested_tags.len()
+            )));
+        }
+        let tags: ::std::collections::BTreeMap<String, String> = requested_tags
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        // Each category of directory carries its own published Region quota, so this
+        // create counts against the connected one alone — the same bound
+        // `GetDirectoryLimits` reports as `ConnectedDirectoriesLimit`.
+        if store.category_limit_reached(crate::state::DirectoryLimitCategory::Connected) {
+            return Err(
+                ConnectDirectoryErrorModeled::DirectoryLimitExceededException(
+                    crate::state::refusal(format!(
+                        "Maximum number of directories in the region has been reached: {}",
+                        crate::state::MAX_CONNECTED_DIRECTORIES
+                    )),
+                )
+                .into(),
+            );
+        }
+
+        let directory_id = store.mint_directory_id();
+        let seq = store.next_seq();
+        let record = crate::state::Directory {
+            directory_id: directory_id.clone(),
+            name: input.name,
+            short_name: input.short_name,
+            description: input.description,
+            // `Size` is `@required` on this operation, so an AD Connector reports the
+            // size the request asked for.
+            size: Some(input.size),
+            // Only AWS Managed Microsoft AD has an edition.
+            edition: None,
+            directory_type: crate::state::TYPE_AD_CONNECTOR.to_string(),
+            stage: crate::state::STAGE_REQUESTED.to_string(),
+            stage_due_at: Some(now + crate::state::TRANSITION_SPAN),
+            launch_time: now,
+            stage_last_updated: now,
+            // No alias until `CreateAlias` assigns one; the directory id stands in for it
+            // until then.
+            alias: None,
+            // An AD Connector reports its placement as `ConnectSettings`, not as
+            // `VpcSettings`: the modelled `DirectoryDescription` carries both members and
+            // this type fills the connector one.
+            vpc_settings: None,
+            connect_settings: Some(DirectoryConnectSettingsDescription {
+                vpc_id: Some(input.connect_settings.vpc_id),
+                subnet_ids: Some(input.connect_settings.subnet_ids),
+                customer_user_name: Some(input.connect_settings.customer_user_name),
+                // The security group, the availability zones and the addresses of the
+                // connector servers are chosen by the VPC data plane this emulator does
+                // not have, so they stay absent rather than invented. The customer DNS
+                // addresses the request named are not members of this structure at all.
+                security_group_id: None,
+                availability_zones: None,
+                connect_ips: None,
+                connect_ips_v6: None,
+            }),
+            // `NetworkType`'s own documentation: "The default value is IPv4 or IPv6 based
+            // on the provided subnet capabilities" — a choice made by the VPC data plane
+            // this emulator does not have, so an unspecified network type stays absent
+            // rather than being invented.
+            network_type: input.network_type,
+            // `EnableSso` (still scaffolded) is what turns this on.
+            sso_enabled: false,
+            // A domain controller is a server of the directory's own domain, which an AD
+            // Connector does not run: it forwards to the self-managed directory's.
+            desired_number_of_domain_controllers: None,
+            domain_controllers: ::std::collections::BTreeMap::new(),
+            tags,
+            // The Region this connector is created in — its `Primary` one — is the one
+            // the request was signed for.
+            primary_region: crate::state::region_from_request(ctx.parts()),
+            additional_regions: ::std::collections::BTreeMap::new(),
+            // `AddIpRoutes` is what routes an address block to this directory.
+            ip_routes: ::std::collections::BTreeMap::new(),
+            // `EnableLDAPS` / `EnableClientAuthentication` are what record a setting for a
+            // type; nothing is configured at create.
+            ldaps_settings: ::std::collections::BTreeMap::new(),
+            client_authentication_settings: ::std::collections::BTreeMap::new(),
+            // `RegisterCertificate` is what registers a certificate with the directory; a
+            // fresh one has none.
+            certificates: ::std::collections::BTreeMap::new(),
+            schema_extensions: ::std::collections::BTreeMap::new(),
+            // `RegisterEventTopic` is what associates an Amazon SNS topic with the
+            // directory; a fresh one publishes to none.
+            event_topics: ::std::collections::BTreeMap::new(),
+            log_subscription: None,
+            conditional_forwarders: ::std::collections::BTreeMap::new(),
+            computers: ::std::collections::BTreeMap::new(),
+            next_computer_rid: crate::state::FIRST_COMPUTER_RID,
+            // The accounts an AD Connector serves live in the self-managed directory it
+            // connects to, so it holds none of its own.
+            users: crate::state::initial_users(crate::state::TYPE_AD_CONNECTOR, now),
+            // Configurable settings are a Managed Microsoft AD feature (see
+            // `crate::state::SETTINGS_DIRECTORY_TYPES`), so an AD Connector carries none.
+            settings: crate::state::initial_settings(crate::state::TYPE_AD_CONNECTOR, now),
+            // `EnableDirectoryDataAccess` is what opens a directory to the Directory
+            // Service Data API; a fresh one is closed to it.
+            data_access_status: crate::state::DATA_ACCESS_DISABLED.to_string(),
+            data_access_due_at: None,
+            seq,
+        };
+        store.directories.insert(directory_id.clone(), record);
+
+        // Read the id back out of the store, so the response cannot name a directory the
+        // insert did not persist.
+        let stored = store
+            .directories
+            .get(&directory_id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        Ok(ConnectDirectoryOutput {
+            directory_id: Some(stored.directory_id.clone()),
+        })
     }
+}
+
+/// Refuse the request with the modelled `InvalidParameterException`, naming the member
+/// and the rule it broke so the caller can fix the request from the message alone.
+fn invalid_parameter(message: String) -> ConnectDirectoryError {
+    ConnectDirectoryErrorModeled::InvalidParameterException(crate::state::refusal(message)).into()
 }

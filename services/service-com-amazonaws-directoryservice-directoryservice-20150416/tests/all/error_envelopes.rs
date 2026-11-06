@@ -180,7 +180,7 @@ fn refusal_table(directory_id: &str, taken_alias: &str) -> Vec<Refusal> {
     // operation that resolves a directory: the diagnostic quotes the id the request
     // carried, and the error shape is the one that operation models for it.
     for absent in ABSENT_DIRECTORY_IDS {
-        let lookups: [(&'static str, Value, &'static str); 11] = [
+        let lookups: [(&'static str, Value, &'static str); 10] = [
             (
                 "DeleteDirectory",
                 json!({ "DirectoryId": absent }),
@@ -214,11 +214,6 @@ fn refusal_table(directory_id: &str, taken_alias: &str) -> Vec<Refusal> {
             (
                 "CreateAlias",
                 json!({ "DirectoryId": absent, "Alias": "wellformedalias" }),
-                "EntityDoesNotExistException",
-            ),
-            (
-                "DescribeDirectories",
-                json!({ "DirectoryIds": [absent] }),
                 "EntityDoesNotExistException",
             ),
             (
@@ -268,6 +263,23 @@ fn refusal_table(directory_id: &str, taken_alias: &str) -> Vec<Refusal> {
             body: json!({ "DirectoryId": absent }),
             error: "DirectoryDoesNotExistException",
             diagnostic: Diagnostic::Fixed(directory_not_found(absent)),
+        });
+        // The two reads whose `DirectoryId` is a FILTER over another listing: those
+        // report the VALUE as an invalid directory id instead, in the singular or the
+        // plural spelling of the member it arrived in.
+        rows.push(Refusal {
+            case: format!("DescribeDirectories filtered by absent {absent}"),
+            operation: "DescribeDirectories",
+            body: json!({ "DirectoryIds": [absent] }),
+            error: "EntityDoesNotExistException",
+            diagnostic: Diagnostic::Fixed(format!("Invalid directory ID(s): {absent}.")),
+        });
+        rows.push(Refusal {
+            case: format!("DescribeSnapshots filtered by absent {absent}"),
+            operation: "DescribeSnapshots",
+            body: json!({ "DirectoryId": absent }),
+            error: "EntityDoesNotExistException",
+            diagnostic: Diagnostic::Fixed(format!("Invalid directory ID: {absent}.")),
         });
         // The tag family, whose diagnostic is its own.
         for (operation, body) in tag_calls(absent) {

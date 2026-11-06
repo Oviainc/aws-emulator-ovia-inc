@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/ad_assessment.rs"]
 mod ad_assessment;
+#[path = "all/ad_connector.rs"]
+mod ad_connector;
 #[path = "all/certificate_deregistration.rs"]
 mod certificate_deregistration;
 #[path = "all/certificate_listing.rs"]
@@ -37,6 +39,8 @@ mod directory_lifecycle;
 mod directory_limits;
 #[path = "all/directory_networking_and_settings.rs"]
 mod directory_networking_and_settings;
+#[path = "all/directory_settings.rs"]
+mod directory_settings;
 #[path = "all/directory_unsharing.rs"]
 mod directory_unsharing;
 #[path = "all/domain_controller_resize.rs"]
@@ -63,6 +67,8 @@ mod microsoft_ad;
 mod pagination_token_refusal;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/region_replication.rs"]
+mod region_replication;
 #[path = "all/request_id_header.rs"]
 mod request_id_header;
 #[path = "all/schema_extension_cancellation.rs"]
@@ -79,5 +85,9 @@ mod snapshot_deletion;
 mod snapshots;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/trust_conflict_message.rs"]
+mod trust_conflict_message;
 #[path = "all/trusts.rs"]
 mod trusts;
+#[path = "all/user_passwords.rs"]
+mod user_passwords;

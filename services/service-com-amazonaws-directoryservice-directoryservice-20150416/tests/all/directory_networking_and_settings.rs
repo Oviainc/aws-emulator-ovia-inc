@@ -30,10 +30,11 @@
 //!   refused as unsupported, a Region the directory does not exist in is refused as
 //!   not found, and a replicated Region is dropped.
 //!
-//! `EnableLDAPS`, `EnableClientAuthentication` and `AddRegion` are still scaffolded, so
-//! the settings and the replicated Regions those operations would write are seeded
-//! directly into the store — the seam `state_roundtrip.rs` documents — and then read
-//! back over HTTP. Everything an implemented operation can write is written over HTTP.
+//! `EnableLDAPS` and `EnableClientAuthentication` are still scaffolded, and a Simple AD
+//! directory does not replicate across Regions, so the settings those operations would
+//! write and the replicated Regions of such a directory are seeded directly into the
+//! store — the seam `state_roundtrip.rs` documents — and then read back over HTTP.
+//! Everything an implemented operation can write is written over HTTP.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -41,7 +42,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_directoryservice_directoryservice_20150416::state::{
-    ClientAuthenticationSetting, Directory, LdapsSetting, MAX_IP_ROUTES,
+    ClientAuthenticationSetting, Directory, LdapsSetting, RegionReplication, MAX_IP_ROUTES,
     MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY,
 };
 use service_com_amazonaws_directoryservice_directoryservice_20150416::ComAmazonawsDirectoryserviceDirectoryservice20150416State as DirectoryServiceState;
@@ -52,6 +53,23 @@ use super::directory_lifecycle::{
     PAST_ONE_SPAN, REGION,
 };
 use super::event_topics::epoch_seconds;
+
+/// A replication of a directory to `region` that is already in service, as `AddRegion`
+/// leaves one once the transition it owes has fallen due.
+///
+/// A Simple AD directory does not replicate across Regions, so `AddRegion` cannot write
+/// this one: the record is seeded directly, the seam `state_roundtrip.rs` documents.
+fn settled_replication(region: &str, now: SystemTime) -> RegionReplication {
+    RegionReplication {
+        region_name: region.to_string(),
+        vpc_settings: None,
+        desired_number_of_domain_controllers: None,
+        status: "Active".to_string(),
+        status_due_at: None,
+        launch_time: now,
+        status_last_updated: now,
+    }
+}
 
 /// Well-formed `DirectoryId`s no directory is ever created under, as `(id, class)`.
 ///
@@ -1299,13 +1317,13 @@ async fn remove_region_acts_on_the_region_the_call_was_signed_for() {
         }
 
         // A Region the directory IS replicated to is removed, and is then a Region it
-        // no longer exists in. `AddRegion` is still scaffolded, so the replication is
-        // seeded directly.
+        // no longer exists in. A Simple AD directory does not replicate across Regions,
+        // so the replication is seeded directly.
         let replica = "us-west-2";
         with_directory(&engine, &id, |directory| {
             directory
                 .additional_regions
-                .insert(replica.to_string());
+                .insert(replica.to_string(), settled_replication(replica, SystemTime::now()));
         });
         let (status, body) =
             call_in_region(&router, "RemoveRegion", json!({ "DirectoryId": id }), replica).await;
@@ -1359,7 +1377,10 @@ async fn removing_a_region_needs_a_directory_that_is_in_service() {
     )
     .await;
     with_directory(&engine, &id, |directory| {
-        directory.additional_regions.insert("us-west-2".to_string());
+        directory.additional_regions.insert(
+            "us-west-2".to_string(),
+            settled_replication("us-west-2", SystemTime::now()),
+        );
     });
     refused_in(
         &router,

@@ -224,15 +224,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.advance_clock(::std::time::SystemTime::now());
 
         // A `DirectoryIds` filter narrows the result, and an id naming no stored
-        // directory is reported rather than silently dropped from the page.
+        // directory is reported rather than silently dropped from the page. The ids
+        // arrived as a FILTER over the directories, so the refusal reports the VALUES as
+        // invalid directory ids — every unresolved one of them, comma-separated — rather
+        // than stating that one directory does not exist: the two ds not-found families
+        // are worded differently.
         if let Some(requested) = requested.as_ref() {
-            for directory_id in requested {
-                if !store.directories.contains_key(*directory_id) {
-                    return Err(DescribeDirectoriesErrorModeled::EntityDoesNotExistException(
-                        crate::state::refusal(crate::state::no_such_directory(directory_id)),
-                    )
-                    .into());
-                }
+            let unresolved: Vec<String> = requested
+                .iter()
+                .filter(|directory_id| !store.directories.contains_key(**directory_id))
+                .map(|directory_id| (*directory_id).clone())
+                .collect();
+            if !unresolved.is_empty() {
+                return Err(DescribeDirectoriesErrorModeled::EntityDoesNotExistException(
+                    crate::state::refusal(crate::state::invalid_directory_ids(&unresolved)),
+                )
+                .into());
             }
         }
 

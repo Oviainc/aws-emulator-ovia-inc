@@ -51,7 +51,12 @@
 //! A second seam is taken for the one thing this service words differently from the
 //! framework when it refuses a request at its boundary: see the `override_refusal` body
 //! below and [`stated_enum_values`].
+//!
+//! [`authorization`] is not a seam at all: it is the IAM decision the operations whose
+//! model declares `AccessDeniedException` take before they touch the store, held beside
+//! this file because it reads the IAM and STS stores rather than this service's own.
 
+pub mod authorization;
 pub mod request_id_header;
 
 use request_id_header::RequestIdHeaderOperation;

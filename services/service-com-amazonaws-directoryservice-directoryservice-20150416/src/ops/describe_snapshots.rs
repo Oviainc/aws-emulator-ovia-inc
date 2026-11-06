@@ -215,9 +215,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `DirectoryId` narrows the listing to one directory's snapshots, and an id
         // naming no stored directory is reported rather than served as an empty page.
+        // The id arrived as a FILTER over the snapshots, so the refusal reports the VALUE
+        // as an invalid directory id rather than stating that the directory does not
+        // exist — the two ds not-found families are worded differently.
         if let Some(directory_id) = input.directory_id.as_deref() {
             if !store.directories.contains_key(directory_id) {
-                return Err(entity_does_not_exist(crate::state::no_such_directory(
+                return Err(entity_does_not_exist(crate::state::invalid_directory_id(
                     directory_id,
                 )));
             }

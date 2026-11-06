@@ -447,11 +447,20 @@ async fn an_alternate_account_cannot_be_authenticated() {
                 "case {case:?}: expected the authentication-failure sentence, got {parsed}"
             );
             // Neither member of the credential pair is echoed back: a refusal discloses
-            // nothing the caller sent.
-            let body_text = parsed.to_string();
+            // nothing the caller sent. The call's own request id is not part of that —
+            // it is minted per call, so a one-character credential can turn up inside
+            // its hex digits by coincidence — so the check is scoped to what the refusal
+            // AUTHORS: its diagnostic and its error type.
+            let disclosed = format!(
+                "{diagnostic}{wire_type}",
+                diagnostic = message(&parsed, &case)
+                    .strip_suffix(&with_request_id("", &reported))
+                    .unwrap_or_default(),
+                wire_type = parsed["__type"],
+            );
             if let Some(password) = password {
                 assert!(
-                    !body_text.contains(password),
+                    !disclosed.contains(password),
                     "case {case:?}: the refusal must not echo the password, got {parsed}"
                 );
             }
