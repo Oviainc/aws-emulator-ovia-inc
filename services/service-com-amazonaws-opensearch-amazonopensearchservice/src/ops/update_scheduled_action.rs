@@ -215,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.action_id)
             .ok_or_else(|| {
                 UpdateScheduledActionErrorModeled::ResourceNotFoundException(
-                    scheduled_action_not_found(&input.action_id, &input.domain_name),
+                    scheduled_action_not_found(),
                 )
             })?;
 

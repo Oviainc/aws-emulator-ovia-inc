@@ -982,6 +982,9 @@ async fn fine_grained_access_control_decides_every_request_to_the_domain() {
     let created = emulator
         .create(json!({
             "DomainName": "guarded",
+            "EncryptionAtRestOptions": { "Enabled": true },
+            "NodeToNodeEncryptionOptions": { "Enabled": true },
+            "DomainEndpointOptions": { "EnforceHTTPS": true },
             "AdvancedSecurityOptions": {
                 "Enabled": true,
                 "InternalUserDatabaseEnabled": false,
@@ -1188,6 +1191,9 @@ async fn the_security_plugin_tells_every_authenticated_caller_who_it_is() {
     let created = emulator
         .create(json!({
             "DomainName": "who-am-i",
+            "EncryptionAtRestOptions": { "Enabled": true },
+            "NodeToNodeEncryptionOptions": { "Enabled": true },
+            "DomainEndpointOptions": { "EnforceHTTPS": true },
             "AdvancedSecurityOptions": {
                 "Enabled": true,
                 "InternalUserDatabaseEnabled": false,

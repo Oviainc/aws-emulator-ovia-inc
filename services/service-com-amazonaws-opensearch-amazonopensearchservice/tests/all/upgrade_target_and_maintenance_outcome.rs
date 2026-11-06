@@ -40,7 +40,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    MAINTAINABLE_DATA_NODES, MAINTENANCE_STATUS_SUCCESS, NODE_TYPE_DATA, SUPPORTED_ENGINE_VERSIONS,
+    MAINTAINABLE_DATA_NODES, MAINTENANCE_STATUS_SUCCESS, NODE_TYPE_DATA,
+    SUPPORTED_ENGINE_VERSIONS,
 };
 
 use super::compatible_versions::{compatible, entries, target_versions};
@@ -62,10 +63,20 @@ const UNPUBLISHED_VERSION: &str = "OpenSearch_99.9";
 /// all.
 const SOURCES: [&str; 3] = ["OpenSearch_2.11", "Elasticsearch_7.10", "OpenSearch_3.7"];
 
+/// The sentence the service refuses a dissociation of a package the domain is not
+/// holding with: fixed text carrying no value of the request. Spelled out here rather
+/// than taken from the crate, so a change to either one fails this suite.
+const PACKAGE_NOT_ASSOCIATED: &str = "Package is not associated to this domain.";
+
 /// The message the service states an ineligible target with: the two versions the
 /// eligibility was decided from, and nothing else of the request.
+///
+/// The two are rendered differently, as the service renders them: the version the domain
+/// RUNS keeps the engine prefix its record declares it with, while the target is stated as
+/// its bare release — the `X.Y` part of the `VersionString` the request carried.
 fn not_supported(source: &str, target: &str) -> String {
-    format!("Failed to submit upgrade. Upgrade from {source} to {target} not supported.")
+    let bare = target.split_once('_').map_or(target, |(_, release)| release);
+    format!("Failed to submit upgrade. Upgrade from {source} to {bare} not supported.")
 }
 
 /// The `EngineVersion` `DescribeDomain` reports for `name`.
@@ -367,7 +378,7 @@ async fn dissociating_a_link_the_domain_does_not_hold_is_refused_as_a_bad_reques
         ("a package associated with another domain", &ids[2]),
         ("a link this domain held and has had removed", &ids[1]),
     ] {
-        let expected = format!("Package {package_id} is not associated with domain {domain}.");
+        let expected = PACKAGE_NOT_ASSOCIATED;
         for (form, answer) in [
             (
                 "DissociatePackages",
@@ -386,7 +397,7 @@ async fn dissociating_a_link_the_domain_does_not_hold_is_refused_as_a_bad_reques
                 &answer,
                 400,
                 "ValidationException",
-                &expected,
+                expected,
                 &format!("{form} / {case}"),
             );
         }
@@ -413,7 +424,7 @@ async fn dissociating_a_link_the_domain_does_not_hold_is_refused_as_a_bad_reques
         &batch,
         400,
         "ValidationException",
-        &format!("Package {} is not associated with domain {domain}.", ids[3]),
+        PACKAGE_NOT_ASSOCIATED,
         "a batch whose last link is absent",
     );
     assert!(

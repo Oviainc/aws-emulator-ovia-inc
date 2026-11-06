@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! VPC endpoint access and the service-managed VPC endpoints themselves, split out of
-//! [`crate::state`] unchanged: an authorization is one principal's access to ONE domain
+//! [`crate::state`]: an authorization is one principal's access to ONE domain
 //! through an interface endpoint, and an endpoint is the proxy a caller in ANOTHER VPC
 //! reaches one domain through.
 
@@ -33,6 +33,30 @@ pub const PRINCIPAL_TYPE_AWS_SERVICE: &str = "AWS Service";
 /// set is held on the domain, with [`DOMAIN_QUOTA`] it also bounds the whole
 /// authorization store.
 pub const VPC_ENDPOINT_ACCESS_QUOTA: usize = 50;
+
+/// The sentence the service refuses a domain it cannot serve an interface VPC endpoint
+/// for with — whether the call asked to CREATE the endpoint
+/// ([`vpc_endpoint_domain_unavailable`]) or to grant or withdraw a principal's access to
+/// the domain through one ([`vpc_endpoint_access_domain_not_found`]).
+///
+/// The service states these as ONE refusal, and deliberately: which of the reasons holds
+/// is something the caller may not be entitled to learn, so the sentence names all three
+/// rather than the one that applied. It is the WHOLE message and carries no value of the
+/// request for the same reason — which is also why the access calls do not answer with
+/// the service's plain domain-not-found sentence ([`domain_not_found_message`]), which
+/// would disclose exactly what this one withholds.
+pub const DOMAIN_UNAVAILABLE_FOR_VPC_ENDPOINT: &str =
+    "Either the domain doesn't exist, it doesn't support creation of VPC endpoints, or you \
+     don't have permission to create a VPC endpoint for the domain.";
+
+/// The `ResourceNotFoundException` payload a grant or a withdrawal of VPC endpoint
+/// access answers a domain it cannot reach with
+/// ([`DOMAIN_UNAVAILABLE_FOR_VPC_ENDPOINT`]).
+pub fn vpc_endpoint_access_domain_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(DOMAIN_UNAVAILABLE_FOR_VPC_ENDPOINT.to_string()),
+    }
+}
 
 /// The principal a VPC endpoint access call names: what kind of principal it is, and the
 /// identity that names it.
@@ -361,20 +385,11 @@ impl VpcEndpointRecord {
 }
 
 /// The `ValidationException` payload for a `CreateVpcEndpoint` whose `DomainArn`
-/// names no domain this account holds, or names one no endpoint can be created for.
-///
-/// The service states these as ONE refusal, and deliberately: which of them holds is
-/// something the caller may not be entitled to learn, so the sentence names all the
-/// reasons rather than the one that applied. It carries no value of the request for
-/// the same reason.
+/// names no domain this account holds, or names one no endpoint can be created for
+/// ([`DOMAIN_UNAVAILABLE_FOR_VPC_ENDPOINT`]).
 pub fn vpc_endpoint_domain_unavailable() -> ValidationException {
     ValidationException {
-        message: Some(
-            "Either the domain doesn't exist, it doesn't support creation of VPC \
-             endpoints, or you don't have permission to create a VPC endpoint for the \
-             domain."
-                .to_string(),
-        ),
+        message: Some(DOMAIN_UNAVAILABLE_FOR_VPC_ENDPOINT.to_string()),
     }
 }
 
@@ -420,6 +435,7 @@ pub fn subnet_outside_endpoint_vpc(subnet_id: &str, vpc_id: &str) -> ValidationE
     }
 }
 
+/// The sentence `DescribeVpcEndpoints` states IN ITS PAYLOAD for an id that names no
 /// service-managed VPC endpoint: fixed text carrying no value of the request, because
 /// the entry beside it already names the id it is about.
 pub const ENDPOINT_DOES_NOT_EXIST: &str = "Endpoint does not exist";

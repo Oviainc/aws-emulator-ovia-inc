@@ -45,7 +45,10 @@ use super::scheduled_actions::{base_instant, base_millis, rows, seed, Row};
 
 /// `UpdateScheduledAction`:
 /// `PUT /2021-01-01/opensearch/domain/{DomainName}/scheduledAction/update`.
-async fn update(emulator: &Emulator, domain: &str, body: Value) -> Answer {
+///
+/// `pub(crate)` because the suite that asserts this service's refusal WORDING drives the
+/// same operation through this wrapper rather than growing a second copy of it.
+pub(crate) async fn update(emulator: &Emulator, domain: &str, body: Value) -> Answer {
     emulator
         .call(
             "PUT",
@@ -56,7 +59,14 @@ async fn update(emulator: &Emulator, domain: &str, body: Value) -> Answer {
 }
 
 /// The request body of a reschedule, with `DesiredStartTime` only where one is given.
-fn body(action_id: &str, action_type: &str, schedule_at: &str, desired: Option<i64>) -> Value {
+///
+/// `pub(crate)` for the reason [`update`] is.
+pub(crate) fn body(
+    action_id: &str,
+    action_type: &str,
+    schedule_at: &str,
+    desired: Option<i64>,
+) -> Value {
     let mut body = json!({
         "ActionID": action_id,
         "ActionType": action_type,

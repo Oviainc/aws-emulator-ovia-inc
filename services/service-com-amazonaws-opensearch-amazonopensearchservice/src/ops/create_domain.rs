@@ -320,6 +320,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resources it is served by and a user pool that exists.
         if let Some(refusal) = [
             crate::state::master_user_password_refusal(input.advanced_security_options.as_ref()),
+            // Fine-grained access control is served by the domain's encryption and its
+            // HTTPS-only endpoint, so a create that switches it on without one of those
+            // prerequisites describes a domain the service does not provision. Judged on
+            // the containers the REQUEST carried, which are the whole of what a create
+            // would store, and by the same rule the update path applies.
+            crate::state::advanced_security::prerequisites_refusal(
+                crate::state::advanced_security::requested_enabled(
+                    input.advanced_security_options.as_ref(),
+                ),
+                input.encryption_at_rest_options.as_ref(),
+                input.node_to_node_encryption_options.as_ref(),
+                input.domain_endpoint_options.as_ref(),
+            ),
+            // The master user is WHO that boundary grants everything to, so an ARN
+            // naming anything other than an IAM identity names a principal no request
+            // can arrive as.
+            crate::state::advanced_security::master_user_arn_refusal(
+                input.advanced_security_options.as_ref(),
+            ),
             crate::state::warm_storage_refusal(input.cluster_config.as_ref()),
             // A performance figure the volume type does not provision describes a
             // volume the service cannot attach

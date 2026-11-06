@@ -93,12 +93,20 @@ fn json_body(case: &str, answer: &Answer) -> Value {
 
 /// Create a domain whose authorization boundary is fine-grained access control, with the
 /// harness's own principal as its master user, answering the `ARN` its status published.
+///
+/// The three prerequisites of that boundary are carried too — the domain's data encrypted
+/// at rest, its node-to-node traffic encrypted and HTTPS-only traffic — because the
+/// OpenSearch control plane refuses a create that would switch fine-grained access
+/// control on without them.
 async fn create_fgac_domain(emulator: &Emulator, name: &str) -> String {
     let request = json!({
         "DomainName": name,
         "EngineVersion": "OpenSearch_2.11",
         "ClusterConfig": { "InstanceType": "t3.small.search", "InstanceCount": 1 },
         "EBSOptions": { "EBSEnabled": true, "VolumeType": "gp3", "VolumeSize": 10 },
+        "EncryptionAtRestOptions": { "Enabled": true },
+        "NodeToNodeEncryptionOptions": { "Enabled": true },
+        "DomainEndpointOptions": { "EnforceHTTPS": true },
         "AdvancedSecurityOptions": {
             "Enabled": true,
             "InternalUserDatabaseEnabled": false,

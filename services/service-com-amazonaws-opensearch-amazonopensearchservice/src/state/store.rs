@@ -1103,10 +1103,7 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
         // A removal needs a link to remove: a package the domain is not holding is
         // nothing this call can take off it.
         if !domain.package_associations.contains_key(package_id) {
-            return Err(AssociationRefusal::Validation(package_not_associated(
-                package_id,
-                domain_name,
-            )));
+            return Err(AssociationRefusal::Validation(package_not_associated()));
         }
 
         Ok(package.clone())

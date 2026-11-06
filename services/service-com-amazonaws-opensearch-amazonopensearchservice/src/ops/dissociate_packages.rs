@@ -89,7 +89,8 @@ use std::collections::BTreeSet;
 use std::time::SystemTime;
 
 use crate::state::{
-    domain_does_not_exist, internal_failure, package_named_twice, AssociationRefusal, Package,
+    domain_does_not_exist, duplicate_packages_in_request, internal_failure, AssociationRefusal,
+    Package,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -193,32 +194,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Each entry is read, checked and decided in ONE pass, and NOTHING is written
-        // until every package the call names can be dissociated, so a refused request
-        // leaves the domain's associations as they were.
+        // A domain holds ONE association per package, so the same package cannot be
+        // named twice by one call: that request asks for two removals of one link, and
+        // the service refuses the batch as a WHOLE with its fixed sentence for a request
+        // that repeats a package. It is a property of the REQUEST, so it is decided over
+        // the whole list before any entry is planned: which links the domain happens to
+        // hold cannot change the answer to a request that repeats a package.
         //
         // `PackageList` carries no length constraint, so how many entries it holds is
-        // the caller's — which is why the pass refuses at the first entry it cannot
-        // serve rather than walking the whole list first, and why nothing here is
-        // sized by that length. Every entry the pass admits names a DISTINCT
-        // association the domain holds, so the work and the records kept are bounded
-        // by the store: a request naming more than that is refused by the entry that
-        // repeats a package or names a link the domain does not have.
-        //
-        // A domain holds ONE association per package, so the same package cannot be
-        // named twice by one call: that request asks for two removals of one link.
-        // Each entry is then decided by the one shared decision this service makes
-        // about unlinking a package from a domain, so this call and the one that
-        // unlinks a single package cannot refuse the same request differently.
+        // the caller's; this pass is one walk of the list the framework already read, and
+        // the set it builds holds one entry per DISTINCT package named, so nothing here
+        // grows beyond the request body.
         let mut requested: BTreeSet<&str> = BTreeSet::new();
-        let mut planned: Vec<Package> = Vec::new();
         for package_id in &input.package_list {
             if !requested.insert(package_id.as_str()) {
                 return Err(DissociatePackagesErrorModeled::ValidationException(
-                    package_named_twice("PackageList", package_id),
+                    duplicate_packages_in_request(),
                 )
                 .into());
             }
+        }
+
+        // Each entry is then read, checked and decided in ONE pass, and NOTHING is
+        // written until every package the call names can be dissociated, so a refused
+        // request leaves the domain's associations as they were. Every entry names a
+        // DISTINCT association the domain holds, so the records kept are bounded by the
+        // store: a request naming more than that is refused by the entry that names a
+        // link the domain does not have.
+        //
+        // Each entry is decided by the one shared decision this service makes about
+        // unlinking a package from a domain, so this call and the one that unlinks a
+        // single package cannot refuse the same request differently.
+        let mut planned: Vec<Package> = Vec::new();
+        for package_id in &input.package_list {
             planned.push(
                 store
                     .plan_package_dissociation(&input.domain_name, package_id)

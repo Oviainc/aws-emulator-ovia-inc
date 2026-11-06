@@ -35,7 +35,10 @@ use super::vpc_endpoint_access::{
 
 /// `RevokeVpcEndpointAccess`:
 /// `POST /opensearch/domain/{DomainName}/revokeVpcEndpointAccess`.
-async fn revoke(emulator: &Emulator, domain: &str, body: Value) -> Answer {
+///
+/// `pub(crate)` because the suite that asserts this service's refusal WORDING drives the
+/// same operation through this wrapper rather than growing a second copy of it.
+pub(crate) async fn revoke(emulator: &Emulator, domain: &str, body: Value) -> Answer {
     emulator
         .call(
             "POST",

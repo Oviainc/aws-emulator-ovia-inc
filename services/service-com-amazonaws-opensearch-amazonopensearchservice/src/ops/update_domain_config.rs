@@ -462,10 +462,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // merge below moves it: what `CancelDomainConfigChange` puts back if the
         // change this call starts is cancelled before it lands.
         let before = crate::state::DomainOptions::capture(&merged);
-        // Whether the STORED domain has work in flight, and which dry run the request
-        // asked for — both read here, before `merge` consumes the request and moves
-        // the copy, so the state gates below judge the record the request arrived at.
+        // Whether the STORED domain has work in flight, which of the one-way security
+        // switches it already runs behind, and which dry run the request asked for — all
+        // read here, before `merge` consumes the request and moves the copy, so the rules
+        // below judge the record the request arrived at rather than the merged one.
         let stored_work_in_flight = merged.work_in_flight();
+        let stored_advanced_security = crate::state::fgac::enforced(&merged);
+        let stored_node_to_node_encryption = merged
+            .node_to_node_encryption_options
+            .as_ref()
+            .and_then(|options| options.enabled)
+            == Some(true);
         let input_dry_run_mode = input.dry_run_mode.clone();
 
         // The master credential of the internal user database has to meet the
@@ -475,6 +482,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(refusal) =
             crate::state::master_user_password_refusal(input.advanced_security_options.as_ref())
         {
+            return Err(UpdateDomainConfigErrorModeled::ValidationException(refusal).into());
+        }
+
+        // Fine-grained access control and node-to-node encryption are ONE-WAY: the
+        // service cannot take back a boundary the domain already runs behind, so a
+        // request asking either to be switched off is refused and the setting stays
+        // enabled. It is decided from the STORED record and the request alone — the
+        // record as the call arrived at it, captured above — so it is answered BEFORE
+        // the state gates below: a configuration the service never applies is refused
+        // whatever the domain happens to be busy with, rather than being reported as a
+        // change that is merely waiting for the domain to go quiet.
+        if let Some(refusal) = crate::state::advanced_security::one_way_switch_refusal(
+            stored_advanced_security,
+            input.advanced_security_options.as_ref(),
+            stored_node_to_node_encryption,
+            input.node_to_node_encryption_options.as_ref(),
+        ) {
+            return Err(UpdateDomainConfigErrorModeled::ValidationException(refusal).into());
+        }
+
+        // The master user a change names is WHO fine-grained access control grants
+        // everything to, so it has to be an IAM identity — checked on the REQUEST, by
+        // the rule the create path applies, because the stored record keeps only the
+        // ARN a call already admitted.
+        if let Some(refusal) = crate::state::advanced_security::master_user_arn_refusal(
+            input.advanced_security_options.as_ref(),
+        ) {
             return Err(UpdateDomainConfigErrorModeled::ValidationException(refusal).into());
         }
 
@@ -539,6 +573,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the change would do, and this change cannot be applied.
         if let Some(refusal) = [
             crate::state::warm_storage_refusal(Some(&merged.cluster_config)),
+            // Fine-grained access control is served by the domain's encryption and its
+            // HTTPS-only endpoint, and the change is judged on the MERGED record for
+            // the reason the storage rules are: a request that switches the boundary on
+            // is checked against the encryption the domain keeps, and one that switches
+            // off a prerequisite against the boundary it keeps.
+            crate::state::advanced_security::prerequisites_refusal(
+                crate::state::fgac::enforced(&merged),
+                merged.encryption_at_rest_options.as_ref(),
+                merged.node_to_node_encryption_options.as_ref(),
+                merged.domain_endpoint_options.as_ref(),
+            ),
             crate::state::log_publishing_refusal(merged.log_publishing_options.iter()),
             crate::state::off_peak_window_refusal(merged.off_peak_window_options.as_ref()),
             // A performance figure the volume type does not provision is refused on the

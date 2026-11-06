@@ -173,10 +173,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // Access is access TO a domain, so a name the registry does not resolve names
         // nothing that can be reached: the modelled missing-resource refusal rather
-        // than an authorization held against no domain.
+        // than an authorization held against no domain. The sentence is the one the
+        // service states for a domain a VPC endpoint cannot be created for, which does
+        // not say whether a domain of that name exists — so this refusal is not the
+        // plain domain-not-found one every other call answers with.
         let domain = store.domains.get_mut(&input.domain_name).ok_or_else(|| {
             AuthorizeVpcEndpointAccessErrorModeled::ResourceNotFoundException(
-                crate::state::domain_not_found(&input.domain_name),
+                crate::state::vpc_endpoint_access_domain_not_found(),
             )
         })?;
 

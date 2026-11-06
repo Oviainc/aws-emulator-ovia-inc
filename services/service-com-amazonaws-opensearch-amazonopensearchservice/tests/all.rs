@@ -15,6 +15,8 @@
 mod absent_scope_listings;
 #[path = "all/action_type_value_set_order.rs"]
 mod action_type_value_set_order;
+#[path = "all/advanced_security_configuration.rs"]
+mod advanced_security_configuration;
 #[path = "all/application_create_refusals.rs"]
 mod application_create_refusals;
 #[path = "all/application_deletion.rs"]
@@ -111,6 +113,8 @@ mod dry_run_progress;
 mod ebs_volume_size_limit;
 #[path = "all/engine_version_resolution.rs"]
 mod engine_version_resolution;
+#[path = "all/fixed_sentence_refusals.rs"]
+mod fixed_sentence_refusals;
 #[path = "all/inbound_connection_acceptance.rs"]
 mod inbound_connection_acceptance;
 #[path = "all/inbound_connections.rs"]

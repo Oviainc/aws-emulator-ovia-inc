@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Packages, split out of [`crate::state`] unchanged: a package of this account, its
-//! versions, and the association that links one package to one domain.
+//! Packages, split out of [`crate::state`]: a package of this account, its versions, and
+//! the association that links one package to one domain.
+//!
+//! [`Package`] below is the ONE copy every package operation reads and writes, and
+//! [`Package::to_details`] the single `PackageDetails` projection they report it through,
+//! so no two of them can describe the same package differently. A [`PackageAssociation`]
+//! is the one record of a package's link to a domain, which the single and batch
+//! associate and dissociate operations all read and write.
 
 use super::*;
 
@@ -363,6 +369,22 @@ pub const PACKAGE_IN_USE: &str = "Operation not allowed. Package is in use.";
 /// has no variable part, so the id the call could not resolve does not appear in it.
 pub const PACKAGE_NOT_FOUND: &str = "Package not found.";
 
+/// The message a batch package operation refuses a request that names the same package
+/// more than once with ([`duplicate_packages_in_request`]).
+///
+/// The service's own fixed sentence for that condition: it is the WHOLE message and has
+/// no variable part, so neither the member that repeated a package nor the repeated id
+/// appears in it.
+pub const DUPLICATE_PACKAGES_IN_REQUEST: &str =
+    "Operation not allowed. Duplicate packages found in the request.";
+
+/// The message a dissociation of a package the domain is not holding is refused with
+/// ([`package_not_associated`]).
+///
+/// The service's own fixed sentence for that condition: the whole message, with no
+/// variable part — neither the package nor the domain it is not on appears in it.
+pub const PACKAGE_NOT_ASSOCIATED: &str = "Package is not associated to this domain.";
+
 /// `ErrorDetails$ErrorType` for an association whose last transition failed — "the type
 /// of error that occurred".
 ///
@@ -556,18 +578,17 @@ pub fn package_in_use() -> ValidationException {
     }
 }
 
-/// The refusal payload for a dissociation of a package the domain is not holding:
-/// the link the call asks to remove does not exist, so the refusal names both the
-/// package and the domain it is not on.
+/// The refusal payload for a dissociation of a package the domain is not holding: the
+/// link the call asks to remove does not exist, so there is nothing for it to act on.
 ///
 /// A request naming a relationship that cannot be dissolved is refused as a bad
 /// REQUEST rather than as a missing resource: both the package and the domain it
 /// names exist, and it is the link between them the service has nothing to act on.
-pub fn package_not_associated(package_id: &str, domain_name: &str) -> ValidationException {
+/// Its wording is the service's fixed sentence for that condition
+/// ([`PACKAGE_NOT_ASSOCIATED`]), which carries no value of the request.
+pub fn package_not_associated() -> ValidationException {
     ValidationException {
-        message: Some(format!(
-            "Package {package_id} is not associated with domain {domain_name}."
-        )),
+        message: Some(PACKAGE_NOT_ASSOCIATED.to_string()),
     }
 }
 
@@ -636,12 +657,16 @@ pub fn domain_does_not_exist(domain_name: &str) -> ValidationException {
     }
 }
 
-/// The `ValidationException` payload for a package the same call names twice: a
-/// domain holds ONE association per package, so a request that names it twice asks
-/// for two states of one association and cannot be served as asked.
-pub fn package_named_twice(member: &str, package_id: &str) -> ValidationException {
+/// The `ValidationException` payload for a batch that names the same package more than
+/// once: a domain holds ONE association per package, so a request that names it twice
+/// asks for two states of one association and is refused as a WHOLE.
+///
+/// Its wording is the service's fixed sentence for that condition
+/// ([`DUPLICATE_PACKAGES_IN_REQUEST`]), which carries no value of the request: a caller
+/// is told its batch repeats a package, not which id it repeated.
+pub fn duplicate_packages_in_request() -> ValidationException {
     ValidationException {
-        message: Some(format!("{member} names package {package_id} twice.")),
+        message: Some(DUPLICATE_PACKAGES_IN_REQUEST.to_string()),
     }
 }
 

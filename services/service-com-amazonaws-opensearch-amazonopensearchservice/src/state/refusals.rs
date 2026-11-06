@@ -533,14 +533,18 @@ pub fn informational_insight_details(
 /// one, and states the two versions the eligibility was decided from: the version the
 /// domain runs, read from its stored record, and the version the request asked for.
 /// Nothing else of the request is named and nothing of the domain's state moves.
-pub fn incompatible_target_version(
-    source_version: &str,
-    target_version: &str,
-) -> BaseException {
+///
+/// The two are rendered as the service renders them, which is NOT the same form: the
+/// domain's version keeps the engine prefix its record declares it with, while the
+/// target is stated as its bare release ([`bare_engine_release`]) — the release the
+/// caller asked for, without the engine name the `VersionString` pattern puts in front
+/// of it.
+pub fn incompatible_target_version(source_version: &str, target_version: &str) -> BaseException {
     BaseException {
         message: Some(format!(
-            "Failed to submit upgrade. Upgrade from {source_version} to {target_version} \
-             not supported."
+            "Failed to submit upgrade. Upgrade from {source_version} to {} \
+             not supported.",
+            bare_engine_release(target_version)
         )),
     }
 }

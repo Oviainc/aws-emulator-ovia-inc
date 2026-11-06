@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Input-to-stored projections, split out of [`crate::state`] unchanged: the OUTPUT
-//! shape a record stores for each INPUT shape a request carries, the ids a create
-//! mints, and the endpoint names a domain publishes.
+//! Input-to-stored projections: the OUTPUT shape a record stores for each INPUT shape a
+//! request carries, the ids a create mints, the endpoint names a domain publishes, the
+//! JSON documents a request carries and a response reports, and the detail views a read
+//! is answered with — each with ONE rendering here, so two operations reporting the same
+//! record report it identically.
 
 use super::*;
 

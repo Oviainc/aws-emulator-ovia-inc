@@ -69,6 +69,19 @@ fn fine_grained_access(password: &str) -> Value {
     })
 }
 
+/// Put the three prerequisites of fine-grained access control into `body` — the domain's
+/// data encrypted at rest, its node-to-node traffic encrypted and HTTPS-only traffic.
+///
+/// A create or an update that would leave the boundary switched on without one of them is
+/// refused, so a case about the master CREDENTIAL carries all three and the only thing it
+/// varies is the password.
+fn with_fine_grained_prerequisites(mut body: Value) -> Value {
+    body["EncryptionAtRestOptions"] = json!({ "Enabled": true });
+    body["NodeToNodeEncryptionOptions"] = json!({ "Enabled": true });
+    body["DomainEndpointOptions"] = json!({ "EnforceHTTPS": true });
+    body
+}
+
 /// Assert that `answer` is a modelled 400 refusal carrying `code` — the error the
 /// service answers this class of unprovisionable configuration with.
 pub(crate) fn assert_refusal(answer: &Answer, code: &str, case: &str) {
@@ -128,13 +141,9 @@ async fn a_master_password_must_meet_the_published_complexity_requirement() {
 
     for (index, (case, password, accepted)) in rows.iter().enumerate() {
         let name = format!("fgac-create-{index}");
-        let answer = create_with(
-            &emulator,
-            &name,
-            "AdvancedSecurityOptions",
-            fine_grained_access(password),
-        )
-        .await;
+        let mut body = with_fine_grained_prerequisites(baseline_create(&name));
+        body["AdvancedSecurityOptions"] = fine_grained_access(password);
+        let answer = emulator.create(body).await;
         if *accepted {
             assert_eq!(
                 answer.status, 200,
@@ -186,7 +195,14 @@ async fn a_master_password_must_meet_the_published_complexity_requirement() {
     // The same rule holds on the call that CHANGES a domain's fine-grained access
     // control, so a weak password cannot be reached by updating into it.
     let name = "fgac-update";
-    create_baseline(&emulator, name).await;
+    let created = emulator
+        .create(with_fine_grained_prerequisites(baseline_create(name)))
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case CreateDomain({name:?}): expected 200, got {} with {:?}",
+        created.status, created.body
+    );
     // The service applies one change of a domain at a time, so each accepted change
     // has to land before the next row's update can start another.
     tokio::time::sleep(SETTLE_WAIT).await;
