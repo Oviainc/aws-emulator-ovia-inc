@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInvestigations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInvestigations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInvestigations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the investigations a behavior graph holds, narrowed by the
+//! request's filter criteria, ordered by its sort criteria and served one page at a
+//! time.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +125,103 @@ impl From<ListInvestigationsErrorModeled> for ListInvestigationsError {
     }
 }
 
+/// The `Field` values the modelled `SortCriteria$Field` enum accepts
+/// (`smithy_query(query="shape",shape="Field")`): the investigation attribute a request
+/// asks the results to be ordered by.
+const FIELD_SEVERITY: &str = "SEVERITY";
+/// See [`FIELD_SEVERITY`].
+const FIELD_STATUS: &str = "STATUS";
+/// See [`FIELD_SEVERITY`].
+const FIELD_CREATED_TIME: &str = "CREATED_TIME";
+
+/// `SortOrder$DESC` (`smithy_query(query="shape",shape="SortOrder")`): the one value
+/// that reverses the ascending walk of the sort field.
+const SORT_ORDER_DESC: &str = "DESC";
+
+/// The investigation id a `NextToken` names, or the modelled `ValidationException` when
+/// the token is not one this operation issued.
+///
+/// The token's own text is never echoed back: it is opaque to a caller, and a caller
+/// that invents one is told only that it is not a token from here.
+fn next_investigation_id(token: &str) -> Result<String, ListInvestigationsError> {
+    crate::state::decode_page_token(token)
+        .filter(|id| crate::state::is_investigation_id(id))
+        .ok_or_else(invalid_next_token)
+}
+
+/// The refusal a `NextToken` this operation cannot resolve carries: the modelled 400.
+///
+/// A token names the investigation the next page starts at, so one this operation never
+/// issued and one whose investigation the current result set no longer holds are the
+/// same condition — "using an expired pagination token will return a Validation
+/// Exception error".
+fn invalid_next_token() -> ListInvestigationsError {
+    ListInvestigationsErrorModeled::ValidationException(ValidationException {
+        message: Some(
+            "NextToken is not a pagination token issued by ListInvestigations".to_string(),
+        ),
+        error_code: Some("INVALID_REQUEST_BODY".to_string()),
+        error_code_reason: Some(
+            "NextToken must be a token a previous ListInvestigations response returned".to_string(),
+        ),
+    })
+    .into()
+}
+
+/// Whether `investigation` satisfies every criterion `criteria` names.
+///
+/// Each member of `FilterCriteria` restricts the results to the investigations whose
+/// matching attribute equals the filter's value — `CreatedTime` to the ones created
+/// inside its inclusive interval ("including the start date", "including the end
+/// date") — and the criteria a request names apply together. A value no investigation
+/// of the graph carries therefore selects none, which is an empty page rather than a
+/// refusal.
+fn matches_criteria(
+    investigation: &crate::state::Investigation,
+    criteria: Option<&FilterCriteria>,
+) -> bool {
+    let Some(criteria) = criteria else {
+        return true;
+    };
+    let equals = |filter: &Option<StringFilter>, attribute: &str| {
+        filter
+            .as_ref()
+            .is_none_or(|filter| filter.value == attribute)
+    };
+    equals(&criteria.severity, &investigation.severity)
+        && equals(&criteria.status, &investigation.status)
+        && equals(&criteria.state, &investigation.state)
+        && equals(&criteria.entity_arn, &investigation.entity_arn)
+        && criteria.created_time.as_ref().is_none_or(|interval| {
+            let start = interval.start_inclusive.to_millis().unwrap_or(i64::MIN);
+            let end = interval.end_inclusive.to_millis().unwrap_or(i64::MAX);
+            (start..=end).contains(&investigation.created_time_millis)
+        })
+}
+
+/// The key `investigation` sorts by when the results are ordered on `field`.
+///
+/// `CREATED_TIME` orders chronologically; `SEVERITY` and `STATUS` order by the rank
+/// their value has in the modelled enum's own declaration order
+/// ([`crate::state::SEVERITY_RANKING`], [`crate::state::STATUS_RANKING`]), which is the
+/// ladder each attribute runs along rather than the alphabet. A request that names no
+/// field asks for no reordering, so the store's own key order stands. The investigation
+/// id is the last component of every key, so the order is TOTAL and a page token names
+/// an unambiguous position in it.
+fn sort_key(investigation: &crate::state::Investigation, field: Option<&str>) -> (i64, String) {
+    let primary = match field {
+        Some(FIELD_SEVERITY) => {
+            crate::state::rank_in(crate::state::SEVERITY_RANKING, &investigation.severity) as i64
+        }
+        Some(FIELD_STATUS) => {
+            crate::state::rank_in(crate::state::STATUS_RANKING, &investigation.status) as i64
+        }
+        Some(FIELD_CREATED_TIME) => investigation.created_time_millis,
+        _ => 0,
+    };
+    (primary, investigation.investigation_id.clone())
+}
+
 /// The `ListInvestigations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -166,18 +258,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInvestigations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInvestigationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInvestigations"))
+        let _ = ctx;
+        // `GraphArn`'s pattern, `MaxResults`' 1..100 range, `NextToken`'s length and the
+        // `Field`/`SortOrder` value sets are modelled constraints the centralized walk
+        // has already refused anything outside of, so what reaches here is a well-formed
+        // request: the only questions left are which investigations this graph holds and
+        // which of them the request asked for.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListInvestigationsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the behavior graph store is unavailable".to_string()),
+            })
+        })?;
+
+        // The page size is the server's own decision, clamped whatever the request asked
+        // for, so no allocation below is sized by caller input.
+        let page_size = crate::state::page_size_within(
+            input.max_results,
+            crate::state::MAX_INVESTIGATION_PAGE_SIZE,
+        );
+        let start_at = input
+            .next_token
+            .as_deref()
+            .map(next_investigation_id)
+            .transpose()?;
+        let field = input
+            .sort_criteria
+            .as_ref()
+            .and_then(|criteria| criteria.field.as_deref());
+        let descending = input
+            .sort_criteria
+            .as_ref()
+            .and_then(|criteria| criteria.sort_order.as_deref())
+            == Some(SORT_ORDER_DESC);
+        let now = crate::state::now_epoch_millis();
+
+        let mut store = state.lock();
+        let graph = store.graph_mut(&input.graph_arn).ok_or_else(|| {
+            ListInvestigationsErrorModeled::ResourceNotFoundException(
+                crate::state::investigation_graph_not_found(),
+            )
+        })?;
+        // The ONLY write this report makes: each investigation's run was due to finish at
+        // an instant the clock has already passed, so it is materialised here rather than
+        // reported as still running, and the next caller sees exactly this. See
+        // `crate::state::Investigation::settle`.
+        graph.settle_investigations(now);
+
+        // Every investigation the graph holds is a candidate — the lifecycle `State` is
+        // one of the attributes a request may filter ON, so a listing narrows to one
+        // state only when it is asked to.
+        let mut ordered: Vec<&crate::state::Investigation> = graph
+            .investigations
+            .values()
+            .filter(|investigation| matches_criteria(investigation, input.filter_criteria.as_ref()))
+            .collect();
+        ordered.sort_by_key(|investigation| sort_key(investigation, field));
+        if descending {
+            ordered.reverse();
+        }
+
+        // The token names the investigation the next page starts at, so a page is served
+        // from that position in this very order.
+        let first = match &start_at {
+            Some(investigation_id) => ordered
+                .iter()
+                .position(|investigation| investigation.investigation_id == *investigation_id)
+                .ok_or_else(invalid_next_token)?,
+            None => 0,
+        };
+        let investigation_details: Vec<InvestigationDetail> = ordered[first..]
+            .iter()
+            .take(page_size)
+            .map(|investigation| investigation.detail())
+            .collect();
+        // The first investigation that did not fit becomes the next page's start, and
+        // only then is a `NextToken` emitted: the last page carries none.
+        let next_token = ordered
+            .get(first + investigation_details.len())
+            .map(|investigation| crate::state::encode_page_token(&investigation.investigation_id));
+
+        Ok(ListInvestigationsOutput {
+            investigation_details: Some(investigation_details),
+            next_token,
+        })
     }
 }

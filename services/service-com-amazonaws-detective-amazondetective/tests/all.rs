@@ -23,6 +23,8 @@ mod datasource_package_ingest;
 mod datasource_package_reporting;
 #[path = "all/investigation_state_transitions.rs"]
 mod investigation_state_transitions;
+#[path = "all/list_investigations.rs"]
+mod list_investigations;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
 #[path = "all/member_datasource_ingest_history.rs"]

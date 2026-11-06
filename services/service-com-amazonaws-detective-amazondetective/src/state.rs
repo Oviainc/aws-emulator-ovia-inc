@@ -12,15 +12,15 @@
 //!
 //! `tags` lives on the graph record, which is what `TagResource` writes and
 //! `ListTagsForResource` reads, and so does the investigation record `StartInvestigation`
-//! mints and `GetInvestigation` reads: the graph owns everything scoped to it, so
-//! deleting the graph drops all of it at once.
+//! mints and `GetInvestigation` and `ListInvestigations` read: the graph owns everything
+//! scoped to it, so deleting the graph drops all of it at once.
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    DatasourcePackageIngestDetail, Graph as GraphDetail, MemberDetail, MembershipDatasources,
-    ResourceNotFoundException, TimestampForCollection, UnprocessedAccount,
+    DatasourcePackageIngestDetail, Graph as GraphDetail, InvestigationDetail, MemberDetail,
+    MembershipDatasources, ResourceNotFoundException, TimestampForCollection, UnprocessedAccount,
 };
 
 /// Characters a behavior-graph id is built from.
@@ -267,6 +267,27 @@ pub const ENTITY_TYPE_IAM_ROLE: &str = "IAM_ROLE";
 /// chooses, short enough not to slow a caller down and long enough that a caller
 /// reading straight back still observes `RUNNING`.
 pub const INVESTIGATION_RUN_MILLIS: i64 = 500;
+
+/// The largest page of investigations this service will return.
+///
+/// From the modelled `MaxResults` range 1..100 that `ListInvestigations` binds its
+/// `MaxResults` to (`smithy_query(query="operation",operation="ListInvestigations")`),
+/// which is a narrower bound than the member-surface [`MAX_PAGE_SIZE`]; it is also the
+/// page size used when a request names none.
+pub const MAX_INVESTIGATION_PAGE_SIZE: usize = 100;
+
+/// The modelled `Severity` values in the order the enum DECLARES them
+/// (`smithy_query(query="shape",shape="Severity")`), which is the ladder severity
+/// "based on the likelihood and impact of the indicators of compromise" runs along —
+/// the order `ListInvestigations` sorts by when it is asked to sort on that field.
+/// `SEVERITY_VALUES` is the same set spelled alphabetically, so it cannot stand in.
+pub const SEVERITY_RANKING: &[&str] = &["INFORMATIONAL", "LOW", "MEDIUM", "HIGH", "CRITICAL"];
+
+/// The modelled `Status` values in the order the enum DECLARES them
+/// (`smithy_query(query="shape",shape="Status")`), which runs from the status a run
+/// starts in to the statuses its completion yields. Used exactly as
+/// [`SEVERITY_RANKING`] is.
+pub const STATUS_RANKING: &[&str] = &["RUNNING", "FAILED", "SUCCESSFUL"];
 
 /// The most investigations one behavior graph will hold.
 ///
@@ -572,6 +593,21 @@ impl Investigation {
                 self.status = INVESTIGATION_STATUS_FAILED.to_string();
                 self.completion_due_millis = None;
             }
+        }
+    }
+
+    /// This investigation as `ListInvestigations`' `InvestigationDetail` shape reports
+    /// it: the summary members of the one record `GetInvestigation` reports in full, so
+    /// a list entry and a read of the same investigation can never disagree.
+    pub fn detail(&self) -> InvestigationDetail {
+        InvestigationDetail {
+            investigation_id: Some(self.investigation_id.clone()),
+            severity: Some(self.severity.clone()),
+            status: Some(self.status.clone()),
+            state: Some(self.state.clone()),
+            created_time: Some(millis_to_date_time(self.created_time_millis)),
+            entity_arn: Some(self.entity_arn.clone()),
+            entity_type: Some(self.entity_type.clone()),
         }
     }
 }
@@ -1143,6 +1179,15 @@ pub fn is_account_id(account_id: &str) -> bool {
     account_id.len() == ACCOUNT_ID_LEN && matches_account_id_pattern(account_id)
 }
 
+/// Whether `value` is shaped like the modelled `InvestigationId` (21 digits).
+///
+/// The modelled constraint is already enforced on every input member that targets it,
+/// so this is only used to check a value the model cannot police — the id carried
+/// inside an opaque pagination token.
+pub fn is_investigation_id(value: &str) -> bool {
+    value.len() == INVESTIGATION_ID_LEN && value.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Whether `value` satisfies the modelled `AccountId` `@pattern`
 /// ([`ACCOUNT_ID_PATTERN`], digits only and at least one), independent of its `@length`:
 /// the two are separate constraints and this service states their refusals differently.
@@ -1155,9 +1200,14 @@ pub fn matches_account_id_pattern(value: &str) -> bool {
 /// The size is the server's own decision — clamped into `1..=MAX_PAGE_SIZE` — so no
 /// allocation a list handler makes is sized by caller input.
 pub fn page_size(requested: Option<i32>) -> usize {
-    requested.map_or(MAX_PAGE_SIZE, |value| {
-        value.clamp(1, MAX_PAGE_SIZE as i32) as usize
-    })
+    page_size_within(requested, MAX_PAGE_SIZE)
+}
+
+/// As [`page_size`], for a surface whose modelled `MaxResults` carries its own upper
+/// bound: the size served is clamped into `1..=max`, so it is the server's decision
+/// whatever the request asked for.
+pub fn page_size_within(requested: Option<i32>, max: usize) -> usize {
+    requested.map_or(max, |value| value.clamp(1, max as i32) as usize)
 }
 
 /// Encode an opaque pagination token naming the next item to return.
@@ -1167,6 +1217,15 @@ pub fn page_size(requested: Option<i32>) -> usize {
 /// graph ARN) renders well inside `PaginationToken`'s 1..1024 length bound.
 pub fn encode_page_token(key: &str) -> String {
     ::hex::encode(key)
+}
+
+/// The rank `value` has in `ranking`, or one past the last rank when `ranking` does not
+/// hold it — so an ordering built on a modelled value set is total over any value.
+pub fn rank_in(ranking: &[&str], value: &str) -> usize {
+    ranking
+        .iter()
+        .position(|candidate| *candidate == value)
+        .unwrap_or(ranking.len())
 }
 
 /// The key a pagination token names, or `None` when the token is not one this

@@ -37,11 +37,102 @@ pub struct StringFilter {
     pub value: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.detective#DateFilter")]
+// `DateFilter` and `InvestigationDetail` are the shapes in this module written out by
+// hand rather than produced by `#[smithy_macros::smithy(shape = ...)]`, and the reason is
+// a single trait the macro does not read: `@timestampFormat`.
+//
+// `DateFilter$StartInclusive`, `DateFilter$EndInclusive` and
+// `InvestigationDetail$CreatedTime` all target `Timestamp`, which carries
+// `@timestampFormat("date-time")`
+// (`smithy_query(query="shape",shape="DateFilter,InvestigationDetail")` reports
+// `"timestampFormat": "date-time"` on each), and `CreatedTime`'s documentation says so
+// too ("The value is an UTC ISO8601 formatted string. For example,
+// 2021-08-18T16:35:56.284Z"). The vendored codegen never emits `with_timestamp_format`,
+// so a macro-built member schema reports no format and the restJson1 JSON codec falls
+// back to its protocol default, epoch seconds — a NUMBER where the model (and every AWS
+// SDK's generated serializer and deserializer for a `date-time` member) requires an
+// ISO-8601 string. The hand-written member schemas below differ from the macro's output
+// in exactly that one chain call.
+//
+// Everything else mirrors the macro's output for a structure: one `M_<MEMBER>` member
+// schema per member (index = position in the model's member list), a `SCHEMA` naming them
+// in order, the `<SHAPE>_SCHEMA` alias, and the serialize/deserialize pair. `DateFilter`'s
+// two `@required` members are enforced where every hand-written input shape in this
+// service enforces them, by `missing_member` below.
 #[derive(Debug, Clone)]
 pub struct DateFilter {
     pub start_inclusive: ::aws_smithy_types::DateTime,
     pub end_inclusive: ::aws_smithy_types::DateTime,
+}
+
+/// One member schema of [`DateFilter`], named and indexed as the model orders it, with
+/// the `date-time` format the macro cannot emit.
+macro_rules! date_filter_member {
+    ($name:literal, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.detective#DateFilter$", $name),
+                DateFilter::NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            $name,
+            $index,
+        )
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime)
+    };
+}
+
+#[allow(non_upper_case_globals)]
+impl DateFilter {
+    const SHAPE_ID: &'static str = "com.amazonaws.detective#DateFilter";
+    const NAMESPACE: &'static str = "com.amazonaws.detective";
+
+    pub const M_START_INCLUSIVE: ::aws_smithy_schema::Schema =
+        date_filter_member!("StartInclusive", 0);
+    pub const M_END_INCLUSIVE: ::aws_smithy_schema::Schema = date_filter_member!("EndInclusive", 1);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(Self::SHAPE_ID, Self::NAMESPACE, "DateFilter"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_START_INCLUSIVE, &Self::M_END_INCLUSIVE],
+    );
+}
+
+pub static DATE_FILTER_SCHEMA: &::aws_smithy_schema::Schema = &DateFilter::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for DateFilter {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        s.write_timestamp(&Self::M_START_INCLUSIVE, &self.start_inclusive)?;
+        s.write_timestamp(&Self::M_END_INCLUSIVE, &self.end_inclusive)?;
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for DateFilter {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut start_inclusive: Option<::aws_smithy_types::DateTime> = None;
+        let mut end_inclusive: Option<::aws_smithy_types::DateTime> = None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => start_inclusive = Some(d.read_timestamp(&Self::M_START_INCLUSIVE)?),
+                Some(1) => end_inclusive = Some(d.read_timestamp(&Self::M_END_INCLUSIVE)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            start_inclusive: start_inclusive
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("StartInclusive"))?,
+            end_inclusive: end_inclusive
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("EndInclusive"))?,
+        })
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.detective#SortCriteria")]
@@ -58,7 +149,8 @@ pub struct ListInvestigationsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.detective#InvestigationDetail")]
+/// `InvestigationDetail`, with its schema written out instead of derived; see the note
+/// above [`DateFilter`] for why.
 #[derive(Debug, Clone, Default)]
 pub struct InvestigationDetail {
     pub investigation_id: Option<String>,
@@ -68,5 +160,119 @@ pub struct InvestigationDetail {
     pub created_time: Option<::aws_smithy_types::DateTime>,
     pub entity_arn: Option<String>,
     pub entity_type: Option<String>,
+}
+
+/// One member schema of [`InvestigationDetail`], named and indexed as the model orders
+/// it.
+macro_rules! investigation_detail_member {
+    ($name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.detective#InvestigationDetail$", $name),
+                InvestigationDetail::NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+#[allow(non_upper_case_globals)]
+impl InvestigationDetail {
+    const SHAPE_ID: &'static str = "com.amazonaws.detective#InvestigationDetail";
+    const NAMESPACE: &'static str = "com.amazonaws.detective";
+
+    pub const M_INVESTIGATION_ID: ::aws_smithy_schema::Schema =
+        investigation_detail_member!("InvestigationId", String, 0);
+    pub const M_SEVERITY: ::aws_smithy_schema::Schema =
+        investigation_detail_member!("Severity", String, 1);
+    pub const M_STATUS: ::aws_smithy_schema::Schema =
+        investigation_detail_member!("Status", String, 2);
+    pub const M_STATE: ::aws_smithy_schema::Schema =
+        investigation_detail_member!("State", String, 3);
+    /// `@timestampFormat("date-time")` — the chain the macro cannot emit.
+    pub const M_CREATED_TIME: ::aws_smithy_schema::Schema =
+        investigation_detail_member!("CreatedTime", Timestamp, 4)
+            .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    pub const M_ENTITY_ARN: ::aws_smithy_schema::Schema =
+        investigation_detail_member!("EntityArn", String, 5);
+    pub const M_ENTITY_TYPE: ::aws_smithy_schema::Schema =
+        investigation_detail_member!("EntityType", String, 6);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            Self::SHAPE_ID,
+            Self::NAMESPACE,
+            "InvestigationDetail",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_INVESTIGATION_ID,
+            &Self::M_SEVERITY,
+            &Self::M_STATUS,
+            &Self::M_STATE,
+            &Self::M_CREATED_TIME,
+            &Self::M_ENTITY_ARN,
+            &Self::M_ENTITY_TYPE,
+        ],
+    );
+}
+
+pub static INVESTIGATION_DETAIL_SCHEMA: &::aws_smithy_schema::Schema = &InvestigationDetail::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for InvestigationDetail {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.investigation_id.as_ref() {
+            s.write_string(&Self::M_INVESTIGATION_ID, v.as_str())?;
+        }
+        if let Some(v) = self.severity.as_ref() {
+            s.write_string(&Self::M_SEVERITY, v.as_str())?;
+        }
+        if let Some(v) = self.status.as_ref() {
+            s.write_string(&Self::M_STATUS, v.as_str())?;
+        }
+        if let Some(v) = self.state.as_ref() {
+            s.write_string(&Self::M_STATE, v.as_str())?;
+        }
+        if let Some(v) = self.created_time.as_ref() {
+            s.write_timestamp(&Self::M_CREATED_TIME, v)?;
+        }
+        if let Some(v) = self.entity_arn.as_ref() {
+            s.write_string(&Self::M_ENTITY_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.entity_type.as_ref() {
+            s.write_string(&Self::M_ENTITY_TYPE, v.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for InvestigationDetail {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => {
+                    out.investigation_id = Some(d.read_string(&Self::M_INVESTIGATION_ID)?)
+                }
+                Some(1) => out.severity = Some(d.read_string(&Self::M_SEVERITY)?),
+                Some(2) => out.status = Some(d.read_string(&Self::M_STATUS)?),
+                Some(3) => out.state = Some(d.read_string(&Self::M_STATE)?),
+                Some(4) => out.created_time = Some(d.read_timestamp(&Self::M_CREATED_TIME)?),
+                Some(5) => out.entity_arn = Some(d.read_string(&Self::M_ENTITY_ARN)?),
+                Some(6) => out.entity_type = Some(d.read_string(&Self::M_ENTITY_TYPE)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 

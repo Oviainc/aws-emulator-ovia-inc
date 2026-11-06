@@ -327,3 +327,53 @@ async fn a_well_formed_scope_window_is_refused_only_on_the_merits_of_the_request
         }
     }
 }
+
+/// The sentence this operation refuses a window that is not a period at all with. Fixed
+/// text: it names the condition and interpolates neither instant of the request, so one
+/// row's instants can never appear in it.
+const INVALID_WINDOW_MESSAGE: &str =
+    "Invalid investigation window: End time is before or equal to start time.";
+
+#[tokio::test]
+async fn a_window_that_is_not_a_period_is_refused_in_the_same_words_whatever_its_instants() {
+    let router = emulator();
+    let graph_arn = create_graph_ok(&router, REGION, &json!({})).await;
+    let entity_arn = format!("arn:aws:iam::{ACCOUNT}:user/alice");
+
+    // The rows differ along HOW the window fails to be a period — inverted by years, by
+    // a day, by a single millisecond, and of no duration at all — and along where the
+    // window sits in time, so the one sentence is pinned rather than one row's instants.
+    let rows = [
+        ("inverted-by-years", "2024-05-01T12:00:00Z", "2019-05-01T12:00:00Z"),
+        ("inverted-by-a-day", "2024-05-02T12:00:00Z", "2024-05-01T12:00:00Z"),
+        (
+            "inverted-by-one-millisecond",
+            "2024-05-01T12:00:00.001Z",
+            "2024-05-01T12:00:00.000Z",
+        ),
+        ("no-duration", "2021-08-18T16:35:56.284Z", "2021-08-18T16:35:56.284Z"),
+        ("no-duration-at-the-epoch", "1970-01-01T00:00:00Z", "1970-01-01T00:00:00Z"),
+    ];
+    for (case, scope_start, scope_end) in rows {
+        let (status, answered) =
+            start_investigation(&router, &graph_arn, &entity_arn, scope_start, scope_end).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} {answered:?}"
+        );
+        assert_eq!(
+            error_code(&answered),
+            "ValidationException",
+            "case {case:?}: got {answered:?}"
+        );
+        let message = error_message(&answered);
+        assert_eq!(
+            message, INVALID_WINDOW_MESSAGE,
+            "case {case:?}: expected the fixed refusal sentence, got {message:?}"
+        );
+        assert!(
+            !message.contains(scope_start) && !message.contains(scope_end),
+            "case {case:?}: the refusal echoes neither instant back, got {message:?}"
+        );
+    }
+}

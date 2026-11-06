@@ -118,6 +118,15 @@ impl From<StartInvestigationErrorModeled> for StartInvestigationError {
     }
 }
 
+/// What this operation answers a scope window that is not a period at all with: the
+/// fixed sentence of that refusal class, which names the condition and interpolates
+/// neither instant from the request.
+///
+/// Recorded behaviour: a request whose `ScopeEndTime` is at or before its
+/// `ScopeStartTime` is refused with this one sentence, in these words.
+const INVALID_INVESTIGATION_WINDOW_MESSAGE: &str =
+    "Invalid investigation window: End time is before or equal to start time.";
+
 /// The `StartInvestigation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -188,9 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if scope_start_time_millis >= scope_end_time_millis {
             return Err(StartInvestigationErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(
-                        "ScopeStartTime must be earlier than ScopeEndTime".to_string(),
-                    ),
+                    message: Some(INVALID_INVESTIGATION_WINDOW_MESSAGE.to_string()),
                     ..Default::default()
                 },
             )
