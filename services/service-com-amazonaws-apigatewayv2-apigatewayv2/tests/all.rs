@@ -111,6 +111,8 @@ mod minted_id_shape;
 mod model_lifecycle;
 #[path = "all/model_template.rs"]
 mod model_template;
+#[path = "all/mutating_success_status.rs"]
+mod mutating_success_status;
 #[path = "all/portal_data_plane.rs"]
 mod portal_data_plane;
 #[path = "all/portal_deletion.rs"]

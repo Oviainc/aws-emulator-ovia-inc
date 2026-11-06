@@ -270,8 +270,8 @@ async fn update_route_response_replaces_the_members_it_carries_and_preserves_the
 
         let (status, updated) = call(&emulator, "PATCH", &uri, Some(row.patch.clone())).await;
         assert_eq!(
-            status, 200,
-            "case {:?}: expected 200 from UpdateRouteResponse, got {status} {updated}",
+            status, 201,
+            "case {:?}: expected 201 from UpdateRouteResponse, got {status} {updated}",
             row.case
         );
         assert_eq!(
@@ -382,8 +382,8 @@ async fn update_route_response_cannot_take_a_key_a_sibling_response_holds() {
     )
     .await;
     assert_eq!(
-        status, 200,
-        "expected 200 for a key another ROUTE holds, got {status} {updated}"
+        status, 201,
+        "expected 201 for a key another ROUTE holds, got {status} {updated}"
     );
     assert_eq!(
         as_str(&updated, "routeResponseKey"),

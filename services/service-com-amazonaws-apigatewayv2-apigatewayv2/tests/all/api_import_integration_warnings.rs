@@ -211,7 +211,7 @@ async fn a_per_path_integration_problem_is_a_warning_and_not_a_refusal() {
         );
         let (status, imported) = import(&router, "", &body).await;
         assert_eq!(
-            status, 201,
+            status, 200,
             "case {case:?}: the api must be created, got {status} {imported}"
         );
         assert_eq!(
@@ -338,7 +338,7 @@ async fn an_extension_key_an_http_integration_has_no_member_for_is_reported_as_i
 
         let (status, imported) = import(&router, "", &body).await;
         assert_eq!(
-            status, 201,
+            status, 200,
             "case {case:?}: an ignored key must not fail the import, got {status} {imported}"
         );
         assert_eq!(
@@ -390,7 +390,7 @@ async fn an_extension_key_an_http_integration_has_no_member_for_is_reported_as_i
     );
     let (status, imported) = import(&router, "", &carried).await;
     assert_eq!(
-        status, 201,
+        status, 200,
         "an extension of carried members imports, got {status} {imported}"
     );
     assert!(
@@ -412,8 +412,8 @@ async fn reimport_api_is_as_lenient_as_import_api() {
     );
     let (status, imported) = import(&router, "", &clean).await;
     assert_eq!(
-        status, 201,
-        "expected 201 from ImportApi, got {status} {imported}"
+        status, 200,
+        "expected 200 from ImportApi, got {status} {imported}"
     );
     let api_id = as_str(&imported, "apiId");
 
@@ -423,8 +423,8 @@ async fn reimport_api_is_as_lenient_as_import_api() {
     let body = definition("reimported", row.declared_method, row.path, row.integration);
     let (status, reimported) = reimport(&router, &api_id, "", &body).await;
     assert_eq!(
-        status, 201,
-        "expected 201 from ReimportApi, got {status} {reimported}"
+        status, 200,
+        "expected 200 from ReimportApi, got {status} {reimported}"
     );
     assert_eq!(
         warnings(&reimported),

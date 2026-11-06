@@ -36,14 +36,16 @@ use crate::product_rest_endpoint_page_lifecycle::{
     pages_of as rest_endpoint_pages_of, product, PRODUCTS,
 };
 
-/// The length an answer that carries no content states.
-const NO_CONTENT_LENGTH: &str = "0";
+/// The length an answer that carries no content states. Reused by `mutating_success_status`,
+/// so both suites judge the framing by one value.
+pub(crate) const NO_CONTENT_LENGTH: &str = "0";
 
 /// The status such an answer carries.
 const NO_CONTENT_STATUS: u16 = 204;
 
-/// The `content-length` a response states, if any.
-fn content_length(headers: &http::HeaderMap) -> Option<String> {
+/// The `content-length` a response states, if any. The ONE reading of that header in this
+/// test target, shared with `mutating_success_status`.
+pub(crate) fn content_length(headers: &http::HeaderMap) -> Option<String> {
     headers
         .get("content-length")
         .and_then(|value| value.to_str().ok())

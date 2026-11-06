@@ -487,8 +487,8 @@ async fn delete_authorizer_is_refused_while_a_route_of_its_api_names_it() {
             )
             .await;
             assert_eq!(
-                status, 200,
-                "case {:?}: expected 200 from UpdateRoute, got {status} {updated}",
+                status, 201,
+                "case {:?}: expected 201 from UpdateRoute, got {status} {updated}",
                 row.case
             );
         }
@@ -525,8 +525,8 @@ async fn delete_authorizer_is_refused_while_a_route_of_its_api_names_it() {
             )
             .await;
             assert_eq!(
-                status, 200,
-                "case {:?}: expected 200 from UpdateRoute clearing the reference, got {status} {updated}",
+                status, 201,
+                "case {:?}: expected 201 from UpdateRoute clearing the reference, got {status} {updated}",
                 row.case
             );
         }

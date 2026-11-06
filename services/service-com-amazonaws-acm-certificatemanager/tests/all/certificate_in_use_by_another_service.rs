@@ -345,8 +345,8 @@ async fn release(router: &MultiServiceRouter, case: &str, reference: &Reference,
             )
             .await;
             assert_eq!(
-                status, 204,
-                "case {case:?}: DeleteDomainName must answer 204 for {}, got {status} {body}",
+                status, 202,
+                "case {case:?}: DeleteDomainName must answer 202 for {}, got {status} {body}",
                 reference.domain_name
             );
         }

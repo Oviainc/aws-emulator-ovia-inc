@@ -195,7 +195,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "ImportApi";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::IMPORT_API_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::IMPORT_API_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 201u16;
+    // The status API Gateway answers this import with, which is not the `code: 201` the
+    // model declares for it — see [`crate::state::wire_status`].
+    const SUCCESS_STATUS: u16 = crate::state::WRITTEN_RESOURCE_OK_STATUS;
 
     async fn handle(
         &self,

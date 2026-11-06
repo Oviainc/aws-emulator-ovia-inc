@@ -4,11 +4,14 @@
 //!
 //! The rules these cases assert:
 //!
-//! * **A delete removes exactly the resource its URI names and answers the 204 its model
-//!   binds** ("Deletes a domain name", "Deletes an API mapping"): the resource stops being
+//! * **A delete removes exactly the resource its URI names and answers the status the
+//!   service answers it with** ("Deletes a domain name", "Deletes an API mapping"): the
+//!   resource stops being
 //!   reported by its own reader and by the collection it was in, every sibling is left
 //!   exactly as it was, and a second delete of the same resource is the 404
-//!   `NotFoundException` of a resource the account no longer holds.
+//!   `NotFoundException` of a resource the account no longer holds. `DeleteApiMapping`
+//!   answers the `204 No Content` its model binds; `DeleteDomainName` answers
+//!   `202 Accepted`, the status of a teardown that continues after the answer.
 //! * **A domain name OWNS its api mappings**: deleting the domain takes its mappings with
 //!   it, so neither the domain nor any mapping under it is reported afterwards, and the
 //!   name is free for a later `CreateDomainName`.
@@ -91,8 +94,8 @@ async fn seed_mapping(
     )
     .await;
     assert_eq!(
-        status, 201,
-        "case {case:?}: expected 201 from CreateApiMapping, got {status} {body}"
+        status, 200,
+        "case {case:?}: expected 200 from CreateApiMapping, got {status} {body}"
     );
     as_str(&body, "apiMappingId")
 }
@@ -275,8 +278,8 @@ async fn deleting_a_domain_name_takes_its_api_mappings_with_it() {
     )
     .await;
     assert_eq!(
-        status, 204,
-        "case {case:?}: expected the modelled 204 from DeleteDomainName, got {status} {body}"
+        status, 202,
+        "case {case:?}: expected 202 from DeleteDomainName, got {status} {body}"
     );
 
     // The domain is gone, and so is every mapping that was addressed under it.

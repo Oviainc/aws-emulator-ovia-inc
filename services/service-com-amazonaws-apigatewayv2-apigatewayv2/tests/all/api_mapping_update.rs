@@ -247,8 +247,8 @@ async fn update_api_mapping_patches_the_stored_record_get_api_mapping_reports_ba
         )
         .await;
         assert_eq!(
-            status, 201,
-            "case {case:?}: expected 201 from CreateApiMapping, got {status} {created}"
+            status, 200,
+            "case {case:?}: expected 200 from CreateApiMapping, got {status} {created}"
         );
         let api_mapping_id = as_str(&created, "apiMappingId");
 
@@ -309,8 +309,8 @@ async fn a_patch_naming_a_resource_the_account_does_not_hold_is_refused_and_writ
     )
     .await;
     assert_eq!(
-        status, 201,
-        "seeding the mapping: expected 201 from CreateApiMapping, got {status} {created}"
+        status, 200,
+        "seeding the mapping: expected 200 from CreateApiMapping, got {status} {created}"
     );
     let api_mapping_id = as_str(&created, "apiMappingId");
 
@@ -431,8 +431,8 @@ async fn a_patch_whose_stage_names_no_stage_of_the_mapped_api_is_refused() {
     )
     .await;
     assert_eq!(
-        status, 201,
-        "seeding the mapping: expected 201 from CreateApiMapping, got {status} {created}"
+        status, 200,
+        "seeding the mapping: expected 200 from CreateApiMapping, got {status} {created}"
     );
     let api_mapping_id = as_str(&created, "apiMappingId");
 
@@ -516,8 +516,8 @@ async fn a_patch_whose_api_mapping_key_is_not_a_base_path_is_refused() {
     )
     .await;
     assert_eq!(
-        status, 201,
-        "seeding the mapping: expected 201 from CreateApiMapping, got {status} {created}"
+        status, 200,
+        "seeding the mapping: expected 200 from CreateApiMapping, got {status} {created}"
     );
     let api_mapping_id = as_str(&created, "apiMappingId");
 
@@ -591,8 +591,8 @@ async fn a_patch_onto_a_base_path_another_mapping_of_the_domain_name_occupies_co
     let (status, root) =
         create_api_mapping(&emulator, DOMAIN, &body(&api_id, None, Some(STAGE))).await;
     assert_eq!(
-        status, 201,
-        "seeding the root mapping: expected 201, got {status} {root}"
+        status, 200,
+        "seeding the root mapping: expected 200, got {status} {root}"
     );
     let root_id = as_str(&root, "apiMappingId");
     let (status, taken) = create_api_mapping(
@@ -602,8 +602,8 @@ async fn a_patch_onto_a_base_path_another_mapping_of_the_domain_name_occupies_co
     )
     .await;
     assert_eq!(
-        status, 201,
-        "seeding the occupied base path: expected 201, got {status} {taken}"
+        status, 200,
+        "seeding the occupied base path: expected 200, got {status} {taken}"
     );
     let taken_id = as_str(&taken, "apiMappingId");
 
@@ -696,8 +696,8 @@ async fn a_patch_onto_a_base_path_another_mapping_of_the_domain_name_occupies_co
     )
     .await;
     assert_eq!(
-        status, 201,
-        "seeding the other domain name's mapping: expected 201, got {status} {elsewhere}"
+        status, 200,
+        "seeding the other domain name's mapping: expected 200, got {status} {elsewhere}"
     );
     let (status, patched) = update_api_mapping(
         &emulator,

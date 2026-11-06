@@ -6,7 +6,7 @@
 //! The rules these cases assert:
 //!
 //! * **`ReimportApi` PUTS the definition over the api `ApiId` names** (`PUT
-//!   /v2/apis/{ApiId}`, success 201): the api keeps its identity — its `ApiId`, its
+//!   /v2/apis/{ApiId}`, answered 200): the api keeps its identity — its `ApiId`, its
 //!   `ApiEndpoint`, its `CreatedDate`, its `ProtocolType` and the stages it holds — and
 //!   everything a definition describes is REPLACED by what the new one describes: the name,
 //!   description and version from `info`, the CORS extension, and exactly the routes and
@@ -434,8 +434,8 @@ async fn a_reimported_definition_replaces_the_api_and_changes_which_route_answer
 
         let (status, imported) = import(&emulator, "", &row.first).await;
         assert_eq!(
-            status, 201,
-            "case {case:?}: ImportApi must answer 201, got {status} {imported}"
+            status, 200,
+            "case {case:?}: ImportApi must answer 200, got {status} {imported}"
         );
         let api_id = as_str(&imported, "apiId");
         let host = endpoint_host(&imported);
@@ -450,8 +450,8 @@ async fn a_reimported_definition_replaces_the_api_and_changes_which_route_answer
 
         let (status, reimported) = reimport(&emulator, &api_id, row.query, &row.second).await;
         assert_eq!(
-            status, 201,
-            "case {case:?}: ReimportApi must answer 201, got {status} {reimported}"
+            status, 200,
+            "case {case:?}: ReimportApi must answer 200, got {status} {reimported}"
         );
 
         // The api kept its identity: the same api was PUT over, not a new one minted.
@@ -610,8 +610,8 @@ async fn a_refused_reimport_leaves_the_api_exactly_as_it_was() {
     .to_string();
     let (status, imported) = import(&emulator, "", &definition).await;
     assert_eq!(
-        status, 201,
-        "ImportApi must answer 201, got {status} {imported}"
+        status, 200,
+        "ImportApi must answer 200, got {status} {imported}"
     );
     let api_id = as_str(&imported, "apiId");
     let before = served_routes(&emulator, &api_id).await;

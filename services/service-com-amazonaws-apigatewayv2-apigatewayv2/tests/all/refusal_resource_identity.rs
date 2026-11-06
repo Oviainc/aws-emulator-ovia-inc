@@ -967,8 +967,8 @@ async fn deleting_an_integration_routes_target_names_every_blocking_route() {
         )
         .await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected 200 from UpdateRoute, got {status} {retargeted}"
+            status, 201,
+            "case {case:?}: expected 201 from UpdateRoute, got {status} {retargeted}"
         );
         for route_id in blockers.iter().skip(1) {
             let (status, removed) = call(

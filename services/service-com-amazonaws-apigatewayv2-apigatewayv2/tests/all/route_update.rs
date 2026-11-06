@@ -309,8 +309,8 @@ async fn update_route_replaces_the_members_it_names_and_keeps_the_rest() {
         }
         let (status, updated) = update_route(&emulator, &api_id, &route_id, &patch).await;
         assert_eq!(
-            status, 200,
-            "case {:?}: expected 200 from UpdateRoute, got {status} {updated}",
+            status, 201,
+            "case {:?}: expected 201 from UpdateRoute, got {status} {updated}",
             row.case
         );
         let expected = patched_record(&created, &patch);
@@ -459,8 +459,8 @@ async fn a_route_authorized_by_an_authorizer_is_refused_unless_it_names_one() {
             let (status, updated) = update_route(&emulator, &api_id, &route_id, &members).await;
             if accepted {
                 assert_eq!(
-                    status, 200,
-                    "case {case:?}: expected 200 from UpdateRoute, got {status} {updated}"
+                    status, 201,
+                    "case {case:?}: expected 201 from UpdateRoute, got {status} {updated}"
                 );
                 assert_eq!(
                     as_str(&updated, "authorizationType"),
@@ -519,8 +519,8 @@ async fn a_route_that_already_names_an_authorizer_may_switch_between_authorizer_
         )
         .await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected 200 from UpdateRoute, got {status} {updated}"
+            status, 201,
+            "case {case:?}: expected 201 from UpdateRoute, got {status} {updated}"
         );
         assert_eq!(
             as_str(&updated, "authorizerId"),
@@ -556,7 +556,7 @@ async fn an_update_cannot_move_a_route_onto_a_key_another_route_already_holds() 
             if other == index {
                 // Its own key is not a conflict with itself.
                 assert_eq!(
-                    status, 200,
+                    status, 201,
                     "case {case:?}: re-sending a route's own key must be accepted, got {status} {body}"
                 );
             } else {
@@ -643,8 +643,8 @@ async fn the_route_key_of_an_api_gateway_managed_route_cannot_be_changed() {
     )
     .await;
     assert_eq!(
-        status, 200,
-        "expected 200 patching a managed route's other members, got {status} {updated}"
+        status, 201,
+        "expected 201 patching a managed route's other members, got {status} {updated}"
     );
     assert_eq!(
         as_str(&updated, "operationName"),
@@ -735,8 +735,8 @@ async fn a_patch_configuring_a_websocket_only_member_is_refused_on_an_http_api()
         let patch = json!({ case: restricted.configuring });
         let (status, updated) = update_route(&emulator, &socket_id, &socket_route, &patch).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: a WebSocket api supports the member; expected 200, got {status} {updated}"
+            status, 201,
+            "case {case:?}: a WebSocket api supports the member; expected 201, got {status} {updated}"
         );
 
         // On an HTTP api it is refused, and the route is left as it was.
@@ -762,8 +762,8 @@ async fn a_patch_configuring_a_websocket_only_member_is_refused_on_an_http_api()
             let (status, updated) =
                 update_route(&emulator, &http_id, &http_route, &json!({ case: inert })).await;
             assert_eq!(
-                status, 200,
-                "case {case:?}: a member set to the value the route carries anyway asks for nothing; expected 200, got {status} {updated}"
+                status, 201,
+                "case {case:?}: a member set to the value the route carries anyway asks for nothing; expected 201, got {status} {updated}"
             );
         }
     }

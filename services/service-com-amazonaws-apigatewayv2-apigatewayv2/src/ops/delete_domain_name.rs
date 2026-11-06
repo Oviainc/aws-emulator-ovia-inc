@@ -144,7 +144,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "DeleteDomainName";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_DOMAIN_NAME_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = DELETE_DOMAIN_NAME_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 204u16;
+    // The status API Gateway answers this teardown with, which is not the `code: 204` the
+    // model declares for it: the endpoints the domain published are still being withdrawn
+    // when the call returns — see [`crate::state::wire_status`].
+    const SUCCESS_STATUS: u16 = crate::state::ACCEPTED_TEARDOWN_STATUS;
 
     async fn handle(
         &self,

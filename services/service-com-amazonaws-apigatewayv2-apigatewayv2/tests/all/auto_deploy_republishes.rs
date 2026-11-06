@@ -131,7 +131,7 @@ fn rows() -> Vec<Row> {
                 uri: format!("/v2/apis/{}/routes/{}", prepared.api_id, prepared.route_id),
                 body: Some(json!({ "routeKey": "GET /moved" })),
             },
-            status: 200,
+            status: 201,
             expect: Expect::Released,
         },
         Row {
@@ -185,7 +185,7 @@ fn rows() -> Vec<Row> {
                 ),
                 body: Some(json!({ "routeResponseKey": "moved" })),
             },
-            status: 200,
+            status: 201,
             expect: Expect::Released,
         },
         // The integrations of the api, and the responses that belong to one.
@@ -295,7 +295,7 @@ fn rows() -> Vec<Row> {
                 uri: format!("/v2/apis/{}", prepared.api_id),
                 body: Some(json!({ "description": "patched by the test" })),
             },
-            status: 200,
+            status: 201,
             expect: Expect::Released,
         },
         Row {

@@ -446,7 +446,7 @@ async fn update_api_holds_a_patch_to_the_same_documented_windows() {
         .await;
         if accepted {
             assert_eq!(
-                status, 200,
+                status, 201,
                 "case {case:?}: a value inside the documented window must be accepted, \
                  got {status} {body}"
             );

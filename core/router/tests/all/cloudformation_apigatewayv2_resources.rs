@@ -611,8 +611,8 @@ async fn a_stack_created_domain_takes_a_direct_api_mapping() {
     )
     .await;
     assert_eq!(
-        status, 201,
-        "case {case:?}: expected 201 from CreateApiMapping onto the stack's domain, got \
+        status, 200,
+        "case {case:?}: expected 200 from CreateApiMapping onto the stack's domain, got \
          {status} {mapping}"
     );
     assert_eq!(

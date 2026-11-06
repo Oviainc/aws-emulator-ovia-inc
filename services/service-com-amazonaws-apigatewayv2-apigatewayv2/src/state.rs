@@ -14,11 +14,19 @@
 //! The pagination a collection reader serves — the page size a caller may ask for and
 //! the opaque `NextToken` that resumes a walk — lives in [`paging`], the module that
 //! holds those bounds, and the selection expressions several members carry live in
-//! [`selection_expression`]. Both are re-exported here so a handler reaches them the way
-//! it reaches everything else in this module.
+//! [`selection_expression`]. The statuses the service answers where they differ from the
+//! model's `@http code` live in [`wire_status`]. All three are re-exported here so a
+//! handler reaches them the way it reaches everything else in this module.
 
 pub mod paging;
 pub mod selection_expression;
+pub mod wire_status;
+
+/// The statuses a mutating operation of this service answers where that is not its
+/// modelled `@http code` — see [`wire_status`], which says which operations each governs.
+pub use wire_status::{
+    ACCEPTED_TEARDOWN_STATUS, REWRITTEN_RESOURCE_STATUS, WRITTEN_RESOURCE_OK_STATUS,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};

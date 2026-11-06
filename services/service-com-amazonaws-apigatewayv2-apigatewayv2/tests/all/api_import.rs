@@ -389,8 +389,8 @@ async fn import_api_persists_the_api_the_definition_describes() {
     for row in rows() {
         let (status, imported) = import(&router, "", &row.definition).await;
         assert_eq!(
-            status, 201,
-            "case {:?}: expected 201 from ImportApi, got {status} {imported}",
+            status, 200,
+            "case {:?}: expected 200 from ImportApi, got {status} {imported}",
             row.case
         );
 
@@ -663,8 +663,8 @@ async fn basepath_decides_what_the_imported_paths_are_prefixed_with() {
     for (case, query, definition, expected_route_key) in cases {
         let (status, imported) = import(&router, query, &definition).await;
         assert_eq!(
-            status, 201,
-            "case {case:?}: expected 201 from ImportApi, got {status} {imported}"
+            status, 200,
+            "case {case:?}: expected 200 from ImportApi, got {status} {imported}"
         );
         let api_id = as_str(&imported, "apiId");
         let routes = stored_routes(&router, &api_id).await;
@@ -816,7 +816,7 @@ async fn an_integration_timeout_is_held_to_the_modelled_range() {
     for timeout in [50_i64, 29_000, 30_000] {
         let (status, imported) = import(&router, "", &timeout_definition(timeout)).await;
         assert_eq!(
-            status, 201,
+            status, 200,
             "case timeoutInMillis={timeout}: inside the modelled range, got {status} {imported}"
         );
         let api_id = as_str(&imported, "apiId");
@@ -837,7 +837,7 @@ async fn an_integration_timeout_is_held_to_the_modelled_range() {
     for timeout in [49_i64, 30_001, 0] {
         let (status, imported) = import(&router, "", &timeout_definition(timeout)).await;
         assert_eq!(
-            status, 201,
+            status, 200,
             "case timeoutInMillis={timeout}: outside the modelled range, got {status} {imported}"
         );
         let warnings = imported["warnings"].as_array().cloned().unwrap_or_default();
@@ -896,7 +896,7 @@ async fn the_read_is_bounded_by_the_base_path_length_and_the_route_quota() {
     // The base path at its bound is read; one character past it is refused, because that
     // prefix is what every route's path carries.
     for (case, chars, expected) in [
-        ("at the bound", MAX_BASE_PATH_CHARS, 201),
+        ("at the bound", MAX_BASE_PATH_CHARS, 200),
         ("one past the bound", MAX_BASE_PATH_CHARS + 1, 400),
     ] {
         let before = stored_api_count(&router).await;
@@ -958,8 +958,8 @@ async fn the_read_is_bounded_by_the_base_path_length_and_the_route_quota() {
     // and not before it.
     let (status, imported) = import(&router, "", &prefixed_definition(1, MAX_ROUTES_PER_API)).await;
     assert_eq!(
-        status, 201,
-        "expected 201 at the route quota of {MAX_ROUTES_PER_API}, got {status} {imported}"
+        status, 200,
+        "expected 200 at the route quota of {MAX_ROUTES_PER_API}, got {status} {imported}"
     );
     let api_id = as_str(&imported, "apiId");
     let routes = stored_routes(&router, &api_id).await;
@@ -994,8 +994,8 @@ async fn fail_on_warnings_rolls_the_import_back() {
     // Without `FailOnWarnings` the api is created and the warnings are reported...
     let (status, imported) = import(&router, "", &warning_definition()).await;
     assert_eq!(
-        status, 201,
-        "expected 201 from ImportApi without FailOnWarnings, got {status} {imported}"
+        status, 200,
+        "expected 200 from ImportApi without FailOnWarnings, got {status} {imported}"
     );
     let warnings = imported["warnings"].as_array().cloned().unwrap_or_default();
     assert_eq!(
@@ -1072,7 +1072,7 @@ async fn fail_on_warnings_rolls_the_import_back() {
     )
     .await;
     assert_eq!(
-        status, 201,
+        status, 200,
         "a definition with no warnings imports under FailOnWarnings, got {status} {imported}"
     );
     assert!(
@@ -1160,8 +1160,8 @@ async fn an_imported_service_action_integration_needs_no_uri() {
 
         let (status, imported) = import(&router, "", &definition).await;
         assert_eq!(
-            status, 201,
-            "case {subtype:?}: expected 201 from ImportApi, got {status} {imported}"
+            status, 200,
+            "case {subtype:?}: expected 200 from ImportApi, got {status} {imported}"
         );
         let api_id = as_str(&imported, "apiId");
         let integrations = stored_integrations(&router, &api_id).await;

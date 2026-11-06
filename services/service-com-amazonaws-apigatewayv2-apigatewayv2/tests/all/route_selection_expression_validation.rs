@@ -245,8 +245,8 @@ async fn update_api_keeps_the_stored_expression_when_the_patch_cannot_route() {
         let expected_after = match row.refused_reference {
             None => {
                 assert_eq!(
-                    status, 200,
-                    "case {:?}: expected 200 patching to {:?}, got {status} {body}",
+                    status, 201,
+                    "case {:?}: expected 201 patching to {:?}, got {status} {body}",
                     row.case, row.expression
                 );
                 row.expression

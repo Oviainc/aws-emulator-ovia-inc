@@ -134,8 +134,8 @@ async fn seed_racers(
         )
         .await;
         assert_eq!(
-            status, 201,
-            "case {case:?} racer {racer}: expected 201 from CreateApiMapping, got {status} {created}"
+            status, 200,
+            "case {case:?} racer {racer}: expected 200 from CreateApiMapping, got {status} {created}"
         );
         seeded.push(Racer {
             api_mapping_id: as_str(&created, "apiMappingId"),
@@ -171,7 +171,7 @@ async fn concurrent_claims_of_one_base_path_leave_at_most_one_holder() {
             )
             .await;
             assert_eq!(
-                status, 201,
+                status, 200,
                 "case {label:?}: expected the non-racing holder to be created, got {status} {holder}"
             );
         }

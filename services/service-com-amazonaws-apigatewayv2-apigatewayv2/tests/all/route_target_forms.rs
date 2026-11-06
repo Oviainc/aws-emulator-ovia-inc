@@ -413,8 +413,8 @@ async fn a_route_reports_its_target_in_the_form_it_was_supplied() {
         )
         .await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected 200 from UpdateRoute, got {status} {patched}"
+            status, 201,
+            "case {case:?}: expected 201 from UpdateRoute, got {status} {patched}"
         );
         assert_eq!(
             as_str(&patched, "target"),

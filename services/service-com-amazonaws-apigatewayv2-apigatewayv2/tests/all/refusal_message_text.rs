@@ -649,8 +649,8 @@ async fn a_route_with_no_valid_authorizer_reference_is_refused_with_the_sentence
     )
     .await;
     assert_eq!(
-        status, 200,
-        "expected 200 from UpdateRoute for a JWT route naming this api's authorizer, \
+        status, 201,
+        "expected 201 from UpdateRoute for a JWT route naming this api's authorizer, \
          got {status} {updated}"
     );
     assert_eq!(

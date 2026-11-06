@@ -214,8 +214,8 @@ async fn update_api_replaces_the_members_it_names_and_keeps_the_rest() {
 
         let (status, updated) = update_api(&emulator, &api_id, &row.patch).await;
         assert_eq!(
-            status, 200,
-            "case {:?}: expected 200 from UpdateApi, got {status} {updated}",
+            status, 201,
+            "case {:?}: expected 201 from UpdateApi, got {status} {updated}",
             row.case
         );
         let expected = patched_record(&created, &row.patch);
@@ -285,8 +285,8 @@ async fn update_api_on_an_api_the_store_does_not_hold_is_not_found() {
     // And the api that does exist is still patchable and untouched by the refusals.
     let (status, updated) = update_api(&emulator, &live, &json!({ "description": "still here" })).await;
     assert_eq!(
-        status, 200,
-        "expected 200 patching the live api, got {status} {updated}"
+        status, 201,
+        "expected 201 patching the live api, got {status} {updated}"
     );
     assert_eq!(
         as_str(&updated, "description"),
@@ -433,8 +433,8 @@ async fn a_cors_configuration_allowing_credentials_cannot_allow_the_wildcard() {
             update_api(&emulator, &api_id, &json!({ "corsConfiguration": row.cors })).await;
         if row.accepted {
             assert_eq!(
-                status, 200,
-                "case {:?}: expected 200 from UpdateApi, got {status} {updated}",
+                status, 201,
+                "case {:?}: expected 201 from UpdateApi, got {status} {updated}",
                 row.case
             );
             assert_eq!(
@@ -542,8 +542,8 @@ async fn a_quick_create_target_patch_moves_the_managed_integration() {
         )
         .await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected 200 from UpdateApi, got {status} {updated}"
+            status, 201,
+            "case {case:?}: expected 201 from UpdateApi, got {status} {updated}"
         );
 
         // The integration quick create minted now carries the new target, and the type

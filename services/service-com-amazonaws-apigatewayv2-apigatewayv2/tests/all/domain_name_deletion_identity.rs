@@ -8,7 +8,8 @@
 //!
 //! The rule these cases assert: **`DeleteDomainName` ("Deletes a domain name") removes
 //! the one custom domain name whose stored key equals the `DomainName` its URI carries,
-//! answering the 204 its model binds, and refuses a name the account does not hold with
+//! answering the 202 Accepted the service answers such a teardown with (its model binds
+//! `code: 204`), and refuses a name the account does not hold with
 //! the modelled `NotFoundException` (404) while removing nothing** — the resource is keyed
 //! by the whole name, so no other stored name is reached by a request naming a different
 //! one. Because every child resource is addressed UNDER the domain
@@ -114,8 +115,8 @@ async fn deleting_a_domain_name_removes_exactly_the_name_its_uri_carries() {
 
         let (status, body) = delete_domain_name(&emulator, &target).await;
         assert_eq!(
-            status, 204,
-            "case {case:?}: expected the modelled 204 from DeleteDomainName, got {status} {body}"
+            status, 202,
+            "case {case:?}: expected 202 from DeleteDomainName, got {status} {body}"
         );
         assert_eq!(
             body,
@@ -270,8 +271,8 @@ async fn deleting_a_domain_name_takes_its_routing_rules_with_it() {
 
     let (status, body) = delete_domain_name(&emulator, domain).await;
     assert_eq!(
-        status, 204,
-        "case {case:?}: expected the modelled 204 from DeleteDomainName, got {status} {body}"
+        status, 202,
+        "case {case:?}: expected 202 from DeleteDomainName, got {status} {body}"
     );
 
     // Neither the domain nor any rule addressed under it is reported afterwards: the

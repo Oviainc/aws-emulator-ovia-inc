@@ -462,7 +462,7 @@ async fn reported_control_plane_documents(emulator: &MultiServiceRouter) -> Vec<
         Some(json!({ "description": "an update keeps the creation instant" })),
     )
     .await;
-    assert_eq!(status, 200, "UpdateApi must answer 200, got {status} {updated_api}");
+    assert_eq!(status, 201, "UpdateApi must answer 201, got {status} {updated_api}");
     let (_, listed_apis) = call(emulator, "GET", "/v2/apis", None).await;
 
     let (status, socket_api) = call(
@@ -488,7 +488,7 @@ async fn reported_control_plane_documents(emulator: &MultiServiceRouter) -> Vec<
         Some(json!({ "body": imported_definition("timestamped-imported-api") })),
     )
     .await;
-    assert_eq!(status, 201, "ImportApi must answer 201, got {status} {imported}");
+    assert_eq!(status, 200, "ImportApi must answer 200, got {status} {imported}");
     let imported_id = as_str(&imported, "apiId");
     let (status, reimported) = call(
         emulator,
@@ -497,7 +497,7 @@ async fn reported_control_plane_documents(emulator: &MultiServiceRouter) -> Vec<
         Some(json!({ "body": imported_definition("timestamped-reimported-api") })),
     )
     .await;
-    assert_eq!(status, 201, "ReimportApi must answer 201, got {status} {reimported}");
+    assert_eq!(status, 200, "ReimportApi must answer 200, got {status} {reimported}");
 
     for (case, document) in [
         ("CreateApi", api.clone()),

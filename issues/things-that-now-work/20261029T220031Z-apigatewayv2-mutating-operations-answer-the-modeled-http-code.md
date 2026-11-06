@@ -100,3 +100,25 @@ Replay verdict `mismatch`, detail `status: expected <aws>, got <emulator>`: Upda
 
 ## Steps to Reproduce
 Replay the corpus. Cause 1: PATCH /v2/apis/{apiId} (fixture apigatewayv2-api-stage-bogus-child-not-found step task#2) - 200 instead of the recorded 201. Cause 2: DELETE /v2/domainnames/{domainName} (apigatewayv2-create-routing-rule-missing-condition-rejected#teardown#14) - 204 instead of 202.
+
+## Resolution
+
+Causes 1, 2, 3, 5, 6, 7, 8 and 10 (the statuses): a modelled operation's success status is
+now the status the service ANSWERS rather than the status its `@http` trait declares, where
+the two differ. The seven statuses that differ are single-homed in
+`src/state/wire_status.rs` and named by the handlers they govern — `UpdateApi`,
+`UpdateRoute` and `UpdateRouteResponse` answer `201`, `ImportApi`, `ReimportApi` and
+`CreateApiMapping` answer `200`, and `DeleteDomainName` answers `202 Accepted`, the status
+of the teardown this service already models as accepted-not-finished
+(`state::DOMAIN_NAME_DELETION`). Every other operation keeps its modelled `code`.
+
+Causes 4 and 9 (`content-length: 0` on an empty `204`): the service STATES that framing on
+every answer it serializes with no body, at whatever status — `src/service.rs` now frames an
+empty answer from the BODY rather than from the `204` status, so the `202` teardown states it
+too, which `tests/all/mutating_success_status.rs` pins on a real socket. CAVEAT: a client
+reached over HTTP/1.1 still does not see the header on a `204`, because the HTTP writer the
+vendored transport uses removes `content-length` from a `204` (RFC 9110 §15.3.5 forbids a
+body there) — that writer is under the read-only vendored tree, so the wire-level half of
+those two causes is a platform limitation rather than something this service can state its
+way out of. The same limitation is recorded for `serverlessrepo|DeleteApplication` in
+`20261022T011815Z-serverlessrepo-response-serialization-drops-empty-labels-presigned-templateurl.md`.

@@ -184,7 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UpdateRoute";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UPDATE_ROUTE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UPDATE_ROUTE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // The status API Gateway answers this patch with, which is not the `code: 200` the
+    // model declares for it — see [`crate::state::wire_status`].
+    const SUCCESS_STATUS: u16 = crate::state::REWRITTEN_RESOURCE_STATUS;
 
     async fn handle(
         &self,

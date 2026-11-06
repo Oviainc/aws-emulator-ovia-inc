@@ -80,20 +80,22 @@
 //!
 //! ## How an answer that carries no content is framed
 //!
-//! Every operation of this model whose success is `204 No Content` answers an empty output
-//! (`smithy.api#Unit`): the deletes, `DisablePortal`, `ResetAuthorizersCache`,
-//! `UntagResource`. The recorded AWS answers for those STATE the length such a message
-//! has — `content-length: 0` — rather than leaving the framing header off, so a client that
+//! Every operation of this model whose output is empty (`smithy.api#Unit`) answers with no
+//! body at all: the deletes, `DisablePortal`, `ResetAuthorizersCache`, `UntagResource`.
+//! The recorded AWS answers for those STATE the length such a message has —
+//! `content-length: 0` — rather than leaving the framing header off, so a client that
 //! closes the message out on an explicit zero length (or a proxy that re-frames it) reads
-//! the same message end the origin wrote.
+//! the same message end the origin wrote. It holds whatever status such an answer carries:
+//! the `204 No Content` most of them are modelled with, and the `202 Accepted` the teardowns
+//! that continue after the answer are answered with ([`crate::state::wire_status`]).
 //!
 //! [`Service::override_protocol`] below therefore serves a protocol that is the model's own
 //! in every respect except one: a `204` this service answers carries no body, whatever a
-//! serializer rendered for it, and states `content-length: 0`. A response that carries
-//! content is left exactly as the model's protocol rendered it. It is done there, at the
-//! one place every modelled response of this service passes through, rather than per
-//! operation. The three data planes above frame their own answers, which carry real
-//! content, and are not reached through this seam.
+//! serializer rendered for it, and every answer that carries no content states
+//! `content-length: 0`. A response that carries content is left exactly as the model's
+//! protocol rendered it. It is done there, at the one place every modelled response of this
+//! service passes through, rather than per operation. The three data planes above frame
+//! their own answers, which carry real content, and are not reached through this seam.
 //!
 //! CAVEAT: a client reached over HTTP/1.1 does not see the header, because the HTTP writer
 //! the vendored transport uses removes `content-length` from a `204` (RFC 9110 §15.3.5
@@ -115,7 +117,7 @@ use smithy_server_runtime::{http, Refusal, Refused, Service};
 use std::sync::Arc;
 
 /// The status whose answer carries NO content, whatever a serializer rendered for it, and
-/// the length such an answer states. See the module docs.
+/// the length an answer that carries no content states. See the module docs.
 const NO_CONTENT_STATUS: u16 = 204;
 const NO_CONTENT_LENGTH: &str = "0";
 
@@ -124,14 +126,21 @@ const NO_CONTENT_LENGTH: &str = "0";
 ///
 /// A response that carries content is untouched — it keeps the body the protocol rendered
 /// and the framing that body already has — so this cannot reframe a modelled output or an
-/// error envelope. The insert is FALLIBLE and ignored on failure: a decimal length is
-/// always a valid header value, so it cannot fail today, and if it ever did the answer
-/// would go out unframed rather than as a transport failure.
+/// error envelope. Whether an answer carries content is read from the BODY rather than from
+/// the status, so the empty answer of a teardown answered `202 Accepted` states its length
+/// as the `204` answers do; a streaming body, whose length is not known here, states
+/// nothing. The insert is FALLIBLE and ignored on failure: a decimal length is always a
+/// valid header value, so it cannot fail today, and if it ever did the answer would go out
+/// unframed rather than as a transport failure.
 fn frame_empty_answer(response: &mut RtResponse) {
-    if response.status().as_u16() != NO_CONTENT_STATUS {
+    // RFC 9110 §15.3.5 gives a `204` no body at all, so whatever was rendered for one is
+    // dropped before the length below is stated.
+    if response.status().as_u16() == NO_CONTENT_STATUS {
+        *response.body_mut() = aws_smithy_types::body::SdkBody::empty();
+    }
+    if !response.body().bytes().is_some_and(|body| body.is_empty()) {
         return;
     }
-    *response.body_mut() = aws_smithy_types::body::SdkBody::empty();
     let _ = response
         .headers_mut()
         .try_insert("content-length", NO_CONTENT_LENGTH);
@@ -303,8 +312,8 @@ impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
             .protocol()
             .serialize_error(error, error_schema, error_code, http_status)?;
         // Every modelled failure of this service carries a JSON error envelope at a 4xx, so
-        // nothing here is emptied or reframed; the same call is made on both paths rather
-        // than leaving one of them to answer differently.
+        // nothing here carries an empty body to frame; the same call is made on both paths
+        // rather than leaving one of them to answer differently.
         frame_empty_answer(&mut response);
         Ok(response)
     }

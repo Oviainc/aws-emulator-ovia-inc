@@ -246,8 +246,8 @@ async fn create_api_mapping_persists_the_record_get_api_mapping_reports_back() {
 
         let (status, created) = create_api_mapping(&emulator, DOMAIN, &request).await;
         assert_eq!(
-            status, 201,
-            "case {label:?}: expected 201 from CreateApiMapping, got {status} {created}"
+            status, 200,
+            "case {label:?}: expected 200 from CreateApiMapping, got {status} {created}"
         );
         assert_eq!(
             as_str(&created, "apiId"),
@@ -306,8 +306,8 @@ async fn create_api_mapping_persists_the_record_get_api_mapping_reports_back() {
     )
     .await;
     assert_eq!(
-        status, 201,
-        "case {label:?}: expected 201 from CreateApiMapping, got {status} {created}"
+        status, 200,
+        "case {label:?}: expected 200 from CreateApiMapping, got {status} {created}"
     );
     assert_eq!(
         as_str(&created, "apiMappingKey"),
@@ -395,7 +395,7 @@ async fn a_domain_name_or_an_api_the_account_does_not_hold_is_not_found() {
     )
     .await;
     assert_eq!(
-        status, 201,
+        status, 200,
         "expected the refused calls to have persisted nothing, got {status} {created}"
     );
 }
@@ -447,7 +447,7 @@ async fn a_stage_that_names_no_stage_of_the_api_is_refused() {
     )
     .await;
     assert_eq!(
-        status, 201,
+        status, 200,
         "expected the neighbour's own stage to be a usable reference, got {status} {created}"
     );
 }
@@ -471,8 +471,8 @@ async fn one_base_path_of_one_domain_name_maps_to_exactly_one_api_stage() {
         }
         let (status, winner) = create_api_mapping(&emulator, DOMAIN, &first).await;
         assert_eq!(
-            status, 201,
-            "case {label:?}: expected 201 from the first CreateApiMapping, got {status} {winner}"
+            status, 200,
+            "case {label:?}: expected 200 from the first CreateApiMapping, got {status} {winner}"
         );
         let winner_id = as_str(&winner, "apiMappingId");
 
@@ -534,7 +534,7 @@ async fn one_base_path_of_one_domain_name_maps_to_exactly_one_api_stage() {
         }
         let (status, body) = create_api_mapping(&emulator, "second.example.com", &request).await;
         assert_eq!(
-            status, 201,
+            status, 200,
             "case {label:?}: expected the same base path to be free on another domain \
              name, got {status} {body}"
         );
@@ -640,7 +640,7 @@ async fn an_api_mapping_key_that_is_not_a_base_path_is_refused() {
         )
         .await;
         assert_eq!(
-            status, 201,
+            status, 200,
             "case {key:?}: expected a key of the documented class to be accepted, \
              got {status} {body}"
         );
@@ -663,8 +663,8 @@ async fn caller_driven_mapping_growth_is_bounded() {
         )
         .await;
         assert_eq!(
-            status, 201,
-            "mapping {index}: expected 201 from CreateApiMapping, got {status} {body}"
+            status, 200,
+            "mapping {index}: expected 200 from CreateApiMapping, got {status} {body}"
         );
     }
 
@@ -694,7 +694,7 @@ async fn caller_driven_mapping_growth_is_bounded() {
     )
     .await;
     assert_eq!(
-        status, 201,
+        status, 200,
         "expected the bound to be per domain name, got {status} {body}"
     );
 }
@@ -709,8 +709,8 @@ async fn an_api_mapping_id_the_domain_name_does_not_hold_is_not_found() {
     )
     .await;
     assert_eq!(
-        status, 201,
-        "expected 201 from CreateApiMapping, got {status} {created}"
+        status, 200,
+        "expected 200 from CreateApiMapping, got {status} {created}"
     );
     let held = as_str(&created, "apiMappingId");
 
@@ -724,8 +724,8 @@ async fn an_api_mapping_id_the_domain_name_does_not_hold_is_not_found() {
     )
     .await;
     assert_eq!(
-        status, 201,
-        "expected 201 from the neighbouring CreateApiMapping, got {status} {elsewhere}"
+        status, 200,
+        "expected 200 from the neighbouring CreateApiMapping, got {status} {elsewhere}"
     );
 
     let rows = [
@@ -836,8 +836,8 @@ async fn get_api_mappings_pages_every_mapping_exactly_once_at_every_page_size() 
             )
             .await;
             assert_eq!(
-                status, 201,
-                "case total={total}, mapping #{index}: expected 201, got {status} {created}"
+                status, 200,
+                "case total={total}, mapping #{index}: expected 200, got {status} {created}"
             );
             expected.insert(as_str(&created, "apiMappingId"));
         }
@@ -913,8 +913,8 @@ async fn get_api_mappings_reports_the_records_the_single_reader_reports() {
         }
         let (status, created) = create_api_mapping(&emulator, domain, &request).await;
         assert_eq!(
-            status, 201,
-            "case {domain:?}/{key:?}: expected 201 from CreateApiMapping, got {status} {created}"
+            status, 200,
+            "case {domain:?}/{key:?}: expected 200 from CreateApiMapping, got {status} {created}"
         );
         let api_mapping_id = as_str(&created, "apiMappingId");
         for (name, ids) in expected.iter_mut() {
@@ -982,8 +982,8 @@ async fn get_api_mappings_refuses_an_absent_domain_name_a_bad_max_results_and_a_
             )
             .await;
             assert_eq!(
-                status, 201,
-                "seeding mapping #{index} of {domain:?}: expected 201, got {status} {created}"
+                status, 200,
+                "seeding mapping #{index} of {domain:?}: expected 200, got {status} {created}"
             );
         }
     }
