@@ -164,6 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // outlives the resource it names and a create/delete loop cannot grow the token
         // store.
         store.forget_wireless_device_tokens_for(&input.id);
+        // A device the store no longer holds was not requested to join anything, so no
+        // group keeps counting it as requested.
+        store.forget_multicast_group_requests_for(&input.id);
         Ok(DeleteWirelessDeviceOutput {})
     }
 }

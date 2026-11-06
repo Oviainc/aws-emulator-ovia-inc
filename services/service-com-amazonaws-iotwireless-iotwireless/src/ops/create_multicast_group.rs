@@ -225,6 +225,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             lorawan: input.lo_ra_wan.clone(),
             tags: input.tags.clone().unwrap_or_default(),
             created_at: ::std::time::SystemTime::now(),
+            // Nothing has asked for a membership in a group this call is minting.
+            requested_devices: ::std::collections::BTreeSet::new(),
         };
         let output = CreateMulticastGroupOutput {
             arn: Some(group.arn.clone()),

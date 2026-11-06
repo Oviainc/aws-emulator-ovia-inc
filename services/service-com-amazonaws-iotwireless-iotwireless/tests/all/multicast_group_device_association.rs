@@ -42,7 +42,7 @@ const DL_CLASSES: &[&str] =
     service_com_amazonaws_iotwireless_iotwireless::ops::types::DL_CLASS_VALUES;
 
 /// Create one destination, so the devices below have something to register against.
-async fn seed_destination(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn seed_destination(router: &MultiServiceRouter, name: &str) {
     let (status, body) = call(
         router,
         Method::POST,
@@ -63,7 +63,7 @@ async fn seed_destination(router: &MultiServiceRouter, name: &str) {
 }
 
 /// Create one multicast group and return its `Id`.
-async fn seed_group(router: &MultiServiceRouter, body: Value) -> String {
+pub(crate) async fn seed_group(router: &MultiServiceRouter, body: Value) -> String {
     let (status, created) = call(router, Method::POST, "/multicast-groups", Some(body)).await;
     assert_eq!(
         status,
@@ -77,7 +77,7 @@ async fn seed_group(router: &MultiServiceRouter, body: Value) -> String {
 }
 
 /// Create one wireless device and return its `Id`.
-async fn seed_device(router: &MultiServiceRouter, body: Value) -> String {
+pub(crate) async fn seed_device(router: &MultiServiceRouter, body: Value) -> String {
     let (status, created) = call(router, Method::POST, "/wireless-devices", Some(body)).await;
     assert_eq!(
         status,
@@ -91,7 +91,7 @@ async fn seed_device(router: &MultiServiceRouter, body: Value) -> String {
 }
 
 /// `AssociateWirelessDeviceWithMulticastGroup` over the wire.
-async fn associate(
+pub(crate) async fn associate(
     router: &MultiServiceRouter,
     group_id: &str,
     device_id: &str,
@@ -107,7 +107,7 @@ async fn associate(
 
 /// The membership counts `GetMulticastGroup` reports for `group_id`, as
 /// `(NumberOfDevicesRequested, NumberOfDevicesInGroup)`.
-async fn group_counts(router: &MultiServiceRouter, group_id: &str) -> (i64, i64) {
+pub(crate) async fn group_counts(router: &MultiServiceRouter, group_id: &str) -> (i64, i64) {
     let (status, fetched) = call(
         router,
         Method::GET,
@@ -131,7 +131,7 @@ async fn group_counts(router: &MultiServiceRouter, group_id: &str) -> (i64, i64)
 
 /// Walk every page of `ListWirelessDevices?multicastGroupId=<group_id>` at `max_results`
 /// and return the `Id`s it served, sorted, so a selection is compared as a set.
-async fn member_ids(
+pub(crate) async fn member_ids(
     router: &MultiServiceRouter,
     group_id: &str,
     max_results: i64,
@@ -187,7 +187,7 @@ struct GroupCase {
 
 /// The devices every case shares: both modelled `WirelessDeviceType`s, with and without
 /// the optional technology record.
-fn device_bodies(destination: &str) -> Vec<(&'static str, Value)> {
+pub(crate) fn device_bodies(destination: &str) -> Vec<(&'static str, Value)> {
     vec![
         (
             "lorawan-with-dev-eui",

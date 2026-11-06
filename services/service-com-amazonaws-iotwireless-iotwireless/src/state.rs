@@ -5,7 +5,7 @@
 //! Every implemented operation computes its answer from the records held here; the
 //! handlers reach this store through [`service_state`] and nothing else.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
@@ -358,8 +358,9 @@ pub struct WirelessDevice {
     /// device that carries one reports a `FuotaDeviceStatus`.
     pub fuota_task_id: Option<String>,
     /// The multicast group this device belongs to, set by
-    /// `AssociateWirelessDeviceWithMulticastGroup` and cleared by its disassociate (still
-    /// scaffolded). `ListWirelessDevices?multicastGroupId=` selects on it, and
+    /// `AssociateWirelessDeviceWithMulticastGroup` and cleared by
+    /// `DisassociateWirelessDeviceFromMulticastGroup`.
+    /// `ListWirelessDevices?multicastGroupId=` selects on it, and
     /// `GetMulticastGroup` counts the devices that name a group.
     pub multicast_group_id: Option<String>,
     pub tags: Vec<Tag>,
@@ -422,9 +423,12 @@ pub fn wireless_gateway_task_definition_not_found(id: &str) -> ResourceNotFoundE
 
 /// A multicast group: the LoRaWAN downlink settings a set of wireless devices shares.
 ///
-/// The membership itself lives on the devices (`WirelessDevice::multicast_group_id`),
-/// so the counts `GetMulticastGroup` reports are DERIVED from the device store rather
-/// than kept here as a second copy that could disagree with it.
+/// The CURRENT membership lives on the devices (`WirelessDevice::multicast_group_id`),
+/// so `NumberOfDevicesInGroup` is DERIVED from the device store rather than kept here as
+/// a second copy that could disagree with it. What this record does hold is the
+/// membership the group was ASKED for ([`Self::requested_devices`]), which the current
+/// membership cannot answer because a device that left the group was still requested to
+/// join it.
 #[derive(Debug, Clone)]
 pub struct MulticastGroup {
     pub id: String,
@@ -436,6 +440,16 @@ pub struct MulticastGroup {
     pub tags: Vec<Tag>,
     /// When the group was created, reported as `GetMulticastGroup`'s `CreatedAt`.
     pub created_at: SystemTime,
+    /// The devices whose association with this group has been REQUESTED, counted as
+    /// `GetMulticastGroup`'s `LoRaWAN.NumberOfDevicesRequested`.
+    ///
+    /// An association request records the device here; disassociating it does NOT take it
+    /// out, because the request still happened — only the device's own membership is
+    /// released, so `NumberOfDevicesInGroup` falls while the number requested stands. A
+    /// device that is deleted is pruned from here by the state's
+    /// `forget_multicast_group_requests_for`, so nothing counts a device the store no
+    /// longer holds, and the set stays bounded by the device store.
+    pub requested_devices: BTreeSet<String>,
 }
 
 /// A FUOTA task: the firmware image a set of wireless devices is updated with, and the
@@ -934,6 +948,25 @@ impl ComAmazonawsIotwirelessIotwirelessState {
             .values()
             .filter(|device| device.multicast_group_id.as_deref() == Some(id))
             .count()
+    }
+
+    /// Record that `device_id`'s association with multicast group `group_id` has been
+    /// requested, so the group keeps counting it as requested after the device leaves.
+    ///
+    /// A no-op for a group the store does not hold: an association request resolves both
+    /// ends before it is recorded.
+    pub fn record_multicast_group_request(&mut self, group_id: &str, device_id: &str) {
+        if let Some(group) = self.multicast_groups.get_mut(group_id) {
+            group.requested_devices.insert(device_id.to_string());
+        }
+    }
+
+    /// Drop `device_id` from every group's requested set, so a deleted device is counted
+    /// by no group and the sets stay bounded by the device store.
+    pub fn forget_multicast_group_requests_for(&mut self, device_id: &str) {
+        for group in self.multicast_groups.values_mut() {
+            group.requested_devices.remove(device_id);
+        }
     }
 
     /// What a `CreateMulticastGroup` `ClientRequestToken` already minted, if anything.

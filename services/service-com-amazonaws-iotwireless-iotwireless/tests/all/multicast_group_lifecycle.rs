@@ -608,13 +608,15 @@ async fn an_unknown_multicast_group_id_is_not_found() {
     );
 }
 
-/// The membership counts a group reports are DERIVED from the devices that name it: as
-/// devices join and leave, every read answers from the device store rather than from a
-/// tally frozen at create time, and one group's members never count towards another's.
+/// The membership counts a group reports come from the two places that hold them: as
+/// devices join and leave, `NumberOfDevicesInGroup` answers from the devices that name
+/// the group rather than from a tally frozen at create time, while
+/// `NumberOfDevicesRequested` answers from the requests the group recorded and does not
+/// fall when a device leaves. One group's members never count towards another's.
 ///
-/// The association operations are still scaffolded, so the membership is written
-/// directly on the devices in the SHARED engine the router hands the handlers — the same
-/// records an association will write.
+/// The memberships are written directly on the SHARED engine the router hands the
+/// handlers — the same records the association operations write — so the reader is
+/// exercised over transitions no single call sequence reaches.
 #[tokio::test]
 async fn the_membership_counts_follow_the_device_store() {
     let (router, engine) = router_with_engine();
@@ -659,8 +661,10 @@ async fn the_membership_counts_follow_the_device_store() {
         devices.push(created["Id"].as_str().expect("an Id").to_string());
     }
 
-    /// Put `device` in `group` (`None` takes it out of every group), the way an
-    /// association writes it.
+    /// Put `device` in `group` (`None` takes it out of every group), the way the
+    /// association and disassociation operations write it: joining records the request on
+    /// the group as well as the membership on the device, while leaving releases only the
+    /// membership.
     fn set_membership(
         engine: &Arc<engine::InMemoryEngine>,
         device: &str,
@@ -673,54 +677,58 @@ async fn the_membership_counts_follow_the_device_store() {
             .get_mut(device)
             .expect("a stored device")
             .multicast_group_id = group.map(str::to_string);
+        if let Some(group) = group {
+            store.record_multicast_group_request(group, device);
+        }
     }
 
-    // One step of the table: the memberships it applies first, then the counts each
-    // group must report once they are applied.
+    // One step of the table: the memberships it applies first, then the
+    // `(NumberOfDevicesRequested, NumberOfDevicesInGroup)` each group must report once
+    // they are applied.
     struct Step<'a> {
         case: &'static str,
         /// `(index into `devices`, the group it now belongs to — `None` = no group)`.
         memberships: Vec<(usize, Option<&'a str>)>,
-        expected_first: i64,
-        expected_second: i64,
+        expected_first: (i64, i64),
+        expected_second: (i64, i64),
     }
 
     let steps = vec![
         Step {
             case: "no members",
             memberships: vec![],
-            expected_first: 0,
-            expected_second: 0,
+            expected_first: (0, 0),
+            expected_second: (0, 0),
         },
         Step {
             case: "one joins",
             memberships: vec![(0, Some(first.as_str()))],
-            expected_first: 1,
-            expected_second: 0,
+            expected_first: (1, 1),
+            expected_second: (0, 0),
         },
         Step {
             case: "two more join",
             memberships: vec![(1, Some(first.as_str())), (2, Some(first.as_str()))],
-            expected_first: 3,
-            expected_second: 0,
+            expected_first: (3, 3),
+            expected_second: (0, 0),
         },
         Step {
             case: "one moves to the other group",
             memberships: vec![(2, Some(second.as_str()))],
-            expected_first: 2,
-            expected_second: 1,
+            expected_first: (3, 2),
+            expected_second: (1, 1),
         },
         Step {
             case: "one leaves",
             memberships: vec![(0, None)],
-            expected_first: 1,
-            expected_second: 1,
+            expected_first: (3, 1),
+            expected_second: (1, 1),
         },
         Step {
             case: "every member leaves",
             memberships: vec![(1, None), (2, None)],
-            expected_first: 0,
-            expected_second: 0,
+            expected_first: (3, 0),
+            expected_second: (1, 0),
         },
     ];
 
@@ -740,7 +748,10 @@ async fn the_membership_counts_follow_the_device_store() {
                 StatusCode::OK,
                 "case {case:?}: expected 200 for group {group}, got {status} {fetched}"
             );
-            for member in ["NumberOfDevicesRequested", "NumberOfDevicesInGroup"] {
+            for (member, expected) in [
+                ("NumberOfDevicesRequested", expected.0),
+                ("NumberOfDevicesInGroup", expected.1),
+            ] {
                 assert_eq!(
                     fetched["LoRaWAN"][member],
                     json!(expected),

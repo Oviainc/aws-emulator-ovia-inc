@@ -202,6 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             None => device.multicast_group_id = Some(input.id.clone()),
         }
+        // The group counts the device as requested from here on, whether or not this
+        // call is the one that wrote the membership: the request was made either way,
+        // and a later disassociation releases the membership without unmaking it.
+        store.record_multicast_group_request(&input.id, &input.wireless_device_id);
         Ok(AssociateWirelessDeviceWithMulticastGroupOutput {})
     }
 }

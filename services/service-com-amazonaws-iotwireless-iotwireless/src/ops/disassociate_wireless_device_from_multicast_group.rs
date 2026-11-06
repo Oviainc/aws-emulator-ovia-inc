@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateWirelessDeviceFromMulticastGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateWirelessDeviceFromMulticastGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateWirelessDeviceFromMulticastGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: releases the membership that joins one stored wireless device to the
+//! multicast group named in the path, so every reader of the CURRENT membership — the
+//! group's `NumberOfDevicesInGroup` and `ListWirelessDevices?multicastGroupId=` — stops
+//! reporting it, while the request that created it stays counted. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -141,20 +137,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateWirelessDeviceFromMulticastGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateWirelessDeviceFromMulticastGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateWirelessDeviceFromMulticastGroup"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DisassociateWirelessDeviceFromMulticastGroupError::from(
+                DisassociateWirelessDeviceFromMulticastGroupErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the iotwireless store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let mut store = state.lock();
+        // Both ends of the membership are path labels addressing stored resources, so
+        // each is resolved against real state before anything is written — exactly as the
+        // associate side resolves them.
+        if !store.multicast_groups.contains_key(&input.id) {
+            return Err(
+                DisassociateWirelessDeviceFromMulticastGroupErrorModeled::ResourceNotFoundException(
+                    crate::state::multicast_group_not_found(&input.id),
+                )
+                .into(),
+            );
+        }
+        let device = store
+            .wireless_devices
+            .get_mut(&input.wireless_device_id)
+            .ok_or_else(|| {
+                DisassociateWirelessDeviceFromMulticastGroupError::from(
+                    DisassociateWirelessDeviceFromMulticastGroupErrorModeled::ResourceNotFoundException(
+                        crate::state::wireless_device_not_found(&input.wireless_device_id),
+                    ),
+                )
+            })?;
+
+        // Removing a membership is idempotent, and it addresses exactly ONE membership:
+        // the device's record is cleared only while it names the group in the path. A
+        // device that holds no membership, or one with another group, is left exactly as
+        // it stands and the same empty success is reported — this operation models no
+        // conflict, and clearing a membership the request does not name would drop the
+        // device out of a group nobody asked about.
+        if device.multicast_group_id.as_deref() == Some(input.id.as_str()) {
+            device.multicast_group_id = None;
+        }
+        Ok(DisassociateWirelessDeviceFromMulticastGroupOutput {})
     }
 }

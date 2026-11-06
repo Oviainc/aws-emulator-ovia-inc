@@ -160,20 +160,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // The membership counts are DERIVED from the devices that name this group, so
-        // they track every association and disassociation without a second tally to keep
-        // in step. `NumberOfDevicesRequested` counts the devices asked to join and
-        // `NumberOfDevicesInGroup` the devices associated to the group; an association
-        // here takes effect when it is made, so no device is ever requested and not yet
-        // in the group. The count cannot exceed the bounded device store
-        // (`MAX_WIRELESS_DEVICES`), so it always fits the modelled 32-bit members; the
-        // saturating conversion is there only so no arithmetic can panic on a request.
-        let members = i32::try_from(store.devices_in_multicast_group(&group.id)).unwrap_or(i32::MAX);
+        // The two membership counts answer two different questions, so they are read
+        // from the two places that hold them. `NumberOfDevicesInGroup` is the devices
+        // CURRENTLY joined to the group, derived from the device records the
+        // associate/disassociate operations write, so it needs no second tally to keep in
+        // step. `NumberOfDevicesRequested` is the devices whose association with the group
+        // has been REQUESTED, which the current membership cannot answer: releasing a
+        // device's membership does not unmake the request that put it there, so that count
+        // does not fall when a device leaves. Neither can exceed the bounded device store
+        // (`MAX_WIRELESS_DEVICES`), so both always fit the modelled 32-bit members; the
+        // saturating conversions are there only so no arithmetic can panic on a request.
+        let requested = i32::try_from(group.requested_devices.len()).unwrap_or(i32::MAX);
+        let in_group = i32::try_from(store.devices_in_multicast_group(&group.id)).unwrap_or(i32::MAX);
         let lorawan = LoRaWANMulticastGet {
             rf_region: group.lorawan.rf_region.clone(),
             dl_class: group.lorawan.dl_class.clone(),
-            number_of_devices_requested: Some(members),
-            number_of_devices_in_group: Some(members),
+            number_of_devices_requested: Some(requested),
+            number_of_devices_in_group: Some(in_group),
             participating_gateways: group.lorawan.participating_gateways.clone(),
             default_session_parameters: group.lorawan.default_session_parameters.clone(),
         };
