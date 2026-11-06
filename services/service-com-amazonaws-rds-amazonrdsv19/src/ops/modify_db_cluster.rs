@@ -510,11 +510,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // RDS is regional: only the region the request was signed for is in scope.
         let key = (region.clone(), identifier.clone());
         let Some(current) = store.db_clusters.get(&key) else {
+            // The wording is the one this front door gives the fault where the call
+            // MODIFIES the cluster's configuration: one fixed sentence with no variable
+            // part ([`crate::state::MODIFY_DB_CLUSTER_NOT_FOUND_MESSAGE`]). Nothing from
+            // the request is interpolated — not the identifier it named — so the sentence
+            // a caller matches on is the same for every identifier.
             return Err(ModifyDBClusterErrorModeled::DBClusterNotFoundFault(
                 DBClusterNotFoundFault {
-                    message: Some(crate::state::db_cluster_not_found_message(
-                        &input.db_cluster_identifier,
-                    )),
+                    message: Some(
+                        crate::state::MODIFY_DB_CLUSTER_NOT_FOUND_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());

@@ -355,9 +355,10 @@ async fn a_sibling_control_planes_cluster_takes_its_own_storage_type_list() {
 // ---------------------------------------------------------------------------
 
 /// What a delete that names neither of its two final-snapshot members answers: exactly one
-/// of them has to be given, so the refusal asks the caller for one and names both.
+/// of them has to be given, so the refusal names the member the request has to carry and
+/// the member that waives it.
 const FINAL_SNAPSHOT_REFUSAL: &str =
-    "Please specify FinalDBSnapshotIdentifier or SkipFinalSnapshot";
+    "FinalDBSnapshotIdentifier is required unless SkipFinalSnapshot is specified.";
 
 /// One row of the delete table: the case, the cluster's engine, and the parameters that
 /// engine's cluster type requires beyond the two required members.

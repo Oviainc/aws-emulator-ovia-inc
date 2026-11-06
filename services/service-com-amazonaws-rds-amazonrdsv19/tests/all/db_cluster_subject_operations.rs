@@ -9,8 +9,10 @@
 //! The first is about the refusal: a request naming a DB cluster the service does not hold
 //! is the modelled `DBClusterNotFoundFault` (HTTP 404, `text/xml`, `Error/Type` `Sender`)
 //! whose `<Message>` is the template THAT operation's API uses — this front door words the
-//! one fault by the role the cluster plays in the call — and names the value the REQUEST
-//! carried, in the spelling it was written in, rather than the key the store folded it to.
+//! one fault by the role the cluster plays in the call — and, where that template has a
+//! variable part, names the value the REQUEST carried, in the spelling it was written in,
+//! rather than the key the store folded it to. The modification path's template has no
+//! variable part at all.
 //! It is asserted over a TABLE spanning the operations that name a cluster and, for each,
 //! the three forms the members that name one accept ("the user-supplied DB cluster
 //! identifier or the Amazon Resource Name (ARN)", "this parameter isn't case-sensitive"),
@@ -121,6 +123,13 @@ fn reported_not_found(named: &str) -> String {
     format!("DBCluster {named} not found.")
 }
 
+/// The wording the call that MODIFIES the cluster's configuration answers the same fault
+/// with: ONE fixed sentence, so the identifier the request named does not appear in it at
+/// all and every identifier gets the same text.
+fn modified_not_found(_named: &str) -> String {
+    "DBCluster not found".to_string()
+}
+
 /// The wording the calls that act on the cluster ITSELF — its delete, and the failover
 /// that moves its primary — answer the same fault with.
 fn subject_not_found(named: &str) -> String {
@@ -151,7 +160,7 @@ const CLUSTER_OPERATIONS: &[ClusterOperation] = &[
     ClusterOperation {
         action: "ModifyDBCluster",
         extra: &[],
-        wording: reported_not_found,
+        wording: modified_not_found,
     },
     ClusterOperation {
         action: "StopDBCluster",

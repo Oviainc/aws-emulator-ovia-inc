@@ -65,7 +65,7 @@ const ONLY_ONE_SNAPSHOT_MEMBER: &str =
 
 /// A delete that names NEITHER of them.
 const A_SNAPSHOT_MEMBER_IS_REQUIRED: &str =
-    "Please specify FinalDBSnapshotIdentifier or SkipFinalSnapshot";
+    "FinalDBSnapshotIdentifier is required unless SkipFinalSnapshot is specified.";
 
 /// `RebootDBInstance` forcing a failover on an instance that is not configured for it.
 const FORCE_FAILOVER_NEEDS_MULTI_AZ: &str = "ForceFailover cannot be specified since the \

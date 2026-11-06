@@ -1447,6 +1447,18 @@ pub fn db_cluster_not_found_message(named: &str) -> String {
     format!("DBCluster {named} not found.")
 }
 
+/// The sentence a `DBClusterNotFoundFault` carries where the call MODIFIES the DB
+/// cluster's own configuration.
+///
+/// Like the shard group's modification wording
+/// ([`DB_SHARD_GROUP_DOES_NOT_EXIST_MESSAGE`]) it has NO variable part: Amazon RDS reports
+/// only that the cluster the request named is not there, and interpolates neither the
+/// identifier the caller wrote nor the account the call was signed for. So it is a constant
+/// rather than a `format!` over the request, which also keeps the sentence's cardinality at
+/// one — a client grouping or alerting on this error class sees one text, not one per
+/// identifier.
+pub const MODIFY_DB_CLUSTER_NOT_FOUND_MESSAGE: &str = "DBCluster not found";
+
 /// The message a `DBClusterNotFoundFault` carries where the DB cluster is the SUBJECT of
 /// the call and the call acts on the cluster itself — the delete that removes it, and the
 /// failover that moves its primary.
@@ -1460,14 +1472,15 @@ pub fn db_cluster_cannot_be_accessed_message(named: &str) -> String {
     format!("The source cluster could not be found or cannot be accessed: {named}")
 }
 
-/// The third wording this front door gives a `DBClusterNotFoundFault`, the one the call
-/// that takes a SNAPSHOT of the cluster answers.
+/// Another wording this front door gives a `DBClusterNotFoundFault`, the one the call that
+/// takes a SNAPSHOT of the cluster answers.
 ///
-/// Three wordings, one fault: AWS words it by the ROLE the cluster plays in the call (see
-/// [`db_cluster_not_found_message`] for a call that REPORTS the cluster or stops it, and
-/// [`db_cluster_cannot_be_accessed_message`] for one that acts on the cluster itself), so
+/// One fault, a wording per ROLE the cluster plays in the call (see
+/// [`db_cluster_not_found_message`] for a call that REPORTS the cluster or stops it,
+/// [`db_cluster_cannot_be_accessed_message`] for one that acts on the cluster itself, and
+/// [`MODIFY_DB_CLUSTER_NOT_FOUND_MESSAGE`] for one that modifies its configuration), so
 /// each operation answers with the one its own API uses rather than with a single house
-/// style. `named` is the value the request carried, as in the other two.
+/// style. `named` is the value the request carried, as in the other two that name one.
 pub fn db_cluster_not_found_colon_message(named: &str) -> String {
     format!("DBCluster not found: {named}")
 }

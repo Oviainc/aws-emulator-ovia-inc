@@ -970,11 +970,12 @@ pub fn master_user_password_len(engine: &str) -> std::ops::RangeInclusive<usize>
 /// `SkipFinalSnapshot`: "If you set this value to false or don't specify it, RDS creates a
 /// DB cluster snapshot before it deletes the DB cluster … If SkipFinalSnapshot is disabled,
 /// you must specify a value for the FinalDBSnapshotIdentifier parameter" — exactly one of
-/// the two has to be given, so the refusal ASKS for one of them and names both. One
-/// constant for every delete that carries the pair, so one refusal class is worded one way
-/// whichever resource is being deleted.
+/// the two has to be given, which is what the sentence states: it names the member the
+/// request has to carry and the member that waives it, and nothing of the request or the
+/// store. One constant for every delete that carries the pair, so one refusal class is
+/// worded one way whichever resource is being deleted.
 pub const FINAL_SNAPSHOT_MEMBER_REQUIRED: &str =
-    "Please specify FinalDBSnapshotIdentifier or SkipFinalSnapshot";
+    "FinalDBSnapshotIdentifier is required unless SkipFinalSnapshot is specified.";
 
 
 /// The `BackupRetentionPeriod` a DB cluster accepts ("Constraints: Must be a value from 1

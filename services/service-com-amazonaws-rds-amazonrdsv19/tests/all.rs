@@ -145,6 +145,8 @@ mod lifecycle_poll_loops;
 mod maintenance_action_resource_guard;
 #[path = "all/management_event_recording.rs"]
 mod management_event_recording;
+#[path = "all/modification_and_final_snapshot_refusal_sentences.rs"]
+mod modification_and_final_snapshot_refusal_sentences;
 #[path = "all/modify_custom_db_engine_version.rs"]
 mod modify_custom_db_engine_version;
 #[path = "all/modify_db_cluster_state_refusal.rs"]
