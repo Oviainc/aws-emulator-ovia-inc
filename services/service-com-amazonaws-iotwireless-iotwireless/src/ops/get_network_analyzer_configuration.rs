@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetNetworkAnalyzerConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetNetworkAnalyzerConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetNetworkAnalyzerConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored network analyzer configuration a `Name` addresses,
+//! including the resources it tracks. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +149,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetNetworkAnalyzerConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetNetworkAnalyzerConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetNetworkAnalyzerConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetNetworkAnalyzerConfigurationError::from(
+                GetNetworkAnalyzerConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the iotwireless store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let store = state.lock();
+        // `ConfigurationName` is this operation's `@httpLabel`, so it ADDRESSES the
+        // configuration to report; a name the account does not hold is the modelled 404,
+        // worded by the one helper every configuration-addressing operation refuses
+        // through.
+        let configuration = store
+            .network_analyzer_configurations
+            .get(&input.configuration_name)
+            .ok_or_else(|| {
+                GetNetworkAnalyzerConfigurationError::from(
+                    GetNetworkAnalyzerConfigurationErrorModeled::ResourceNotFoundException(
+                        crate::state::network_analyzer_configuration_not_found(
+                            &input.configuration_name,
+                        ),
+                    ),
+                )
+            })?;
+
+        Ok(GetNetworkAnalyzerConfigurationOutput {
+            arn: Some(configuration.arn.clone()),
+            name: Some(configuration.name.clone()),
+            description: configuration.description.clone(),
+            trace_content: configuration.trace_content.clone(),
+            // A tracked-resource list is REPORTED, not omitted, when the configuration
+            // tracks nothing of that kind: an empty list is this reader's answer about
+            // what the configuration tracks, the same answer every later read gives
+            // until something is added.
+            wireless_devices: Some(configuration.wireless_devices.clone()),
+            wireless_gateways: Some(configuration.wireless_gateways.clone()),
+            multicast_groups: Some(configuration.multicast_groups.clone()),
+        })
     }
 }

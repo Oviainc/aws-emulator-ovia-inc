@@ -29,6 +29,8 @@ mod multicast_group_device_association;
 mod multicast_group_device_disassociation;
 #[path = "all/multicast_group_lifecycle.rs"]
 mod multicast_group_lifecycle;
+#[path = "all/network_analyzer_configuration_lifecycle.rs"]
+mod network_analyzer_configuration_lifecycle;
 #[path = "all/resource_log_level_overrides.rs"]
 mod resource_log_level_overrides;
 #[path = "all/resource_event_configuration.rs"]

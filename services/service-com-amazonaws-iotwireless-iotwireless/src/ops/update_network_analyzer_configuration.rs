@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateNetworkAnalyzerConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateNetworkAnalyzerConfiguration`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: adds and removes the resources a stored network analyzer configuration
+//! tracks, and replaces the trace settings and description a request carries. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateNetworkAnalyzerConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -161,20 +155,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateNetworkAnalyzerConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateNetworkAnalyzerConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateNetworkAnalyzerConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateNetworkAnalyzerConfigurationError::from(
+                UpdateNetworkAnalyzerConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the iotwireless store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let devices_to_add = input.wireless_devices_to_add.as_deref().unwrap_or(&[]);
+        let gateways_to_add = input.wireless_gateways_to_add.as_deref().unwrap_or(&[]);
+        let groups_to_add = input.multicast_groups_to_add.as_deref().unwrap_or(&[]);
+
+        let mut store = state.lock();
+        // `ConfigurationName` is this operation's `@httpLabel`, so it ADDRESSES the
+        // configuration to update; a name the account does not hold is the modelled 404.
+        let Some(configuration) = store
+            .network_analyzer_configurations
+            .get(&input.configuration_name)
+        else {
+            return Err(
+                UpdateNetworkAnalyzerConfigurationErrorModeled::ResourceNotFoundException(
+                    crate::state::network_analyzer_configuration_not_found(
+                        &input.configuration_name,
+                    ),
+                )
+                .into(),
+            );
+        };
+        // What the tracked-resource lists would become: every id the request adds that
+        // the configuration does not already track, minus every id it removes — so one
+        // id named in both halves ends up untracked, and adding an id twice tracks it
+        // once.
+        let mut wireless_devices = configuration.wireless_devices.clone();
+        let mut wireless_gateways = configuration.wireless_gateways.clone();
+        let mut multicast_groups = configuration.multicast_groups.clone();
+
+        // A configuration only tracks resources this account holds, so an id it is told
+        // to ADD must resolve; an id it is told to REMOVE need not, because a caller may
+        // stop tracking a resource that has since been deleted.
+        if let Some(missing) =
+            store.unresolved_tracked_resource(devices_to_add, gateways_to_add, groups_to_add)
+        {
+            return Err(
+                UpdateNetworkAnalyzerConfigurationErrorModeled::ResourceNotFoundException(missing)
+                    .into(),
+            );
+        }
+
+        crate::state::add_tracked_ids(&mut wireless_devices, devices_to_add);
+        crate::state::add_tracked_ids(&mut wireless_gateways, gateways_to_add);
+        crate::state::add_tracked_ids(&mut multicast_groups, groups_to_add);
+        crate::state::remove_tracked_ids(
+            &mut wireless_devices,
+            input.wireless_devices_to_remove.as_deref().unwrap_or(&[]),
+        );
+        crate::state::remove_tracked_ids(
+            &mut wireless_gateways,
+            input.wireless_gateways_to_remove.as_deref().unwrap_or(&[]),
+        );
+        crate::state::remove_tracked_ids(
+            &mut multicast_groups,
+            input.multicast_groups_to_remove.as_deref().unwrap_or(&[]),
+        );
+
+        // A configuration may not end up tracking more resources than the member that
+        // reports them can carry, however many calls built the set up.
+        for (member, len, max) in [
+            (
+                "WirelessDevices",
+                wireless_devices.len(),
+                crate::state::MAX_TRACKED_WIRELESS_DEVICES,
+            ),
+            (
+                "MulticastGroups",
+                multicast_groups.len(),
+                crate::state::MAX_TRACKED_MULTICAST_GROUPS,
+            ),
+            (
+                "WirelessGateways",
+                wireless_gateways.len(),
+                crate::state::MAX_TRACKED_WIRELESS_GATEWAYS,
+            ),
+        ] {
+            if let Some(refusal) = crate::state::tracked_list_over_limit(member, len, max) {
+                return Err(
+                    UpdateNetworkAnalyzerConfigurationErrorModeled::ValidationException(refusal)
+                        .into(),
+                );
+            }
+        }
+
+        // The record this request addressed was resolved above, under the same lock, so
+        // the lookup that takes it for writing cannot miss. An emulator that somehow
+        // lost it between the two must not answer success for a write it did not make.
+        let Some(configuration) = store
+            .network_analyzer_configurations
+            .get_mut(&input.configuration_name)
+        else {
+            return Err(
+                UpdateNetworkAnalyzerConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the iotwireless store lost the network analyzer configuration \
+                             this request was updating"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        configuration.wireless_devices = wireless_devices;
+        configuration.wireless_gateways = wireless_gateways;
+        configuration.multicast_groups = multicast_groups;
+
+        // Every other member the request CARRIED replaces the stored one, and a member
+        // it omitted leaves the stored value as it was — so changing only the log level
+        // keeps the configuration's description and the frame-info settings beside it.
+        if let Some(description) = input.description {
+            configuration.description = Some(description);
+        }
+        if let Some(trace_content) = input.trace_content {
+            let stored = configuration
+                .trace_content
+                .get_or_insert_with(Default::default);
+            if let Some(log_level) = trace_content.log_level {
+                stored.log_level = Some(log_level);
+            }
+            if let Some(frame_info) = trace_content.wireless_device_frame_info {
+                stored.wireless_device_frame_info = Some(frame_info);
+            }
+            if let Some(frame_info) = trace_content.multicast_frame_info {
+                stored.multicast_frame_info = Some(frame_info);
+            }
+        }
+
+        Ok(UpdateNetworkAnalyzerConfigurationOutput {})
     }
 }

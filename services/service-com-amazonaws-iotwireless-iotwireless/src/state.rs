@@ -16,7 +16,7 @@ use crate::ops::types::{
     LoRaWANJoinEventNotificationConfigurations, LoRaWANMulticast, LoRaWANServiceProfile,
     MessageDeliveryStatusEventConfiguration, ProximityEventConfiguration,
     ResourceNotFoundException, SidewalkDevice, SidewalkEventNotificationConfigurations, Tag,
-    UpdateWirelessGatewayTaskCreate, ValidationException,
+    TraceContent, UpdateWirelessGatewayTaskCreate, ValidationException,
 };
 
 /// The ARN service namespace (`arn:aws:iotwireless:...`) and the SigV4 signing name
@@ -77,6 +77,15 @@ pub fn wireless_gateway_task_definition_arn(region: &str, id: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("WirelessGatewayTaskDefinition/{id}"),
+    )
+}
+
+/// `arn:aws:iotwireless:<region>:<account>:NetworkAnalyzerConfiguration/<name>`.
+pub fn network_analyzer_configuration_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("NetworkAnalyzerConfiguration/{name}"),
     )
 }
 
@@ -853,6 +862,98 @@ pub fn multicast_group_not_found(id: &str) -> ResourceNotFoundException {
     }
 }
 
+/// A network analyzer configuration: the trace settings, and the wireless devices,
+/// wireless gateways and multicast groups whose frames the configuration tracks.
+///
+/// Keyed by `Name` — the `@httpLabel` every reader, updater and delete addresses it by.
+/// The three tracked-resource lists hold the ids in the order they were first added, so
+/// a reader reports them in the order the caller built them up in, and each id appears
+/// at most once however many times it is added.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkAnalyzerConfiguration {
+    pub name: String,
+    pub arn: String,
+    pub description: Option<String>,
+    pub trace_content: Option<TraceContent>,
+    /// `WirelessDeviceId`s this configuration tracks.
+    pub wireless_devices: Vec<String>,
+    /// `WirelessGatewayId`s this configuration tracks.
+    pub wireless_gateways: Vec<String>,
+    /// `MulticastGroupId`s this configuration tracks.
+    pub multicast_groups: Vec<String>,
+    pub tags: Vec<Tag>,
+}
+
+/// The `ResourceNotFoundException` body for a network analyzer configuration the account
+/// does not hold.
+///
+/// One function, so every operation that addresses a configuration by `Name` — its
+/// reader and its updater — refuses a missing one with the same body, worded the way
+/// [`resource_not_found`] words this error class for every kind this service addresses by
+/// an identifier.
+pub fn network_analyzer_configuration_not_found(name: &str) -> ResourceNotFoundException {
+    resource_not_found("NetworkAnalyzerConfiguration", name)
+}
+
+/// The most wireless devices one network analyzer configuration tracks.
+///
+/// The ceiling the model publishes for the member that carries them:
+/// `smithy_query(query="shape", shape="WirelessDeviceList")` is `length 0..250`, and
+/// `GetNetworkAnalyzerConfiguration` reports the tracked devices through that very list
+/// — so a stored set past this could not be reported.
+pub const MAX_TRACKED_WIRELESS_DEVICES: usize = 250;
+
+/// The most multicast groups one network analyzer configuration tracks, for the same
+/// reason as [`MAX_TRACKED_WIRELESS_DEVICES`]:
+/// `smithy_query(query="shape", shape="NetworkAnalyzerMulticastGroupList")` is
+/// `length 0..10`.
+pub const MAX_TRACKED_MULTICAST_GROUPS: usize = 10;
+
+/// The most wireless gateways one network analyzer configuration tracks.
+///
+/// `smithy_query(query="shape", shape="WirelessGatewayList")` publishes no length for
+/// the member that carries them, so the bound is the one the store itself implies: a
+/// configuration tracks gateways this account holds, and the account holds at most
+/// [`MAX_WIRELESS_GATEWAYS`] of them.
+pub const MAX_TRACKED_WIRELESS_GATEWAYS: usize = MAX_WIRELESS_GATEWAYS;
+
+/// Add every id in `additions` the list does not already carry, keeping the order ids
+/// were first added in.
+///
+/// One function, so the create (which starts from an empty list) and the update (which
+/// adds to a stored one) build a tracked-resource list the same way, and neither can
+/// store an id twice.
+pub fn add_tracked_ids(list: &mut Vec<String>, additions: &[String]) {
+    for id in additions {
+        if !list.iter().any(|held| held == id) {
+            list.push(id.clone());
+        }
+    }
+}
+
+/// Drop every id in `removals` from the list, leaving the rest in order.
+///
+/// Removing an id a configuration does not track is a no-op: the request asks for a
+/// state the configuration is already in.
+pub fn remove_tracked_ids(list: &mut Vec<String>, removals: &[String]) {
+    list.retain(|held| !removals.iter().any(|id| id == held));
+}
+
+/// The `ValidationException` for a tracked-resource list that would pass the ceiling the
+/// model publishes for the member reporting it, or `None` when it fits.
+pub fn tracked_list_over_limit(
+    member: &str,
+    len: usize,
+    max: usize,
+) -> Option<ValidationException> {
+    (len > max).then(|| ValidationException {
+        message: Some(format!(
+            "a network analyzer configuration tracks at most {max} entries in {member}; \
+             this request would track {len}"
+        )),
+    })
+}
+
 /// What an `@idempotencyToken` create remembers: which resource the token minted, and
 /// a fingerprint of the parameters it was minted with.
 ///
@@ -976,6 +1077,19 @@ pub const MAX_MULTICAST_GROUP_TOKENS: usize = MAX_MULTICAST_GROUPS;
 /// Bounded for the same reason as [`MAX_DESTINATION_TOKENS`].
 pub const MAX_WIRELESS_GATEWAY_TOKENS: usize = MAX_WIRELESS_GATEWAYS;
 
+/// The most network analyzer configurations this emulator stores. A ceiling, for the
+/// same reason as [`MAX_DESTINATIONS`]; `CreateNetworkAnalyzerConfiguration` models no
+/// quota error either (`smithy_query(query="operation",
+/// operation="CreateNetworkAnalyzerConfiguration")` lists AccessDenied / Conflict /
+/// InternalServer / ResourceNotFound / Throttling / Validation), so a full store refuses
+/// with `ValidationException`.
+pub const MAX_NETWORK_ANALYZER_CONFIGURATIONS: usize = 100;
+
+/// The most `ClientRequestToken` entries kept for
+/// `CreateNetworkAnalyzerConfiguration` idempotency. Bounded for the same reason as
+/// [`MAX_DESTINATION_TOKENS`].
+pub const MAX_NETWORK_ANALYZER_CONFIGURATION_TOKENS: usize = MAX_NETWORK_ANALYZER_CONFIGURATIONS;
+
 /// The resource kinds a log-level override addresses.
 ///
 /// `ResourceType` is an unconstrained string in the model
@@ -1033,7 +1147,8 @@ pub fn log_level_resource_not_found(
 /// Every store here is BOUNDED: the resource maps by [`MAX_DESTINATIONS`] /
 /// [`MAX_WIRELESS_DEVICES`] / [`MAX_DEVICE_PROFILES`] / [`MAX_SERVICE_PROFILES`] /
 /// [`MAX_MULTICAST_GROUPS`] / [`MAX_FUOTA_TASKS`] /
-/// [`MAX_WIRELESS_GATEWAYS`] / [`MAX_WIRELESS_GATEWAY_TASK_DEFINITIONS`] (the
+/// [`MAX_WIRELESS_GATEWAYS`] / [`MAX_WIRELESS_GATEWAY_TASK_DEFINITIONS`] /
+/// [`MAX_NETWORK_ANALYZER_CONFIGURATIONS`] (the
 /// creates refuse once full), `dev_eui_index` by one entry per stored device,
 /// `gateway_eui_index` and `wireless_gateway_tasks` by one entry per stored gateway,
 /// and the
@@ -1041,13 +1156,15 @@ pub fn log_level_resource_not_found(
 /// [`MAX_DEVICE_PROFILE_TOKENS`] / [`MAX_SERVICE_PROFILE_TOKENS`] /
 /// [`MAX_MULTICAST_GROUP_TOKENS`] / [`MAX_FUOTA_TASK_TOKENS`] /
 /// [`MAX_WIRELESS_GATEWAY_TOKENS`] /
-/// [`MAX_WIRELESS_GATEWAY_TASK_DEFINITION_TOKENS`] with oldest-entry
+/// [`MAX_WIRELESS_GATEWAY_TASK_DEFINITION_TOKENS`] /
+/// [`MAX_NETWORK_ANALYZER_CONFIGURATION_TOKENS`] with oldest-entry
 /// eviction. The token maps are private so every write goes through
 /// [`Self::record_destination_token`] / [`Self::record_wireless_device_token`] /
 /// [`Self::record_device_profile_token`] / [`Self::record_service_profile_token`] /
 /// [`Self::record_multicast_group_token`] / [`Self::record_fuota_task_token`] /
 /// [`Self::record_wireless_gateway_token`] /
-/// [`Self::record_wireless_gateway_task_definition_token`] and
+/// [`Self::record_wireless_gateway_task_definition_token`] /
+/// [`Self::record_network_analyzer_configuration_token`] and
 /// cannot bypass the cap. The log-level override map is bounded by
 /// [`MAX_RESOURCE_LOG_LEVEL_OVERRIDES`] and private for the same reason.
 #[derive(Debug, Default)]
@@ -1125,6 +1242,15 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
     wireless_gateway_task_definition_tokens: HashMap<String, IdempotentCreate>,
     /// Write order for [`Self::wireless_gateway_task_definition_tokens`].
     wireless_gateway_task_definition_token_order: VecDeque<String>,
+    /// Network analyzer configurations by `Name`. Bounded by
+    /// [`MAX_NETWORK_ANALYZER_CONFIGURATIONS`].
+    pub network_analyzer_configurations: BTreeMap<String, NetworkAnalyzerConfiguration>,
+    /// `CreateNetworkAnalyzerConfiguration` client request tokens, bounded by
+    /// [`MAX_NETWORK_ANALYZER_CONFIGURATION_TOKENS`]. Private, like the destination
+    /// tokens.
+    network_analyzer_configuration_tokens: HashMap<String, IdempotentCreate>,
+    /// Write order for [`Self::network_analyzer_configuration_tokens`].
+    network_analyzer_configuration_token_order: VecDeque<String>,
     /// The log-level override each resource carries: `ResourceType` -> that type's
     /// `ResourceIdentifier` -> `LogLevel`. Nested so a lookup resolves a pair without
     /// building a key, and bounded by [`MAX_RESOURCE_LOG_LEVEL_OVERRIDES`] across every
@@ -1459,6 +1585,66 @@ impl ComAmazonawsIotwirelessIotwirelessState {
             }),
             _ => None,
         }
+    }
+
+    /// What a `CreateNetworkAnalyzerConfiguration` `ClientRequestToken` already minted,
+    /// if anything.
+    pub fn network_analyzer_configuration_token(&self, token: &str) -> Option<&IdempotentCreate> {
+        self.network_analyzer_configuration_tokens.get(token)
+    }
+
+    /// Record `token` as having minted the configuration named by `record`, evicting the
+    /// oldest token first if that would push the map past
+    /// [`MAX_NETWORK_ANALYZER_CONFIGURATION_TOKENS`].
+    pub fn record_network_analyzer_configuration_token(
+        &mut self,
+        token: String,
+        record: IdempotentCreate,
+    ) {
+        record_token(
+            &mut self.network_analyzer_configuration_tokens,
+            &mut self.network_analyzer_configuration_token_order,
+            MAX_NETWORK_ANALYZER_CONFIGURATION_TOKENS,
+            token,
+            record,
+        );
+    }
+
+    /// The modelled 404 for the first id in these tracked-resource lists that names no
+    /// stored resource, or `None` when every one of them resolves.
+    ///
+    /// A network analyzer configuration tracks OTHER resources by id, so a configuration
+    /// may only name resources this account holds: one function, so the create and the
+    /// update resolve a tracked id against the same state and refuse a missing one with
+    /// the same body as its own reader does.
+    pub fn unresolved_tracked_resource(
+        &self,
+        wireless_devices: &[String],
+        wireless_gateways: &[String],
+        multicast_groups: &[String],
+    ) -> Option<ResourceNotFoundException> {
+        if let Some(id) = wireless_devices
+            .iter()
+            .find(|id| !self.wireless_devices.contains_key(id.as_str()))
+        {
+            return Some(wireless_device_not_found(id));
+        }
+        if wireless_gateways
+            .iter()
+            .any(|id| !self.wireless_gateways.contains_key(id.as_str()))
+        {
+            // Every operation that addresses a gateway refuses a missing one with this
+            // one fixed sentence, so a tracked gateway that does not resolve is refused
+            // with it too rather than with a second wording.
+            return Some(wireless_gateway_not_found());
+        }
+        if let Some(id) = multicast_groups
+            .iter()
+            .find(|id| !self.multicast_groups.contains_key(id.as_str()))
+        {
+            return Some(multicast_group_not_found(id));
+        }
+        None
     }
 
     /// The gateway a `GetWirelessGateway` identifier resolves to, or `None`.

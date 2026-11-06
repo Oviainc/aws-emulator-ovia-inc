@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNetworkAnalyzerConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNetworkAnalyzerConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNetworkAnalyzerConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: persists a network analyzer configuration keyed by its `Name`, minting
+//! its ARN and resolving every resource it is told to track against this service's
+//! store. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +168,182 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNetworkAnalyzerConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNetworkAnalyzerConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNetworkAnalyzerConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateNetworkAnalyzerConfigurationError::from(
+                CreateNetworkAnalyzerConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the iotwireless store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let fingerprint = fingerprint(&input);
+        let mut store = state.lock();
+
+        // `ClientRequestToken` is an `@idempotencyToken`: replaying it with the same
+        // parameters completes successfully and returns what the first call created;
+        // replaying it with different parameters is an HTTP 409. Checked BEFORE the name
+        // conflict, or the documented successful replay would be refused as a name
+        // collision.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if let Some(prior) = store.network_analyzer_configuration_token(token) {
+                if prior.fingerprint != fingerprint {
+                    return Err(
+                        CreateNetworkAnalyzerConfigurationErrorModeled::ConflictException(
+                            ConflictException {
+                                message: Some(format!(
+                                    "ClientRequestToken {token} was already used with \
+                                     different parameters"
+                                )),
+                                resource_id: Some(prior.resource_key.clone()),
+                                resource_type: Some("NetworkAnalyzerConfiguration".to_string()),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                let replayed = prior.resource_key.clone();
+                if let Some(existing) = store.network_analyzer_configurations.get(&replayed) {
+                    return Ok(CreateNetworkAnalyzerConfigurationOutput {
+                        arn: Some(existing.arn.clone()),
+                        name: Some(existing.name.clone()),
+                    });
+                }
+                // The configuration this token minted has since been deleted, so there
+                // is nothing to replay: fall through and create it again.
+            }
+        }
+
+        // `Name` is this resource's key, so a second claimant is refused rather than
+        // overwriting the first.
+        if store.network_analyzer_configurations.contains_key(&input.name) {
+            return Err(
+                CreateNetworkAnalyzerConfigurationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "NetworkAnalyzerConfiguration {} already exists",
+                            input.name
+                        )),
+                        resource_id: Some(input.name.clone()),
+                        resource_type: Some("NetworkAnalyzerConfiguration".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store is bounded, so a create loop cannot grow the emulator's heap without
+        // bound. This operation models no quota error, so a full store is a
+        // `ValidationException` naming the ceiling it hit.
+        if store.network_analyzer_configurations.len()
+            >= crate::state::MAX_NETWORK_ANALYZER_CONFIGURATIONS
+        {
+            return Err(
+                CreateNetworkAnalyzerConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "this emulator stores at most {} network analyzer \
+                             configurations; delete one before creating another",
+                            crate::state::MAX_NETWORK_ANALYZER_CONFIGURATIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A configuration tracks OTHER resources by id, so every id it is given must
+        // name a resource this account holds; one that does not is the modelled 404.
+        let wireless_devices = input.wireless_devices.as_deref().unwrap_or(&[]);
+        let wireless_gateways = input.wireless_gateways.as_deref().unwrap_or(&[]);
+        let multicast_groups = input.multicast_groups.as_deref().unwrap_or(&[]);
+        if let Some(missing) =
+            store.unresolved_tracked_resource(wireless_devices, wireless_gateways, multicast_groups)
+        {
+            return Err(
+                CreateNetworkAnalyzerConfigurationErrorModeled::ResourceNotFoundException(missing)
+                    .into(),
+            );
+        }
+
+        // An id repeated in one request is tracked once: a configuration holds a SET of
+        // resources, which is what `UpdateNetworkAnalyzerConfiguration`'s add/remove
+        // members address.
+        let mut configuration = crate::state::NetworkAnalyzerConfiguration {
+            name: input.name.clone(),
+            arn: crate::state::network_analyzer_configuration_arn(&region, &input.name),
+            description: input.description.clone(),
+            trace_content: input.trace_content.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+            ..Default::default()
+        };
+        crate::state::add_tracked_ids(&mut configuration.wireless_devices, wireless_devices);
+        crate::state::add_tracked_ids(&mut configuration.wireless_gateways, wireless_gateways);
+        crate::state::add_tracked_ids(&mut configuration.multicast_groups, multicast_groups);
+
+        // A configuration may not track more resources than the member that reports them
+        // can carry — the same ceilings the update enforces, so neither entry point can
+        // store a set the reader could not report. On this path the modelled list
+        // lengths already refuse an over-long request before the handler runs, so this
+        // is the belt to the update's braces.
+        for (member, len, max) in [
+            (
+                "WirelessDevices",
+                configuration.wireless_devices.len(),
+                crate::state::MAX_TRACKED_WIRELESS_DEVICES,
+            ),
+            (
+                "MulticastGroups",
+                configuration.multicast_groups.len(),
+                crate::state::MAX_TRACKED_MULTICAST_GROUPS,
+            ),
+            (
+                "WirelessGateways",
+                configuration.wireless_gateways.len(),
+                crate::state::MAX_TRACKED_WIRELESS_GATEWAYS,
+            ),
+        ] {
+            if let Some(refusal) = crate::state::tracked_list_over_limit(member, len, max) {
+                return Err(
+                    CreateNetworkAnalyzerConfigurationErrorModeled::ValidationException(refusal)
+                        .into(),
+                );
+            }
+        }
+
+        let output = CreateNetworkAnalyzerConfigurationOutput {
+            arn: Some(configuration.arn.clone()),
+            name: Some(configuration.name.clone()),
+        };
+        store
+            .network_analyzer_configurations
+            .insert(input.name.clone(), configuration);
+        if let Some(token) = input.client_request_token.clone() {
+            store.record_network_analyzer_configuration_token(
+                token,
+                crate::state::IdempotentCreate {
+                    resource_key: input.name.clone(),
+                    fingerprint,
+                },
+            );
+        }
+        Ok(output)
     }
+}
+
+/// The create parameters, the token excluded, as one comparable string — what decides
+/// whether a replayed `ClientRequestToken` carries "the same parameters".
+fn fingerprint(input: &CreateNetworkAnalyzerConfigurationInput) -> String {
+    let tags = crate::state::sorted_tag_pairs(input.tags.as_deref().unwrap_or_default());
+    format!(
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{tags:?}",
+        input.name,
+        input.description,
+        input.trace_content,
+        input.wireless_devices,
+        input.wireless_gateways,
+        input.multicast_groups,
+    )
 }
