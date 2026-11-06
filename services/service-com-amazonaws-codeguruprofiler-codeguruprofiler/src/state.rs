@@ -570,10 +570,12 @@ impl ResourcePolicy {
         self.statements.remove(action_group).is_some()
     }
 
-    /// Whether the policy holds no statement at all — what the writer that revoked the
-    /// last one asks before deciding whether there is still a policy to store.
-    pub fn is_empty(&self) -> bool {
-        self.statements.is_empty()
+    /// Whether revoking `action_group` would leave the policy holding no statement at
+    /// all — what the writer that revokes a statement asks before deciding whether
+    /// there is still a policy to store, and so a revision to be at. True only for the
+    /// policy's LAST remaining statement.
+    pub fn is_last_statement(&self, action_group: &str) -> bool {
+        self.statements.len() == 1 && self.statements.contains_key(action_group)
     }
 
     /// The JSON-formatted resource-based policy document, as every operation that
@@ -1644,13 +1646,15 @@ pub enum PolicyLimit {
 /// or [`ComAmazonawsCodeguruprofilerCodeguruprofilerState::remove_permission`]) did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyWrite {
-    /// Applied: the policy document the write produced, and the revision it minted.
-    /// EVERY applied write reports both, including a removal that took the policy's
-    /// last statement: that removal DELETED the policy, and what it reports is the
-    /// document the removal left (one with no statement in it) at the revision it
-    /// minted — a revision no later write can name, there being no policy to name it
-    /// of.
+    /// Applied, and the group still holds a policy: the document that policy now
+    /// carries, and the revision the write minted — the revision the next write to it
+    /// must name.
     Written { policy: String, revision_id: String },
+    /// Applied, and the group holds NO policy any more: the write took the policy's
+    /// last statement, and a policy exists only while it holds one, so the policy was
+    /// deleted. There is no document and no revision to report — nothing is stored for
+    /// either, and no revision was minted, a deleted policy having none to be at.
+    Deleted,
     /// There is no such profiling group.
     UnknownGroup,
     /// The group has no resource-based policy at all, so there is nothing to remove
@@ -1794,14 +1798,14 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
     /// optimistic locking as [`Self::put_permission`]: the revision is checked first,
     /// so a stale revision is answered as a conflict whatever else the request names.
     ///
-    /// An applied removal is [`PolicyWrite::Written`] whatever it leaves behind: the
-    /// policy as it then stands and the revision the change minted.
+    /// A removal that leaves a statement behind is [`PolicyWrite::Written`]: the policy
+    /// as it then stands and the revision the change minted.
     ///
     /// A resource-based policy exists only while it holds at least one statement, so a
-    /// removal that takes the LAST statement DELETES the policy: the group is
-    /// policy-less again, exactly as it was before the first grant. The removal still
-    /// reports the document it left (one with no statement in it) and the revision it
-    /// minted, but nothing stores that revision — the next grant on the group is a
+    /// removal that takes the LAST statement DELETES the policy and is
+    /// [`PolicyWrite::Deleted`]: the group is policy-less again, exactly as it was
+    /// before the first grant. There is then no policy to render a document of and none
+    /// to carry a revision, so none is minted either — the next grant on the group is a
     /// FIRST write again, and every other policy-scoped call finds no policy.
     pub fn remove_permission(
         &mut self,
@@ -1829,7 +1833,12 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
             return PolicyWrite::NoStatement;
         }
 
-        let revision_id = self.mint_revision_id(group_name, action_group);
+        // A statement-less policy is no policy: the removal that takes the last
+        // statement deletes the group's policy, so the group goes back to the
+        // policy-less state it was created in. There is then no policy to be at a
+        // revision, so a removal that deletes one mints none.
+        let revision_id = (!policy.is_last_statement(action_group))
+            .then(|| self.mint_revision_id(group_name, action_group));
         let Some(group) = self.groups.get_mut(group_name) else {
             // Unreachable: the group was resolved above, under the same `&mut self`.
             return PolicyWrite::UnknownGroup;
@@ -1839,17 +1848,14 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
             return PolicyWrite::NoPolicy;
         };
         policy.revoke(action_group);
+        // Only a policy that still holds a statement is stored again, and only such a
+        // policy has a document and a revision to report.
+        let Some(revision_id) = revision_id else {
+            return PolicyWrite::Deleted;
+        };
         policy.set_revision(&revision_id);
-        // The policy as it stands after the removal — the statements it still holds,
-        // which is none once the removal took the last of them.
         let document = policy.document(&group.arn);
-        // A statement-less policy is no policy: the removal that took the last
-        // statement is what deletes the group's policy, so the group goes back to the
-        // policy-less state it was created in. Only a policy that still holds a
-        // statement is stored again.
-        if !policy.is_empty() {
-            group.policy = Some(policy);
-        }
+        group.policy = Some(policy);
         PolicyWrite::Written {
             policy: document,
             revision_id,

@@ -65,8 +65,9 @@ fn principal() -> String {
 
 /// The store's own identifier-mint counters, `(notification-channel ids, policy
 /// revisions)` — state no response reports, so the only way to see what a refused write
-/// did to it is to read the one shared engine behind the harness.
-fn mint_counts(harness: &Harness) -> (u64, u64) {
+/// did to it is to read the one shared engine behind the harness. Shared with the
+/// sibling suites that assert which writes mint a revision at all.
+pub(crate) fn mint_counts(harness: &Harness) -> (u64, u64) {
     let state = harness
         .engine()
         .state::<service_com_amazonaws_codeguruprofiler_codeguruprofiler::ComAmazonawsCodeguruprofilerCodeguruprofilerState>();
@@ -543,9 +544,9 @@ async fn an_applied_policy_write_mints_one_revision_and_a_refused_one_mints_none
          {after_second:?} from {after_first:?}"
     );
 
-    // Removing the policy's LAST statement is an applied write like any other: exactly
-    // one revision is minted and reported, even though the policy that revision belongs
-    // to is deleted by the same removal — so the group stores none afterwards.
+    // Removing the policy's LAST statement DELETES the policy — a policy exists only
+    // while it holds a statement — so there is no policy left to be at a revision: the
+    // removal mints none, reports neither member, and the group stores none afterwards.
     let removed = remove_permission(&harness, group, ACTION_GROUP, &second_revision).await;
     assert_eq!(
         removed.status,
@@ -554,18 +555,18 @@ async fn an_applied_policy_write_mints_one_revision_and_a_refused_one_mints_none
         removed.status,
         String::from_utf8_lossy(&removed.body)
     );
-    let removal_revision = string_member(&removed, "revisionId");
-    assert_ne!(
-        removal_revision, second_revision,
-        "case emptying removal: an applied removal must carry a fresh revision, got \
-         {removal_revision}"
+    assert_eq!(
+        removed.json(),
+        serde_json::json!({}),
+        "case emptying removal: the removal deleted the policy, so it must report neither \
+         policy nor revisionId, got {}",
+        String::from_utf8_lossy(&removed.body)
     );
     let after_removal = mint_counts(&harness);
     assert_eq!(
-        after_removal,
-        (after_second.0, after_second.1 + 1),
-        "case emptying removal: an applied removal must mint exactly one revision, got \
-         {after_removal:?} from {after_second:?}"
+        after_removal, after_second,
+        "case emptying removal: a removal that deleted the policy must mint no revision, \
+         got {after_removal:?} from {after_second:?}"
     );
     assert_eq!(
         harness.stored_policy_revision(group),
@@ -573,5 +574,28 @@ async fn an_applied_policy_write_mints_one_revision_and_a_refused_one_mints_none
         "case emptying removal: the removal took the last statement, so the group must \
          store no policy, got {:?}",
         harness.stored_policy_revision(group)
+    );
+
+    // ...and the counter that removal left alone is still the one the next APPLIED write
+    // draws from: the group is policy-less, so that write is a first grant again.
+    let regranted = put_permission(&harness, group, ACTION_GROUP, &[principal()], None).await;
+    assert_eq!(
+        regranted.status,
+        200,
+        "case re-grant: expected 200, got {} / {}",
+        regranted.status,
+        String::from_utf8_lossy(&regranted.body)
+    );
+    let regrant_revision = string_member(&regranted, "revisionId");
+    assert_ne!(
+        regrant_revision, second_revision,
+        "case re-grant: an applied write must carry a fresh revision, got {regrant_revision}"
+    );
+    let after_regrant = mint_counts(&harness);
+    assert_eq!(
+        after_regrant,
+        (after_removal.0, after_removal.1 + 1),
+        "case re-grant: an applied policy write must mint exactly one revision, got \
+         {after_regrant:?} from {after_removal:?}"
     );
 }

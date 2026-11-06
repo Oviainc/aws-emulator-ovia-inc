@@ -216,8 +216,16 @@ async fn both_policy_writes_answer_from_the_shared_action_group_rule() {
             String::from_utf8_lossy(&removed.body)
         );
         // The statement is gone; it was the policy's only one, so the policy went with
-        // it and the group is policy-less again — which is what the reader reports, and
-        // why the next grantable action group is written as a FIRST write.
+        // it and the group is policy-less again — so the removal itself reports neither
+        // member, which is what the reader reports too, and why the next grantable
+        // action group is written as a FIRST write.
+        assert_eq!(
+            removed.json(),
+            serde_json::json!({}),
+            "case {action_group:?}: the removal took the policy's last statement, so it \
+             must report neither policy nor revisionId, got {}",
+            String::from_utf8_lossy(&removed.body)
+        );
         let after = get_policy(&harness, GROUP).await;
         assert_eq!(
             after.json(),
@@ -227,9 +235,9 @@ async fn both_policy_writes_answer_from_the_shared_action_group_rule() {
             String::from_utf8_lossy(&after.body)
         );
         assert!(
-            !string_member(&removed, "policy").contains(sid.as_str()),
+            !String::from_utf8_lossy(&removed.body).contains(sid.as_str()),
             "case {action_group:?}: the removed action group must hold no statement, got {}",
-            string_member(&removed, "policy")
+            String::from_utf8_lossy(&removed.body)
         );
         current = None;
     }

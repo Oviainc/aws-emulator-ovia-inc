@@ -19,14 +19,27 @@ pub struct RemovePermissionInput {
     pub revision_id: String,
 }
 
-/// `RemovePermissionResponse`. Both members are `@required` in the model, and an
-/// applied removal always reports both — the policy as it stands after the removal and
-/// the revision it then carries — so they are plain fields the serializer always
-/// writes, exactly like `PutPermissionOutput`'s.
-#[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#RemovePermissionResponse")]
+/// `RemovePermissionResponse`. Its schema and codec come from [`profiler_schema_and_codec!`]
+/// rather than `#[smithy_macros::smithy(shape = ...)]` because BOTH its members are
+/// `@required` in the model yet neither is in the body of the 200 a removal that took the
+/// policy's LAST statement answers: a policy exists only while it holds a statement, so
+/// that removal deleted the policy and left no document to report and no revision to
+/// report it at. The derive makes a `@required` member a non-`Option` field its
+/// serializer always writes, which cannot express that; see `types/date_time_wire.rs`,
+/// and `GetPolicyOutput`, which reports the same two members of the same policy.
 #[derive(Debug, Clone, Default)]
 pub struct RemovePermissionOutput {
-    pub policy: String,
-    pub revision_id: String,
+    pub policy: Option<String>,
+    pub revision_id: Option<String>,
 }
+
+profiler_schema_and_codec!(
+    RemovePermissionOutput,
+    REMOVE_PERMISSION_OUTPUT_SCHEMA,
+    "com.amazonaws.codeguruprofiler#RemovePermissionResponse",
+    "com.amazonaws.codeguruprofiler",
+    "RemovePermissionResponse",
+    (M_POLICY, policy, "policy", 0, opt, string),
+    (M_REVISION_ID, revision_id, "revisionId", 1, opt, string),
+);
 

@@ -3,15 +3,15 @@
 //! What an APPLIED `RemovePermission` reports, end to end over HTTP through the router
 //! this service mounts in production.
 //!
-//! The rule every case here asserts: an applied removal reports both members the model
-//! marks `@required` on `RemovePermissionResponse` — the resource-based policy as the
-//! removal left it (one statement per action group the policy still holds, and no
-//! statement at all once the removal took the last one) and the fresh revision the
-//! removal minted. A policy that still holds a statement is still the group's policy, at
-//! that revision, so that is the revision the next write to it must name; a policy the
-//! removal emptied is DELETED, which [`crate::last_statement_removal_deletes_the_policy`]
-//! is about. Either way a removal answers with both members, never with ones a generated
-//! client would find missing.
+//! The rule every case here asserts: an applied removal reports the resource-based
+//! policy the profiling group holds once the removal is done, and the revision that
+//! policy is then at — one statement per action group the policy still holds, at the
+//! fresh revision the removal minted. A policy that still holds a statement is still the
+//! group's policy, so that revision is the one the next write to it must name. A policy
+//! exists only while it holds a statement, so the removal that took the LAST one DELETED
+//! it, and there is then neither a document to report nor a revision to report it at:
+//! that removal's 200 carries neither member, which
+//! [`crate::last_statement_removal_deletes_the_policy`] is about.
 //!
 //! Rows differ along what the rule generalises over: how many statements the policy
 //! holds when the removal arrives (1, 2 and 3 — so the removal leaves 0, 1 and 2
@@ -260,9 +260,11 @@ async fn an_applied_removal_reports_the_policy_and_revision_it_leaves_behind() {
             String::from_utf8_lossy(&removed.body)
         );
 
-        // BOTH members the model marks `@required` are in the body, and nothing else is.
+        // WHICH members the body carries is the policy's existence: both the model marks
+        // `@required` while the group still holds a policy, NEITHER once the removal
+        // deleted it — and nothing else either way.
         let body = removed.json();
-        let reported: Vec<&String> = body
+        let reported: Vec<String> = body
             .as_object()
             .unwrap_or_else(|| {
                 panic!(
@@ -271,28 +273,41 @@ async fn an_applied_removal_reports_the_policy_and_revision_it_leaves_behind() {
                 )
             })
             .keys()
+            .cloned()
             .collect();
+        let expected_members: Vec<String> = if case.kept().is_empty() {
+            Vec::new()
+        } else {
+            ["policy", "revisionId"]
+                .iter()
+                .map(|member| (*member).to_string())
+                .collect()
+        };
         assert_eq!(
-            reported,
-            vec!["policy", "revisionId"],
-            "case {case:?}: a removal must report the policy and the revision, got {}",
+            reported, expected_members,
+            "case {case:?}: expected the members {expected_members:?}, got {}",
             String::from_utf8_lossy(&removed.body)
         );
 
-        let revision = string_member(&removed, "revisionId");
-        assert!(
-            is_revision_id(&revision),
-            "case {case:?}: expected a revisionId of the modelled form, got {revision:?}"
-        );
-        assert_ne!(
-            revision, case.revision_id,
-            "case {case:?}: an applied removal must mint a new revision, got {revision}"
-        );
-        assert_reports_the_remaining_policy(&case, "the removal", &removed);
+        let expected_stored = if case.kept().is_empty() {
+            None
+        } else {
+            let revision = string_member(&removed, "revisionId");
+            assert!(
+                is_revision_id(&revision),
+                "case {case:?}: expected a revisionId of the modelled form, got {revision:?}"
+            );
+            assert_ne!(
+                revision, case.revision_id,
+                "case {case:?}: an applied removal must mint a new revision, got {revision}"
+            );
+            assert_reports_the_remaining_policy(&case, "the removal", &removed);
+            Some(revision)
+        };
 
         // A policy that still holds a statement is what the group holds now, so the
         // reader reports exactly what the removal reported; one the removal emptied is
-        // gone, so the reader reports neither member.
+        // gone, so both report neither member.
         let read = get_policy(&harness, name).await;
         assert_eq!(
             read.status,
@@ -301,15 +316,10 @@ async fn an_applied_removal_reports_the_policy_and_revision_it_leaves_behind() {
             read.status,
             String::from_utf8_lossy(&read.body)
         );
-        let (expected_read, expected_stored) = if case.kept().is_empty() {
-            (serde_json::json!({}), None)
-        } else {
-            (body, Some(revision.clone()))
-        };
         assert_eq!(
             read.json(),
-            expected_read,
-            "case {case:?}: expected GetPolicy to report {expected_read}, got {}",
+            body,
+            "case {case:?}: expected GetPolicy to report {body}, got {}",
             String::from_utf8_lossy(&read.body)
         );
         assert_eq!(
@@ -330,7 +340,14 @@ async fn the_revision_a_removal_reports_is_the_one_the_next_write_must_name() {
         let name = case.group.name.as_str();
         let removed =
             remove_permission(&harness, name, REMOVED_ACTION_GROUP, &case.revision_id).await;
-        let revision = string_member(&removed, "revisionId");
+        // A row whose policy survived is at the revision the removal reported; a row
+        // whose policy the removal DELETED is at no revision at all, there being no
+        // policy — so the only revision such a row can name is the one it consumed.
+        let revision = if case.kept().is_empty() {
+            case.revision_id.clone()
+        } else {
+            string_member(&removed, "revisionId")
+        };
 
         // A row whose policy survived has moved past the revision it was seeded at, so a
         // write naming that one is a conflict; a row whose policy the removal DELETED
@@ -356,10 +373,10 @@ async fn the_revision_a_removal_reports_is_the_one_the_next_write_must_name() {
             String::from_utf8_lossy(&superseded.body)
         );
 
-        // ...while naming the revision the removal reported is refused as the
-        // operation's 404 `ResourceNotFoundException`: there is no statement to remove,
-        // the policy no longer holding one for the action group — or, for a row the
-        // removal emptied, no policy at all.
+        // ...while naming the revision the removal reported (or, for an emptied row, the
+        // one it consumed) is refused as the operation's 404 `ResourceNotFoundException`:
+        // there is no statement to remove, the policy no longer holding one for the
+        // action group — or, for a row the removal emptied, no policy at all.
         let again = remove_permission(&harness, name, REMOVED_ACTION_GROUP, &revision).await;
         assert_eq!(
             again.status,
@@ -418,7 +435,7 @@ async fn the_revision_a_removal_reports_is_the_one_the_next_write_must_name() {
             "case {case:?}: the regrant must mint a fresh revision, got \
              {regrant_revision:?} after {revision:?}"
         );
-        // The revision the emptying removal reported is of a policy that no longer
+        // The revision the emptied policy used to carry names a policy that no longer
         // exists, so naming it is refused.
         let stale_regrant = put_permission(
             &harness,
@@ -431,7 +448,7 @@ async fn the_revision_a_removal_reports_is_the_one_the_next_write_must_name() {
         assert_eq!(
             stale_regrant.status,
             409,
-            "case {case:?}: the revision the emptying removal reported names no stored \
+            "case {case:?}: the revision the emptied policy carried names no stored \
              policy, so a write naming it must conflict, got {} {}",
             stale_regrant.status,
             String::from_utf8_lossy(&stale_regrant.body)
@@ -440,15 +457,8 @@ async fn the_revision_a_removal_reports_is_the_one_the_next_write_must_name() {
 }
 
 #[tokio::test]
-async fn a_removal_that_empties_the_policy_reports_a_document_with_no_statement() {
+async fn a_removal_that_empties_the_policy_reports_neither_member() {
     let harness = Harness::new();
-
-    // The rows the rule's boundary sits on: a policy holding ONE statement, so the
-    // removal leaves a policy with no statement at all. The document is built from the
-    // layout rule the policy surface writes documents in (two-space indentation, `" : "`
-    // between a member and its value, an array on one line inside `[ ` / ` ]`), not from
-    // the renderer.
-    let expected = format!("{{\n  \"Version\" : \"{POLICY_VERSION}\",\n  \"Statement\" : [ ]\n}}");
 
     for case in seeded_cases(&harness)
         .await
@@ -465,35 +475,33 @@ async fn a_removal_that_empties_the_policy_reports_a_document_with_no_statement(
             removed.status,
             String::from_utf8_lossy(&removed.body)
         );
+        // The rows the rule's boundary sits on: a policy holding ONE statement, so the
+        // removal takes the last one and the policy is gone — there is no document to
+        // report and no revision to report it at, so the body carries nothing at all,
+        // and nothing it ever granted can be reported either.
         assert_eq!(
-            string_member(&removed, "policy"),
-            expected,
-            "case {case:?}: a policy with no statement must be reported as the document \
-             with an empty Statement array"
+            removed.json(),
+            serde_json::json!({}),
+            "case {case:?}: a removal that deleted the policy must report neither policy \
+             nor revisionId, got {}",
+            String::from_utf8_lossy(&removed.body)
         );
         for granted in &case.held[0].1 {
             assert!(
-                !string_member(&removed, "policy").contains(granted),
+                !String::from_utf8_lossy(&removed.body).contains(granted),
                 "case {case:?}: {granted} was removed, so it must be granted nothing in {}",
-                string_member(&removed, "policy")
+                String::from_utf8_lossy(&removed.body)
             );
         }
-        // The document is what the REMOVAL reports; the policy it describes is gone, so
-        // the reader reports neither member and a repeat removal has no policy to remove
-        // from.
+        // The reader agrees, and a repeat removal has no policy to remove from.
         assert_eq!(
             get_policy(&harness, name).await.json(),
             serde_json::json!({}),
             "case {case:?}: the removal took the last statement, so GetPolicy must \
              report neither policy nor revisionId"
         );
-        let repeated = remove_permission(
-            &harness,
-            name,
-            REMOVED_ACTION_GROUP,
-            &string_member(&removed, "revisionId"),
-        )
-        .await;
+        let repeated =
+            remove_permission(&harness, name, REMOVED_ACTION_GROUP, &case.revision_id).await;
         let expected_message =
             format!("No policy attached to profiling group name: {name} in accountId: {ACCOUNT}; ");
         assert_eq!(

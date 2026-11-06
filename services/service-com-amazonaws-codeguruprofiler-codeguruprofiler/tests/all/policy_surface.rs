@@ -125,19 +125,6 @@ fn expected_document(arn: &str, principals: &[String]) -> String {
     .join("\n")
 }
 
-/// The document a policy holding NO statement is reported as, built from the same layout
-/// rule as [`expected_document`]: an array is written on one line, so an empty one is
-/// `[ ]`.
-fn empty_document() -> String {
-    [
-        "{".to_string(),
-        "  \"Version\" : \"2012-10-17\",".to_string(),
-        "  \"Statement\" : [ ]".to_string(),
-        "}".to_string(),
-    ]
-    .join("\n")
-}
-
 /// One rendering row: a group from the shared table and the principal set granted on it.
 #[derive(Debug)]
 struct RenderCase {
@@ -184,8 +171,8 @@ async fn created_groups(harness: &Harness, label: &str) -> Vec<GroupCase> {
     groups
 }
 
-/// Rule 1, on `GetPolicy`: an existing group with no policy is a 200 whose body carries
-/// neither member.
+/// Rule 1, on an answer that reports a resource-based policy: a group that holds none is
+/// a 200 whose body carries neither member.
 fn assert_empty_policy_answer(case: &str, answer: &Answer) {
     assert_eq!(
         answer.status,
@@ -268,33 +255,30 @@ async fn a_group_with_no_policy_answers_an_empty_200_whether_none_was_written_or
                 removed.status,
                 String::from_utf8_lossy(&removed.body)
             );
-            let emptied = string_member(&removed, "revisionId");
-            assert_eq!(
-                string_member(&removed, "policy"),
-                empty_document(),
-                "case {name}: round {round}: the document the removal reports must hold \
-                 no statement"
+            // The removal took the policy's only statement, so the policy is gone: the
+            // removal reports neither member, and neither does the reader.
+            assert_empty_policy_answer(
+                &format!("{name}: round {round}: the emptying removal"),
+                &removed,
             );
             assert_empty_policy_answer(
                 &format!("{name}: round {round}: emptied"),
                 &get_policy(&harness, name).await,
             );
 
-            // Neither the revision the policy used to carry nor the one the removal
-            // minted names a policy any more, there being none: a write naming either is
-            // refused.
-            for sent in [&revision, &emptied] {
-                let stale =
-                    put_permission(&harness, name, ACTION_GROUP, &principals(1), Some(sent)).await;
-                assert_eq!(
-                    stale.status,
-                    409,
-                    "case {name}: round {round}: a revision naming no stored policy must \
-                     conflict, got {} {}",
-                    stale.status,
-                    String::from_utf8_lossy(&stale.body)
-                );
-            }
+            // The revision the policy used to carry names a policy that is no longer
+            // there: a write naming it is refused.
+            let stale =
+                put_permission(&harness, name, ACTION_GROUP, &principals(1), Some(&revision))
+                    .await;
+            assert_eq!(
+                stale.status,
+                409,
+                "case {name}: round {round}: a revision naming no stored policy must \
+                 conflict, got {} {}",
+                stale.status,
+                String::from_utf8_lossy(&stale.body)
+            );
         }
     }
 

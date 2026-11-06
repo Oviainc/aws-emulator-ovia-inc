@@ -6,12 +6,13 @@
 //! The rule every row asserts: a profiling group holds a resource-based policy exactly
 //! while that policy holds at least one statement, so the removal that revokes the last
 //! statement DELETES the policy and returns the group to the policy-less state it was
-//! created in — `GetPolicy` then answers 200 carrying neither `policy` nor `revisionId`,
-//! a policy-scoped removal finds no policy to remove from (404
-//! `ResourceNotFoundException`, naming the group and the account the lookup was scoped
-//! to), and the next grant is a FIRST write again, which names no revision. A removal
-//! that leaves a statement behind changes nothing about the policy's existence: it is
-//! still stored, at the revision the removal minted.
+//! created in — that removal's own 200 carries neither `policy` nor `revisionId`, and
+//! `GetPolicy` then answers 200 carrying neither either, a policy-scoped removal finds
+//! no policy to remove from (404 `ResourceNotFoundException`, naming the group and the
+//! account the lookup was scoped to), and the next grant is a FIRST write again, which
+//! names no revision. A removal that leaves a statement behind changes nothing about the
+//! policy's existence: it is still stored, at the revision the removal minted and
+//! reported.
 //!
 //! Rows differ along what the rule generalises over: how many statements the policy
 //! holds when the removal arrives (1, 2 and 3 — so the removal leaves 0, 1 and 2
@@ -27,9 +28,7 @@
 //! through the same state writer [`crate::resource_policy::attach_policy`] uses. Every
 //! removal, read and re-grant goes over HTTP.
 
-use service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::{
-    ACTION_GROUP_AGENT_PERMISSIONS, POLICY_VERSION,
-};
+use service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::ACTION_GROUP_AGENT_PERMISSIONS;
 
 use crate::permission_writes::{
     get_policy, is_revision_id, put_permission, remove_permission, string_member,
@@ -78,14 +77,6 @@ fn principal(index: usize) -> String {
 
 fn principals(count: usize) -> Vec<String> {
     (0..count).map(principal).collect()
-}
-
-/// The document a policy holding NO statement is reported as, built from the layout rule
-/// this surface writes policy documents in (two-space indentation, `" : "` between a
-/// member and its value, an array on one line inside `[ ` / ` ]`) rather than from the
-/// renderer.
-fn empty_document() -> String {
-    format!("{{\n  \"Version\" : \"{POLICY_VERSION}\",\n  \"Statement\" : [ ]\n}}")
 }
 
 /// One row: the group the policy sits on, the statements the policy holds when the
@@ -227,23 +218,6 @@ async fn a_removal_that_takes_the_last_statement_deletes_the_group_s_policy() {
             removed.status,
             String::from_utf8_lossy(&removed.body)
         );
-        // The removal always reports both members the model marks `@required`: the
-        // document it left and the revision it minted.
-        let revision = string_member(&removed, "revisionId");
-        assert!(
-            is_revision_id(&revision) && revision != case.revision_id,
-            "case {label}: an applied removal must mint a fresh revision, got \
-             {revision:?} after {:?}",
-            case.revision_id
-        );
-        assert_eq!(
-            statement_count(&label, &removed),
-            case.statements_left(),
-            "case {label}: expected {} statement(s) in the document the removal left, \
-             got {}",
-            case.statements_left(),
-            string_member(&removed, "policy")
-        );
 
         let read = get_policy(&harness, name).await;
         assert_eq!(
@@ -255,8 +229,24 @@ async fn a_removal_that_takes_the_last_statement_deletes_the_group_s_policy() {
         );
 
         if case.statements_left() > 0 {
-            // A statement survived, so the policy did: it is stored at the revision the
-            // removal minted, and the reader reports exactly what the removal reported.
+            // A statement survived, so the policy did: the removal reports the document
+            // it left and the revision it minted, the policy is stored at that revision,
+            // and the reader reports exactly what the removal reported.
+            let revision = string_member(&removed, "revisionId");
+            assert!(
+                is_revision_id(&revision) && revision != case.revision_id,
+                "case {label}: an applied removal must mint a fresh revision, got \
+                 {revision:?} after {:?}",
+                case.revision_id
+            );
+            assert_eq!(
+                statement_count(&label, &removed),
+                case.statements_left(),
+                "case {label}: expected {} statement(s) in the document the removal left, \
+                 got {}",
+                case.statements_left(),
+                string_member(&removed, "policy")
+            );
             assert_eq!(
                 harness.stored_policy_revision(name),
                 Some(revision.clone()),
@@ -293,8 +283,8 @@ async fn a_removal_that_takes_the_last_statement_deletes_the_group_s_policy() {
         }
 
         // The removal took the last statement, so the policy is GONE: nothing is stored,
-        // and the read carries neither member — equality against the empty object says
-        // both that nothing is reported and that nothing else crept in.
+        // and NEITHER the removal nor the read carries a member — equality against the
+        // empty object says both that nothing is reported and that nothing else crept in.
         assert_eq!(
             harness.stored_policy_revision(name),
             None,
@@ -303,9 +293,11 @@ async fn a_removal_that_takes_the_last_statement_deletes_the_group_s_policy() {
             harness.stored_policy_revision(name)
         );
         assert_eq!(
-            string_member(&removed, "policy"),
-            empty_document(),
-            "case {label}: the document the removal reports must hold no statement"
+            removed.json(),
+            serde_json::json!({}),
+            "case {label}: a removal that deleted the policy must report neither policy \
+             nor revisionId, got {}",
+            String::from_utf8_lossy(&removed.body)
         );
         assert_eq!(
             read.json(),
@@ -315,10 +307,10 @@ async fn a_removal_that_takes_the_last_statement_deletes_the_group_s_policy() {
             String::from_utf8_lossy(&read.body)
         );
 
-        // There is no policy, so every revision — the one the removal minted, the one it
-        // consumed, and any other well-formed one — is answered the same way: a removal
-        // has no policy to remove from.
-        let mut revisions: Vec<String> = vec![revision.clone(), case.revision_id.clone()];
+        // There is no policy, so every revision — the one the removal consumed and any
+        // other well-formed one — is answered the same way: a removal has no policy to
+        // remove from.
+        let mut revisions: Vec<String> = vec![case.revision_id.clone()];
         revisions.extend(FOREIGN_REVISIONS.iter().map(|value| value.to_string()));
         for sent in &revisions {
             let answer = remove_permission(&harness, name, REMOVED_ACTION_GROUP, sent).await;
@@ -380,7 +372,14 @@ async fn a_group_whose_policy_was_deleted_takes_a_first_write_again() {
                 removed.status,
                 String::from_utf8_lossy(&removed.body)
             );
-            let consumed = string_member(&removed, "revisionId");
+            let consumed = current.clone();
+            assert_eq!(
+                removed.json(),
+                serde_json::json!({}),
+                "case {name} round {round}: the removal deleted the policy, so it must \
+                 report neither policy nor revisionId, got {}",
+                String::from_utf8_lossy(&removed.body)
+            );
             assert_eq!(
                 get_policy(&harness, name).await.json(),
                 serde_json::json!({}),

@@ -6,7 +6,9 @@
 //! policy under optimistic locking on `revisionId`, and answers with the policy as it
 //! then stands and the revision that removal minted. A policy exists only while it
 //! holds a statement, so a removal that takes the LAST one deletes the policy: the
-//! group is policy-less again, which is what `GetPolicy` then reports and why the next
+//! group is policy-less again, and the 200 then carries NEITHER `policy` nor
+//! `revisionId` — there is no policy to report a document of and none to be at a
+//! revision — which is what `GetPolicy` then reports too, and why the next
 //! `PutPermission` on it is a first write, naming no revision.
 //!
 //! ## Shape of an operation
@@ -188,16 +190,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         match written {
-            // Every applied removal reports both members the model marks `@required`:
-            // the document the removal left and the revision it minted — also when it
-            // took the last statement and so deleted the policy, where the document is
-            // the one with no statement in it.
+            // The removal left a statement behind, so the group still holds the policy:
+            // both members the model marks `@required` are reported — the document the
+            // removal left and the revision it minted, which is the one the next write
+            // to that policy must name.
             crate::state::PolicyWrite::Written {
                 policy,
                 revision_id,
             } => Ok(RemovePermissionOutput {
-                policy,
-                revision_id,
+                policy: Some(policy),
+                revision_id: Some(revision_id),
+            }),
+            // The removal took the policy's last statement, so the policy is GONE: there
+            // is no document to report and no revision to report it at, and neither
+            // member is serialized — the same empty 200 `GetPolicy` then answers on the
+            // same group, rather than a document a client would read as "still shared"
+            // and a revision no later write could name.
+            crate::state::PolicyWrite::Deleted => Ok(RemovePermissionOutput {
+                policy: None,
+                revision_id: None,
             }),
             crate::state::PolicyWrite::UnknownGroup => {
                 Err(RemovePermissionErrorModeled::ResourceNotFoundException(
