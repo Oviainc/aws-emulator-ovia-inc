@@ -285,6 +285,10 @@ mod disable_application_status_check_suppression;
 // then owes the route, and what the create refuses. Declared beside `prefix_lists` for the
 #[path = "all/create_local_gateway_route.rs"]
 mod create_local_gateway_route;
+// Where `ModifyLocalGatewayRoute` re-points one stored local gateway route, what the clock
+// then owes it, and what the modify refuses. Declared beside `prefix_lists` for the
+#[path = "all/modify_local_gateway_route.rs"]
+mod modify_local_gateway_route;
 // The IAM instance profile an instance runs as: what the associate records, what the two
 // describes report of it, and what the disassociate takes away. Declared beside
 #[path = "all/iam_instance_profile_associations.rs"]

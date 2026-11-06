@@ -1877,6 +1877,118 @@ pub fn require_local_gateway_route_destination<E>(
     }
 }
 
+/// WHERE a local gateway route sends the traffic its destination matches: exactly one of the
+/// two targets the operation that writes a route documents ("You must specify one of the
+/// following targets: LocalGatewayVirtualInterfaceGroupId NetworkInterfaceId",
+/// `CreateLocalGatewayRoute`).
+///
+/// The choice is read ONCE out of the pair of members a request carries
+/// ([`require_local_gateway_route_target`]), so the form check, the lookup that resolves it
+/// and the member the stored route reports it in all ask the same question of the same
+/// answer — the arrangement [`LocalGatewayRouteDestination`] has for the pair of members
+/// that NAMES a route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalGatewayRouteTarget {
+    /// "The ID of the virtual interface group" (`$LocalGatewayVirtualInterfaceGroupId`).
+    VirtualInterfaceGroup(String),
+    /// "The ID of the network interface" (`$NetworkInterfaceId`).
+    NetworkInterface(String),
+}
+
+impl LocalGatewayRouteTarget {
+    /// The id this target is named by, whichever of the two members carried it.
+    pub fn id(&self) -> &str {
+        match self {
+            Self::VirtualInterfaceGroup(id) => id.as_str(),
+            Self::NetworkInterface(id) => id.as_str(),
+        }
+    }
+
+    /// The pair of members a stored route reports this target in — the virtual interface
+    /// group and the network interface, exactly one of them set — so a route can never
+    /// report two targets at once.
+    pub fn members(&self) -> (Option<String>, Option<String>) {
+        match self {
+            Self::VirtualInterfaceGroup(id) => (Some(id.clone()), None),
+            Self::NetworkInterface(id) => (None, Some(id.clone())),
+        }
+    }
+}
+
+/// The target a request names, or the refusal EC2 answers when it names none, both, or a
+/// value that is no id of its resource at all.
+///
+/// The ONE reading of that pair of members, so every operation that points a local gateway
+/// route at a target (`CreateLocalGatewayRoute`, `ModifyLocalGatewayRoute`) refuses the same
+/// request the same way:
+///
+/// * both given — `InvalidParameterCombination`, a route having one target;
+/// * neither given — `InvalidParameterValue`, since "You must specify ONE of the following
+///   targets" (`CreateLocalGatewayRoute`) is about the VALUE a request names a target with
+///   rather than about one member it left out, neither member being required on its own;
+/// * a value that is no id of its resource — that resource's own `.Malformed`, answered
+///   here on the request's FORM, before anything is resolved
+///   ([`require_known_local_gateway_route_target`] does the resolving).
+pub fn require_local_gateway_route_target<E>(
+    local_gateway_virtual_interface_group_id: Option<&str>,
+    network_interface_id: Option<&str>,
+) -> Result<LocalGatewayRouteTarget, Scaffolded<E>> {
+    match (
+        local_gateway_virtual_interface_group_id,
+        network_interface_id,
+    ) {
+        (Some(_), Some(_)) => Err(invalid_parameter_combination(
+            "You cannot use localGatewayVirtualInterfaceGroupId and networkInterfaceId in \
+             the same request",
+        )),
+        (None, None) => Err(invalid_parameter_value(
+            "You must specify one of the following targets: \
+             localGatewayVirtualInterfaceGroupId, networkInterfaceId",
+        )),
+        (Some(group_id), None) => {
+            if !local_gateway_virtual_interface_group_id_is_well_formed(group_id) {
+                return Err(invalid_local_gateway_virtual_interface_group_id_malformed(
+                    group_id,
+                ));
+            }
+            Ok(LocalGatewayRouteTarget::VirtualInterfaceGroup(
+                group_id.to_string(),
+            ))
+        }
+        (None, Some(interface_id)) => {
+            if !network_interface_id_is_well_formed(interface_id) {
+                return Err(invalid_network_interface_id_malformed(interface_id));
+            }
+            Ok(LocalGatewayRouteTarget::NetworkInterface(
+                interface_id.to_string(),
+            ))
+        }
+    }
+}
+
+/// Refuse a target id the account holds no such resource for with that resource's own
+/// `.NotFound`, so a route is never stored pointing at nothing.
+///
+/// The ONE resolution of a route's target: the virtual interface group through the crate's
+/// one reader of that id ([`require_known_local_gateway_virtual_interface_group`]), the
+/// network interface through the store the account's interfaces live in.
+pub fn require_known_local_gateway_route_target<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    target: &LocalGatewayRouteTarget,
+) -> Result<(), Scaffolded<E>> {
+    match target {
+        LocalGatewayRouteTarget::VirtualInterfaceGroup(group_id) => {
+            require_known_local_gateway_virtual_interface_group(store, group_id)
+        }
+        LocalGatewayRouteTarget::NetworkInterface(interface_id) => {
+            if !store.network_interfaces.contains_key(interface_id) {
+                return Err(invalid_network_interface_id_not_found(interface_id));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// One stored local gateway route table: the modelled shape a report of the tables answers
 /// with, and the routes that table holds.
 ///
@@ -2276,6 +2388,75 @@ impl ComAmazonawsEc2Amazonec2State {
         route.state = Some(LOCAL_GATEWAY_ROUTE_STATE_DELETED.to_string());
         Some(route)
     }
+
+    /// Point the route the local gateway route table `route_table_id` holds for
+    /// `destination` at `target`, put it in `state` with the move `becomes` owes it, and
+    /// answer it as the store now holds it — or `None` when there is no such table or no
+    /// such route.
+    ///
+    /// The route keeps its identity: the destination that names it, the table it is in and
+    /// that table's own ARN and account are left exactly as they were, because this replaces
+    /// WHERE the route sends traffic rather than which route it is. Exactly one of the two
+    /// target members ends up set ([`LocalGatewayRouteTarget::members`]), so a retargeted
+    /// route can never report the target it used to have beside the one it has now.
+    ///
+    /// The store's byte charge is ADJUSTED rather than re-checked: the route is already
+    /// stored and one id EC2 could have issued replaces another, both bounded by the form
+    /// their own readers accept, so the charge stays exact without a budget a stored route
+    /// could fail. The record is taken ONCE, so the release and the charge are
+    /// unconditionally paired: there is no second lookup between them that could leave the
+    /// budget holding a figure for a route nothing wrote.
+    pub fn retarget_local_gateway_route(
+        &mut self,
+        route_table_id: &str,
+        destination: &str,
+        target: &LocalGatewayRouteTarget,
+        state: &str,
+        becomes: Option<&str>,
+    ) -> Option<crate::ops::types::LocalGatewayRoute> {
+        let record = self
+            .local_gateway_route_tables
+            .get_mut(route_table_id)?
+            .routes
+            .get_mut(destination)?;
+        let before_bytes = local_gateway_route_payload_bytes(&record.view);
+        let (virtual_interface_group_id, network_interface_id) = target.members();
+        record.view.local_gateway_virtual_interface_group_id = virtual_interface_group_id;
+        record.view.network_interface_id = network_interface_id;
+        record.view.state = Some(state.to_string());
+        // RECORDED, never slept for: [`Self::materialize_due_transitions`] applies it once
+        // [`TRANSITION_DELAY`] has passed, so a caller searching the table straight after
+        // this write still sees the state the route was put in here.
+        record.pending = becomes.map(PendingStateMove::starting_now);
+        let after = record.view.clone();
+        let after_bytes = local_gateway_route_payload_bytes(&after);
+        self.release_stored_bytes(before_bytes);
+        self.add_stored_bytes(after_bytes);
+        Some(after)
+    }
+}
+
+/// Refuse a local gateway route the local gateway PROPAGATED rather than a caller created,
+/// for the `action` asked of it: HTTP 400 `OperationNotPermitted`.
+///
+/// "The route type" (`LocalGatewayRoute$Type`) is what decides whether there is anything for
+/// a caller to do with a route: a `propagated` route is one the local gateway learned, while
+/// a `static` one is exactly what `CreateLocalGatewayRoute` put there. The ONE wording of
+/// that refusal, so the operations that change a stored route cannot drift on the same class
+/// — only the `action` each of them performs differs.
+pub fn require_static_local_gateway_route<E>(
+    route: &crate::ops::types::LocalGatewayRoute,
+    route_table_id: &str,
+    destination: &str,
+    action: &str,
+) -> Result<(), Scaffolded<E>> {
+    if route.r#type.as_deref() != Some(LOCAL_GATEWAY_ROUTE_TYPE_PROPAGATED) {
+        return Ok(());
+    }
+    Err(Scaffolded::operation_not_permitted(format!(
+        "The route '{destination}' in the local gateway route table '{route_table_id}' is a \
+         {LOCAL_GATEWAY_ROUTE_TYPE_PROPAGATED} route, which cannot be {action}"
+    )))
 }
 
 // =============================================================================

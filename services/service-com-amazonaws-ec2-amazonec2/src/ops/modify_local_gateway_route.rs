@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyLocalGatewayRoute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyLocalGatewayRoute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: points the one route the named local gateway route table holds for the
+//! destination the request names at the one target the request names, and answers that route
+//! as the store now holds it. A route has no id of its own — it is named by the DESTINATION
+//! it matches inside one route table ("The value that you provide must match the CIDR of an
+//! existing route in the table", `$DestinationCidrBlock`) — so the destination SELECTS the
+//! route and the target is the only thing this call changes. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyLocalGatewayRoute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The refusals, in the order the service answers them: a request that carries no route
+//! table id is `MissingParameter`, something that is not a `LocalGatewayRoutetableId` at all
+//! is `InvalidLocalGatewayRouteTableID.Malformed`, a destination or a target that names
+//! neither member, both of them, or a value of the wrong form is `MissingParameter` /
+//! `InvalidParameterCombination` / `InvalidParameterValue` / that resource's own
+//! `.Malformed` — all of that being the request's own FORM, read before anything is
+//! resolved; a `DryRun` request a caller holds the permissions for is then `DryRunOperation`
+//! and writes nothing, because the flag asks whether the CALLER MAY make the request
+//! ("without actually making the request", `DryRun`) rather than anything about the named
+//! resources; then a well-formed route table id this account holds no table for is
+//! `InvalidLocalGatewayRouteTableID.NotFound`, a target id the account holds no virtual
+//! interface group or network interface for is that resource's own `.NotFound`, a
+//! destination the table holds no route for is `InvalidRoute.NotFound`, and a route the
+//! local gateway learned rather than a caller created is `OperationNotPermitted`.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +87,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -142,18 +156,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyLocalGatewayRoute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyLocalGatewayRouteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyLocalGatewayRoute"))
+        // `ctx` carries request metadata only; this operation reads none of it — every fact
+        // the reported route carries comes from the request or from the STORED route and the
+        // table it is in, whose own ARN names the Region it belongs to. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+
+        // The request's own FORM first, before anything is resolved. "The ID of the local
+        // gateway route table" is `@required` but modelled `clientOptional`, so a request
+        // that left it out reaches this handler as an empty string rather than being refused
+        // by the boundary validator: a parameter the request did not carry is EC2's
+        // `MissingParameter`.
+        let route_table_id = input.local_gateway_route_table_id.as_str();
+        if route_table_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter localGatewayRouteTableId",
+            ));
+        }
+        // Something that is not a `LocalGatewayRoutetableId` at all is refused before any
+        // lookup, with the sentence every reader of this id bar the create of a route words
+        // the class with — the same check the resolver below makes before it looks the id up,
+        // so this operation's earlier reading of the FORM cannot drift from the resolver's.
+        state::require_well_formed_local_gateway_route_table_id(route_table_id)?;
+        // "The value that you provide must match the CIDR of an existing route in the table"
+        // (`$DestinationCidrBlock`): the route this call modifies is the one that destination
+        // names, read by the crate's one reader of that pair of members, so this operation
+        // refuses a destination exactly as the create and the delete of a route do.
+        let destination = state::require_local_gateway_route_destination(
+            input.destination_cidr_block.as_deref(),
+            input.destination_prefix_list_id.as_deref(),
+        )?;
+        // The target is WHAT this call changes, and a route has one: exactly one of the two
+        // members, read by the crate's one reader of that pair, so a request that names both,
+        // neither, or a value that is no id of its resource at all is refused here exactly as
+        // the create of a route refuses it.
+        let target = state::require_local_gateway_route_target(
+            input.local_gateway_virtual_interface_group_id.as_deref(),
+            input.network_interface_id.as_deref(),
+        )?;
+
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request" (`DryRun`): a question about the CALLER, answered once the
+        // request's own form has been read and before anything is resolved or written; every
+        // caller of this emulator is permitted.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this write reads it.
+        store.materialize_due_transitions();
+
+        // The route TABLE before anything in it: an id this account holds no table for is
+        // refused with the table's own `NotFound` whatever the destination and the target
+        // turn out to be, so a client can tell "no such route table" from "no such target"
+        // and from "no route for that destination".
+        state::require_known_local_gateway_route_table(&store, route_table_id)?;
+        // The target next, the order the create of a route resolves the two in: the route
+        // sends traffic to it, so an id the account holds no such resource for is refused
+        // with that resource's own `.NotFound` rather than written as a route pointing at
+        // nothing.
+        state::require_known_local_gateway_route_target(&store, &target)?;
+        // Then the route the destination names. "The value that you provide must MATCH the
+        // CIDR of an existing route in the table": a destination the table holds no route for
+        // leaves nothing to modify, which is the code EC2 answers a route it cannot find in
+        // a route table with.
+        let route = store
+            .local_gateway_route(route_table_id, destination.key())
+            .cloned()
+            .ok_or_else(|| {
+                state::local_gateway_route_not_found(route_table_id, destination.key())
+            })?;
+
+        // "The route type" (`LocalGatewayRoute$Type`) decides whether there is anything to
+        // modify: a `propagated` route is one the local gateway learned, so where it sends
+        // traffic is not a caller's to choose, while a `static` one is exactly what
+        // `CreateLocalGatewayRoute` put there. Read through the crate's one reader of that
+        // class, the same one the delete of a route refuses a propagated route with.
+        state::require_static_local_gateway_route(
+            &route,
+            route_table_id,
+            destination.key(),
+            "modified",
+        )?;
+
+        // The write itself: the route keeps the destination that names it, its type and the
+        // table facts it was stored with, and takes the one target the request named. A route
+        // whose target this call just moved is not carrying that traffic yet, so it goes back
+        // into the TRANSIENT `pending` state with the clock owing it `active` one
+        // TRANSITION_DELAY later — a caller that searches the table straight after this call
+        // still sees `pending`, exactly as it does after the create.
+        let modified = store
+            .retarget_local_gateway_route(
+                route_table_id,
+                destination.key(),
+                &target,
+                state::LOCAL_GATEWAY_ROUTE_STATE_PENDING,
+                Some(state::LOCAL_GATEWAY_ROUTE_STATE_ACTIVE),
+            )
+            .ok_or_else(|| {
+                state::internal_error(format!(
+                    "the route '{destination}' resolved a moment ago is not in the local \
+                     gateway route table '{route_table_id}' any more",
+                    destination = destination.key(),
+                ))
+            })?;
+
+        // "Information about the local gateway route table"
+        // (`ModifyLocalGatewayRouteResult$Route`): the route as it was STORED, so this
+        // operation and `SearchLocalGatewayRoutes` cannot report one route differently.
+        Ok(ModifyLocalGatewayRouteOutput {
+            route: Some(modified),
+        })
     }
 }

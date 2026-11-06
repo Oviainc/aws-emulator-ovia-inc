@@ -203,17 +203,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The route type" (`LocalGatewayRoute$Type`) decides whether there is anything to
         // delete: a `propagated` route is one the local gateway learned, so removing it
         // from the table is not a request this service can carry out, while a `static` one
-        // is exactly what `CreateLocalGatewayRoute` put there.
-        if route.r#type.as_deref() == Some(state::LOCAL_GATEWAY_ROUTE_TYPE_PROPAGATED) {
-            return Err(crate::scaffolded::Scaffolded::operation_not_permitted(
-                format!(
-                    "The route '{destination}' in the local gateway route table \
-                     '{route_table_id}' is a {route_type} route, which cannot be deleted",
-                    destination = destination.key(),
-                    route_type = state::LOCAL_GATEWAY_ROUTE_TYPE_PROPAGATED,
-                ),
-            ));
-        }
+        // is exactly what `CreateLocalGatewayRoute` put there. Read through the crate's one
+        // reader of that class, the same one the modify of a route refuses a propagated
+        // route with.
+        state::require_static_local_gateway_route(
+            &route,
+            route_table_id,
+            destination.key(),
+            "deleted",
+        )?;
 
         // The route leaves the table here and is answered in its terminal `deleted` state:
         // nothing is owed to the clock, because the route AWS hands back from this call is

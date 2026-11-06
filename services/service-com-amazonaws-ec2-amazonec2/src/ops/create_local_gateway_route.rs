@@ -189,56 +189,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.destination_prefix_list_id.as_deref(),
         )?;
         // "You must specify one of the following targets: LocalGatewayVirtualInterfaceGroupId
-        // NetworkInterfaceId" (`CreateLocalGatewayRoute`): exactly one, so a request that
-        // names both is refused for the combination and one that names neither for the
-        // parameter it is missing — the two refusals a destination that names neither member
-        // or both gets, for the same reason.
-        let target = match (
-            input.local_gateway_virtual_interface_group_id.as_deref(),
-            input.network_interface_id.as_deref(),
-        ) {
-            (Some(_), Some(_)) => {
-                return Err(state::invalid_parameter_combination(
-                    "You cannot use localGatewayVirtualInterfaceGroupId and \
-                     networkInterfaceId in the same request",
-                ));
-            }
-            (None, None) => {
-                // "You must specify ONE of the following targets:
-                // LocalGatewayVirtualInterfaceGroupId NetworkInterfaceId"
-                // (`CreateLocalGatewayRoute`): a route with no target has nowhere to send
-                // the traffic it matches, and the sentence is about the VALUE the request
-                // names a target with rather than about one parameter it left out — there
-                // are two members it could have carried, neither of them required on its
-                // own — so it is refused with the code EC2 answers a parameter value it
-                // cannot act on with.
-                return Err(state::invalid_parameter_value(
-                    "You must specify one of the following targets: \
-                     localGatewayVirtualInterfaceGroupId, networkInterfaceId",
-                ));
-            }
-            (Some(group_id), None) => Target::VirtualInterfaceGroup(group_id),
-            (None, Some(interface_id)) => Target::NetworkInterface(interface_id),
-        };
-        // A target id that is not an id of its resource at all is `.Malformed` BEFORE
+        // NetworkInterfaceId" (`CreateLocalGatewayRoute`): exactly one, read by the crate's
+        // one reader of that pair of members — so a request that names both, neither, or a
+        // value that is no id of its resource at all is refused here, on the request's own
+        // FORM, exactly as the modify of a route refuses it. The malformed arm comes BEFORE
         // anything is looked up, the order this service answers the route table's own two
         // refusals in: there is nothing to resolve.
-        match target {
-            Target::VirtualInterfaceGroup(group_id) => {
-                if !state::local_gateway_virtual_interface_group_id_is_well_formed(group_id) {
-                    return Err(
-                        state::invalid_local_gateway_virtual_interface_group_id_malformed(
-                            group_id,
-                        ),
-                    );
-                }
-            }
-            Target::NetworkInterface(interface_id) => {
-                if !state::network_interface_id_is_well_formed(interface_id) {
-                    return Err(state::invalid_network_interface_id_malformed(interface_id));
-                }
-            }
-        }
+        let target = state::require_local_gateway_route_target(
+            input.local_gateway_virtual_interface_group_id.as_deref(),
+            input.network_interface_id.as_deref(),
+        )?;
 
         // "Checks whether you have the required permissions for the action, without actually
         // making the request" (`DryRun`): a question about the CALLER, answered once the
@@ -261,19 +221,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state::require_known_route_table_for_create_local_gateway_route(&store, route_table_id)?;
         // The target next: the route sends traffic to it, so an id the account holds no such
         // resource for is refused with that resource's own `.NotFound` rather than stored as
-        // a route pointing at nothing. The virtual interface group is resolved through the
-        // crate's one reader of that id; a network interface through the store the account's
-        // interfaces live in.
-        match target {
-            Target::VirtualInterfaceGroup(group_id) => {
-                state::require_known_local_gateway_virtual_interface_group(&store, group_id)?;
-            }
-            Target::NetworkInterface(interface_id) => {
-                if !store.network_interfaces.contains_key(interface_id) {
-                    return Err(state::invalid_network_interface_id_not_found(interface_id));
-                }
-            }
-        }
+        // a route pointing at nothing.
+        state::require_known_local_gateway_route_target(&store, &target)?;
 
         // A route IS the destination it matches inside one table, so a table that already
         // holds a route for that destination has nothing to create: a second one would give
@@ -294,10 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // never taken from the request, and `SubnetId`/`CoipPoolId` are left unset: they
         // describe a route the local gateway itself knows about rather than a static route a
         // caller named a target for.
-        let (local_gateway_virtual_interface_group_id, network_interface_id) = match target {
-            Target::VirtualInterfaceGroup(group_id) => (Some(group_id.to_string()), None),
-            Target::NetworkInterface(interface_id) => (None, Some(interface_id.to_string())),
-        };
+        let (local_gateway_virtual_interface_group_id, network_interface_id) = target.members();
         let route = store
             .insert_local_gateway_route(state::LocalGatewayRouteSpec {
                 local_gateway_route_table_id: route_table_id.to_string(),
@@ -319,19 +265,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             route: Some(route),
         })
     }
-}
-
-/// What the route sends traffic matching its destination to: exactly one of the two targets
-/// the operation documents ("You must specify one of the following targets:
-/// LocalGatewayVirtualInterfaceGroupId NetworkInterfaceId").
-///
-/// The choice is read ONCE, out of the pair of members the request carries, so every step
-/// after it — the form of the id, the lookup that resolves it, and the member the stored
-/// route reports it in — asks the same question of the same answer.
-#[derive(Debug, Clone, Copy)]
-enum Target<'a> {
-    /// "The ID of the virtual interface group" (`$LocalGatewayVirtualInterfaceGroupId`).
-    VirtualInterfaceGroup(&'a str),
-    /// "The ID of the network interface" (`$NetworkInterfaceId`).
-    NetworkInterface(&'a str),
 }
