@@ -870,6 +870,10 @@ async fn an_unissued_next_token_is_refused() {
 /// An inference job runs asynchronously, so the status a reader reports is the one the
 /// clock owes it now: a transition already due is materialised, one not yet due is not,
 /// and reading changes nothing a later caller sees.
+///
+/// Each attempt reads the collaboration twice over: unfiltered, and narrowed to the model
+/// those jobs ran — a job the filter admits carries the same clock-owed status as the same
+/// job in the unfiltered page, because the transition was owed whichever call arrived.
 #[tokio::test]
 async fn the_reported_status_is_the_one_the_clock_owes() {
     let (router, engine) = emulator();
@@ -905,6 +909,7 @@ async fn the_reported_status_is_the_one_the_clock_owes() {
     ];
 
     let mut expected = Vec::new();
+    let mut ran_model = String::new();
     for (index, (case, stored, due_in, moves_to, reported)) in cases.iter().copied().enumerate() {
         let mut record = inference_job(&collaboration, &membership, REGION, &format!("job-{index}"));
         record.status = stored.to_string();
@@ -918,31 +923,45 @@ async fn the_reported_status_is_the_one_the_clock_owes() {
             },
             status: moves_to.to_string(),
         });
+        ran_model = record.trained_model_arn.clone();
         expected.push((case, seed(&engine, record), reported));
     }
 
+    let queries = [
+        ("unfiltered", String::new()),
+        (
+            "filtered to the model these jobs ran",
+            format!("?trainedModelArn={ran_model}"),
+        ),
+    ];
     for attempt in 0..2 {
-        let answer = list(&router, REGION, &collaboration, "").await;
-        assert_eq!(
-            answer.status, 200,
-            "attempt {attempt}: expected HTTP 200, got {} with {:?}",
-            answer.status, answer.body
-        );
-        let reported = summaries(&answer);
-        for (case, arn, want) in &expected {
-            let summary = reported
-                .iter()
-                .find(|summary| {
-                    summary["trainedModelInferenceJobArn"].as_str() == Some(arn.as_str())
-                })
-                .unwrap_or_else(|| {
-                    panic!("case {case:?}: {arn} is missing from {:?}", answer.body)
-                });
+        for (view, query) in &queries {
+            let answer = list(&router, REGION, &collaboration, query).await;
             assert_eq!(
-                summary["status"].as_str(),
-                Some(*want),
-                "case {case:?}: attempt {attempt} expected status {want:?}, got {summary:?}"
+                answer.status, 200,
+                "view {view:?}: attempt {attempt} expected HTTP 200, got {} with {:?}",
+                answer.status, answer.body
             );
+            let reported = summaries(&answer);
+            for (case, arn, want) in &expected {
+                let summary = reported
+                    .iter()
+                    .find(|summary| {
+                        summary["trainedModelInferenceJobArn"].as_str() == Some(arn.as_str())
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: {arn} is missing from the {view} page {:?}",
+                            answer.body
+                        )
+                    });
+                assert_eq!(
+                    summary["status"].as_str(),
+                    Some(*want),
+                    "case {case:?}: attempt {attempt} of the {view} page expected status \
+                     {want:?}, got {summary:?}"
+                );
+            }
         }
     }
 }

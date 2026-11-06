@@ -569,6 +569,11 @@ pub fn collaboration_page<'a, Record: CollaborationScoped + 'a>(
 /// and its version) narrows the same walk: the filter is applied BEFORE the page
 /// fills, so the token a full page carries names the next record the list would
 /// report rather than one it would skip.
+///
+/// A record of this collaboration is settled before `reported` sees it, so a
+/// filter reads the record in the same state the summary beside it reports: the
+/// status change the clock already owed is materialised whether or not anybody
+/// called, so it cannot be a filter's business whether this call came first.
 pub fn collaboration_page_where<'a, Record: CollaborationScoped + 'a>(
     records: impl Iterator<Item = &'a mut Record>,
     collaboration_identifier: &str,
@@ -589,6 +594,9 @@ pub fn collaboration_page_where<'a, Record: CollaborationScoped + 'a>(
         {
             continue;
         }
+        // Settled before the filter reads it, and before the page-full check names it
+        // as the next token: the transition was owed at `now` regardless of this call.
+        record.settle_now(now);
         if !reported(record) {
             continue;
         }
@@ -596,7 +604,6 @@ pub fn collaboration_page_where<'a, Record: CollaborationScoped + 'a>(
             next_token = Some(record.page_key().to_string());
             break;
         }
-        record.settle_now(now);
         page.push(record.summary());
     }
     (page, next_token)
