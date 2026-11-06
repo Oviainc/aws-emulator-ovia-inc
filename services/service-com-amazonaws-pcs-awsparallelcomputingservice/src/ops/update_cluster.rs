@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies an update to a STORED cluster: refuses a scheduler version the service cannot
+//! move a cluster to, merges the requested Slurm options into the stored record, and
+//! reports the cluster `UPDATING` until the clock owes it `ACTIVE` again. `GetCluster`
+//! reads back exactly what this wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +173,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCluster"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateClusterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the PCS emulator holds no state on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `scheduler.version` is an unconstrained `String` in the model, so the set of
+        // versions the service can move a cluster to is enforced here. Refused before
+        // the store is touched, so the stored cluster is left exactly as it was.
+        if let Some(scheduler) = input.scheduler.as_ref() {
+            if let Some(refusal) =
+                crate::state::update_scheduler_version_violation(&scheduler.version)
+            {
+                return Err(UpdateClusterErrorModeled::ValidationException(refusal).into());
+            }
+        }
+
+        // The caller-sized lists this update would PERSIST, bounded for the same reason
+        // the create's are: the model bounds none of them.
+        if let Some(slurm) = input.slurm_configuration.as_ref() {
+            let stored_lists: [(&str, usize); 3] = [
+                (
+                    "slurmConfiguration.slurmCustomSettings",
+                    slurm.slurm_custom_settings.as_ref().map_or(0, Vec::len),
+                ),
+                (
+                    "slurmConfiguration.slurmdbdCustomSettings",
+                    slurm.slurmdbd_custom_settings.as_ref().map_or(0, Vec::len),
+                ),
+                (
+                    "slurmConfiguration.cgroupCustomSettings",
+                    slurm.cgroup_custom_settings.as_ref().map_or(0, Vec::len),
+                ),
+            ];
+            for (member, entries) in stored_lists {
+                if let Some(message) = crate::state::stored_list_violation(member, entries) {
+                    return Err(UpdateClusterErrorModeled::ValidationException(
+                        crate::state::field_validation(member, message),
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let mut state = state.lock();
+        state.settle();
+
+        let Some(cluster) = state.cluster_mut(&input.cluster_identifier) else {
+            return Err(UpdateClusterErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::CLUSTER, &input.cluster_identifier),
+            )
+            .into());
+        };
+
+        // "You can only update clusters that are in ACTIVE, UPDATE_FAILED, or SUSPENDED
+        // state": one still provisioning, already updating, or on its way out conflicts.
+        if !crate::state::UPDATABLE_CLUSTER_STATUSES.contains(&cluster.status.as_str()) {
+            return Err(UpdateClusterErrorModeled::ConflictException(
+                crate::state::cluster_not_active(&cluster.id),
+            )
+            .into());
+        }
+
+        // A member the request carries is applied; one it omits leaves the stored value
+        // alone. A request that asks for no change leaves the cluster where it is rather
+        // than moving its status for nothing.
+        let mut changed = false;
+        if let Some(scheduler) = input.scheduler {
+            cluster.scheduler.version = scheduler.version;
+            changed = true;
+        }
+        if let Some(slurm) = input.slurm_configuration {
+            let stored = cluster.slurm_configuration.take();
+            cluster.slurm_configuration = Some(crate::state::apply_slurm_update(stored, slurm));
+            changed = true;
+        }
+        if changed {
+            // PCS reports a cluster as UPDATING while it applies the change; the clock
+            // owes it ACTIVE again.
+            cluster.status = crate::state::STATUS_UPDATING.to_string();
+            cluster.modified_at = crate::state::now_date_time();
+            cluster.pending = Some(crate::state::Pending::in_a_span(
+                crate::state::PendingChange::Activate,
+            ));
+        }
+
+        // Answered from the STORED record, so the update and a later read cannot differ.
+        Ok(UpdateClusterOutput {
+            cluster: Some(cluster.to_api()),
+        })
     }
 }

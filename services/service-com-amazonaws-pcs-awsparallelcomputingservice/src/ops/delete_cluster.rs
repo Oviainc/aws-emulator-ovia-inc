@@ -173,11 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(cluster) = state.cluster_mut(&input.cluster_identifier) else {
             return Err(DeleteClusterErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no cluster identified by {}", input.cluster_identifier),
-                    resource_id: input.cluster_identifier.clone(),
-                    resource_type: "cluster".to_string(),
-                },
+                crate::state::not_found(crate::state::CLUSTER, &input.cluster_identifier),
             )
             .into());
         };
@@ -202,16 +198,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Only a settled cluster can be deleted; one still provisioning, or already on
         // its way out, conflicts.
         if cluster.status != crate::state::STATUS_ACTIVE {
-            return Err(DeleteClusterErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "cluster {} is in {} status, not {}",
-                    cluster.id,
-                    cluster.status,
-                    crate::state::STATUS_ACTIVE
-                ),
-                resource_id: cluster.id.clone(),
-                resource_type: "cluster".to_string(),
-            })
+            return Err(DeleteClusterErrorModeled::ConflictException(
+                crate::state::cluster_not_active(&cluster.id),
+            )
             .into());
         }
 

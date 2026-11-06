@@ -175,24 +175,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(cluster) = state.cluster(&input.cluster_identifier) else {
             return Err(GetQueueErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no cluster identified by {}", input.cluster_identifier),
-                    resource_id: input.cluster_identifier.clone(),
-                    resource_type: "cluster".to_string(),
-                },
+                crate::state::not_found(crate::state::CLUSTER, &input.cluster_identifier),
             )
             .into());
         };
         let Some(queue) = cluster.queue(&input.queue_identifier) else {
             return Err(GetQueueErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "cluster {} has no queue identified by {}",
-                        cluster.id, input.queue_identifier
-                    ),
-                    resource_id: input.queue_identifier.clone(),
-                    resource_type: "queue".to_string(),
-                },
+                crate::state::not_found(crate::state::QUEUE, &input.queue_identifier),
             )
             .into());
         };

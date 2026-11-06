@@ -177,24 +177,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(cluster) = state.cluster(&input.cluster_identifier) else {
             return Err(GetComputeNodeGroupErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no cluster identified by {}", input.cluster_identifier),
-                    resource_id: input.cluster_identifier.clone(),
-                    resource_type: "cluster".to_string(),
-                },
+                crate::state::not_found(crate::state::CLUSTER, &input.cluster_identifier),
             )
             .into());
         };
         let Some(group) = cluster.compute_node_group(&input.compute_node_group_identifier) else {
             return Err(GetComputeNodeGroupErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "cluster {} has no compute node group identified by {}",
-                        cluster.id, input.compute_node_group_identifier
-                    ),
-                    resource_id: input.compute_node_group_identifier.clone(),
-                    resource_type: "computenodegroup".to_string(),
-                },
+                crate::state::not_found(
+                    crate::state::COMPUTE_NODE_GROUP,
+                    &input.compute_node_group_identifier,
+                ),
             )
             .into());
         };

@@ -204,6 +204,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `scheduler.version` is an unconstrained `String` in the model, so the set of
+        // versions the service can actually provision is enforced here — before anything
+        // is minted or stored, so a refused request persists nothing.
+        if let Some(refusal) = crate::state::create_scheduler_version_violation(
+            &input.scheduler.r#type,
+            &input.scheduler.version,
+        ) {
+            return Err(CreateClusterErrorModeled::ValidationException(refusal).into());
+        }
+
         // The caller-sized lists this create would PERSIST. The model bounds none of
         // them, so one request could otherwise size one stored record arbitrarily.
         // `tags` needs no entry: `RequestTagMap` is modelled `@length(min: 1, max: 200)`
@@ -257,29 +267,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // further effect, rather than creating a second cluster or conflicting on the
         // name that call took. The remembered entry is never overwritten, so the token
         // names the FIRST call's cluster for as long as it is remembered.
-        if let Some(remembered) = state
+        let remembered = state
             .remembered_create(Self::NAME, input.client_token.as_ref())
-            .cloned()
-        {
-            let Some(first) = state.clusters.get(&remembered.resource_id) else {
-                return Err(CreateClusterErrorModeled::ConflictException(ConflictException {
-                    message: format!(
-                        "clientToken was already used to create cluster {}",
-                        remembered.resource_id
-                    ),
-                    resource_id: remembered.resource_id,
-                    resource_type: "cluster".to_string(),
-                })
-                .into());
-            };
+            .map(|remembered| remembered.resource_id.clone());
+        if let Some(first) = remembered.as_deref().and_then(|id| state.clusters.get(id)) {
             return Ok(CreateClusterOutput {
                 cluster: Some(first.to_api()),
             });
         }
 
+        // A name another cluster already holds is a conflict. The message is the
+        // service's own fixed sentence: it names no cluster, so the caller-supplied
+        // name is not echoed back in it.
         if let Some(existing) = state.cluster_ids_by_name.get(&input.cluster_name) {
             return Err(CreateClusterErrorModeled::ConflictException(ConflictException {
-                message: format!("a cluster named {} already exists", input.cluster_name),
+                message: "A cluster with the name you specified already exists.".to_string(),
                 resource_id: existing.clone(),
                 resource_type: "cluster".to_string(),
             })

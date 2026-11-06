@@ -287,11 +287,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(cluster_id) = state.cluster_id_for(&input.cluster_identifier) else {
             return Err(CreateComputeNodeGroupErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no cluster identified by {}", input.cluster_identifier),
-                    resource_id: input.cluster_identifier.clone(),
-                    resource_type: "cluster".to_string(),
-                },
+                crate::state::not_found(crate::state::CLUSTER, &input.cluster_identifier),
             )
             .into());
         };
@@ -343,16 +339,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // provisioning, or on its way out, cannot take one.
         if cluster.status != crate::state::STATUS_ACTIVE {
             return Err(CreateComputeNodeGroupErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "cluster {} is in {} status, not {}",
-                        cluster.id,
-                        cluster.status,
-                        crate::state::STATUS_ACTIVE
-                    ),
-                    resource_id: cluster.id.clone(),
-                    resource_type: "cluster".to_string(),
-                },
+                crate::state::cluster_not_active(&cluster.id),
             )
             .into());
         }
@@ -364,12 +351,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateComputeNodeGroupErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "a compute node group named {} already exists in cluster {}",
-                        input.compute_node_group_name, cluster.id
-                    ),
+                    // The service's own fixed sentence for a name already taken, in the
+                    // form it uses for a cluster: it echoes no caller-supplied value.
+                    message: "A compute node group with the name you specified already exists."
+                        .to_string(),
                     resource_id: existing.id.clone(),
-                    resource_type: "computenodegroup".to_string(),
+                    resource_type: crate::state::COMPUTE_NODE_GROUP.resource_type.to_string(),
                 },
             )
             .into());

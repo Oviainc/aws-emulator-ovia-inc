@@ -28,7 +28,7 @@ const SIGNED_FOR_PCS: &str = "AWS4-HMAC-SHA256 \
 const REGION: &str = "us-east-1";
 
 /// An emulator with only PCS mounted, on its own engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine = std::sync::Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -39,7 +39,11 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// Call one operation and return its HTTP status and JSON body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -70,7 +74,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 /// Wait out the span the service stores for a lifecycle transition the clock owes, so
 /// the next call sees it materialised. The service never sleeps for it — this is the
 /// CALLER waiting, as a caller of the real service would.
-async fn wait_past_the_owed_transition() {
+pub(crate) async fn wait_past_the_owed_transition() {
     tokio::time::sleep(TRANSITION_SPAN + Duration::from_millis(250)).await;
 }
 

@@ -51,11 +51,12 @@ use crate::ops::types::{
     Accounting, AccountingRequest, Cluster, ClusterSlurmConfiguration,
     ClusterSlurmConfigurationRequest, ClusterSummary, ComputeNodeGroup,
     ComputeNodeGroupConfiguration, ComputeNodeGroupSlurmConfiguration,
-    ComputeNodeGroupSlurmConfigurationRequest, CustomLaunchTemplate,
-    Endpoint, ErrorInfo, InstanceConfig, Networking, NetworkingRequest, NodeLifecycleActions,
+    ComputeNodeGroupSlurmConfigurationRequest, ConflictException, CustomLaunchTemplate, Endpoint,
+    ErrorInfo, InstanceConfig, Networking, NetworkingRequest, NodeLifecycleActions,
     NodeLifecycleActionsRequest, Queue, QueueSlurmConfiguration, QueueSlurmConfigurationRequest,
-    QueueSummary, ScalingConfiguration, ScalingConfigurationRequest, Scheduler, SchedulerRequest,
-    ServiceQuotaExceededException, SlurmRest, SlurmRestRequest, SpotOptions, ValidationException,
+    QueueSummary, ResourceNotFoundException, ScalingConfiguration, ScalingConfigurationRequest,
+    Scheduler, SchedulerRequest, ServiceQuotaExceededException, SlurmRest, SlurmRestRequest,
+    SpotOptions, UpdateClusterSlurmConfigurationRequest, ValidationException,
     ValidationExceptionField,
 };
 
@@ -69,6 +70,58 @@ pub const STATUS_ACTIVE: &str = "ACTIVE";
 
 /// The status a cluster carries between `DeleteCluster` and its removal.
 pub const STATUS_DELETING: &str = "DELETING";
+
+/// The status a cluster carries while an `UpdateCluster` is being applied (a
+/// `ClusterStatus` member), until the clock owes it [`STATUS_ACTIVE`] again.
+pub const STATUS_UPDATING: &str = "UPDATING";
+
+/// The cluster statuses an update can start from: "You can only update clusters that are
+/// in ACTIVE, UPDATE_FAILED, or SUSPENDED state" (`UpdateCluster`'s own documentation).
+pub const UPDATABLE_CLUSTER_STATUSES: &[&str] = &[STATUS_ACTIVE, "UPDATE_FAILED", "SUSPENDED"];
+
+/// The scheduler versions `CreateCluster` can provision, from the model's
+/// `SchedulerRequest$version` documentation ("Valid Values: 24.11 | 25.05 | 25.11 |
+/// 26.05"). `version` is an unconstrained `String` in the model, so the supported set is
+/// a service-side rule rather than a boundary constraint.
+pub const CREATE_SCHEDULER_VERSIONS: &[&str] = &["24.11", "25.05", "25.11", "26.05"];
+
+/// The scheduler versions `UpdateCluster` can move a cluster to, from the model's
+/// `UpdateSchedulerRequest$version` documentation ("Valid Values: 24.05 | 24.11 | 25.05 |
+/// 25.11 | 26.05"). Deliberately a DIFFERENT set from [`CREATE_SCHEDULER_VERSIONS`]: a
+/// version a cluster can be updated to need not be one a new cluster can be created on.
+pub const UPDATE_SCHEDULER_VERSIONS: &[&str] = &["24.05", "24.11", "25.05", "25.11", "26.05"];
+
+/// The `AccountingMode`/`SlurmRestMode` member that turns an optional Slurm daemon on
+/// ("A value of STANDARD means Slurm accounting is enabled" / "... the Slurm REST API is
+/// enabled"). Both enums declare exactly `STANDARD` and `NONE`.
+pub const MODE_STANDARD: &str = "STANDARD";
+
+/// The `AccountingMode`/`SlurmRestMode` member that leaves an optional Slurm daemon off,
+/// which is also what both members default to when a request names neither.
+pub const MODE_NONE: &str = "NONE";
+
+/// The `EndpointType` member of the Slurm controller endpoint every provisioned cluster
+/// publishes (see `ENDPOINT_TYPE_VALUES` in `crate::ops::types`).
+pub const ENDPOINT_SLURMCTLD: &str = "SLURMCTLD";
+
+/// The `EndpointType` member of the Slurm accounting daemon's endpoint.
+pub const ENDPOINT_SLURMDBD: &str = "SLURMDBD";
+
+/// The `EndpointType` member of the Slurm REST API's endpoint.
+pub const ENDPOINT_SLURMRESTD: &str = "SLURMRESTD";
+
+/// The port `slurmctld` listens on — Slurm's own default `SlurmctldPort` — rendered as
+/// the `String` the modelled `Endpoint$port` declares.
+pub const SLURMCTLD_PORT: &str = "6817";
+
+/// The port `slurmdbd` listens on — Slurm's own default `DbdPort`.
+pub const SLURMDBD_PORT: &str = "6819";
+
+/// The port `slurmrestd` listens on — Slurm's own default REST API port.
+pub const SLURMRESTD_PORT: &str = "6820";
+
+/// The `NetworkType` member a cluster whose control plane is addressed over IPv6 carries.
+pub const NETWORK_TYPE_IPV6: &str = "IPV6";
 
 /// How long after the call that starts it a PCS lifecycle transition the clock owes
 /// comes due: a created resource leaving `CREATING`, a deleted cluster leaving
@@ -179,8 +232,8 @@ pub struct ClusterRecord {
     pub networking: Networking,
     /// Slurm options, when the request carried any.
     pub slurm_configuration: Option<ClusterSlurmConfiguration>,
-    /// Scheduler endpoints. Empty: the emulator serves no Slurm control plane, so it
-    /// reports no endpoint for one.
+    /// Scheduler endpoints, published once the cluster has finished provisioning (see
+    /// [`ClusterRecord::scheduler_endpoints`]). Empty while it is still `CREATING`.
     pub endpoints: Vec<Endpoint>,
     /// Provisioning errors. Empty on the path the emulator implements.
     pub error_info: Vec<ErrorInfo>,
@@ -325,7 +378,62 @@ impl ClusterRecord {
         self.compute_node_groups
             .retain(|_, group| !group.settle(now));
         self.queues.retain(|_, queue| !queue.settle(now));
-        apply_pending(&mut self.pending, &mut self.status, &mut self.modified_at, now)
+        let removable =
+            apply_pending(&mut self.pending, &mut self.status, &mut self.modified_at, now);
+        // A cluster that has finished provisioning publishes the scheduler endpoints its
+        // own configuration enables. Derived from the stored record, so recomputing it
+        // is idempotent: a read can never change what a later caller sees.
+        if !removable && self.status == STATUS_ACTIVE {
+            self.endpoints = self.scheduler_endpoints();
+        }
+        removable
+    }
+
+    /// The scheduler endpoints this cluster publishes.
+    ///
+    /// The Slurm controller is how a client reaches the scheduler at all, so a
+    /// provisioned cluster always publishes a [`ENDPOINT_SLURMCTLD`] endpoint; the
+    /// optional daemons are published exactly when the cluster's Slurm configuration
+    /// turns them on — accounting ([`ENDPOINT_SLURMDBD`]) and the Slurm REST API
+    /// ([`ENDPOINT_SLURMRESTD`]), each `STANDARD` rather than `NONE`.
+    fn scheduler_endpoints(&self) -> Vec<Endpoint> {
+        let slurm = self.slurm_configuration.as_ref();
+        let accounting = slurm
+            .and_then(|slurm| slurm.accounting.as_ref())
+            .is_some_and(|accounting| accounting.mode == MODE_STANDARD);
+        let slurm_rest = slurm
+            .and_then(|slurm| slurm.slurm_rest.as_ref())
+            .is_some_and(|slurm_rest| slurm_rest.mode == MODE_STANDARD);
+        [
+            (ENDPOINT_SLURMCTLD, SLURMCTLD_PORT, true),
+            (ENDPOINT_SLURMDBD, SLURMDBD_PORT, accounting),
+            (ENDPOINT_SLURMRESTD, SLURMRESTD_PORT, slurm_rest),
+        ]
+        .into_iter()
+        .filter(|(_, _, published)| *published)
+        .map(|(endpoint_type, port, _)| self.endpoint(endpoint_type, port))
+        .collect()
+    }
+
+    /// One endpoint of this cluster's control plane, on the address family its
+    /// `networking.networkType` asks for.
+    fn endpoint(&self, endpoint_type: &str, port: &str) -> Endpoint {
+        let ipv6 = self.networking.network_type.as_deref() == Some(NETWORK_TYPE_IPV6);
+        Endpoint {
+            r#type: endpoint_type.to_string(),
+            // "For clusters configured to use IPv6, this is an empty string"
+            // (`Endpoint$privateIpAddress`).
+            private_ip_address: if ipv6 {
+                String::new()
+            } else {
+                control_plane_ipv4(self.seq)
+            },
+            // PCS runs the cluster controller in a service-owned account and reaches it
+            // over the caller's subnets, so no public address is reported.
+            public_ip_address: None,
+            ipv6_address: ipv6.then(|| control_plane_ipv6(self.seq)),
+            port: port.to_string(),
+        }
     }
 }
 
@@ -562,6 +670,26 @@ fn non_empty<T: Clone>(items: &[T]) -> Option<Vec<T>> {
     (!items.is_empty()).then(|| items.to_vec())
 }
 
+/// The private IPv4 address the cluster created `seq`th reports its control plane on.
+///
+/// PCS puts the cluster controller's elastic network interface in one of the caller's
+/// subnets, so the real address is whichever one that VPC assigns. The emulator
+/// provisions no interface, so it reports an address from the RFC 1918 `10.0.0.0/16`
+/// block derived from the creation sequence: distinct per cluster, stable across reads,
+/// and never a host or broadcast byte.
+fn control_plane_ipv4(seq: u64) -> String {
+    let host = seq % 254 + 1;
+    let subnet = (seq / 254) % 256;
+    format!("10.0.{subnet}.{host}")
+}
+
+/// The IPv6 address the cluster created `seq`th reports its control plane on, for a
+/// cluster whose `networkType` is IPv6. From the `fd00::/8` unique-local range, for the
+/// same reason [`control_plane_ipv4`] uses RFC 1918 space.
+fn control_plane_ipv6(seq: u64) -> String {
+    format!("fd00::{seq:x}")
+}
+
 /// Apply the transition the clock owes one record at `now`; `true` means the record is
 /// owed removal and its owner should drop it.
 ///
@@ -686,6 +814,61 @@ pub fn field_validation(member: &str, message: String) -> ValidationException {
     }
 }
 
+/// One of the resource kinds this service refuses a request about: the `resourceType`
+/// member its errors carry, and the noun the service's own error sentences name it by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceKind {
+    /// The `resourceType` member of `ResourceNotFoundException`/`ConflictException`.
+    pub resource_type: &'static str,
+    /// How an error sentence names this kind of resource.
+    pub noun: &'static str,
+}
+
+/// The cluster kind.
+pub const CLUSTER: ResourceKind = ResourceKind {
+    resource_type: "cluster",
+    noun: "cluster",
+};
+
+/// The queue kind.
+pub const QUEUE: ResourceKind = ResourceKind {
+    resource_type: "queue",
+    noun: "queue",
+};
+
+/// The compute node group kind.
+pub const COMPUTE_NODE_GROUP: ResourceKind = ResourceKind {
+    resource_type: "computenodegroup",
+    noun: "compute node group",
+};
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) for a resource the service cannot
+/// find.
+///
+/// The message is the service's own FIXED sentence for that kind of resource: it names
+/// the kind and nothing else, so the identifier the caller supplied is not echoed back in
+/// it — the modelled `resourceId` member is where that belongs.
+pub fn not_found(kind: ResourceKind, identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("AWS PCS couldn't find the {} you specified.", kind.noun),
+        resource_id: identifier.to_string(),
+        resource_type: kind.resource_type.to_string(),
+    }
+}
+
+/// The modelled `ConflictException` (HTTP 409) for an operation that needs a cluster in
+/// [`STATUS_ACTIVE`] while the cluster is in another status.
+///
+/// The message is the service's own fixed sentence for the conflict (the model lists it
+/// among `ConflictException`'s examples); the cluster is named by `resourceId`.
+pub fn cluster_not_active(cluster_id: &str) -> ConflictException {
+    ConflictException {
+        message: "A cluster isn't in ACTIVE status.".to_string(),
+        resource_id: cluster_id.to_string(),
+        resource_type: CLUSTER.resource_type.to_string(),
+    }
+}
+
 /// Why the service refuses a caller-sized list a create would PERSIST, or `None` when
 /// it accepts it.
 ///
@@ -695,6 +878,94 @@ pub fn stored_list_violation(member: &str, entries: usize) -> Option<String> {
     (entries > MAX_STORED_LIST_ENTRIES).then(|| {
         format!("{member} must carry at most {MAX_STORED_LIST_ENTRIES} entries, not {entries}")
     })
+}
+
+/// The modelled `ValidationException` (HTTP 400) `CreateCluster` answers for a scheduler
+/// version it cannot provision, or `None` when the version is supported.
+///
+/// The service refuses a version outside the set it can provision rather than persisting
+/// a cluster that could never come up; the message names the scheduler type and version
+/// the request asked for.
+pub fn create_scheduler_version_violation(
+    scheduler_type: &str,
+    version: &str,
+) -> Option<ValidationException> {
+    if CREATE_SCHEDULER_VERSIONS.contains(&version) {
+        return None;
+    }
+    Some(service_validation(format!(
+        "Scheduler version not found: type={scheduler_type}, version={version}"
+    )))
+}
+
+/// The modelled `ValidationException` (HTTP 400) `UpdateCluster` answers for a scheduler
+/// version it cannot move a cluster to, or `None` when the version is supported.
+///
+/// The update path has its own wording, which names no version.
+pub fn update_scheduler_version_violation(version: &str) -> Option<ValidationException> {
+    if UPDATE_SCHEDULER_VERSIONS.contains(&version) {
+        return None;
+    }
+    Some(service_validation(
+        "AWS PCS doesn't support the scheduler version you provided.".to_string(),
+    ))
+}
+
+/// The modelled `ValidationException` for a request the SERVICE refuses by a rule the
+/// model does not express as a member constraint: reason `other` (a
+/// `ValidationExceptionReason` member) and no `fieldList`, which is for the
+/// member-by-member refusals [`field_validation`] builds.
+fn service_validation(message: String) -> ValidationException {
+    ValidationException {
+        message,
+        reason: "other".to_string(),
+        field_list: None,
+    }
+}
+
+/// The stored Slurm configuration an `UpdateCluster` leaves behind: a member the request
+/// carries replaces the stored one, a member it omits leaves the stored one alone.
+pub fn apply_slurm_update(
+    stored: Option<ClusterSlurmConfiguration>,
+    update: UpdateClusterSlurmConfigurationRequest,
+) -> ClusterSlurmConfiguration {
+    let mut merged = stored.unwrap_or_default();
+    if let Some(seconds) = update.scale_down_idle_time_in_seconds {
+        merged.scale_down_idle_time_in_seconds = Some(seconds);
+    }
+    if let Some(settings) = update.slurm_custom_settings {
+        merged.slurm_custom_settings = Some(settings);
+    }
+    if let Some(settings) = update.slurmdbd_custom_settings {
+        merged.slurmdbd_custom_settings = Some(settings);
+    }
+    if let Some(settings) = update.cgroup_custom_settings {
+        merged.cgroup_custom_settings = Some(settings);
+    }
+    if let Some(accounting) = update.accounting {
+        let previous = merged.accounting.take();
+        merged.accounting = Some(Accounting {
+            default_purge_time_in_days: accounting
+                .default_purge_time_in_days
+                .or_else(|| previous.as_ref().and_then(|a| a.default_purge_time_in_days)),
+            // "The default value for mode is NONE" (`AccountingRequest$mode`).
+            mode: accounting
+                .mode
+                .or_else(|| previous.map(|previous| previous.mode))
+                .unwrap_or_else(|| MODE_NONE.to_string()),
+        });
+    }
+    if let Some(slurm_rest) = update.slurm_rest {
+        let previous = merged.slurm_rest.take();
+        merged.slurm_rest = Some(SlurmRest {
+            // "The default value for mode is NONE" (`SlurmRestRequest$mode`).
+            mode: slurm_rest
+                .mode
+                .or_else(|| previous.map(|previous| previous.mode))
+                .unwrap_or_else(|| MODE_NONE.to_string()),
+        });
+    }
+    merged
 }
 
 /// The modelled `ServiceQuotaExceededException` (HTTP 402) for a create that would take

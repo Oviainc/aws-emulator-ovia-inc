@@ -235,11 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(cluster_id) = state.cluster_id_for(&input.cluster_identifier) else {
             return Err(CreateQueueErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no cluster identified by {}", input.cluster_identifier),
-                    resource_id: input.cluster_identifier.clone(),
-                    resource_type: "cluster".to_string(),
-                },
+                crate::state::not_found(crate::state::CLUSTER, &input.cluster_identifier),
             )
             .into());
         };
@@ -288,16 +284,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // PCS adds a queue to a cluster that is ACTIVE; one that is still provisioning,
         // or on its way out, cannot take one.
         if cluster.status != crate::state::STATUS_ACTIVE {
-            return Err(CreateQueueErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "cluster {} is in {} status, not {}",
-                    cluster.id,
-                    cluster.status,
-                    crate::state::STATUS_ACTIVE
-                ),
-                resource_id: cluster.id.clone(),
-                resource_type: "cluster".to_string(),
-            })
+            return Err(CreateQueueErrorModeled::ConflictException(
+                crate::state::cluster_not_active(&cluster.id),
+            )
             .into());
         }
 
@@ -307,12 +296,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .find(|queue| queue.name == input.queue_name)
         {
             return Err(CreateQueueErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "a queue named {} already exists in cluster {}",
-                    input.queue_name, cluster.id
-                ),
+                // The service's own fixed sentence for this conflict (the model lists it
+                // as a `ConflictException` example): it echoes no caller-supplied value.
+                message: "A queue already exists in a cluster.".to_string(),
                 resource_id: existing.id.clone(),
-                resource_type: "queue".to_string(),
+                resource_type: crate::state::QUEUE.resource_type.to_string(),
             })
             .into());
         }
@@ -334,14 +322,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             if cluster.compute_node_group(named).is_none() {
                 return Err(CreateQueueErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!(
-                            "cluster {} has no compute node group identified by {named}",
-                            cluster.id
-                        ),
-                        resource_id: named.to_string(),
-                        resource_type: "computenodegroup".to_string(),
-                    },
+                    crate::state::not_found(crate::state::COMPUTE_NODE_GROUP, named),
                 )
                 .into());
             }
