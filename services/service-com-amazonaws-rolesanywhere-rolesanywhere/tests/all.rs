@@ -25,6 +25,8 @@ mod iso8601_timestamp_members;
 mod not_found_refusal_messages;
 #[path = "all/notification_settings.rs"]
 mod notification_settings;
+#[path = "all/profile_disablement.rs"]
+mod profile_disablement;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]

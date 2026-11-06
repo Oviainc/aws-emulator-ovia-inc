@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Clears `enabled` on one profile in
+//! [`crate::state::ComAmazonawsRolesanywhereRolesanywhereState::profiles`], so a later
+//! read reports the profile as disabled. The flag is written rather than toggled, so a
+//! second call reports the same state.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +134,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableProfile"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut store = state.lock();
+
+        // An id no stored profile carries — never created, or already deleted — is a
+        // 404, never a canned success: there is nothing to disable. The refusal reports
+        // the profile by the ARN the id names in this request's Region, the wording this
+        // service words an ARN-keyed miss with.
+        let record = store.profiles.get_mut(&input.profile_id).ok_or_else(|| {
+            DisableProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::arn_not_found_message(
+                    &crate::state::profile_arn(
+                        &crate::state::request_region(ctx.parts()),
+                        &input.profile_id,
+                    ),
+                )),
+            })
+        })?;
+
+        // "When disabled, temporary credential requests with this profile fail": the
+        // whole effect is this flag, which every profile read reports. It writes the flag
+        // rather than toggling it, so a second call on an already-disabled profile is a
+        // success reporting the same state, and the instant the record was last updated
+        // moves because the call wrote to it — as the sibling `DisableTrustAnchor` has it.
+        record.enabled = false;
+        record.updated_at = ::std::time::SystemTime::now();
+
+        Ok(DisableProfileOutput {
+            profile: Some(record.to_detail()),
+        })
     }
 }

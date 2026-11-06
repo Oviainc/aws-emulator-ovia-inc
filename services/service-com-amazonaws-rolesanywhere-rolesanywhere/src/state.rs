@@ -6,7 +6,7 @@
 //! (`CreateTrustAnchor`, `UpdateTrustAnchor`, `GetTrustAnchor`, `ListTrustAnchors`,
 //! `DeleteTrustAnchor`, `DisableTrustAnchor`, `PutNotificationSettings`,
 //! `ResetNotificationSettings`,
-//! `CreateProfile`, `GetProfile`, `ListProfiles`, `DeleteProfile`,
+//! `CreateProfile`, `GetProfile`, `ListProfiles`, `DisableProfile`, `DeleteProfile`,
 //! `PutAttributeMapping`, `DeleteAttributeMapping`, `ImportCrl`,
 //! `GetCrl`, `ListCrls`) are backed entirely by the maps below, so a write is visible to the next
 //! request on the same engine. The record types and their projections live here rather
