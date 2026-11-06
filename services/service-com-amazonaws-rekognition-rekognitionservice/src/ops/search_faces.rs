@@ -8,13 +8,15 @@
 //! refused as a bad parameter, since the collection the request named does exist.
 //!
 //! No face recogniser runs in this process, so this operation computes no graded
-//! similarity and reports none. The one comparison it can make honestly is identity:
+//! similarity and reports none. The one comparison it can make honestly between two faces
+//! the collection already HOLDS is identity:
 //! a stored face is a match when it was indexed from the SAME image content as the
 //! searched face (`crate::state::image_signature`), and such a face is reported at
 //! `Similarity` 100 — the only value this operation ever reports. Two faces indexed
 //! from different images are not matched at all rather than scored, so nothing here
-//! stands in for the recogniser; `CompareFaces`, `SearchFacesByImage` and the other
-//! operations that can only be answered by one remain unimplemented 501s.
+//! stands in for the recogniser; the resemblance of two face patches this emulator does
+//! measure needs the PIXELS of the face being searched for, which only an operation taking
+//! an image has (`CompareFaces`, `SearchFacesByImage`).
 //!
 //! `FaceMatchThreshold` is applied to that value, so every threshold the model allows
 //! (`Percent`, 0..100) admits an identical-content match and nothing else can be

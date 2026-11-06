@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchFacesByImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchFacesByImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports which faces of a collection match the face in a SUBMITTED image.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchFacesByImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The search starts from the image: the detector measures the faces the submitted image
+//! carries, the `QualityFilter`'s bar removes the ones too blurry to search with ("filtered
+//! faces aren't searched for in the collection"), and the largest of the rest is the face
+//! searched for — the detector reports faces largest first, so it is the first of them. An
+//! image left with no such face is refused as a bad parameter, which is what the operation
+//! documents: "if no faces are detected in the input image, SearchFacesByImage returns an
+//! InvalidParameterException error". A collection the store does not hold is answered as
+//! not found before the image is read at all.
+//!
+//! What a match is, is MEASURED: each face `IndexFaces` stored kept the appearance the
+//! detector read off its own pixels (`crate::state::StoredFace::appearance`), so the
+//! resemblance between the submitted face and a stored one is the same correlation
+//! `CompareFaces` reports between two submitted images
+//! (`crate::state::face_detection::FaceAppearance::similarity_to`) — a measurement of two
+//! face patches, never an identity. A stored face whose similarity reaches
+//! `FaceMatchThreshold` (80 by default) is reported as a `FaceMatch` carrying that
+//! similarity; the matches come back highest first, as "an array of faces that match,
+//! ordered by similarity score with the highest similarity first", and `MaxFaces` then caps
+//! how many of them are reported, so the cap keeps the strongest matches.
+//!
+//! The answer also carries the box and the confidence measured for the face the search used
+//! ("the operation also returns the bounding box (and a confidence level that the bounding
+//! box contains a face) of the face that Amazon Rekognition used for the input image") and
+//! the collection's own stored face model version. Nothing is written: the search reports
+//! the collection's faces and does not change them.
 //!
 //! ## Shape of an operation
 //!
@@ -212,18 +230,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchFacesByImage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchFacesByImageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchFacesByImage"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SearchFacesByImageErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
+        })?;
+
+        // The resource is resolved before the image is read, so a call naming a collection
+        // that does not exist is answered as not found whatever else is wrong with it. The
+        // guard is dropped before the detection below: no other request may be kept waiting
+        // while this one reads pixels.
+        if !state.lock().collections.contains_key(&input.collection_id) {
+            return Err(SearchFacesByImageErrorModeled::ResourceNotFoundException(
+                crate::state::modeled_error::collection_id_does_not_exist(&input.collection_id),
+            )
+            .into());
+        }
+
+        // "Filtered faces aren't searched for in the collection": the bar removes the faces
+        // too blurry to search with before the largest one is picked, so a filter can change
+        // WHICH face the search uses, not only whether there is one.
+        let bar = crate::state::face_detection::quality_bar(input.quality_filter.as_deref());
+        let mut detected =
+            crate::state::face_detection::measured_faces_in_submitted_image(ctx, &input.image)
+                .await
+                .map_err(unreadable_error)?;
+        detected.retain(|face| face.meets_quality_bar(bar));
+
+        // "First detects the largest face in the image, and then searches the specified
+        // collection for matching faces" — the detector reports faces largest first.
+        let Some(searched) = detected.into_iter().next() else {
+            return Err(SearchFacesByImageErrorModeled::InvalidParameterException(
+                crate::state::modeled_error::no_face_in_image(),
+            )
+            .into());
+        };
+
+        let threshold = input
+            .face_match_threshold
+            .unwrap_or(crate::state::DEFAULT_FACE_MATCH_THRESHOLD);
+        // `MaxFaces` caps how many matches are reported. The model documents no default, so
+        // an omitted cap reports every match; a value that is not a cap at all (a negative
+        // one, which the modelled range 1..4096 refuses at the boundary) asks for none, as
+        // `search_faces` and `state::page_size` do.
+        let max_faces = input
+            .max_faces
+            .map_or(crate::state::DEFAULT_MAX_FACES, |max| {
+                usize::try_from(max).unwrap_or(0)
+            });
+
+        let state = state.lock();
+        // The collection is resolved again: the detection above ran without the lock, so a
+        // `DeleteCollection` may have landed in between.
+        let collection = state.collections.get(&input.collection_id).ok_or_else(|| {
+            SearchFacesByImageErrorModeled::ResourceNotFoundException(
+                crate::state::modeled_error::collection_id_does_not_exist(&input.collection_id),
+            )
+        })?;
+
+        let mut matches: Vec<FaceMatch> = Vec::new();
+        for face in &collection.faces {
+            let similarity = searched.appearance.similarity_to(&face.appearance);
+            // "Don't return any matches where confidence in matches is less than" the
+            // threshold: a face below it is not a match and is reported nowhere, this
+            // operation modelling no list of the faces that did not match.
+            if similarity >= threshold {
+                matches.push(FaceMatch {
+                    similarity: Some(similarity),
+                    face: Some(face.modeled()),
+                });
+            }
+        }
+        // "Ordered by similarity score with the highest similarity first." The sort is
+        // stable, so two faces that resemble the searched face equally keep the
+        // collection's insertion order between them.
+        matches.sort_by(|left, right| {
+            right
+                .similarity
+                .unwrap_or_default()
+                .total_cmp(&left.similarity.unwrap_or_default())
+        });
+        // "The operation returns the maximum number of faces with the highest confidence in
+        // the match": the cap is applied to the ordered matches, so it keeps the strongest.
+        matches.truncate(max_faces);
+
+        Ok(SearchFacesByImageOutput {
+            // "The operation also returns the bounding box (and a confidence level that the
+            // bounding box contains a face) of the face that Amazon Rekognition used for the
+            // input image" — both measured off the submitted image.
+            searched_face_bounding_box: searched.detail.bounding_box.clone(),
+            searched_face_confidence: searched.detail.confidence,
+            face_matches: Some(matches),
+            face_model_version: Some(collection.face_model_version.clone()),
+        })
     }
+}
+
+/// The modelled answer for an image whose faces could not be detected: one modelled error
+/// per reason, each carrying the reason's own message. The reason type and its wording are
+/// shared (`crate::state::image_source`); the mapping is written per operation because each
+/// operation's error enum is its own type, generated from the errors the model declares for
+/// it, so there is no one enum for a shared function to return.
+fn unreadable_error(
+    reason: crate::state::image_source::UnreadableImage,
+) -> SearchFacesByImageError {
+    use crate::state::image_source::UnreadableImage;
+    use crate::state::modeled_error::ModeledError;
+
+    let message = reason.message().to_string();
+    match reason {
+        UnreadableImage::InvalidFormat(_) => {
+            SearchFacesByImageErrorModeled::InvalidImageFormatException(
+                InvalidImageFormatException::with_message(message),
+            )
+        }
+        UnreadableImage::TooLarge(_) => SearchFacesByImageErrorModeled::ImageTooLargeException(
+            ImageTooLargeException::with_message(message),
+        ),
+        UnreadableImage::S3Unreadable(_) => {
+            SearchFacesByImageErrorModeled::InvalidS3ObjectException(
+                InvalidS3ObjectException::with_message(message),
+            )
+        }
+        UnreadableImage::InvalidParameter(_) => {
+            SearchFacesByImageErrorModeled::InvalidParameterException(
+                InvalidParameterException::with_message(message),
+            )
+        }
+        // Nothing was established about the image itself, so this is the server fault it
+        // is rather than anything about the request.
+        UnreadableImage::NotAnalysed(_) => SearchFacesByImageErrorModeled::InternalServerError(
+            InternalServerError::with_message(message),
+        ),
+    }
+    .into()
 }

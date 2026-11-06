@@ -27,13 +27,17 @@
 //!
 //! Nothing here reports a value nothing measured. The same detector is what decides what
 //! `IndexFaces` stores: a collection holds one face per face DETECTED in a submitted
-//! image, and an image carrying none adds nothing to it. A STORED face therefore carries
+//! image, and an image carrying none adds nothing to it. A STORED face therefore REPORTS
 //! its minted identity plus the two members the detector measured for it and `Face`
 //! models — its `BoundingBox` and its `Confidence` — and nothing else: no landmarks, pose
-//! or quality, no demographic attribute and no orientation correction. The feature vector
-//! AWS stores for a face is not among them, so the operations that would match a
-//! submitted image against the faces a collection holds (`SearchFacesByImage`,
-//! `SearchUsersByImage`, …) stay unimplemented 501s.
+//! or quality, no demographic attribute and no orientation correction. Beside those it
+//! keeps, unreported, the [`face_detection::FaceAppearance`] the detector measured off its
+//! own pixels, which is what lets a face submitted later be compared with the faces a
+//! collection already holds: `SearchFacesByImage` reports that measured resemblance, the
+//! same measurement `CompareFaces` makes between two submitted images, and it is a
+//! resemblance of two face patches and still not an identity. The operations that would
+//! need a trained model of WHO a face belongs to (`SearchUsersByImage`, …) stay
+//! unimplemented 501s.
 //!
 //! Where an operation PARTITIONS the faces of a submitted image by an identity nothing here
 //! holds, the detector still answers for the part it measured: `RecognizeCelebrities`
@@ -41,7 +45,7 @@
 //! puts a face it does not recognise on — and names no celebrity, rather than refusing the
 //! call or inventing one.
 //!
-//! The one comparison this emulator can make about stored faces is IDENTITY:
+//! The one comparison this emulator can make about two STORED faces is IDENTITY:
 //! [`image_signature`] digests what an image is, so two indexed faces can be told to have
 //! come from the same image content or not. `SearchFaces` reports exactly that and no
 //! graded score — see its own module docs.
@@ -80,13 +84,14 @@ pub const FACE_MODEL_VERSION: &str = "7.0";
 /// `MaxResults`: the largest page the model allows (`PageSize` range 0..4096).
 pub const DEFAULT_PAGE_SIZE: usize = 4096;
 
-/// The `SearchFaces` cap used when the caller sends no `MaxFaces`: the largest the
-/// model allows (`MaxFaces` range 1..4096). The model documents no default for it.
+/// The cap `SearchFaces` / `SearchFacesByImage` use when the caller sends no `MaxFaces`:
+/// the largest the model allows (`MaxFaces` range 1..4096). The model documents no default
+/// for it.
 pub const DEFAULT_MAX_FACES: usize = 4096;
 
-/// The `SearchFaces` match floor used when the caller sends no
-/// `FaceMatchThreshold`. Documented on the member itself
-/// (`smithy_query(query="doc",shape="SearchFacesRequest",member="FaceMatchThreshold")`:
+/// The match floor `SearchFaces` / `SearchFacesByImage` use when the caller sends no
+/// `FaceMatchThreshold`. Documented on the member itself in both requests
+/// (`smithy_query(query="doc",shape="SearchFacesRequest,SearchFacesByImageRequest",member="FaceMatchThreshold")`:
 /// "The default value is 80%").
 pub const DEFAULT_FACE_MATCH_THRESHOLD: f32 = 80.0;
 
@@ -174,7 +179,9 @@ pub const MAX_PROJECTS: usize = 100;
 ///
 /// Its members are the face's IDENTITY — what the service minted and what the caller
 /// supplied — plus the two measurements `Face` models for a stored face, taken by the
-/// detector that found it. Nothing nothing measured is stored.
+/// detector that found it, and the appearance that same detector measured off its pixels,
+/// which this API reports nowhere and a later search compares against. Nothing nothing
+/// measured is stored.
 #[derive(Debug, Clone)]
 pub struct StoredFace {
     /// The id this service minted for the face; the collection's key for it.
@@ -199,6 +206,12 @@ pub struct StoredFace {
     /// The digest of the image content this face was indexed from: what lets
     /// `SearchFaces` tell whether two stored faces came from the same image.
     pub signature: [u8; 32],
+    /// What this face LOOKS LIKE, measured by the detector off the pixels inside its own
+    /// box when it was indexed (`face_detection::FaceAppearance`). It is not a member of
+    /// any modelled shape and is reported by nothing: it is what a face submitted later is
+    /// compared WITH, so `SearchFacesByImage` can measure how alike that face and this one
+    /// look instead of reporting a resemblance nothing measured.
+    pub appearance: face_detection::FaceAppearance,
     /// This face's position in the collection's insertion order. Monotonic per
     /// collection and never reused, so a `ListFaces` cursor built from it neither
     /// repeats nor skips a face when other faces are added or deleted between

@@ -25,6 +25,8 @@ mod face_collections;
 mod face_comparison;
 #[path = "all/face_detection.rs"]
 mod face_detection;
+#[path = "all/face_search_by_image.rs"]
+mod face_search_by_image;
 #[path = "all/image_content_refusal.rs"]
 mod image_content_refusal;
 #[path = "all/photographic_enrolment.rs"]

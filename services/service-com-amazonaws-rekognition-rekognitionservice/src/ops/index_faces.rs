@@ -380,15 +380,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let image_id = crate::state::new_image_id();
         let mut records = Vec::with_capacity(candidates.len());
         for detected in candidates {
+            // The face's own measurements go two ways: the box and the confidence are what
+            // a stored face REPORTS, and the appearance is what it is later compared with,
+            // so the face `SearchFacesByImage` matches against is the face indexed here.
+            let MeasuredFace { detail, appearance } = detected;
             let face = crate::state::StoredFace {
                 face_id: crate::state::new_face_id(),
                 image_id: image_id.clone(),
                 external_image_id: input.external_image_id.clone(),
                 index_faces_model_version: face_model_version.clone(),
-                bounding_box: detected.detail.bounding_box.clone(),
-                confidence: detected.detail.confidence,
+                bounding_box: detail.bounding_box.clone(),
+                confidence: detail.confidence,
                 user_id: None,
                 signature,
+                appearance,
                 sequence: collection.next_sequence,
             };
             collection.next_sequence += 1;
@@ -396,7 +401,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 face: Some(face.modeled()),
                 // "Structure containing attributes of the face that the algorithm
                 // detected": what the detector measured, and only that.
-                face_detail: Some(detected.detail),
+                face_detail: Some(detail),
             });
             collection.faces.push(face);
         }
