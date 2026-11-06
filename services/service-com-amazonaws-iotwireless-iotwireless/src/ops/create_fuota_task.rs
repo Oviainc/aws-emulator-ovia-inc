@@ -209,8 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         id: Some(existing.id.clone()),
                     });
                 }
-                // The task this token minted has since been deleted, so there is nothing
-                // to replay: fall through and create a new one.
+                // The token names a task the store no longer holds, so there is nothing
+                // to replay: fall through and create a new one. `DeleteFuotaTask` drops
+                // the tokens that minted the task it removes, so this is the belt to
+                // that brace rather than the path a delete normally takes.
             }
         }
 
@@ -241,9 +243,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             lorawan: input.lo_ra_wan.clone(),
             firmware_update_image: input.firmware_update_image.clone(),
             firmware_update_role: input.firmware_update_role.clone(),
-            redundancy_percent: input.redundancy_percent,
-            fragment_size_bytes: input.fragment_size_bytes,
-            fragment_interval_ms: input.fragment_interval_ms,
+            // Every FUOTA task carries LoRaWAN radio settings — the only ones this
+            // operation takes — so the stored task's protocol is that one.
+            protocol_type: crate::state::FUOTA_TASK_PROTOCOL_TYPE_LORAWAN.to_string(),
+            // `RedundancyPercent`, `FragmentSizeBytes` and `FragmentIntervalMS` are
+            // optional and the model declares no `@default` for them, so the service
+            // applies ITS OWN default for each one the request omits: a created task
+            // always has a complete transfer plan for its reader to report.
+            redundancy_percent: input
+                .redundancy_percent
+                .unwrap_or(crate::state::DEFAULT_FUOTA_REDUNDANCY_PERCENT),
+            fragment_size_bytes: input
+                .fragment_size_bytes
+                .unwrap_or(crate::state::DEFAULT_FUOTA_FRAGMENT_SIZE_BYTES),
+            fragment_interval_ms: input
+                .fragment_interval_ms
+                .unwrap_or(crate::state::DEFAULT_FUOTA_FRAGMENT_INTERVAL_MS),
             descriptor: input.descriptor.clone(),
             tags: input.tags.clone().unwrap_or_default(),
             // A created task is waiting for its session to be asked for; it leaves this

@@ -23,6 +23,8 @@ mod fuota_task_device_association;
 mod fuota_task_device_disassociation;
 #[path = "all/fuota_task_lifecycle.rs"]
 mod fuota_task_lifecycle;
+#[path = "all/fuota_task_update_and_delete.rs"]
+mod fuota_task_update_and_delete;
 #[path = "all/multicast_group_device_association.rs"]
 mod multicast_group_device_association;
 #[path = "all/multicast_group_device_disassociation.rs"]

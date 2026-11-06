@@ -12,7 +12,9 @@
 //! * `CreateFuotaTask` persists the task it was given and mints its identity, so
 //!   `GetFuotaTask` reports back every member that was stored, over the modelled
 //!   `SupportedRfRegion` catalog, both ends of the published `RedundancyPercent` range
-//!   and both `Descriptor` padding forms the published pattern admits;
+//!   and both `Descriptor` padding forms the published pattern admits (the effective
+//!   fragmentation plan a create that pins none reports has its own suite,
+//!   `fuota_task_update_and_delete`);
 //! * a minted `Id` is a fresh uuid and its ARN carries the region the request names;
 //! * a created task reports a modelled `FuotaTaskStatus` and no session start time,
 //!   because nothing has started its session;
@@ -34,7 +36,8 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The store ceiling and the created-task status the service declares, so this suite
 /// asserts what the implementation publishes rather than numbers copied by hand.
 use service_com_amazonaws_iotwireless_iotwireless::state::{
-    DEFAULT_REGION, FUOTA_TASK_STATUS_PENDING, MAX_FUOTA_TASKS,
+    DEFAULT_FUOTA_FRAGMENT_INTERVAL_MS, DEFAULT_FUOTA_FRAGMENT_SIZE_BYTES,
+    DEFAULT_FUOTA_REDUNDANCY_PERCENT, DEFAULT_REGION, FUOTA_TASK_STATUS_PENDING, MAX_FUOTA_TASKS,
 };
 
 // The ONE wire harness this crate's suites share, and the region and account its
@@ -158,14 +161,16 @@ fn cases() -> Vec<Case> {
 }
 
 /// The member names `GetFuotaTask` reports straight back from what the create stored.
+///
+/// The three fragmentation members are NOT here: they are optional and the service
+/// applies its own default for one a create omits, so what the reader reports is the
+/// EFFECTIVE value rather than the request's presence state. That rule has its own
+/// suite, `fuota_task_update_and_delete`.
 const ECHOED_MEMBERS: &[&str] = &[
     "Name",
     "Description",
     "FirmwareUpdateImage",
     "FirmwareUpdateRole",
-    "RedundancyPercent",
-    "FragmentSizeBytes",
-    "FragmentIntervalMS",
     "Descriptor",
 ];
 
@@ -248,6 +253,28 @@ async fn a_fuota_task_round_trips_through_get() {
                 case.case,
                 case.body.get(*member),
                 fetched.get(*member)
+            );
+        }
+        // A fragmentation member the create pinned reads back as it was pinned; one it
+        // omitted reads back as the default the service applied, so the task always
+        // reports a complete transfer plan.
+        for member in [
+            ("RedundancyPercent", DEFAULT_FUOTA_REDUNDANCY_PERCENT),
+            ("FragmentSizeBytes", DEFAULT_FUOTA_FRAGMENT_SIZE_BYTES),
+            ("FragmentIntervalMS", DEFAULT_FUOTA_FRAGMENT_INTERVAL_MS),
+        ] {
+            let (member, default) = member;
+            let expected = case
+                .body
+                .get(member)
+                .cloned()
+                .unwrap_or_else(|| json!(default));
+            assert_eq!(
+                fetched.get(member),
+                Some(&expected),
+                "case {:?}: expected {member} = {expected}, got {:?}",
+                case.case,
+                fetched.get(member)
             );
         }
         assert_eq!(

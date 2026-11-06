@@ -72,6 +72,8 @@
 //! * `LoRaWAN` (LoRaWANFuotaTaskGetInfo) — The LoRaWAN information returned from getting a
 //!   FUOTA task.
 //! * `Name` (FuotaTaskName, len 0..256) — The name of a FUOTA task.
+//! * `ProtocolType` (FuotaTaskType, one of: LoRaWAN) — The protocol type the FUOTA task
+//!   transfers its firmware update image with.
 //! * `RedundancyPercent` (RedundancyPercent, range 0..100) — The percentage of the added
 //!   fragments that are redundant. For example, if the size of the firmware image file is 100
 //!   bytes and the fragment size is 10 bytes, with RedundancyPercent set to 50(%), the final
@@ -200,9 +202,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             firmware_update_image: Some(task.firmware_update_image.clone()),
             firmware_update_role: Some(task.firmware_update_role.clone()),
             created_at: Some(::aws_smithy_types::DateTime::from(task.created_at)),
-            redundancy_percent: task.redundancy_percent,
-            fragment_size_bytes: task.fragment_size_bytes,
-            fragment_interval_ms: task.fragment_interval_ms,
+            // The protocol the image is transferred with, and the task's EFFECTIVE
+            // fragmentation settings: what the create or a later update pinned, or the
+            // default the service applied for a member neither of them named. A stored
+            // task always has all four, so the reader reports the whole transfer plan.
+            protocol_type: Some(task.protocol_type.clone()),
+            redundancy_percent: Some(task.redundancy_percent),
+            fragment_size_bytes: Some(task.fragment_size_bytes),
+            fragment_interval_ms: Some(task.fragment_interval_ms),
             descriptor: task.descriptor.clone(),
         })
     }

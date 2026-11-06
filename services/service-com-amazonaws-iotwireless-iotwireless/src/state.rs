@@ -874,9 +874,18 @@ pub struct FuotaTask {
     pub firmware_update_image: String,
     /// The role the firmware update is applied under. Required, like the image.
     pub firmware_update_role: String,
-    pub redundancy_percent: Option<i32>,
-    pub fragment_size_bytes: Option<i32>,
-    pub fragment_interval_ms: Option<i32>,
+    /// The protocol the firmware update is transferred with. Every FUOTA task this
+    /// service creates is a LoRaWAN task — `CreateFuotaTask`'s only radio-settings
+    /// member is `LoRaWAN` — so this carries [`FUOTA_TASK_PROTOCOL_TYPE_LORAWAN`].
+    pub protocol_type: String,
+    /// The task's EFFECTIVE fragmentation settings: the values the create carried, or
+    /// the service defaults ([`DEFAULT_FUOTA_REDUNDANCY_PERCENT`],
+    /// [`DEFAULT_FUOTA_FRAGMENT_SIZE_BYTES`], [`DEFAULT_FUOTA_FRAGMENT_INTERVAL_MS`])
+    /// it applied for the ones the create omitted. Not optional, because a stored task
+    /// always has a transfer plan to report.
+    pub redundancy_percent: i32,
+    pub fragment_size_bytes: i32,
+    pub fragment_interval_ms: i32,
     /// The base64 file descriptor the create carried, reported back unchanged.
     pub descriptor: Option<String>,
     pub tags: Vec<Tag>,
@@ -899,6 +908,30 @@ pub struct FuotaTask {
 /// scaffolded).
 pub const FUOTA_TASK_STATUS_PENDING: &str = "Pending";
 
+/// The `ProtocolType` a stored FUOTA task reports: the only protocol a FUOTA task
+/// carries radio settings for, as the modelled `FuotaTaskType` catalog
+/// ([`crate::ops::types::FUOTA_TASK_TYPE_VALUES`]) and `CreateFuotaTask`'s single
+/// `LoRaWAN` settings member both state.
+pub const FUOTA_TASK_PROTOCOL_TYPE_LORAWAN: &str = "LoRaWAN";
+
+/// The `RedundancyPercent` a FUOTA task is created with when the request names none:
+/// half the fragments of the image are added as redundant ones, which is the value the
+/// service is observed to report for a task whose create pinned none. One of the three
+/// fragmentation defaults the service applies at create time, so a task that pinned
+/// none still reports a complete transfer plan. Inside the member's published
+/// `range 0..100`.
+pub const DEFAULT_FUOTA_REDUNDANCY_PERCENT: i32 = 50;
+
+/// The `FragmentSizeBytes` a FUOTA task is created with when the request names none:
+/// the fragment size the service is observed to report for a task whose create pinned
+/// none. Inside the published `range min 1`, like every value this member may take.
+pub const DEFAULT_FUOTA_FRAGMENT_SIZE_BYTES: i32 = 50;
+
+/// The `FragmentIntervalMS` a FUOTA task is created with when the request names none:
+/// one second between fragments, which is the granularity the member's own
+/// documentation gives it ("rounded to the nearest second").
+pub const DEFAULT_FUOTA_FRAGMENT_INTERVAL_MS: i32 = 1_000;
+
 /// The `FuotaDeviceStatus` a wireless device carries the moment it joins a FUOTA task:
 /// it is a member, and no FUOTA session has sent it a fragment yet.
 ///
@@ -919,13 +952,18 @@ pub fn wireless_device_not_found(id: &str) -> ResourceNotFoundException {
     }
 }
 
-/// The `ResourceNotFoundException` body for a FUOTA task the account does not hold.
+/// The `ResourceNotFoundException` body for a FUOTA task the account does not hold,
+/// worded by [`resource_not_found`] — the sentence this service refuses a missing
+/// resource of this kind with, carrying the resource type and the requested `Id`.
 ///
 /// One function, so every operation that addresses a FUOTA task by `Id` refuses a
 /// missing one with the same body.
 pub fn fuota_task_not_found(id: &str) -> ResourceNotFoundException {
-    resource_not_found("FuotaTask", id)
+    resource_not_found(FUOTA_TASK_RESOURCE_TYPE, id)
 }
+
+/// The `ResourceType` a FUOTA task's refusals name.
+pub const FUOTA_TASK_RESOURCE_TYPE: &str = "FuotaTask";
 
 /// The `ResourceNotFoundException` body for a multicast group the account does not hold.
 ///
@@ -1459,6 +1497,27 @@ impl ComAmazonawsIotwirelessIotwirelessState {
             token,
             record,
         );
+    }
+
+    /// Drop every idempotency token that minted FUOTA task `id`, so a token never
+    /// outlives the resource it names and a create/delete loop cannot grow the token
+    /// store.
+    pub fn forget_fuota_task_tokens_for(&mut self, id: &str) {
+        forget_tokens_for(
+            &mut self.fuota_task_tokens,
+            &mut self.fuota_task_token_order,
+            id,
+        );
+    }
+
+    /// Release every wireless device's membership of FUOTA task `id`, so no device
+    /// reports belonging to a task the store no longer holds.
+    pub fn release_fuota_task_members(&mut self, id: &str) {
+        for device in self.wireless_devices.values_mut() {
+            if device.fuota_task_id.as_deref() == Some(id) {
+                device.fuota_task_id = None;
+            }
+        }
     }
 
     /// Mint a fresh, unused `WirelessGatewayId`.

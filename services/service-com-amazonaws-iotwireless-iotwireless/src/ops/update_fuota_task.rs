@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFuotaTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFuotaTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFuotaTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the patch to the stored FUOTA task named by `Id`. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,20 +157,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFuotaTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFuotaTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFuotaTask"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateFuotaTaskError::from(UpdateFuotaTaskErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the iotwireless store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let mut store = state.lock();
+        // `Id` is this operation's `@httpLabel`, so it ADDRESSES the task to patch; an
+        // id the account does not hold is the modelled 404, worded by the one helper
+        // every FUOTA-task-addressing operation refuses through.
+        let task = store.fuota_tasks.get_mut(&input.id).ok_or_else(|| {
+            UpdateFuotaTaskError::from(UpdateFuotaTaskErrorModeled::ResourceNotFoundException(
+                crate::state::fuota_task_not_found(&input.id),
+            ))
+        })?;
+
+        // Every member the request CARRIED replaces the stored one, and a member it
+        // omitted leaves the stored value as it was — so renaming a task keeps its image,
+        // role, descriptor and fragmentation settings. Modelled ranges and patterns are
+        // refused before this handler runs, so nothing unmodelled reaches the store.
+        if let Some(name) = input.name {
+            task.name = Some(name);
+        }
+        if let Some(description) = input.description {
+            task.description = Some(description);
+        }
+        if let Some(lorawan) = input.lo_ra_wan {
+            task.lorawan = Some(lorawan);
+        }
+        if let Some(firmware_update_image) = input.firmware_update_image {
+            task.firmware_update_image = firmware_update_image;
+        }
+        if let Some(firmware_update_role) = input.firmware_update_role {
+            task.firmware_update_role = firmware_update_role;
+        }
+        if let Some(redundancy_percent) = input.redundancy_percent {
+            task.redundancy_percent = redundancy_percent;
+        }
+        if let Some(fragment_size_bytes) = input.fragment_size_bytes {
+            task.fragment_size_bytes = fragment_size_bytes;
+        }
+        if let Some(fragment_interval_ms) = input.fragment_interval_ms {
+            task.fragment_interval_ms = fragment_interval_ms;
+        }
+        if let Some(descriptor) = input.descriptor {
+            task.descriptor = Some(descriptor);
+        }
+
+        Ok(UpdateFuotaTaskOutput {})
     }
 }
