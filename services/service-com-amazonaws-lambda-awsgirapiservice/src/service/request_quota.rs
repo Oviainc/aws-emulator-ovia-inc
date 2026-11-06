@@ -124,6 +124,27 @@ const INVOCATION_TYPE_HEADER: &str = "x-amz-invocation-type";
 /// The `InvocationType` whose payload quota is the asynchronous one.
 const INVOCATION_TYPE_EVENT: &str = "Event";
 
+/// The `InvocationType` an invocation that names none is: "RequestResponse (default) –
+/// Invoke the function synchronously" (the model's own `InvocationType` documentation).
+const INVOCATION_TYPE_REQUEST_RESPONSE: &str = "RequestResponse";
+
+/// The `InvocationType` that validates parameters and runs nothing, whose payload is still
+/// the synchronous one's.
+const INVOCATION_TYPE_DRY_RUN: &str = "DryRun";
+
+/// Every value the model's `InvocationType` enum admits
+/// (`smithy_query(query="shape",shape="InvocationType")`: `DryRun | Event |
+/// RequestResponse`).
+///
+/// A header carrying anything else names no invocation type the service accepts, so the
+/// quota check leaves it to the boundary validator rather than naming the caller's text in
+/// a quota sentence.
+const INVOCATION_TYPES: &[&str] = &[
+    INVOCATION_TYPE_DRY_RUN,
+    INVOCATION_TYPE_EVENT,
+    INVOCATION_TYPE_REQUEST_RESPONSE,
+];
+
 /// "For synchronous invocations, the maximum payload size is 6 MB" (the model's own
 /// `Invoke` documentation).
 const MAX_SYNCHRONOUS_PAYLOAD_BYTES: usize = 6 * 1024 * 1024;
@@ -136,18 +157,24 @@ const MAX_ASYNCHRONOUS_PAYLOAD_BYTES: usize = 1024 * 1024;
 ///
 /// The quota is the invocation TYPE's — "The maximum payload size is 6 MB for synchronous
 /// invocations and 1 MB for asynchronous invocations" — so which one applies is read off
-/// the request's own `InvocationType` header, and each is refused in the sentence AWS
-/// gives it: the asynchronous one names the payload's own size against the limit, and the
-/// synchronous one names the limit and the action.
+/// the request's own `InvocationType` header, and the refusal states that payload against
+/// that type's quota: the size the request actually carried, the invocation type it carried
+/// it for, and the limit for that type. Every part but the fixed text is a value of the
+/// request, so ONE sentence serves every invocation type rather than one per type.
+///
+/// The type named has to be one the model declares ([`INVOCATION_TYPES`]): a header carrying
+/// anything else names no invocation type, so there is no quota of its to state and nothing
+/// of the caller's text is reflected — the request falls through to the boundary validator,
+/// which refuses the value against the modelled enum.
 fn refusing_payload(operation: &str, req: &RtRequest, body_bytes: usize) -> Option<RtResponse> {
     if operation != INVOKE {
         return None;
     }
-    let asynchronous = req
-        .headers()
-        .get(INVOCATION_TYPE_HEADER)
-        .is_some_and(|invocation_type| invocation_type == INVOCATION_TYPE_EVENT);
-    let limit = if asynchronous {
+    let invocation_type = match req.headers().get(INVOCATION_TYPE_HEADER) {
+        None => INVOCATION_TYPE_REQUEST_RESPONSE,
+        Some(named) => *INVOCATION_TYPES.iter().find(|known| **known == named)?,
+    };
+    let limit = if invocation_type == INVOCATION_TYPE_EVENT {
         MAX_ASYNCHRONOUS_PAYLOAD_BYTES
     } else {
         MAX_SYNCHRONOUS_PAYLOAD_BYTES
@@ -155,15 +182,10 @@ fn refusing_payload(operation: &str, req: &RtRequest, body_bytes: usize) -> Opti
     if body_bytes <= limit {
         return None;
     }
-    let message = if asynchronous {
-        format!(
-            "{body_bytes} byte payload is too large for the {INVOCATION_TYPE_EVENT} invocation \
-             type (limit {limit} bytes)"
-        )
-    } else {
-        format!("Request must be smaller than {limit} bytes for the InvokeFunction operation")
-    };
-    Some(too_large_response(&message))
+    Some(too_large_response(&format!(
+        "{body_bytes} byte payload is too large for the {invocation_type} invocation type \
+         (limit {limit} bytes)"
+    )))
 }
 
 /// The refusal itself: this service's JSON error envelope, at the status the error shape
@@ -254,19 +276,28 @@ mod tests {
                 "no type, one byte over the synchronous quota",
                 None,
                 MAX_SYNCHRONOUS_PAYLOAD_BYTES + 1,
-                Some("Request must be smaller than 6291456 bytes for the InvokeFunction operation"),
+                Some(
+                    "6291457 byte payload is too large for the RequestResponse invocation type \
+                     (limit 6291456 bytes)",
+                ),
             ),
             (
                 "RequestResponse over the synchronous quota",
                 Some("RequestResponse"),
                 MAX_SYNCHRONOUS_PAYLOAD_BYTES + 1,
-                Some("Request must be smaller than 6291456 bytes for the InvokeFunction operation"),
+                Some(
+                    "6291457 byte payload is too large for the RequestResponse invocation type \
+                     (limit 6291456 bytes)",
+                ),
             ),
             (
                 "DryRun over the synchronous quota",
                 Some("DryRun"),
                 MAX_SYNCHRONOUS_PAYLOAD_BYTES + 2,
-                Some("Request must be smaller than 6291456 bytes for the InvokeFunction operation"),
+                Some(
+                    "6291458 byte payload is too large for the DryRun invocation type (limit \
+                     6291456 bytes)",
+                ),
             ),
             (
                 "Event under its own quota",
@@ -291,6 +322,21 @@ mod tests {
                     "1048585 byte payload is too large for the Event invocation type (limit \
                      1048576 bytes)",
                 ),
+            ),
+            // A header the model's enum does not admit names no invocation type, so there
+            // is no quota of its to refuse against: the request is left to the boundary
+            // validator, which refuses the value itself.
+            (
+                "an unmodelled type, far over every quota",
+                Some("NotAType"),
+                MAX_SYNCHRONOUS_PAYLOAD_BYTES * 2,
+                None,
+            ),
+            (
+                "an empty type header, far over every quota",
+                Some(""),
+                MAX_SYNCHRONOUS_PAYLOAD_BYTES * 2,
+                None,
             ),
         ];
         for (case, invocation_type, body_bytes, expected) in cases {

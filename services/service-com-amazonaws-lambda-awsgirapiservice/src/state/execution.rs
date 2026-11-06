@@ -154,10 +154,10 @@ const MAX_RUN_RECURSION: usize = 2_000;
 /// log" on `LogResult`, so what is kept is a multiple of that rather than unbounded.
 const MAX_RUN_LOG_BYTES: usize = 256 * 1024;
 
-/// How large a handler's response may be. "The maximum payload size is 6 MB for
-/// synchronous invocations" (the model's own `Invoke` documentation) bounds the REQUEST;
-/// the response Lambda publishes the same quota for.
-const MAX_RESPONSE_BYTES: usize = 6 * 1024 * 1024;
+/// How large a handler's response may be, which is the quota Lambda names in its own
+/// refusal for a response past it ([`RESPONSE_SIZE_TOO_LARGE`]) — a response of exactly
+/// this many bytes is delivered, and one byte more is not.
+const MAX_RESPONSE_BYTES: usize = 6_291_556;
 
 /// The bytes of a run's log the model reports on `LogResult`: "The last 4 KB of the
 /// execution log, which is base64-encoded."
@@ -538,6 +538,23 @@ fn answered(
             ),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
+        // A run the RESPONSE ceiling ended produced an answer Lambda will not carry, and
+        // Lambda attributes that failure to the response rather than reporting it as a
+        // runtime that exited: the error names the response-size class and states the
+        // quota the response passed.
+        Completion::Stopped(Stop::Response) => (
+            error_document(
+                &format!(
+                    "Response payload size exceeded maximum allowed payload size ({} bytes).",
+                    budget.response_bytes
+                ),
+                Some(RESPONSE_SIZE_TOO_LARGE),
+                request_id,
+                &[],
+                stack_member,
+            ),
+            Some(FUNCTION_ERROR_UNHANDLED.to_string()),
+        ),
         Completion::Stopped(stop) => (
             error_document(
                 stop.reason(),
@@ -575,6 +592,11 @@ fn answered(
 
 /// The `errorType` of a run whose runtime ended instead of answering.
 const RUNTIME_EXIT_ERROR: &str = "Runtime.ExitError";
+
+/// The `errorType` of a run whose answer was larger than an invocation may return. The
+/// failure is the RESPONSE's, so it is attributed to the function's response rather than
+/// reported as a runtime that exited.
+const RESPONSE_SIZE_TOO_LARGE: &str = "Function.ResponseSizeTooLarge";
 
 /// What AWS reports as the message of such a run when the sandbox ended it.
 const RUNTIME_KILLED: &str = "Runtime exited with error: signal: killed";

@@ -4,10 +4,8 @@
 //!
 //! Put a new suite at `tests/all/<name>.rs` and declare it below, keeping the list
 //! sorted.
-//!
 //! A suite that is not declared here compiles nowhere and its tests never run. A
 //! suite left at the top level of `tests/` fails the build.
-
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
@@ -43,12 +41,10 @@ mod alias_write_not_found_sentence;
 mod async_delivery;
 #[path = "all/async_invocation.rs"]
 mod async_invocation;
-
-#[path = "all/async_invocation_delivery.rs"]
-mod async_invocation_delivery;
 #[path = "all/asynchronous_invoke_run.rs"]
 mod asynchronous_invoke_run;
-
+#[path = "all/aws_refusal_wording_and_region_isolation.rs"]
+mod aws_refusal_wording_and_region_isolation;
 #[path = "all/capacity_provider_bounds.rs"]
 mod capacity_provider_bounds;
 #[path = "all/capacity_provider_duplicate_name.rs"]
@@ -109,8 +105,6 @@ mod event_source_mapping_least_privilege_role;
 mod event_source_mapping_metrics_scope;
 #[path = "all/event_source_mapping_paused_state_and_response_types.rs"]
 mod event_source_mapping_paused_state_and_response_types;
-#[path = "all/event_source_mapping_processed_batch.rs"]
-mod event_source_mapping_processed_batch;
 #[path = "all/event_source_mapping_processing_visibility.rs"]
 mod event_source_mapping_processing_visibility;
 #[path = "all/event_source_mapping_queue_visibility.rs"]
@@ -279,3 +273,7 @@ mod version_delete_alias_reference;
 mod version_publishing;
 #[path = "all/vpc_config_execution_role_permissions.rs"]
 mod vpc_config_execution_role_permissions;
+#[path = "all/async_invocation_delivery.rs"]
+mod async_invocation_delivery;
+#[path = "all/event_source_mapping_processed_batch.rs"]
+mod event_source_mapping_processed_batch;

@@ -340,7 +340,8 @@ async fn a_pair_that_names_no_function_is_the_modelled_not_found() {
     // for each of the two invocation types — the refusal is about resolution, so it does
     // not depend on what the caller asked to be done once resolved. The expected message
     // names the resource the invocation addressed: the function AT the version it would
-    // have run, which is `$LATEST` when the request names no qualifier.
+    // have run, which is `$LATEST` when the request names no qualifier, in the Region the
+    // name itself named when it carried one.
     for (label, reference, qualifier, addressed) in [
         (
             "a function that does not exist",
@@ -359,6 +360,12 @@ async fn a_pair_that_names_no_function_is_the_modelled_not_found() {
             format!("{ACCOUNT}:function:stream-absent"),
             None,
             format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:stream-absent:{LATEST}"),
+        ),
+        (
+            "a held function addressed through another Region",
+            format!("arn:aws:lambda:us-west-2:{ACCOUNT}:function:stream-held"),
+            None,
+            format!("arn:aws:lambda:us-west-2:{ACCOUNT}:function:stream-held"),
         ),
         (
             "a version a known function has not published",

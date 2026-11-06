@@ -4118,6 +4118,39 @@ pub fn mint_revision_id() -> String {
 /// environment variables combined.
 pub const MAX_ENVIRONMENT_BYTES: usize = 4 * 1024;
 
+/// The environment variable names Lambda sets itself and will not let a function's
+/// configuration set.
+///
+/// The Lambda Developer Guide's "Use Lambda environment variables" lists these as the
+/// RESERVED runtime environment variables: "Lambda reserves [them] … you cannot set these
+/// keys in your function's configuration." The variables the runtime sets that the guide
+/// does NOT reserve (`TZ`, `LANG`, `PATH`, `LD_LIBRARY_PATH`,
+/// `AWS_XRAY_CONTEXT_MISSING`, the X-Ray daemon address and port) are deliberately absent:
+/// a function may set those, and the run's own environment applies its value
+/// (`crate::state::execution`). A request naming a reserved key is refused whole, so the
+/// function keeps the environment it had.
+const RESERVED_ENVIRONMENT_KEYS: &[&str] = &[
+    "AWS_ACCESS_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_DEFAULT_REGION",
+    "AWS_EXECUTION_ENV",
+    "AWS_LAMBDA_FUNCTION_MEMORY_SIZE",
+    "AWS_LAMBDA_FUNCTION_NAME",
+    "AWS_LAMBDA_FUNCTION_VERSION",
+    "AWS_LAMBDA_INITIALIZATION_TYPE",
+    "AWS_LAMBDA_LOG_GROUP_NAME",
+    "AWS_LAMBDA_LOG_STREAM_NAME",
+    "AWS_LAMBDA_RUNTIME_API",
+    "AWS_REGION",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SECRET_KEY",
+    "AWS_SESSION_TOKEN",
+    "LAMBDA_RUNTIME_DIR",
+    "LAMBDA_TASK_ROOT",
+    "_HANDLER",
+    "_X_AMZN_TRACE_ID",
+];
+
 /// What the environment budget is measured on: the variables as ONE serialized JSON
 /// object, which is the string AWS's refusal reports it measured.
 ///
@@ -4143,12 +4176,30 @@ pub fn environment_too_large_message(measured: &str) -> String {
     )
 }
 
+/// The refusal a set of environment variables naming a key Lambda reserves gets.
+///
+/// Fixed text, with the reserved keys the REQUEST used as its one variable part — which is
+/// what tells a caller which of its own variables to drop. Listed in the order
+/// [`RESERVED_ENVIRONMENT_KEYS`] states, so one request is refused one way.
+#[must_use]
+pub fn reserved_environment_keys_message(reserved: &[&str]) -> String {
+    format!(
+        "Lambda was unable to configure your environment variables because the environment \
+         variables you have provided contains reserved keys that are currently not supported \
+         for modification. Reserved keys used in this request: {}",
+        reserved.join(", ")
+    )
+}
+
 /// The environment variables an `Environment` member asks a function to hold, ordered so
 /// a read reports them deterministically.
 ///
-/// `Err` carries the message of the refusal: the set is larger than the documented
-/// quota. Every operation that accepts an `Environment` applies the same quota, so the
-/// check lives here rather than once per operation.
+/// `Err` carries the message of the refusal, in the words AWS gives each: the set names a
+/// key Lambda reserves for the runtime, or it is larger than the documented quota. Both
+/// state what Lambda could not do and then the part of the REQUEST that stopped it — the
+/// reserved keys the request used, and the whole set as it was measured — so a caller can
+/// see which of its own variables to change. Every operation that accepts an `Environment`
+/// applies the same two rules, so the check lives here rather than once per operation.
 pub fn environment_variables(
     environment: Option<&Environment>,
 ) -> Result<BTreeMap<String, String>, String> {
@@ -4156,6 +4207,16 @@ pub fn environment_variables(
         .and_then(|environment| environment.variables.clone())
         .map(|variables| variables.into_iter().collect())
         .unwrap_or_default();
+    // The reserved keys are checked FIRST: a request naming one is refused for the key
+    // whatever the set's size, because the key is what the caller has to drop.
+    let reserved: Vec<&str> = RESERVED_ENVIRONMENT_KEYS
+        .iter()
+        .copied()
+        .filter(|key| variables.contains_key(*key))
+        .collect();
+    if !reserved.is_empty() {
+        return Err(reserved_environment_keys_message(&reserved));
+    }
     let measured = measured_environment(&variables);
     if measured.len() > MAX_ENVIRONMENT_BYTES {
         return Err(environment_too_large_message(&measured));
@@ -4172,6 +4233,10 @@ pub struct FunctionReference {
     pub qualifier: Option<String>,
     /// Whether the reference was given as a full or partial ARN rather than a name.
     pub was_arn: bool,
+    /// The REGION the reference named, when it was a full ARN — the only documented form
+    /// that carries one. A bare name, the `function:` prefix form and the partial ARN name
+    /// no region, so a request that uses one addresses the endpoint's own.
+    pub region: Option<String>,
 }
 
 /// Split a `FunctionName` into its name and its qualifier.
@@ -4197,8 +4262,9 @@ pub fn parse_function_reference(value: &str) -> Option<FunctionReference> {
     // code-signing config) is not read as a function named after its resource type.
     if value.starts_with("arn:") {
         let arn = service_common::arn::parse_of(value, ARN_NAMESPACE)?;
+        let region = arn.region.to_string();
         let after_type = arn.resource.strip_prefix(FUNCTION_RESOURCE_TYPE_PREFIX)?;
-        return name_and_qualifier(after_type, true);
+        return name_and_qualifier(after_type, true, Some(region));
     }
 
     // Partial ARN: <account>:function:<name>[:<qualifier>]. The `function` literal is
@@ -4208,7 +4274,7 @@ pub fn parse_function_reference(value: &str) -> Option<FunctionReference> {
     if let Some((account, after_account)) = value.split_once(':') {
         if account.len() == 12 && account.bytes().all(|byte| byte.is_ascii_digit()) {
             if let Some(after_type) = after_account.strip_prefix(FUNCTION_RESOURCE_TYPE_PREFIX) {
-                return name_and_qualifier(after_type, true);
+                return name_and_qualifier(after_type, true, None);
             }
         }
     }
@@ -4217,8 +4283,8 @@ pub fn parse_function_reference(value: &str) -> Option<FunctionReference> {
     // It is not an ARN, so it does not lift the documented 64-character limit on a name
     // given without one.
     match value.strip_prefix(FUNCTION_RESOURCE_TYPE_PREFIX) {
-        Some(after_type) => name_and_qualifier(after_type, false),
-        None => name_and_qualifier(value, false),
+        Some(after_type) => name_and_qualifier(after_type, false, None),
+        None => name_and_qualifier(value, false, None),
     }
 }
 
@@ -4229,7 +4295,11 @@ const FUNCTION_RESOURCE_TYPE_PREFIX: &str = "function:";
 ///
 /// `None` for a value that names no function: an empty name, an empty qualifier, or a
 /// third `:`-separated field, none of which any documented form writes.
-fn name_and_qualifier(value: &str, was_arn: bool) -> Option<FunctionReference> {
+fn name_and_qualifier(
+    value: &str,
+    was_arn: bool,
+    region: Option<String>,
+) -> Option<FunctionReference> {
     let (name, qualifier) = match value.split_once(':') {
         None => (value, None),
         Some((name, qualifier)) if !qualifier.is_empty() && !qualifier.contains(':') => {
@@ -4241,6 +4311,7 @@ fn name_and_qualifier(value: &str, was_arn: bool) -> Option<FunctionReference> {
         name: name.to_string(),
         qualifier: qualifier.map(str::to_string),
         was_arn,
+        region,
     })
 }
 
@@ -4589,8 +4660,11 @@ pub fn resolve_durable_execution<'a>(
 /// the resource they address is the same one: a refusal naming no single resolved ARN is
 /// what a client comparing it against the ARN it invoked cannot match.
 ///
-/// `None` is a `FunctionName` that names no function at all, which the resolution refuses as
-/// malformed instead.
+/// `None` is a `FunctionName` this operation resolves NO version for, so there is no
+/// resolved ARN to name and the refusal is the resolution's own: a value that names no
+/// function at all (which the resolution refuses as malformed), and an ARN of another
+/// Region, which is refused on the Region before any version is resolved
+/// ([`foreign_region_function_message`]).
 #[must_use]
 pub fn addressed_function_arn(
     region: &str,
@@ -4598,7 +4672,7 @@ pub fn addressed_function_arn(
     qualifier: Option<&str>,
 ) -> Option<String> {
     let reference = parse_function_reference(function_name)?;
-    Some(addressed_arn_of(region, &reference, qualifier))
+    addressed_arn_of(region, &reference, qualifier)
 }
 
 /// [`addressed_function_arn`] for a caller that has ALREADY parsed the reference, so no
@@ -4609,14 +4683,58 @@ pub fn addressed_arn_of(
     region: &str,
     reference: &FunctionReference,
     qualifier: Option<&str>,
-) -> String {
+) -> Option<String> {
+    if reference
+        .region
+        .as_deref()
+        .is_some_and(|named| named != region)
+    {
+        return None;
+    }
     let addressed = reference
         .qualifier
         .as_deref()
         .or(qualifier)
         .unwrap_or(VERSION_LATEST);
-    format!("{}:{addressed}", function_arn(region, &reference.name))
+    Some(format!(
+        "{}:{addressed}",
+        function_arn(region, &reference.name)
+    ))
 }
+
+/// The refusal a `FunctionName` that names a function of ANOTHER Region gets, or `None` when
+/// the reference names this endpoint's own Region or names no Region at all.
+///
+/// A Lambda function is a REGIONAL resource: it lives in the Region it was created in and is
+/// reachable only through that Region's endpoint. The full-ARN form is the only documented
+/// `FunctionName` that carries a Region, so it is the only one this can refuse; a bare name,
+/// the `function:` prefix form and the partial ARN address the endpoint's own Region. The
+/// refusal is the one a name no function is held under gets, naming the function the request
+/// addressed IN THE REGION IT NAMED, because that is what is true of it here: this endpoint
+/// holds no such function.
+///
+/// [`resolve_function`] applies this to every operation that resolves a `FunctionName`
+/// through it; an operation that keys the store by name itself applies it where it parses
+/// the reference.
+#[must_use]
+pub fn foreign_region_function_message(
+    reference: &FunctionReference,
+    region: &str,
+) -> Option<String> {
+    reference
+        .region
+        .as_deref()
+        .filter(|named| *named != region)
+        .map(|named| format!("Function not found: {}", function_arn(named, &reference.name)))
+}
+
+/// The refusal a request whose `FunctionName` qualifies one version and whose `Qualifier`
+/// names another gets.
+///
+/// Fixed text: both halves came from the caller, so the sentence states only that the
+/// qualifier DERIVED from the name is not the one the request specified.
+pub const DERIVED_QUALIFIER_MISMATCH_MESSAGE: &str =
+    "The derived qualifier from the function name does not match the specified qualifier.";
 
 /// Why a `FunctionName`/`Qualifier` pair names no record.
 #[derive(Debug, Clone)]
@@ -4634,14 +4752,6 @@ pub enum ResolveFailure {
 ///
 /// The record is brought up to whatever the clock already made due before it is
 /// handed back, so every caller reports the same lifecycle state at the same instant.
-/// The refusal a request whose `FunctionName` qualifies one version and whose `Qualifier`
-/// names another gets.
-///
-/// Fixed text: both halves came from the caller, so the sentence states only that the
-/// qualifier DERIVED from the name is not the one the request specified.
-pub const DERIVED_QUALIFIER_MISMATCH_MESSAGE: &str =
-    "The derived qualifier from the function name does not match the specified qualifier.";
-
 pub fn resolve_function<'a>(
     store: &'a mut ComAmazonawsLambdaAwsgirapiserviceState,
     function_name: &str,
@@ -4658,7 +4768,9 @@ pub fn resolve_function<'a>(
     })?;
 
     // Both the name's own qualifier and the `Qualifier` parameter name a version, so a
-    // request carrying two different ones names no single resource.
+    // request carrying two different ones names no single resource. The refusal states the
+    // requirement and nothing of the request: the two values are the caller's own, and the
+    // sentence says which of them disagree.
     let version = match (reference.qualifier.as_deref(), qualifier) {
         (Some(from_name), Some(from_query)) if from_name != from_query => {
             // The sentence is AWS's fixed text for this condition and carries NOTHING of
@@ -4672,6 +4784,16 @@ pub fn resolve_function<'a>(
         (None, Some(from_query)) => from_query.to_string(),
         (None, None) => VERSION_LATEST.to_string(),
     };
+
+    // A Lambda function is a REGIONAL resource: it lives in the Region it was created in
+    // and is reachable only through that Region's endpoint. So a reference that NAMES a
+    // Region — the full-ARN form is the only documented one that does — names a function of
+    // this endpoint only when the two Regions are the same one, and names nothing here
+    // otherwise, exactly as a name no function of this Region is held under does
+    // ([`foreign_region_function_message`]).
+    if let Some(message) = foreign_region_function_message(&reference, region) {
+        return Err(ResolveFailure::NotFound(message));
+    }
 
     let Some(record) = store.functions.get_mut(&reference.name) else {
         return Err(ResolveFailure::NotFound(format!(

@@ -311,9 +311,12 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
         )
         .map_err(|failure| match failure {
             crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
-            crate::state::ResolveFailure::NotFound(_) => {
-                not_found(format!("Function not found: {addressed_arn}"))
-            }
+            crate::state::ResolveFailure::NotFound(message) => match &addressed_arn {
+                Some(arn) => not_found(format!("Function not found: {arn}")),
+                // No version was resolved for this name — an ARN of another Region is
+                // refused on the Region — so the refusal is the resolution's own.
+                None => not_found(message),
+            },
         })?;
 
         // "During this time, you can't invoke or modify the function" (`CreateFunction`),

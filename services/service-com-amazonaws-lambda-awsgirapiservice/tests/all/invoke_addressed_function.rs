@@ -10,19 +10,22 @@
 //! nothing names the ARN the invocation RESOLVED, qualifier included:
 //! `Function not found: arn:aws:lambda:<region>:<account>:function:<name>:<qualifier>`.** The
 //! fixed text is `Function not found: `; the variable part is built from the request — the
-//! function the name addresses and the qualifier it resolved, whether the qualifier was
-//! named in the name, in the `Qualifier` parameter, or by neither.
+//! function the name addresses, the Region the name named when it carried one, and the
+//! qualifier it resolved, whether that qualifier was named in the name, in the `Qualifier`
+//! parameter, or by neither.
 //!
 //! The rows differ along what the rule generalises over: the documented `FunctionName` form
 //! the request addresses the function by (the bare name, the full ARN, the partial ARN, the
 //! `function:` prefix form, a name carrying its own qualifier), where the qualifier is named
 //! (the name, the `Qualifier` parameter, nowhere), which qualifier it is (the unpublished
 //! version, a published version number, an alias name), what is missing (the function
-//! itself, a version of a function that does exist), and the `InvocationType` the request
-//! carries — the resolution happens before any of the three is acted on, so each row is
-//! driven through all of them. Two controls keep the table honest: a request that resolves
-//! is NOT refused, and the refusal for a function that exists under a version that does not
-//! carries that version rather than `$LATEST`.
+//! itself, a version of a function that does exist, a Region this endpoint does not serve),
+//! and the `InvocationType` the request carries — the resolution happens before any of the
+//! three is acted on, so each row is driven through all of them. Two controls keep the table
+//! honest: a request that resolves is NOT refused, and the refusal for a function that
+//! exists under a version that does not carries that version rather than `$LATEST`. A Region
+//! this endpoint does not serve is settled BEFORE a version is, so its refusal names the
+//! function and no version at all.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,6 +47,10 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 
 /// The region the scope above names.
 const REGION: &str = "us-east-1";
+
+/// Another Region, to address this endpoint's own function through: a function is regional,
+/// so an ARN naming this Region's function from another Region names nothing here.
+const OTHER_REGION: &str = "us-west-2";
 
 /// The account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT: &str = "000000000000";
@@ -217,8 +224,13 @@ struct NotFoundRow {
     reference: fn(&str) -> String,
     /// The `Qualifier` query parameter the request carries, if any.
     qualifier: Option<&'static str>,
-    /// The qualifier the invocation resolves, which the refused ARN must carry.
-    resolved_qualifier: &'static str,
+    /// The qualifier the invocation resolves, which the refused ARN must carry — absent
+    /// for a name no version is resolved for at all, which is an ARN of another Region:
+    /// that is refused on the Region, before a version is resolved.
+    resolved_qualifier: Option<&'static str>,
+    /// The Region the refused ARN must name: the one the reference itself named when it
+    /// carried one, else this endpoint's.
+    addressed_region: &'static str,
     /// The function the refused ARN must name — the one the request addressed, which for the
     /// version rows is the function that exists.
     function: &'static str,
@@ -238,63 +250,94 @@ fn not_found_rows() -> Vec<NotFoundRow> {
             case: "a function that does not exist, addressed by the bare name",
             reference: |_| ABSENT.to_string(),
             qualifier: None,
-            resolved_qualifier: LATEST,
+            resolved_qualifier: Some(LATEST),
+            addressed_region: REGION,
             function: ABSENT,
         },
         NotFoundRow {
             case: "a function arn that names no function",
             reference: |_| format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:{ABSENT}"),
             qualifier: None,
-            resolved_qualifier: LATEST,
+            resolved_qualifier: Some(LATEST),
+            addressed_region: REGION,
             function: ABSENT,
         },
         NotFoundRow {
             case: "a partial arn that names no function",
             reference: |_| format!("{ACCOUNT}:function:{ABSENT}"),
             qualifier: None,
-            resolved_qualifier: LATEST,
+            resolved_qualifier: Some(LATEST),
+            addressed_region: REGION,
             function: ABSENT,
         },
         NotFoundRow {
             case: "the function: prefix form naming no function",
             reference: |_| format!("function:{ABSENT}"),
             qualifier: None,
-            resolved_qualifier: LATEST,
+            resolved_qualifier: Some(LATEST),
+            addressed_region: REGION,
             function: ABSENT,
         },
         NotFoundRow {
             case: "a missing function with the qualifier named in the Qualifier parameter",
             reference: |_| ABSENT.to_string(),
             qualifier: Some("7"),
-            resolved_qualifier: "7",
+            resolved_qualifier: Some("7"),
+            addressed_region: REGION,
             function: ABSENT,
         },
         NotFoundRow {
             case: "a missing function with the qualifier named in the name",
             reference: |_| format!("{ABSENT}:live"),
             qualifier: None,
-            resolved_qualifier: "live",
+            resolved_qualifier: Some("live"),
+            addressed_region: REGION,
             function: ABSENT,
         },
         NotFoundRow {
             case: "a version a function that exists has not published",
             reference: |held| held.to_string(),
             qualifier: Some("9"),
-            resolved_qualifier: "9",
+            resolved_qualifier: Some("9"),
+            addressed_region: REGION,
             function: HELD,
         },
         NotFoundRow {
             case: "an alias a function that exists does not hold",
             reference: |held| held.to_string(),
             qualifier: Some("absent-alias"),
-            resolved_qualifier: "absent-alias",
+            resolved_qualifier: Some("absent-alias"),
+            addressed_region: REGION,
             function: HELD,
         },
         NotFoundRow {
             case: "a version named in the function name that does not exist",
             reference: |held| format!("{held}:9"),
             qualifier: None,
-            resolved_qualifier: "9",
+            resolved_qualifier: Some("9"),
+            addressed_region: REGION,
+            function: HELD,
+        },
+        // A function this endpoint DOES hold, addressed through another Region's ARN: the
+        // function is regional, so this endpoint holds no such function. The Region is
+        // settled before a version is, so the refusal names the function the caller
+        // addressed and no version.
+        NotFoundRow {
+            case: "a held function addressed through another Region",
+            reference: |held| format!("arn:aws:lambda:{OTHER_REGION}:{ACCOUNT}:function:{held}"),
+            qualifier: None,
+            resolved_qualifier: None,
+            addressed_region: OTHER_REGION,
+            function: HELD,
+        },
+        NotFoundRow {
+            case: "a held function addressed through another Region at a version",
+            reference: |held| {
+                format!("arn:aws:lambda:{OTHER_REGION}:{ACCOUNT}:function:{held}:1")
+            },
+            qualifier: None,
+            resolved_qualifier: None,
+            addressed_region: OTHER_REGION,
             function: HELD,
         },
     ]
@@ -311,9 +354,12 @@ async fn the_invoke_refusal_names_the_qualified_arn_the_invocation_resolved() {
     for row in not_found_rows() {
         let case = row.case;
         let reference = (row.reference)(HELD);
+        let qualified = row
+            .resolved_qualifier
+            .map_or_else(String::new, |qualifier| format!(":{qualifier}"));
         let expected = format!(
-            "Function not found: arn:aws:lambda:{REGION}:{ACCOUNT}:function:{}:{}",
-            row.function, row.resolved_qualifier
+            "Function not found: arn:aws:lambda:{}:{ACCOUNT}:function:{}{qualified}",
+            row.addressed_region, row.function
         );
         // The resolution happens before the invocation type is acted on, so every type is
         // refused the same way — including the asynchronous one, which never queues an

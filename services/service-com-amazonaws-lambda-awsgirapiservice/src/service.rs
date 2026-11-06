@@ -121,6 +121,10 @@ pub mod public_access;
 /// one that passes it; see the module's own header.
 mod request_quota;
 
+/// The header every answer of this service names the request it answered in, which is where
+/// an SDK reads its response metadata's `RequestId` from; see the module's own header.
+pub mod request_id_header;
+
 /// WHERE a constraint broken by a COLLECTION's elements is stated, and what that clause says
 /// an element has to satisfy; see the module's own header.
 mod validation;
@@ -545,7 +549,11 @@ where
             // An INVOCATION's response body is the document the function produced, which
             // is announced as the JSON it is (see [`invoke_media_type`]).
             let answered = invoke_media_type::announced(O::NAME, answered);
-            fault_class::with_fault_class(O::NAME, answered)
+            // And every answer names the request it answered, which is where an SDK reads
+            // the `RequestId` of its response metadata from (see [`request_id_header`]).
+            request_id_header::with_request_id_header(fault_class::with_fault_class(
+                O::NAME, answered,
+            ))
         })
     }
 
@@ -833,8 +841,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
         // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        //
+        // The envelope stays the framework's; what is added is the one header every answer
+        // of this service names the request it answered in (see [`request_id_header`]), so a
+        // client correlating on it has an id for a refused route as much as for a served
+        // call.
+        Some(request_id_header::with_request_id_header(
+            self.entry.routing_error_response(req),
+        ))
     }
 
     fn override_framework_error(

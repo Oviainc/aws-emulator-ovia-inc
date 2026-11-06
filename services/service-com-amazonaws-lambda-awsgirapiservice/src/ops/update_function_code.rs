@@ -355,6 +355,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
+
+        // A Lambda function is a REGIONAL resource, so a `FunctionName` given as an ARN of
+        // another Region names no function at this endpoint and is refused exactly as a
+        // name no function is held under is
+        // (`crate::state::foreign_region_function_message`). This operation keys the store
+        // by the reference's name itself, so it applies the rule here.
+        if let Some(message) =
+            crate::state::foreign_region_function_message(&reference, &region)
+        {
+            return Err(UpdateFunctionCodeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    r#type: None,
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let mut store = state.lock();
 
         // The storage this account already uses, measured BEFORE this call changes it

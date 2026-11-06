@@ -545,6 +545,11 @@ async fn an_invocation_that_resolves_to_nothing_names_the_qualified_resource() {
             format!("arn:aws:lambda:us-east-1:{ACCOUNT}:function:absent-function:$LATEST"),
         ),
         (
+            "a function of another Region",
+            "arn:aws:lambda:us-west-2:000000000000:function:probe-missing",
+            format!("arn:aws:lambda:us-west-2:{ACCOUNT}:function:probe-missing"),
+        ),
+        (
             "a version that does not exist",
             "probe-missing:7",
             format!("arn:aws:lambda:us-east-1:{ACCOUNT}:function:probe-missing:7"),

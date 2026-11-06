@@ -398,6 +398,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
 
+        // A Lambda function is a REGIONAL resource, so a `FunctionName` given as an ARN of
+        // another Region names no function at this endpoint and is refused exactly as a
+        // name no function is held under is
+        // (`crate::state::foreign_region_function_message`). This operation keys the store
+        // by the reference's name itself, so it applies the rule here.
+        if let Some(message) =
+            crate::state::foreign_region_function_message(&reference, &region)
+        {
+            return Err(UpdateFunctionConfigurationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    r#type: None,
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // A request that REPLACES the function's execution role resolves the new role
         // exactly as creation resolves the first one: the function would run as it. The
         // function has to exist for its configuration to be updated at all, so that is
