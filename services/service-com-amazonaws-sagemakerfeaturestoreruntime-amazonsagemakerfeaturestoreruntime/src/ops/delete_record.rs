@@ -198,7 +198,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteRecordErrorModeled::InternalFailure(InternalFailure {
                 message: Some(
@@ -233,8 +232,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // feature group is a request defect, refused with the modelled `ValidationError`
         // — the delete marker this operation's doc appends to the OfflineStore belongs to
         // a feature group that EXISTS, so an unresolvable name writes nothing anywhere.
-        let definition = match crate::state::resolve_group(&*self.engine, &input.feature_group_name)
-        {
+        let definition = match crate::state::resolve_group(
+            &*self.engine,
+            &crate::state::request_region(ctx),
+            &input.feature_group_name,
+        ) {
             Ok(definition) => definition,
             Err(crate::state::Unresolved::Refused(message)) => return Err(validation(message)),
             Err(crate::state::Unresolved::NoDirectory) => {

@@ -16,7 +16,10 @@
 //! `ConflictException` (409) leaving the record untouched, while an omitted `EventTime`
 //! keeps the stored one. A `TtlDuration` replaces the record's TTL duration, from which
 //! `ExpiresAt = EventTime + TtlDuration` is re-derived; an omitted one leaves the
-//! record's TTL setting as it stands.
+//! record's TTL setting as it stands. Because that expiry is derived from the event time,
+//! an update made under a TTL — the request's own `TtlDuration`, or the default one the
+//! feature group's `OnlineStoreConfig` configures — must carry an `EventTime`, and one
+//! that does not is refused with `ValidationError` (400).
 //!
 //! This is the one operation that GROWS a stored record — a posted feature the record
 //! does not carry yet is appended, where `PutRecord` replaces a record's feature values
@@ -217,7 +220,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateRecordErrorModeled::InternalFailure(InternalFailure {
                 message: Some(
@@ -239,8 +241,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // feature group is a request defect (400 `ValidationError`), never a missing
         // record (404 `ResourceNotFound`). It also supplies the two feature names the
         // group's definition fixes, which the runtime API never carries.
-        let definition = match crate::state::resolve_group(&*self.engine, &input.feature_group_name)
-        {
+        let definition = match crate::state::resolve_group(
+            &*self.engine,
+            &crate::state::request_region(ctx),
+            &input.feature_group_name,
+        ) {
             Ok(definition) => definition,
             Err(crate::state::Unresolved::Refused(message)) => return Err(validation(message)),
             Err(crate::state::Unresolved::NoDirectory) => {
@@ -299,13 +304,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "If you specify a TtlDuration, you must also provide an EventTime in the
         // request. Otherwise, the operation returns a ValidationError." (`ExpiresAt` is
-        // `EventTime + TtlDuration`, so a TTL with no event time states no instant.)
-        if input.ttl_duration.is_some() && posted_event_time.is_none() {
-            return Err(validation(format!(
-                "Validation Error: TtlDuration requires an EventTime in the same request; \
-                 include the feature group's EventTime feature '{event_time_feature_name}' in \
-                 Features."
-            )));
+        // `EventTime + TtlDuration`, so a TTL with no event time states no instant.) The
+        // same holds for the TTL the feature group's own `OnlineStoreConfig` configures by
+        // default: an update of a record under a default TTL re-derives that record's
+        // expiry from its event time, so this request has to state one.
+        let ttl_in_force =
+            input.ttl_duration.is_some() || definition.default_ttl_seconds.is_some();
+        if ttl_in_force && posted_event_time.is_none() {
+            return Err(validation(EVENT_TIME_REQUIRED_FOR_TTL));
         }
         let ttl_secs = match input.ttl_duration.as_ref() {
             None => None,
@@ -380,10 +386,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // soft-deleted. A feature group that resolves but has taken no record yet holds
         // no online store here, which is the same "no such record" answer.
         let Some(group) = store.group_mut(&input.feature_group_name) else {
-            return Err(no_such_record(&identifier, &key));
+            return Err(no_such_record(&identifier));
         };
         let Some(existing) = group.live_record(&identifier) else {
-            return Err(no_such_record(&identifier, &key));
+            return Err(no_such_record(&identifier));
         };
         // The merge runs on a CLONE of the stored record, so a refusal below leaves the
         // store untouched.
@@ -479,14 +485,23 @@ const MAX_FEATURES_PER_UPDATE: usize = 100;
 
 /// How this operation states an `EventTime` older than the record's current one.
 ///
-/// The modelled `ConflictException`'s own doc, which is the rule: "The service rejected
-/// the update because the provided EventTime is older than the record's current
-/// EventTime. To persist the update, retrieve the record's latest EventTime and resubmit
-/// the request with an EventTime that is equal to or newer than the current value."
+/// A refusal message is the SERVICE's wording, not the model's: the modelled
+/// `ConflictException`'s documentation paragraph states the rule for a reader of the API
+/// reference, while the message this operation sends states the verdict and the fact a
+/// retry path keys on — that the record was not modified. It names no identifier,
+/// timestamp or feature group, because the verdict is on the ordering alone.
 const CONFLICTING_EVENT_TIME: &str =
-    "The service rejected the update because the provided EventTime is older than the record's \
-     current EventTime. To persist the update, retrieve the record's latest EventTime and \
-     resubmit the request with an EventTime that is equal to or newer than the current value.";
+    "Update rejected: the provided EventTime is older than the record's current EventTime. The \
+     record was not modified.";
+
+/// How this operation states a `TtlDuration` — the request's own, or the feature group's
+/// default — with no `EventTime` to derive an expiry from.
+///
+/// Fixed text: the rule names the two members it is about and the feature a request
+/// carries an event time in, and nothing of this request or this feature group.
+const EVENT_TIME_REQUIRED_FOR_TTL: &str =
+    "Validation Error: EventTime is required when TtlDuration is specified or when the feature \
+     group has a default TTL configured. Include the EventTime feature in the Features list.";
 
 /// The modelled `ValidationError` (HTTP 400) for a request this operation refuses.
 fn validation(message: impl Into<String>) -> UpdateRecordError {
@@ -499,11 +514,16 @@ fn validation(message: impl Into<String>) -> UpdateRecordError {
 /// The modelled `ResourceNotFound` (HTTP 404) for a record this operation cannot update
 /// because the feature group holds no live one under that identifier — never written, or
 /// soft-deleted.
-fn no_such_record(identifier: &str, group: &str) -> UpdateRecordError {
+///
+/// The absence is the RECORD's, so the message names the record — by the
+/// `RecordIdentifierValueAsString` the request carried, the only thing that identifies it
+/// — and is prefixed as a missing record rather than as a missing resource of the feature
+/// group's own class (`crate::state::no_such_feature_group`, a 400 `ValidationError`):
+/// the two absences are routed differently by a caller, so they are stated differently.
+fn no_such_record(identifier: &str) -> UpdateRecordError {
     UpdateRecordErrorModeled::ResourceNotFound(ResourceNotFound {
         message: Some(format!(
-            "Resource Not Found: Record with RecordIdentifierValueAsString {identifier} was not \
-             found in FeatureGroup {group}."
+            "Record Not Found: Record not found with record identifier [{identifier}]."
         )),
     })
     .into()

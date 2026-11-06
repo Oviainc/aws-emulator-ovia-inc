@@ -67,6 +67,7 @@ impl Emulator {
                 record_identifier_feature_name: record_identifier_feature_name.to_owned(),
                 event_time_feature_name: event_time_feature_name.to_owned(),
                 online_store_enabled,
+                default_ttl_seconds: None,
             });
     }
 

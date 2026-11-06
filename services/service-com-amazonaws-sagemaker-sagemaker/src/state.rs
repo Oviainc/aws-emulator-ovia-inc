@@ -2796,6 +2796,25 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsSagemakerSagemakerState>)
 }
 
+/// The default time-to-live `config` states for the records of a feature group's
+/// OnlineStore, in seconds, and `None` for a configuration that states none (or one whose
+/// `TtlDuration` names no unit, no value, or a unit the model's `TtlDurationUnit` enum
+/// does not declare).
+///
+/// Read through the ONE conversion of a Feature Store `TtlDuration`
+/// ([`::service_common::feature_store_groups::ttl_duration_seconds`]), so the duration
+/// this service records for a group and the one the FeatureStore Runtime data plane reads
+/// off a request cannot be converted two ways.
+pub fn online_store_default_ttl_seconds(
+    config: &crate::ops::types::OnlineStoreConfig,
+) -> Option<f64> {
+    let ttl = config.ttl_duration.as_ref()?;
+    ::service_common::feature_store_groups::ttl_duration_seconds(
+        ttl.unit.as_deref()?,
+        ttl.value?,
+    )
+}
+
 /// The SHARED feature-group directory in the shared engine: call it with a handler's
 /// `&*self.engine`.
 ///

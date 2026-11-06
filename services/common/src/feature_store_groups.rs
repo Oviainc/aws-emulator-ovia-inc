@@ -61,6 +61,34 @@ pub struct FeatureGroupRecord {
     /// The runtime data plane serves the OnlineStore, so a group without one holds no
     /// record it can read or write.
     pub online_store_enabled: bool,
+    /// The DEFAULT time-to-live the group's `OnlineStoreConfig.TtlDuration` states, in
+    /// seconds ([`ttl_duration_seconds`]), and `None` for a group configured with none.
+    ///
+    /// "Amazon SageMaker Feature Store deletes the record when EventTime + TtlDuration
+    /// elapses" (`TtlDuration`), so a default TTL makes every record of the group carry an
+    /// expiry derived from its own event time — which is why the data plane cannot update
+    /// such a record without being told an `EventTime`.
+    pub default_ttl_seconds: Option<f64>,
+}
+
+/// `value` of the `TtlDurationUnit` `unit`, in seconds, or `None` when `unit` is not one
+/// of the units the `TtlDurationUnit` enum declares.
+///
+/// The ONE reading of a `TtlDuration` the Feature Store API carries, so the control plane
+/// that records a group's default duration and the data plane that applies a request's own
+/// cannot read the same unit two ways. The units are the enum's own values: Seconds,
+/// Minutes, Hours, Days, Weeks.
+#[must_use]
+pub fn ttl_duration_seconds(unit: &str, value: i32) -> Option<f64> {
+    let unit_secs = match unit {
+        "Seconds" => 1.0,
+        "Minutes" => 60.0,
+        "Hours" => 3_600.0,
+        "Days" => 86_400.0,
+        "Weeks" => 604_800.0,
+        _ => return None,
+    };
+    Some(f64::from(value) * unit_secs)
 }
 
 /// The directory itself: feature group name -> its definition.
@@ -155,6 +183,31 @@ mod tests {
             record_identifier_feature_name: "record_id".to_owned(),
             event_time_feature_name: "event_time".to_owned(),
             online_store_enabled: true,
+            default_ttl_seconds: None,
+        }
+    }
+
+    /// Every unit the `TtlDurationUnit` enum declares converts to its own span in seconds,
+    /// and a value outside that set converts to nothing at all.
+    #[test]
+    fn a_ttl_duration_converts_by_the_unit_the_model_declares() {
+        // (case, unit, value, expected seconds)
+        let rows: [(&str, &str, i32, Option<f64>); 8] = [
+            ("seconds", "Seconds", 30, Some(30.0)),
+            ("minutes", "Minutes", 2, Some(120.0)),
+            ("hours", "Hours", 1, Some(3_600.0)),
+            ("days", "Days", 3, Some(259_200.0)),
+            ("weeks", "Weeks", 1, Some(604_800.0)),
+            ("a zero value", "Hours", 0, Some(0.0)),
+            ("a unit the enum does not declare", "Fortnights", 1, None),
+            ("a unit in the wrong case", "hours", 1, None),
+        ];
+        for (case, unit, value, expected) in rows {
+            let actual = ttl_duration_seconds(unit, value);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?} seconds, got {actual:?}"
+            );
         }
     }
 

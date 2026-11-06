@@ -273,6 +273,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .and_then(|config| config.enable_online_store)
                 .unwrap_or(false),
+            // "Amazon SageMaker Feature Store deletes the record when EventTime +
+            // TtlDuration elapses" (`OnlineStoreConfig$TtlDuration`): the group's default
+            // duration governs the records the DATA PLANE writes, so it is recorded with
+            // the rest of the definition that plane cannot see.
+            default_ttl_seconds: input
+                .online_store_config
+                .as_ref()
+                .and_then(crate::state::online_store_default_ttl_seconds),
         };
         store.feature_groups.insert(
             input.feature_group_name.clone(),

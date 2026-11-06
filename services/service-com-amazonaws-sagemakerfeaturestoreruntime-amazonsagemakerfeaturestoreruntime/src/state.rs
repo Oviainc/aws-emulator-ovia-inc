@@ -558,16 +558,11 @@ pub fn iso8601(secs: f64) -> Result<String, aws_smithy_types::date_time::DateTim
 ///
 /// The units are exactly the model's `TtlDurationUnit` values (see
 /// `TTL_DURATION_UNIT_VALUES` in `ops::types`): Seconds, Minutes, Hours, Days, Weeks.
+/// Delegated to the ONE conversion of a Feature Store `TtlDuration`, which the SageMaker
+/// control plane reads a feature group's DEFAULT duration through, so a request's own
+/// duration and a group's default cannot be converted two ways.
 pub fn ttl_seconds(ttl: &crate::ops::types::TtlDuration) -> Option<f64> {
-    let unit_secs = match ttl.unit.as_str() {
-        "Seconds" => 1.0,
-        "Minutes" => 60.0,
-        "Hours" => 3600.0,
-        "Days" => 86_400.0,
-        "Weeks" => 604_800.0,
-        _ => return None,
-    };
-    Some(f64::from(ttl.value) * unit_secs)
+    ::service_common::feature_store_groups::ttl_duration_seconds(&ttl.unit, ttl.value)
 }
 
 /// The first value of an enum-typed member the model's value list does not declare.
@@ -687,9 +682,9 @@ pub fn feature_group_directory<Eng: Send + Sync + 'static>(
 pub enum Unresolved {
     /// No feature group of that name exists, so the REQUEST is at fault — the name
     /// denotes no feature group at all — and every operation answers it with its modelled
-    /// `ValidationError` (HTTP 400), carrying this message. It is never
-    /// `ResourceNotFound`, which is reserved for a RECORD that is absent from a feature
-    /// group that does resolve.
+    /// `ValidationError` (HTTP 400), carrying this message ([`no_such_feature_group`]). It
+    /// is never `ResourceNotFound`, which is reserved for a RECORD that is absent from a
+    /// feature group that does resolve.
     Refused(String),
     /// This service is mounted on an engine that holds no state, so nothing can be
     /// resolved at all: a server fault, answered with the modelled `InternalFailure`.
@@ -713,6 +708,7 @@ pub enum Unresolved {
 /// OfflineStore does.
 pub fn resolve_group<Eng: Send + Sync + 'static>(
     engine: &Eng,
+    region: &str,
     name_or_arn: &str,
 ) -> Result<::service_common::feature_store_groups::FeatureGroupRecord, Unresolved> {
     let Some(directory) = feature_group_directory(engine) else {
@@ -721,11 +717,25 @@ pub fn resolve_group<Eng: Send + Sync + 'static>(
     let held = directory.lock().get(name_or_arn).cloned();
     match held {
         Some(group) => Ok(group),
-        None => Err(Unresolved::Refused(format!(
-            "Validation Error: FeatureGroup with name {} does not exist.",
-            group_key(name_or_arn)
+        None => Err(Unresolved::Refused(no_such_feature_group(
+            &feature_group_arn(region, name_or_arn),
         ))),
     }
+}
+
+/// How this data plane states a `FeatureGroupName` that denotes no feature group: the
+/// group is named by `arn`, the fully qualified ARN the request's name resolves to
+/// ([`feature_group_arn`]), so the refusal says which account and Region the lookup
+/// looked in.
+///
+/// Stated ONCE, for every operation of this service: the single-record calls carry it in
+/// the modelled `ValidationError` (HTTP 400) and the batch calls in the per-element
+/// `ErrorMessage` beside [`VALIDATION_ERROR_CODE`], so no two of them can word one
+/// absence differently. The prefix is the feature group's own — a RECORD that is absent
+/// from a group that resolves is a different class, stated by the operation that looks a
+/// record up.
+pub fn no_such_feature_group(arn: &str) -> String {
+    format!("Resource Not Found: Amazon SageMaker can't find a FeatureGroup with name [{arn}].")
 }
 
 /// How a READ of a feature group with no `OnlineStore` is refused: there is no online

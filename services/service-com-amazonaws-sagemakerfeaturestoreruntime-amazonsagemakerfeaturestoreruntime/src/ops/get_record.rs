@@ -163,7 +163,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetRecordErrorModeled::InternalFailure(InternalFailure {
                 message: Some("GetRecord: this service holds no state on the mounted engine".into()),
@@ -187,8 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record (404 `ResourceNotFound`), which is what a client swallows as a cache
         // miss. A group that resolves but has no `OnlineStore` holds nothing this READ
         // could serve, so it is refused the same way.
-        let definition = match crate::state::resolve_group(&*self.engine, &input.feature_group_name)
-        {
+        let definition = match crate::state::resolve_group(
+            &*self.engine,
+            &crate::state::request_region(ctx),
+            &input.feature_group_name,
+        ) {
             Ok(definition) => definition,
             Err(unresolved) => {
                 return Err(match unresolved {

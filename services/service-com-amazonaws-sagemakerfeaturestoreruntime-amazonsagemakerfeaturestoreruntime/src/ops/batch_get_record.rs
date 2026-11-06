@@ -151,7 +151,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(BatchGetRecordErrorModeled::InternalFailure(InternalFailure {
                 message: Some(
@@ -176,6 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut records: Vec<BatchGetRecordResultDetail> = Vec::new();
         let mut errors: Vec<BatchGetRecordError2> = Vec::new();
+        // A feature group an identifier names is reported by its ARN, which carries the
+        // region the request was signed for.
+        let region = crate::state::request_region(ctx);
 
         let mut store = state.lock();
         // The fan-out is bounded by the request: `Identifiers` is modelled
@@ -197,6 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // holds nothing this read could serve, and is reported the same way.
             let refusal = match crate::state::resolve_group(
                 &*self.engine,
+                &region,
                 &wanted.feature_group_name,
             ) {
                 Ok(definition) => (!definition.online_store_enabled)

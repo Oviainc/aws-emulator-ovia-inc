@@ -237,11 +237,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instant moves even when the request restated a value the group already carried.
         group.last_modified_time = now;
         let arn = group.arn.clone();
+        // The group's DEFAULT TtlDuration is one of the things the shared directory
+        // records for the FeatureStore Runtime data plane, and this operation is what
+        // changes it ("To remove the default TtlDuration from an existing feature group,
+        // use the UpdateFeatureGroup API"), so the new duration is read out while the
+        // group is still borrowed and written to the directory below.
+        let default_ttl_seconds = group
+            .online_store_config
+            .as_ref()
+            .and_then(crate::state::online_store_default_ttl_seconds);
         drop(store);
-        // The shared feature-group directory is NOT rewritten here: it records the group's
-        // name, ARN, record-identifier and event-time features and whether its OnlineStore
-        // is on ([`::service_common::feature_store_groups::FeatureGroupRecord`]), and this
-        // operation models no member that changes any of them.
+        // Nothing else this operation can change is in the shared directory: it records
+        // the group's name, ARN, record-identifier and event-time features, whether its
+        // OnlineStore is on and its default TTL
+        // ([`::service_common::feature_store_groups::FeatureGroupRecord`]), and only the
+        // last of those is reachable from this operation's members.
+        if let Some(directory) = crate::state::feature_group_directory(&*self.engine) {
+            let mut held = directory.lock();
+            if let Some(mut record) = held.get(&name).cloned() {
+                record.default_ttl_seconds = default_ttl_seconds;
+                held.register(record);
+            }
+        }
 
         crate::state::record_state_change(Self::NAME, &arn, ctx);
         Ok(UpdateFeatureGroupOutput {

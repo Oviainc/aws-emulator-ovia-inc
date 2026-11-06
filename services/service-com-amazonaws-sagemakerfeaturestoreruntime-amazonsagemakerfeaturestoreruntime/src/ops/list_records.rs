@@ -161,7 +161,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListRecordsErrorModeled::InternalFailure(InternalFailure {
                 message: Some(
@@ -190,8 +189,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource (404 `ResourceNotFound`). A group that resolves but has no
         // `OnlineStore` holds nothing this READ could enumerate, so it is refused the
         // same way.
-        let definition = match crate::state::resolve_group(&*self.engine, &input.feature_group_name)
-        {
+        let definition = match crate::state::resolve_group(
+            &*self.engine,
+            &crate::state::request_region(ctx),
+            &input.feature_group_name,
+        ) {
             Ok(definition) => definition,
             Err(unresolved) => {
                 return Err(match unresolved {

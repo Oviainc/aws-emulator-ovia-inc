@@ -237,21 +237,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // reports a failure that concerns ONE entry in `Errors` rather than failing
             // the whole batch, so a name that denotes no feature group is that entry's
             // own error, carrying the `ValidationError` code every single-record write of
-            // this data plane refuses the same name with. The MESSAGE is this operation's
-            // own: it states that the feature group could not be found and names it by
-            // its ARN, which is what tells a caller which of up to 25 entries the failure
-            // belongs to.
+            // this data plane refuses the same name with, and the one message that
+            // resolution states (`crate::state::no_such_feature_group`) — which names the
+            // group by its ARN, so a caller can tell which of up to 25 entries the
+            // failure belongs to.
             let definition =
-                match crate::state::resolve_group(&*self.engine, &entry.feature_group_name) {
+                match crate::state::resolve_group(&*self.engine, &region, &entry.feature_group_name)
+                {
                     Ok(definition) => definition,
-                    Err(crate::state::Unresolved::Refused(_)) => {
+                    Err(crate::state::Unresolved::Refused(message)) => {
                         errors.push(entry_error(
                             entry,
                             crate::state::VALIDATION_ERROR_CODE,
-                            no_such_feature_group(&crate::state::feature_group_arn(
-                                &region,
-                                &entry.feature_group_name,
-                            )),
+                            message,
                         ));
                         continue;
                     }
@@ -339,16 +337,6 @@ fn entry_error(
         error_code: error_code.to_owned(),
         error_message: bounded_message(message),
     }
-}
-
-/// How this operation states an entry whose `FeatureGroupName` denotes no feature group.
-///
-/// The group is named by `arn`, the ARN a feature group of that name would carry
-/// ([`crate::state::feature_group_arn`]): a batch carries up to 25 entries, so the
-/// message has to say WHICH group could not be found for a caller to tell which entry it
-/// belongs to.
-fn no_such_feature_group(arn: &str) -> String {
-    format!("Resource Not Found: Amazon SageMaker can't find a FeatureGroup with name [{arn}].")
 }
 
 /// `message`, cut to the modelled maximum length of an `ErrorMessage`.

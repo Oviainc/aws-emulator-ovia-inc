@@ -21,6 +21,8 @@ mod feature_group_resolution;
 mod online_store_record_lifecycle;
 #[path = "all/pattern_refusal_rendering.rs"]
 mod pattern_refusal_rendering;
+#[path = "all/refusal_message_wording.rs"]
+mod refusal_message_wording;
 #[path = "all/rejection_statements.rs"]
 mod rejection_statements;
 #[path = "all/sagemaker_signing_name_routing.rs"]

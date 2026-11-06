@@ -190,7 +190,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutRecordErrorModeled::InternalFailure(InternalFailure {
                 message: Some("PutRecord: this service holds no state on the mounted engine".into()),
@@ -212,8 +211,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolution is the data plane's one rule (`crate::state::resolve_group`), and it
         // runs before the `TargetStores` shortcut below so an unresolvable name is
         // refused whichever stores the caller named.
-        let definition = match crate::state::resolve_group(&*self.engine, &input.feature_group_name)
-        {
+        let definition = match crate::state::resolve_group(
+            &*self.engine,
+            &crate::state::request_region(ctx),
+            &input.feature_group_name,
+        ) {
             Ok(definition) => definition,
             Err(crate::state::Unresolved::Refused(message)) => return Err(validation(message)),
             Err(crate::state::Unresolved::NoDirectory) => {

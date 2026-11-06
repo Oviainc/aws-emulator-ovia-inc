@@ -508,6 +508,10 @@ mod sagemaker_feature_store_control_plane_handoff;
 // end of this file, for the same reason the line above gives.
 #[path = "all/sagemaker_feature_store_group_deletion.rs"]
 mod sagemaker_feature_store_group_deletion;
+// Declared beside the hand-off suite whose harness it drives, rather than appended at the
+// end of this file, for the same reason the two lines above give.
+#[path = "all/sagemaker_feature_store_default_ttl.rs"]
+mod sagemaker_feature_store_default_ttl;
 // Declared beside the feature-store hand-off suite it is the counterpart of, rather than
 // appended at the end of this file, for the same reason the line above gives: the tail is
 // where every concurrently landing router suite appends its line.

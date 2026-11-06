@@ -20,9 +20,11 @@
 //!   request's resolved route key against this service's signing name. Edit it
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
-//! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//! - `override_operation` — EDITED HERE. The routing DECISION is still the model's: this
+//!   service serves the operation the generated table names, through a wrapper that lets a
+//!   refusal of a COLLECTION member state the collection the request carried, which the
+//!   `override_refusal` seam cannot do because it never sees the request. See "How a
+//!   clause on a LIST member states its value" below.
 //! - `override_refusal` — EDITED HERE. A request refused for violating a modelled
 //!   `@pattern` reports that pattern as the EXPRESSION a value has to satisfy, without
 //!   the `^`/`$` anchors the model spells it with. Everything else about the refusal —
@@ -72,9 +74,26 @@
 //! ("Still to migrate here") is where it belongs, and migrating all of them is one
 //! change of its own rather than a side effect of this service's issue, so it is
 //! inlined here with this note, exactly as that module asks.
+//!
+//! # How a clause on a LIST member states its value
+//!
+//! The same rule — a constraint message is BUILT FROM THE REQUEST — decides the VALUE
+//! half of a clause about a collection member: the value such a clause rejects is the
+//! collection itself, which AWS echoes rendered the way a list renders. The framework's
+//! validating walk has no rendering for a collection and stores its own summary of one
+//! (`<n> items`), which no caller ever sent, so that one clause is completed from the
+//! request through the tree's shared echo walk
+//! (`service_common::validation::refusing_violations_with_declared_echoes_over`) — see
+//! [`QuotingSubmittedCollections`], which exists because [`Service::override_refusal`] is
+//! handed the violations alone and never the request they were found in. Every other
+//! clause keeps the framework's own rendering, which already states the bytes the caller
+//! submitted.
 
+use service_common::validation::SubmittedEcho;
+use service_common::validation_message::quoting_the_submitted_collection;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
+    http, ErasedOperation, Operation, OperationRoutingTable, Refusal, Refused, Service, Violation,
+    ViolationKind,
 };
 use std::sync::Arc;
 
@@ -128,6 +147,121 @@ fn as_stated(violation: &Violation) -> Violation {
     }
 }
 
+/// The member POSITIONS the echo-collecting walk may visit for one request of this
+/// service, stated from this model rather than taken from the shared default (256).
+///
+/// A collection is quoted in a clause only when every one of its elements was walked, and
+/// the largest collection of STRUCTURES this model declares is `BatchGetRecordIdentifiers`
+/// (`@length` max 100 over `BatchGetRecordIdentifier`:
+/// `smithy_query(query="shape", shape="BatchGetRecordIdentifiers")`), so the ceiling has
+/// to cover the 101 elements that break that bound. Each element contributes a position
+/// per leaf its three members bottom out in and one per composite it and its two list
+/// members are — eight for an identifier asking for two records and two features — so 101
+/// of them need a little over 800. Past this the framework's own count summary stands,
+/// which is the fail-safe direction: a request whose identifiers each ask for a hundred
+/// records (`RecordIdentifiers` is itself `@length` max 100) is not quoted at all rather
+/// than quoted short.
+const MAX_ECHO_POSITIONS: usize = 1024;
+
+/// One modelled operation, served so that a refusal of a `@length` on one of its
+/// COLLECTION members states the collection the caller submitted.
+///
+/// Why it exists: [`Service::override_refusal`] is handed the violations alone, never the
+/// request they were found in, so the one clause whose value the framework could not
+/// render cannot be completed there. Here the input can be re-read.
+///
+/// Nothing is re-implemented and no check is repeated in other words: the violations and
+/// the echoes come from the tree's shared collecting walk
+/// (`service_common::validation::refusing_violations_with_declared_echoes_over`, which
+/// runs the protocol's own deserializer and the framework's own `constraints::validate`
+/// and owns every bound on what one clause may quote), the restatement of a collection's
+/// clause from `service_common::validation_message`, the envelope and every other clause
+/// from the framework, and the status and the error body from the framework's refusal
+/// channel. A request this wrapper does not refuse is handed to the generated operation,
+/// which owns deserialize -> validate -> handle -> serialize and every modelled error.
+/// The cost is DELIBERATE: an accepted request's body is read twice, here and in the
+/// operation's own sequence, because the framework hands no already-built input to an
+/// operation.
+struct QuotingSubmittedCollections<Op> {
+    operation: Op,
+}
+
+impl<Op> QuotingSubmittedCollections<Op> {
+    /// Wrap one operation, already constructed from the shared engine.
+    fn new(operation: Op) -> Self {
+        Self { operation }
+    }
+}
+
+impl<Op> ErasedOperation for QuotingSubmittedCollections<Op>
+where
+    Op: Operation + ErasedOperation,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r smithy_server_runtime::OperationContext<'r>,
+    ) -> smithy_server_runtime::BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            // The protocol is read, used and dropped inside this one statement:
+            // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
+            // below would make this future non-`Send`.
+            let refused: Vec<Violation> =
+                ::service_common::validation::refusing_violations_with_declared_echoes_over::<Op>(
+                    svc.definition().protocol(),
+                    req,
+                    MAX_ECHO_POSITIONS,
+                )
+                .into_iter()
+                .map(|(violation, echo)| stated_clause(violation, echo))
+                .collect();
+            if let Some(message) = aws_smithy_schema_server::constraints::envelope(&refused) {
+                return svc.definition().refusal_response(
+                    aws_smithy_schema_server::ProtocolError::Invalid(refused),
+                    Some(Refused {
+                        code: VALIDATION_EXCEPTION.to_string(),
+                        message,
+                    }),
+                    req,
+                );
+            }
+            self.operation.run(svc, req, ctx).await
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not
+    /// change which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
+    }
+}
+
+/// One violation as this service states it: a `@pattern` requirement unanchored
+/// ([`as_stated`]) and a COLLECTION member's `@length` clause quoting the collection the
+/// request carried (`service_common::validation_message::quoting_the_submitted_collection`,
+/// the tree's one home for that restoring rule). Every other clause is the framework's,
+/// untouched.
+fn stated_clause(violation: Violation, echo: SubmittedEcho) -> Violation {
+    as_stated(&quoting_the_submitted_collection(violation, echo))
+}
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
+/// [`QuotingSubmittedCollections`] and keyed by its operation shape name — the routing key
+/// `ServerHttpProtocol::routing_key` resolves and the generated table is keyed by.
+macro_rules! wrap_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                stringify!($operation),
+                ::std::boxed::Box::new(QuotingSubmittedCollections::new(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
+}
+
 /// The `com-amazonaws-sagemakerfeaturestoreruntime-amazonsagemakerfeaturestoreruntime` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -135,6 +269,12 @@ fn as_stated(violation: &Violation) -> Violation {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The same modelled operations the generated table holds, each wrapped in
+    /// [`QuotingSubmittedCollections`]. Keyed by the routing key the protocol resolves —
+    /// the key the generated table uses — and built from the SAME shared engine, so a
+    /// wrapped operation reads and writes the one store. Held on the service because
+    /// [`Service::override_operation`] hands back a borrow of `self`.
+    quoting_submitted_collections: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -142,8 +282,21 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut quoting_submitted_collections = OperationRoutingTable::new();
+        wrap_operations!(
+            quoting_submitted_collections,
+            engine,
+            batch_get_record::BatchGetRecord,
+            batch_write_record::BatchWriteRecord,
+            delete_record::DeleteRecord,
+            get_record::GetRecord,
+            list_records::ListRecords,
+            put_record::PutRecord,
+            update_record::UpdateRecord,
+        );
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            quoting_submitted_collections,
         }
     }
 }
@@ -183,12 +336,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Serve the operation the generated routing table names, through the wrapper that
+        // lets a refusal of a collection member state the collection the request carried
+        // (see [`QuotingSubmittedCollections`]). The routing DECISION is not overridden:
+        // the key is resolved by the model's own protocol, and a request the table cannot
+        // serve is declined here so the framework's routing-error path stays exactly as
+        // it was.
+        let operation = self.definition().protocol().routing_key(req).ok()?;
+        self.definition().routing_table().get(operation)?;
+        self.quoting_submitted_collections.get(operation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
