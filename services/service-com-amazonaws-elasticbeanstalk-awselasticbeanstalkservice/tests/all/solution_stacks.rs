@@ -82,11 +82,11 @@ async fn the_catalog_is_reported_whole_and_does_not_change_when_read() {
     );
     let pinned: &[(&str, &[&str])] = &[
         (
-            "64bit Amazon Linux 2023 v4.6.0 running Python 3.13",
+            "64bit Amazon Linux 2023 v4.7.0 running Python 3.13",
             &["zip"],
         ),
         (
-            "64bit Amazon Linux 2023 v4.4.0 running Corretto 21",
+            "64bit Amazon Linux 2023 v4.5.0 running Corretto 21",
             &["jar", "zip"],
         ),
         (

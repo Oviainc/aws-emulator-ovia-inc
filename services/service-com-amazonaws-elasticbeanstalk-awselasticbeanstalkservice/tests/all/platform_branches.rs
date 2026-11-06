@@ -248,10 +248,17 @@ async fn every_reported_branch_satisfies_the_modelled_value_sets() {
             "case {case:?}: expected LifecycleState in {REPORTED_LIFECYCLE_STATES:?}, got {:?}",
             branch.lifecycle_state
         );
-        assert!(
-            !branch.supported_tiers.is_empty(),
-            "case {case:?}: expected a non-empty SupportedTierList, got {branch:?}"
-        );
+        // "The environment tiers that platform versions in this branch support":
+        // a branch that names a runtime and an operating system runs
+        // environments, so it names the tiers they run in. A branch that is not
+        // a runtime at all (the custom-platform builder) names none, which is
+        // the empty list the service reports for it.
+        if branch.branch_name.contains(" running on ") {
+            assert!(
+                !branch.supported_tiers.is_empty(),
+                "case {case:?}: expected a non-empty SupportedTierList, got {branch:?}"
+            );
+        }
         for tier in &branch.supported_tiers {
             assert!(
                 TIERS.contains(&tier.as_str()),

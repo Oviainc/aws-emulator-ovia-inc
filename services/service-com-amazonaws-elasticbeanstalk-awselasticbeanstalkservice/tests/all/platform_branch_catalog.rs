@@ -166,14 +166,23 @@ async fn every_published_branch_carries_an_aws_shaped_ordinal_and_state() {
             branch.branch_order
         );
         assert!(
-            !branch.supported_tiers.is_empty()
-                && branch
-                    .supported_tiers
-                    .iter()
-                    .all(|tier| TIERS.contains(&tier.as_str())),
+            branch
+                .supported_tiers
+                .iter()
+                .all(|tier| TIERS.contains(&tier.as_str())),
             "case {case:?}: expected a SupportedTierList drawn from {TIERS:?}, got {:?}",
             branch.supported_tiers
         );
+        // A branch that names a runtime and an operating system runs
+        // environments, so it names the tiers they run in; only a branch that
+        // is not a runtime at all (the custom-platform builder) names none.
+        if branch.branch_name.contains(" running on ") {
+            assert!(
+                !branch.supported_tiers.is_empty(),
+                "case {case:?}: expected the tiers this runtime branch supports, got {:?}",
+                branch.supported_tiers
+            );
+        }
     }
 
     // A placeholder catalog is small and uniform; the published one spans
@@ -365,7 +374,7 @@ async fn each_documented_life_cycle_state_is_reported_capitalized() {
 }
 
 #[tokio::test]
-async fn a_version_is_published_for_exactly_the_branches_that_have_not_retired() {
+async fn a_version_is_published_for_exactly_the_branches_an_environment_can_run_on() {
     let emulator = Emulator::new();
     let catalog = full_catalog(&emulator).await;
 
@@ -410,10 +419,15 @@ async fn a_version_is_published_for_exactly_the_branches_that_have_not_retired()
                      {tiers:?}"
                 );
             }
+            // A retired branch has no version an account can deploy on, and
+            // neither has a branch that supports no environment tier — a branch
+            // that is not a runtime an application is deployed on at all.
             None => assert!(
-                retired,
-                "case {case:?}: expected a published version for a branch in state {:?}",
-                branch.lifecycle_state
+                retired || branch.supported_tiers.is_empty(),
+                "case {case:?}: expected a published version for a branch in state {:?} \
+                 supporting {:?}",
+                branch.lifecycle_state,
+                branch.supported_tiers
             ),
         }
     }

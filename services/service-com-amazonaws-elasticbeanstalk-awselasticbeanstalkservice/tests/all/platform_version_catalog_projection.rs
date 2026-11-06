@@ -5,9 +5,12 @@
 //!
 //! The rule under test: a platform-version response projects every member its
 //! catalog record defines — the platform's category, the operating system it
-//! runs on, the add-ons and tiers it supports, the languages and frameworks it
-//! runs, its description, its maintainer, its publication instants and the
-//! life-cycle state of the version and of its branch — and `ListPlatformVersions`
+//! runs on, the add-ons and tiers it supports, the languages it runs, its
+//! description, its maintainer, its publication instants and the
+//! life-cycle state of the version and of its branch — and reports no detail the
+//! catalog does NOT define: the frameworks and the custom AMIs of a platform
+//! version come from the platform definition its owner built it from, which a
+//! version Elastic Beanstalk publishes has none of. `ListPlatformVersions`
 //! and `DescribePlatformVersion` project the SAME record, the summary carrying
 //! the members `PlatformSummary` models and the description the members
 //! `PlatformDescription` models.
@@ -19,7 +22,7 @@
 //! release superseded) — rather than written out here: its rows span the
 //! categories, the two operating systems
 //! and their versions, platforms that run one language and platforms that run
-//! none, platforms that ship a framework and platforms that ship none, and
+//! none, and
 //! branches that support both environment tiers as well as one that supports only
 //! the web-server tier. Every expectation is computed from the catalog row plus
 //! this suite's own statement of the rule, so no row is a transcription of a
@@ -333,9 +336,6 @@ async fn every_published_version_summarises_its_catalog_record() {
 #[tokio::test]
 async fn every_published_version_is_described_in_full_from_the_same_record() {
     let emulator = Emulator::new();
-    // Every machine image the catalog published, so no two versions can be
-    // reported as sharing one.
-    let mut minted_image_ids: Vec<String> = Vec::new();
 
     for (stack, platform_version) in published_catalog() {
         let case = &format!("{} v{platform_version}", stack.branch_name);
@@ -418,15 +418,18 @@ async fn every_published_version_is_described_in_full_from_the_same_record() {
             "case {case:?}: expected the languages the catalog states, got {}",
             described.body
         );
+        // A version Elastic Beanstalk itself publishes states no framework of
+        // its own: the one entry it reports carries neither a name nor a
+        // version.
         assert_eq!(
             named_versions(&described, "Frameworks"),
-            catalog_pairs(stack.frameworks),
-            "case {case:?}: expected the frameworks the catalog states, got {}",
+            vec![(String::new(), None)],
+            "case {case:?}: a managed version states no framework, got {}",
             described.body
         );
-        // One AMI entry per virtualization type the platform publishes images
-        // for, each naming a machine image in the `ami-` long-id form EC2 issues
-        // one in.
+        // One entry per virtualization type, each naming NO image: a managed
+        // version pins no custom AMI, so every `ImageId` is reported empty
+        // rather than as a machine image this service would have invented.
         let amis: Vec<(String, Option<String>)> = described
             .elements_at("CustomAmiList/member")
             .into_iter()
@@ -447,21 +450,16 @@ async fn every_published_version_is_described_in_full_from_the_same_record() {
             // The two EC2 virtualization types, spelled out here rather than
             // read from the service, so this assertion stands on its own.
             vec!["pv", "hvm"],
-            "case {case:?}: expected one AMI per virtualization type, got {}",
+            "case {case:?}: expected one entry per virtualization type, got {}",
             described.body
         );
         for (virtualization_type, image_id) in &amis {
-            let image_id = image_id.clone().unwrap_or_default();
-            assert!(
-                image_id
-                    .strip_prefix("ami-")
-                    .is_some_and(|body| body.len() == 17
-                        && body.chars().all(|character| character.is_ascii_hexdigit()
-                            && !character.is_ascii_uppercase())),
-                "case {case:?}: the {virtualization_type} image must carry an ami- id of 17 \
-                 lowercase hex characters, got {image_id:?}"
+            assert_eq!(
+                image_id.clone().unwrap_or_default(),
+                String::new(),
+                "case {case:?}: the {virtualization_type} entry of a managed version must name \
+                 no image, got {image_id:?}"
             );
-            minted_image_ids.push(image_id);
         }
         // The publication instants: both present, both the same instant, since
         // the catalog has not been re-published since it was seeded.
@@ -473,18 +471,6 @@ async fn every_published_version_is_described_in_full_from_the_same_record() {
             "case {case:?}: a catalog version was published once, got {created:?} and {updated:?}"
         );
     }
-
-    // An image id identifies one image: no two of the catalog's published images
-    // share one.
-    let mut unique = minted_image_ids.clone();
-    unique.sort();
-    unique.dedup();
-    assert_eq!(
-        unique.len(),
-        minted_image_ids.len(),
-        "case \"published images\": every published ImageId must be unique, got \
-         {minted_image_ids:?}"
-    );
 }
 
 #[tokio::test]

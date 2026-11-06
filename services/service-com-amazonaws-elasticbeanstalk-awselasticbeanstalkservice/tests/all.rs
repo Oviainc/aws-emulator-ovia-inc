@@ -59,6 +59,8 @@ mod lifecycle;
 mod managed_action_history;
 #[path = "all/managed_actions.rs"]
 mod managed_actions;
+#[path = "all/managed_platform_catalog_rules.rs"]
+mod managed_platform_catalog_rules;
 #[path = "all/not_found_messages.rs"]
 mod not_found_messages;
 #[path = "all/operations_role.rs"]
