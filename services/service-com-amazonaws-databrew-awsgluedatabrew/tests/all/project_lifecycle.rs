@@ -513,7 +513,10 @@ async fn the_recipe_a_project_develops_reports_that_project() {
     .await;
     assert_eq!(
         error_message(&refused),
-        format!("Recipe {recipe} is currently in use by the following projects: attached."),
+        format!(
+            "The recipe {recipe} is already associated with project attached. Choose a \
+             recipe that isn't already part of a project."
+        ),
         "case \"a recipe another project develops\": unexpected message, got {:?}",
         refused.body
     );

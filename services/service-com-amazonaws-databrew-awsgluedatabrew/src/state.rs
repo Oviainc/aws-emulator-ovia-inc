@@ -93,25 +93,22 @@ pub fn already_exists_message(kind: &str, name: &str) -> String {
     }
 }
 
-/// The message DataBrew answers a `ConflictException` with when a write is refused
-/// because another resource already holds the one the request names: the kind and name
-/// of the resource the request addressed, and every resource that references it, so a
-/// client can tell exactly what to release first.
+/// The message `CreateProject` answers its `ConflictException` with when the recipe the
+/// create names is already developed in another project: DataBrew's own sentence for
+/// this refusal, which names the recipe the request carried, the ONE project that
+/// already holds it, and the step that clears the refusal.
 ///
 /// The sentence the model documents on the error SHAPE ("Updating or deleting a
-/// resource can cause an inconsistent state.") describes the error class; the message
-/// a particular refusal answers with names the references that would be left dangling.
-/// `kind` is the addressed resource's kind as DataBrew opens a sentence with it,
-/// capitalised (`Dataset`, `Project`, `Job`, `Recipe`); `by_kind_plural` is the
-/// referencing resources' kind in prose mid-sentence, so lower case and plural
-/// (`projects`, `jobs`, `recipes`).
-///
-/// A refusal DataBrew words with its own per-resource sentence does NOT come from here:
-/// see [`dataset_in_use_by_project_message`].
-pub fn in_use_message(kind: &str, name: &str, by_kind_plural: &str, by_names: &[&str]) -> String {
+/// resource can cause an inconsistent state.") describes the error class, and the error
+/// shape carries no per-resource member, so the message is the only detail a client can
+/// tell this 409 by. The project is named in the SINGULAR because a recipe belongs to at
+/// most one project (model: `Recipe$ProjectName` is a single name), so there is never
+/// more than one holder to report, and the remediation clause states the rule the caller
+/// ran into: a recipe may be part of only one project.
+pub fn recipe_already_in_project_message(recipe_name: &str, project_name: &str) -> String {
     format!(
-        "{kind} {name} is currently in use by the following {by_kind_plural}: {}.",
-        by_names.join(", ")
+        "The recipe {recipe_name} is already associated with project {project_name}. \
+         Choose a recipe that isn't already part of a project."
     )
 }
 

@@ -221,18 +221,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // recipe another project already develops cannot be taken over by this one:
         // re-pointing it would leave the first project naming a recipe that reports
         // somebody else. That is the inconsistent state `ConflictException` is the
-        // modelled answer for.
+        // modelled answer for, and DataBrew words this refusal with its own sentence
+        // naming the single project that holds the recipe.
         if let Some(owner) = store
             .recipes
             .get(&record.recipe_name)
             .and_then(|recipe| recipe.project_name.clone())
         {
             return Err(CreateProjectErrorModeled::ConflictException(ConflictException {
-                message: Some(crate::state::in_use_message(
-                    "Recipe",
+                message: Some(crate::state::recipe_already_in_project_message(
                     &record.recipe_name,
-                    "projects",
-                    &[owner.as_str()],
+                    &owner,
                 )),
             })
             .into());
