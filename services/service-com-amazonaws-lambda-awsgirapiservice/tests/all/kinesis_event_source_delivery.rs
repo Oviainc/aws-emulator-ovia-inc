@@ -389,8 +389,12 @@ async fn wait_for_iterator_age(
     }
 }
 
-/// `GetEventSourceMapping` on one mapping.
-async fn get_mapping(router: &MultiServiceRouter, case: &str, uuid: &str) -> Value {
+/// `GetEventSourceMapping` on one mapping, which must resolve the mapping the create
+/// accepted.
+///
+/// Published with the rest of this harness, so every suite over this surface reads a
+/// mapping back the one way.
+pub(crate) async fn get_mapping(router: &MultiServiceRouter, case: &str, uuid: &str) -> Value {
     let (status, read) = lambda(
         router,
         "GET",

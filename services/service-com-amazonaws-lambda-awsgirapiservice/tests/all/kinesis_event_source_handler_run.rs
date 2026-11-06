@@ -37,7 +37,6 @@
 //! fixture) is the one `kinesis_event_source_delivery.rs` publishes, so every suite over this
 //! surface drives the same wire.
 
-use std::io::Write as _;
 use std::time::Instant;
 
 use base64::Engine as _;
@@ -45,8 +44,10 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::kinesis_event_source_delivery::{
-    cloudwatch, emulator, given_stream, kinesis, lambda, BUDGET, LOOK_AGAIN, MAPPINGS_URI,
+    cloudwatch, emulator, get_mapping, given_stream, kinesis, lambda, BUDGET, LOOK_AGAIN,
+    MAPPINGS_URI,
 };
+use crate::synchronous_invoke_run::package;
 
 /// Where `CreateFunction` is bound (`POST /2015-03-31/functions`).
 const FUNCTIONS_URI: &str = "/2015-03-31/functions";
@@ -93,15 +94,22 @@ const POISON: &str = "poison";
 /// See [`POISON`].
 const RAISE: &str = "raise";
 
-/// The handler every row runs. It asserts the shape of the envelope Lambda hands a Kinesis
-/// batch over as — one record per envelope, naming its source and stream and carrying the
-/// record's own partition key, sequence number and base64 data — and decides what to report
-/// from that record's DATA, so the report is a consequence of the record having arrived.
-const HANDLER_SOURCE: &str = r#"
+/// The handler every row runs, with the two markers above bound to the names it reads them
+/// by — so there is ONE spelling of each on both sides of the interpreter.
+///
+/// It asserts the shape of the envelope Lambda hands a Kinesis batch over as — one record
+/// per envelope, naming its source and stream and carrying the record's own partition key,
+/// sequence number and base64 data — and decides what to report from that record's DATA, so
+/// the report is a consequence of the record having arrived.
+fn handler_source() -> String {
+    format!(
+        r#"
 import base64
 import os
 
 STREAM_ARN = os.environ["STREAM_ARN"]
+POISON = "{POISON}"
+RAISE = "{RAISE}"
 
 
 def lambda_handler(event, context):
@@ -123,12 +131,14 @@ def lambda_handler(event, context):
         if not sequence_number:
             raise ValueError("a record carries no sequenceNumber")
         payload = base64.b64decode(stream_record["data"]).decode()
-        if payload.startswith("raise"):
+        if payload.startswith(RAISE):
             raise RuntimeError("the handler cannot process " + payload)
-        if payload.startswith("poison"):
-            failures.append({"itemIdentifier": sequence_number})
-    return {"batchItemFailures": failures}
-"#;
+        if payload.startswith(POISON):
+            failures.append({{"itemIdentifier": sequence_number}})
+    return {{"batchItemFailures": failures}}
+"#
+    )
+}
 
 /// One row: the mapping's shape, the records put on its stream, and what the mapping must
 /// report once the handler has run on them.
@@ -151,25 +161,7 @@ struct Row {
     expected_result: &'static str,
 }
 
-/// A .zip deployment package holding `source` as `lambda_function.py`, written in memory the
-/// way a caller uploads one.
-fn package(source: &str) -> Vec<u8> {
-    let mut buffer = std::io::Cursor::new(Vec::new());
-    {
-        let mut writer = zip::ZipWriter::new(&mut buffer);
-        let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
-        writer
-            .start_file("lambda_function.py", options)
-            .expect("the entry starts");
-        writer
-            .write_all(source.as_bytes())
-            .expect("the entry's bytes");
-        writer.finish().expect("a finished archive");
-    }
-    buffer.into_inner()
-}
-
-/// A function whose package RUNS [`HANDLER_SOURCE`], told through its environment which
+/// A function whose package RUNS [`handler_source`], told through its environment which
 /// stream the records it is handed must come from, waited out to `Active`.
 async fn given_handler_function(
     router: &MultiServiceRouter,
@@ -190,7 +182,7 @@ async fn given_handler_function(
             "Environment": { "Variables": { "STREAM_ARN": stream_arn } },
             "Code": {
                 "ZipFile": base64::engine::general_purpose::STANDARD
-                    .encode(package(HANDLER_SOURCE)),
+                    .encode(package(&handler_source())),
             },
         }),
     )
@@ -284,22 +276,6 @@ async fn put_payloads(
         json!(0),
         "case {case:?}: every record must be placed, got {written}"
     );
-}
-
-/// `GetEventSourceMapping` on one mapping.
-async fn get_mapping(router: &MultiServiceRouter, case: &str, uuid: &str) -> Value {
-    let (status, read) = lambda(
-        router,
-        "GET",
-        &format!("{MAPPINGS_URI}/{uuid}"),
-        &Value::Null,
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: GetEventSourceMapping answered {status} {read}"
-    );
-    read
 }
 
 /// Wait until the mapping reports `expected` as its `LastProcessingResult`, answering every

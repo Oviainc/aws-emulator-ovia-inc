@@ -145,7 +145,10 @@ async fn call(
 
 /// A .zip deployment package holding `source` as `lambda_function.py`, written in memory
 /// the way a caller uploads one.
-fn package(source: &str) -> Vec<u8> {
+///
+/// Shared with the suites that upload a package whose handler RUNS, so there is one
+/// writer of a deployment archive in this target.
+pub(crate) fn package(source: &str) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
