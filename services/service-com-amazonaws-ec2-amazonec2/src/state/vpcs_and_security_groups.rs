@@ -1789,6 +1789,52 @@ impl SecurityGroupRuleAtom {
         ))
     }
 
+    /// This rule as the SENTENCE a refusal names it by: its peer, its protocol, its port
+    /// range and the action every security group rule carries.
+    ///
+    /// A security group rule is "a protocol, from and to ports, and source (CIDR range,
+    /// security group, or prefix list)" (`RevokeSecurityGroupIngress`) and it only ever
+    /// allows traffic — unlike a network ACL entry, which also denies
+    /// (`NetworkAclEntry$RuleAction`) — so those are the members a rule is described by, in
+    /// that order, whether or not it has been stored. No rule id: a request the service is
+    /// refusing named its rule by these members rather than by an id, and a rule that was
+    /// never stored has no id to name at all.
+    ///
+    /// For ICMP the port range is a type and a code rather than ports — "this is the ICMP
+    /// type" (`IpPermission$FromPort`) and "this is the ICMP code" (`$ToPort`) — and a rule
+    /// on a protocol that carries no port range is described without one.
+    pub fn descriptor(&self) -> String {
+        let peer = match &self.source {
+            SecurityGroupRuleSource::Ipv4(cidr) | SecurityGroupRuleSource::Ipv6(cidr) => cidr,
+            SecurityGroupRuleSource::PrefixList(prefix_list_id) => prefix_list_id,
+            SecurityGroupRuleSource::ReferencedGroup(named) => named,
+        };
+        // "To specify all protocols, use -1" (`$IpProtocol`): the rule is on every protocol,
+        // which is what it is described as. A protocol NAME is the word for the protocol and
+        // a protocol NUMBER is the number itself.
+        let protocol = if self.ip_protocol == ALL_IP_PROTOCOLS {
+            "ALL".to_string()
+        } else {
+            self.ip_protocol.to_ascii_uppercase()
+        };
+        let range = match (self.from_port, self.to_port) {
+            // BOTH ends, which is the only shape a rule's range has: "fromPort and toPort are
+            // given together or not at all" is what
+            // [`validate_ip_permission_port_range`] holds an authorized permission to, and a
+            // protocol that carries no range has neither end.
+            (Some(from_port), Some(to_port)) => {
+                let (first, second) = if protocol_is_icmp(&self.ip_protocol) {
+                    ("type", "code")
+                } else {
+                    ("from port", "to port")
+                };
+                format!(", {first}: {from_port}, {second}: {to_port}")
+            }
+            _ => String::new(),
+        };
+        format!("peer: {peer}, {protocol}{range}, ALLOW")
+    }
+
     /// This rule's IDENTITY as a hashable key: see [`SecurityGroupRuleKey`]. The ONE way
     /// to ask whether two rules are the same rule — `left.identity() == right.identity()`
     /// — so there is no second, quieter comparison beside it.

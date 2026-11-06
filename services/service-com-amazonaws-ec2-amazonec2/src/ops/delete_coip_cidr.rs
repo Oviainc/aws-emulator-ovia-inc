@@ -257,7 +257,12 @@ pub const MAX_ECHOED_CIDR_CHARS: usize = 64;
 /// Every refusal of this operation names the value through here, the readable ones included:
 /// a prefix length may be written with any number of leading zeros, so a value that PARSES as
 /// a block is no shorter than one that does not.
-fn echoed_cidr(cidr: &str) -> String {
+///
+/// Public because the ceiling is the one every refusal of this crate echoes a CIDR block to:
+/// [`crate::ops::create_coip_cidr`] and
+/// [`crate::state::malformed_security_group_rule_cidr`] name a refused range through this one
+/// function rather than each taking the characters themselves.
+pub fn echoed_cidr(cidr: &str) -> String {
     cidr.chars().take(MAX_ECHOED_CIDR_CHARS).collect()
 }
 

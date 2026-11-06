@@ -235,14 +235,12 @@ fn names_range(stored: &str, canonical: &str) -> bool {
     crate::state::canonical_ipv4_cidr(stored).is_ok_and(|range| range == canonical)
 }
 
-/// A `Cidr` from the REQUEST, as a refusal may name it: its first
-/// [`crate::ops::delete_coip_cidr::MAX_ECHOED_CIDR_CHARS`] characters, the same ceiling the
-/// delete of a range bounds its own echo by — a prefix length may be written with any number
-/// of leading zeros, so a value that PARSES as a block is no shorter than one that does not.
+/// A `Cidr` from the REQUEST, as a refusal may name it: the one bounded echo
+/// [`crate::ops::delete_coip_cidr::echoed_cidr`] is, so the create and the delete of a range
+/// name a refused value identically — a prefix length may be written with any number of
+/// leading zeros, so a value that PARSES as a block is no shorter than one that does not.
 fn echoed_cidr(cidr: &str) -> String {
-    cidr.chars()
-        .take(crate::ops::delete_coip_cidr::MAX_ECHOED_CIDR_CHARS)
-        .collect()
+    crate::ops::delete_coip_cidr::echoed_cidr(cidr)
 }
 
 /// Refuse a `Cidr` that is not an address range at all: HTTP 400 `InvalidParameterValue`, in

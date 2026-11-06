@@ -1976,26 +1976,39 @@ pub fn canonical_security_group_cidr(value: &str) -> Result<String, CidrProblem>
     canonical_ipv4_cidr(value)
 }
 
-/// Refuse a rule the group already holds: HTTP 400 `InvalidPermission.Duplicate`.
-pub fn invalid_permission_duplicate<E>(rule_id: &str) -> Scaffolded<E> {
-    Scaffolded::service_error(
-        INVALID_PERMISSION_DUPLICATE,
-        400,
-        format!("the specified rule \"{rule_id}\" already exists"),
-    )
+/// Refuse a security group rule whose address range is not a CIDR block: HTTP 400
+/// [`INVALID_PARAMETER_VALUE`], `CIDR block <value> is malformed`.
+///
+/// The block is named as the REQUEST wrote it — the value the caller has to fix — and the
+/// sentence is the one AWS answers a rule's unreadable range with, whichever address family
+/// the range named: an `IpRange$CidrIp` and an `Ipv6Range$CidrIpv6` are the same member of
+/// the same rule pointing at the two address spaces, so one unreadable block is one refusal.
+///
+/// The echo is the bounded one [`crate::ops::delete_coip_cidr::echoed_cidr`] builds — the
+/// ceiling this crate already holds a refused CIDR block's echo to, far above any block of
+/// either family — so a caller-sized value cannot grow the refusal it earned.
+pub fn malformed_security_group_rule_cidr<E>(cidr: &str) -> Scaffolded<E> {
+    invalid_parameter_value(format!(
+        "CIDR block {echoed} is malformed",
+        echoed = crate::ops::delete_coip_cidr::echoed_cidr(cidr),
+    ))
 }
 
-/// Refuse a request that describes one rule more than once: HTTP 400
-/// `InvalidPermission.Duplicate`. The same code as a rule the group already holds, because
-/// it is the same refusal — the rule would be added twice — but worded for a request that
-/// has not been stored, so there is no rule id to name.
-pub fn invalid_permission_duplicate_in_request<E>(position: usize) -> Scaffolded<E> {
+/// Refuse a rule the group would hold twice: HTTP 400 `InvalidPermission.Duplicate`.
+///
+/// The message names the rule the way the REQUEST described it —
+/// [`SecurityGroupRuleAtom::descriptor`], its peer, protocol, port range and action — so a
+/// caller is told which of the rules it asked for is the one that already exists, whether
+/// that rule is one the group already held or one the same request described twice. A
+/// request that describes a rule twice earns the same refusal for the same reason: the rule
+/// would be added twice.
+pub fn invalid_permission_duplicate<E>(atom: &SecurityGroupRuleAtom) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_PERMISSION_DUPLICATE,
         400,
         format!(
-            "the rule described at ipPermissions.{position} is already described earlier \
-             in this request"
+            "the specified rule \"{descriptor}\" already exists",
+            descriptor = atom.descriptor(),
         ),
     )
 }
@@ -2207,11 +2220,8 @@ pub fn prepared_ip_permission<E>(
     for range in permission.ip_ranges.iter().flatten() {
         validate_security_group_rule_description(range.description.as_ref())?;
         let cidr = range.cidr_ip.as_deref().unwrap_or_default();
-        let canonical = canonical_security_group_cidr(cidr).map_err(|_| {
-            invalid_parameter_value(format!(
-                "CIDR block '{cidr}' of ipPermissions.{position} is malformed"
-            ))
-        })?;
+        let canonical = canonical_security_group_cidr(cidr)
+            .map_err(|_| malformed_security_group_rule_cidr(cidr))?;
         ip_ranges.push(IpRange {
             cidr_ip: Some(canonical),
             description: range.description.clone(),
@@ -2222,11 +2232,8 @@ pub fn prepared_ip_permission<E>(
     for range in permission.ipv6_ranges.iter().flatten() {
         validate_security_group_rule_description(range.description.as_ref())?;
         let cidr = range.cidr_ipv6.as_deref().unwrap_or_default();
-        let canonical = canonical_ipv6_cidr(cidr).map_err(|_| {
-            invalid_parameter_value(format!(
-                "CIDR block '{cidr}' of ipPermissions.{position} is malformed"
-            ))
-        })?;
+        let canonical =
+            canonical_ipv6_cidr(cidr).map_err(|_| malformed_security_group_rule_cidr(cidr))?;
         ipv6_ranges.push(Ipv6Range {
             cidr_ipv6: Some(canonical),
             description: range.description.clone(),
@@ -2394,35 +2401,21 @@ pub fn refuse_duplicate_security_group_rules<E>(
 ) -> Result<(), Scaffolded<E>> {
     // The group's rules on this side, by identity, so a request of N rules costs N lookups
     // rather than N times the rules the group holds.
-    let held: HashMap<SecurityGroupRuleKey, String> = store
+    let held: HashSet<SecurityGroupRuleKey> = store
         .security_group_rules
         .values()
         .filter(|record| {
             record.rule.group_id.as_deref() == Some(group_id)
                 && record.rule.is_egress == Some(is_egress)
         })
-        .filter_map(|record| {
-            let atom = SecurityGroupRuleAtom::of_stored_rule(record)?;
-            Some((
-                atom.identity(),
-                record
-                    .rule
-                    .security_group_rule_id
-                    .clone()
-                    .unwrap_or_default(),
-            ))
-        })
+        .filter_map(|record| Some(SecurityGroupRuleAtom::of_stored_rule(record)?.identity()))
         .collect();
     let mut described: HashSet<SecurityGroupRuleKey> = HashSet::new();
-    for (index, permission) in prepared.iter().enumerate() {
-        let position = index + 1;
+    for permission in prepared {
         for atom in security_group_rule_atoms(permission) {
             let identity = atom.identity();
-            if let Some(rule_id) = held.get(&identity) {
-                return Err(invalid_permission_duplicate(rule_id));
-            }
-            if !described.insert(identity) {
-                return Err(invalid_permission_duplicate_in_request(position));
+            if held.contains(&identity) || !described.insert(identity) {
+                return Err(invalid_permission_duplicate(&atom));
             }
         }
     }

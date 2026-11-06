@@ -1417,6 +1417,12 @@ mod refusal_classes_and_unreadable_ids;
 // of this file, which is where every new ec2 suite inserts its lines.
 #[path = "all/monitor_instances.rs"]
 mod monitor_instances;
+// How both authorize operations WORD the two refusals a described rule earns: a rule the group
+// would hold twice named by its peer, protocol, port range and action rather than by any rule
+// id, and an address range that is no CIDR block named as the request wrote it. Declared at the
+// tail of this file, which is where every new ec2 suite inserts its lines.
+#[path = "all/security_group_rule_refusal_wording.rs"]
+mod security_group_rule_refusal_wording;
 // What a SUCCESSFUL delete makes observable on the Network Access Scope, Traffic Mirror filter
 // and route server surfaces: an id that stops resolving for every read of a resource whose
 // shape carries no state, and the `deleting` -> `deleted` states a route server is described
