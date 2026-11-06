@@ -456,13 +456,14 @@ pub fn table_not_restorable_rejection(
     )
 }
 
-/// The refusal a deletion of a user-defined type that something still uses carries: "You
-/// can only delete a type that is not used in a table or another UDT."
+/// The refusal a deletion of a user-defined type that something still uses carries:
+/// `<formatted type name> is referenced by other UDTs or tables.`
 ///
-/// Amazon Keyspaces states the fault and nothing else — the formatted type name, then the
-/// fixed clause about the kinds of user a type can have. It names neither the keyspace nor
-/// any individual user, so the sentence is the SAME whichever and however many resources
-/// refer to the type, and it discloses no sibling resource name.
+/// The rule behind it is "You can only delete a type that is not used in a table or
+/// another UDT", and the sentence states that fault and nothing else — the formatted type
+/// name, then the fixed clause about the kinds of user a type can have. It names neither
+/// the keyspace nor any individual user, so the sentence is the SAME whichever and however
+/// many resources refer to the type, and it discloses no sibling resource name.
 pub fn type_still_referenced_rejection(type_name: &str) -> String {
     format!("{type_name} is referenced by other UDTs or tables.")
 }

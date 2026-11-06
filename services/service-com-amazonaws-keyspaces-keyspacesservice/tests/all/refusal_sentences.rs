@@ -32,7 +32,7 @@ use service_com_amazonaws_keyspaces_keyspacesservice::scaffolded;
 use service_com_amazonaws_keyspaces_keyspacesservice::state as keyspaces;
 
 use crate::keyspace_table_lifecycle::{
-    assert_failure, assert_ok, error_code, ensure_keyspace, keyspace_arn, minimal_schema,
+    assert_failure, assert_ok, ensure_keyspace, error_code, keyspace_arn, minimal_schema,
     settle_wait, Emulator,
 };
 use crate::regional_partitioning::RegionalEmulator;
@@ -124,7 +124,12 @@ async fn a_drop_of_a_keyspace_nothing_holds_is_refused_as_a_failed_drop() {
     }
 
     // The keyspace that IS held was not touched by any of the refusals above.
-    let reported = assert_ok(held, emulator.call("GetKeyspace", json!({"keyspaceName": held})).await);
+    let reported = assert_ok(
+        held,
+        emulator
+            .call("GetKeyspace", json!({"keyspaceName": held}))
+            .await,
+    );
     assert_eq!(
         reported["keyspaceName"],
         json!(held),

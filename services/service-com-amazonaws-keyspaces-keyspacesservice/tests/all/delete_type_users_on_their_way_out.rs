@@ -443,7 +443,7 @@ async fn delete_type_refuses_a_type_whose_user_is_not_on_its_way_out() {
         let refusal = message(&body);
         assert_eq!(
             refusal,
-            keyspaces::type_still_referenced_rejection(row.used),
+            format!("{} is referenced by other UDTs or tables.", row.used),
             "case {:?}: unexpected refusal sentence, got {refusal:?}",
             row.case
         );
@@ -516,7 +516,7 @@ async fn delete_type_counts_each_user_on_its_own() {
     let refusal = message(&body);
     assert_eq!(
         refusal,
-        keyspaces::type_still_referenced_rejection("used_by_four"),
+        "used_by_four is referenced by other UDTs or tables.",
         "case {case:?}: unexpected refusal sentence, got {refusal:?}"
     );
     for user in departing.iter().chain(remaining.iter()) {
