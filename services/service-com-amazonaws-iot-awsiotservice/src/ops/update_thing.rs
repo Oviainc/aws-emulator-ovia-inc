@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateThing
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateThing`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateThing::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +148,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateThing` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateThingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateThing"))
+        // `ctx` carries request metadata only; an update addresses a thing that is
+        // already registered, so nothing it changes is region-scoped.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateThingErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // What the request asks the registry to change. `attributePayload` provides an
+        // attribute list only when it carries the `attributes` map: a request without one
+        // says nothing about the thing's attributes and so leaves them alone, while one
+        // carrying an EMPTY map provides the empty list — which, not being a merge, leaves
+        // the thing with no attributes.
+        let update = crate::state::ThingUpdate {
+            thing_type_name: input.thing_type_name,
+            remove_thing_type: input.remove_thing_type,
+            attributes: input.attribute_payload.and_then(|payload| {
+                let merge = payload.merge;
+                payload
+                    .attributes
+                    .map(|attributes| crate::state::AttributeUpdate {
+                        attributes: attributes.into_iter().collect(),
+                        merge,
+                    })
+            }),
+            expected_version: input.expected_version,
+        };
+
+        let mut store = state.lock();
+        // The ONE registry write that changes a thing record
+        // (`crate::state::ComAmazonawsIotAwsiotserviceState::update_thing`): it refuses
+        // before it writes, so a refused update leaves the record — and its version —
+        // exactly as it was, and a successful one advances that version for the next
+        // `expectedVersion` to match.
+        store
+            .update_thing(&input.thing_name, update)
+            .map_err(|refusal| {
+                let message = Some(refusal.message());
+                match refusal {
+                    // "The specified resource does not exist" (HTTP 404) is the modelled
+                    // error both for a thing the registry does not hold and for a thing
+                    // type it does not hold.
+                    crate::state::ThingUpdateRefusal::MissingThing(_)
+                    | crate::state::ThingUpdateRefusal::ThingType(
+                        crate::state::ThingRegistrationRefusal::MissingThingType(_),
+                    ) => UpdateThingErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException { message },
+                    ),
+                    // A record at another version is what `VersionConflictException`
+                    // (HTTP 409) is modelled for.
+                    crate::state::ThingUpdateRefusal::VersionConflict { .. } => {
+                        UpdateThingErrorModeled::VersionConflictException(VersionConflictException {
+                            message,
+                        })
+                    }
+                    // A request that both sets and removes the thing type, and one naming a
+                    // DEPRECATED type (which exists, so it is no 404, but is a type nothing
+                    // may be associated with), are requests the service cannot perform:
+                    // `InvalidRequestException` ("The request is not valid", HTTP 400).
+                    crate::state::ThingUpdateRefusal::ContradictoryThingType
+                    | crate::state::ThingUpdateRefusal::ThingType(_) => {
+                        UpdateThingErrorModeled::InvalidRequestException(InvalidRequestException {
+                            message,
+                        })
+                    }
+                }
+            })?;
+
+        // `UpdateThingResponse` has no members: what the update did is read back through
+        // `DescribeThing`, which reports the record this write left.
+        Ok(UpdateThingOutput {})
     }
 }

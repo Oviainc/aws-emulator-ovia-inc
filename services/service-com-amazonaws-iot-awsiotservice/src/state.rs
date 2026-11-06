@@ -270,6 +270,30 @@ impl ThingRegistrationRefusal {
     }
 }
 
+/// How this service states that a `thingName` names no thing in the registry.
+///
+/// AWS IoT words it from the REQUEST — the account the call was made for and the name
+/// it asked about — so every operation addressing a single thing refuses a name the
+/// registry does not hold with the same sentence, and none of them hardcodes it.
+pub fn missing_thing_message(thing_name: &str) -> String {
+    format!(
+        "Thing {}:{} not found.",
+        ::engine::emulator_account_id(),
+        thing_name
+    )
+}
+
+/// How this service states that an `expectedVersion` does not match the registry.
+///
+/// `VersionConflictException` is "An exception thrown when the version of an entity
+/// specified with the expectedVersion parameter does not match the latest version in
+/// the system", and `UpdateThing`/`DeleteThing` both check a thing's version against
+/// it, so the refusal is worded once here from the version the request asked for and
+/// the one the record holds.
+pub fn thing_version_conflict_message(thing_name: &str, expected: i64, registered: i64) -> String {
+    format!("expectedVersion {expected} does not match the version {registered} of thing {thing_name}")
+}
+
 /// The configuration of a thing group: the members of a `CreateThingGroup` request
 /// that describe the group rather than name it.
 ///
@@ -819,19 +843,7 @@ impl ComAmazonawsIotAwsiotserviceState {
         configuration: ThingConfiguration,
     ) -> Result<RegisteredThing, ThingRegistrationRefusal> {
         if let Some(thing_type_name) = &configuration.thing_type_name {
-            match self.thing_types.get(thing_type_name) {
-                None => {
-                    return Err(ThingRegistrationRefusal::MissingThingType(
-                        thing_type_name.clone(),
-                    ))
-                }
-                Some(thing_type) if thing_type.is_deprecated() => {
-                    return Err(ThingRegistrationRefusal::DeprecatedThingType(
-                        thing_type_name.clone(),
-                    ))
-                }
-                Some(_) => {}
-            }
+            self.resolve_associable_thing_type(thing_type_name)?;
         }
         if let Some(billing_group_name) = &configuration.billing_group_name {
             if !self.billing_groups.contains(billing_group_name) {
@@ -862,6 +874,29 @@ impl ComAmazonawsIotAwsiotserviceState {
         let thing = RegisteredThing::new(thing_name, thing_id, thing_arn, configuration);
         self.things.insert(thing.thing_name.clone(), thing.clone());
         Ok(thing)
+    }
+
+    /// Resolve `thing_type_name` as a type a thing may be ASSOCIATED with — the ONE
+    /// resolution every writer that points a thing at a thing type makes, so they
+    /// cannot drift about which types a thing may carry.
+    ///
+    /// A name the account holds no type under is a missing type, and one it has
+    /// DEPRECATED is a type nothing may be associated with: `DeprecateThingType` is
+    /// documented "Deprecates a thing type. You can not associate new things with
+    /// deprecated thing type."
+    pub fn resolve_associable_thing_type(
+        &self,
+        thing_type_name: &str,
+    ) -> Result<(), ThingRegistrationRefusal> {
+        match self.thing_types.get(thing_type_name) {
+            None => Err(ThingRegistrationRefusal::MissingThingType(
+                thing_type_name.to_string(),
+            )),
+            Some(thing_type) if thing_type.is_deprecated() => Err(
+                ThingRegistrationRefusal::DeprecatedThingType(thing_type_name.to_string()),
+            ),
+            Some(_) => Ok(()),
+        }
     }
 
     /// Mint a `thingId` no thing in the registry is using.
@@ -2598,6 +2633,14 @@ pub use rules_engine::{dispatch_published_message, SERVICE_PRINCIPAL};
 // reason the rules engine does.
 pub mod thing_registration;
 pub use thing_registration::ThingRegistrationTask;
+
+// What an UPDATE of a thing record changes — the thing type it is associated with and
+// its attributes, under the optimistic concurrency `expectedVersion` states — lives in
+// `state/thing_update.rs`, beside the store accessor for the same reason the bulk
+// provisioning rules do. Its names are re-exported here so a handler reaches them as
+// `crate::state::<name>`.
+pub mod thing_update;
+pub use thing_update::{AttributeUpdate, ThingUpdate, ThingUpdateRefusal};
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

@@ -171,11 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let thing = store.things.get(&input.thing_name).ok_or_else(|| {
             DescribeThingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "Thing {}:{} not found.",
-                    ::engine::emulator_account_id(),
-                    input.thing_name
-                )),
+                message: Some(crate::state::missing_thing_message(&input.thing_name)),
             })
         })?;
 

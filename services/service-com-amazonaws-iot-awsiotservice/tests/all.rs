@@ -59,6 +59,8 @@ mod thing_listing;
 mod thing_registry_lifecycle;
 #[path = "all/thing_type_registry.rs"]
 mod thing_type_registry;
+#[path = "all/thing_update.rs"]
+mod thing_update;
 #[path = "all/topic_rule_deletion.rs"]
 mod topic_rule_deletion;
 #[path = "all/topic_rule_enablement.rs"]

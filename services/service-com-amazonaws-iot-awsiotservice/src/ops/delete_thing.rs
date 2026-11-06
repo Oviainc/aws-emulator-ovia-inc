@@ -175,9 +175,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if registered.version != expected {
                     return Err(DeleteThingErrorModeled::VersionConflictException(
                         VersionConflictException {
-                            message: Some(format!(
-                                "expectedVersion {expected} does not match the version {} of thing {}",
-                                registered.version, registered.thing_name
+                            message: Some(crate::state::thing_version_conflict_message(
+                                &registered.thing_name,
+                                expected,
+                                registered.version,
                             )),
                         },
                     )
