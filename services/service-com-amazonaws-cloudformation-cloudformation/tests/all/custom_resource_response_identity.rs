@@ -38,7 +38,8 @@ use super::custom_resource_providers::{
     awaited_request, emulator, outputs_of, put_response, settled,
     settled_with_a_responsive_provider, template, POLL_ATTEMPTS, POLL_INTERVAL,
 };
-use super::harness::{call, create_stack, member, xml_blocks, xml_text, xml_texts};
+use super::harness::{call, create_stack, member, xml_text, xml_texts};
+use super::stack_lifecycle::resource_event_reason;
 
 /// The attribute every row's template publishes through `Fn::GetAtt`, so each case reads the
 /// answered `Data` beside the answered id.
@@ -394,12 +395,10 @@ async fn a_failed_answer_fails_the_action_its_request_was_for() {
 
         // The resource's OWN event is that action's failure, carrying the provider's reason.
         if let Some(expected) = row.resource_status {
-            let reason = resource_event_reason(&router, row.stack_name, "Thing", expected).await;
+            let reason = recorded_event_reason(&router, row.stack_name, "Thing", expected).await;
             assert_eq!(
-                reason.as_deref(),
-                Some(STATED_REASON),
-                "case {case:?}: the resource's {expected} event must carry the provider's \
-                 reason, got {reason:?}"
+                reason, STATED_REASON,
+                "case {case:?}: the resource's {expected} event must carry the provider's reason"
             );
         }
     }
@@ -430,13 +429,13 @@ async fn the_reason_a_failed_answer_states_is_the_resources_failure_reason() {
             "an empty reason",
             "reason-empty",
             Some(String::new()),
-            UNSTATED_REASON.to_string(),
+            custom_resource::UNSTATED_REASON.to_string(),
         ),
         (
             "no reason at all",
             "reason-absent",
             None,
-            UNSTATED_REASON.to_string(),
+            custom_resource::UNSTATED_REASON.to_string(),
         ),
         (
             "a reason longer than a response may carry",
@@ -478,55 +477,36 @@ async fn the_reason_a_failed_answer_states_is_the_resources_failure_reason() {
             status, "ROLLBACK_COMPLETE",
             "case {case:?}: a FAILED answer must fail the create, got {described}"
         );
-        let reason = resource_event_reason(&router, stack_name, "Thing", "CREATE_FAILED").await;
+        let reason = recorded_event_reason(&router, stack_name, "Thing", "CREATE_FAILED").await;
         assert_eq!(
-            reason.as_deref(),
-            Some(expected.as_str()),
+            reason, expected,
             "case {case:?}: expected the resource to report the provider's reason, got {reason:?}"
         );
     }
 }
 
-/// What a provider that states no reason of its own leaves on the resource's status: the one
-/// sentence this emulator words for it.
+/// The reason the event in which `logical_id` reached `status` carries, once the stack has
+/// recorded that event.
 ///
-/// Read off the crate rather than spelled here, so the suite cannot drift from it.
-const UNSTATED_REASON: &str = "The custom resource provider reported FAILED";
-
-/// The `ResourceStatusReason` of the event in which `logical_id` reached `status`, read
-/// through `DescribeStackEvents`.
-///
-/// The events are scanned as BLOCKS so a reason is read off the event that carries the
-/// status, rather than off whichever event of the stack happens to state one.
-async fn resource_event_reason(
+/// The read itself is the shared one every suite of this crate asks an event's
+/// `ResourceStatusReason` with ([`resource_event_reason`]); what this adds is the WAIT, since
+/// a stack's events become readable as its own clock reaches them. Every row here expects a
+/// reason the provider's answer put there — a `FAILED` answer always leaves one, its own or
+/// the fixed sentence for an unstated one — so an empty answer means the event is not there
+/// yet, and the last one read is returned for the assertion to report.
+async fn recorded_event_reason(
     router: &smithy_server_runtime::MultiServiceRouter,
     stack_name: &str,
     logical_id: &str,
     status: &str,
-) -> Option<String> {
+) -> String {
+    let mut last = String::new();
     for _ in 0..POLL_ATTEMPTS {
-        let (status_code, events) = call(
-            router,
-            "DescribeStackEvents",
-            &[member("StackName", stack_name)],
-        )
-        .await;
-        assert_eq!(
-            status_code, 200,
-            "expected DescribeStackEvents to answer for {stack_name:?}, got {status_code} with \
-             {events}"
-        );
-        let found = xml_blocks(&events, "member").into_iter().find_map(|event| {
-            let names_resource =
-                xml_text(&event, "LogicalResourceId").as_deref() == Some(logical_id);
-            let reached = xml_text(&event, "ResourceStatus").as_deref() == Some(status);
-            (names_resource && reached)
-                .then(|| xml_text(&event, "ResourceStatusReason").unwrap_or_default())
-        });
-        if found.is_some() {
-            return found;
+        last = resource_event_reason(router, stack_name, logical_id, status).await;
+        if !last.is_empty() {
+            return last;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-    None
+    last
 }

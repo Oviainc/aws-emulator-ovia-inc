@@ -146,8 +146,11 @@ pub const MAX_DATA_VALUE_CHARS: usize = 4096;
 /// one response sizes an event.
 pub const MAX_REASON_CHARS: usize = 4096;
 
-/// What a provider answers a `FAILED` request with when it states no reason of its own.
-const UNSTATED_REASON: &str = "The custom resource provider reported FAILED";
+/// What a resource's failure reads when the provider answered `FAILED` and stated no reason
+/// of its own: the one sentence this service words for an unstated reason, which is what
+/// [`ProviderResponse::failure_reason`] falls back to. Public so a suite asserting a
+/// resource's reported reason reads it from here rather than spelling it again.
+pub const UNSTATED_REASON: &str = "The custom resource provider reported FAILED";
 
 /// The provider request ONE stack operation sent about ONE custom resource: which operation
 /// it was for and the id it is answered under.
