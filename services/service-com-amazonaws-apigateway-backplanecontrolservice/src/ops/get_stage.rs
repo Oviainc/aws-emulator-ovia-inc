@@ -180,16 +180,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
         let store = state.lock();
-        let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
-            GetStageErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
-            })
-        })?;
-        let stage = api.stages.get(&input.stage_name).ok_or_else(|| {
-            GetStageErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::NO_SUCH_STAGE.to_string()),
-            })
-        })?;
+        // The `(restApiId, stageName)` pair is resolved as ONE lookup for the stage the URI
+        // addresses, so an identifier no stored API answers to is reported as the stage
+        // that cannot be resolved rather than as the API above it.
+        let (api, stage) = store
+            .api_and_stage(&input.rest_api_id, &input.stage_name)
+            .map_err(|message| {
+                GetStageErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(message),
+                })
+            })?;
         let region = api.arn_region().to_string();
         let body = super::create_stage::stage_body(stage, None);
         // The web ACL in front of the stage is WAFv2's own record, so it is read with

@@ -349,23 +349,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // The `(restApiId, resourceId)` pair is resolved as ONE lookup for the resource the
+        // URI addresses, so an identifier no stored API answers to is reported as the
+        // resource that cannot be resolved rather than as the API above it.
+        store
+            .resource(&input.rest_api_id, &input.resource_id)
+            .map_err(|message| {
+                UpdateResourceErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(message),
+                })
+            })?;
         // Patched on a COPY of the API: a list whose later op is refused leaves the
         // stored tree untouched, rather than keeping the ops before it.
         let mut updated = store
             .rest_apis
             .get(&input.rest_api_id)
-            .ok_or_else(|| {
-                UpdateResourceErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
-                })
-            })?
+            .ok_or_else(crate::state::state_unavailable)?
             .clone();
-        if !updated.resources.contains_key(&input.resource_id) {
-            return Err(UpdateResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::NO_SUCH_RESOURCE.to_string()),
-            })
-            .into());
-        }
 
         for patch in &patches {
             apply_patch(&mut updated, &input.resource_id, patch).map_err(patch_failure)?;

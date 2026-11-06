@@ -166,20 +166,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(crate::state::state_unavailable)?;
         let mut store = state.lock();
 
-        // Both identifiers are resolved against stored state before anything is
-        // removed, each naming its own record so the refusal says which one was not
-        // found.
-        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
-            DeleteResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
-            })
-        })?;
-        if !api.resources.contains_key(&input.resource_id) {
-            return Err(DeleteResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::NO_SUCH_RESOURCE.to_string()),
-            })
-            .into());
-        }
+        // Both identifiers are resolved as ONE lookup for the resource the URI addresses,
+        // before anything is removed, so an identifier no stored API answers to is reported
+        // as the resource that cannot be resolved rather than as the API above it.
+        store
+            .resource(&input.rest_api_id, &input.resource_id)
+            .map_err(|message| {
+                DeleteResourceErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(message),
+                })
+            })?;
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(crate::state::state_unavailable)?;
         // The root resource is created with its API and is the tree's anchor — every
         // other resource's path hangs off it — so it goes only when the API goes.
         if input.resource_id == api.root_resource_id {

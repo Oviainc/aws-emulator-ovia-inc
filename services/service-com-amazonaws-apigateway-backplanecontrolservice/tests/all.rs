@@ -374,6 +374,14 @@ mod delete_usage_plan_key;
 // signed with credentials whose principal is allowed no `execute-api:Invoke`.
 #[path = "all/stage_invoke_identity_policy.rs"]
 mod stage_invoke_identity_policy;
+// Appended for the reason the note above gives: WHICH record a call addressed by a stage
+// or a resource of a REST API reports when that address resolves to nothing.
+#[path = "all/nested_record_refusals.rs"]
+mod nested_record_refusals;
+// Appended for the reason the note above gives: how an integration whose own HTTP method
+// carries no value is refused.
+#[path = "all/integration_http_method_enumeration.rs"]
+mod integration_http_method_enumeration;
 // Appended for the reason the note above gives: the `Model` records every REST API is
 // CREATED with, over every create path.
 #[path = "all/default_models.rs"]

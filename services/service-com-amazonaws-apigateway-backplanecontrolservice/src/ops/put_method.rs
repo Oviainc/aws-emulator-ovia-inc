@@ -300,16 +300,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
-            PutMethodErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
-            })
-        })?;
-        let resource = api.resources.get_mut(&input.resource_id).ok_or_else(|| {
-            PutMethodErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::NO_SUCH_RESOURCE.to_string()),
-            })
-        })?;
+        // A method is put ON a resource, so the `(restApiId, resourceId)` pair is resolved
+        // as ONE lookup for that resource: an identifier no stored API answers to leaves
+        // the addressed resource unresolvable too, and the refusal names the resource the
+        // method would hang off rather than the API above it.
+        let resource = store
+            .resource_mut(&input.rest_api_id, &input.resource_id)
+            .map_err(|message| {
+                PutMethodErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(message),
+                })
+            })?;
         // A verb names at most one method on a resource: re-putting one is a conflict,
         // not an overwrite. The message is API Gateway's own wording for it, as a
         // recorded refusal reports: it names the conflict, not the verb, which the

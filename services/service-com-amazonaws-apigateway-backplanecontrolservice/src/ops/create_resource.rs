@@ -265,11 +265,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         let parent_path = {
-            let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
-                CreateResourceErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
-                })
-            })?;
+            // A resource is created ON a parent resource, so the `(restApiId, parentId)`
+            // pair is resolved as ONE lookup for that parent: an identifier no stored API
+            // answers to leaves the parent unresolvable too, and the refusal names the
+            // resource the new one would hang off rather than the API above it.
+            let parent_path = store
+                .resource(&input.rest_api_id, &input.parent_id)
+                .map_err(|message| {
+                    CreateResourceErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(message),
+                    })
+                })?
+                .path
+                .clone();
+            let api = store
+                .rest_apis
+                .get(&input.rest_api_id)
+                .ok_or_else(crate::state::state_unavailable)?;
             // One resource per request, and at most this many per API: the store cannot
             // grow past the quota however many requests arrive.
             if api.resources.len() >= crate::state::MAX_RESOURCES_PER_API {
@@ -281,11 +293,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            let parent = api.resources.get(&input.parent_id).ok_or_else(|| {
-                CreateResourceErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::NO_SUCH_RESOURCE.to_string()),
-                })
-            })?;
             // One path part per parent: two siblings with the same part would share one
             // path, and a path is what routes a request.
             let taken = api.resources.values().any(|resource| {
@@ -298,7 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into());
             }
-            parent.path.clone()
+            parent_path
         };
 
         // The materialised path is bounded too, which is what bounds how deeply
@@ -317,11 +324,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = store.mint_sub_resource_id();
         let sequence = store.next_sequence();
 
-        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
-            CreateResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
-            })
-        })?;
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(crate::state::state_unavailable)?;
         api.resources.insert(
             id.clone(),
             ResourceEntry {

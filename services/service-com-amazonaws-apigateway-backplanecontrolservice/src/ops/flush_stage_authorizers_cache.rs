@@ -185,16 +185,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
         let mut store = state.lock();
-        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
-            FlushStageAuthorizersCacheErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
-            })
-        })?;
-        let stage = api.stages.get_mut(&input.stage_name).ok_or_else(|| {
-            FlushStageAuthorizersCacheErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::NO_SUCH_STAGE.to_string()),
-            })
-        })?;
+        let stage = store
+            .stage_mut(&input.rest_api_id, &input.stage_name)
+            .map_err(|message| {
+                FlushStageAuthorizersCacheErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(message),
+                })
+            })?;
         // The flush is recorded as the instant from which cached authorizer results of
         // this stage are invalid, so a result cached before this call is a miss and one
         // cached after it is not. A repeated flush is accepted and advances the

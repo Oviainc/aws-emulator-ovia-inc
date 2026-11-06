@@ -1210,22 +1210,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = crate::state::now();
         let mut store = state.lock();
-        let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
-            UpdateStageErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
-            })
-        })?;
+        // The `(restApiId, stageName)` pair is resolved as ONE lookup for the stage the URI
+        // addresses, so an identifier no stored API answers to is reported as the stage.
+        //
         // Patched on a COPY: a list whose later op is refused leaves the stored stage
         // untouched, rather than keeping the ops before it.
-        let mut updated = api
-            .stages
-            .get(&input.stage_name)
-            .ok_or_else(|| {
+        let (api, stage) = store
+            .api_and_stage(&input.rest_api_id, &input.stage_name)
+            .map_err(|message| {
                 UpdateStageErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::NO_SUCH_STAGE.to_string()),
+                    message: Some(message),
                 })
-            })?
-            .clone();
+            })?;
+        let mut updated = stage.clone();
         let deployments: BTreeSet<String> = api.deployments.keys().cloned().collect();
         // The account singleton's CloudWatch Logs role, which a patch that turns this
         // stage's execution logging on is a configuration of: a role set to no ARN at all

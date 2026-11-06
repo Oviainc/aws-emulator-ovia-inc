@@ -307,6 +307,20 @@ pub fn accepted_timeout(requested: i32) -> Result<i32, String> {
     Ok(requested)
 }
 
+/// The `BadRequestException` message for an integration whose own HTTP method is missing
+/// where the integration type needs one, or is carried as a blank value.
+///
+/// API Gateway reads that member as an ENUMERATION of HTTP verbs — the request carries it
+/// as `integrationHttpMethod`, which is the integration record's own `httpMethod`
+/// (`smithy_query(query="operation", operation="PutIntegration")`: `integrationHttpMethod`
+/// has `jsonName: httpMethod`) — and a value no enumeration can be read out of is refused
+/// with ENTIRELY FIXED TEXT naming that member in the record's own spelling: neither the
+/// integration type, the submitted value nor the wire member name appears. One copy, so
+/// the call that creates an integration and the one that patches it (both check the record
+/// through [`validate_integration`]) say the same thing about the same empty value.
+pub const EMPTY_INTEGRATION_HTTP_METHOD: &str =
+    "Enumeration value for HttpMethod must be non-empty";
+
 /// The refusal for a private integration that names no VPC link: a fixed sentence saying
 /// what `connectionId` must be set to on that connection type, which quotes nothing of
 /// the request back.
@@ -469,6 +483,13 @@ pub fn validate_integration(
     }
 
     match integration.http_method.as_deref() {
+        // A value that is all whitespace carries no enumeration value at all, so it is the
+        // same empty member as one that was never set — and only emptiness is read off the
+        // trimmed value: the verb itself is judged exactly as the record carries it, so a
+        // padded verb stays the invalid value it was.
+        Some(verb) if verb.trim().is_empty() => {
+            return Err(EMPTY_INTEGRATION_HTTP_METHOD.to_string())
+        }
         Some(verb) => {
             if !HTTP_METHODS.contains(&verb) {
                 return Err(format!(
@@ -486,11 +507,7 @@ pub fn validate_integration(
             }
         }
         None if is_mock => {}
-        None => {
-            return Err(format!(
-                "integrationHttpMethod is required for an integration of type {integration_type}"
-            ))
-        }
+        None => return Err(EMPTY_INTEGRATION_HTTP_METHOD.to_string()),
     }
 
     match integration.uri.as_deref().map(str::trim) {

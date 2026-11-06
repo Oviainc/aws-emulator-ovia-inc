@@ -168,14 +168,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(crate::state::state_unavailable)?;
         let mut store = state.lock();
 
-        // Both identifiers are resolved against stored state before anything is removed,
-        // each naming its own record so the refusal says which one was not found — the
-        // same order `GetStage` resolves them in.
-        let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
-            DeleteStageErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
-            })
-        })?;
+        // Both identifiers are resolved as ONE lookup for the stage the URI addresses,
+        // before anything is removed — the same lookup `GetStage` makes — so an identifier
+        // no stored API answers to is reported as the stage that cannot be resolved.
+        store
+            .api_and_stage(&input.rest_api_id, &input.stage_name)
+            .map_err(|message| {
+                DeleteStageErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(message),
+                })
+            })?;
         // "Deletes a Stage resource": removing the record is what makes a later `GetStage`
         // — and the API's `GetStages` listing — stop reporting it. A stage name that names
         // no stage is nothing to delete, so the call is refused rather than answering a
@@ -195,12 +197,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DeleteStage` models no error for them and the model states no rule for
         // rewriting them, so this call leaves them exactly as `DeleteRestApi` does, and
         // dropping an association is `UpdateApiKey`'s / `UpdateUsagePlan`'s job.
-        if !api.stages.contains_key(&input.stage_name) {
-            return Err(DeleteStageErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::NO_SUCH_STAGE.to_string()),
-            })
-            .into());
-        }
 
         // A `BasePathMapping` that names this stage ROUTES to it: the calls arriving on
         // its base path of a custom domain name are served by this stage, so removing the

@@ -9,14 +9,19 @@
 //! from `rest_api_lifecycle`.
 //!
 //! The RULE under test, which is this service's and not one operation's: an API Gateway
-//! operation that cannot resolve the API identifier a request supplies states that
-//! identifier back, qualified by the account the lookup ran in —
+//! operation whose own target is the API — the REST API record itself, a collection of it,
+//! or an API an input member REFERENCES — states an identifier it cannot resolve back,
+//! qualified by the account the lookup ran in —
 //! `Invalid API identifier specified <accountId>:<restApiId>` — so the sentence is built
 //! from the request and is the same whichever operation resolved the identifier and
 //! whichever error class that operation models for the failure.
 //!
+//! Where the rule STOPS: a call addressed by a record NESTED under the API — a stage of
+//! it, a resource of it — resolves that record by its whole key in one lookup and reports
+//! THAT record instead, which `nested_record_refusals` asserts.
+//!
 //! The rows span what the rule generalises over rather than repeating one recorded call:
-//! twenty operations that resolve a `restApiId` (so the sentence is shown not to be one
+//! fourteen operations that resolve a `restApiId` (so the sentence is shown not to be one
 //! handler's), a set of unknown identifiers differing in length, alphabet and case (so
 //! the identifier is shown to be quoted from the request rather than fixed), both
 //! bindings the identifier arrives on (a URI label and a body member), and both error
@@ -85,36 +90,6 @@ fn requests(
             None,
         ),
         (
-            "GetResource",
-            "GET",
-            format!("/restapis/{api}/resources/{resource}"),
-            None,
-        ),
-        (
-            "CreateResource",
-            "POST",
-            format!("/restapis/{api}/resources/{resource}"),
-            Some(json!({ "pathPart": "pets" })),
-        ),
-        (
-            "UpdateResource",
-            "PATCH",
-            format!("/restapis/{api}/resources/{resource}"),
-            Some(patch("/pathPart", "renamed")),
-        ),
-        (
-            "DeleteResource",
-            "DELETE",
-            format!("/restapis/{api}/resources/{resource}"),
-            None,
-        ),
-        (
-            "PutMethod",
-            "PUT",
-            format!("/restapis/{api}/resources/{resource}/methods/GET"),
-            Some(json!({ "authorizationType": "NONE" })),
-        ),
-        (
             "GetMethod",
             "GET",
             format!("/restapis/{api}/resources/{resource}/methods/GET"),
@@ -173,12 +148,6 @@ fn requests(
             "POST",
             format!("/restapis/{api}/stages"),
             Some(json!({ "stageName": "prod", "deploymentId": deployment })),
-        ),
-        (
-            "GetStage",
-            "GET",
-            format!("/restapis/{api}/stages/prod"),
-            None,
         ),
     ]
 }
