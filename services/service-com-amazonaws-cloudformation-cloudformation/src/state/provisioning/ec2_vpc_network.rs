@@ -30,6 +30,17 @@
 //! * `AWS::EC2::RouteTable`'s are `CreateRouteTable`'s own `VpcId` plus the tag set, which
 //!   reaches EC2 through the one call that tags a resource that exists ([`tag_resource`]).
 //!   "Ref returns the route table ID", which EC2 assigns.
+//! * `AWS::EC2::Route`'s are `CreateRoute`'s own members under the same names: the table the
+//!   route goes in, the ONE destination it matches on and the ONE target it points at. EC2
+//!   mints no identifier for a route — the delete addresses it by its table and its
+//!   destination — and "Ref returns the CloudFormation-generated ID of the resource", so this
+//!   resource keeps the identity CloudFormation computed for it.
+//! * `AWS::EC2::NatGateway`'s are `CreateNatGateway`'s own members under the same names, with
+//!   the tag set applied by the tagging call. "Ref returns the ID of the NAT gateway" — the
+//!   `nat-…` id EC2 assigns — and the gateway comes up in the non-terminal state that
+//!   service answers the create in, so the stack holds its creation open until
+//!   `DescribeNatGateways` reports it available ([`readiness`]) and holds its deletion open
+//!   until that service reports it deleted ([`removal`]).
 //! * `AWS::EC2::SubnetRouteTableAssociation`'s are `AssociateRouteTable`'s own `SubnetId` and
 //!   `RouteTableId`. The resource IS the association, and "Ref returns the ID of the subnet
 //!   route table association" — the `rtbassoc-…` id that call answers with. It is not a
@@ -61,7 +72,10 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use super::{call_query, xml_element, xml_elements, xml_scalar_children, Created, Refusal};
+use super::{
+    call_query, xml_element, xml_elements, xml_scalar_children, Created, Readiness, Refusal,
+    Removal,
+};
 use crate::state::provisioner::tags_of;
 use crate::state::StoredResource;
 
@@ -74,6 +88,8 @@ pub(super) const EC2_INTERNET_GATEWAY: &str = "AWS::EC2::InternetGateway";
 pub(super) const EC2_VPN_GATEWAY: &str = "AWS::EC2::VPNGateway";
 pub(super) const EC2_VPC_GATEWAY_ATTACHMENT: &str = "AWS::EC2::VPCGatewayAttachment";
 pub(super) const EC2_EIP: &str = "AWS::EC2::EIP";
+pub(super) const EC2_ROUTE: &str = "AWS::EC2::Route";
+pub(super) const EC2_NAT_GATEWAY: &str = "AWS::EC2::NatGateway";
 
 /// Amazon EC2's signing name and the API version a request names beside the action, from its
 /// model (`sigv4Name: ec2`, `version: 2016-11-15`) — the same pair the VPC and subnet arms of
@@ -119,6 +135,10 @@ pub(in crate::state) enum Kind {
     VpcGatewayAttachment,
     /// `AWS::EC2::EIP`.
     ElasticIp,
+    /// `AWS::EC2::Route`.
+    Route,
+    /// `AWS::EC2::NatGateway`.
+    NatGateway,
 }
 
 /// The kind `resource_type` names, or `None` for a type this module does not own.
@@ -131,6 +151,8 @@ pub(super) fn kind_of(resource_type: &str) -> Option<Kind> {
         EC2_VPN_GATEWAY => Some(Kind::VpnGateway),
         EC2_VPC_GATEWAY_ATTACHMENT => Some(Kind::VpcGatewayAttachment),
         EC2_EIP => Some(Kind::ElasticIp),
+        EC2_ROUTE => Some(Kind::Route),
+        EC2_NAT_GATEWAY => Some(Kind::NatGateway),
         _ => None,
     }
 }
@@ -232,6 +254,86 @@ const VPC_ENDPOINT_LIST_MEMBERS: &[(&str, &str)] = &[
     ("SubnetIds", "SubnetId"),
 ];
 
+/// Every property `AWS::EC2::Route` publishes, from AWS's CloudFormation resource reference
+/// for the type read against `CreateRoute`'s member list
+/// (`smithy_query(query="operation",operation="CreateRoute")`): each one is that call's own
+/// member under the same name, so the declaration IS the request.
+const ROUTE_PROPERTIES: &[&str] = &[
+    "CarrierGatewayId",
+    "CoreNetworkArn",
+    "DestinationCidrBlock",
+    "DestinationIpv6CidrBlock",
+    "DestinationPrefixListId",
+    "EgressOnlyInternetGatewayId",
+    "GatewayId",
+    "InstanceId",
+    "LocalGatewayId",
+    "NatGatewayId",
+    "NetworkInterfaceId",
+    "RouteTableId",
+    "TransitGatewayId",
+    "VpcEndpointId",
+    "VpcPeeringConnectionId",
+];
+
+/// The three `AWS::EC2::Route` properties that are DESTINATIONS: a route matches on exactly
+/// one of them, and it is what identifies the route inside its table — which is how the
+/// delete addresses it ([`delete_route`]), EC2 minting no identifier for a route.
+const ROUTE_DESTINATIONS: &[&str] = &[
+    "DestinationCidrBlock",
+    "DestinationIpv6CidrBlock",
+    "DestinationPrefixListId",
+];
+
+/// Every property `AWS::EC2::NatGateway` publishes that `CreateNatGateway` takes, from the
+/// same reference read against that call's member list
+/// (`smithy_query(query="operation",operation="CreateNatGateway")`).
+///
+/// `MaxDrainDurationSeconds` is not among them HERE: it is how long a DELETE drains the
+/// gateway's connections, which `DeleteNatGateway` takes no member for in this model, so a
+/// declaration carrying it is refused rather than created without it.
+const NAT_GATEWAY_PROPERTIES: &[&str] = &[
+    "AllocationId",
+    "ConnectivityType",
+    "PrivateIpAddress",
+    "SecondaryAllocationIds",
+    "SecondaryPrivateIpAddressCount",
+    "SecondaryPrivateIpAddresses",
+    "SubnetId",
+    "Tags",
+];
+
+/// The `AWS::EC2::NatGateway` properties that are `CreateNatGateway`'s own SCALAR members
+/// under the same name, each travelling as that member's own `ec2Query` parameter.
+const NAT_GATEWAY_SCALAR_MEMBERS: &[&str] = &[
+    "AllocationId",
+    "ConnectivityType",
+    "PrivateIpAddress",
+    "SecondaryPrivateIpAddressCount",
+    "SubnetId",
+];
+
+/// The `AWS::EC2::NatGateway` properties that are LIST members of that call, each against the
+/// parameter name `ec2Query` flattens it under — the member's own `xmlName`, numbered from one
+/// (`SecondaryAllocationId.1`).
+const NAT_GATEWAY_LIST_MEMBERS: &[(&str, &str)] = &[
+    ("SecondaryAllocationIds", "SecondaryAllocationId"),
+    ("SecondaryPrivateIpAddresses", "SecondaryPrivateIpAddress"),
+];
+
+/// The states Amazon EC2 reports a NAT gateway in (`NatGatewayState`): the one it answers a
+/// create in, the one a usable gateway is in, and the one a deletion has finished in. The
+/// `deleting` state a deletion passes through is every other state a deleted gateway can be
+/// reported in, so it is read as "not gone yet" rather than named.
+const NAT_GATEWAY_PENDING: &str = "pending";
+const NAT_GATEWAY_AVAILABLE: &str = "available";
+const NAT_GATEWAY_DELETED: &str = "deleted";
+
+/// Amazon EC2's error code for a NAT gateway this account does not hold
+/// (`NatGatewayNotFound`), which does NOT carry [`NOT_FOUND_SUFFIX`] — so the calls that
+/// treat "not there" as the state they asked for name it themselves.
+const NAT_GATEWAY_NOT_FOUND: &str = "NatGatewayNotFound";
+
 /// Create the resource one of these types declares, in Amazon EC2 itself — so a client that
 /// deployed the stack and then calls `ec2 describe-route-tables` (or `describe-vpc-endpoints`)
 /// with the id the stack published reads it back, and the subnet the stack deployed really
@@ -257,6 +359,8 @@ pub(super) async fn create(
         Kind::VpnGateway => create_vpn_gateway(ctx, region, resource, propagated).await,
         Kind::VpcGatewayAttachment => attach_gateway(ctx, region, resource).await,
         Kind::ElasticIp => allocate_address(ctx, region, resource, propagated).await,
+        Kind::Route => create_route(ctx, region, resource).await,
+        Kind::NatGateway => create_nat_gateway(ctx, region, resource, propagated).await,
     }
 }
 
@@ -393,6 +497,11 @@ pub(super) async fn delete(
             )
             .map(|_| ())
         }
+        // A route is addressed by the table it is in and the destination it matches, not by
+        // an id: EC2 mints none for it, so the delete reads both off the declaration this
+        // resource was created from.
+        Kind::Route => delete_route(ctx, region, resource).await,
+        Kind::NatGateway => delete_nat_gateway(ctx, region, &id).await,
     }
 }
 
@@ -783,6 +892,300 @@ async fn allocate_address(
     })
 }
 
+/// Add the route an `AWS::EC2::Route` declares to the route table it declares, in Amazon EC2 —
+/// so the subnets on that table really reach the target the template declared rather than only
+/// the VPC's own block.
+///
+/// Every property of the type is `CreateRoute`'s own member under the same name, so the
+/// declaration IS the request: the table, the one destination the route matches on and the one
+/// target it points at, each carrying the identifier the owning service minted for the resource
+/// of the same template it names ([`super::reconcile`] re-points a reference at it).
+///
+/// EC2 assigns no identifier to a route — `CreateRoute` answers only whether it stored one, and
+/// both the delete and the `DescribeRouteTables` entry address a route by its table and its
+/// destination — so this answers no physical id and the resource keeps the one CloudFormation
+/// computed.
+async fn create_route(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    refuse_unmapped_properties(resource, ROUTE_PROPERTIES)?;
+    required(resource, "RouteTableId")?;
+    // A route matches on ONE destination, and a request carrying none identifies no route: the
+    // declaration is refused here naming the three it may state one in, rather than sent as a
+    // request that cannot say where the route matches.
+    if route_destination(resource).is_none() {
+        return Err(missing_destination(resource));
+    }
+    let mut parameters: Vec<(String, String)> = Vec::new();
+    for member in ROUTE_PROPERTIES {
+        if let Some(value) = scalar(resource, member) {
+            parameters.push(((*member).to_string(), value));
+        }
+    }
+    call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "CreateRoute",
+        &parameters,
+    )
+    .await?;
+    Ok(Created::default())
+}
+
+/// Take the route an `AWS::EC2::Route` added back out of its table.
+///
+/// The counterpart of [`create_route`], addressing the route the only way EC2 lets one be
+/// addressed: the table it is in and the destination it matches, both read off the declaration.
+/// A route EC2 no longer holds — or a table it no longer holds — is already in the state the
+/// delete asks for ([`NOT_FOUND_SUFFIX`], which `InvalidRoute.NotFound` and
+/// `InvalidRouteTableID.NotFound` both carry).
+async fn delete_route(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let route_table_id = required(resource, "RouteTableId")?;
+    let (member, destination) =
+        route_destination(resource).ok_or_else(|| missing_destination(resource))?;
+    forgiving(
+        call_query(
+            ctx,
+            EC2_SIGNING_NAME,
+            region,
+            EC2_API_VERSION,
+            "DeleteRoute",
+            &[
+                ("RouteTableId".to_string(), route_table_id),
+                (member.to_string(), destination),
+            ],
+        )
+        .await,
+    )
+    .map(|_| ())
+}
+
+/// The ONE destination an `AWS::EC2::Route` declaration matches on, as the member that carries
+/// it and its value — what identifies the route inside its table.
+///
+/// Read off the declaration rather than kept on the resource, so the create and the delete
+/// cannot disagree about which route the resource is.
+fn route_destination(resource: &StoredResource) -> Option<(&'static str, String)> {
+    ROUTE_DESTINATIONS
+        .iter()
+        .find_map(|member| scalar(resource, member).map(|value| (*member, value)))
+}
+
+/// The refusal for a route declaration that states no destination at all, naming the three
+/// properties one of which identifies the route.
+fn missing_destination(resource: &StoredResource) -> Refusal {
+    Refusal {
+        code: "InvalidRequest".to_string(),
+        message: format!(
+            "{} requires one of the {} properties",
+            resource.resource_type,
+            ROUTE_DESTINATIONS.join(", ")
+        ),
+    }
+}
+
+/// Create the NAT gateway an `AWS::EC2::NatGateway` declares, in Amazon EC2 — so the private
+/// subnets whose route tables point at it really reach the internet through a gateway that
+/// service holds.
+///
+/// "Ref returns the ID of the NAT gateway" — the `nat-…` id EC2 assigns, which is what this
+/// answers as the resource's physical id, so a route of the same template is created with the
+/// id EC2 knows the gateway by and `DescribeNatGateways` reports the id the stack published.
+async fn create_nat_gateway(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    refuse_unmapped_properties(resource, NAT_GATEWAY_PROPERTIES)?;
+    required(resource, "SubnetId")?;
+    let mut parameters: Vec<(String, String)> = Vec::new();
+    for member in NAT_GATEWAY_SCALAR_MEMBERS {
+        if let Some(value) = scalar(resource, member) {
+            parameters.push(((*member).to_string(), value));
+        }
+    }
+    for (property, member) in NAT_GATEWAY_LIST_MEMBERS {
+        for (index, entry) in list(resource, property).iter().enumerate() {
+            parameters.push((format!("{member}.{}", index + 1), entry.clone()));
+        }
+    }
+    let answered = call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "CreateNatGateway",
+        &parameters,
+    )
+    .await?;
+    let nat_gateway_id = reported(&answered, "natGateway", "natGatewayId")?;
+    tag_resource(
+        ctx,
+        region,
+        &nat_gateway_id,
+        &tags_of(&resource.properties, propagated),
+    )
+    .await?;
+    // The one attribute the type publishes beside its `Ref`: "Fn::GetAtt NatGatewayId — the ID
+    // of the NAT gateway", which IS the id EC2 assigned.
+    let mut attributes = BTreeMap::new();
+    attributes.insert("NatGatewayId".to_string(), nat_gateway_id.clone());
+    Ok(Created {
+        physical_resource_id: Some(nat_gateway_id),
+        attributes,
+    })
+}
+
+/// Delete the NAT gateway a stack created, addressed by the id EC2 minted for it.
+///
+/// A gateway EC2 no longer holds is already in the state the delete asks for
+/// ([`NAT_GATEWAY_NOT_FOUND`], which carries no [`NOT_FOUND_SUFFIX`]), and a gateway a delete
+/// has already been asked for is answered by that service as the deletion already under way.
+async fn delete_nat_gateway(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    nat_gateway_id: &str,
+) -> Result<(), Refusal> {
+    match call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "DeleteNatGateway",
+        &[("NatGatewayId".to_string(), nat_gateway_id.to_string())],
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == NAT_GATEWAY_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Whether the resource one of these types created is ready for a client to use.
+///
+/// Every one of them EXISTS from the moment its create answers — the table takes its routes,
+/// the association holds, the gateway is there to be attached, the attachment is in force, the
+/// address is allocated, the route is in its table, and the `pending` window Amazon EC2 reports
+/// a new VPC ENDPOINT in is that service's own transition rather than a resource that has yet
+/// to come into being.
+///
+/// A NAT GATEWAY is the one exception, for the reason the Amazon EBS volume arm of
+/// [`super::super::provisioner`] states: `CreateNatGateway` answers the gateway in
+/// [`NAT_GATEWAY_PENDING`], nothing routes through it in that state, and that service reports
+/// when it reaches [`NAT_GATEWAY_AVAILABLE`] — so the stack holds the resource's creation open
+/// until it does, and a client that reads the stack as complete finds a gateway it can route
+/// through. A state no wait brings a NEW gateway out of (either state of a deletion, or a
+/// gateway that service holds none of) fails the resource with what that service reports,
+/// rather than waiting the window out.
+pub(super) async fn readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    kind: Kind,
+    physical_resource_id: &str,
+) -> Result<Readiness, Refusal> {
+    if kind != Kind::NatGateway {
+        return Ok(Readiness::Ready);
+    }
+    let Some(state) = nat_gateway_state(ctx, region, physical_resource_id).await? else {
+        return Ok(Readiness::Failed(format!(
+            "Amazon EC2 holds no NAT gateway for {physical_resource_id}"
+        )));
+    };
+    match state.as_str() {
+        NAT_GATEWAY_AVAILABLE => Ok(Readiness::Ready),
+        NAT_GATEWAY_PENDING => Ok(Readiness::Pending(state)),
+        other => Ok(Readiness::Failed(format!(
+            "Amazon EC2 reports NAT gateway {physical_resource_id} in state {other}"
+        ))),
+    }
+}
+
+/// Whether the service that owns a deleted resource has finished removing it.
+///
+/// Each of these deletes takes the resource away as it answers — Amazon EC2 reports no state a
+/// deleted route table, association, endpoint, gateway, attachment, address or route is still
+/// being removed in — except the NAT gateway, which `DeleteNatGateway` moves into `deleting`
+/// and that service reports [`NAT_GATEWAY_DELETED`] when it has finished with. So the stack
+/// holds that resource's deletion open until it is gone there, and a client that reads the
+/// deletion as complete finds nothing still being torn down.
+pub(super) async fn removal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    kind: Kind,
+    physical_resource_id: &str,
+) -> Result<Removal, Refusal> {
+    if kind != Kind::NatGateway {
+        return Ok(Removal::Gone);
+    }
+    match nat_gateway_state(ctx, region, physical_resource_id).await? {
+        None => Ok(Removal::Gone),
+        Some(state) if state == NAT_GATEWAY_DELETED => Ok(Removal::Gone),
+        Some(state) => Ok(Removal::Pending(state)),
+    }
+}
+
+/// The state Amazon EC2 reports the NAT gateway `nat_gateway_id` in, or `None` for one it does
+/// not hold ([`NAT_GATEWAY_NOT_FOUND`]).
+///
+/// The one read behind [`readiness`] and [`removal`], so the two ask that service the same
+/// question and read its answer the same way.
+async fn nat_gateway_state(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    nat_gateway_id: &str,
+) -> Result<Option<String>, Refusal> {
+    let answered = match call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "DescribeNatGateways",
+        &[("NatGatewayId.1".to_string(), nat_gateway_id.to_string())],
+    )
+    .await
+    {
+        Ok(answered) => answered,
+        Err(refusal)
+            if refusal.code == NAT_GATEWAY_NOT_FOUND
+                || refusal.code.ends_with(NOT_FOUND_SUFFIX) =>
+        {
+            return Ok(None)
+        }
+        Err(refusal) => return Err(refusal),
+    };
+    // The gateway's own `<state>`, read out of the answer's result set rather than as the first
+    // element of that name anywhere in the document.
+    Ok(set_entry(&answered, "natGatewaySet", "state"))
+}
+
+/// One member of the FIRST entry of an `ec2Query` answer's result set, as the non-empty text it
+/// holds.
+///
+/// The set counterpart of [`reported`]: the read is scoped to the `<…Set>` the answer nests its
+/// entries in and then to that set's first `<item>`'s own direct children, so a member of the
+/// same name nested deeper cannot be mistaken for it. Every read through this names ONE id, so
+/// the set holds one entry.
+fn set_entry(document: &str, set: &str, member: &str) -> Option<String> {
+    let entries = document
+        .find(&format!("<{set}>"))
+        .map(|start| &document[start..])?;
+    xml_scalar_children(entries, "item")
+        .get(member)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 /// One element of an `ec2Query` answer's own members, as the non-empty text it holds.
 ///
 /// The counterpart of [`reported`] for a call that answers its members at the top of the
@@ -989,6 +1392,27 @@ mod tests {
                  {EC2_VPC_ENDPOINT}, got none"
             );
         }
+        for member in NAT_GATEWAY_SCALAR_MEMBERS {
+            assert!(
+                NAT_GATEWAY_PROPERTIES.contains(member),
+                "case {member:?}: expected the sent member to be a published property of \
+                 {EC2_NAT_GATEWAY}, got none"
+            );
+        }
+        for (property, _) in NAT_GATEWAY_LIST_MEMBERS {
+            assert!(
+                NAT_GATEWAY_PROPERTIES.contains(property),
+                "case {property:?}: expected the sent list to be a published property of \
+                 {EC2_NAT_GATEWAY}, got none"
+            );
+        }
+        for member in ROUTE_DESTINATIONS {
+            assert!(
+                ROUTE_PROPERTIES.contains(member),
+                "case {member:?}: expected the destination to be a published property of \
+                 {EC2_ROUTE}, got none"
+            );
+        }
     }
 
     /// Each of the three types is owned by this module, and nothing else is.
@@ -1008,8 +1432,9 @@ mod tests {
                 Some(Kind::VpcGatewayAttachment),
             ),
             (EC2_EIP, Some(Kind::ElasticIp)),
+            (EC2_ROUTE, Some(Kind::Route)),
+            (EC2_NAT_GATEWAY, Some(Kind::NatGateway)),
             ("AWS::EC2::VPC", None),
-            ("AWS::EC2::Route", None),
             ("AWS::EC2::EIPAssociation", None),
         ];
         for (resource_type, expected) in cases {

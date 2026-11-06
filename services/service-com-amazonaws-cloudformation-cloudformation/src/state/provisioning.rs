@@ -672,11 +672,12 @@ impl Owner {
             // Each of these resources EXISTS from the moment its create answers: the table
             // takes its routes, the association holds, the gateway is there to be attached,
             // the attachment is in force, the address is allocated, and the endpoint's own
-            // route is in the tables the create named. The `pending` window Amazon EC2
-            // reports a new endpoint in is that service's own transition, not a resource that
-            // has yet to come into being — the case [`lambda_function::readiness`] states for
-            // a function and an `AWS::RDS::DBInstance` for a database.
-            Self::Ec2VpcNetwork(_) => Ok(Readiness::Ready),
+            // route is in the tables the create named. A NAT GATEWAY is the one that comes up
+            // in a state nothing routes through, which that arm waits out
+            // ([`ec2_vpc_network::readiness`]).
+            Self::Ec2VpcNetwork(kind) => {
+                ec2_vpc_network::readiness(ctx, region, kind, physical_resource_id).await
+            }
             // A pool exists, and its role configuration is in force, from the moment the
             // owning service's own call answers.
             Self::CognitoIdentityPool(_) => Ok(cognito_identity_pool::ready()),
@@ -751,9 +752,12 @@ impl Owner {
             Self::LambdaPermission => Ok(Removal::Gone),
             // Each of these deletes takes the resource away as it answers — Amazon EC2
             // reports no state a deleted route table, association, endpoint, gateway,
-            // attachment or address is still being removed in — so there is nothing to wait
-            // for either.
-            Self::Ec2VpcNetwork(_) => Ok(Removal::Gone),
+            // attachment, address or route is still being removed in — except the NAT
+            // gateway, whose `deleting` state that arm waits out
+            // ([`ec2_vpc_network::removal`]).
+            Self::Ec2VpcNetwork(kind) => {
+                ec2_vpc_network::removal(ctx, region, kind, physical_resource_id).await
+            }
             // `DeleteIdentityPool` takes the pool away as it answers, and the call that
             // clears a pool's roles leaves nothing behind either.
             Self::CognitoIdentityPool(_) => Ok(Removal::Gone),

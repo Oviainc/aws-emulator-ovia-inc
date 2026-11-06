@@ -841,6 +841,23 @@ pub(super) fn return_values(
             let id = ec2_network_identity("rtb", "RouteTableId", name, &mut attributes);
             (id, attributes)
         }
+        // An Elastic IP address, whose published return values are the two halves of what
+        // `AllocateAddress` answers: "Ref returns the Elastic IP address" and "AllocationId
+        // — the ID that represents the allocation of the Elastic IP address". Only the
+        // allocation id has a FORM a rule here can compute (Amazon EC2's own `eipalloc-` plus
+        // 17 hexadecimal characters), which is the stand-in a NAT gateway of the same
+        // template is resolved against before the address is allocated and which the
+        // deployment then re-points at the allocation that service answered. The address
+        // itself is this resource's physical id, so it is the identity's own stand-in rather
+        // than an attribute computed beside it, and the create reports the address EC2
+        // allocated ([`super::provisioning`]).
+        EC2_EIP => {
+            attributes.insert(
+                "AllocationId".to_string(),
+                generated_service_id("eipalloc", name, EC2_ID_HEX_DIGITS),
+            );
+            (name.to_string(), attributes)
+        }
         EC2_NAT_GATEWAY => {
             let id = ec2_network_identity("nat", "NatGatewayId", name, &mut attributes);
             (id, attributes)
@@ -1443,6 +1460,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         EC2_SECURITY_GROUP => &["GroupId"],
         EC2_INTERNET_GATEWAY => &["InternetGatewayId"],
         EC2_ROUTE_TABLE => &["RouteTableId"],
+        EC2_EIP => &["AllocationId"],
         EC2_NAT_GATEWAY => &["NatGatewayId"],
         EC2_DHCP_OPTIONS => &["DhcpOptionsId"],
         EC2_VPN_GATEWAY => &["VPNGatewayId"],
@@ -2968,6 +2986,11 @@ pub const EC2_NAT_GATEWAY: &str = "AWS::EC2::NatGateway";
 pub const EC2_VPC_ENDPOINT: &str = "AWS::EC2::VPCEndpoint";
 pub const EC2_DHCP_OPTIONS: &str = "AWS::EC2::DHCPOptions";
 pub const EC2_VPN_GATEWAY: &str = "AWS::EC2::VPNGateway";
+
+/// `AWS::EC2::EIP`: an Elastic IP address of the account. Not a VPC-network type whose
+/// identity is an Amazon EC2 `<prefix>-` id — "Ref returns the Elastic IP address" — but its
+/// `AllocationId` return value is one, which is why it is read here.
+pub const EC2_EIP: &str = "AWS::EC2::EIP";
 
 /// `AWS::EC2::Volume`: an Amazon EBS volume. It is not a VPC-network type, but its identity
 /// is read exactly the same way — `CreateVolume` takes no name, Amazon EC2 assigns the

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRoute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRoute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes one route back out of a stored route table — the route whose
+//! destination the request names — and answers the modelled empty body (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::remove_route`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRoute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +150,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRoute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRouteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRoute"))
+        // `ctx` carries request metadata only; this operation reads none of it — a route is
+        // named by the table it is in. The store is reached through the engine on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "Deletes the specified route from the specified route table": WHICH route is the
+        // destination it matches on, and a route matches on ONE destination — the member it
+        // carries — so none and more than one are both refusals, exactly as they are for the
+        // create that stored it.
+        let destinations = [
+            (
+                "destinationCidrBlock",
+                "destination-cidr-block",
+                input.destination_cidr_block.as_deref(),
+            ),
+            (
+                "destinationIpv6CidrBlock",
+                "destination-ipv6-cidr-block",
+                input.destination_ipv6_cidr_block.as_deref(),
+            ),
+            (
+                "destinationPrefixListId",
+                "destination-prefix-list-id",
+                input.destination_prefix_list_id.as_deref(),
+            ),
+        ];
+        let named: Vec<(&str, &str, &str)> = destinations
+            .iter()
+            .filter_map(|(member, filter, value)| {
+                value
+                    .filter(|value| !value.is_empty())
+                    .map(|value| (*member, *filter, value))
+            })
+            .collect();
+        let Some(&(member, destination_name, destination)) = named.first() else {
+            return Err(state::missing_parameter(
+                "The request must contain either the parameter destinationCidrBlock, \
+                 destinationIpv6CidrBlock or destinationPrefixListId",
+            ));
+        };
+        if named.len() > 1 {
+            return Err(state::invalid_parameter_combination(format!(
+                "The parameters {named} cannot be used together",
+                named = named
+                    .iter()
+                    .map(|(member, _, _)| *member)
+                    .collect::<Vec<&str>>()
+                    .join(", "),
+            )));
+        }
+        // The destination is compared in the form the create STORED it in: "we modify the
+        // specified CIDR block to its canonical form" (`CreateRouteRequest$
+        // DestinationCidrBlock`), so the same block written either way addresses the same
+        // route rather than one the table is reported as not holding.
+        let destination = match member {
+            "destinationCidrBlock" => match state::canonical_ipv4_cidr(destination) {
+                Ok(canonical) => canonical,
+                Err(_) => {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Value ({destination}) for parameter destinationCidrBlock is invalid. \
+                         This is not a valid CIDR block."
+                    )))
+                }
+            },
+            "destinationIpv6CidrBlock" => match state::canonical_ipv6_cidr(destination) {
+                Ok(canonical) => canonical,
+                Err(_) => {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Value ({destination}) for parameter destinationIpv6CidrBlock is \
+                         invalid. This is not a valid IPv6 CIDR block."
+                    )))
+                }
+            },
+            _ => destination.to_string(),
+        };
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "The ID of the route table": an id this account holds no table for is a refusal,
+        // not a route taken out of no table.
+        let Some(route_table) = store.route_tables.get(&input.route_table_id) else {
+            return Err(state::invalid_route_table_id_not_found(&input.route_table_id));
+        };
+        // The route this request addresses, if the table holds one for that destination:
+        // what says whether the delete has anything to take away, and whether what it names
+        // is the local route no caller may remove.
+        let local = route_table
+            .routes
+            .iter()
+            .flatten()
+            .any(|route| {
+                state::route_is_local(route) && route_destination(route) == destination.as_str()
+            });
+        if local {
+            return Err(state::invalid_parameter_value(format!(
+                "cannot remove local route {destination} in route table {route_table_id}",
+                route_table_id = input.route_table_id
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        if !store.remove_route(&input.route_table_id, &destination) {
+            return Err(state::invalid_route_not_found(
+                destination_name,
+                &destination,
+                &input.route_table_id,
+            ));
+        }
+        // `DeleteRoute` answers nothing but its status.
+        Ok(DeleteRouteOutput)
     }
+}
+
+/// The destination one stored route matches on — the member it carries, whichever of the
+/// three that is.
+///
+/// The stored counterpart of the one destination a request names, read here so the local
+/// route this operation refuses to remove is found by the same comparison the removal makes.
+fn route_destination(route: &Route) -> &str {
+    route
+        .destination_cidr_block
+        .as_deref()
+        .or(route.destination_ipv6_cidr_block.as_deref())
+        .or(route.destination_prefix_list_id.as_deref())
+        .unwrap_or_default()
 }

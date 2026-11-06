@@ -204,6 +204,21 @@ fn supporting_vpc() -> Value {
     json!({ "Vpc": { "Type": "AWS::EC2::VPC", "Properties": { "CidrBlock": VPC_CIDR } } })
 }
 
+/// The VPC and a SUBNET of it, which a row whose resource is created inside a subnet declares
+/// beside itself — a NAT gateway is created in one, and "this action creates a network
+/// interface in the specified subnet with a private IP address from the IP address range of
+/// the subnet" (`CreateNatGateway`), so that subnet has to be a resource of the same stack
+/// rather than an id nothing holds.
+fn supporting_vpc_and_subnet() -> Value {
+    json!({
+        "Vpc": { "Type": "AWS::EC2::VPC", "Properties": { "CidrBlock": VPC_CIDR } },
+        "Subnet": {
+            "Type": "AWS::EC2::Subnet",
+            "Properties": { "VpcId": { "Ref": "Vpc" }, "CidrBlock": "10.77.9.0/24" },
+        },
+    })
+}
+
 const IDENTITY_ROWS: &[IdentityRow] = &[
     IdentityRow {
         resource_type: "AWS::EC2::VPC",
@@ -251,8 +266,15 @@ const IDENTITY_ROWS: &[IdentityRow] = &[
         resource_type: "AWS::EC2::NatGateway",
         prefix: "nat",
         identifier_attribute: "NatGatewayId",
-        properties: |_| json!({ "SubnetId": "subnet-0a1b2c3d4e5f60718" }),
-        supporting: nothing_else,
+        // A PRIVATE gateway, the one form of the type whose declaration states no Elastic IP
+        // address: "you cannot specify an Elastic IP address with a private NAT gateway"
+        // (`CreateNatGatewayRequest$AllocationId`), and a public one is not created without
+        // one.
+        properties: |_| json!({
+            "SubnetId": { "Ref": "Subnet" },
+            "ConnectivityType": "private",
+        }),
+        supporting: supporting_vpc_and_subnet,
     },
     IdentityRow {
         resource_type: "AWS::EC2::DHCPOptions",
@@ -295,6 +317,38 @@ const IDENTITY_ROWS: &[IdentityRow] = &[
         supporting: supporting_vpc,
     },
 ];
+
+/// Read a stack until it reports a status no longer in progress, and answer that read's body.
+///
+/// A resource whose owning service answers its create while the resource is still coming up
+/// holds the stack at `CREATE_IN_PROGRESS` until that service reports it ready (a NAT gateway
+/// is `pending` when `CreateNatGateway` answers), so the status is POLLED the way a client
+/// polls it rather than read once after a fixed wait.
+async fn poll_to_terminal(router: &MultiServiceRouter, region: &str, stack_name: &str) -> String {
+    /// How long one read waits before the next, and how many times it reads.
+    const INTERVAL: Duration = Duration::from_millis(250);
+    const ATTEMPTS: usize = 40;
+
+    let mut described = String::new();
+    for _ in 0..ATTEMPTS {
+        let (status, body) =
+            cloudformation(router, region, "DescribeStacks", &[("StackName", stack_name)]).await;
+        assert_eq!(
+            status, 200,
+            "case {stack_name:?}: expected HTTP 200 from DescribeStacks, got {status} with body \
+             {body}"
+        );
+        described = body;
+        if !opt_element(&described, "StackStatus")
+            .unwrap_or_default()
+            .ends_with("_IN_PROGRESS")
+        {
+            break;
+        }
+        tokio::time::sleep(INTERVAL).await;
+    }
+    described
+}
 
 /// Every Amazon EC2 VPC-network type a stack declares reports the identifier its `Ref`
 /// return value publishes: the prefix EC2 mints it under followed by 17 hexadecimal
@@ -348,13 +402,7 @@ async fn a_declared_ec2_network_resource_reports_the_identifier_its_type_publish
         );
         tokio::time::sleep(PAST_PROVISIONING_SPANS).await;
 
-        let (status, described) =
-            cloudformation(&router, region, "DescribeStacks", &[("StackName", &stack_name)]).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected HTTP 200 from DescribeStacks, got {status} with body \
-             {described}"
-        );
+        let described = poll_to_terminal(&router, region, &stack_name).await;
         assert_eq!(
             opt_element(&described, "StackStatus").as_deref(),
             Some("CREATE_COMPLETE"),

@@ -148,6 +148,53 @@ pub fn route_limit_exceeded<E>() -> Scaffolded<E> {
     )
 }
 
+/// Refuse a route the named route table does not hold: HTTP 400
+/// [`super::INVALID_ROUTE_NOT_FOUND`] ("the specified route does not exist"), worded the way
+/// Amazon EC2 words this error class — the destination FILTER name the request addressed the
+/// route by (`destination-cidr-block`, `destination-ipv6-cidr-block`,
+/// `destination-prefix-list-id`) and the table it is not in.
+pub fn invalid_route_not_found<E>(
+    destination_name: &str,
+    destination: &str,
+    route_table_id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        super::INVALID_ROUTE_NOT_FOUND,
+        400,
+        format!(
+            "no route with {destination_name} {destination} in route table {route_table_id}"
+        ),
+    )
+}
+
+/// Whether one stored route matches on `destination` — the destination member it carries,
+/// whichever of the three that is.
+///
+/// The one reading of a stored route's destination, so the duplicate check a create makes
+/// ([`ComAmazonawsEc2Amazonec2State::route_table_holds_destination`]) and the route a delete
+/// takes away ([`ComAmazonawsEc2Amazonec2State::remove_route`]) cannot disagree about which
+/// route a destination names.
+fn route_matches_destination(route: &Route, destination: &str) -> bool {
+    [
+        route.destination_cidr_block.as_deref(),
+        route.destination_ipv6_cidr_block.as_deref(),
+        route.destination_prefix_list_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|held| held == destination)
+}
+
+/// Whether one stored route is the LOCAL route its table came with: the route to the table's
+/// own VPC, whose target is [`LOCAL_ROUTE_GATEWAY_ID`].
+///
+/// "You cannot modify or delete the local route" (Amazon VPC User Guide, "Route tables"), so
+/// a delete that names its destination is refused rather than cutting the VPC off from
+/// itself.
+pub fn route_is_local(route: &Route) -> bool {
+    route.gateway_id.as_deref() == Some(LOCAL_ROUTE_GATEWAY_ID)
+}
+
 /// Refuse an attachment the resource already has: HTTP 400
 /// [`super::RESOURCE_ALREADY_ASSOCIATED`], the code EC2's error list gives for exactly this
 /// — "the resource is already associated. For example, you might be trying to attach more
@@ -631,16 +678,9 @@ impl ComAmazonawsEc2Amazonec2State {
             .get(route_table_id)
             .and_then(|route_table| route_table.routes.as_deref())
             .is_some_and(|routes| {
-                routes.iter().any(|route| {
-                    [
-                        route.destination_cidr_block.as_deref(),
-                        route.destination_ipv6_cidr_block.as_deref(),
-                        route.destination_prefix_list_id.as_deref(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .any(|held| held == destination)
-                })
+                routes
+                    .iter()
+                    .any(|route| route_matches_destination(route, destination))
             })
     }
 
@@ -680,6 +720,29 @@ impl ComAmazonawsEc2Amazonec2State {
         };
         route_table.routes.get_or_insert_with(Vec::new).push(route);
         true
+    }
+
+    /// Remove the route the route table `route_table_id` holds for `destination`, and answer
+    /// whether one was removed.
+    ///
+    /// The counterpart of [`Self::insert_route`], reading a route's destination the one way
+    /// [`Self::route_table_holds_destination`] reads it — the member the route carries,
+    /// whichever of the three it is — so a delete addresses exactly the route a create
+    /// stored. A route record holds no caller-supplied bytes
+    /// ([`Self::insert_route`] charges none), so there is nothing to give back to the budget.
+    ///
+    /// `false`, with nothing written, for a table the store does not hold or one that holds
+    /// no route for that destination.
+    pub fn remove_route(&mut self, route_table_id: &str, destination: &str) -> bool {
+        let Some(route_table) = self.route_tables.get_mut(route_table_id) else {
+            return false;
+        };
+        let Some(routes) = route_table.routes.as_mut() else {
+            return false;
+        };
+        let held = routes.len();
+        routes.retain(|route| !route_matches_destination(route, destination));
+        held != routes.len()
     }
 
     /// Record that the subnet `subnet_id` is associated with the route table

@@ -656,6 +656,10 @@ mod delete_coip_pool;
 mod delete_network_acl;
 #[path = "all/delete_network_interface.rs"]
 mod delete_network_interface;
+// What `DeleteRoute` takes out of a route table: the ONE route the destination it names
+// matches, the table that route is in, and the refusals for what names no route of a table.
+#[path = "all/delete_route.rs"]
+mod delete_route;
 #[path = "all/delete_security_group.rs"]
 mod delete_security_group;
 #[path = "all/delete_vpc.rs"]
