@@ -325,6 +325,12 @@
 //! a caller asks for one ([`ComAmazonawsEc2Amazonec2State::insert_import_snapshot_task`]),
 //! and the describe answers "a list of zero or more import snapshot tasks".
 //!
+//! What the CLOCK owes a task an import is still running behind — the EBS snapshot its disk
+//! becomes, and the `active` -> `completed` move that snapshot being ready earns it — is
+//! kept beside the store as an [`ImportSnapshotConversion`], because `SnapshotTaskDetail`
+//! carries no member for an instant; see
+//! [`ComAmazonawsEc2Amazonec2State::complete_due_import_snapshot_conversions`].
+//!
 //! ## EBS volume modifications
 //!
 //! [`ComAmazonawsEc2Amazonec2State::volume_modifications`] holds, per `VolumeId`, the most
@@ -1992,6 +1998,14 @@ macro_rules! resource_tag_lists {
 // crate gains, so naming them beside the code that uses them keeps this slice off a line
 // nothing else of it touches.
 use crate::ops::types::{ImportImageOutput, ImportImageTask};
+
+// ---------------------------------------------------------------------------
+// VM import: the import snapshot tasks `ImportSnapshot` starts
+// ---------------------------------------------------------------------------
+
+// The shape that operation answers with, named here for the reason the two above are: the
+// slice that reads it keeps its own modelled names beside the code that uses them.
+use crate::ops::types::ImportSnapshotOutput;
 
 // ---------------------------------------------------------------------------
 // Application status checks: the configurations `DescribeApplicationStatusChecks` reports

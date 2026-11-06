@@ -247,7 +247,25 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// The caller-chosen bytes the record retains are charged against the store's budget
     /// here, so no path can store them uncharged.
-    pub fn insert_snapshot(&mut self, mut view: SnapshotView, started_at: SystemTime) -> String {
+    pub fn insert_snapshot(&mut self, view: SnapshotView, started_at: SystemTime) -> String {
+        self.insert_snapshot_completing_at(view, started_at, Instant::now() + TRANSITION_DELAY)
+    }
+
+    /// [`Self::insert_snapshot`] with the instant the `pending` -> `completed` move falls
+    /// due named by the writer.
+    ///
+    /// For a writer whose snapshot was DUE at an earlier instant than the one this write
+    /// runs at — the snapshot a VM import's conversion window owed, minted when the first
+    /// caller since that window observed it — so when the snapshot completes is fixed by the
+    /// call that started it rather than by when anybody looked. The reported completion
+    /// timestamp is the wall-clock instant that same move is still away by, so a snapshot
+    /// reported `completed` never carries one in the future.
+    pub fn insert_snapshot_completing_at(
+        &mut self,
+        mut view: SnapshotView,
+        started_at: SystemTime,
+        completed_at: Instant,
+    ) -> String {
         let snapshot_id = self.next_id(SNAPSHOT_ID_PREFIX);
         view.snapshot_id = Some(snapshot_id.clone());
         view.start_time = Some(system_time_to_date_time(started_at));
@@ -255,12 +273,11 @@ impl ComAmazonawsEc2Amazonec2State {
             view.tags.as_deref().unwrap_or_default(),
             view.description.as_deref(),
         ));
-        let completion_time = started_at
-            .checked_add(TRANSITION_DELAY)
-            .unwrap_or(started_at);
+        let still_to_run = completed_at.saturating_duration_since(Instant::now());
+        let completion_time = started_at.checked_add(still_to_run).unwrap_or(started_at);
         self.snapshots.insert(
             snapshot_id.clone(),
-            SnapshotRecord::started(view, Instant::now() + TRANSITION_DELAY, completion_time),
+            SnapshotRecord::started(view, completed_at, completion_time),
         );
         snapshot_id
     }

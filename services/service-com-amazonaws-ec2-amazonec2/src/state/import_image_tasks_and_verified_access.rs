@@ -170,25 +170,12 @@ impl ImportImageTaskRecord {
     /// The percentage of progress this import has made by `now`, as the string the
     /// `Progress` members carry.
     ///
-    /// Derived from the share of the import's window that has elapsed, and held below
-    /// [`MAX_ACTIVE_IMPORT_PROGRESS`] because a task still reporting progress has not
-    /// finished.
+    /// Derived from the share of the import's window that has elapsed, through the ONE
+    /// reader of that share ([`import_task_progress_at`]), so an import image task and an
+    /// import snapshot task cannot report two different percentages for the same elapsed
+    /// share of their window.
     pub fn progress_at(&self, now: Instant) -> String {
-        let window = self
-            .completed_at
-            .saturating_duration_since(self.started_at)
-            .as_nanos();
-        let elapsed = now
-            .saturating_duration_since(self.started_at)
-            .as_nanos()
-            .min(window);
-        let percent = elapsed
-            .saturating_mul(100)
-            .checked_div(window)
-            .and_then(|percent| u64::try_from(percent).ok())
-            .unwrap_or(MAX_ACTIVE_IMPORT_PROGRESS)
-            .min(MAX_ACTIVE_IMPORT_PROGRESS);
-        percent.to_string()
+        import_task_progress_at(self.started_at, self.completed_at, now)
     }
 
     /// This task as `ImportImage` reports it: [`Self::view_at`] through the members
@@ -215,6 +202,43 @@ impl ImportImageTaskRecord {
             usage_operation: view.usage_operation,
         }
     }
+}
+
+/// The size, in whole GiB, of the EBS volume a disk image of `disk_image_size` GiB needs:
+/// "the size of the uploaded disk image, in GiB" (`ClientData$UploadSize`) rounded UP,
+/// because a volume a GiB short of the disk could not hold it.
+///
+/// `None` for a size no disk has — a size the request never named is `None` before it gets
+/// here, and one that is not a finite number of at least one GiB names no volume either, so
+/// the caller falls back to the size it would have used anyway. The ONE reader of that
+/// rounding for every kind of VM import, so an imported AMI's root volume and an imported
+/// snapshot's volume cannot disagree about the same disk.
+pub fn imported_disk_volume_size(disk_image_size: f64) -> Option<i32> {
+    (disk_image_size.is_finite() && disk_image_size >= 1.0)
+        .then(|| i32::try_from(disk_image_size.ceil() as i64).unwrap_or(i32::MAX))
+}
+
+/// The percentage of progress an import running from `started_at` to `ends_at` has made by
+/// `now`, as the string an import task's `Progress` members carry.
+///
+/// Derived from the share of the import's window that has elapsed, and held below
+/// [`MAX_ACTIVE_IMPORT_PROGRESS`] because a task still reporting progress has not finished.
+/// The ONE reader of that share, for every kind of import task: a percentage is a fact of
+/// elapsed time, so no stored value could be right twice and no second definition of it
+/// could agree with this one.
+pub fn import_task_progress_at(started_at: Instant, ends_at: Instant, now: Instant) -> String {
+    let window = ends_at.saturating_duration_since(started_at).as_nanos();
+    let elapsed = now
+        .saturating_duration_since(started_at)
+        .as_nanos()
+        .min(window);
+    let percent = elapsed
+        .saturating_mul(100)
+        .checked_div(window)
+        .and_then(|percent| u64::try_from(percent).ok())
+        .unwrap_or(MAX_ACTIVE_IMPORT_PROGRESS)
+        .min(MAX_ACTIVE_IMPORT_PROGRESS);
+    percent.to_string()
 }
 
 /// The caller-chosen bytes one stored import image task holds: its description, the KMS
@@ -449,8 +473,7 @@ impl ComAmazonawsEc2Amazonec2State {
             .iter()
             .flatten()
             .filter_map(|detail| detail.disk_image_size)
-            .filter(|size| size.is_finite() && *size >= 1.0)
-            .map(|size| i32::try_from(size.ceil() as i64).unwrap_or(i32::MAX))
+            .filter_map(imported_disk_volume_size)
             .max()
             .unwrap_or(if windows {
                 WINDOWS_ROOT_VOLUME_SIZE

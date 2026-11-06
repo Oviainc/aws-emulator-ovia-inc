@@ -1939,6 +1939,18 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// (`DescribeImportSnapshotTasksResult$ImportSnapshotTasks`). `ImportSnapshot` is the
     /// writer, through [`Self::insert_import_snapshot_task`].
     pub import_snapshot_tasks: BTreeMap<String, ImportSnapshotTask>,
+    /// An `ImportSnapshot` `ClientToken` and the import task id it minted, so a repeat of
+    /// the same request answers with that task instead of starting a second import: "Token
+    /// to enable idempotency for VM import requests"
+    /// (`ImportSnapshotRequest$ClientToken`).
+    pub import_snapshot_task_client_tokens: HashMap<String, String>,
+    /// The conversion window of each import snapshot task an import is still running
+    /// behind, by `ImportTaskId` — see [`ImportSnapshotConversion`], and
+    /// [`Self::import_task_deleted_at`] for why the instants live beside the stored task
+    /// rather than on it. An entry is dropped as soon as the task has nothing left owed to
+    /// it ([`Self::complete_due_import_snapshot_conversions`]), so this holds exactly the
+    /// imports still in flight.
+    pub import_snapshot_conversions: BTreeMap<String, ImportSnapshotConversion>,
     /// Every instance event window the account holds, by `InstanceEventWindowId` — see the
     /// module docs. Ordered by id, which is the order `DescribeInstanceEventWindows`
     /// reports and pages over.
@@ -3100,6 +3112,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             volume_client_tokens: HashMap::new(),
             snapshots: BTreeMap::new(),
             import_snapshot_tasks: BTreeMap::new(),
+            import_snapshot_task_client_tokens: HashMap::new(),
+            import_snapshot_conversions: BTreeMap::new(),
             instance_event_windows: BTreeMap::new(),
             volume_modifications: BTreeMap::new(),
             secondary_networks: BTreeMap::new(),

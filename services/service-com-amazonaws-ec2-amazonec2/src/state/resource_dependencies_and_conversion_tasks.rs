@@ -607,6 +607,312 @@ impl ComAmazonawsEc2Amazonec2State {
 }
 
 // ---------------------------------------------------------------------------
+// What the clock owes an import snapshot task
+// ---------------------------------------------------------------------------
+//
+// "Imports a disk into an EBS snapshot" (`ImportSnapshot`): the task a caller is handed
+// back is `active`, and the snapshot that disk becomes is owed by the CLOCK rather than by
+// a later call. The window that takes is kept BESIDE the stored task
+// ([`ComAmazonawsEc2Amazonec2State::import_snapshot_conversions`]) for the reason
+// [`ComAmazonawsEc2Amazonec2State::import_task_deleted_at`] is: the task is stored as the
+// modelled shape its describe reports, and `SnapshotTaskDetail` carries no member for an
+// instant. A task written with no window — one seeded in a state the import did not put it
+// in — is therefore left exactly as stored.
+
+/// The disk image formats an `ImportSnapshot` disk container may carry: "Valid values:
+/// VHD | VMDK | RAW" (`SnapshotDiskContainer$Format`).
+///
+/// A SHORTER catalog than the one a whole-machine import takes
+/// ([`IMPORT_DISK_IMAGE_FORMATS`]), which also admits the container formats a VM's disks
+/// arrive in: what this operation imports is one bare disk image.
+pub const IMPORT_SNAPSHOT_DISK_IMAGE_FORMATS: [&str; 3] = ["VHD", "VMDK", "RAW"];
+
+/// The resource type an `ImportSnapshot` `TagSpecification` may name: "The tags to apply to
+/// the import snapshot task during creation" (`ImportSnapshotRequest$TagSpecifications`),
+/// which the modelled `ResourceType` enum spells `import-snapshot-task`.
+pub const IMPORT_SNAPSHOT_TASK_TAGGABLE_RESOURCE: &str = "import-snapshot-task";
+
+/// The status message an import snapshot task carries while the disk image it names is
+/// still being read: the import has been accepted and the snapshot it makes does not exist
+/// yet, which is a different fact from the `active` state on its own
+/// (`SnapshotTaskDetail$StatusMessage`, "A detailed status message for the import snapshot
+/// task").
+pub const IMPORT_SNAPSHOT_TASK_STATUS_MESSAGE_PENDING: &str = "pending";
+
+/// The window one import snapshot task's conversion runs over: when it started, when the
+/// snapshot it makes is minted, and when the task may report itself `completed`.
+///
+/// Every instant is monotonic ([`Instant`]), because each is only ever compared against the
+/// clock and never reported, so a wall-clock adjustment cannot move a task back to `active`.
+#[derive(Debug, Clone)]
+pub struct ImportSnapshotConversion {
+    /// When the import started, which its progress percentage is measured from.
+    pub started_at: Instant,
+    /// The instant from which the snapshot this import makes is due to exist. Before it,
+    /// the task reports no `SnapshotId`: there is no snapshot of a disk that has not been
+    /// read yet.
+    pub snapshot_due_at: Instant,
+    /// The instant from which the task's `active` -> `completed` move is due, which is the
+    /// instant the snapshot it minted is itself `completed` — a task that provisions another
+    /// resource is not finished before that resource is ready. `None` until the snapshot has
+    /// been minted, because until then there is nothing to wait for.
+    pub completed_at: Option<Instant>,
+}
+
+impl ImportSnapshotConversion {
+    /// The instant the import's progress percentage runs out at: the end of the whole
+    /// window, which is known exactly once the snapshot has been minted and is one further
+    /// [`TRANSITION_DELAY`] away before that.
+    pub fn ends_at(&self) -> Instant {
+        self.completed_at
+            .unwrap_or(self.snapshot_due_at + TRANSITION_DELAY)
+    }
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Record that the import snapshot task `import_task_id` started converting its disk at
+    /// `now`, so the clock owes it the snapshot and the completion
+    /// [`Self::complete_due_import_snapshot_conversions`] applies.
+    ///
+    /// Separate from [`Self::insert_import_snapshot_task`] because a task can be STORED
+    /// without an import running behind it — one written directly in a terminal state has
+    /// nothing left for the clock to do — and only the operation that starts an import knows
+    /// that it did.
+    pub fn start_import_snapshot_conversion(&mut self, import_task_id: &str, now: Instant) {
+        self.import_snapshot_conversions.insert(
+            import_task_id.to_string(),
+            ImportSnapshotConversion {
+                started_at: now,
+                snapshot_due_at: now + TRANSITION_DELAY,
+                completed_at: None,
+            },
+        );
+    }
+
+    /// `task` as of `now`: the stored task with the percentage of progress an import still
+    /// converting has made by then. A read observes that percentage without writing
+    /// anything, for the reason [`ImportImageTaskRecord::view_at`] derives the same member —
+    /// progress is a fact of elapsed time, so no stored value could be right twice.
+    ///
+    /// A task with no conversion window behind it, and one that is no longer `active`, is
+    /// answered exactly as stored: neither has a percentage left to make.
+    pub fn import_snapshot_task_view(
+        &self,
+        task: &ImportSnapshotTask,
+        now: Instant,
+    ) -> ImportSnapshotTask {
+        let mut view = task.clone();
+        let active = view
+            .snapshot_task_detail
+            .as_ref()
+            .and_then(|detail| detail.status.as_deref())
+            == Some(IMPORT_TASK_STATE_ACTIVE);
+        let window = view
+            .import_task_id
+            .as_deref()
+            .and_then(|task_id| self.import_snapshot_conversions.get(task_id))
+            .map(|conversion| (conversion.started_at, conversion.ends_at()));
+        if let (true, Some((started_at, ends_at))) = (active, window) {
+            let progress = import_task_progress_at(started_at, ends_at, now);
+            if let Some(detail) = view.snapshot_task_detail.as_mut() {
+                detail.progress = Some(progress);
+            }
+        }
+        view
+    }
+
+    /// The import snapshot task `import_task_id` as of `now`, or `None` when this account
+    /// holds no import snapshot task under that id — [`Self::import_snapshot_task_view`] on
+    /// one task the store names.
+    pub fn import_snapshot_task_view_at(
+        &self,
+        import_task_id: &str,
+        now: Instant,
+    ) -> Option<ImportSnapshotTask> {
+        let task = self.import_snapshot_tasks.get(import_task_id)?;
+        Some(self.import_snapshot_task_view(task, now))
+    }
+
+    /// The import snapshot task `import_task_id` as `ImportSnapshot` reports it:
+    /// [`Self::import_snapshot_task_view_at`] through the members `ImportSnapshotResult`
+    /// declares, which are the task's own.
+    pub fn import_snapshot_response_at(
+        &self,
+        import_task_id: &str,
+        now: Instant,
+    ) -> Option<ImportSnapshotOutput> {
+        let view = self.import_snapshot_task_view_at(import_task_id, now)?;
+        Some(ImportSnapshotOutput {
+            description: view.description,
+            import_task_id: view.import_task_id,
+            snapshot_task_detail: view.snapshot_task_detail,
+            tags: view.tags,
+        })
+    }
+
+    /// Carry every import snapshot task the clock owes a move to the state it is owed: the
+    /// snapshot its disk becomes once the conversion window has passed, and the
+    /// `active` -> `completed` move once that snapshot is itself `completed`.
+    ///
+    /// Reached only through [`Self::materialize_due_transitions`], so a reporting operation
+    /// observes both moves without having caused either: each was owed at this instant
+    /// whether or not anybody called. They are WRITES rather than derives because the first
+    /// of them MINTS a resource — "the snapshot ID of the disk being imported"
+    /// (`SnapshotTaskDetail$SnapshotId`), an EBS snapshot of this account's own store, which
+    /// every later read of either resource has to agree on.
+    ///
+    /// The task waits for the snapshot to be `completed` before reporting itself completed,
+    /// because an import that has not finished writing the snapshot it made has not
+    /// finished. A cancel that got in first takes the task out of `active`, and its
+    /// conversion then produces nothing at all.
+    pub fn complete_due_import_snapshot_conversions(&mut self, now: Instant) {
+        let converting: Vec<String> = self
+            .import_snapshot_conversions
+            .iter()
+            .filter(|(_, conversion)| {
+                conversion.completed_at.is_none() && now >= conversion.snapshot_due_at
+            })
+            .map(|(import_task_id, _)| import_task_id.clone())
+            .collect();
+        for import_task_id in converting {
+            if self.import_task_state(&import_task_id).as_deref() != Some(IMPORT_TASK_STATE_ACTIVE)
+            {
+                // The task is gone or no longer importing — a cancel reached it first — so
+                // there is no disk being read and nothing more is owed on it.
+                self.import_snapshot_conversions.remove(&import_task_id);
+                continue;
+            }
+            let Some(view) = self.imported_snapshot_view(&import_task_id) else {
+                self.import_snapshot_conversions.remove(&import_task_id);
+                continue;
+            };
+            // No room for the snapshot means the import cannot produce one at all, so the
+            // task ends where a failed import ends rather than staying `active` for ever,
+            // and its message says which ceiling stopped it — the number of snapshots this
+            // store holds, or the caller-chosen bytes they hold, a count of records being no
+            // bound on the bytes each one carries. The same rule
+            // [`Self::complete_due_import_image_tasks`] holds for the AMI its own import
+            // could not create.
+            let no_room = if !self.has_snapshot_capacity(1) {
+                Some(format!(
+                    "This emulator holds {MAX_STORED_SNAPSHOTS} EBS snapshots, which is as \
+                     many as it stores, so the imported snapshot could not be created"
+                ))
+            } else {
+                let payload_bytes = snapshot_payload_bytes(
+                    view.tags.as_deref().unwrap_or_default(),
+                    view.description.as_deref(),
+                );
+                self.would_exceed_stored_bytes(payload_bytes).then(|| {
+                    format!(
+                        "This emulator holds {held} of at most {MAX_STORED_BYTES} bytes of \
+                         caller-supplied data, so the imported snapshot could not be created \
+                         with {payload_bytes} more",
+                        held = self.stored_bytes()
+                    )
+                })
+            };
+            if let Some(reason) = no_room {
+                if let Some(detail) = self
+                    .import_snapshot_tasks
+                    .get_mut(&import_task_id)
+                    .and_then(|task| task.snapshot_task_detail.as_mut())
+                {
+                    detail.status = Some(IMPORT_TASK_STATE_DELETED.to_string());
+                    detail.status_message = Some(reason);
+                    detail.progress = None;
+                }
+                self.import_snapshot_conversions.remove(&import_task_id);
+                continue;
+            }
+            // The snapshot the import creates is an EBS snapshot of this account like any
+            // other, so it is stored through the ONE writer of one rather than beside it —
+            // which is also what gives it the `pending` -> `completed` move every snapshot
+            // starts out owing. That move is anchored to the instant the conversion fell
+            // DUE, not to the instant this pass ran, so when the import finishes is fixed by
+            // the call that started it rather than by when anybody first looked.
+            let snapshot_due_at = self
+                .import_snapshot_conversions
+                .get(&import_task_id)
+                .map_or(now, |conversion| conversion.snapshot_due_at);
+            let snapshot_completed_at = snapshot_due_at + TRANSITION_DELAY;
+            let snapshot_id =
+                self.insert_snapshot_completing_at(view, SystemTime::now(), snapshot_completed_at);
+            if let Some(detail) = self
+                .import_snapshot_tasks
+                .get_mut(&import_task_id)
+                .and_then(|task| task.snapshot_task_detail.as_mut())
+            {
+                detail.snapshot_id = Some(snapshot_id);
+            }
+            if let Some(conversion) = self.import_snapshot_conversions.get_mut(&import_task_id) {
+                conversion.completed_at = Some(snapshot_completed_at);
+            }
+        }
+
+        let completed: Vec<String> = self
+            .import_snapshot_conversions
+            .iter()
+            .filter(|(_, conversion)| conversion.completed_at.is_some_and(|due| now >= due))
+            .map(|(import_task_id, _)| import_task_id.clone())
+            .collect();
+        for import_task_id in completed {
+            if let Some(detail) = self
+                .import_snapshot_tasks
+                .get_mut(&import_task_id)
+                .and_then(|task| task.snapshot_task_detail.as_mut())
+            {
+                // Only a task still importing completes: one a cancel moved on keeps the
+                // state that cancel left it in.
+                if detail.status.as_deref() == Some(IMPORT_TASK_STATE_ACTIVE) {
+                    detail.status = Some(IMPORT_TASK_STATE_COMPLETED.to_string());
+                    // The import is over, so there is no stage left to report and no
+                    // percentage left to make.
+                    detail.status_message = None;
+                    detail.progress = None;
+                }
+            }
+            // The move is applied once; nothing is owed on this task any more.
+            self.import_snapshot_conversions.remove(&import_task_id);
+        }
+    }
+
+    /// The EBS snapshot a converted import snapshot task made, as [`Self::insert_snapshot`]
+    /// takes it.
+    ///
+    /// Everything comes off the task's own detail: the disk image's description, whether the
+    /// import was asked for an encrypted snapshot and under which KMS key, and a volume as
+    /// large as the disk that was read ("The size of the volume, in GiB",
+    /// `Snapshot$VolumeSize`, against "The size of the disk in the snapshot, in GiB",
+    /// `SnapshotTaskDetail$DiskImageSize`). The task's own tags are NOT copied onto it —
+    /// "the tags to apply to the import snapshot task during creation"
+    /// (`ImportSnapshotRequest$TagSpecifications`) tags the task, not the snapshot — which is
+    /// the rule [`Self::imported_image_spec`] holds for the AMI its import creates.
+    fn imported_snapshot_view(&self, import_task_id: &str) -> Option<SnapshotView> {
+        let detail = self
+            .import_snapshot_tasks
+            .get(import_task_id)?
+            .snapshot_task_detail
+            .as_ref()?;
+        Some(SnapshotView {
+            description: detail.description.clone(),
+            encrypted: detail.encrypted,
+            kms_key_id: detail.kms_key_id.clone(),
+            volume_size: detail.disk_image_size.and_then(imported_disk_volume_size),
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            storage_tier: Some(SNAPSHOT_STORAGE_TIER_STANDARD.to_string()),
+            // Every other member is one an imported snapshot carries nothing for, for the
+            // reasons `CreateSnapshot` records against the same shape — and the volume this
+            // snapshot was made from is a disk image outside this emulator, so there is no
+            // volume of the account to name as its source. The id, the start time, and the
+            // state, progress and completion time the clock decides are minted, stamped and
+            // derived by the store.
+            ..SnapshotView::default()
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Cancelling an import task, whichever resource it imports
 // ---------------------------------------------------------------------------
 //

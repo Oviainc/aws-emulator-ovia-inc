@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: starts an import snapshot task from the request's disk container, stores it
+//! in [`crate::state`] as the modelled `ImportSnapshotTask` `DescribeImportSnapshotTasks`
+//! reports, and answers it back out of the store. The task is `active`, and the clock — not
+//! a caller — converts the disk into an EBS snapshot of this account and completes the task.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +153,255 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportSnapshot"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            IMPORT_SNAPSHOT_DISK_IMAGE_FORMATS, IMPORT_SNAPSHOT_TASK_STATUS_MESSAGE_PENDING,
+            IMPORT_SNAPSHOT_TASK_TAGGABLE_RESOURCE, IMPORT_TASK_STATE_ACTIVE,
+            ImportSnapshotTaskSpec, MAX_CLIENT_TOKEN_CHARS, MAX_KMS_KEY_ID_CHARS,
+            MAX_STORED_BYTES, MAX_STORED_IMPORT_SNAPSHOT_TASKS,
+            import_snapshot_task_payload_bytes, require_service_state, resource_count_exceeded,
+            tags_from_specifications,
+        };
+
+        // `ctx` carries request metadata only; an import task names no Region (it carries no
+        // ARN and no zone), so this operation reads none of it. The store is reached through
+        // the engine held on `self`.
+        let _ = ctx;
+
+        // "If a KmsKeyId is specified, the Encrypted flag must also be set"
+        // (`ImportSnapshotRequest$KmsKeyId`).
+        let encrypted = input.encrypted.unwrap_or(false);
+        if input.kms_key_id.is_some() && !encrypted {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "kmsKeyId may be specified only when encrypted is true",
+            ));
+        }
+        // The model declares no `@length` on `KmsKeyId`, so the handler is the only place
+        // the bound AWS KMS publishes for a key identifier can be enforced.
+        if input
+            .kms_key_id
+            .as_ref()
+            .is_some_and(|key_id| key_id.chars().count() > MAX_KMS_KEY_ID_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "kmsKeyId accepts at most {MAX_KMS_KEY_ID_CHARS} characters"
+            )));
+        }
+
+        // "Imports a disk into an EBS snapshot" (`ImportSnapshot`): the disk container IS
+        // what is imported — "the disk container object for the import snapshot request"
+        // (`SnapshotDiskContainer`) — so a request that names none asks for an import of
+        // nothing.
+        let Some(container) = input.disk_container.as_ref() else {
+            return Err(Scaffolded::missing_parameter(
+                "diskContainer must name the disk image to import",
+            ));
+        };
+        // The two members name different sources for the one disk this container describes —
+        // "the URL to the Amazon S3-based disk image being imported" and "the Amazon S3
+        // bucket for the disk image" (`SnapshotDiskContainer`) — so a container carries
+        // exactly one of them.
+        let sources =
+            usize::from(container.url.is_some()) + usize::from(container.user_bucket.is_some());
+        if sources > 1 {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "A disk container names its disk image by exactly one of url or userBucket",
+            ));
+        }
+        if sources == 0 {
+            return Err(Scaffolded::missing_parameter(
+                "A disk container must name its disk image by url or userBucket",
+            ));
+        }
+        // "The format of the disk image being imported. Valid values: VHD | VMDK | RAW"
+        // (`SnapshotDiskContainer$Format`): a disk image read from S3 cannot be interpreted
+        // without one, and the model declares no enum for the member, so the handler is the
+        // only place a value outside that catalog can be refused. The catalog spelling is
+        // restored here so one format is reported one way however the request spelled it.
+        let Some(format) = container.format.as_deref() else {
+            return Err(Scaffolded::missing_parameter(
+                "format is required for a disk container that names a disk image",
+            ));
+        };
+        let Some(canonical_format) = IMPORT_SNAPSHOT_DISK_IMAGE_FORMATS
+            .iter()
+            .find(|known| known.eq_ignore_ascii_case(format))
+        else {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{format}' for format. Valid values: {}",
+                IMPORT_SNAPSHOT_DISK_IMAGE_FORMATS.join(" | ")
+            )));
+        };
+
+        // "The tags to apply to the import snapshot task during creation"
+        // (`ImportSnapshotRequest$TagSpecifications`): the task is the only resource this
+        // call creates, so a specification naming any other resource type is refused by the
+        // crate's one reader of a create's tag specifications, which also holds the tag
+        // payload to its documented bounds.
+        let tags = tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            IMPORT_SNAPSHOT_TASK_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+        // The token is retained in the store for the process's lifetime and the model bounds
+        // its length nowhere, so it is held to the width every other idempotency token of
+        // this crate is held to.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        // "The name of the role to use when not using the default role, 'vmimport'"
+        // (`ImportSnapshotRequest$RoleName`): nothing in the response reports the role, and
+        // this emulator reads no S3 object, so the member names no fact of the task — the
+        // same reason `ImportImage` reads none of it either.
+        let _ = input.role_name.as_deref();
+
+        // "The size of the uploaded disk image, in GiB" (`ClientData$UploadSize`) is the one
+        // member of the client data that states a fact of the disk, and "the size of the disk
+        // in the snapshot, in GiB" (`SnapshotTaskDetail$DiskImageSize`) is the task's member
+        // for it; the comment and the upload window are the uploader's own notes, which no
+        // member of either shape reports.
+        let disk_image_size = input
+            .client_data
+            .as_ref()
+            .and_then(|client_data| client_data.upload_size);
+
+        // The task's detail as it will be stored, all but the description the store writes
+        // onto both halves of the task and the snapshot the clock mints.
+        let detail = SnapshotTaskDetail {
+            disk_image_size,
+            encrypted: Some(encrypted),
+            format: Some((*canonical_format).to_string()),
+            kms_key_id: input.kms_key_id.clone(),
+            url: container.url.clone(),
+            user_bucket: container.user_bucket.as_ref().map(|bucket| UserBucketDetails {
+                s3_bucket: bucket.s3_bucket.clone(),
+                s3_key: bucket.s3_key.clone(),
+            }),
+            // An import AWS hands back is running: the snapshot and the completion are owed
+            // by the clock, not by this call.
+            status: Some(IMPORT_TASK_STATE_ACTIVE.to_string()),
+            status_message: Some(IMPORT_SNAPSHOT_TASK_STATUS_MESSAGE_PENDING.to_string()),
+            // Minted when the clock has read the disk, not before: there is no snapshot of a
+            // disk that has not been converted yet.
+            snapshot_id: None,
+            // Derived from the import's window on every read.
+            progress: None,
+            // Written by the store onto the task and its detail alike, from the one
+            // description the request carried.
+            description: None,
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        let now = ::std::time::Instant::now();
+
+        // The clock-owed moves of every import already due are applied before anything is
+        // read back, for the reason `DescribeImportSnapshotTasks` applies them: each was owed
+        // at this instant whether or not anybody called. Without it a `ClientToken` replay
+        // arriving after a task's window would answer the stale `active` view while the
+        // describe reported the same task `completed` with its snapshot.
+        store.materialize_due_transitions();
+
+        // Idempotency: "Token to enable idempotency for VM import requests"
+        // (`ImportSnapshotRequest$ClientToken`) — one token names the one task it started, so
+        // a replay reports that task and starts no second import. Read before the DryRun
+        // check, answered after it, because a replay stores nothing and so passes the
+        // ceilings a fresh import has to clear.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.import_snapshot_task_client_tokens.get(token).cloned());
+
+        if replayed.is_none() && !store.has_import_snapshot_task_capacity() {
+            return Err(resource_count_exceeded(format!(
+                "This emulator holds {MAX_STORED_IMPORT_SNAPSHOT_TASKS} import snapshot \
+                 tasks, which is as many as it stores"
+            )));
+        }
+
+        // The caller-chosen bytes this import would retain for the process's lifetime,
+        // counted by the ONE definition of a stored task's charge plus the token kept beside
+        // it. A COUNT ceiling admits megabytes on its own, because each record holds strings
+        // the caller chose the length of.
+        let draft = ImportSnapshotTask {
+            description: input.description.clone(),
+            import_task_id: None,
+            snapshot_task_detail: Some(SnapshotTaskDetail {
+                description: input.description.clone(),
+                ..detail.clone()
+            }),
+            tags: Some(tags.clone()),
+        };
+        let token_bytes = input.client_token.as_deref().map_or(0, str::len);
+        let payload_bytes = import_snapshot_task_payload_bytes(&draft).saturating_add(token_bytes);
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(resource_count_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                store.stored_bytes()
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        if let Some(import_task_id) = replayed {
+            return store
+                .import_snapshot_response_at(&import_task_id, now)
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "a client token names import task '{import_task_id}', which is not \
+                         stored"
+                    ))
+                });
+        }
+
+        // The id is minted by the store, which also charges the task's own bytes and writes
+        // the request's description onto both the task and its detail.
+        let import_task_id = store
+            .insert_import_snapshot_task(ImportSnapshotTaskSpec {
+                description: input.description.clone(),
+                detail,
+                tags,
+            })
+            .ok_or_else(|| {
+                resource_count_exceeded(format!(
+                    "This emulator holds {MAX_STORED_IMPORT_SNAPSHOT_TASKS} import snapshot \
+                     tasks, which is as many as it stores"
+                ))
+            })?;
+        // The window the conversion takes: the snapshot the disk becomes, and the completion
+        // that snapshot being ready earns the task, are the clock's to apply.
+        store.start_import_snapshot_conversion(&import_task_id, now);
+        if let Some(token) = input.client_token.clone() {
+            // The token is caller-chosen text this store retains beside the task, so its
+            // bytes are charged here — the task's own are charged by the writer above.
+            store.add_stored_bytes(token.len());
+            store
+                .import_snapshot_task_client_tokens
+                .insert(token, import_task_id.clone());
+        }
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // DescribeImportSnapshotTasks will see rather than the request object.
+        store
+            .import_snapshot_response_at(&import_task_id, now)
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "import task '{import_task_id}' was not stored by this request"
+                ))
+            })
     }
 }

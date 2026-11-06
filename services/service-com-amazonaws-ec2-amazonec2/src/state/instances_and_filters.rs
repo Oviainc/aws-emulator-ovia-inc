@@ -336,7 +336,9 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// An `active` import image task becoming `completed` with the AMI it created is one of
     /// them too; it is documented on [`Self::complete_due_import_image_tasks`], which this
-    /// calls. So is the end of an import task cancellation — a `deleting` task of either
+    /// calls. So is an `active` import SNAPSHOT task reaching `completed` with the EBS
+    /// snapshot its disk became ([`Self::complete_due_import_snapshot_conversions`]). So is
+    /// the end of an import task cancellation — a `deleting` task of either
     /// import kind reaching `deleted`
     /// ([`Self::delete_due_cancelled_import_tasks`]). So is a NAT gateway address an
     /// association left `associating` reaching
@@ -1674,6 +1676,10 @@ impl ComAmazonawsEc2Amazonec2State {
         // moves above.
         self.apply_due_ptr_record_updates(now);
         self.complete_due_import_image_tasks(now);
+        // The same two moves for an import SNAPSHOT task: the snapshot its disk becomes
+        // once the conversion window has passed, and the `active` -> `completed` move once
+        // that snapshot is itself `completed`.
+        self.complete_due_import_snapshot_conversions(now);
         // AFTER the completions: a cancel takes a task out of `active`, so the two can
         // never be owed on one task at once, and applying the completions first means a
         // cancelled task's `deleted` is written over nothing.

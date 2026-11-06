@@ -257,7 +257,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let state = require_service_state(&*self.engine)?;
-        let store = state.lock();
+        let mut store = state.lock();
+
+        // The moves the clock already owed each import — the EBS snapshot a converted disk
+        // became, the `active` -> `completed` move that earns, and the end of a
+        // cancellation — are observed here, not caused: each was due at this instant whether
+        // or not anybody called, so this changes nothing a later caller would otherwise have
+        // seen, and the `task-state` filter therefore compares against the state the caller
+        // is shown.
+        store.materialize_due_transitions();
+        let now = ::std::time::Instant::now();
 
         // Every comparison is charged to ONE budget, so the PRODUCT of stored tasks,
         // filters, values, held values and value length is bounded however the caller
@@ -273,12 +282,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !requested_ids.is_empty() && !requested_ids.contains(import_task_id) {
                 continue;
             }
+            // The percentage an import still converting has reached by now is a fact of
+            // elapsed time rather than a stored value, so it is filled in by the one reader
+            // of a task's reported view.
+            let task = store.import_snapshot_task_view(task, now);
             // The AND/OR evaluation is the one `crate::state` defines for every EC2
             // `Filters` member; only the per-task lookup is this operation's, supplied as
             // `values_of`. It charges one step per task scanned as well, so even an
             // unfiltered walk of the store is counted against the budget.
-            if matches_every_filter(&selectors, &mut budget, &|name| filter_values(task, name)) {
-                selected.push(task.clone());
+            if matches_every_filter(&selectors, &mut budget, &|name| filter_values(&task, name)) {
+                selected.push(task);
             }
         }
         // A spent budget means the answer is INCOMPLETE, which is not something to report

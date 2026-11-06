@@ -793,6 +793,10 @@ mod images;
 mod import_image_tasks;
 #[path = "all/import_snapshot_tasks.rs"]
 mod import_snapshot_tasks;
+// Importing a disk into an EBS snapshot: what `ImportSnapshot` starts, and the snapshot the
+// clock makes from it.
+#[path = "all/snapshot_imports.rs"]
+mod snapshot_imports;
 // Cancelling an import task of either kind: what `CancelImportTask` moves and what it
 // refuses.
 #[path = "all/import_task_cancellation.rs"]
