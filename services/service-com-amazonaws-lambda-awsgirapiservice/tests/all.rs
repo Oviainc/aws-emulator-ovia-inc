@@ -177,6 +177,8 @@ mod invocation_count_series;
 mod invoke_addressed_function;
 #[path = "all/kinesis_event_source_delivery.rs"]
 mod kinesis_event_source_delivery;
+#[path = "all/kinesis_event_source_handler_run.rs"]
+mod kinesis_event_source_handler_run;
 #[path = "all/layer_archive_unzipped_size.rs"]
 mod layer_archive_unzipped_size;
 #[path = "all/layer_listing.rs"]
