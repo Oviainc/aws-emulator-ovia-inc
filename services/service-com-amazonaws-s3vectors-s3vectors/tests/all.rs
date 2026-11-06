@@ -25,6 +25,8 @@ mod policy_document_bytes;
 mod policy_not_found_message;
 #[path = "all/query_candidate_slots.rs"]
 mod query_candidate_slots;
+#[path = "all/refusal_sentence_wording.rs"]
+mod refusal_sentence_wording;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/reserved_tag_keys.rs"]

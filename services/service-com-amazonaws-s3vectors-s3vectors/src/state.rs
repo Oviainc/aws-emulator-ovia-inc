@@ -412,10 +412,22 @@ pub const BUCKET_NOT_EMPTY: &str = "The specified vector bucket is not empty";
 /// The `ConflictException` message for a tag mutation that raced another mutation of the
 /// same resource: ONE fixed sentence, carrying no value from the request, saying what the
 /// caller has to do about it — the conflict is between two callers rather than about
-/// anything either of them named.
+/// anything either of them named. The sentence is about the TAGS, which is what the
+/// optimistic lock guards, so a client retrying a tag read-modify-write tells this 409
+/// from every other condition the operation answers 409 for.
 pub const TAG_WRITE_CONFLICT: &str =
-    "A conflicting conditional operation is currently in progress against this resource. \
-     Try again.";
+    "The resource tags were modified by another request. Please retry the operation.";
+
+/// The `ValidationException` message for a parallel ListVectors whose `segmentIndex` is
+/// not inside the partition its `segmentCount` describes.
+///
+/// `ListVectorsInput$segmentIndex` documents the rule — "Segment IDs are zero-based, so
+/// the first segment is always 0 [...] The value of segmentIndex must be less than the
+/// value provided for segmentCount" — and this is ONE fixed sentence restating that
+/// rule, interpolating neither submitted number: the caller already holds both, and a
+/// client that branches on the text matches one constant string.
+pub const SEGMENT_INDEX_OUT_OF_RANGE: &str =
+    "Segment index is zero-indexed and must be smaller than segment count";
 
 /// Wording for the one failure that is not about the request: the shared engine
 /// did not hand this service's store back. Every operation models
@@ -1032,8 +1044,8 @@ pub fn vector_distance(metric: &str, left: &[f32], right: &[f32]) -> f32 {
 /// ONE sentence about the VECTOR, which names no member and no index: WHICH vector
 /// the request got wrong is the path the refusal carries (the element of the input
 /// list, or the query member), so the sentence is the same wherever a vector is
-/// checked. The dimension sentence is the one the real service answered in the
-/// recorded response.
+/// checked. The dimension and zero-norm sentences are the ones the real service
+/// answered in the recorded responses.
 ///
 /// `PutInputVector$data` documents all three rules: "vector dimensions must
 /// match the dimension count that's configured for the vector index"; "for the
@@ -1057,8 +1069,12 @@ pub fn vector_data_defect(index: &VectorIndexRecord, data: &[f32]) -> Option<Str
         );
     }
     if index.distance_metric == DISTANCE_METRIC_COSINE && data.iter().all(|value| *value == 0.0) {
+        // Named after the PROPERTY that makes the vector unusable — its norm is zero,
+        // so the metric is undefined for it — rather than after the member it arrived
+        // in, so a client tells this refusal from the dimension and the data-type ones
+        // that share its error code.
         return Some(format!(
-            "zero vectors aren't allowed for the {DISTANCE_METRIC_COSINE} distance metric"
+            "{DISTANCE_METRIC_COSINE} distance does not support vectors with zero norm"
         ));
     }
     None
