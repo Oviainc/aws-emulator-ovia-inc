@@ -11,7 +11,10 @@
 //! the execution plane (`crate::state::execution`), which starts that stage's first
 //! actions, publishes the approval token or queues the job whoever reports an action's
 //! outcome needs, and from there moves the execution on by the clock until it reaches a
-//! terminal `PipelineExecutionStatus`.
+//! terminal `PipelineExecutionStatus` — without any further call from the client, which
+//! is what `crate::state::clock` is for: a client that starts a pipeline and then
+//! watches the artifact store for the delivered object makes no second CodePipeline
+//! call, and the execution still runs to its end.
 //!
 //! ## Shape of an operation
 //!
@@ -317,8 +320,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The execution's first step is not due yet (it becomes due a span from now), so
-        // this only publishes the start; the steps the clock makes due are materialised
-        // by whichever call comes after each one.
+        // this only publishes the start and then sets this store's clock running: from
+        // here the service itself materialises each step as it falls due, whether or not
+        // the client ever calls again.
         crate::state::advance(&*self.engine, ctx, &input.name).await;
 
         Ok(StartPipelineExecutionOutput {

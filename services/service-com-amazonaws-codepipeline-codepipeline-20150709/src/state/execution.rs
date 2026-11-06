@@ -27,12 +27,17 @@
 //!
 //! # Where the work happens, and why a read may perform it
 //!
-//! Nothing here sleeps and nothing runs in the background: every step carries the
-//! instant it became DUE ([`ACTION_STEP`] after the step before it finished), and
-//! [`advance`] materialises only the steps whose instant has already passed. That is
-//! exactly the "a reporting operation may write only to materialise a change the clock
-//! already made due" case: an action owed at `t` is performed on the first call after
-//! `t`, whoever makes it, and a caller that polls faster never makes it run sooner.
+//! Nothing here sleeps: every step carries the instant it became DUE ([`ACTION_STEP`]
+//! after the step before it finished), and [`advance`] materialises only the steps whose
+//! instant has already passed. That is exactly the "a reporting operation may write only
+//! to materialise a change the clock already made due" case: an action owed at `t` is
+//! performed on the first call after `t`, whoever makes it, and a caller that polls
+//! faster never makes it run sooner.
+//!
+//! A client that starts an execution and then watches the artifact store makes no such
+//! call at all, so [`super::clock`] waits for those instants on the service's own
+//! behalf and materialises the same steps the same way. Which step is due, and when,
+//! is decided here either way.
 //!
 //! # What this engine can and cannot run
 //!

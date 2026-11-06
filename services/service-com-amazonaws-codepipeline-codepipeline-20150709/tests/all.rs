@@ -97,6 +97,8 @@ mod third_party_job_results;
 mod third_party_jobs;
 #[path = "all/third_party_webhooks.rs"]
 mod third_party_webhooks;
+#[path = "all/unattended_execution.rs"]
+mod unattended_execution;
 #[path = "all/update_pipeline.rs"]
 mod update_pipeline;
 #[path = "all/validation_and_messages.rs"]

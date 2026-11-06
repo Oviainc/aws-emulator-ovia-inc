@@ -3,14 +3,17 @@
 //! The driver that MOVES a pipeline execution forward: what is due now, and the real
 //! work that materialising it performs.
 //!
-//! [`advance`] is the one entry point. It alternates between the store (under the
+//! [`advance`] is the entry point a request takes, and [`advance_pipeline`] the one the
+//! clock takes; both run the same walk. It alternates between the store (under the
 //! lock, planning the next due step) and the emulated services an action's work runs
 //! through (without the lock: S3 for artifact I/O, CodeCommit for a source revision,
 //! Lambda for an invoke action — each over the framework's in-process callback), so no
 //! step is ever reported as done without the work having been performed.
 //!
 //! See [`super::execution`] for the data model and for why a reporting operation is
-//! allowed to run this at all (every step carries the instant the CLOCK made it due).
+//! allowed to run this at all (every step carries the instant the CLOCK made it due),
+//! and [`super::clock`] for how the steps a client makes no further call for are
+//! materialised.
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -81,10 +84,12 @@ const STAGE_FAILED: &str = "Failed";
 const STAGE_SKIPPED: &str = "Skipped";
 
 /// Materialise every step of `pipeline_name`'s executions the clock has already made
-/// due, performing each step's real work.
+/// due, performing each step's real work, and keep this store's clock running for the
+/// steps that are still to fall due.
 ///
 /// Returns once nothing more is due. Bounded by [`MAX_ADVANCE_STEPS`]: the state is
-/// durable, so the next call continues where this one stopped.
+/// durable, so the next call continues where this one stopped — and the clock
+/// ([`super::clock`]) is what continues it when no further call comes.
 pub async fn advance<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -94,16 +99,34 @@ pub async fn advance<Eng: Send + Sync + 'static>(
         return;
     };
     let region = super::request_region(&ctx.parts().headers);
+    advance_pipeline(&state, ctx.callback(), &region, pipeline_name).await;
+    super::clock::drive(&state, ctx.callback(), &region);
+}
+
+/// The body of [`advance`] for ONE pipeline, over the store and the callback rather than
+/// over a request: the clock drives the same steps with no request to borrow them from.
+///
+/// Answers how many units of real WORK this call performed, which is what tells the clock
+/// whether the pipeline is moving or parked.
+pub(super) async fn advance_pipeline(
+    state: &::engine::ServiceState<ComAmazonawsCodepipelineCodepipeline20150709State>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    pipeline_name: &str,
+) -> usize {
+    let mut performed = 0;
     for _ in 0..MAX_ADVANCE_STEPS {
         let planned = {
             let mut store = state.lock();
             plan(&mut store, pipeline_name, SystemTime::now())
         };
         let Some(job) = planned else { break };
-        let outcome = run_job(ctx, &region, &job).await;
+        let outcome = run_job(callback, region, &job).await;
         let mut store = state.lock();
         record_outcome(&mut store, &job, outcome, SystemTime::now());
+        performed += 1;
     }
+    performed
 }
 
 /// Apply every transition `pipeline_name` is owed at `now`, and claim the next unit of
@@ -1245,7 +1268,7 @@ fn record_outcome(
 /// service names no other service's crate. Path-style addressing is what the emulated
 /// S3 service routes on (its operations are bound under a `{Bucket}` path label).
 fn s3_client(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
 ) -> ::aws_sdk_s3::Client {
     let config = ::aws_sdk_s3::Config::builder()
@@ -1256,8 +1279,8 @@ fn s3_client(
         // re-point this call, which carries the emulator's own credentials.
         .endpoint_url(super::in_process_endpoint("s3"))
         .force_path_style(true)
-        .credentials_provider(ctx.callback().aws_credentials_provider())
-        .http_client(ctx.callback().http_client())
+        .credentials_provider(callback.aws_credentials_provider())
+        .http_client(callback.http_client())
         // The transport is in-process: there is nothing to retry, time out or watch for
         // a stalled stream, and each of those would need a sleep implementation this
         // client is not given.
@@ -1277,15 +1300,15 @@ fn s3_client(
 /// emulator's own credentials, and no retry, timeout or stalled-stream machinery, because
 /// the transport is in process.
 fn code_commit_client(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
 ) -> ::aws_sdk_codecommit::Client {
     let config = ::aws_sdk_codecommit::Config::builder()
         .behavior_version(::aws_sdk_codecommit::config::BehaviorVersion::latest())
         .region(::aws_sdk_codecommit::config::Region::new(region.to_string()))
         .endpoint_url(super::in_process_endpoint("codecommit"))
-        .credentials_provider(ctx.callback().aws_credentials_provider())
-        .http_client(ctx.callback().http_client())
+        .credentials_provider(callback.aws_credentials_provider())
+        .http_client(callback.http_client())
         .retry_config(::aws_sdk_codecommit::config::retry::RetryConfig::disabled())
         .timeout_config(::aws_sdk_codecommit::config::timeout::TimeoutConfig::disabled())
         .identity_cache(::aws_sdk_codecommit::config::IdentityCache::no_cache())
@@ -1300,15 +1323,15 @@ fn code_commit_client(
 ///
 /// Built exactly like [`s3_client`], for the same reasons.
 fn lambda_client(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
 ) -> ::aws_sdk_lambda::Client {
     let config = ::aws_sdk_lambda::Config::builder()
         .behavior_version(::aws_sdk_lambda::config::BehaviorVersion::latest())
         .region(::aws_sdk_lambda::config::Region::new(region.to_string()))
         .endpoint_url(super::in_process_endpoint("lambda"))
-        .credentials_provider(ctx.callback().aws_credentials_provider())
-        .http_client(ctx.callback().http_client())
+        .credentials_provider(callback.aws_credentials_provider())
+        .http_client(callback.http_client())
         .retry_config(::aws_sdk_lambda::config::retry::RetryConfig::disabled())
         .timeout_config(::aws_sdk_lambda::config::timeout::TimeoutConfig::disabled())
         .identity_cache(::aws_sdk_lambda::config::IdentityCache::no_cache())
@@ -1321,7 +1344,7 @@ fn lambda_client(
 
 /// Perform one claimed job's real work.
 async fn run_job(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     job: &Job,
 ) -> JobOutcome {
@@ -1334,7 +1357,7 @@ async fn run_job(
             ..
         } => {
             run_source(
-                &s3_client(ctx, region),
+                &s3_client(callback, region),
                 bucket,
                 key,
                 version_id.as_deref(),
@@ -1349,8 +1372,8 @@ async fn run_job(
             ..
         } => {
             run_code_commit_source(
-                &code_commit_client(ctx, region),
-                &s3_client(ctx, region),
+                &code_commit_client(callback, region),
+                &s3_client(callback, region),
                 repository,
                 branch,
                 outputs,
@@ -1366,7 +1389,7 @@ async fn run_job(
             ..
         } => {
             run_lambda_invoke(
-                &lambda_client(ctx, region),
+                &lambda_client(callback, region),
                 function_name,
                 user_parameters.as_deref(),
                 job_id,
@@ -1383,7 +1406,7 @@ async fn run_job(
             ..
         } => {
             run_deploy(
-                &s3_client(ctx, region),
+                &s3_client(callback, region),
                 input,
                 bucket,
                 key.as_deref(),
