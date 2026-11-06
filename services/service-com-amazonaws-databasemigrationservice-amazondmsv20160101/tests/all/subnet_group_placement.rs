@@ -55,12 +55,15 @@ const VPC_CIDR: &str = "10.32.0.0/16";
 const OTHER_VPC_CIDR: &str = "10.33.0.0/16";
 
 /// One subnet of the account, as EC2 answered for it.
+///
+/// Shared with the sibling suites in this target, so a subnet is created through EC2 in
+/// exactly one place.
 #[derive(Clone, Debug)]
-struct Subnet {
+pub(crate) struct Subnet {
     /// The id EC2 minted.
-    id: String,
+    pub(crate) id: String,
     /// The Availability Zone EC2 placed it in.
-    zone: String,
+    pub(crate) zone: String,
 }
 
 /// The account's network, created through EC2 itself.
@@ -121,7 +124,7 @@ async fn create_network(ec2: &::aws_sdk_ec2::Client) -> Network {
 }
 
 /// A VPC of `cidr`, and the id EC2 minted for it.
-async fn create_vpc(ec2: &::aws_sdk_ec2::Client, cidr: &str) -> String {
+pub(crate) async fn create_vpc(ec2: &::aws_sdk_ec2::Client, cidr: &str) -> String {
     ec2.create_vpc()
         .cidr_block(cidr)
         .send()
@@ -133,7 +136,7 @@ async fn create_vpc(ec2: &::aws_sdk_ec2::Client, cidr: &str) -> String {
 }
 
 /// A subnet of `cidr` in `zone` of `vpc`, as EC2 answered for it.
-async fn create_subnet(
+pub(crate) async fn create_subnet(
     ec2: &::aws_sdk_ec2::Client,
     vpc: &str,
     cidr: &str,
@@ -282,7 +285,7 @@ fn reported_subnets(group: &Value) -> Vec<(String, String)> {
 }
 
 /// Delete `identifier`, and answer the `(status, error code)` of the attempt.
-async fn delete(emulator: &Emulator, identifier: &str) -> (u16, String) {
+pub(crate) async fn delete(emulator: &Emulator, identifier: &str) -> (u16, String) {
     let (status, response) = emulator
         .call(
             "DeleteReplicationSubnetGroup",

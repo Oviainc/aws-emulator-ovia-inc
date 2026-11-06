@@ -198,6 +198,18 @@ pub const VPC_SECURITY_GROUP_ACTIVE: &str = "active";
 /// group that is ready.
 pub const SUBNET_GROUP_COMPLETE: &str = "Complete";
 
+/// The network type a resource placed in a subnet group of IPv4 subnets gets:
+/// "A value of IPV4 represents an instance profile with IPv4 network type and only
+/// supports IPv4 addressing" (`CreateInstanceProfile$NetworkType`, the one member of this
+/// model that publishes the value list; `ReplicationInstance$NetworkType` and
+/// `ReplicationSubnetGroup$SupportedNetworkTypes` are plain strings over the same set).
+pub const NETWORK_TYPE_IPV4: &str = "IPV4";
+
+/// The network type a resource placed in a subnet group whose subnets carry IPv4 AND IPv6
+/// gets: "A value of DUAL represents an instance profile with dual network type that
+/// supports IPv4 and IPv6 addressing" (same member).
+pub const NETWORK_TYPE_DUAL: &str = "DUAL";
+
 /// The status one subnet of a replication subnet group carries
 /// (`Subnet$SubnetStatus`). As with the group status, the model publishes no value
 /// list, so this is the value this emulator reports for a usable subnet.
@@ -379,6 +391,11 @@ impl Pending {
 /// one place groups are held.
 #[derive(Debug, Clone, Default)]
 pub struct ReplicationSubnetGroupRecord {
+    /// The group's ARN, `arn:aws:dms:<region>:<account>:subgrp:<identifier>` — the
+    /// handle DMS reports for the group, derived from the Region the create was signed
+    /// for and the identifier it is held under, and stored so it is the same value on
+    /// every later reading.
+    pub arn: String,
     /// The caller's identifier, stored lowercased: "This value is stored as a
     /// lowercase string" (`CreateReplicationSubnetGroup$ReplicationSubnetGroupIdentifier`).
     pub identifier: String,
@@ -399,12 +416,42 @@ pub struct SubnetRecord {
     pub identifier: String,
     /// The Availability Zone the subnet sits in.
     pub availability_zone: String,
+    /// Whether EC2 reports an IPv4 CIDR block for the subnet.
+    pub ipv4: bool,
+    /// Whether EC2 reports an IPv6 CIDR block the subnet still holds.
+    pub ipv6: bool,
 }
 
 impl ReplicationSubnetGroupRecord {
+    /// The IP addressing protocols this group's subnets support, as
+    /// `ReplicationSubnetGroup$SupportedNetworkTypes` reports them.
+    ///
+    /// The member doc: "The IP addressing protocol supported by the subnet group. This
+    /// is used by a replication instance with values such as IPv4 only or Dual-stack
+    /// that supports both IPv4 and IPv6 addressing. IPv6 only is not yet supported."
+    /// The values are the ones the `NetworkType` doc publishes for a resource placed in
+    /// a group ([`NETWORK_TYPE_IPV4`], [`NETWORK_TYPE_DUAL`]), and they follow from the
+    /// address families EC2 reports for the group's OWN subnets: a replication instance
+    /// gets an address in every one of them, so a protocol is supported only when every
+    /// subnet carries it. `IPV6` is never reported, because IPv6 only "is not yet
+    /// supported" — a group of subnets carrying no IPv4 range therefore supports no
+    /// protocol DMS offers.
+    pub fn supported_network_types(&self) -> Vec<String> {
+        let mut supported = Vec::new();
+        if self.subnets.is_empty() || !self.subnets.iter().all(|subnet| subnet.ipv4) {
+            return supported;
+        }
+        supported.push(NETWORK_TYPE_IPV4.to_string());
+        if self.subnets.iter().all(|subnet| subnet.ipv6) {
+            supported.push(NETWORK_TYPE_DUAL.to_string());
+        }
+        supported
+    }
+
     /// This record as the modelled `ReplicationSubnetGroup` shape.
     pub fn to_shape(&self) -> ReplicationSubnetGroup {
         ReplicationSubnetGroup {
+            replication_subnet_group_arn: Some(self.arn.clone()),
             replication_subnet_group_identifier: Some(self.identifier.clone()),
             replication_subnet_group_description: Some(self.description.clone()),
             vpc_id: Some(self.vpc_id.clone()),
@@ -421,10 +468,9 @@ impl ReplicationSubnetGroupRecord {
                     })
                     .collect(),
             ),
-            // The IP addressing protocol a group supports follows from the address
-            // families its subnets carry, which this slice does not read off them: it
-            // reports none rather than inventing one.
-            supported_network_types: None,
+            // The IP addressing protocols a group supports follow from the address
+            // families EC2 reports for its subnets.
+            supported_network_types: Some(self.supported_network_types()),
             // A group a caller created is its own, not one DMS manages for a zero-ETL
             // integration, so it is not read-only.
             is_read_only: Some(DEFAULT_IS_READ_ONLY),
@@ -1437,6 +1483,33 @@ pub async fn placed_subnets(
         subnets.push(SubnetRecord {
             identifier: subnet_id.clone(),
             availability_zone: availability_zone.to_string(),
+            ipv4: reported
+                .cidr_block()
+                .is_some_and(|block| !block.is_empty()),
+            ipv6: reported
+                .ipv6_cidr_block_association_set()
+                .iter()
+                .filter(|association| {
+                    // An association that is on its way out (`disassociating`,
+                    // `disassociated`) or that never took (`failing`, `failed`) does not
+                    // give the subnet a range; one with no state reported is read as
+                    // holding its block.
+                    association
+                        .ipv6_cidr_block_state()
+                        .and_then(|state| state.state())
+                        .is_none_or(|state| {
+                            matches!(
+                                state,
+                                ::aws_sdk_ec2::types::SubnetCidrBlockStateCode::Associating
+                                    | ::aws_sdk_ec2::types::SubnetCidrBlockStateCode::Associated
+                            )
+                        })
+                })
+                .any(|association| {
+                    association
+                        .ipv6_cidr_block()
+                        .is_some_and(|block| !block.is_empty())
+                }),
         });
     }
     match vpc_ids.len() {

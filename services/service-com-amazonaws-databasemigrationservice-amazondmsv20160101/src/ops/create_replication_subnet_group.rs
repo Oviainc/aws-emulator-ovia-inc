@@ -72,6 +72,11 @@
 //! * `ReplicationSubnetGroup` (ReplicationSubnetGroup) — The replication subnet group that
 //!   was created.
 //!
+//! AWS's published model declares no ARN member on the `ReplicationSubnetGroup` shape, yet
+//! the service answers a create with `ReplicationSubnetGroupArn` carrying the group's
+//! `subgrp` ARN — the handle a caller tags the group by and references it from another
+//! resource with — so that member is on the shape in `smithy-model/`.
+//!
 //! ## Errors
 //!
 //! * `AccessDeniedFault` (HTTP 400) — DMS was denied access to the endpoint. Check that the
@@ -311,14 +316,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The group's own handle, over the `subgrp` resource type. A replication subnet
+        // group is named by its identifier in every operation that takes one, so the ARN's
+        // last field is that identifier rather than a minted resource id. Stored with the
+        // record, so every later reading of the group reports the same value.
+        let arn = crate::state::dms_arn(&region, "subgrp", &identifier);
+
         let record = crate::state::ReplicationSubnetGroupRecord {
+            arn: arn.clone(),
             identifier: identifier.clone(),
             description: input.replication_subnet_group_description,
             vpc_id,
             subnets,
-            // A group is reported by its identifier, not by an ARN, so its tags carry no
-            // `ResourceArn` for the group itself.
-            tags: input.tags.unwrap_or_default(),
+            // A tag reports the ARN of the resource it was attached to
+            // (`Tag$ResourceArn`), which for these is the group's own.
+            tags: crate::state::tags_for(&arn, input.tags),
         };
 
         // DMS provisions nothing for a subnet group — it records the subnets the account

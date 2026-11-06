@@ -23,7 +23,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_databasemigrationservice_amazondmsv20160101::state::{
-    service_state, ReplicationSubnetGroupRecord, SubnetRecord,
+    dms_arn, service_state, ReplicationSubnetGroupRecord, SubnetRecord,
 };
 
 use crate::migration_task_slice::{error_code, text, Emulator, REGION};
@@ -48,6 +48,7 @@ fn persist_subnet_group(emulator: &Emulator, identifier: &str) {
     state.lock().replication_subnet_groups.insert(
         identifier.to_string(),
         ReplicationSubnetGroupRecord {
+            arn: dms_arn(REGION, "subgrp", identifier),
             identifier: identifier.to_string(),
             description: format!("subnets for {identifier}"),
             vpc_id: "vpc-0dms0000000000001".to_string(),
@@ -55,10 +56,14 @@ fn persist_subnet_group(emulator: &Emulator, identifier: &str) {
                 SubnetRecord {
                     identifier: "subnet-0dms0000000000001".to_string(),
                     availability_zone: format!("{REGION}a"),
+                    ipv4: true,
+                    ipv6: false,
                 },
                 SubnetRecord {
                     identifier: "subnet-0dms0000000000002".to_string(),
                     availability_zone: format!("{REGION}b"),
+                    ipv4: true,
+                    ipv6: false,
                 },
             ],
             // This suite asserts nothing about a group's tags.
