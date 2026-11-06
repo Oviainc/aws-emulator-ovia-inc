@@ -30,9 +30,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{
-    call, create_cluster, create_control_panel, create_routing_control, enc, error_code, router,
-};
+use super::common::{call, enc, error_code, panel_with_controls, router};
 
 /// The values `RuleType` declares, in the order the model declares them
 /// (`smithy_query(query="shape",shape="RuleType")`).
@@ -85,49 +83,6 @@ fn cannot_delete(resource: &str, dependents: &str) -> String {
 /// The sentence a create whose name is already taken in its control panel is refused with.
 fn already_exists(name: &str, panel_arn: &str) -> String {
     format!("Safety Rule {name} already exists in Control Panel {panel_arn}.")
-}
-
-/// A fresh control panel holding `controls` routing controls; answers its ARN and the
-/// routing control ARNs in creation order.
-async fn panel_with_controls(
-    router: &MultiServiceRouter,
-    label: &str,
-    controls: usize,
-) -> (String, Vec<String>) {
-    let cluster = create_cluster(router, json!({ "ClusterName": format!("{label}-cluster") })).await;
-    let cluster_arn = cluster["ClusterArn"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let panel = create_control_panel(
-        router,
-        json!({ "ClusterArn": cluster_arn, "ControlPanelName": format!("{label}-panel") }),
-    )
-    .await;
-    let panel_arn = panel["ControlPanelArn"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-
-    let mut arns = Vec::new();
-    for n in 0..controls {
-        let control = create_routing_control(
-            router,
-            json!({
-                "ClusterArn": cluster_arn,
-                "ControlPanelArn": panel_arn,
-                "RoutingControlName": format!("{label}-control-{n}")
-            }),
-        )
-        .await;
-        arns.push(
-            control["RoutingControlArn"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-        );
-    }
-    (panel_arn, arns)
 }
 
 /// A `RuleConfig` body.

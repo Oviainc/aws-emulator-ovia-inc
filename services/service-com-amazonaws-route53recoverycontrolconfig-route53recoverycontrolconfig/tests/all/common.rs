@@ -106,6 +106,59 @@ pub async fn create_routing_control(router: &MultiServiceRouter, body: Value) ->
     created["RoutingControl"].clone()
 }
 
+/// A fresh control panel holding `controls` routing controls; answers its ARN and the
+/// routing control ARNs in creation order.
+///
+/// The fixture every safety-rule suite starts from, so they cannot drift apart on how a
+/// cluster, its control panel and its routing controls are built.
+pub async fn panel_with_controls(
+    router: &MultiServiceRouter,
+    label: &str,
+    controls: usize,
+) -> (String, Vec<String>) {
+    let cluster = create_cluster(
+        router,
+        serde_json::json!({ "ClusterName": format!("{label}-cluster") }),
+    )
+    .await;
+    let cluster_arn = cluster["ClusterArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let panel = create_control_panel(
+        router,
+        serde_json::json!({
+            "ClusterArn": cluster_arn,
+            "ControlPanelName": format!("{label}-panel")
+        }),
+    )
+    .await;
+    let panel_arn = panel["ControlPanelArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let mut arns = Vec::new();
+    for n in 0..controls {
+        let control = create_routing_control(
+            router,
+            serde_json::json!({
+                "ClusterArn": cluster_arn,
+                "ControlPanelArn": panel_arn,
+                "RoutingControlName": format!("{label}-control-{n}")
+            }),
+        )
+        .await;
+        arns.push(
+            control["RoutingControlArn"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+    (panel_arn, arns)
+}
+
 /// The `__type` of an error body, without its optional `namespace#` prefix.
 pub fn error_code(body: &Value) -> String {
     let raw = body

@@ -15,6 +15,8 @@
 mod body_enum_refusals;
 #[path = "all/common.rs"]
 mod common;
+#[path = "all/create_safety_rule_rule_choice.rs"]
+mod create_safety_rule_rule_choice;
 #[path = "all/cross_account_authorization.rs"]
 mod cross_account_authorization;
 #[path = "all/list_clusters.rs"]
