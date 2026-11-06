@@ -63,6 +63,8 @@ mod db_major_engine_versions;
 mod db_parameter_group_deletion;
 #[path = "all/db_parameter_group_provisioning.rs"]
 mod db_parameter_group_provisioning;
+#[path = "all/db_parameter_group_reset.rs"]
+mod db_parameter_group_reset;
 #[path = "all/db_parameter_groups.rs"]
 mod db_parameter_groups;
 #[path = "all/db_parameter_metadata.rs"]

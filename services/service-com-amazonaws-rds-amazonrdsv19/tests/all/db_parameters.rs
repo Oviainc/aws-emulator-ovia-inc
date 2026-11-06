@@ -89,7 +89,10 @@ pub(crate) async fn create_group(
 
 /// `ModifyDBParameterGroup` on `group` in `region`, carrying one `Parameters.Parameter.<n>`
 /// entry per setting.
-async fn modify_in(
+///
+/// `pub(crate)` so a sibling suite of this one test target writes the settings a reset then
+/// clears through the SAME call rather than growing a second copy of it.
+pub(crate) async fn modify_in(
     router: &MultiServiceRouter,
     region: &str,
     group: &str,

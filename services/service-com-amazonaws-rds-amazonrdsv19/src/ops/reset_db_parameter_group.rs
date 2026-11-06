@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetDBParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetDBParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Resets a DB (instance) parameter group's parameters to the values its engine-version
+//! family publishes. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetDBParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A group holds only the parameters a CALLER set ([`crate::state::DbParameterGroupRecord`]);
+//! the engine's own defaults belong to the FAMILY, which publishes them
+//! ([`crate::state::published_db_parameters`]). So resetting a parameter to "the
+//! engine/system default value" is dropping the setting the group carried for it, after
+//! which the family's published default is what a describe reports and what the engine data
+//! plane runs with — the same rule, over the same store, as the cluster-level
+//! [`crate::ops::reset_db_cluster_parameter_group`].
+//!
+//! A change this group is still waiting on a reboot for does NOT stand in the way: this
+//! operation documents that "when resetting the entire DB parameter group, dynamic
+//! parameters are updated immediately and static parameters are set to pending-reboot to
+//! take effect on the next DB instance restart", so a pending change is what the reset
+//! leaves behind rather than a state that refuses it — and that is the recorded AWS answer
+//! for a reset of a group carrying one. (The cluster-level sibling is the operation whose
+//! recorded answer is the `InvalidDBParameterGroupState` refusal; the two operations differ
+//! here.)
 //!
 //! ## Shape of an operation
 //!
@@ -158,17 +168,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetDBParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetDBParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetDBParameterGroup"))
+        // request metadata.
+        let region =
+            crate::state::request_region(ctx).map_err(ResetDBParameterGroupError::validation)?;
+        let named: Vec<&Parameter> = input.parameters.iter().flatten().collect();
+        // The two members name the two SCOPES this operation documents: "To reset the entire
+        // DB parameter group, specify the DBParameterGroup name and ResetAllParameters
+        // parameters. To reset specific parameters, provide a list of the following:
+        // ParameterName and ApplyMethod." A request that names neither takes the scope
+        // `ResetAllParameters` documents as its default ("By default, all parameters in the DB
+        // parameter group are reset to default values"), so the whole group is reset.
+        let reset_all = input.reset_all_parameters.unwrap_or(named.is_empty());
+        // A request that turns the whole-group scope OFF and names no parameter asks for no
+        // parameter to be reset, which is served as the no-op it asks for: the group is still
+        // resolved (so a name no region holds is still the modelled 404) and nothing of it
+        // changes. Only a request naming BOTH scopes is a contradiction, and that is the one
+        // refused below.
+        // Asking for both scopes at once names no one scope this operation can serve, so the
+        // request is refused rather than half of it silently ignored. The code is the Query
+        // API's own for members that cannot hold together.
+        if reset_all && !named.is_empty() {
+            return Err(ResetDBParameterGroupError::invalid_parameter_combination(
+                "ResetAllParameters cannot be used together with a list of Parameters",
+            ));
+        }
+        // `Parameters`: "A maximum of 20 parameters can be modified in a single request" —
+        // the bound `ModifyDBParameterGroup` enforces over the same member.
+        if named.len() > crate::state::MAX_PARAMETERS_PER_MODIFY {
+            return Err(ResetDBParameterGroupError::invalid_parameter_value(format!(
+                "Parameters carries {} entries: a maximum of {} parameters can be reset in a \
+                 single request",
+                named.len(),
+                crate::state::MAX_PARAMETERS_PER_MODIFY
+            )));
+        }
+
+        // A parameter group RDS provides itself is not the account's to change — and a reset
+        // is a change — so such a name is refused with the protection RDS states for it
+        // rather than resolved against this store, which holds no record of one. Checked
+        // before the group is resolved, exactly as `ModifyDBParameterGroup` checks it.
+        if crate::state::is_default_parameter_group_name(&input.db_parameter_group_name) {
+            return Err(ResetDBParameterGroupError::invalid_parameter_value(
+                crate::state::CANNOT_MODIFY_DEFAULT_PARAMETER_GROUP_MESSAGE,
+            ));
+        }
+
+        // Every entry of the request is read BEFORE the store is touched, so a request
+        // carrying a malformed one changes nothing at all. A name the family's published
+        // catalog does not carry is taken as sent: that catalog is a SAMPLE of the family's
+        // parameter list rather than the whole of it
+        // (`crate::state::published_db_parameters`), so refusing an unpublished name would
+        // reject a parameter the engine has — and a name the group holds no setting under
+        // clears nothing in any case.
+        let mut to_clear: Vec<String> = Vec::with_capacity(named.len());
+        for parameter in &named {
+            let Some(name) = parameter.parameter_name.as_deref() else {
+                return Err(ResetDBParameterGroupError::invalid_parameter_value(
+                    "each entry of Parameters must carry a ParameterName",
+                ));
+            };
+            to_clear.push(name.to_string());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+
+        // RDS is regional, and `DBParameterGroupName` is "stored as a lowercase string", so
+        // the group is looked up by the lowercased name in the region the request was signed
+        // for; a name that matches none is the modelled 404.
+        let key = (region, input.db_parameter_group_name.to_ascii_lowercase());
+        let Some(group) = store.db_parameter_groups.get_mut(&key) else {
+            return Err(
+                ResetDBParameterGroupErrorModeled::DBParameterGroupNotFoundFault(
+                    DBParameterGroupNotFoundFault {
+                        message: Some(crate::state::db_parameter_group_not_found_message(
+                            &input.db_parameter_group_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Dropping a setting is what returns its parameter to "the engine/system default
+        // value": the group then carries nothing for it, so the family's published default is
+        // what a describe reports and what the engine data plane runs with.
+        if reset_all {
+            group.parameters.clear();
+        } else {
+            for name in to_clear {
+                group.parameters.remove(&name);
+            }
+        }
+
+        Ok(ResetDBParameterGroupOutput {
+            db_parameter_group_name: Some(group.name.clone()),
+        })
     }
 }
