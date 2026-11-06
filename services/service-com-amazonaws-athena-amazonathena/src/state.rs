@@ -1223,6 +1223,18 @@ pub fn work_group_not_found(name: &str) -> String {
     format!("WorkGroup {name} is not found.")
 }
 
+/// The message a query submitted to a workgroup in state [`WORK_GROUP_STATE_DISABLED`]
+/// is refused with.
+///
+/// A workgroup's state is what decides whether queries may run in it — Athena documents
+/// that members of a disabled workgroup cannot submit queries to it — so a submission to
+/// a disabled workgroup is refused rather than queued. Worded beside
+/// [`work_group_not_found`], so the two per-workgroup refusals name the addressed
+/// workgroup the same way.
+pub fn work_group_disabled(name: &str) -> String {
+    format!("WorkGroup {name} is disabled.")
+}
+
 /// The `ErrorCode` `BatchGetQueryExecution` reports beside
 /// [`query_execution_not_found`] for an id this account holds no execution for: the id
 /// is the caller's own input, which is what `INVALID_INPUT` names.

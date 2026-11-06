@@ -34,3 +34,6 @@ mod table_metadata;
 
 #[path = "all/work_group_lifecycle.rs"]
 mod work_group_lifecycle;
+
+#[path = "all/work_group_update.rs"]
+mod work_group_update;

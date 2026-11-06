@@ -214,6 +214,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             let group = store.work_groups.get(&work_group).cloned();
+            // A workgroup's state is what decides whether queries may run in it: a
+            // query submitted to a DISABLED workgroup is refused rather than queued, so
+            // the state `UpdateWorkGroup` stored is what this submission is judged by.
+            if group
+                .as_ref()
+                .is_some_and(|group| group.state == crate::state::WORK_GROUP_STATE_DISABLED)
+            {
+                return Err(invalid_request(crate::state::work_group_disabled(
+                    &work_group,
+                )));
+            }
             // Nowhere to write the results is a refusal, not a query that runs: "If
             // none of them is set, Athena issues an error that no output location is
             // provided." Resolved BEFORE the idempotency check below, so that check

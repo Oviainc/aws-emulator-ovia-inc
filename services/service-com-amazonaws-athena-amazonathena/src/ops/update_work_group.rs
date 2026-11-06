@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWorkGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWorkGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWorkGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the members the request carries to the stored workgroup —
+//! `Description` and `State` replace their stored values, and every member of
+//! `ConfigurationUpdates` replaces its counterpart in the stored configuration, with a
+//! `Remove…` flag clearing the member it names — leaving every member the request does
+//! not mention exactly as the last accepted write left it.
 //!
 //! ## Shape of an operation
 //!
@@ -139,20 +135,193 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWorkGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWorkGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWorkGroup"))
+        // `State` needs no check of its own before the registry is touched: it is the
+        // model's `WorkGroupState` enum, so a value outside that set is refused before
+        // this handler runs.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateWorkGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("Athena state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        // One lock for the whole read-modify-write, so two updates arriving together are
+        // applied one after the other and the registry never holds a half-applied
+        // configuration.
+        let mut store = state.lock();
+
+        let Some(record) = store.work_groups.get_mut(&input.work_group) else {
+            // Athena models no not-found error for this operation; naming a workgroup
+            // that does not exist is "something wrong with the input to the request",
+            // which is what `InvalidRequestException` (HTTP 400) reports.
+            return Err(invalid_request(crate::state::work_group_not_found(
+                &input.work_group,
+            )));
+        };
+
+        // The updates are applied to a COPY, so a configuration refused below leaves the
+        // stored workgroup exactly as the last accepted update left it.
+        let mut configuration = record.configuration.clone();
+        if let Some(updates) = input.configuration_updates {
+            apply_configuration_updates(&mut configuration, updates);
+        }
+        let configuration_bytes = crate::state::open_configuration_bytes(&configuration);
+        if configuration_bytes > crate::state::MAX_WORK_GROUP_CONFIGURATION_BYTES {
+            return Err(invalid_request(format!(
+                "ConfigurationUpdates carries {configuration_bytes} bytes of Spark \
+                 properties, classifications and log types, more than the {} bytes a \
+                 workgroup configuration can hold.",
+                crate::state::MAX_WORK_GROUP_CONFIGURATION_BYTES
+            )));
+        }
+
+        // Only now is anything written, and only the members this request named: the
+        // workgroup's name, creation time and tags are not updatable here ("The
+        // workgroup's name cannot be changed"), and a description or state the request
+        // left out keeps the value a read reported before this call.
+        record.configuration = configuration;
+        if let Some(description) = input.description {
+            record.description = Some(description);
+        }
+        if let Some(requested_state) = input.state {
+            record.state = requested_state;
+        }
+
+        // `UpdateWorkGroupOutput` models no members: the updated workgroup is read back
+        // through `GetWorkGroup`.
+        Ok(UpdateWorkGroupOutput {})
     }
+}
+
+/// Apply one `WorkGroupConfigurationUpdates` to the configuration a workgroup holds.
+///
+/// A member the updates carry replaces its counterpart, and a member they leave out
+/// changes nothing — "The configuration information that will be updated for this
+/// workgroup". Where the shape pairs a value with a `Remove…` flag, the flag is what
+/// clears the stored member: `RemoveOutputLocation`, for instance, "indicates that the
+/// previously-specified query results location … should be ignored and set to null",
+/// which it does whatever value accompanies it.
+fn apply_configuration_updates(
+    configuration: &mut WorkGroupConfiguration,
+    updates: WorkGroupConfigurationUpdates,
+) {
+    if let Some(enforce) = updates.enforce_work_group_configuration {
+        configuration.enforce_work_group_configuration = Some(enforce);
+    }
+    if let Some(publish) = updates.publish_cloud_watch_metrics_enabled {
+        configuration.publish_cloud_watch_metrics_enabled = Some(publish);
+    }
+    if let Some(requester_pays) = updates.requester_pays_enabled {
+        configuration.requester_pays_enabled = Some(requester_pays);
+    }
+    if let Some(minimum_encryption) = updates.enable_minimum_encryption_configuration {
+        configuration.enable_minimum_encryption_configuration = Some(minimum_encryption);
+    }
+    if let Some(additional) = updates.additional_configuration {
+        configuration.additional_configuration = Some(additional);
+    }
+    if let Some(role) = updates.execution_role {
+        configuration.execution_role = Some(role);
+    }
+    if let Some(grants) = updates.query_results_s3_access_grants_configuration {
+        configuration.query_results_s3_access_grants_configuration = Some(grants);
+    }
+    if let Some(monitoring) = updates.monitoring_configuration {
+        configuration.monitoring_configuration = Some(monitoring);
+    }
+    if let Some(engine) = updates.engine_configuration {
+        configuration.engine_configuration = Some(engine);
+    }
+    // "After the update, all queries on the workgroup run on the requested engine
+    // version", and the effective version is Athena's own resolution of the selected one
+    // rather than anything the request put there — the same resolution the create path
+    // makes.
+    if let Some(version) = updates.engine_version.as_ref() {
+        configuration.engine_version = Some(crate::state::resolved_engine_version(Some(version)));
+    }
+    if updates.remove_bytes_scanned_cutoff_per_query == Some(true) {
+        configuration.bytes_scanned_cutoff_per_query = None;
+    } else if let Some(cutoff) = updates.bytes_scanned_cutoff_per_query {
+        configuration.bytes_scanned_cutoff_per_query = Some(cutoff);
+    }
+    if updates.remove_customer_content_encryption_configuration == Some(true) {
+        configuration.customer_content_encryption_configuration = None;
+    } else if let Some(encryption) = updates.customer_content_encryption_configuration {
+        configuration.customer_content_encryption_configuration = Some(encryption);
+    }
+    if let Some(result_updates) = updates.result_configuration_updates {
+        let mut result = configuration.result_configuration.take().unwrap_or_default();
+        apply_result_configuration_updates(&mut result, result_updates);
+        // A result configuration that names nothing at all is no result configuration:
+        // removing every member of one leaves the workgroup without it, the state it was
+        // in before anything was ever set.
+        configuration.result_configuration = names_something(&result).then_some(result);
+    }
+    if let Some(managed_updates) = updates.managed_query_results_configuration_updates {
+        let mut managed = configuration
+            .managed_query_results_configuration
+            .take()
+            .unwrap_or_default();
+        if let Some(enabled) = managed_updates.enabled {
+            managed.enabled = enabled;
+        }
+        if managed_updates.remove_encryption_configuration == Some(true) {
+            managed.encryption_configuration = None;
+        } else if let Some(encryption) = managed_updates.encryption_configuration {
+            managed.encryption_configuration = Some(encryption);
+        }
+        configuration.managed_query_results_configuration = Some(managed);
+    }
+}
+
+/// Apply one `ResultConfigurationUpdates` to the result configuration a workgroup holds;
+/// see [`apply_configuration_updates`] for the rule each `Remove…` flag follows.
+fn apply_result_configuration_updates(
+    result: &mut ResultConfiguration,
+    updates: ResultConfigurationUpdates,
+) {
+    if updates.remove_output_location == Some(true) {
+        result.output_location = None;
+    } else if let Some(location) = updates.output_location {
+        result.output_location = Some(location);
+    }
+    if updates.remove_encryption_configuration == Some(true) {
+        result.encryption_configuration = None;
+    } else if let Some(encryption) = updates.encryption_configuration {
+        result.encryption_configuration = Some(encryption);
+    }
+    if updates.remove_expected_bucket_owner == Some(true) {
+        result.expected_bucket_owner = None;
+    } else if let Some(owner) = updates.expected_bucket_owner {
+        result.expected_bucket_owner = Some(owner);
+    }
+    if updates.remove_acl_configuration == Some(true) {
+        result.acl_configuration = None;
+    } else if let Some(acl) = updates.acl_configuration {
+        result.acl_configuration = Some(acl);
+    }
+}
+
+/// Whether a result configuration carries any member at all.
+fn names_something(result: &ResultConfiguration) -> bool {
+    result.output_location.is_some()
+        || result.encryption_configuration.is_some()
+        || result.expected_bucket_owner.is_some()
+        || result.acl_configuration.is_some()
+}
+
+/// The operation's own client error (HTTP 400), carrying `message`.
+///
+/// Every refusal above is a bad request rather than an unwritten operation, and
+/// `InvalidRequestException` is the client error this operation models: "Indicates that
+/// something is wrong with the input to the request."
+fn invalid_request(message: String) -> UpdateWorkGroupError {
+    UpdateWorkGroupErrorModeled::InvalidRequestException(InvalidRequestException {
+        athena_error_code: None,
+        message: Some(message),
+    })
+    .into()
 }
