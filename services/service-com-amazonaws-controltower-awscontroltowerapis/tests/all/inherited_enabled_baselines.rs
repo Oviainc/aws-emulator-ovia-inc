@@ -36,7 +36,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::enabled_control_lifecycle::entries;
 use crate::landing_zone_lifecycle::{
-    call, emulator, past_the_settle_span, simple_manifest, Answer,
+    call, emulator, past_the_settle_span, set_up_account, simple_manifest, Answer,
 };
 
 /// One enablement a row applies.
@@ -58,14 +58,18 @@ struct Governance {
 }
 
 /// The table: rows differ along what the rule generalises over — what the landing zone
-/// designates (nothing, because none is deployed; two distinct accounts; one account named
+/// designates (the shared manifest's own accounts; two distinct accounts; one account named
 /// by both members), how many enablements the store holds, the baseline (one Control Tower
 /// assesses inheritance drift on and two it does not), the version, the parameters, and the
 /// organization, partition and management account the target units live in.
+///
+/// Every row deploys a landing zone, because Control Tower enables a baseline only for an
+/// account it has been set up in; the row that names no accounts deploys the shared
+/// manifest unchanged.
 fn governances() -> Vec<Governance> {
     vec![
         Governance {
-            case: "no landing zone deployed, one enablement",
+            case: "a landing zone designating the shared manifest's accounts, one enablement",
             accounts: None,
             enablements: vec![Enablement {
                 baseline_identifier: "arn:aws:controltower:us-west-2::baseline/17BSJV3IGJ2QSGA2",
@@ -256,8 +260,14 @@ async fn the_listing_reports_the_parent_each_enablement_inherits_from() {
     for row in governances() {
         let case = row.case;
         let router = emulator();
-        if let Some(accounts) = row.accounts {
-            deploy_landing_zone(&router, case, accounts).await;
+        match row.accounts {
+            // The rows that name accounts deploy a landing zone designating them; the one
+            // that names none still deploys the shared manifest, because Control Tower
+            // enables a baseline only for an account it has been set up in.
+            Some(accounts) => deploy_landing_zone(&router, case, accounts).await,
+            None => {
+                set_up_account(&router).await;
+            }
         }
 
         let mut expected: Vec<String> = Vec::new();

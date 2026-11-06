@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::baseline_operations::{enable, enablements, get_operation, member, Enablement};
-use crate::landing_zone_lifecycle::{call, call_in_region, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, call_in_region, past_the_settle_span, set_up_emulator, Answer};
 use crate::resource_tags::{read_tags, reported_tags};
 
 /// POST `/get-enabled-baseline` and hand back the answer plus its `enabledBaselineDetails`
@@ -97,7 +97,7 @@ fn row_tags(row: &Enablement) -> BTreeMap<String, String> {
 /// `SUCCEEDED` after, and no read changes any of it.
 #[tokio::test]
 async fn an_accepted_enablement_reports_back_every_member_it_accepted() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let rows = enablements();
     let mut enabled_resources: Vec<(&'static str, String, String)> = Vec::new();
 
@@ -264,7 +264,7 @@ async fn an_enablement_is_minted_in_the_region_the_request_was_signed_for() {
     // Rows differ along the only thing this rule generalises over: the signed region,
     // across three AWS partitions-worth of region names.
     for region in ["us-west-2", "eu-central-1", "ap-southeast-2"] {
-        let router = emulator();
+        let router = set_up_emulator().await;
         let enabled = call_in_region(
             &router,
             region,

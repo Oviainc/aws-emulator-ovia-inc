@@ -8,6 +8,14 @@
 //! [`crate::state`], while the `DISABLE_CONTROL` record it appended to the control
 //! operation log outlives it and still resolves through `GetControlOperation`.
 //!
+//! Served only for an account Control Tower has been set up in
+//! ([`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::is_set_up`]): one it
+//! has provisioned nothing in holds no landing zone for this call to resolve an enablement
+//! through, so the call is the modelled `ResourceNotFoundException` (404) reporting the
+//! landing zone as what is missing — ahead of reading which enablement the request names,
+//! since in such an account no combination of its members names one either. See
+//! `crate::state` for the one precondition the enablement calls share.
+//!
 //! Implemented: this operation no longer answers HTTP 501. It is the counterpart of
 //! `EnableControl` and tears down what that operation persisted.
 //!
@@ -199,6 +207,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.settle(now);
+
+        // Control Tower tears a control enablement down for an account it has been set up
+        // in; one it has provisioned nothing in holds no landing zone for this call to
+        // resolve an enablement through, so the landing zone is what is reported missing.
+        // Asked BEFORE the request's own members are read, because in such an account no
+        // combination of them names an enablement either: what blocks the call is the
+        // un-provisioned landing zone, not the shape of the request. See `crate::state` for
+        // the one precondition the enablement calls share.
+        if !store.is_set_up() {
+            return Err(DisableControlErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::SETUP_REQUIRED_FOR_CONTROLS.to_string(),
+                },
+            )
+            .into());
+        }
 
         // WHICH enablement this call tears down is settled before anything is written. The
         // model marks no member of this input required, so the request may name the

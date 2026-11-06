@@ -38,7 +38,9 @@ use service_com_amazonaws_controltower_awscontroltowerapis::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::landing_zone_lifecycle::{call, call_in_region, emulator, Answer, SIGNED_REGION};
+use crate::landing_zone_lifecycle::{
+    call, call_in_region, emulator, set_up_emulator, Answer, SIGNED_REGION,
+};
 
 /// The region these tests sign for unless a case names another, and therefore the region
 /// of the ARNs the service mints for them.
@@ -355,7 +357,7 @@ async fn an_id_the_catalog_does_not_hold_is_not_found() {
 /// baseline identifier the catalog does not hold is not enabled into it.
 #[tokio::test]
 async fn the_answer_is_stable_and_no_call_adds_a_baseline() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let catalog_baseline = BASELINE_CATALOG
         .first()
         .expect("the catalog publishes at least one baseline");

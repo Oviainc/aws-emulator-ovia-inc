@@ -46,7 +46,7 @@ use crate::enabled_control_lifecycle::{
     control, details, enable_with, entries, listed_arns, listed_entry, ou,
 };
 use crate::landing_zone_lifecycle::{
-    call, emulator_with_engine, past_the_settle_span, Answer, SIGNED_REGION,
+    call, emulator_with_engine, past_the_settle_span, set_up_account, Answer, SIGNED_REGION,
 };
 
 /// One OU-level enablement a row applies, with the inheritance hanging off it.
@@ -300,6 +300,7 @@ async fn include_children_widens_the_listing_to_the_inherited_enablements() {
     for shape in shapes() {
         let case = shape.case;
         let (router, engine) = emulator_with_engine();
+        set_up_account(&router).await;
         let applied = apply(&router, &engine, &shape).await;
 
         // Past the settle span, so every enablement is terminal and the cases below do not
@@ -412,6 +413,7 @@ async fn every_entry_reports_the_enablement_it_inherits_from() {
     for shape in shapes() {
         let case = shape.case;
         let (router, engine) = emulator_with_engine();
+        set_up_account(&router).await;
         let applied = apply(&router, &engine, &shape).await;
         tokio::time::sleep(past_the_settle_span()).await;
 
@@ -472,6 +474,7 @@ async fn a_walk_of_the_widened_listing_returns_every_enablement_once() {
     for shape in shapes() {
         let case = shape.case;
         let (router, engine) = emulator_with_engine();
+        set_up_account(&router).await;
         let applied = apply(&router, &engine, &shape).await;
         tokio::time::sleep(past_the_settle_span()).await;
 
@@ -550,6 +553,7 @@ async fn a_walk_of_the_widened_listing_returns_every_enablement_once() {
 #[tokio::test]
 async fn an_enablement_applied_directly_to_its_target_inherits_from_nothing() {
     let (router, _) = emulator_with_engine();
+    set_up_account(&router).await;
     let units = [ou("2a01"), ou("2a02")];
     let mut enabled: Vec<String> = Vec::new();
     for unit in &units {

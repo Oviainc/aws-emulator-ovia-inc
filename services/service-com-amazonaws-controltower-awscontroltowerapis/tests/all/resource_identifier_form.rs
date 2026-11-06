@@ -30,7 +30,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::baseline_operations::{enable as enable_baseline, enablements};
 use crate::enabled_control_lifecycle::{control, enable as enable_control, ou};
 use crate::landing_zone_lifecycle::{
-    call, call_in_region, emulator, is_operation_identifier, manifest_governing,
+    call, call_in_region, emulator, is_operation_identifier, manifest_governing, set_up_emulator,
 };
 
 /// How many characters a Control Tower resource id carries: the `[A-Z0-9]{16}` of
@@ -181,8 +181,10 @@ async fn every_minted_resource_id_is_sixteen_uppercase_alphanumerics() {
     }
 
     // Enabled controls and enabled baselines share one emulator: neither is bounded to
-    // one per account, so every row's id is minted from the same store.
-    let router = emulator();
+    // one per account, so every row's id is minted from the same store. The account is set
+    // up first, because Control Tower enables a control or a baseline only for an account
+    // it has been set up in.
+    let router = set_up_emulator().await;
     for (case, control_identifier, target) in [
         (
             "enabled control on an organizational unit",

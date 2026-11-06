@@ -144,7 +144,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetLandingZoneErrorModeled::InternalServerException(
                 InternalServerException {
@@ -180,11 +179,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resolve_landing_zone_arn(&input.landing_zone_identifier)
             .and_then(|arn| store.landing_zones.get(&arn).cloned());
         let Some(landing_zone) = resolved else {
+            // A landing zone ARN of the right shape naming none this account holds is the
+            // account and Region having no such landing zone, which is what the service
+            // reports: the one wording every operation resolving this member refuses a miss
+            // with, built from the management account and the Region of the request rather
+            // than from the identifier that was sent.
             return Err(GetLandingZoneErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "no landing zone matches landingZoneIdentifier {}",
-                        input.landing_zone_identifier
+                    message: crate::state::unknown_landing_zone_message(
+                        &crate::state::request_region(ctx.parts()),
                     ),
                 },
             )

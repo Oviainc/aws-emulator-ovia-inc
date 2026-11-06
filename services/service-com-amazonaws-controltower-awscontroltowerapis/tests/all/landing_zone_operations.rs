@@ -784,7 +784,21 @@ async fn the_log_starts_empty_and_holds_only_landing_zone_operations() {
     );
 
     // A control enablement mints an identifier in a DIFFERENT log, so it is not a landing
-    // zone operation and this listing does not report it.
+    // zone operation and this listing does not report it. Control Tower enables a control
+    // only for an account it has been set up in, so the CREATE that sets it up is the one
+    // record this log holds by then.
+    let created = call(
+        &router,
+        CREATE,
+        serde_json::json!({ "version": "3.3", "manifest": manifest_governing(&["us-west-2"]) }),
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "create-landingzone: expected 200, got {} body {:?}",
+        created.status, created.body
+    );
+    let create_operation = created.string("operationIdentifier");
     let enabled = call(
         &router,
         "/enable-control",
@@ -804,8 +818,8 @@ async fn the_log_starts_empty_and_holds_only_landing_zone_operations() {
     let listed = list(&router, serde_json::json!({})).await;
     assert_eq!(
         listed_identifiers(&listed),
-        Vec::<String>::new(),
-        "after a control call: expected no landing zone operations, got {:?}",
+        vec![create_operation],
+        "after a control call: expected only the landing zone CREATE, got {:?}",
         listed.body
     );
     assert_eq!(

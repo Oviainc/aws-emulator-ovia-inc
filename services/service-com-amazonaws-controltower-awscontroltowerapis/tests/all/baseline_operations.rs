@@ -30,7 +30,8 @@
 //! belong to the `enabled_baseline_update` / `enabled_baseline_reset` suites.
 
 use crate::landing_zone_lifecycle::{
-    call, emulator, is_operation_identifier, past_the_settle_span, simple_manifest, Answer,
+    call, emulator, is_operation_identifier, past_the_settle_span, set_up_emulator,
+    simple_manifest, Answer,
 };
 
 use smithy_server_runtime::MultiServiceRouter;
@@ -183,7 +184,7 @@ pub(crate) fn member<'a>(operation: &'a serde_json::Value, name: &str) -> Option
 /// made it due — whatever the enablement's members were.
 #[tokio::test]
 async fn an_identifier_enable_baseline_returned_reports_that_enablement() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let mut started: Vec<(&'static str, String, String)> = Vec::new();
 
     for row in enablements() {
@@ -322,7 +323,7 @@ async fn the_record_reports_the_call_that_created_it() {
     let baseline = "arn:aws:controltower:us-west-2::baseline/17BSJV3IGJ2QSGA2";
     let target = "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-ff66-6f";
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     let enabled = enable_pair(&router, baseline, target).await;
     assert_eq!(
         enabled.status, 200,
@@ -474,7 +475,7 @@ async fn an_enablement_round_trips_through_the_store() {
     let target = "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-9988-8x";
     let other_target = "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-7766-6y";
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     let first = enable_pair(&router, baseline, target).await;
     assert_eq!(
         first.status, 200,
@@ -598,7 +599,7 @@ async fn the_enablement_store_is_bounded() {
     let overflow_target =
         "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-cap1-overflow";
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     let mut first_arn = String::new();
     for index in 0..MAX_ENABLED_BASELINES {
         let target =

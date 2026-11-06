@@ -7,6 +7,13 @@
 //! `operationIdentifier` this call returns — the same shape `ResetLandingZone` has one
 //! level up.
 //!
+//! Served only for an account Control Tower has been set up in
+//! ([`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::is_set_up`]): one it
+//! has provisioned nothing in holds no landing zone for this call to resolve an enablement
+//! through, so the call is the modelled `ResourceNotFoundException` (404) reporting the
+//! landing zone as what is missing and nothing is written — see `crate::state` for the one
+//! precondition the enablement calls share.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -165,6 +172,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.settle(now);
+
+        // Control Tower re-deploys a control enablement for an account it has been set up
+        // in; one it has provisioned nothing in holds no landing zone for this call to
+        // resolve an enablement through, so the landing zone is what is reported missing —
+        // asked BEFORE the identifier is resolved and before anything is written. See
+        // `crate::state` for the one precondition the enablement calls share.
+        if !store.is_set_up() {
+            return Err(ResetEnabledControlErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::SETUP_REQUIRED_FOR_CONTROLS.to_string(),
+                },
+            )
+            .into());
+        }
 
         // `enabledControlIdentifier` is modelled as an `Arn`, so the only identifier the
         // front door lets through is the ARN `EnableControl` minted — which is this map's

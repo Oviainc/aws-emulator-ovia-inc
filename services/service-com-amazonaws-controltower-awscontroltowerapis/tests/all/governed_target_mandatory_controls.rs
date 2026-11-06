@@ -36,7 +36,7 @@ use service_com_amazonaws_controltower_awscontroltowerapis::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::enabled_control_lifecycle::{catalog_arn, control, entries, ou};
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, past_the_settle_span, set_up_emulator, Answer};
 
 /// The `BaselineArn` of a catalog baseline, in the region these tests sign for.
 pub(crate) fn baseline(id: &str) -> String {
@@ -245,7 +245,7 @@ async fn governance_applies_every_mandatory_catalog_control_to_its_target() {
         ));
     }
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     let mut governed: Vec<(String, String)> = Vec::new();
 
     for (case, baseline_identifier, version, target, governs) in cases {
@@ -357,7 +357,7 @@ async fn a_governed_targets_listing_holds_the_mandatory_controls_and_the_callers
     let governed_with_own = ou("lb02");
     let ungoverned = ou("lb03");
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     enable_baseline(&router, &baseline(governance.id), version, &governed_bare).await;
     enable_baseline(&router, &baseline(governance.id), version, &governed_with_own).await;
 
@@ -466,7 +466,7 @@ async fn a_mandatory_control_on_a_governed_target_is_not_a_callers_to_enable_or_
     let governance = governance_baseline();
     let target = ou("mr01");
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     enable_baseline(&router, &baseline(governance.id), governance.versions[0], &target).await;
     // Past the settle span, so a refusal below cannot be the in-flight `ConflictException`
     // a control still being applied answers with.
@@ -565,7 +565,7 @@ async fn withdrawing_governance_tears_down_the_controls_it_applied() {
     let withdrawn = ou("wd01");
     let kept = ou("wd02");
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     let enablement = enable_baseline(&router, &baseline(governance.id), version, &withdrawn).await;
     // A second governed target, so the teardown is shown to reach the withdrawn target's
     // controls only.

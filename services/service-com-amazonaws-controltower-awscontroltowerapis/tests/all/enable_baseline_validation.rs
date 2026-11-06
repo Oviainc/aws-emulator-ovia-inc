@@ -25,7 +25,7 @@ use service_com_amazonaws_controltower_awscontroltowerapis::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, past_the_settle_span, set_up_emulator, Answer};
 
 /// The ARN this endpoint serves a catalog baseline under, as `GetBaseline` reports it.
 fn baseline_arn(baseline_id: &str) -> String {
@@ -155,7 +155,7 @@ fn uncatalogued_id(seed: &str) -> String {
 /// later read reports.
 #[tokio::test]
 async fn every_catalog_baseline_enables_at_every_version_it_offers() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     // One row per baseline/version pair, each with the parameters that baseline declares
     // (an empty list for a baseline that declares none), on its own target.
@@ -235,7 +235,7 @@ async fn a_baseline_identifier_that_is_not_a_baseline_arn_is_refused() {
         .first()
         .expect("a catalog baseline offers at least one version");
 
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     // Every row satisfies `Arn` (@length 20..2048, @pattern ^arn:aws[0-9a-zA-Z_\-:\/]+$),
     // the type `EnableBaseline$baselineIdentifier` carries, so the front door passes them
@@ -308,7 +308,7 @@ async fn a_baseline_identifier_that_is_not_a_baseline_arn_is_refused() {
 /// not hold names a resource that does not exist, so it is 404 and persists nothing.
 #[tokio::test]
 async fn a_baseline_arn_naming_no_catalog_baseline_is_not_found() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     // One row per catalog entry, each a 16-character id the catalog does not hold, plus
     // two ids built from nothing in it.
@@ -363,7 +363,7 @@ async fn a_baseline_arn_naming_no_catalog_baseline_is_not_found() {
 /// newest, and a differently written form of one it does offer — and persists nothing.
 #[tokio::test]
 async fn a_version_the_baseline_does_not_offer_is_refused() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let offered_anywhere = every_offered_version();
 
     for (baseline_index, baseline) in BASELINE_CATALOG.iter().enumerate() {
@@ -435,7 +435,7 @@ async fn a_target_that_is_not_an_organizational_unit_is_refused() {
         .first()
         .expect("a catalog baseline offers at least one version");
 
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     // Every row satisfies `Arn`, the type `EnableBaseline$targetIdentifier` carries, so
     // the front door passes them and the HANDLER is what refuses them.
@@ -518,7 +518,7 @@ async fn a_parameter_the_baseline_does_not_declare_is_refused() {
         .first()
         .expect("that baseline declares at least one parameter");
 
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     let cases: Vec<(String, &CatalogBaseline, serde_json::Value)> = vec![
         (
@@ -624,7 +624,7 @@ async fn an_update_is_checked_against_the_enablements_baseline() {
         .last()
         .expect("a catalog baseline offers at least one version");
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     let enabled = enable(
         &router,
         &baseline_arn(declaring.id),

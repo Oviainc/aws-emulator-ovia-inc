@@ -41,7 +41,7 @@ use crate::catalog_identifier_equivalence::{
 use crate::enabled_control_lifecycle::{
     details, entries, last_operation, member, status_summary_status,
 };
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, past_the_settle_span, set_up_emulator, Answer};
 
 /// One row: a control enabled under one of its identifiers and repeated under another, on
 /// a target of its own.
@@ -123,7 +123,7 @@ fn assert_refused_naming(
 /// whichever of the control's published identifiers each call names it by.
 #[tokio::test]
 async fn one_control_on_one_target_is_one_enablement_and_one_lifecycle() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let mut enabled: Vec<(Row, String, String)> = Vec::new();
 
     for row in rows() {

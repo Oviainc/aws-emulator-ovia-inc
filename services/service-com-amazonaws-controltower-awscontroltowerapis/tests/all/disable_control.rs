@@ -56,7 +56,8 @@ use crate::enabled_control_lifecycle::{
 };
 use crate::front_door_validation::arn_of_length;
 use crate::landing_zone_lifecycle::{
-    call, emulator, is_operation_identifier, past_the_settle_span, simple_manifest, Answer,
+    call, emulator, is_operation_identifier, past_the_settle_span, set_up_emulator,
+    simple_manifest, Answer,
 };
 use crate::resource_tags::{read_tags, reported_tags};
 
@@ -328,7 +329,7 @@ fn assert_refused(case: &str, refused: &Answer, expected_status: u16, expected_c
 /// form the request names it in.
 #[tokio::test]
 async fn every_enablement_tears_down_through_its_own_operation() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let rows = rows();
 
     // case, the minted EnabledControl ARN, the ENABLE_CONTROL operation's identifier.
@@ -768,7 +769,7 @@ async fn a_request_acts_on_the_enablement_it_names() {
 /// and status.
 #[tokio::test]
 async fn a_teardown_removes_only_the_enablement_it_names() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let rows = rows();
     assert!(
         rows.len() >= 3,
@@ -1043,7 +1044,7 @@ fn non_control_references(target: &str, enabled_arn: &str) -> Vec<IdentifierRow>
 /// `EnableControl`, which reads the same member: one value, one answer, down to the message.
 #[tokio::test]
 async fn a_control_identifier_is_classified_by_what_it_names() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     let entry = plain_control(0);
     let other = plain_control(1);

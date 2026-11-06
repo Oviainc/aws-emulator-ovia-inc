@@ -46,7 +46,7 @@ use crate::enabled_control_lifecycle::{
     control, enable as enable_control, enabled_control_prefix, entries, ou,
 };
 use crate::front_door_validation::FRONT_DOOR_CODE;
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, set_up_emulator, Answer};
 
 /// One listing that narrows by the shared rule: the path its `@http` trait binds it to,
 /// the output member carrying its records, and the record member that identifies one
@@ -526,7 +526,7 @@ fn absent_enabled_control_arn() -> String {
 /// together.
 #[tokio::test]
 async fn every_listing_narrows_by_the_one_shared_filter_rule() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     seed(&router).await;
 
     // Past the settle span, so every seeded record is in its terminal status and the

@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::enabled_control_lifecycle::{
     control, details, enable, enabled_control_prefix, entries, ou,
 };
-use crate::landing_zone_lifecycle::{call, emulator, is_operation_identifier, past_the_settle_span};
+use crate::landing_zone_lifecycle::{call, is_operation_identifier, past_the_settle_span, set_up_emulator};
 use crate::resource_identifier_form::is_resource_id;
 use crate::resource_tags::{read_tags, reported_tags, tags};
 
@@ -104,7 +104,7 @@ async fn enable_control_persists_the_tag_map_it_was_given() {
 
     // One emulator for the whole table, so the last loop also proves one resource's tags
     // are its own: a later enablement must not disturb an earlier one's map.
-    let router = emulator();
+    let router = set_up_emulator().await;
     let mut persisted: Vec<(&str, String, BTreeMap<String, String>)> = Vec::new();
 
     for (index, (case, tags)) in cases.into_iter().enumerate() {
@@ -176,7 +176,7 @@ async fn every_enablement_mints_its_own_arn_and_operation_identifier() {
         ("another control on the third OU", &root_user, &third_ou),
     ];
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     let mut arns: BTreeSet<String> = BTreeSet::new();
     let mut operations: BTreeSet<String> = BTreeSet::new();
     let mut enabled: Vec<(&str, String, String)> = Vec::new();
@@ -280,7 +280,7 @@ async fn every_enablement_mints_its_own_arn_and_operation_identifier() {
 async fn the_enabled_control_store_is_bounded_by_the_modeled_quota() {
     use service_com_amazonaws_controltower_awscontroltowerapis::state::MAX_ENABLED_CONTROLS;
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     let encrypted = control("AWS-GR_ENCRYPTED_VOLUMES");
 
     // Fill the store to its cap. Each control/target pair is one entry, so one control on

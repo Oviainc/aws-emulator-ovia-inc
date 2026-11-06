@@ -40,7 +40,7 @@ use service_com_amazonaws_controltower_awscontroltowerapis::state::assesses_inhe
 use crate::baseline_operations::{disable, enable, enablements, Enablement};
 use crate::enabled_control_lifecycle::entries;
 use crate::front_door_validation::FRONT_DOOR_CODE;
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, set_up_account, Answer};
+use crate::landing_zone_lifecycle::{call, past_the_settle_span, set_up_emulator, Answer};
 
 /// POST `/list-enabled-baselines` with `body`.
 async fn list(router: &MultiServiceRouter, body: serde_json::Value) -> Answer {
@@ -124,11 +124,10 @@ async fn enable_rows(router: &MultiServiceRouter, rows: &[Enablement]) -> Vec<(S
 /// down.
 #[tokio::test]
 async fn the_listing_reports_every_enablement_the_store_holds() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     // The account is set up first, because Control Tower lists enablements for an account it
     // has been set up in; what this case is about is the listing of a set-up account that
     // has enabled nothing yet.
-    set_up_account(&router).await;
 
     let empty = list(&router, serde_json::json!({})).await;
     assert_eq!(
@@ -308,7 +307,7 @@ async fn the_listing_reports_every_enablement_the_store_holds() {
 /// repeating their ARNs.
 #[tokio::test]
 async fn the_listing_is_narrowed_by_every_filter_member() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let rows = enablements();
     let enabled = enable_rows(&router, &rows).await;
 
@@ -537,7 +536,7 @@ async fn the_listing_is_narrowed_by_every_filter_member() {
 /// evenly, one equal to the set, and the published upper bound.
 #[tokio::test]
 async fn a_paginated_walk_returns_every_enablement_exactly_once() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let row = enablements()
         .into_iter()
         .next()

@@ -43,7 +43,8 @@ use crate::enabled_control_lifecycle::{
     catalog_arn, control, control_operation, control_operations, enable_with, member, ou,
 };
 use crate::landing_zone_lifecycle::{
-    call, emulator, is_operation_identifier, past_the_settle_span, simple_manifest, Answer,
+    call, emulator, is_operation_identifier, past_the_settle_span, set_up_emulator,
+    simple_manifest, Answer,
 };
 
 /// POST `/get-control-operation`, handing back the answer plus its `controlOperation`
@@ -390,7 +391,7 @@ async fn assert_settled(router: &MultiServiceRouter, subject: &Subject) {
 /// of the four calls started it.
 #[tokio::test]
 async fn an_identifier_a_control_call_returned_reports_that_call() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     // Phase 1: every row's enablement, with the `ENABLE_CONTROL` rows' records asserted in
     // flight straight after their own call — the settle span is short on purpose, so a case

@@ -23,7 +23,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::enabled_control_lifecycle::{
     control, details, enable, enabled_control_prefix, entries, ou,
 };
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span};
+use crate::landing_zone_lifecycle::{call, past_the_settle_span, set_up_emulator};
 
 /// One enablement a case asks for: a label, the control, the target and the `parameters`
 /// list `EnableControl` is given (`Value::Null` for a request that carries no
@@ -94,7 +94,7 @@ fn populated_store() -> Vec<Enablement<'static>> {
 /// enablement's own persisted configuration whatever else the store holds.
 #[tokio::test]
 async fn each_identifier_reports_its_own_enablement_among_many() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let specs = populated_store();
 
     let mut minted: Vec<String> = Vec::new();
@@ -156,7 +156,7 @@ async fn reading_an_enablement_changes_nothing_a_later_caller_sees() {
         ("reads interleaved with its neighbours", 2, true),
     ];
     for (case, repeats, interleave_neighbours) in cases {
-        let router = emulator();
+        let router = set_up_emulator().await;
         let specs = populated_store();
         let mut minted: Vec<String> = Vec::new();
         for spec in &specs {

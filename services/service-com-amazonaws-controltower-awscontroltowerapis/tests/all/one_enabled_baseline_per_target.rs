@@ -41,7 +41,7 @@ use crate::catalog_identifier_equivalence::{
 };
 use crate::enable_baseline_validation::enable;
 use crate::in_flight_configuration_change_drift::{baseline_details, baseline_status};
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, past_the_settle_span, set_up_emulator, Answer};
 
 /// One row: a baseline enabled under one of its identifiers at one version, and repeated
 /// under another identifier at another version, on a target of its own.
@@ -135,7 +135,7 @@ fn last_operation(details: &serde_json::Value) -> Option<&str> {
 /// neither refusal mints an enablement, an operation or a slot of the enablement cap.
 #[tokio::test]
 async fn a_repeated_enablement_is_classified_by_the_state_of_the_one_it_collided_with() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let mut enabled: Vec<(Row, String, String)> = Vec::new();
 
     for row in rows() {
@@ -273,7 +273,7 @@ async fn a_repeated_enablement_is_classified_by_the_state_of_the_one_it_collided
 /// the repeat, the version it asks for, or whether the accepted call carried parameters.
 #[tokio::test]
 async fn the_classification_turns_only_on_whether_a_change_is_in_flight() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let baseline = BASELINE_CATALOG.first().expect("a catalog baseline");
     let (version, newest) = oldest_and_newest(baseline);
     let forms = baseline_identifier_forms(baseline.id);

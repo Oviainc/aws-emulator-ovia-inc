@@ -23,7 +23,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::enabled_control_lifecycle::{control, details, enable, entries, ou};
 use crate::landing_zone_lifecycle::{
-    call, call_in_region, emulator, manifest_governing, past_the_settle_span, SIGNED_REGION,
+    call, call_in_region, emulator, manifest_governing, past_the_settle_span,
+    set_up_then_decommission, SIGNED_REGION,
 };
 
 /// A landing zone version the catalog offers, for the rows whose subject is the manifest
@@ -33,8 +34,10 @@ const VERSION: &str = "3.3";
 /// One row of [`target_regions_follow_the_landing_zones_current_governance`].
 struct GovernanceCase {
     case: &'static str,
-    /// The `governedRegions` of the landing zone deployed BEFORE the control is enabled,
-    /// or `None` to enable the control with no landing zone at all.
+    /// The `governedRegions` of the landing zone deployed BEFORE the control is enabled, or
+    /// `None` to enable the control with no landing zone deployed — an account set up and
+    /// decommissioned again, which is the only way a control enables with none, since
+    /// Control Tower enables one only for an account it has been set up in.
     before: Option<&'static [&'static str]>,
     /// The `governedRegions` each later deployment governs, in order.
     after: &'static [&'static [&'static str]],
@@ -209,10 +212,13 @@ async fn target_regions_follow_the_landing_zones_current_governance() {
 
         let mut landing_zone: Option<String> = None;
         let mut governed: Vec<&str> = Vec::new();
-        if let Some(before) = row.before {
-            landing_zone = Some(create_landing_zone(&router, row.case, before).await);
-            governed = before.to_vec();
-            tokio::time::sleep(past_the_settle_span()).await;
+        match row.before {
+            Some(before) => {
+                landing_zone = Some(create_landing_zone(&router, row.case, before).await);
+                governed = before.to_vec();
+                tokio::time::sleep(past_the_settle_span()).await;
+            }
+            None => set_up_then_decommission(&router, row.case).await,
         }
 
         let (arn, _) = enable(
@@ -287,6 +293,7 @@ async fn with_nothing_governed_the_region_is_the_enabling_requests_own() {
 
     for (case, enabling_region, reading_region) in cases {
         let router = emulator();
+        set_up_then_decommission(&router, case).await;
         let enabled = call_in_region(
             &router,
             enabling_region,

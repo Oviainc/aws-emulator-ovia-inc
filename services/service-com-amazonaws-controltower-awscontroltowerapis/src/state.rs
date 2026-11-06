@@ -93,14 +93,15 @@
 //! which stored status becomes which reported member — and whether the member is reported
 //! at all — cannot drift between the detail and the listing.
 //!
-//! The enablement reads share one PRECONDITION, so it lives here once as well: Control
+//! The enablement calls share one PRECONDITION, so it lives here once as well: Control
 //! Tower serves them for an account it has been set up in, and [`is_set_up`] is that
 //! question asked of the stores above. An account it has provisioned nothing in has no
-//! landing zone and no service role for a read to reach enablement state through, so each
-//! such read refuses rather than reporting out of its empty store, in the words its
-//! resource family uses — [`SETUP_REQUIRED_FOR_BASELINES`] for the enabled-baseline reads
-//! and [`SETUP_REQUIRED_FOR_CONTROLS`] for the enabled-control and control-operation
-//! ones.
+//! landing zone and no service role for a call to reach enablement state through, so each
+//! such READ refuses rather than reporting out of its empty store, and each call that would
+//! enable, update, re-deploy or disable a control or a baseline refuses rather than writing
+//! an enablement into it — in the words its resource family uses,
+//! [`SETUP_REQUIRED_FOR_BASELINES`] for the baseline enablement calls and
+//! [`SETUP_REQUIRED_FOR_CONTROLS`] for the control enablement and control-operation ones.
 //!
 //! [`is_set_up`]: ComAmazonawsControltowerAwscontroltowerapisState::is_set_up
 //! [`merge_tags`]: ComAmazonawsControltowerAwscontroltowerapisState::merge_tags
@@ -4143,28 +4144,50 @@ pub fn non_landing_zone_identifier_message(identifier: &str) -> Option<String> {
     ))
 }
 
-/// What an enabled-BASELINE read answers in an account Control Tower was never set up in
+/// What a `landingZoneIdentifier` that names no landing zone this account holds is refused
+/// with.
+///
+/// The one place that refusal's wording is built, so every operation resolving a
+/// `landingZoneIdentifier` — the read, the update, the reset and the decommissioning —
+/// reports a miss the same way. A miss is reported as this ACCOUNT and Region holding no
+/// landing zone rather than as the identifier being unknown, so the value a caller sent is
+/// not what the message names: the management account is the account this emulator presents
+/// and the Region is the one the request was signed for ([`request_region`]), both read off
+/// the request and the emulator's own state.
+pub fn unknown_landing_zone_message(region: &str) -> String {
+    format!(
+        "AWS Control Tower could not find a landing zone identifier value for the management \
+         account: {account}, in Region {region}. To continue, provide a valid resource ARN or \
+         landingZoneIdentifier string for your landing zone.",
+        account = ::engine::emulator_account_id()
+    )
+}
+
+/// What a baseline-ENABLEMENT call answers in an account Control Tower was never set up in
 /// ([`is_set_up`]).
 ///
 /// The baseline enablement APIs act through the service role that setting Control Tower up
 /// creates, so without it the service reports that it could not assume that role rather
-/// than reporting out of a store it never reached. Written here once, so the two reads
-/// that carry it cannot word one precondition two ways. The role is the fixed service role
-/// of that name, so the whole message is fixed text; it is a `ValidationException` (400),
-/// which is the only client error `ListEnabledBaselines` models at all.
+/// than reporting out of a store it never reached — or, for a call that would enable,
+/// update, re-deploy or disable a baseline, rather than writing into it. Written here once,
+/// so the reads and the writes that carry it cannot word one precondition two ways. The
+/// role is the fixed service role of that name, so the whole message is fixed text; it is a
+/// `ValidationException` (400), which is the only client error `ListEnabledBaselines`
+/// models at all and which every baseline enablement call models.
 ///
 /// [`is_set_up`]: ComAmazonawsControltowerAwscontroltowerapisState::is_set_up
 pub const SETUP_REQUIRED_FOR_BASELINES: &str =
     "AWS Control Tower could not complete the operation because it could not assume the \
      'AWSControlTowerAdmin' role. Check the configuration for this role and try again.";
 
-/// What an enabled-CONTROL or control-operation read answers in an account Control Tower
+/// What a control-ENABLEMENT or control-operation call answers in an account Control Tower
 /// was never set up in ([`is_set_up`]).
 ///
 /// The control enablement APIs resolve the account's landing zone, so without one the
 /// service reports the landing zone as the resource that is missing — a
 /// `ResourceNotFoundException` (404) — and names the call that creates it, rather than
-/// reporting out of a store it never reached. Written here once, so every read that
+/// reporting out of a store it never reached, or writing into it for a call that would
+/// enable, update, re-deploy or disable a control. Written here once, so every call that
 /// carries it words the one precondition the same way.
 ///
 /// [`is_set_up`]: ComAmazonawsControltowerAwscontroltowerapisState::is_set_up

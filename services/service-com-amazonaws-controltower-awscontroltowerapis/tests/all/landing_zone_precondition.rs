@@ -50,19 +50,21 @@ use crate::landing_zone_lifecycle::{
     call, emulator, past_the_settle_span, set_up_account, Answer,
 };
 
-/// What AWS Control Tower answers an enabled-BASELINE read with when it cannot assume the
+/// What AWS Control Tower answers a baseline-enablement call with when it cannot assume the
 /// service role setting it up creates. Fixed text: the role is the fixed service role of
-/// that name.
-const BASELINE_REFUSAL: &str = "AWS Control Tower could not complete the operation because it \
-                                could not assume the 'AWSControlTowerAdmin' role. Check the \
-                                configuration for this role and try again.";
+/// that name. Shared with `tests/all/enablement_write_precondition.rs`, which asserts the
+/// same wording on the WRITES of that family.
+pub(crate) const BASELINE_REFUSAL: &str =
+    "AWS Control Tower could not complete the operation because it could not assume the \
+     'AWSControlTowerAdmin' role. Check the configuration for this role and try again.";
 
-/// What it answers an enabled-CONTROL or control-operation read with when the account has
-/// no landing zone. Fixed text, naming the call that creates one.
-const CONTROL_REFUSAL: &str = "AWS Control Tower cannot complete the operation, because you \
-                               must create a landing zone first. To continue, create your \
-                               landing zone from the console, or call the CreateLandingZone \
-                               API.";
+/// What it answers a control-enablement or control-operation call with when the account has
+/// no landing zone. Fixed text, naming the call that creates one. Shared with the write
+/// suite for the same reason.
+pub(crate) const CONTROL_REFUSAL: &str =
+    "AWS Control Tower cannot complete the operation, because you must create a landing \
+     zone first. To continue, create your landing zone from the console, or call the \
+     CreateLandingZone API.";
 
 /// One read under the precondition: its path, the output member that would carry what it
 /// reports, and the refusal its resource family answers with.

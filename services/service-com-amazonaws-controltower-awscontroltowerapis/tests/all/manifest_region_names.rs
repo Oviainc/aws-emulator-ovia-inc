@@ -31,7 +31,8 @@ use service_com_amazonaws_controltower_awscontroltowerapis::state::{
 
 use crate::enabled_control_lifecycle::{control, details, enable, entries, ou};
 use crate::landing_zone_lifecycle::{
-    call, call_in_region, emulator, manifest_governing, past_the_settle_span, Answer,
+    call, call_in_region, emulator, manifest_governing, past_the_settle_span,
+    set_up_then_decommission, Answer,
     SIGNED_REGION,
 };
 
@@ -378,6 +379,10 @@ async fn the_fallback_region_is_a_region_name_too() {
 
     for (case, signed_for, expected) in cases {
         let router = emulator();
+        // Control Tower enables a control only for an account it has been set up in, and
+        // this case needs NOTHING governed to read a region from, so the landing zone the
+        // setup deployed is decommissioned again.
+        set_up_then_decommission(&router, &case).await;
         let enabled = call_in_region(
             &router,
             &signed_for,

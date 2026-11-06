@@ -56,7 +56,7 @@ use crate::enabled_control_lifecycle::{
     configured, control, details as control_details, drift_dimensions, enable_with, entries, ou,
     status_summary_status as control_status,
 };
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, past_the_settle_span, set_up_emulator, Answer};
 
 /// Which call starts applying a configuration to an already deployed enablement of a
 /// baseline, and with which configuration.
@@ -301,7 +301,7 @@ pub(crate) fn deployed_summary(baseline: &CatalogBaseline) -> Option<serde_json:
 /// configuration again once it is due.
 #[tokio::test]
 async fn a_baseline_change_in_flight_reports_no_drift_assessment() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     let rows = baseline_rows();
     assert!(
@@ -546,7 +546,7 @@ pub(crate) async fn start_control_change(
 /// it deploys — and `IN_SYNC` again once the configuration is deployed.
 #[tokio::test]
 async fn a_control_change_in_flight_reports_unknown_drift() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     let rows = control_rows();
 

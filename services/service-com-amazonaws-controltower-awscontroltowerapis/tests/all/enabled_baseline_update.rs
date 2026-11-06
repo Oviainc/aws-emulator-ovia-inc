@@ -32,7 +32,7 @@
 //! come from `smithy_query(query="operation", operation="UpdateEnabledBaseline")`.
 
 use crate::landing_zone_lifecycle::{
-    call, emulator, is_operation_identifier, past_the_settle_span, Answer,
+    call, is_operation_identifier, past_the_settle_span, set_up_emulator, Answer,
 };
 
 use smithy_server_runtime::MultiServiceRouter;
@@ -239,7 +239,7 @@ fn parameters(details: &serde_json::Value) -> serde_json::Value {
 #[tokio::test]
 async fn an_update_applies_the_requested_version_and_parameters() {
     let baseline = "arn:aws:controltower:us-west-2::baseline/17BSJV3IGJ2QSGA2";
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     // Every row is its own enablement on its own target, so the rows do not interact.
     let mut rows: Vec<(UpdateCase, String, String)> = Vec::new();
@@ -440,7 +440,7 @@ async fn a_version_outside_the_modelled_bounds_is_refused() {
     let baseline = "arn:aws:controltower:us-west-2::baseline/17BSJV3IGJ2QSGA2";
     let target = "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-bd11-1a";
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     let enabled = enable(&router, baseline, target, "4.0", None).await;
     assert_eq!(
         enabled.status, 200,
@@ -484,7 +484,7 @@ async fn updates_apply_in_order_one_after_the_other() {
     let baseline = "arn:aws:controltower:us-west-2::baseline/17BSJV3IGJ2QSGA2";
     let target = "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-seq1-1a";
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     let enabled = enable(&router, baseline, target, "1.0", None).await;
     assert_eq!(
         enabled.status, 200,
@@ -548,7 +548,7 @@ async fn updates_apply_in_order_one_after_the_other() {
 #[tokio::test]
 async fn an_update_overlapping_an_operation_in_flight_is_a_conflict() {
     let baseline = "arn:aws:controltower:us-east-1::baseline/17BSJV3IGJ2QSGA2";
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     for (case, start_a_second_operation) in [
         ("while the enable is in flight", false),
@@ -628,7 +628,7 @@ async fn an_identifier_no_enablement_matches_is_not_found() {
     let baseline = "arn:aws:controltower:ap-south-1::baseline/QXK3R9ZB7PN5TD2H";
     let target = "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-nf11-1a";
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     let enabled = enable(&router, baseline, target, "1.0", None).await;
     assert_eq!(
         enabled.status, 200,
@@ -700,7 +700,7 @@ async fn reading_an_enablement_changes_nothing() {
     let baseline = "arn:aws:controltower:us-west-2::baseline/17BSJV3IGJ2QSGA2";
     let target = "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-ro11-1a";
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     let enabled = enable(
         &router,
         baseline,

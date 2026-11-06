@@ -58,7 +58,7 @@ use crate::in_flight_configuration_change_drift::{
     baseline_details, baseline_status, baseline_summary, deployed_summary, drift_summary,
     enable_baseline_on, ou_target, parameters_of,
 };
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, past_the_settle_span, set_up_emulator, Answer};
 
 /// One row of the baseline table: the configuration an enablement has deployed when
 /// `DisableBaseline` starts removing it.
@@ -142,7 +142,7 @@ async fn get_enabled_baseline(router: &MultiServiceRouter, arn: &str) -> Answer 
 /// deployed — and once it is due the enablement is gone.
 #[tokio::test]
 async fn a_baseline_teardown_in_flight_reports_no_drift_assessment() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     let rows = baseline_rows();
     assert!(
@@ -357,7 +357,7 @@ pub(crate) async fn get_enabled_control(router: &MultiServiceRouter, arn: &str) 
 /// enablement is gone.
 #[tokio::test]
 async fn a_control_teardown_in_flight_reports_unknown_drift() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     // Every row is its own enablement on its own target, so the rows do not interact.
     let mut enabled: Vec<(ControlRow, String)> = Vec::new();

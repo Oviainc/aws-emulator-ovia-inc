@@ -55,7 +55,7 @@ use crate::enabled_control_lifecycle::{
     status_summary_status as status,
 };
 use crate::landing_zone_lifecycle::{
-    call, emulator, is_operation_identifier, past_the_settle_span, Answer,
+    call, is_operation_identifier, past_the_settle_span, set_up_emulator, Answer,
 };
 
 /// POST `/reset-enabled-control`. `enabledControlIdentifier` is the only member the model
@@ -232,7 +232,7 @@ fn rows() -> Vec<Row> {
 /// `IN_SYNC`, and the configured parameters, the target and the regions never move.
 #[tokio::test]
 async fn a_reset_redeploys_the_configuration_the_control_already_carries() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     // Every row is its own enablement on its own target, so the rows do not interact.
     let mut enabled: Vec<(Row, String)> = Vec::new();
@@ -407,7 +407,7 @@ async fn a_reset_redeploys_the_configuration_the_control_already_carries() {
 /// `RESET_ENABLED_CONTROL` record and leaves the configuration where it was.
 #[tokio::test]
 async fn each_reset_starts_its_own_operation() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     // A control a reset works for. Every control the catalog publishes WITH parameters is
     // implemented with a service control policy, so the configuration a repeat re-deploys
     // here is the empty one this control carries.
@@ -489,7 +489,7 @@ async fn a_reset_overlapping_an_operation_in_flight_is_a_conflict() {
     .into_iter()
     .enumerate()
     {
-        let router = emulator();
+        let router = set_up_emulator().await;
         let (arn, enable_operation) =
             enable_with(&router, &identifier, &ou(&format!("cf{index:02}")), None).await;
 
@@ -554,7 +554,7 @@ async fn a_reset_overlapping_an_operation_in_flight_is_a_conflict() {
 /// refusal leaves the control that does exist alone.
 #[tokio::test]
 async fn an_identifier_no_enabled_control_matches_is_not_found() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let parameterized = parameterized_control();
     let control_identifier = control(parameterized.name);
     let enabled_with = parameters_of(parameterized, 1, &[serde_json::json!(["us-west-2"])]);
@@ -669,7 +669,7 @@ fn assert_documented_refusal(refused: &Answer, case: &str, control_name: &str) {
 /// none, and read both while its enablement is still deploying and once it is deployed.
 #[tokio::test]
 async fn a_control_implemented_with_a_service_control_policy_cannot_be_reset() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let policy_controls = service_control_policy_controls();
     assert!(
         !policy_controls.is_empty(),

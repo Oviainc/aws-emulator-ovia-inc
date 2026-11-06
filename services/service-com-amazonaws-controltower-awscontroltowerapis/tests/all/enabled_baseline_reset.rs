@@ -48,7 +48,7 @@ use service_com_amazonaws_controltower_awscontroltowerapis::state::{
 
 use crate::baseline_catalog::served_arn;
 use crate::landing_zone_lifecycle::{
-    call, emulator, is_operation_identifier, past_the_settle_span, Answer,
+    call, is_operation_identifier, past_the_settle_span, set_up_emulator, Answer,
 };
 
 /// One row of the reset table: which catalog baseline is enabled, at which version, with
@@ -237,7 +237,7 @@ fn expected_summary(baseline: &CatalogBaseline) -> Option<serde_json::Value> {
 /// is reported again.
 #[tokio::test]
 async fn a_reset_re_applies_the_configuration_already_applied() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     let rows = reset_cases();
     assert!(
@@ -444,7 +444,7 @@ async fn every_reset_starts_its_own_operation() {
         .copied()
         .expect("every catalog baseline offers at least one version");
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     let enabled = call(
         &router,
         "/enable-baseline",
@@ -536,7 +536,7 @@ async fn a_reset_overlapping_an_operation_in_flight_is_a_conflict() {
     let oldest = baseline.versions[0];
     let newest = baseline.versions[baseline.versions.len() - 1];
 
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     for (index, (case, overlapping)) in [
         ("while the enable is in flight", None),
@@ -625,7 +625,7 @@ async fn an_identifier_no_enablement_matches_is_not_found() {
         .expect("the catalog publishes at least one baseline");
     let baseline_identifier = served_arn(baseline);
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     let enabled = call(
         &router,
         "/enable-baseline",

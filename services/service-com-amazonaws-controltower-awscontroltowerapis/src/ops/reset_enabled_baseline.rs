@@ -7,6 +7,14 @@
 //! applied version and parameters alone, and lets [`crate::state`] re-assess the
 //! enablement's inheritance drift once the clock has made that operation due.
 //!
+//! Served only for an account Control Tower has been set up in
+//! ([`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::is_set_up`]): setting
+//! it up is what creates the service role the baseline enablement APIs act through, so in
+//! one it has provisioned nothing in the call is the modelled `ValidationException` (400)
+//! reporting that it could not assume that role, ahead of resolving the identifier and
+//! before anything is written — see `crate::state` for the one precondition the enablement
+//! calls share.
+//!
 //! AUTHORIZATION and THROTTLING are NOT emulated here, so the modelled
 //! `AccessDeniedException` (403) and `ThrottlingException` (429) are deliberately
 //! unreachable from this handler: the emulator verifies the request signature at its front
@@ -178,6 +186,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.settle(now);
+
+        // Control Tower re-applies a baseline through the service role setting it up
+        // creates, so an account it has provisioned nothing in has no role for this call to
+        // act through and it reports that it could not assume it — asked BEFORE the
+        // identifier is resolved and before anything is written. See `crate::state` for the
+        // one precondition the enablement calls share.
+        if !store.is_set_up() {
+            return Err(ResetEnabledBaselineErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::SETUP_REQUIRED_FOR_BASELINES.to_string(),
+                },
+            )
+            .into());
+        }
 
         // `enabledBaselineIdentifier` is modelled as an `Arn` and documented "in ARN
         // format", so the only identifier the front door lets through is the ARN

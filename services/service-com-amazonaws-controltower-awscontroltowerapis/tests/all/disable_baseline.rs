@@ -32,7 +32,8 @@
 use crate::baseline_operations::{disable, enable, enablements, get_operation, member};
 use crate::front_door_validation::arn_of_length;
 use crate::landing_zone_lifecycle::{
-    call, emulator, is_operation_identifier, past_the_settle_span, simple_manifest,
+    call, emulator, is_operation_identifier, past_the_settle_span, set_up_emulator,
+    simple_manifest,
 };
 
 /// RULE: every enablement tears down through its own `DISABLE_BASELINE` operation —
@@ -42,7 +43,7 @@ use crate::landing_zone_lifecycle::{
 /// whatever version, parameter list and tag map the enablement carries.
 #[tokio::test]
 async fn every_enablement_tears_down_through_its_own_idempotent_operation() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let rows = enablements();
 
     // case, the minted EnabledBaseline ARN, the ENABLE_BASELINE operation's identifier.
@@ -362,7 +363,7 @@ async fn only_the_enablements_own_arn_names_it() {
 /// conflict — and every other operation record keeps its own type and status.
 #[tokio::test]
 async fn a_teardown_removes_only_its_own_enablement() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let rows = enablements();
     assert!(
         rows.len() >= 3,

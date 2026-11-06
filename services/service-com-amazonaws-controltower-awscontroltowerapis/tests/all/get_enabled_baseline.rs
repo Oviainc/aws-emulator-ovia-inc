@@ -50,7 +50,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::baseline_operations::{enable, enablements, member};
 use crate::catalog_identifier_equivalence::listed_arns;
 use crate::front_door_validation::arn_of_length;
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, past_the_settle_span, set_up_emulator, Answer};
 use crate::list_tags_for_resource::one_character_off;
 
 /// The modelled `EnablementStatus` value set: the only statuses an enablement's
@@ -204,7 +204,7 @@ fn assert_reported_form(case: &str, arn: &str, details: &serde_json::Value) {
 /// `parentIdentifier`.
 #[tokio::test]
 async fn only_the_exact_minted_arn_names_an_enablement() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let applied = applied_enablements(&router).await;
     let minted: Vec<String> = applied.iter().map(|(_, arn)| arn.clone()).collect();
 
@@ -260,7 +260,7 @@ async fn only_the_exact_minted_arn_names_an_enablement() {
 /// enablements that were applied, and the missing ARNs are still missing.
 #[tokio::test]
 async fn a_read_that_names_no_enablement_changes_nothing_a_later_caller_sees() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let applied = applied_enablements(&router).await;
 
     // Let the clock make every enablement's operation due FIRST, so each one has reached

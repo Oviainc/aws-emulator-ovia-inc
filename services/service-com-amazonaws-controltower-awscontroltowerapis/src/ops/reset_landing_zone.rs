@@ -185,11 +185,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(now);
 
         let Some(arn) = store.resolve_landing_zone_arn(&input.landing_zone_identifier) else {
+            // The one wording every operation resolving this member refuses a miss with: a
+            // landing zone ARN naming none this account holds is the account and Region
+            // having no landing zone to re-deploy, named from the request rather than from
+            // the identifier it sent.
             return Err(ResetLandingZoneErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "no landing zone matches landingZoneIdentifier {}",
-                        input.landing_zone_identifier
+                    message: crate::state::unknown_landing_zone_message(
+                        &crate::state::request_region(ctx.parts()),
                     ),
                 },
             )

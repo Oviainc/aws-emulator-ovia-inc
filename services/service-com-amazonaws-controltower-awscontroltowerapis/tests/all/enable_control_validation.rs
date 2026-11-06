@@ -210,7 +210,7 @@ fn undeclared_key(seed: &str) -> String {
 /// parameters it declares — and what was accepted is what a later read reports.
 #[tokio::test]
 async fn every_enablable_catalog_control_enables_under_either_arn_form() {
-    let router = emulator();
+    let router = emulator_for_enablement().await;
 
     // One row per enablable control per identifier form, each with the parameters that
     // control declares (an empty list for a control that declares none), on its own target.
@@ -583,7 +583,7 @@ async fn an_update_naming_a_parameter_the_control_does_not_declare_is_refused() 
         .expect("the catalog publishes an enablable control with parameters");
     let declared = parameterized.parameters[0];
 
-    let router = emulator();
+    let router = emulator_for_enablement().await;
     let enabled = enable(
         &router,
         &control_arn(parameterized.name),

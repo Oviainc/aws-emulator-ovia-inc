@@ -41,7 +41,9 @@ use service_com_amazonaws_controltower_awscontroltowerapis::state::{
 
 use crate::baseline_operations::{disable, enable, enablements};
 use crate::enabled_control_lifecycle::entries;
-use crate::landing_zone_lifecycle::{call, emulator_with_engine, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{
+    call, emulator_with_engine, past_the_settle_span, set_up_account, Answer,
+};
 use crate::resource_tags::{apply_tags, read_tags, reported_tags, tags};
 
 /// The baseline this suite enables: `AWSControlTowerBaseline`, which offers the versions
@@ -202,6 +204,7 @@ async fn a_parked_transition_is_reported_and_applied_though_its_record_was_evict
     for (index, (case, started, settled_version)) in rows.into_iter().enumerate() {
         // A router per row, so the rows cannot evict each other's records.
         let (router, engine) = emulator_with_engine();
+        set_up_account(&router).await;
         let target =
             format!("arn:aws:organizations::123456789012:ou/o-exampleorg/ou-pt{index:02}-0001");
 
@@ -319,6 +322,7 @@ async fn a_parked_transition_is_reported_and_applied_though_its_record_was_evict
 #[tokio::test]
 async fn a_teardown_whose_record_was_evicted_still_removes_the_enablement_and_its_tags() {
     let (router, engine) = emulator_with_engine();
+    set_up_account(&router).await;
     let rows = enablements();
     let attached = tags(&[("Owner", "platform"), ("Cost-Centre", "4711")]);
 

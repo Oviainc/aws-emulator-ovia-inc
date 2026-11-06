@@ -42,7 +42,7 @@ use crate::baseline_catalog::served_arn_in;
 use crate::baseline_operations::{enablements, Enablement};
 use crate::enabled_control_lifecycle::{control, entries, ou};
 use crate::landing_zone_lifecycle::{
-    call_in_region, emulator, past_the_settle_span, simple_manifest, Answer,
+    call_in_region, emulator, past_the_settle_span, set_up_emulator, simple_manifest, Answer,
 };
 
 /// One row of the table: the region a request is signed for, and the region the ARNs that
@@ -327,7 +327,7 @@ async fn a_minted_landing_zone_arn_is_addressable_whatever_region_was_signed_for
 #[tokio::test]
 async fn a_served_baseline_arn_round_trips_whatever_region_was_signed_for() {
     for row in signing_regions() {
-        let router = emulator();
+        let router = set_up_emulator().await;
 
         for baseline in BASELINE_CATALOG {
             let case = format!("{}: {}", row.case, baseline.name);
@@ -405,7 +405,7 @@ async fn a_served_baseline_arn_round_trips_whatever_region_was_signed_for() {
 #[tokio::test]
 async fn a_minted_enablement_arn_resolves_whatever_region_was_signed_for() {
     for row in signing_regions() {
-        let router = emulator();
+        let router = set_up_emulator().await;
 
         let enabled_control = accepted(
             &router,

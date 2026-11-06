@@ -40,7 +40,7 @@ use crate::enabled_control_lifecycle::{
 use crate::governed_target_mandatory_controls::{
     baseline, enable_baseline, governance_baseline, list, listed_arn_of, mandatory,
 };
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, past_the_settle_span, set_up_emulator, Answer};
 
 /// One request of the table: a call a caller makes against an enabled control, and the word
 /// the refusal must read back for what that call would have done.
@@ -232,7 +232,7 @@ async fn a_control_the_service_applied_is_not_a_callers_to_change() {
     let governance = governance_baseline();
     let target = ou("mu01");
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     enable_baseline(
         &router,
         &baseline(governance.id),
@@ -325,7 +325,7 @@ async fn the_same_calls_are_accepted_on_the_controls_a_caller_enabled() {
         .find(|entry| entry.name != resettable.name && entry.name != parameterized.name)
         .expect("the catalog must publish three controls a caller may enable");
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     enable_baseline(
         &router,
         &baseline(governance.id),

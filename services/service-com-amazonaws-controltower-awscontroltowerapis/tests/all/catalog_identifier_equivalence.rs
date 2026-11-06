@@ -31,7 +31,7 @@ use service_com_amazonaws_controltower_awscontroltowerapis::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::enabled_control_lifecycle::entries;
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, past_the_settle_span, set_up_emulator, Answer};
 
 /// An organizational-unit target, in the form the AWS Organizations documentation
 /// publishes. `suffix` keeps the rows of one case on distinct targets.
@@ -223,7 +223,7 @@ fn uncatalogued_baseline_id(seed: &str) -> String {
 /// names it — and whatever version the repeat asks for, in flight or already deployed.
 #[tokio::test]
 async fn one_baseline_enables_once_per_target_whichever_identifier_names_it() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let mut enabled: Vec<(String, String)> = Vec::new();
 
     for (index, baseline) in BASELINE_CATALOG.iter().enumerate() {
@@ -302,7 +302,7 @@ async fn the_pair_rule_narrows_to_one_baseline_and_one_target() {
     let target = ou("p0");
     let other_target = ou("p1");
 
-    let router = emulator();
+    let router = set_up_emulator().await;
     let enabled = enable_baseline(&router, &first_forms[0].1, version, &target).await;
     assert_eq!(
         enabled.status, 200,
@@ -385,7 +385,7 @@ async fn a_baseline_filter_selects_enablements_named_by_any_identifier_of_that_b
     let first_forms = baseline_identifier_forms(first.id);
     let second_forms = baseline_identifier_forms(second.id);
 
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     // One enablement of the first baseline per equivalent identifier, each on its own
     // target, so the stored identifiers span every form.
@@ -474,7 +474,7 @@ async fn a_baseline_filter_selects_enablements_named_by_any_identifier_of_that_b
 /// `ListEnabledControls`/`ListControlOperations` find that enablement by any of them.
 #[tokio::test]
 async fn one_control_enables_once_per_target_whichever_identifier_names_it() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let enablable: Vec<&CatalogControl> = CONTROL_CATALOG
         .iter()
         .filter(|control| control.enablable)

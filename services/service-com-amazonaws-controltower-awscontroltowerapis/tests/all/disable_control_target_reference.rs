@@ -33,7 +33,7 @@ use crate::enabled_control_lifecycle::{
     status_summary_status as status,
 };
 use crate::front_door_validation::arn_of_length;
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, past_the_settle_span, set_up_emulator, Answer};
 
 /// POST `/disable-control` with exactly the members `body` carries.
 async fn disable(router: &MultiServiceRouter, body: serde_json::Value) -> Answer {
@@ -175,7 +175,7 @@ fn not_organizational_units() -> Vec<(&'static str, String)> {
 /// nothing down.
 #[tokio::test]
 async fn a_target_that_is_not_an_organizational_unit_is_refused() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let entry = enablable(0);
     let target = ou("g001");
     let (arn, _) = enable(
@@ -268,7 +268,7 @@ async fn a_target_that_is_not_an_organizational_unit_is_refused() {
 /// nothing is enabled on and 200 for the enablement it names — in any partition.
 #[tokio::test]
 async fn an_organizational_unit_target_reaches_the_store() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     // Two enablements of the same control shape on organizational units that differ in the
     // partition their ARN names: the rule is about the ARN being an organizational unit's,

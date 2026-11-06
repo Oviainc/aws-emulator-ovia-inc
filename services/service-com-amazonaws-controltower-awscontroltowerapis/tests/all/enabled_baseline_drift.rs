@@ -34,7 +34,7 @@ use service_com_amazonaws_controltower_awscontroltowerapis::state::{
 };
 
 use crate::baseline_catalog::served_arn;
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, past_the_settle_span, set_up_emulator, Answer};
 
 /// The ARN the service serves `baseline` under, in the region these tests sign for. The
 /// sibling `baseline_catalog` suite owns that form, so the two cannot disagree about it.
@@ -99,7 +99,7 @@ fn expected_summary(baseline: &CatalogBaseline) -> Option<serde_json::Value> {
 /// configuration.
 #[tokio::test]
 async fn a_deployed_enablement_reports_the_inheritance_drift_of_its_baseline() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     // Every baseline the catalog publishes, each on its own target so the rows do not
     // interact.
@@ -188,7 +188,7 @@ async fn a_deployed_enablement_reports_the_inheritance_drift_of_its_baseline() {
 /// is in flight no assessment is reported at all.
 #[tokio::test]
 async fn the_listing_and_an_update_report_the_same_drift_summary() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     // The rows that can be UPDATED are the ones whose baseline offers a second version, so
     // the update asks for a version the baseline really offers; the rest are enabled too,

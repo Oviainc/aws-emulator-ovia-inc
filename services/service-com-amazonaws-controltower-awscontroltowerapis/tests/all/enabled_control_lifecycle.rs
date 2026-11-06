@@ -31,7 +31,8 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::landing_zone_lifecycle::{
-    call, emulator, is_operation_identifier, manifest_governing, past_the_settle_span, Answer,
+    call, emulator, is_operation_identifier, manifest_governing, past_the_settle_span,
+    set_up_emulator, set_up_then_decommission, Answer,
 };
 
 /// The `ControlIdentifier` of a control, as AWS Control Tower names its controls: the
@@ -315,7 +316,7 @@ async fn an_enabled_control_round_trips_through_list_and_get() {
     ];
 
     for (case, control_identifier, target_identifier, parameters, tags) in cases {
-        let router = emulator();
+        let router = set_up_emulator().await;
 
         let mut body = serde_json::json!({
             "controlIdentifier": control_identifier,
@@ -415,7 +416,7 @@ async fn an_enabled_control_round_trips_through_list_and_get() {
 /// it, so two reads of the same instant agree.
 #[tokio::test]
 async fn an_enablement_settles_from_under_change_to_succeeded() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let (arn, operation) = enable(
         &router,
         serde_json::json!({
@@ -489,7 +490,7 @@ async fn an_enablement_settles_from_under_change_to_succeeded() {
 /// child of another and the flag changes nothing.
 #[tokio::test]
 async fn the_listing_is_narrowed_by_target_and_by_every_filter_member() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     let encrypted = control("AWS-GR_ENCRYPTED_VOLUMES");
     let root_user = control("AWS-GR_RESTRICT_ROOT_USER");
@@ -681,7 +682,7 @@ async fn the_listing_is_narrowed_by_target_and_by_every_filter_member() {
 /// a size that divides the set evenly, one that does not, and one equal to the set.
 #[tokio::test]
 async fn a_paginated_walk_returns_every_control_exactly_once() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let target = ou("7777");
     // Six catalogued controls on one target: one enablement per control/target pair.
     let controls = [
@@ -793,7 +794,7 @@ async fn a_paginated_walk_returns_every_control_exactly_once() {
 /// succeed.
 #[tokio::test]
 async fn a_control_is_enabled_at_most_once_per_target() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let encrypted = control("AWS-GR_ENCRYPTED_VOLUMES");
     let target = ou("8888");
     let request = serde_json::json!({
@@ -870,7 +871,7 @@ async fn a_control_is_enabled_at_most_once_per_target() {
 /// re-check those value sets.
 #[tokio::test]
 async fn a_request_the_state_cannot_satisfy_is_refused_with_its_modeled_error() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let (arn, _) = enable(
         &router,
         serde_json::json!({
@@ -1024,7 +1025,7 @@ async fn the_parameter_list_is_bounded_in_weight() {
     ];
 
     for (case, parameters, accepted) in cases {
-        let router = emulator();
+        let router = set_up_emulator().await;
         let answer = call(
             &router,
             "/enable-control",
@@ -1067,8 +1068,9 @@ async fn the_parameter_list_is_bounded_in_weight() {
 }
 
 /// One row of [`target_regions_are_the_governed_regions_of_the_deployed_landing_zone`]:
-/// the case name, the `governedRegions` of the landing zone to deploy first (or `None`
-/// to deploy none), and the target regions the enablement must then report.
+/// the case name, the `governedRegions` of the landing zone to deploy first (or `None` to
+/// deploy none, which is the account set up and decommissioned again), and the target
+/// regions the enablement must then report.
 type RegionCase<'a> = (&'a str, Option<Vec<&'a str>>, Vec<&'a str>);
 
 /// RULE: a control is deployed into the regions the landing zone governs, whatever that
@@ -1078,7 +1080,7 @@ type RegionCase<'a> = (&'a str, Option<Vec<&'a str>>, Vec<&'a str>);
 async fn target_regions_are_the_governed_regions_of_the_deployed_landing_zone() {
     let cases: Vec<RegionCase<'_>> = vec![
         (
-            "no landing zone: the request's own region",
+            "no landing zone deployed: the request's own region",
             None,
             vec!["us-west-2"],
         ),
@@ -1101,21 +1103,27 @@ async fn target_regions_are_the_governed_regions_of_the_deployed_landing_zone() 
 
     for (case, governed, expected) in cases {
         let router = emulator();
-        if let Some(governed) = &governed {
-            let created = call(
-                &router,
-                "/create-landingzone",
-                serde_json::json!({
-                    "version": "3.3",
-                    "manifest": manifest_governing(governed)
-                }),
-            )
-            .await;
-            assert_eq!(
-                created.status, 200,
-                "case {case:?}: create-landingzone expected 200, got {} body {:?}",
-                created.status, created.body
-            );
+        match &governed {
+            Some(governed) => {
+                let created = call(
+                    &router,
+                    "/create-landingzone",
+                    serde_json::json!({
+                        "version": "3.3",
+                        "manifest": manifest_governing(governed)
+                    }),
+                )
+                .await;
+                assert_eq!(
+                    created.status, 200,
+                    "case {case:?}: create-landingzone expected 200, got {} body {:?}",
+                    created.status, created.body
+                );
+            }
+            // A control enables only for an account Control Tower has been set up in, so the
+            // row that enables with NO landing zone deployed sets the account up and
+            // decommissions it again: nothing is left to read a governed-region list from.
+            None => set_up_then_decommission(&router, case).await,
         }
 
         let (arn, _) = enable(

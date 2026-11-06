@@ -36,7 +36,7 @@ use service_com_amazonaws_controltower_awscontroltowerapis::state::{
 
 use crate::baseline_catalog::served_arn;
 use crate::enabled_control_lifecycle::{control, details as control_details, entries, ou};
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span};
+use crate::landing_zone_lifecycle::{call, past_the_settle_span, set_up_emulator};
 
 /// The `driftStatusSummary` member of a reported record, absent as `None`.
 fn drift_summary(record: &serde_json::Value) -> Option<serde_json::Value> {
@@ -158,7 +158,7 @@ enum Change {
 /// declares it and absent when no inheritance drift is assessed.
 #[tokio::test]
 async fn both_enabled_baseline_readers_report_one_projection() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     // Every baseline the catalog publishes, each on its own target so the rows do not
     // interact.
@@ -323,7 +323,7 @@ async fn both_enabled_control_readers_report_one_projection() {
     ];
 
     for (case, control_identifier, target_identifier, initial, change) in rows {
-        let router = emulator();
+        let router = set_up_emulator().await;
 
         let mut body = serde_json::json!({
             "controlIdentifier": control_identifier,

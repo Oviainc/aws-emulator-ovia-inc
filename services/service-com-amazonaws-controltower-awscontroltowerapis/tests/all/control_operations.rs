@@ -38,7 +38,7 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::enabled_control_lifecycle::{control, enable, entries, ou};
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, set_up_emulator, Answer};
 
 /// POST `/list-control-operations` with `body`, asserting the call succeeded.
 async fn list(router: &MultiServiceRouter, body: serde_json::Value) -> Answer {
@@ -150,7 +150,7 @@ async fn enable_row(router: &MultiServiceRouter, row: &Row) -> (String, String) 
 /// has made it due — whatever the enablement's members were.
 #[tokio::test]
 async fn an_enable_control_call_is_the_record_the_listing_reports() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let mut started: Vec<(&'static str, Row, String, String)> = Vec::new();
 
     for row in rows() {
@@ -274,7 +274,7 @@ async fn an_enable_control_call_is_the_record_the_listing_reports() {
 /// `@length(1..1)`, so every row carries exactly one value per member.
 #[tokio::test]
 async fn the_listing_is_the_log_narrowed_by_every_filter_member() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     let mut enabled: Vec<(String, String, String, String)> = Vec::new();
     for row in rows() {
@@ -461,7 +461,7 @@ async fn the_listing_is_the_log_narrowed_by_every_filter_member() {
 /// equal to the set.
 #[tokio::test]
 async fn a_paginated_walk_returns_each_record_exactly_once() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     // Six records, so a page size of 2 and 3 divide the set and 4 does not. One catalogued
     // control on six organizational units: a control is enabled at most once per target.

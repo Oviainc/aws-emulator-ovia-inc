@@ -32,7 +32,7 @@
 use crate::baseline_operations::{disable, enable, enablements};
 use crate::landing_zone_lifecycle::{
     call, emulator, is_operation_identifier, manifest_governing, past_the_settle_span,
-    simple_manifest, Answer,
+    set_up_emulator, simple_manifest, Answer,
 };
 
 use smithy_server_runtime::MultiServiceRouter;
@@ -418,10 +418,11 @@ async fn every_idempotent_teardown_reports_the_operation_in_flight() {
     ));
 
     let enablement = &enablements()[0];
-    // Its own emulator: the half above decommissions this account's landing zone, and a
-    // decommissioning deletes the enablements deployed under it, so a shared store would
-    // tear this enablement down in the middle of the case.
-    let baseline_router = emulator();
+    // Its own emulator, SET UP: the half above decommissions this account's landing zone,
+    // and a decommissioning deletes the enablements deployed under it, so a shared store
+    // would tear this enablement down in the middle of the case — and a baseline enables
+    // only for an account Control Tower has been set up in.
+    let baseline_router = set_up_emulator().await;
     let enabled = enable(&baseline_router, enablement).await;
     assert_eq!(
         enabled.status, 200,

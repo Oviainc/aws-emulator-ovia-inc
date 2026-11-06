@@ -45,7 +45,7 @@ use crate::enabled_control_lifecycle::{
     status_summary_status as control_status,
 };
 use crate::in_flight_configuration_change_drift::{control_rows, start_control_change, ControlRow};
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, past_the_settle_span, set_up_emulator, Answer};
 
 /// The three `EnabledControlFilter` members that narrow the listing by one of the drift
 /// dimensions a control reports.
@@ -134,7 +134,7 @@ pub(crate) fn state(status: &str, drift: &str) -> (String, (String, String, Stri
 /// makes the change due.
 #[tokio::test]
 async fn every_reporting_call_agrees_on_a_control_change_in_flight() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     let rows = control_rows();
     // A control nobody changes, so each case also pins that a change withdraws the

@@ -19,6 +19,14 @@
 //! (`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::apply_governance_controls`);
 //! `DisableBaseline` withdraws them again.
 //!
+//! Served only for an account Control Tower has been set up in
+//! ([`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::is_set_up`]): setting
+//! it up is what creates the service role the baseline enablement APIs act through, so in
+//! one it has provisioned nothing in the call is the modelled `ValidationException` (400)
+//! reporting that it could not assume that role — ahead of the target lookup, and before
+//! anything is persisted or an operation minted. See `crate::state` for the one precondition
+//! the enablement calls share.
+//!
 //! A baseline is enabled at most once per target, and the refusal of a repeat is
 //! classified by the STATE of the enablement already holding the pair, as `EnableControl`
 //! classifies its own: while that enablement is still being deployed the repeat would race
@@ -290,6 +298,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.settle(now);
+
+        // Control Tower applies a baseline through the service role setting it up creates,
+        // so an account it has provisioned nothing in has no role for this call to deploy
+        // the baseline through and it reports that it could not assume it. Asked BEFORE the
+        // target is looked up and before anything is persisted or an operation minted, so
+        // no enablement — and no operation to poll for one — exists for an account the
+        // service was never set up in. See `crate::state` for the one precondition the
+        // enablement calls share.
+        if !store.is_set_up() {
+            return Err(EnableBaselineErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::SETUP_REQUIRED_FOR_BASELINES.to_string(),
+                },
+            )
+            .into());
+        }
 
         // One baseline per target: the pair is what identifies an enablement, so a second
         // enable of the same pair would leave two `EnabledBaseline` resources describing

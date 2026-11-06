@@ -48,7 +48,7 @@ use crate::enable_baseline_validation::{
 };
 use crate::enabled_baseline_update::get_operation;
 use crate::landing_zone_lifecycle::{
-    emulator, is_operation_identifier, past_the_settle_span, Answer,
+    is_operation_identifier, past_the_settle_span, set_up_emulator, Answer,
 };
 
 /// The acceptable `parameters` form for `baseline`: every key it declares, once each — the
@@ -191,7 +191,7 @@ fn the_catalog_lists_each_baselines_versions_oldest_first() {
 /// as an asynchronous operation and applied once the clock makes it due.
 #[tokio::test]
 async fn an_update_to_a_version_the_enablements_baseline_does_not_offer_is_refused() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let offered_anywhere = every_offered_version();
     let enablements = deployed_enablements(&router, "uv", |baseline| {
         Some(declared_parameters(baseline))
@@ -329,7 +329,7 @@ async fn an_update_to_a_version_the_enablements_baseline_does_not_offer_is_refus
 /// applies nothing — while the keys that baseline declares are accepted and applied.
 #[tokio::test]
 async fn an_update_carrying_a_parameter_the_enablements_baseline_does_not_declare_is_refused() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let declared_anywhere = every_declared_parameter();
     // Nothing applied to start with, so a refused update is visible as "still none applied".
     let enablements = deployed_enablements(&router, "up", |_| None).await;

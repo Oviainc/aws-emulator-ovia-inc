@@ -45,7 +45,7 @@ use crate::enabled_control_lifecycle::{
     last_operation, member, ou, status_summary_status as status,
 };
 use crate::landing_zone_lifecycle::{
-    call, emulator, is_operation_identifier, past_the_settle_span, Answer,
+    call, is_operation_identifier, past_the_settle_span, set_up_emulator, Answer,
 };
 
 /// POST `/update-enabled-control`. `parameters` is a required member, so every call
@@ -161,7 +161,7 @@ fn rows() -> Vec<Row> {
 /// nothing else about the control has moved.
 #[tokio::test]
 async fn an_update_applies_the_requested_configuration_once_it_is_due() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     // Every row is its own enablement on its own target, so the rows do not interact.
     let mut enabled: Vec<(Row, String, String)> = Vec::new();
@@ -390,7 +390,7 @@ async fn an_update_to_the_configuration_already_carried_is_refused() {
     ];
 
     for (index, (case, initial, same, different)) in cases.into_iter().enumerate() {
-        let router = emulator();
+        let router = set_up_emulator().await;
         let (arn, enable_operation) = enable_with(
             &router,
             &control("AWS-GR_REGION_DENY"),
@@ -515,7 +515,7 @@ async fn the_requested_configuration_is_bounded_the_same_way_an_enablement_is() 
     ];
 
     for (index, (case, requested, accepted)) in cases.into_iter().enumerate() {
-        let router = emulator();
+        let router = set_up_emulator().await;
         // The control is enabled with one parameter, so no row's list is refused merely
         // for repeating the configured one.
         let (arn, enable_operation) = enable_with(
@@ -575,7 +575,7 @@ async fn an_update_overlapping_an_operation_in_flight_is_a_conflict() {
         ("while the enable is in flight", false),
         ("while another update is in flight", true),
     ] {
-        let router = emulator();
+        let router = set_up_emulator().await;
         let (arn, _) = enable_with(
             &router,
             &control("AWS-GR_REGION_DENY"),
@@ -645,7 +645,7 @@ async fn an_update_overlapping_an_operation_in_flight_is_a_conflict() {
 /// of another resource kind — and such a refusal leaves the control that does exist alone.
 #[tokio::test]
 async fn an_identifier_no_enabled_control_matches_is_not_found() {
-    let router = emulator();
+    let router = set_up_emulator().await;
     let (arn, enable_operation) = enable_with(
         &router,
         &control("AWS-GR_REGION_DENY"),

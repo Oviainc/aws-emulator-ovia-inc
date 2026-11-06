@@ -65,7 +65,7 @@ use crate::governed_target_mandatory_controls::{
 };
 use crate::in_flight_teardown_drift::{disable_control, get_enabled_control};
 use crate::landing_zone_lifecycle::{
-    call, emulator_with_engine, past_the_settle_span, Answer,
+    call, emulator_with_engine, past_the_settle_span, set_up_account, Answer,
 };
 use crate::resource_tags::{apply_tags, read_tags, reported_tags, tags};
 
@@ -285,6 +285,7 @@ async fn a_control_teardown_is_decided_once_from_the_resource_not_from_the_log()
     let mut enabled: Vec<Enabled> = Vec::new();
     for row in rows {
         let (router, engine) = emulator_with_engine();
+        set_up_account(&router).await;
         let (arn, _) = enable_with(
             &router,
             &control(row.entry.name),
@@ -538,6 +539,7 @@ async fn a_control_teardown_is_decided_once_from_the_resource_not_from_the_log()
 #[tokio::test]
 async fn a_mandatory_control_whose_teardown_failed_is_torn_down_when_governance_ends_again() {
     let (router, engine) = emulator_with_engine();
+    set_up_account(&router).await;
     let governance = governance_baseline();
     let version = governance.versions[0];
     let target = ou("gw01");

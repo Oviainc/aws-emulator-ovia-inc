@@ -50,6 +50,19 @@ pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemor
     (router, engine)
 }
 
+/// A fresh emulator in an account AWS Control Tower has already been SET UP in: as
+/// [`emulator`], plus the one landing zone [`set_up_account`] creates.
+///
+/// For the suites whose subject lies PAST the precondition the enablement calls share —
+/// what an enablement persists, what a listing holds, which refusals a request's own
+/// members earn — so a case about something else is not answered by the un-set-up account's
+/// refusal.
+pub(crate) async fn set_up_emulator() -> MultiServiceRouter {
+    let router = emulator();
+    set_up_account(&router).await;
+    router
+}
+
 /// A dispatched call's answer: the HTTP status, the `x-amzn-errortype` error code
 /// restJson1 names a modeled failure with, and the parsed JSON body.
 pub(crate) struct Answer {
@@ -234,6 +247,33 @@ async fn create(
 /// target.
 pub(crate) async fn set_up_account(router: &MultiServiceRouter) -> String {
     create(router, "3.3", simple_manifest()).await.string("arn")
+}
+
+/// Set the account up and decommission its landing zone again: the account stays SET UP —
+/// the operation log the teardown leaves behind is what says so, so Control Tower still
+/// serves the enablement calls for it — while no landing zone is deployed and nothing is
+/// governed.
+///
+/// For the cases whose subject is what a call answers with no landing zone DEPLOYED, which
+/// is reachable only this way: an enablement call itself is served only for an account
+/// Control Tower has been set up in.
+pub(crate) async fn set_up_then_decommission(router: &MultiServiceRouter, case: &str) {
+    let landing_zone = set_up_account(router).await;
+    // Nothing sleeps server-side: the wait is the test's, so the teardown the clock owes has
+    // been applied before the caller's own calls.
+    tokio::time::sleep(past_the_settle_span()).await;
+    let deleted = call(
+        router,
+        "/delete-landingzone",
+        serde_json::json!({ "landingZoneIdentifier": landing_zone }),
+    )
+    .await;
+    assert_eq!(
+        deleted.status, 200,
+        "case {case:?}: delete-landingzone expected 200, got {} body {:?}",
+        deleted.status, deleted.body
+    );
+    tokio::time::sleep(past_the_settle_span()).await;
 }
 
 /// The modeled `OperationIdentifier` pattern:

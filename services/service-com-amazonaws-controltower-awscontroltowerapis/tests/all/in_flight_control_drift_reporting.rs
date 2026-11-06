@@ -50,7 +50,7 @@ use crate::in_flight_control_change_reporting::{
 use crate::in_flight_teardown_drift::{
     control_rows, disable_control, get_enabled_control, ControlRow,
 };
-use crate::landing_zone_lifecycle::{emulator, past_the_settle_span};
+use crate::landing_zone_lifecycle::{past_the_settle_span, set_up_emulator};
 
 /// RULE: while a teardown is in flight an enabled control is `UNDER_CHANGE` with `UNKNOWN`
 /// in all three drift dimensions — whatever configuration it had deployed — in
@@ -59,7 +59,7 @@ use crate::landing_zone_lifecycle::{emulator, past_the_settle_span};
 /// the teardown due the enablement is gone from every reporting call.
 #[tokio::test]
 async fn every_reporting_call_agrees_on_a_control_teardown_in_flight() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     let rows = control_rows();
     // A control nobody tears down, so each case also pins that a teardown withdraws the

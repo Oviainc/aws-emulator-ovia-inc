@@ -20,6 +20,13 @@
 //! control or a target that could not exist, and no tag AWS reserves, becomes persisted
 //! state.
 //!
+//! Served only for an account Control Tower has been set up in
+//! ([`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::is_set_up`]): one it
+//! has provisioned nothing in holds no landing zone to deploy the enablement from, so the
+//! call is the modelled `ResourceNotFoundException` (404) reporting the landing zone as what
+//! is missing and nothing is persisted — see `crate::state` for the one precondition the
+//! enablement calls share.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -280,6 +287,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.settle(now);
+
+        // Control Tower enables a control for an account it has been set up in; one it has
+        // provisioned nothing in holds no landing zone for the enablement to be deployed
+        // from, so the landing zone is what is reported missing. Asked BEFORE anything is
+        // persisted or an operation minted, so no enablement exists for an account the
+        // service was never set up in. See `crate::state` for the one precondition the
+        // enablement calls share.
+        if !store.is_set_up() {
+            return Err(EnableControlErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::SETUP_REQUIRED_FOR_CONTROLS.to_string(),
+                },
+            )
+            .into());
+        }
 
         // A control is enabled at most once per target. A repeat while the first
         // enablement is still deploying would race it, which is the inconsistent state

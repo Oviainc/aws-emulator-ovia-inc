@@ -57,6 +57,8 @@ mod enabled_control_reset;
 mod enabled_control_target_regions;
 #[path = "all/enabled_control_update.rs"]
 mod enabled_control_update;
+#[path = "all/enablement_write_precondition.rs"]
+mod enablement_write_precondition;
 #[path = "all/first_deployment_drift.rs"]
 mod first_deployment_drift;
 #[path = "all/front_door_validation.rs"]
@@ -141,5 +143,7 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;
+#[path = "all/unknown_landing_zone_identifier.rs"]
+mod unknown_landing_zone_identifier;
 #[path = "all/update_refusal_order.rs"]
 mod update_refusal_order;

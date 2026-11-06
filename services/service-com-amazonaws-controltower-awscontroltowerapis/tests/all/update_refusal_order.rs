@@ -45,7 +45,7 @@ use crate::enable_baseline_validation::{
     member, ou, update,
 };
 use crate::enabled_control_lifecycle::{control, enable_with, ou as control_ou};
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, past_the_settle_span, set_up_emulator, Answer};
 
 /// A parameter key no catalog entry declares, so a `parameters` list carrying it configures
 /// nothing whichever baseline or control it is sent to. Pinned as such by
@@ -274,7 +274,7 @@ fn no_catalog_entry_declares_the_undeclared_key() {
 /// neither refusal writes anything.
 #[tokio::test]
 async fn an_unacceptable_baseline_update_is_a_bad_request_while_a_change_is_in_flight() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     // One enablement per catalog baseline, each on its own organizational unit, at the
     // oldest version it offers. Nothing waits for the clock yet, so every ENABLE is still
@@ -468,7 +468,7 @@ async fn unacceptable_control_refusals(
 /// configuration the control does declare.
 #[tokio::test]
 async fn an_unacceptable_control_update_is_a_bad_request_while_a_change_is_in_flight() {
-    let router = emulator();
+    let router = set_up_emulator().await;
 
     // One enablement per control a caller may enable, each on its own organizational unit.
     // The enables are asynchronous, so all of them are in flight when the first rows go out.
