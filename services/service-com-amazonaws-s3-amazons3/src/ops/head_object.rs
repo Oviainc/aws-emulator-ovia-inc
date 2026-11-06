@@ -385,6 +385,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Read-only: the guard is taken, the object's metadata is copied out, and
         // nothing is written — a later caller sees exactly what this one saw.
+        //
+        // WHO is asking is resolved BEFORE the store is locked, so the STS and IAM stores
+        // this service reads the calling principal and its policies from are never reached
+        // while this service's own guard is held.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let store = state.lock();
         // A `versionId` that is not SHAPED like one cannot name a version of anything, so
         // it is a malformed argument rather than an absent version: `InvalidArgument` with
@@ -425,10 +430,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // credential speaks for no principal, so it is served only what the bucket grants to
         // everyone ([`crate::state::Bucket::anonymous_object_read_refusal`] carries that
         // rule, over the `s3:GetObject` permission a HEAD of an object needs too); one
-        // presenting a credential speaks for this account, and the bucket's own policy is in
-        // force on it too ([`crate::service::authorization::caller_object_read_refusal`]), so
-        // an explicit deny refuses the HEAD whatever the store holds. Either way the refusal
-        // is
+        // presenting a credential is authorized per action against the documents in force on
+        // the principal it signed for and against the bucket's own policy
+        // ([`crate::service::request_authorization::object_read_denial`], which a HEAD asks
+        // exactly as a GET does — "a HEAD request has the same options as a GET operation on
+        // an object"). Either way the refusal is
         // answered with S3's authorization status — ahead of the 404 below, so it says
         // nothing about whether the key is there. A HEAD carries no body, so the status is
         // the whole answer.
@@ -437,10 +443,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 true => bucket
                     .anonymous_object_read_refusal(&input.bucket, &input.key, object)
                     .map(str::to_string),
-                false => crate::service::authorization::caller_object_read_refusal(
+                false => crate::service::request_authorization::object_read_denial(
+                    &caller,
                     bucket,
                     &input.bucket,
                     &input.key,
+                    input.version_id.as_deref(),
                     object,
                 ),
             }

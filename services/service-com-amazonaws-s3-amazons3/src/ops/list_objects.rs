@@ -221,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         &self,
         input: Self::Input,
         // A listing needs nothing from the request beyond its deserialized input.
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
 
         // `OptionalObjectAttributes` asks for restore state, which is an archive tier this
@@ -304,10 +304,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         // Read-only: the guard is taken, the entries are copied out, and nothing is
         // written — a later caller sees exactly what this one saw.
+        //
+        // WHO is asking is resolved BEFORE the store is locked, so the STS and IAM stores
+        // this service reads the calling principal and its policies from are never reached
+        // while this service's own guard is held.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let store = state.lock();
         let bucket = store
             .bucket(&input.bucket)
             .ok_or(ListObjectsErrorModeled::NoSuchBucket(NoSuchBucket {}))?;
+
+        // The `s3:ListBucket` permission a listing of a bucket's objects needs, judged exactly
+        // as the newer revision of this listing judges it
+        // ([`crate::service::request_authorization`] carries IAM's order, and the listing's
+        // own members travel as the condition context so a capped `max-keys` is enforced),
+        // before anything about the bucket's contents is reported.
+        if let Some(message) = crate::service::request_authorization::denial(
+            &caller,
+            bucket.policy.as_deref(),
+            crate::state::LIST_BUCKET_ACTION,
+            &bucket.arn(&input.bucket),
+            &crate::service::authorization::ListingContext {
+                max_keys: input.max_keys,
+                prefix: input.prefix.as_deref(),
+                delimiter: input.delimiter.as_deref(),
+            }
+            .conditions(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
 
         let prefix = input.prefix.clone().unwrap_or_default();
         let delimiter = input.delimiter.clone().unwrap_or_default();

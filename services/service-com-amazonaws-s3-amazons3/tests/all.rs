@@ -131,6 +131,8 @@ mod error_messages;
 mod general_purpose_bucket_names;
 #[path = "all/head_object_read_back.rs"]
 mod head_object_read_back;
+#[path = "all/identity_authorization.rs"]
+mod identity_authorization;
 #[path = "all/json_payload_media_type.rs"]
 mod json_payload_media_type;
 #[path = "all/list_buckets.rs"]

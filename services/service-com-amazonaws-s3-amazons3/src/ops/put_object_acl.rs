@@ -309,6 +309,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObjectAcl<Eng>
         // not hold answers that rather than reporting whatever is wrong with an ACL that
         // bucket could never have carried — the order `PutBucketAcl` keeps. The bucket's
         // Region is also what decides how an email grantee is refused.
+        //
+        // WHO is asking is resolved before the store is locked, so a guardrail refusal below
+        // names the principal that really signed this request.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         let version_id = input.version_id.clone();
         let version_id = version_id.as_deref();
@@ -340,6 +344,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObjectAcl<Eng>
                 ACCESS_DENIED_CODE,
                 ACCESS_DENIED_STATUS,
                 crate::state::block_public_acls_denial(
+                    &caller.arn,
                     PUT_OBJECT_ACL_ACTION,
                     &crate::state::object_arn(&input.bucket, &input.key),
                 ),

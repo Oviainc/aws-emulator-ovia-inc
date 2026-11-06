@@ -301,6 +301,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjects<Eng
                 "the shared S3 store is unreachable from this engine",
             )
         })?;
+        // WHO is asking is resolved BEFORE the store is locked, so the STS and IAM stores
+        // this service reads the calling principal and its policies from are never reached
+        // while this service's own guard is held.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
 
         // The whole request is addressed to one bucket, so a bucket this emulator does not
@@ -362,6 +366,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjects<Eng
         let now = ::std::time::SystemTime::now();
         for identifier in identifiers {
             let key = identifier.key.as_str();
+            // WHO is asking, per identifier: each one performs exactly what a `DeleteObject`
+            // for it would, so it asks for the same permission — the version-scoped
+            // `s3:DeleteObjectVersion` for an identifier NAMING a version and the plain
+            // `s3:DeleteObject` for one that names none
+            // ([`crate::service::request_authorization::delete_object_action`]). A refused
+            // identifier is THIS key's failure, reported beside the keys that did delete the
+            // way every other per-key refusal here is, and nothing of it is removed.
+            if let Some(message) = crate::service::request_authorization::denial(
+                &caller,
+                store
+                    .bucket(&input.bucket)
+                    .and_then(|bucket| bucket.policy.as_deref()),
+                crate::service::request_authorization::delete_object_action(
+                    identifier.version_id.as_deref(),
+                ),
+                &crate::state::object_arn(&input.bucket, key),
+                &crate::service::authorization::read_conditions(),
+            ) {
+                errors.push(Error {
+                    key: Some(key.to_string()),
+                    version_id: identifier.version_id.clone(),
+                    code: Some(crate::state::ACCESS_DENIED_CODE.to_string()),
+                    message: Some(message),
+                });
+                continue;
+            }
             // The conditional members of THIS identifier, judged against the version it
             // addresses before anything is taken away, through the one rule every
             // conditional delete in this service is judged by

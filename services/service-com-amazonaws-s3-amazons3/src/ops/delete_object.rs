@@ -380,8 +380,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
                 "the shared S3 store is unreachable from this engine",
             )
         })?;
+        // WHO is asking is resolved BEFORE the store is locked, so the STS and IAM stores
+        // this service reads the calling principal and its policies from are never reached
+        // while this service's own guard is held.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
 
+        // "`s3:DeleteObject` — to delete an object (or add a delete marker)" and
+        // "`s3:DeleteObjectVersion` — to delete a specific version of an object"
+        // (`DeleteObject`'s own documentation of the permissions a delete needs): a delete
+        // that NAMES a version asks for the version-scoped permission, which the permission
+        // to stack a delete marker does not cover, and one that names none asks for the plain
+        // one ([`crate::service::request_authorization::delete_object_action`]). Judged
+        // against the documents in force on the principal the request signed for and against
+        // the bucket's own policy ([`crate::service::request_authorization`] carries IAM's
+        // order), before anything is taken away or laid down.
+        let delete_denial = store.bucket(&input.bucket).and_then(|bucket| {
+            crate::service::request_authorization::denial(
+                &caller,
+                bucket.policy.as_deref(),
+                crate::service::request_authorization::delete_object_action(
+                    input.version_id.as_deref(),
+                ),
+                &crate::state::object_arn(&input.bucket, &input.key),
+                &crate::service::authorization::read_conditions(),
+            )
+        });
+        if let Some(message) = delete_denial {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
         // The conditional members, judged against the version this delete ADDRESSES — the
         // delete is what they make conditional, so they are judged here, before anything is
         // taken away, through the one rule every conditional delete in this service is

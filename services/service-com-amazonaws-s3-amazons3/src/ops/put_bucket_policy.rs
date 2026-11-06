@@ -258,8 +258,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(refusal);
         }
-        // The write needs nothing from the request beyond its deserialized input.
-        let _ = ctx;
+        // The write needs nothing from the request beyond its deserialized input and the
+        // credential it presented.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 "InternalError",
@@ -290,6 +290,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // A resource-based policy states WHO it grants to, so every identity the document
+        // names is resolved against this account's IAM before anything is stored: a grant to
+        // an identity that does not exist is a grant to nobody, and a user group is not a
+        // principal at all ([`crate::service::policy_principals`] carries that rule). The
+        // whole write is refused — one unresolvable value in a `Principal` list refuses the
+        // document, not just that statement — and the policy the bucket already carried is
+        // left exactly as it was.
+        if crate::service::policy_principals::unresolvable_principal(&*self.engine, &input.policy)
+            .is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MALFORMED_POLICY_CODE,
+                400,
+                INVALID_PRINCIPAL_MESSAGE,
+            ));
+        }
+
+        // WHO is asking is resolved BEFORE the store is locked, so the STS and IAM stores
+        // this service reads the calling principal and its policies from are never reached
+        // while this service's own guard is held.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         let Some(bucket) = store.bucket_mut(&input.bucket) else {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
@@ -298,6 +319,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::NO_SUCH_BUCKET_MESSAGE,
             ));
         };
+
+        // "The `s3:PutBucketPolicy` permission is required in a policy" (this operation's own
+        // documentation): a signed request is authorized against the documents in force on
+        // the principal it signed for and against the bucket's own policy
+        // ([`crate::service::request_authorization`] carries IAM's order, and the lockout
+        // guard the three bucket-policy operations carry), before the write commits — so a
+        // refused call leaves the bucket's policy as it was.
+        if let Some(message) = crate::service::request_authorization::policy_operation_denial(
+            &caller,
+            bucket.policy.as_deref(),
+            PUT_BUCKET_POLICY_ACTION,
+            &crate::state::bucket_arn(&input.bucket),
+            &crate::service::authorization::read_conditions(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
 
         // Block Public Access: with `BlockPublicPolicy` on, S3 "causes Amazon S3 to reject
         // calls to PUT Bucket policy if the specified bucket policy allows public access"
@@ -317,6 +358,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ACCESS_DENIED_CODE,
                 ACCESS_DENIED_STATUS,
                 crate::state::block_public_policy_denial(
+                    &caller.arn,
                     PUT_BUCKET_POLICY_ACTION,
                     &crate::state::bucket_arn(&input.bucket),
                 ),
@@ -340,4 +382,10 @@ const ACCESS_DENIED_CODE: &str = "AccessDenied";
 const ACCESS_DENIED_STATUS: u16 = 403;
 
 /// The IAM action this operation is authorized by, which its refusal names.
-const PUT_BUCKET_POLICY_ACTION: &str = "s3:PutBucketPolicy";
+const PUT_BUCKET_POLICY_ACTION: &str = crate::service::request_authorization::PUT_BUCKET_POLICY_ACTION;
+
+/// How S3 words the `MalformedPolicy` of a document naming an identity it cannot resolve as a
+/// grantee: fixed text with no variable part — the value that could not be resolved is not
+/// quoted back, which is what S3 answers for every one of them (see
+/// [`crate::service::policy_principals`] for which values those are).
+const INVALID_PRINCIPAL_MESSAGE: &str = "Invalid principal in policy";

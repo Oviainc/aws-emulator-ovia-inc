@@ -1,0 +1,597 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! WHO a signed request speaks for, and whether the policies in force let it perform the
+//! action it asks for — the authorization step an object or bucket-configuration handler
+//! runs BEFORE it reads or writes anything.
+//!
+//! "When a request is made, the Amazon Web Services principal sends a request to Amazon S3.
+//! Amazon S3 evaluates all of the relevant access policies, user policies, and
+//! resource-based policies in deciding whether to authorize the request" (Amazon S3 User
+//! Guide, *Identity and Access Management for Amazon S3*). So a signed request is NOT the
+//! bucket owner's by assumption: it is judged, per action, against the documents in force on
+//! the principal that signed it and against the bucket's own policy.
+//!
+//! Three pieces, each held in exactly one place:
+//!
+//! 1. **who** — the principal the request's access key id speaks for ([`request_caller`]):
+//!    the session STS minted that key for (the same place `sts:GetCallerIdentity` answers
+//!    from, so the principal a refusal blames is the one the caller reads back for the
+//!    credentials it signed with), else the IAM user that holds the long-term key, else the
+//!    account's own published credential.
+//! 2. **what it may do** — the identity-based documents the IAM store holds for that
+//!    principal, read through the IAM service's OWN accessor (`principal_policies`, where
+//!    the collection rule itself lives, groups included), so a policy `iam:PutUserPolicy`
+//!    wrote takes effect on the next request and deleting it lifts it again; and the
+//!    BUCKET's own policy, which this service holds.
+//! 3. **the decision** — [`::service_common::iam_authorization`], the tree's ONE evaluation
+//!    of policy documents against `(action, resource, principal)`, so this service and every
+//!    other one handed the same documents answer alike.
+//!
+//! ## The rule
+//!
+//! In IAM's own order ("Determining whether a request is allowed or denied within an
+//! account"): an explicit `Deny` about the request — in the bucket policy or in an
+//! identity-based document — refuses it, whatever any grant says. Otherwise the request
+//! needs a grant: an `Allow` about it among the caller's identity-based documents, or one in
+//! the bucket policy that names the CALLER ("the resource-based policy and the
+//! identity-based policy are evaluated together, and access is granted if either allows
+//! it"). With neither the request falls to IAM's implicit deny and is refused 403
+//! `AccessDenied` ([`state::ACCESS_DENIED_CODE`]), naming the principal, the action and the
+//! resource it addressed.
+//!
+//! A statement that names the ACCOUNT rather than the caller (the account's root ARN, or the
+//! bare account id that stands for it) delegates to the account rather than granting — "you
+//! must also attach an identity-based policy" to the principal — so the account spellings
+//! decide a `Deny`, which covers every principal of the account, and never make a grant on
+//! their own.
+//!
+//! Only a deny the evaluation could DECIDE refuses ([`authorization::deny_is_decided`]): a
+//! clause over a condition key this service does not answer leaves its statement undecided,
+//! and reading an undecided `Deny` as a refusal would refuse calls on every bucket whose
+//! policy conditions anything this emulator does not model.
+//!
+//! ## The callers this gate does not bound
+//!
+//! * **The account's own published credential.** A request whose access key id neither STS
+//!   nor IAM holds a record for speaks for the account itself — the position AWS account root
+//!   credentials are in, which no identity-based policy bounds — so it is allowed where no
+//!   readable document denies it. This is also what every in-process call another emulated
+//!   service makes against S3 presents.
+//! * **A principal holding an attachment this emulator cannot read.** An AWS-managed policy
+//!   is owned by AWS rather than by the account, so the account's store holds no document for
+//!   it; refusing on a grant this emulator cannot see would deny access AWS permits. An
+//!   explicit `Deny` in a document that CAN be read still refuses.
+//! * **An engine carrying no STS or IAM store**, where no session and no identity can exist.
+//!
+//! An expired session credential speaks for nobody: it carries no documents and no principal
+//! spelling, so every action it asks for is refused. (In the assembled emulator the layer
+//! that authenticates a request refuses such a credential before any handler runs.)
+
+use std::time::SystemTime;
+
+use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_store;
+use ::service_common::iam_authorization::{self as iam, Decision};
+
+use super::authorization::{self, PUBLISHED_CONDITION_KEYS};
+use crate::state::{self, Bucket, Object, GET_OBJECT_ACTION, LIST_BUCKET_ACTION};
+
+/// The IAM action a read that names a `versionId` is authorized under: "if you include a
+/// `versionId` in your request header, you must have the `s3:GetObjectVersion` permission to
+/// access a specific version of an object. The `s3:GetObject` permission is not required in
+/// this scenario" (`GetObject`'s own documentation) — so naming a version asks for THIS
+/// action instead of [`GET_OBJECT_ACTION`], and a read of the current version asks for that
+/// one alone.
+pub const GET_OBJECT_VERSION_ACTION: &str = "s3:GetObjectVersion";
+
+/// The IAM action an object WRITE is authorized under: "you must have the `s3:PutObject`
+/// permission" (`PutObject`'s own documentation of its general purpose bucket permissions).
+pub const PUT_OBJECT_ACTION: &str = "s3:PutObject";
+
+/// The IAM action a delete that names NO `versionId` is authorized under: "`s3:DeleteObject`
+/// — to delete an object (or add a delete marker)" (`DeleteObject`'s own documentation of
+/// the permissions a delete needs).
+pub const DELETE_OBJECT_ACTION: &str = "s3:DeleteObject";
+
+/// The IAM action a delete that NAMES a `versionId` is authorized under: "`s3:DeleteObject
+/// Version` — to delete a specific version of an object" (same documentation), which is a
+/// permission of its own — a caller holding only [`DELETE_OBJECT_ACTION`] may stack a delete
+/// marker and may not remove a version.
+pub const DELETE_OBJECT_VERSION_ACTION: &str = "s3:DeleteObjectVersion";
+
+/// The IAM action a listing of a bucket's VERSIONS is authorized under: "you must have the
+/// `s3:ListBucketVersions` permission" (`ListObjectVersions`'s own documentation), which the
+/// permission to list the bucket's current objects ([`LIST_BUCKET_ACTION`]) does not cover.
+pub const LIST_BUCKET_VERSIONS_ACTION: &str = "s3:ListBucketVersions";
+
+/// The IAM action a read of a bucket's default-encryption configuration is authorized under:
+/// "to use this operation, you must have permission to perform the
+/// `s3:GetEncryptionConfiguration` action" (`GetBucketEncryption`'s own documentation). The
+/// name does not follow the operation's, so a policy granting the `s3:GetBucket*` family does
+/// NOT cover it.
+pub const GET_ENCRYPTION_CONFIGURATION_ACTION: &str = "s3:GetEncryptionConfiguration";
+
+/// The IAM action a bucket-policy write is authorized under: "the `s3:PutBucketPolicy`
+/// permission is required in a policy" (`PutBucketPolicy`'s own documentation).
+pub const PUT_BUCKET_POLICY_ACTION: &str = "s3:PutBucketPolicy";
+
+/// What a refusal names as the principal of a request whose session credential has already
+/// expired: that credential speaks for nobody, and the key it presented is not quoted back.
+const EXPIRED_CREDENTIAL_PRINCIPAL: &str = "an expired session credential";
+
+/// The principal a request speaks for, and everything the decision is made from.
+///
+/// Resolved once per request and BEFORE this service's own store is locked, so the STS and
+/// IAM stores are never reached while this service's state guard is held.
+#[derive(Debug, Clone, Default)]
+pub struct Caller {
+    /// The principal's ARN, as `sts:GetCallerIdentity` reports it — what a refusal names.
+    pub arn: String,
+    /// Every spelling of the principal a policy may name IT by: the ARN STS reports, and the
+    /// ARN of the IAM role behind an assumed-role session. These decide a GRANT.
+    pub principals: Vec<String>,
+    /// The spellings that name the ACCOUNT the principal belongs to rather than the
+    /// principal: they decide a deny and never grant (see the module docs).
+    pub account_principals: Vec<String>,
+    /// The identity-based policy documents in force on the principal.
+    pub documents: Vec<String>,
+    /// Set when this request presents the account's own published credential, which holds no
+    /// IAM policies (see the module docs).
+    pub account_credential: bool,
+    /// Set when the principal carries a policy whose document the IAM store does not hold —
+    /// an AWS-managed policy (see the module docs).
+    pub unreadable_attachment: bool,
+}
+
+impl Caller {
+    /// Every spelling a DENY is decided against: the principal's own and its account's,
+    /// because a statement denying the account denies each of its principals.
+    fn denied_spellings(&self) -> Vec<String> {
+        let mut named = self.principals.clone();
+        named.extend(self.account_principals.iter().cloned());
+        named
+    }
+
+    /// Whether nothing the identity-based decision found can refuse this caller once no
+    /// readable document DENIES the action (see the module docs).
+    fn identity_is_unbounded(&self) -> bool {
+        self.account_credential || self.unreadable_attachment
+    }
+}
+
+/// Who this request speaks for, resolved from the access key id it signed with.
+///
+/// Call it BEFORE locking this service's store (see [`Caller`]). Resolving the caller goes
+/// through STS's own resolution, which first materialises the session expiries the clock has
+/// already made due: that write is owed at the same instant whether or not anybody called,
+/// which is why a REPORTING operation of this service may take this decision too.
+pub fn request_caller<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> Caller {
+    let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+    let iam_state = sts_store::iam_state(engine);
+    // A long-term access key speaks for the IAM user that holds it, which is the identity
+    // STS itself reports for it; a key no store holds is the account's own credential.
+    let long_term = match &iam_state {
+        Some(iam_state) => sts_store::long_term_identity(Some(&iam_state.lock()), &access_key_id),
+        None => sts_store::ambient_identity(),
+    };
+    let resolved = match sts_store::service_state(engine) {
+        Some(sts) => sts_store::resolve_request_caller(
+            &mut sts.lock(),
+            &access_key_id,
+            SystemTime::now(),
+            ctx.credential_store(),
+            long_term.clone(),
+        )
+        .map(|caller| (caller.identity.arn, caller.role_arn)),
+        // No STS store on this engine: the credential names no session, so it speaks for the
+        // long-term identity it was resolved to.
+        None => Ok((long_term.arn.clone(), None)),
+    };
+    // An expired session credential speaks for nobody: it carries no documents and no
+    // principal spelling, so every action it asks for falls to the implicit deny.
+    let Ok((arn, role_arn)) = resolved else {
+        return Caller {
+            arn: EXPIRED_CREDENTIAL_PRINCIPAL.to_string(),
+            ..Caller::default()
+        };
+    };
+    let mut caller = Caller {
+        account_credential: arn == sts_store::ambient_identity().arn,
+        principals: vec![arn.clone()],
+        account_principals: iam::account_principals(&arn),
+        arn,
+        ..Caller::default()
+    };
+    // An assumed-role session is also named by the ARN of the ROLE it is a session of, which
+    // is the spelling a policy uses to name the role itself, and the identity whose policies
+    // are in force for it ("the temporary security credentials … have the permissions of the
+    // role", `AssumeRole`).
+    let identity_arn = match role_arn {
+        Some(role_arn) => {
+            if !caller.principals.contains(&role_arn) {
+                caller.principals.push(role_arn.clone());
+            }
+            role_arn
+        }
+        None => caller.arn.clone(),
+    };
+    if let Some(iam_state) = iam_state {
+        if let Some(policies) = iam_state.lock().principal_policies(&identity_arn) {
+            caller.documents = policies.documents;
+            // An attachment the collection resolved no document for is an entry of AWS's own
+            // catalog this emulator does not carry: a grant it cannot read.
+            caller.unreadable_attachment = !policies.uncarried.is_empty();
+        }
+    }
+    caller
+}
+
+/// Why the policies in force refuse `caller` the IAM `action` on `resource` — the sentence
+/// S3 words that refusal in — or `None` when they permit it.
+///
+/// `policy` is the bucket's own policy, `None` for a bucket carrying none, and `conditions`
+/// the condition keys this request carries a value for
+/// ([`authorization::ObjectWriteContext`], [`authorization::read_conditions`]). The decision
+/// is the module docs' rule.
+#[must_use]
+pub fn denial(
+    caller: &Caller,
+    policy: Option<&str>,
+    action: &str,
+    resource: &str,
+    conditions: &[(String, String)],
+) -> Option<String> {
+    let refusal = |reason: &str| Some(state::authorization_denial(&caller.arn, action, resource, reason));
+    let prepared = policy.map(iam::PreparedDocument::read);
+
+    // An explicit deny wins over every grant, including the account's own credential.
+    if let Some(prepared) = &prepared {
+        let denied_spellings = caller.denied_spellings();
+        let denying = iam::Request::new(action, resource, &denied_spellings)
+            .with_context(conditions)
+            .with_published_keys(PUBLISHED_CONDITION_KEYS);
+        if authorization::deny_is_decided(&iam::resource_outcome_prepared(prepared, &denying)) {
+            return refusal(state::RESOURCE_POLICY_DENY_REASON);
+        }
+    }
+    let granting = iam::Request::new(action, resource, &caller.principals)
+        .with_context(conditions)
+        .with_published_keys(PUBLISHED_CONDITION_KEYS);
+    let documents = iam::prepare_documents(&caller.documents);
+    let identity_said = iam::identity_outcome_prepared(&documents, &granting);
+    if authorization::deny_is_decided(&identity_said) {
+        return refusal(IDENTITY_POLICY_DENY_REASON);
+    }
+    if identity_said.decision == Decision::Allowed || caller.identity_is_unbounded() {
+        return None;
+    }
+    // A grant in the BUCKET's own policy names this principal directly, which is a
+    // permission of its own (see the module docs).
+    if prepared.is_some_and(|prepared| {
+        iam::resource_outcome_prepared(&prepared, &granting).decision == Decision::Allowed
+    }) {
+        return None;
+    }
+    refusal(&format!(
+        "because no identity-based policy allows the {action} action"
+    ))
+}
+
+/// The reason clause IAM publishes for a request an identity-based document explicitly
+/// denies — the identity half of [`state::RESOURCE_POLICY_DENY_REASON`].
+const IDENTITY_POLICY_DENY_REASON: &str = "with an explicit deny in an identity-based policy";
+
+/// [`denial`], for one of the three operations that read, write or remove the BUCKET POLICY
+/// itself.
+///
+/// "To ensure that bucket owners don't inadvertently lock themselves out of their own
+/// buckets, the root principal in a bucket owner's Amazon Web Services account can perform
+/// the `GetBucketPolicy`, `PutBucketPolicy`, and `DeleteBucketPolicy` API actions, even if
+/// their bucket policy explicitly denies the root principal's access" (`PutBucketPolicy`'s
+/// own documentation). The account's own published credential is that principal here (see the
+/// module docs), so those three are never refused it — which is what keeps a document that
+/// denies everything from making the bucket's policy unreadable and unremovable. Every other
+/// principal is judged by the rule above.
+#[must_use]
+pub fn policy_operation_denial(
+    caller: &Caller,
+    policy: Option<&str>,
+    action: &str,
+    resource: &str,
+    conditions: &[(String, String)],
+) -> Option<String> {
+    if caller.account_credential {
+        return None;
+    }
+    denial(caller, policy, action, resource, conditions)
+}
+
+/// Why S3 refuses a read of `key` — the bytes or the metadata of the version the request
+/// addressed — to the CREDENTIALED caller, or `None` when the policies in force leave the
+/// read to it.
+///
+/// WHICH action the read is judged under is decided by the request and by what its address
+/// resolved to, which is what keeps a refusal from saying whether the object is there:
+///
+/// * a read naming a `versionId` asks for [`GET_OBJECT_VERSION_ACTION`] and one naming none
+///   for [`GET_OBJECT_ACTION`] (see those constants);
+/// * an address holding NOTHING is answered by what the caller may learn about the bucket's
+///   contents at all: "if the object that you request doesn't exist, the error that Amazon S3
+///   returns depends on whether you also have the `s3:ListBucket` permission. If you have the
+///   `s3:ListBucket` permission on the bucket, Amazon S3 returns an HTTP status code 404 Not
+///   Found error. If you don't have the `s3:ListBucket` permission, Amazon S3 returns an HTTP
+///   status code 403 Access Denied error" (`GetObject`'s own documentation) — so a caller
+///   without [`LIST_BUCKET_ACTION`] is refused the read instead of being told the key is
+///   absent, and one holding it is left the 404 to be answered.
+///
+/// Asked BEFORE anything about the key is reported.
+#[must_use]
+pub fn object_read_denial(
+    caller: &Caller,
+    bucket: &Bucket,
+    name: &str,
+    key: &str,
+    version_id: Option<&str>,
+    addressed: Option<&Object>,
+) -> Option<String> {
+    let conditions = authorization::read_conditions();
+    let policy = bucket.policy.as_deref();
+    if addressed.is_some() {
+        let action = match version_id {
+            Some(_) => GET_OBJECT_VERSION_ACTION,
+            None => GET_OBJECT_ACTION,
+        };
+        return denial(
+            caller,
+            policy,
+            action,
+            &state::object_arn(name, key),
+            &conditions,
+        );
+    }
+    denial(
+        caller,
+        policy,
+        LIST_BUCKET_ACTION,
+        &bucket.arn(name),
+        &conditions,
+    )
+}
+
+/// The IAM action a delete of `version_id` is authorized under: the version-scoped one for a
+/// delete that NAMES a version, and the plain one for a delete that names none (see
+/// [`DELETE_OBJECT_VERSION_ACTION`]).
+#[must_use]
+pub fn delete_object_action(version_id: Option<&str>) -> &'static str {
+    match version_id {
+        Some(_) => DELETE_OBJECT_VERSION_ACTION,
+        None => DELETE_OBJECT_ACTION,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A caller that holds an IAM identity and no policy at all: the position every signed
+    /// request from an unprivileged principal is in.
+    fn named_caller(documents: &[&str]) -> Caller {
+        let arn = ::engine::emulator_arn("iam", "", "user/reader");
+        Caller {
+            account_principals: iam::account_principals(&arn),
+            principals: vec![arn.clone()],
+            arn,
+            documents: documents.iter().map(|text| (*text).to_string()).collect(),
+            ..Caller::default()
+        }
+    }
+
+    /// A document, in the flavor its `Principal` element decides: a bucket policy names one,
+    /// an identity policy names none.
+    fn document(effect: &str, action: &str, resource: &str, principal: Option<&str>) -> String {
+        let principal = match principal {
+            Some(principal) => format!("\"Principal\":{{\"AWS\":\"{principal}\"}},"),
+            None => String::new(),
+        };
+        format!(
+            "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"{effect}\",{principal}\
+             \"Action\":\"{action}\",\"Resource\":\"{resource}\"}}]}}"
+        )
+    }
+
+    /// One row of the grant table: the case, the documents in force on the caller, the bucket
+    /// policy, the action asked about and whether the request must be refused.
+    type GrantRow<'a> = (&'a str, Vec<String>, Option<&'a str>, &'a str, bool);
+
+    /// One row of the deny table: the case, the documents in force on the caller, the bucket
+    /// policy and the reason clause the refusal must carry (`None` for a request that stands).
+    type DenyRow<'a> = (&'a str, Vec<String>, Option<&'a str>, Option<&'a str>);
+
+    /// RULE: a signed request needs a grant for the action it asks for, from the caller's own
+    /// documents or from the bucket policy naming it; the rows differ along where the grant
+    /// comes from and whether it covers the action asked about.
+    #[test]
+    fn a_grant_from_either_side_admits_and_nothing_else_does() {
+        let caller = named_caller(&[]);
+        let object = "arn:aws:s3:::reports/held.csv";
+        let granted_identity = document("Allow", "s3:GetObject", object, None);
+        let granted_resource = document("Allow", "s3:GetObject", object, Some(&caller.arn));
+        let other_user = ::engine::emulator_arn("iam", "", "user/someone-else");
+        let granted_to_another = document("Allow", "s3:GetObject", object, Some(&other_user));
+        let rows: [GrantRow<'_>; 6] = [
+            ("no document anywhere", Vec::new(), None, "s3:GetObject", true),
+            (
+                "an identity grant for the action",
+                vec![granted_identity.clone()],
+                None,
+                "s3:GetObject",
+                false,
+            ),
+            (
+                "an identity grant for another action",
+                vec![granted_identity.clone()],
+                None,
+                "s3:PutObject",
+                true,
+            ),
+            (
+                "a bucket-policy grant naming the caller",
+                Vec::new(),
+                Some(granted_resource.as_str()),
+                "s3:GetObject",
+                false,
+            ),
+            (
+                "a bucket-policy grant naming another principal",
+                Vec::new(),
+                Some(granted_to_another.as_str()),
+                "s3:GetObject",
+                true,
+            ),
+            (
+                "a bucket-policy grant for another action",
+                Vec::new(),
+                Some(granted_resource.as_str()),
+                "s3:DeleteObject",
+                true,
+            ),
+        ];
+        for (case, documents, policy, action, refused) in rows {
+            let caller = Caller {
+                documents,
+                ..caller.clone()
+            };
+            let answer = denial(&caller, policy, action, object, &[]);
+            assert_eq!(
+                answer.is_some(),
+                refused,
+                "case {case:?}: expected refused={refused}, got {answer:?}"
+            );
+        }
+    }
+
+    /// RULE: an explicit deny about the request refuses it whatever grants it, from either
+    /// kind of document, and the sentence names which document denied.
+    #[test]
+    fn an_explicit_deny_overrides_every_grant() {
+        let caller = named_caller(&[]);
+        let object = "arn:aws:s3:::reports/held.csv";
+        let grant_everything = document("Allow", "s3:*", "*", None);
+        let identity_deny = document("Deny", "s3:GetObject", object, None);
+        let resource_deny = document("Deny", "s3:GetObject", object, Some(&caller.arn));
+        let account_deny = document(
+            "Deny",
+            "s3:GetObject",
+            object,
+            Some(&format!("arn:aws:iam::{}:root", ::engine::emulator_account_id())),
+        );
+        let rows: [DenyRow<'_>; 4] = [
+            (
+                "an identity deny beside an identity grant",
+                vec![grant_everything.clone(), identity_deny],
+                None,
+                Some(IDENTITY_POLICY_DENY_REASON),
+            ),
+            (
+                "a bucket-policy deny beside an identity grant",
+                vec![grant_everything.clone()],
+                Some(resource_deny.as_str()),
+                Some(state::RESOURCE_POLICY_DENY_REASON),
+            ),
+            (
+                "a bucket-policy deny of the whole account",
+                vec![grant_everything.clone()],
+                Some(account_deny.as_str()),
+                Some(state::RESOURCE_POLICY_DENY_REASON),
+            ),
+            (
+                "the grant alone",
+                vec![grant_everything],
+                None,
+                None,
+            ),
+        ];
+        for (case, documents, policy, clause) in rows {
+            let caller = Caller {
+                documents,
+                ..caller.clone()
+            };
+            let answer = denial(&caller, policy, "s3:GetObject", object, &[]);
+            match clause {
+                Some(clause) => {
+                    let message = answer.unwrap_or_default();
+                    assert!(
+                        message.ends_with(clause)
+                            && message.starts_with(&format!("User: {} is not authorized", caller.arn)),
+                        "case {case:?}: expected a refusal ending in {clause:?}, got {message:?}"
+                    );
+                }
+                None => assert!(
+                    answer.is_none(),
+                    "case {case:?}: expected the grant to stand, got {answer:?}"
+                ),
+            }
+        }
+    }
+
+    /// RULE: the account's own published credential and a principal carrying a grant this
+    /// emulator cannot read are not bounded by the identity-based half, while an explicit
+    /// deny still refuses both.
+    #[test]
+    fn the_callers_this_gate_does_not_bound() {
+        let object = "arn:aws:s3:::reports/held.csv";
+        let unbounded: [(&str, Caller); 2] = [
+            (
+                "the account's own published credential",
+                Caller {
+                    arn: sts_store::ambient_identity().arn,
+                    account_credential: true,
+                    ..Caller::default()
+                },
+            ),
+            (
+                "a principal carrying an unreadable attachment",
+                Caller {
+                    unreadable_attachment: true,
+                    ..named_caller(&[])
+                },
+            ),
+        ];
+        for (case, caller) in unbounded {
+            let admitted = denial(&caller, None, "s3:GetObject", object, &[]);
+            assert!(
+                admitted.is_none(),
+                "case {case:?}: expected no refusal, got {admitted:?}"
+            );
+            let deny = document("Deny", "s3:GetObject", object, Some("*"));
+            let refused = denial(&caller, Some(&deny), "s3:GetObject", object, &[]);
+            assert!(
+                refused.is_some(),
+                "case {case:?}: expected the explicit deny to refuse, got {refused:?}"
+            );
+        }
+    }
+
+    /// RULE: which action a read and a delete are judged under is decided by whether the
+    /// request names a version.
+    #[test]
+    fn naming_a_version_asks_for_the_version_scoped_action() {
+        let rows: [(&str, Option<&str>, &str); 2] = [
+            ("a delete naming no version", None, DELETE_OBJECT_ACTION),
+            (
+                "a delete naming a version",
+                Some("3HL4kqtJlcpXroDTDmjVBH40Nrjfkd"),
+                DELETE_OBJECT_VERSION_ACTION,
+            ),
+        ];
+        for (case, version_id, expected) in rows {
+            let action = delete_object_action(version_id);
+            assert_eq!(
+                action, expected,
+                "case {case:?}: expected {expected}, got {action}"
+            );
+        }
+    }
+}

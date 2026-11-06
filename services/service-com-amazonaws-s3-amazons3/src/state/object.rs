@@ -408,10 +408,34 @@ pub const BYPASS_GOVERNANCE_RETENTION_ACTION: &str = "s3:BypassGovernanceRetenti
 /// the policy denied and the resource is the one the request addressed — so nothing in it
 /// is a recorded value.
 pub fn explicit_resource_policy_denial(action: &str, resource: &str) -> String {
+    authorization_denial(
+        &caller_principal_arn(),
+        action,
+        resource,
+        RESOURCE_POLICY_DENY_REASON,
+    )
+}
+
+/// The reason clause IAM publishes for a request the RESOURCE's own policy explicitly denies
+/// — see [`explicit_resource_policy_denial`], and
+/// [`crate::service::request_authorization`] for the identity-based half of the same
+/// decision.
+pub const RESOURCE_POLICY_DENY_REASON: &str = "with an explicit deny in a resource-based policy";
+
+/// The ONE sentence every authorization refusal of this service is worded in: who was
+/// refused (`principal`), which IAM `action`, on which `resource`, and the `reason` clause
+/// saying what refused it — an explicit deny in one of the documents in force
+/// ([`RESOURCE_POLICY_DENY_REASON`]), the absence of any grant, or a Block Public Access
+/// setting ([`block_public_access_denial`]).
+///
+/// One place, so every refusal of this crate reads alike and only the clause that names the
+/// reason differs. Every value in it comes from the request and from the policies in force:
+/// the principal from the credential the request presented, the action from what the request
+/// asked to do and the resource from the bucket or object it addressed.
+pub fn authorization_denial(principal: &str, action: &str, resource: &str, reason: &str) -> String {
     format!(
-        "User: {} is not authorized to perform: {action} on resource: \"{resource}\" with an \
-         explicit deny in a resource-based policy",
-        caller_principal_arn()
+        "User: {principal} is not authorized to perform: {action} on resource: \
+         \"{resource}\" {reason}"
     )
 }
 

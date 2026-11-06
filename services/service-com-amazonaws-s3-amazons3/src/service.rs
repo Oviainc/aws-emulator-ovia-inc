@@ -70,6 +70,13 @@ pub mod metadata_tables;
 // What an object WRITE must satisfy about the key it names and the class it asks for, before
 // anything is stored — see `service/object_write.rs`.
 pub mod object_write;
+// Whether every identity a bucket policy grants to is one this account's IAM can resolve —
+// see `service/policy_principals.rs`.
+pub mod policy_principals;
+// WHO a signed request speaks for, and whether the identity-based documents in force on that
+// principal and the bucket's own policy let it perform the action it asks for — see
+// `service/request_authorization.rs`.
+pub mod request_authorization;
 pub mod sigv4;
 pub mod wire;
 

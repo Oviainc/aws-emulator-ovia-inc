@@ -72,6 +72,12 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 aws-sdk-sqs = { version = "1", default-features = false }
 aws-sdk-sns = { version = "1", default-features = false }
 aws-sdk-lambda = { version = "1", default-features = false }
+# WHO a signed request speaks for: STS's own resolution of an access key id to the session or
+# the IAM user it was minted for, and its view of the IAM store that holds that principal's
+# identity-based policies — the same records `sts:GetCallerIdentity` and `iam:PutUserPolicy`
+# answer from, so this service authorizes a request against the documents really in force
+# (`service::request_authorization`).
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -86,7 +92,9 @@ service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 # The SSE-KMS read suite makes the principals its key policies name through IAM's and STS's
 # own operations (`CreateRole` + `PutRolePolicy` + `AssumeRole`), so the role sessions and
-# the documents the decision reads are the ones those services wrote.
+# the documents the decision reads are the ones those services wrote; the
+# identity-authorization suite makes its callers' users, access keys and policies the same
+# way, so what it authorizes against is the records `iam:PutUserPolicy` really wrote.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 

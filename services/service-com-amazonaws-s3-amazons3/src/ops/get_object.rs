@@ -396,6 +396,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Read-only: the guard is taken, the object is copied out, and nothing is
         // written — a later caller sees exactly what this one saw.
+        //
+        // WHO is asking is resolved BEFORE the store is locked, so the STS and IAM stores
+        // this service reads the calling principal and its policies from are never reached
+        // while this service's own guard is held.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let store = state.lock();
         let Some(bucket) = store.bucket(&input.bucket) else {
             return Err(GetObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
@@ -430,18 +435,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A request presenting no credential speaks for no principal, so it is served only
         // what the bucket grants to everyone
         // ([`crate::state::Bucket::anonymous_object_read_refusal`] carries that rule); one
-        // presenting a credential speaks for this account, and the bucket's own policy is in
-        // force on it too ([`crate::service::authorization::caller_object_read_refusal`]) — an
-        // explicit deny refuses the read whatever the store holds. Either way the refusal is
-        // S3's authorization code.
+        // presenting a credential is authorized per action against the documents in force on
+        // the principal it signed for and against the bucket's own policy
+        // ([`crate::service::request_authorization::object_read_denial`]) — a read naming a
+        // `versionId` asks for `s3:GetObjectVersion`, one naming none for `s3:GetObject`, and
+        // an address holding nothing is answered by whether the caller may list the bucket at
+        // all. Either way the refusal is S3's authorization code.
         let refusal = match crate::state::request_is_anonymous(ctx.parts()) {
             true => bucket
                 .anonymous_object_read_refusal(&input.bucket, &input.key, addressed)
                 .map(str::to_string),
-            false => crate::service::authorization::caller_object_read_refusal(
+            false => crate::service::request_authorization::object_read_denial(
+                &caller,
                 bucket,
                 &input.bucket,
                 &input.key,
+                input.version_id.as_deref(),
                 addressed,
             ),
         };
@@ -533,6 +542,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::INVALID_OBJECT_STATE_READ_MESSAGE,
             ));
         }
+
+        // Everything this read still needs from the STORE is taken here, and the guard is
+        // given up before the cross-service decision below: a request must never hold this
+        // service's state guard while it reaches another service's store through the shared
+        // engine, because two services locked in opposite orders would wedge both. The
+        // caller was resolved ahead of the guard for that same reason.
+        //
+        // "If the object expiration is configured (see PutBucketLifecycleConfiguration), the
+        // response includes this header" (`GetObjectOutput$Expiration`): the bucket's
+        // lifecycle configuration applied to THIS version, matched against the tag set and
+        // size it carries right now.
+        let expiration = store
+            .bucket(&input.bucket)
+            .and_then(|bucket| bucket.object_expiration_header(&input.key, object));
+        let object = object.clone();
+        drop(store);
 
         // The bytes of an SSE-KMS object are readable only THROUGH the KMS key the write
         // stored it under, so serving them performs `kms:Decrypt` on that key as this
@@ -706,13 +731,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             server_side_encryption: object.encryption.sse_algorithm.clone(),
             ssekms_key_id: object.encryption.kms_key_id.clone(),
             bucket_key_enabled: object.encryption.bucket_key_enabled,
-            // "If the object expiration is configured (see PutBucketLifecycleConfiguration
-            // ), the response includes this header" (`GetObjectOutput$Expiration`): the
-            // bucket's lifecycle configuration applied to THIS version, matched against the
-            // tag set and size it carries right now.
-            expiration: store
-                .bucket(&input.bucket)
-                .and_then(|bucket| bucket.object_expiration_header(&input.key, object)),
+            // See the lifecycle note above, where this is read off the bucket while the
+            // store's guard is still held.
+            expiration,
             // "Provides information about object restoration action and expiration time of
             // the restored object copy" (`GetObjectOutput$Restore`): the state of the
             // restore `RestoreObject` initiated on THIS version, reported through the one

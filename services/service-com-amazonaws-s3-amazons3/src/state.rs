@@ -1823,12 +1823,15 @@ pub fn caller_principal_arn() -> String {
 /// caused: who was refused, which IAM `action`, on which `resource`, and the setting that
 /// prevented it.
 ///
-/// Every value in it comes from the request and from this emulator's own identity: the
-/// principal is the caller ([`caller_principal_arn`]), the action is the operation the
-/// request called and the resource is the bucket or object it addressed. One place, so the
-/// bucket half and the object half of the same guardrail word it identically.
-pub fn block_public_acls_denial(action: &str, resource: &str) -> String {
+/// Every value in it comes from the request: the `principal` is the one the request signed
+/// for ([`crate::service::request_authorization::request_caller`] resolves it, and
+/// [`caller_principal_arn`] is what the account's own credential speaks for), the action is
+/// the operation the request called and the resource is the bucket or object it addressed.
+/// One place, so the bucket half and the object half of the same guardrail word it
+/// identically.
+pub fn block_public_acls_denial(principal: &str, action: &str, resource: &str) -> String {
     block_public_access_denial(
+        principal,
         action,
         resource,
         "public ACLs are prevented by the BlockPublicAcls",
@@ -1839,10 +1842,10 @@ pub fn block_public_acls_denial(action: &str, resource: &str) -> String {
 /// setting caused — the policy half of the guardrail [`block_public_acls_denial`] states
 /// for an ACL, in the same sentence with the setting that prevented the call.
 ///
-/// Every value in it comes from the request and from this emulator's own identity, exactly
-/// as in the ACL half.
-pub fn block_public_policy_denial(action: &str, resource: &str) -> String {
+/// Every value in it comes from the request, exactly as in the ACL half.
+pub fn block_public_policy_denial(principal: &str, action: &str, resource: &str) -> String {
     block_public_access_denial(
+        principal,
         action,
         resource,
         "public policies are prevented by the BlockPublicPolicy",
@@ -1853,13 +1856,20 @@ pub fn block_public_policy_denial(action: &str, resource: &str) -> String {
 /// `action`, on which `resource`, and the `prevented_by` clause naming what the setting
 /// prevents and which setting it is.
 ///
-/// One place, so every switch's refusal reads alike and only the clause that names the
-/// setting differs — which is the only thing that differs about them.
-fn block_public_access_denial(action: &str, resource: &str, prevented_by: &str) -> String {
-    format!(
-        "User: {} is not authorized to perform: {action} on resource: \"{resource}\" because \
-         {prevented_by} setting in S3 Block Public Access.",
-        caller_principal_arn()
+/// The sentence shape itself is the crate's one authorization refusal
+/// ([`authorization_denial`]), so a guardrail refusal and a policy refusal read alike and
+/// only the reason clause differs — which is the only thing that differs about them.
+fn block_public_access_denial(
+    principal: &str,
+    action: &str,
+    resource: &str,
+    prevented_by: &str,
+) -> String {
+    authorization_denial(
+        principal,
+        action,
+        resource,
+        &format!("because {prevented_by} setting in S3 Block Public Access."),
     )
 }
 

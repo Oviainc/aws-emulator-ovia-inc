@@ -1271,6 +1271,58 @@ pub(super) fn policy_statements(parsed: &::serde_json::Value) -> Option<Vec<&::s
     }
 }
 
+/// The principals a policy document GRANTS TO: every value of every statement's `Principal`
+/// or `NotPrincipal` element, in the order the document names them and without repeats — the
+/// same identity named twice is one identity to resolve.
+///
+/// The element is written as a bare string, a list of strings, or a map keyed by principal
+/// kind (`AWS`, `Service`, `Federated`, `CanonicalUser`) whose values are each one string or
+/// a list of them ([`principal_names_wildcard`] reads the same three forms), and the values
+/// of every kind are reported: which of them names an IAM identity at all is the resolution's
+/// question, not this reading's.
+///
+/// Empty for a text this cannot read as a policy: what makes a document unusable is stated by
+/// the grammar ([`is_valid_policy_document`]) and not a second time here.
+pub fn policy_principals(policy: &str) -> Vec<String> {
+    let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(policy) else {
+        return Vec::new();
+    };
+    let Some(statements) = policy_statements(&parsed) else {
+        return Vec::new();
+    };
+    let mut named: Vec<String> = Vec::new();
+    for value in statements
+        .iter()
+        .filter_map(|statement| statement.as_object())
+        .flat_map(|statement| {
+            ["Principal", "NotPrincipal"]
+                .into_iter()
+                .filter_map(|element| statement.get(element))
+        })
+        .flat_map(principal_element_values)
+    {
+        if !named.contains(&value) {
+            named.push(value);
+        }
+    }
+    named
+}
+
+/// The string values one `Principal`/`NotPrincipal` element names, in each of the three forms
+/// a policy writes it in — see [`policy_principals`].
+fn principal_element_values(element: &::serde_json::Value) -> Vec<String> {
+    match element {
+        ::serde_json::Value::String(value) => vec![value.clone()],
+        ::serde_json::Value::Array(list) => {
+            list.iter().flat_map(principal_element_values).collect()
+        }
+        ::serde_json::Value::Object(kinds) => {
+            kinds.values().flat_map(principal_element_values).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Whether `policy` is a policy document S3 accepts on `PutBucketPolicy`.
 ///
 /// The grammar an IAM resource policy has to satisfy: a JSON object carrying a
@@ -1333,9 +1385,13 @@ pub(super) const SOURCE_IP_CONDITION_KEY: &str = "aws:sourceip";
 /// of these still grants access to everyone.
 pub(super) const WHOLE_INTERNET_CIDRS: [&str; 2] = ["0.0.0.0/0", "::/0"];
 
-/// The operand value that names no fixed set at all: it matches every value the key could
-/// take, so a condition on it restricts nothing.
-pub(super) const MATCHES_EVERY_VALUE: &str = "*";
+/// IAM's two wildcard characters, which a condition operand carrying either of them matches
+/// a CLASS of values with rather than naming fixed ones: `*` stands for any run of characters
+/// and `?` for exactly one (the pair
+/// `service_common::iam_authorization::wildcard_match` compares a pattern by). A statement
+/// whose only restriction is such an operand still reaches everyone the key could name, so it
+/// restricts nothing for the purpose of "The Meaning of 'Public'".
+pub(super) const WILDCARD_CHARACTERS: [char; 2] = ['*', '?'];
 
 /// Whether `policy` grants access to the PUBLIC — the question
 /// `GetBucketPolicyStatus`'s `PolicyStatus$IsPublic` answers about the bucket's policy.
@@ -1430,15 +1486,65 @@ pub(super) fn names_fixed_values(key: &str, values: &::serde_json::Value) -> boo
     }
 }
 
-/// Whether one operand value of `key` is a fixed value rather than one matching everything
-/// the key could be: the bare wildcard names no set, and for `aws:SourceIp` neither does
-/// the whole address space ([`WHOLE_INTERNET_CIDRS`]).
+/// Whether one operand value of `key` is a FIXED value rather than one every value the key
+/// could take falls under.
+///
+/// Three kinds of operand name no fixed value: the empty one; one whose wildcards leave every
+/// value of the key's own value space matching ([`names_every_value`] — `vpc-*` admits every
+/// VPC there is, while `o-exampleorgid/r-examplerootid/*` admits the paths under one
+/// organization root and so names a set); and, for `aws:SourceIp`, the whole address space
+/// ([`WHOLE_INTERNET_CIDRS`]).
 pub(super) fn is_fixed_value(key: &str, value: &str) -> bool {
-    if value.is_empty() || value == MATCHES_EVERY_VALUE {
+    if value.is_empty() || names_every_value(key, value) {
         return false;
     }
     key != SOURCE_IP_CONDITION_KEY || !WHOLE_INTERNET_CIDRS.contains(&value)
 }
+
+/// Whether `value`, read as the pattern a wildcard operator compares with, matches EVERY
+/// value `key` could name — which is what makes a condition over it restrict nothing.
+///
+/// A value carrying no wildcard names itself and nothing else, so it always restricts. One
+/// that carries a wildcard restricts only while what it fixes BEFORE the first wildcard goes
+/// beyond the prefix every value of that key begins with ([`VALUE_SPACE_PREFIXES`]): `vpc-*`
+/// fixes exactly `vpc-`, which every VPC id starts with, so it admits every VPC and names no
+/// set, while `o-exampleorgid/r-examplerootid/*` fixes an organization and a root inside it
+/// and so names the paths under that root. The bare `*` fixes nothing at all and therefore
+/// matches everything, whatever the key.
+fn names_every_value(key: &str, value: &str) -> bool {
+    let Some(fixed) = value.split(WILDCARD_CHARACTERS).next().filter(|fixed| {
+        // `split` yields the whole value when it carries no wildcard at all.
+        fixed.len() < value.len()
+    }) else {
+        return false;
+    };
+    let prefix = VALUE_SPACE_PREFIXES
+        .iter()
+        .find(|(known, _)| *known == key)
+        .map_or("", |(_, prefix)| *prefix);
+    fixed.len() <= prefix.len() && prefix.starts_with(fixed)
+}
+
+/// The prefix every value of a condition key begins with, for the keys whose values are
+/// identifiers of ONE published form — so a pattern that fixes no more than this names no
+/// value of that key in particular ([`names_every_value`]).
+///
+/// Each prefix is the published form of that key's own values: a VPC id is `vpc-<id>` and a
+/// VPC endpoint id `vpce-<id>` (Amazon VPC, resource id formats); an organization id is "`o-`
+/// followed by 10 to 32 lowercase letters or digits" and an organization PATH begins with
+/// that id (AWS Organizations, `Organization$Id` and `aws:PrincipalOrgPaths`); an ARN begins
+/// with `arn:` (AWS General Reference, *Amazon Resource Names*). A key whose values carry no
+/// such prefix — an account id, a unique id, an IP range — is not listed, and for those only
+/// a pattern that fixes nothing at all matches every value.
+const VALUE_SPACE_PREFIXES: [(&str, &str); 7] = [
+    ("aws:sourcevpc", "vpc-"),
+    ("aws:sourcevpce", "vpce-"),
+    ("aws:principalorgid", "o-"),
+    ("aws:principalorgpaths", "o-"),
+    ("aws:principalarn", "arn:"),
+    ("aws:sourcearn", "arn:"),
+    ("s3:dataaccesspointarn", "arn:"),
+];
 
 /// What a bucket policy says about `action` on `resource` for a caller that presents NO
 /// credential.

@@ -203,7 +203,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(refusal);
         }
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Nothing can be reported about a bucket the emulator cannot look up, and
             // the one modeled error here says "no such bucket", which would be a false
@@ -214,6 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Read-only: the guard is taken, the bucket's Region is copied out, and nothing
         // is written — a later caller sees exactly what this one saw.
+        //
+        // WHO is asking is resolved BEFORE the store is locked, so the STS and IAM stores
+        // this service reads the calling principal and its policies from are never reached
+        // while this service's own guard is held.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let store = state.lock();
         let Some(bucket) = store.bucket(&input.bucket) else {
             // "If the bucket doesn't exist or you don't have permission to access it, the
@@ -236,6 +240,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .unwrap_or_default(),
             ));
         };
+
+        // "You must have permissions to perform the `s3:ListBucket` action" to use this
+        // operation (this operation's own documentation), judged against the documents in
+        // force on the principal the request signed for and against the bucket's own policy
+        // ([`crate::service::request_authorization`] carries IAM's order). "If the bucket
+        // doesn't exist or you don't have permission to access it, the HEAD request returns a
+        // generic 400 Bad Request, 403 Forbidden, or 404 Not Found HTTP status code" (same
+        // documentation): the permission case is the 403, and a HEAD carries no body, so the
+        // status is the whole of what tells a caller which it was.
+        if crate::service::request_authorization::denial(
+            &caller,
+            bucket.policy.as_deref(),
+            crate::state::LIST_BUCKET_ACTION,
+            &bucket.arn(&input.bucket),
+            &crate::service::authorization::read_conditions(),
+        )
+        .is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                crate::state::ACCESS_DENIED_MESSAGE,
+            ));
+        }
 
         Ok(HeadBucketOutput {
             bucket_region: Some(bucket.region.clone()),

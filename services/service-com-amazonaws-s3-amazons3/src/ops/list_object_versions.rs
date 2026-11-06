@@ -229,8 +229,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A listing needs nothing from the request beyond its deserialized input.
-        let _ = ctx;
+        // A listing needs nothing from the request beyond its deserialized input and the
+        // credential it presented.
 
         // `OptionalObjectAttributes` adds restore state, which is not served here, and
         // answering a plain listing would be answering something the request did not ask
@@ -312,10 +312,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         // Read-only: the guard is taken, the entries are copied out, and nothing is
         // written — a later caller sees exactly what this one saw.
+        //
+        // WHO is asking is resolved BEFORE the store is locked, so the STS and IAM stores
+        // this service reads the calling principal and its policies from are never reached
+        // while this service's own guard is held.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let store = state.lock();
         let bucket = store
             .bucket(&input.bucket)
             .ok_or(ListObjectVersionsErrorModeled::NoSuchBucket(NoSuchBucket {}))?;
+
+        // "You must have the `s3:ListBucketVersions` permission" to list a bucket's versions
+        // (this operation's own documentation) — a permission of its own, which the
+        // `s3:ListBucket` grant that admits a listing of the bucket's CURRENT objects does not
+        // cover. Judged against the documents in force on the principal the request signed
+        // for and against the bucket's own policy
+        // ([`crate::service::request_authorization`] carries IAM's order), before anything
+        // about the bucket's contents is reported.
+        if let Some(message) = crate::service::request_authorization::denial(
+            &caller,
+            bucket.policy.as_deref(),
+            crate::service::request_authorization::LIST_BUCKET_VERSIONS_ACTION,
+            &bucket.arn(&input.bucket),
+            &crate::service::authorization::ListingContext {
+                max_keys: input.max_keys,
+                prefix: input.prefix.as_deref(),
+                delimiter: input.delimiter.as_deref(),
+            }
+            .conditions(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
 
         let prefix = input.prefix.clone().unwrap_or_default();
         let delimiter = input.delimiter.clone().unwrap_or_default();

@@ -31,13 +31,12 @@
 //! denies nothing.
 
 use ::service_common::iam_authorization::{
-    account_principals, resource_outcome_prepared, Decision, PreparedDocument, Request,
+    account_principals, resource_outcome_prepared, Decision, Outcome, PreparedDocument, Request,
 };
 
 use crate::state::{
-    self, caller_principal_arn, explicit_resource_policy_denial, Bucket, Object,
-    ACCESS_DENIED_CODE, ACCESS_DENIED_MESSAGE, ACCESS_DENIED_STATUS, GET_OBJECT_ACTION,
-    LIST_BUCKET_ACTION,
+    caller_principal_arn, explicit_resource_policy_denial, ACCESS_DENIED_CODE,
+    ACCESS_DENIED_MESSAGE, ACCESS_DENIED_STATUS,
 };
 
 /// The condition key saying whether the request arrived over a secure transport: "whether
@@ -75,6 +74,18 @@ const COPY_SOURCE_KEY: &str = "s3:x-amz-copy-source";
 /// (`s3:x-amz-metadata-directive`, same published list).
 const METADATA_DIRECTIVE_KEY: &str = "s3:x-amz-metadata-directive";
 
+/// The condition key a LISTING's `max-keys` parameter answers (`s3:max-keys`, same published
+/// list) — the key a bucket policy caps the size of an admitted listing with.
+const MAX_KEYS_KEY: &str = "s3:max-keys";
+
+/// The condition key a listing's `prefix` parameter answers (`s3:prefix`, same published
+/// list) — the key a policy scopes a caller to one folder of a bucket with.
+const PREFIX_KEY: &str = "s3:prefix";
+
+/// The condition key a listing's `delimiter` parameter answers (`s3:delimiter`, same
+/// published list).
+const DELIMITER_KEY: &str = "s3:delimiter";
+
 /// Every condition key a request judged here carries a value for when its member is present,
 /// and so DECLARES this service models — the keys whose absence from the context is decided
 /// ("the request carries none") rather than unknown. Every other key keeps the undecided
@@ -87,7 +98,53 @@ pub const PUBLISHED_CONDITION_KEYS: &[&str] = &[
     KMS_KEY_ID_KEY,
     COPY_SOURCE_KEY,
     METADATA_DIRECTIVE_KEY,
+    MAX_KEYS_KEY,
+    PREFIX_KEY,
+    DELIMITER_KEY,
 ];
+
+/// The number of keys a listing returns when the request names no `max-keys`: "sets the
+/// maximum number of keys returned in the response. By default, the action returns up to
+/// 1,000 key names" (`ListObjectsV2Request$MaxKeys`), so that is the figure a clause over
+/// [`MAX_KEYS_KEY`] is decided against for a request that names none — the listing it would
+/// return is that large.
+pub const DEFAULT_MAX_KEYS: i32 = 1_000;
+
+/// The members of a LISTING a bucket policy may be written over, as the request carried them.
+///
+/// One value per published listing condition key; the size of the listing is always known
+/// (see [`DEFAULT_MAX_KEYS`]), while a `prefix` and a `delimiter` the request does not carry
+/// are absent, which is itself part of the decision — a policy admitting a listing only
+/// "when" it names a prefix refuses one that names none.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ListingContext<'a> {
+    /// `max-keys` — the largest number of keys the listing may return.
+    pub max_keys: Option<i32>,
+    /// `prefix` — the key prefix the listing is confined to.
+    pub prefix: Option<&'a str>,
+    /// `delimiter` — the character the listing rolls common prefixes up on.
+    pub delimiter: Option<&'a str>,
+}
+
+impl ListingContext<'_> {
+    /// The request's condition context: the secure transport every endpoint of this emulator
+    /// serves, the effective size of the listing, and one pair per member the request
+    /// carried.
+    #[must_use]
+    pub fn conditions(&self) -> Vec<(String, String)> {
+        let mut context = ObjectWriteContext::default().conditions();
+        context.push((
+            MAX_KEYS_KEY.to_string(),
+            self.max_keys.unwrap_or(DEFAULT_MAX_KEYS).to_string(),
+        ));
+        for (key, value) in [(PREFIX_KEY, self.prefix), (DELIMITER_KEY, self.delimiter)] {
+            if let Some(value) = value {
+                context.push((key.to_string(), value.to_string()));
+            }
+        }
+        context
+    }
+}
 
 /// The members of an object write a bucket policy may be written over, as the request carried
 /// them.
@@ -166,15 +223,27 @@ pub fn policy_denial(
             .with_context(conditions)
             .with_published_keys(PUBLISHED_CONDITION_KEYS),
     );
-    // A key the decision needed and this service does not model leaves the statement
-    // undecided, which refuses nothing; a key it DOES model is decided by its absence, so a
-    // report of one says only that the request carried no value for it.
-    let undecided = outcome
-        .required_context_keys
-        .iter()
-        .any(|key| !models(key));
-    (outcome.decision == Decision::Denied && !undecided)
-        .then(|| explicit_resource_policy_denial(action, resource))
+    deny_is_decided(&outcome).then(|| explicit_resource_policy_denial(action, resource))
+}
+
+/// Whether `outcome` is a deny this evaluation could DECIDE — the only kind that refuses.
+///
+/// A key the decision needed and this service does not model leaves the statement undecided,
+/// and the evaluation's reading of an undecided `Deny` is that it still refuses — fail-closed,
+/// which is right where a GRANT is at stake and wrong for a refusal, because it would refuse
+/// calls on every bucket whose policy conditions anything nothing here models. A key this
+/// service DOES model is decided by its absence, so a report of one says only that the
+/// request carried no value for it.
+///
+/// One place, so the bucket-policy half ([`policy_denial`]) and the full authorization gate
+/// ([`super::request_authorization::denial`]) read an undecided deny the same way.
+#[must_use]
+pub fn deny_is_decided(outcome: &Outcome) -> bool {
+    outcome.decision == Decision::Denied
+        && !outcome
+            .required_context_keys
+            .iter()
+            .any(|key| !models(key))
 }
 
 /// Whether this service ANSWERS the condition key `key`, compared the way a condition key's
@@ -183,49 +252,6 @@ fn models(key: &str) -> bool {
     PUBLISHED_CONDITION_KEYS
         .iter()
         .any(|known| known.eq_ignore_ascii_case(key))
-}
-
-/// Why S3 refuses a read of `key` — the bytes or the metadata of the version `addressed`
-/// names, `None` for an address the bucket holds no object at — to the CREDENTIALED caller,
-/// or `None` when the bucket's policy leaves the read to it.
-///
-/// WHICH refusal it is depends on what the address resolved to, and both are worded as the
-/// explicit deny they are, about the action the policy denied:
-///
-/// * a version the read DID resolve, whose read the policy denies, is refused the read itself
-///   — [`GET_OBJECT_ACTION`] on that object;
-/// * an address holding NOTHING is answered by what the caller may learn about the bucket's
-///   contents at all: "if the object that you request doesn't exist, the error that Amazon S3
-///   returns depends on whether you also have the `s3:ListBucket` permission. If you have the
-///   `s3:ListBucket` permission on the bucket, Amazon S3 returns an HTTP status code 404 Not
-///   Found error. If you don't have the `s3:ListBucket` permission, Amazon S3 returns an HTTP
-///   status code 403 Access Denied error" (`GetObject`'s own documentation) — so a policy
-///   denying [`LIST_BUCKET_ACTION`] refuses the read instead of reporting the key absent, and
-///   one that does not leaves the 404 to be answered.
-///
-/// Asked BEFORE anything about the key is reported, which is what keeps a refusal from saying
-/// whether the object is there.
-pub fn caller_object_read_refusal(
-    bucket: &Bucket,
-    name: &str,
-    key: &str,
-    addressed: Option<&Object>,
-) -> Option<String> {
-    let conditions = read_conditions();
-    if addressed.is_some() {
-        return policy_denial(
-            bucket.policy.as_deref(),
-            GET_OBJECT_ACTION,
-            &state::object_arn(name, key),
-            &conditions,
-        );
-    }
-    policy_denial(
-        bucket.policy.as_deref(),
-        LIST_BUCKET_ACTION,
-        &bucket.arn(name),
-        &conditions,
-    )
 }
 
 /// Why a request naming `expected` as the account that owns the bucket it addresses is

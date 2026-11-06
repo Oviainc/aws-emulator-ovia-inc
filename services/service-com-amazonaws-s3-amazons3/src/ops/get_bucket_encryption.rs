@@ -173,8 +173,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A read needs nothing from the request beyond its deserialized input.
-        let _ = ctx;
+        // A read needs nothing from the request beyond its deserialized input and the
+        // credential it presented.
 
         // "The account ID of the expected bucket owner. If the account ID that you provide
         // does not match the actual owner of the bucket, the request fails with the HTTP
@@ -208,10 +208,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // COMPUTED here rather than stored on first read: "By default, all buckets have a
         // default encryption configuration that uses server-side encryption with Amazon S3
         // managed keys (SSE-S3)" (this operation's own documentation).
+        // WHO is asking is resolved BEFORE the store is locked, so the STS and IAM stores
+        // this service reads the calling principal and its policies from are never reached
+        // while this service's own guard is held.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let store = state.lock();
         let Some(bucket) = store.bucket(&input.bucket) else {
             return Err(GetBucketEncryptionErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };
+
+        // "To use this operation, you must have permission to perform the
+        // `s3:GetEncryptionConfiguration` action" (this operation's own documentation) — an
+        // action whose name does not follow the operation's, so a policy granting the
+        // `s3:GetBucket*` family does NOT cover it. Judged against the documents in force on
+        // the principal the request signed for and against the bucket's own policy
+        // ([`crate::service::request_authorization`] carries IAM's order), before anything
+        // about the bucket's configuration is reported.
+        if let Some(message) = crate::service::request_authorization::denial(
+            &caller,
+            bucket.policy.as_deref(),
+            crate::service::request_authorization::GET_ENCRYPTION_CONFIGURATION_ACTION,
+            &bucket.arn(&input.bucket),
+            &crate::service::authorization::read_conditions(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
         // One accessor for the rules IN FORCE, shared with the write path that resolves a
         // `PutObject`'s inherited encryption from them, so what this reports and what an
         // object inherits can never disagree.

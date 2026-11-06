@@ -252,19 +252,31 @@ fn pool_trust_policy(pool_id: &str) -> String {
     )
 }
 
-/// The identity policy the first suite's pool role carries, so a session of it may have the
-/// plaintext of the SSE-KMS objects those rows read: the objects' key carries its DEFAULT
-/// key policy, which delegates the decision to this account's own identity-based policies,
-/// and a read that serves an SSE-KMS object's bytes performs `kms:Decrypt` on that key as
-/// the session's principal. A pool role carrying NO such policy is refused that plaintext,
-/// which is what [`a_vended_session_the_key_policy_does_not_reach_cannot_read_the_object`]
-/// drives below; what the rows are about is what a read the key DOES permit reports about
-/// the object's encryption.
+/// The identity policy the first suite's pool role carries, so a session of it may READ those
+/// rows' objects and have their plaintext: S3 authorizes the signed read itself against the
+/// documents in force on the session's principal (`s3:GetObject`), and the objects' key
+/// carries its DEFAULT key policy, which delegates the decision to this account's own
+/// identity-based policies, so a read that serves an SSE-KMS object's bytes also performs
+/// `kms:Decrypt` on that key as that principal. A pool role carrying NO such policy is
+/// refused, which is what
+/// [`a_vended_session_the_key_policy_does_not_reach_cannot_read_the_object`] drives below;
+/// what the rows are about is what a read the policies DO permit reports about the object's
+/// encryption.
 ///
 /// Compact and carrying none of the characters that are significant in an
 /// `application/x-www-form-urlencoded` body, exactly like [`pool_trust_policy`].
 const POOL_ROLE_POLICY: &str = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
-     \"Action\":\"kms:Decrypt\",\"Resource\":\"*\"}]}";
+     \"Action\":[\"kms:Decrypt\",\"s3:GetObject\"],\"Resource\":\"*\"}]}";
+
+/// The identity policy the SECOND suite's guest role carries: the S3 read alone, and no
+/// `kms:Decrypt`.
+///
+/// S3 authorizes the signed read itself against the session principal's own documents, so a
+/// role with no policy at all is refused before the object's key is ever consulted — which
+/// would not be the refusal that suite is about. With the read granted and the decrypt left to
+/// the KEY POLICY, the refusal it drives is exactly the one it names.
+const POOL_ROLE_READ_POLICY: &str = "{\"Version\":\"2012-10-17\",\"Statement\":\
+     [{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}]}";
 
 /// `iam:CreateRole` for a role an identity pool vends sessions of, carrying `policy` as its
 /// inline policy when one is given, and answering its ARN.
@@ -852,7 +864,8 @@ fn a_vended_session_the_key_policy_does_not_reach_cannot_read_the_object() {
             create_bucket(&router, &runtime, bucket);
 
             // The pool and its two roles. The guest session below is a session of the
-            // unauthenticated one, which carries no identity policy of its own.
+            // unauthenticated one, which carries the S3 read and no `kms:Decrypt` of its own
+            // ([`POOL_ROLE_READ_POLICY`]), so what decides its read is the KEY policy.
             let pool_name = "vended-session-denied-pool";
             let pool_id = create_identity_pool(&router, &runtime, pool_name);
             let guest_role = create_pool_role(
@@ -860,7 +873,7 @@ fn a_vended_session_the_key_policy_does_not_reach_cannot_read_the_object() {
                 &runtime,
                 &format!("{pool_name}-unauth"),
                 &pool_id,
-                None,
+                Some(POOL_ROLE_READ_POLICY),
             );
             let authenticated = create_pool_role(
                 &router,

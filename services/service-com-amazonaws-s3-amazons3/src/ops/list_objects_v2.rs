@@ -288,7 +288,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The confused-deputy guard the request itself asks for: "if the account ID that you
         // provide does not match the actual owner of the bucket, the request fails with the
@@ -366,11 +366,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the shared S3 store is unreachable from this engine",
             )
         })?;
+        // WHO is asking is resolved BEFORE the store is locked, so the STS and IAM stores
+        // this service reads the calling principal and its policies from are never reached
+        // while this service's own guard is held.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let store = state.lock();
 
         let bucket = store
             .bucket(&input.bucket)
             .ok_or(ListObjectsV2ErrorModeled::NoSuchBucket(NoSuchBucket {}))?;
+
+        // "You must have READ access to the bucket" — the `s3:ListBucket` permission — to list
+        // its objects (this operation's own documentation of its general purpose bucket
+        // permissions), so a signed request is authorized against the documents in force on
+        // the principal it signed for and against the bucket's own policy
+        // ([`crate::service::request_authorization`] carries IAM's order). The listing's own
+        // members travel as the condition context
+        // ([`crate::service::authorization::ListingContext`]), so a bucket policy that admits
+        // a listing only up to a capped `max-keys` refuses a larger one rather than serving
+        // it. Judged before anything about the bucket's contents is reported.
+        if let Some(message) = crate::service::request_authorization::denial(
+            &caller,
+            bucket.policy.as_deref(),
+            crate::state::LIST_BUCKET_ACTION,
+            &bucket.arn(&input.bucket),
+            &crate::service::authorization::ListingContext {
+                max_keys: input.max_keys,
+                prefix: input.prefix.as_deref(),
+                delimiter: input.delimiter.as_deref(),
+            }
+            .conditions(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
 
         let prefix = input.prefix.clone().unwrap_or_default();
         let delimiter = input.delimiter.clone().unwrap_or_default();

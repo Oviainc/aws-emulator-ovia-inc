@@ -278,6 +278,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not hold answers that rather than reporting whatever is wrong with an ACL that
         // bucket could never have carried — the order `PutBucketOwnershipControls` keeps.
         // Its Region is also what decides how an email grantee is refused.
+        //
+        // WHO is asking is resolved before the store is locked, so a guardrail refusal below
+        // names the principal that really signed this request.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         let Some(bucket) = store.bucket_mut(&input.bucket) else {
             return Err(PutBucketAclErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
@@ -316,6 +320,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ACCESS_DENIED_CODE,
                 ACCESS_DENIED_STATUS,
                 crate::state::block_public_acls_denial(
+                    &caller.arn,
                     PUT_BUCKET_ACL_ACTION,
                     &crate::state::bucket_arn(&input.bucket),
                 ),

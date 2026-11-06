@@ -126,6 +126,23 @@ fn assumed_role_session(session_arn: &str) -> Option<(&str, &str)> {
     (!role.is_empty() && !session.is_empty()).then_some((role, session))
 }
 
+/// The group name an IAM ARN carries, when the ARN names an IAM group of THIS account
+/// (`arn:<partition>:iam::<account>:group<path><name>`).
+///
+/// A group is a different IAM entity from a user and a role even where they share a name, so
+/// a `user/…` or `role/…` ARN resolves to nothing here. `None` otherwise for the same reasons
+/// [`role_name`] answers it.
+///
+/// A group is NOT an identity a request can speak for and not one a resource-based policy can
+/// grant to — "you cannot identify a user group as a `Principal` in a policy (such as a
+/// resource-based policy) because groups relate to permissions, not authentication" (IAM User
+/// Guide, *IAM identities*) — so a service that resolves the principals of a document it is
+/// handed reads this to tell such a value apart from an identity that merely does not exist.
+#[must_use]
+pub fn group_name(group_arn: &str) -> Option<&str> {
+    entity_name(group_arn, "group")
+}
+
 /// The name an IAM ARN of the entity type `entity_type` carries, when the ARN names an
 /// entity of that type of THIS account: everything after the last `/`, so an entity under
 /// a path resolves to the name IAM holds it under.

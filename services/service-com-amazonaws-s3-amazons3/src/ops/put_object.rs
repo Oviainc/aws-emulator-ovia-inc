@@ -582,6 +582,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // WHO is asking is resolved BEFORE the store is locked, so the STS and IAM stores
+        // this service reads the calling principal and its policies from are never reached
+        // while this service's own guard is held.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         // The bucket decides the encryption of a write that named none of it: "Amazon S3
         // encrypts data with server-side encryption by using Amazon S3 managed keys
@@ -624,11 +628,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             requested
         };
 
-        // WHO is asking, before the write commits. A bucket policy is a RESOURCE-BASED
-        // policy, so it is in force on this write too: "an explicit deny in any policy
-        // overrides any allow" (IAM's own evaluation order), which is what makes a policy
-        // that requires an encryption header — or any other condition over the request's own
-        // members — mandatory rather than advisory. The context is the request's own
+        // WHO is asking, before the write commits. A signed request is authorized per action
+        // against the documents in force on the principal it signed for and against the
+        // bucket's own policy, which is a RESOURCE-BASED policy and so is in force on this
+        // write too ([`crate::service::request_authorization`] carries IAM's order): a write
+        // needs an `s3:PutObject` grant from one of them, and "an explicit deny in any policy
+        // overrides any allow" — which is what makes a policy that requires an encryption
+        // header, or any other condition over the request's own members, mandatory rather
+        // than advisory. The context is the request's own
         // ([`crate::service::authorization::ObjectWriteContext`]), so a clause over one of
         // those members is decided by what THIS request carried: the encryption header as
         // sent, never the bucket default resolved above, since the policy is about the
@@ -641,7 +648,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             kms_key_id: input.ssekms_key_id.as_deref(),
             ..crate::service::authorization::ObjectWriteContext::default()
         };
-        if let Some(message) = crate::service::authorization::policy_denial(
+        if let Some(message) = crate::service::request_authorization::denial(
+            &caller,
             bucket_record.policy.as_deref(),
             PUT_OBJECT_ACTION,
             &crate::state::object_arn(&input.bucket, &input.key),
@@ -774,6 +782,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ACCESS_DENIED_CODE,
                     ACCESS_DENIED_STATUS,
                     crate::state::block_public_acls_denial(
+                        &caller.arn,
                         PUT_OBJECT_ACTION,
                         &crate::state::object_arn(&input.bucket, &input.key),
                     ),
