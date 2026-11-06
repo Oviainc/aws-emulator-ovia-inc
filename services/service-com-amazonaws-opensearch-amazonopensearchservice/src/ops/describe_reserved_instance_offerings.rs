@@ -214,14 +214,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .into(),
                         );
                     }
-                    let offering = store
-                        .reserved_instance_offerings
-                        .get(offering_id)
-                        .ok_or_else(|| {
+                    let Some(offering) = store.reserved_instance_offerings.get(offering_id) else {
+                        // The recorded wire answer for a filter naming an offering the
+                        // catalog publishes nothing for is HTTP 404, which is not the
+                        // status this model's `ResourceNotFoundException` annotates — so
+                        // the refusal states it
+                        // ([`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`]) rather than
+                        // taking the shape's own.
+                        return Err(crate::scaffolded::Scaffolded::not_found(
                             DescribeReservedInstanceOfferingsErrorModeled::ResourceNotFoundException(
-                                crate::state::offering_not_found(offering_id),
-                            )
-                        })?;
+                                crate::state::offering_not_found(),
+                            ),
+                        ));
+                    };
                     vec![offering]
                 }
                 None => store.published_reserved_instance_offerings(),

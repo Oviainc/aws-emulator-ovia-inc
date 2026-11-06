@@ -44,7 +44,9 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
     RESERVED_INSTANCE_CURRENCY_CODE, RESERVED_INSTANCE_QUOTA, RESERVED_INSTANCE_TERMS,
 };
 
-use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
+use super::domain_lifecycle::{
+    error_code, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS, SETTLE_WAIT,
+};
 
 /// How close two money amounts have to be to count as equal: a JSON number is an
 /// `f64`, and a price is rounded to cents or to a hundredth of a cent.
@@ -63,7 +65,7 @@ async fn offerings(emulator: &Emulator, query: &str) -> Answer {
 
 /// `PurchaseReservedInstanceOffering`:
 /// `POST /opensearch/purchaseReservedInstanceOffering`.
-async fn purchase(emulator: &Emulator, body: Value) -> Answer {
+pub(crate) async fn purchase(emulator: &Emulator, body: Value) -> Answer {
     emulator
         .call(
             "POST",
@@ -74,7 +76,7 @@ async fn purchase(emulator: &Emulator, body: Value) -> Answer {
 }
 
 /// `DescribeReservedInstances`: `GET /opensearch/reservedInstances`.
-async fn reservations(emulator: &Emulator, query: &str) -> Answer {
+pub(crate) async fn reservations(emulator: &Emulator, query: &str) -> Answer {
     emulator
         .call(
             "GET",
@@ -739,8 +741,9 @@ async fn an_id_filter_names_one_resource_and_an_unknown_one_is_refused() {
         let case = format!("DescribeReservedInstanceOfferings with {unknown}");
         let answer = offerings(&emulator, &format!("?offeringId={unknown}")).await;
         assert_eq!(
-            answer.status, 409,
-            "case {case}: expected the modelled not-found's HTTP 409, got {} {:?}",
+            answer.status, RECORDED_NOT_FOUND_STATUS,
+            "case {case}: expected HTTP {RECORDED_NOT_FOUND_STATUS} for an offering the catalog \
+             does not publish, got {} {:?}",
             answer.status, answer.body
         );
         assert_eq!(
@@ -764,8 +767,9 @@ async fn an_id_filter_names_one_resource_and_an_unknown_one_is_refused() {
         )
         .await;
         assert_eq!(
-            answer.status, 409,
-            "case {case}: expected the modelled not-found's HTTP 409, got {} {:?}",
+            answer.status, RECORDED_NOT_FOUND_STATUS,
+            "case {case}: expected HTTP {RECORDED_NOT_FOUND_STATUS} for an offering the catalog \
+             does not publish, got {} {:?}",
             answer.status, answer.body
         );
         assert_eq!(

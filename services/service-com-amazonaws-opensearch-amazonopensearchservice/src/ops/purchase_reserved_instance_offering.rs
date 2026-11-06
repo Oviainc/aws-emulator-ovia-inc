@@ -212,12 +212,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // out of the catalog so the reservation below is priced from what the store
         // itself published.
         let Some(offering) = store.reserved_instance_offering(&offering_id).cloned() else {
-            return Err(
+            // The same refusal, worded and carried the same way, as the catalog listing
+            // answers such an id with: the recorded wire answer is HTTP 404, which the
+            // shape's own `@httpError` does not state
+            // ([`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`]).
+            return Err(crate::scaffolded::Scaffolded::not_found(
                 PurchaseReservedInstanceOfferingErrorModeled::ResourceNotFoundException(
-                    crate::state::offering_not_found(&offering_id),
-                )
-                .into(),
-            );
+                    crate::state::offering_not_found(),
+                ),
+            ));
         };
 
         // `ReservationName` is "a customer-specified identifier to track this

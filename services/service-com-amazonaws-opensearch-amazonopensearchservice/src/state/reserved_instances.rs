@@ -155,10 +155,10 @@ impl ReservedInstanceRecord {
 /// The refusal of a `GUID` that names no stored Reserved Instance.
 ///
 /// A well-formed identifier that addresses no record names no resource, so this is
-/// the modelled `ResourceNotFoundException` (HTTP 409) — the same refusal the
-/// offering catalog answers an id it publishes nothing for with
-/// ([`offering_not_found`]) — in the service's own wording for a reservation id that
-/// resolves to nothing.
+/// the modelled `ResourceNotFoundException` — the same refusal the offering catalog
+/// answers an id it publishes nothing for with ([`offering_not_found`]) — naming the
+/// KIND of identifier that resolved to nothing and no value, which is how the
+/// recorded refusal of a reservation id words it.
 pub fn reserved_instance_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some("Reservation id not found".to_string()),

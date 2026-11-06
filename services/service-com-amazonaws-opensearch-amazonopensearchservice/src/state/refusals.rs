@@ -349,11 +349,17 @@ pub fn maintenance_not_found(domain_name: &str, maintenance_id: &str) -> Resourc
 
 /// The `ResourceNotFoundException` payload for an offering id the catalog publishes
 /// no Reserved Instance offering for.
-pub fn offering_not_found(offering_id: &str) -> ResourceNotFoundException {
+///
+/// The sentence names the KIND of identifier that resolved to nothing and no value:
+/// the id is the one the request itself carried, so echoing it back tells a caller
+/// nothing it does not hold, and that is how the recorded wire refusal of such an id
+/// words it — the same shape as the sibling refusal for a reservation id that
+/// resolves to nothing ([`crate::state::reserved_instance_not_found`]). Every
+/// operation that resolves an offering id answers through here, so the catalog
+/// listing and a purchase cannot word the same miss differently.
+pub fn offering_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
-            "Reserved Instance offering not found: {offering_id}"
-        )),
+        message: Some("Offering id not found".to_string()),
     }
 }
 

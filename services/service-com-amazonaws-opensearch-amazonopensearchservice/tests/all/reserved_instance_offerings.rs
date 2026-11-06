@@ -45,7 +45,9 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
     RESERVED_INSTANCE_TERMS, TERM_ONE_YEAR, TERM_THREE_YEARS,
 };
 
-use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX};
+use super::domain_lifecycle::{
+    error_code, string_member, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS,
+};
 
 /// `DescribeReservedInstanceOfferings`:
 /// `GET /2021-01-01/opensearch/reservedInstanceOfferings`, with `query` as its
@@ -465,7 +467,10 @@ async fn offering_id_filter_reports_exactly_that_offering() {
         );
     }
 
-    // A well-formed id the catalog publishes nothing for names no resource.
+    // A well-formed id the catalog publishes nothing for names no resource, on the
+    // status a missing resource is reported under rather than the shape's own
+    // `@httpError`. The whole rule, over more ids, lives in
+    // [`super::missing_offering_refusals`].
     for absent in [
         "00000000-0000-0000-0000-000000000000",
         "ffffffff-ffff-ffff-ffff-ffffffffffff",
@@ -473,8 +478,8 @@ async fn offering_id_filter_reports_exactly_that_offering() {
     ] {
         let answer = describe(&emulator, &format!("offeringId={absent}")).await;
         assert_eq!(
-            answer.status, 409,
-            "case {absent}: expected HTTP 409, got {} {:?}",
+            answer.status, RECORDED_NOT_FOUND_STATUS,
+            "case {absent}: expected HTTP {RECORDED_NOT_FOUND_STATUS}, got {} {:?}",
             answer.status, answer.body
         );
         assert_eq!(
