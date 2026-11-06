@@ -21,7 +21,7 @@
 //! * [`IndexEntry::to_wire`] / [`ViewEntry::to_wire`] — the modelled `Index` and
 //!   `View` structures, so `CreateView` and `GetView` cannot disagree about what a
 //!   stored view looks like.
-//! * [`SetupTask`] (in [`setup_tasks`]) — the multi-Region setup tasks
+//! * [`SetupTask`] — the multi-Region setup tasks
 //!   `CreateResourceExplorerSetup` starts and `GetResourceExplorerSetup` reports on.
 //! * [`paginate`] / [`encode_page_token`] — the opaque `NextToken` cursors the
 //!   `@paginated` operations share. The offset travels INSIDE the token, so a

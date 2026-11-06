@@ -122,6 +122,15 @@ impl From<CreateResourceExplorerSetupErrorModeled> for CreateResourceExplorerSet
     }
 }
 
+/// How a step blocked by the Region's index being torn down reads.
+///
+/// `cause` says what the deletion blocks — the Region cannot be configured, or the
+/// view behind its index cannot be created — and the sentence telling the caller what
+/// to do about it is shared, so the two steps of one Region cannot drift apart.
+fn blocked_by_deletion(cause: String) -> String {
+    format!("{cause} Wait for the deletion to finish, then try again.")
+}
+
 /// The `CreateResourceExplorerSetup` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -254,12 +263,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // What the Region's index step is, and when the Region's index is usable:
             // a view lives behind its Region's index, so the view step is one
             // dependency level later than that instant.
-            let being_deleted = || {
-                format!(
-                    "The index in Region {region} is being deleted. Wait for the \
-                     deletion to finish, then try again."
-                )
-            };
             let (index_step, index_ready_at) = match held {
                 None => {
                     let arn = guard
@@ -282,7 +285,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some((crate::state::IndexLifecycle::Deleting, _, _)) => (
                     crate::state::SetupStep::failed(
                         crate::state::SETUP_CONFLICT_CODE,
-                        being_deleted(),
+                        blocked_by_deletion(format!(
+                            "The index in Region {region} is being deleted, so Resource \
+                             Explorer cannot be configured there."
+                        )),
                     ),
                     None,
                 ),
@@ -350,7 +356,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // created either.
                 None => crate::state::SetupStep::failed(
                     crate::state::SETUP_CONFLICT_CODE,
-                    being_deleted(),
+                    blocked_by_deletion(format!(
+                        "The view cannot be created in Region {region} while the \
+                         Region's index is being deleted."
+                    )),
                 ),
             };
 

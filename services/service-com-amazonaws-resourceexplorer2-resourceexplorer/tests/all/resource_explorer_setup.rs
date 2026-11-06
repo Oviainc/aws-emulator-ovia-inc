@@ -794,3 +794,91 @@ async fn setup_promotes_an_existing_local_index_to_aggregator() {
         read.body
     );
 }
+
+/// A Region whose index is being torn down cannot be set up: both of its steps `FAIL`
+/// with `ErrorDetails` saying why, and nothing is created there — while a Region in
+/// the same call that holds nothing is configured normally.
+#[tokio::test]
+async fn setup_fails_the_steps_of_a_region_whose_index_is_being_deleted() {
+    let emulator = Emulator::new();
+    let doomed = "ap-southeast-2";
+    let fresh = "eu-west-2";
+    let index_arn = emulator
+        .call(doomed, "CreateIndex", json!({ "ClientToken": "to-be-deleted" }))
+        .await
+        .ok("CreateIndex")["Arn"]
+        .as_str()
+        .expect("CreateIndex answers an Arn")
+        .to_string();
+    tokio::time::sleep(PAST_SETUP).await;
+    let deleted = emulator
+        .call(doomed, "DeleteIndex", json!({ "Arn": index_arn }))
+        .await;
+    assert_eq!(
+        deleted.ok("DeleteIndex")["State"].as_str(),
+        Some("DELETING"),
+        "case \"DeleteIndex\": expected the index to be on its way out, got {}",
+        deleted.body
+    );
+
+    // Within the deletion's span, so the Region still holds an index that is going
+    // away: there is nothing the setup can build on there.
+    let task_id = emulator
+        .create_setup(
+            "a Region mid-deletion",
+            json!({
+                "RegionList": [doomed, fresh],
+                "ViewName": "mid-deletion",
+            }),
+        )
+        .await;
+    let regions = emulator
+        .setup_regions("a Region mid-deletion", &task_id, None)
+        .await;
+    let status = status_of("a Region mid-deletion", &regions, doomed);
+    for member in ["Index", "View"] {
+        let case = format!("{member} of a Region mid-deletion");
+        let failed = step(&case, status, member, "FAILED");
+        assert_eq!(
+            failed["ErrorDetails"]["Code"].as_str(),
+            Some("ConflictException"),
+            "case {case:?}: expected the refusal's code, got {failed}"
+        );
+        let message = failed["ErrorDetails"]["Message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            message.contains(doomed) && message.contains("deleted"),
+            "case {case:?}: expected a message naming the Region and the deletion, got \
+             {message:?}"
+        );
+        assert!(
+            failed.get(member).is_none(),
+            "case {case:?}: expected no resource on a failed step, got {failed}"
+        );
+    }
+
+    // The other Region in the same call is configured as usual.
+    tokio::time::sleep(PAST_SETUP).await;
+    let regions = emulator
+        .setup_regions("a Region mid-deletion", &task_id, None)
+        .await;
+    let status = status_of("the healthy Region", &regions, fresh);
+    step("the healthy Region's index", status, "Index", "SUCCEEDED");
+    step("the healthy Region's view", status, "View", "SUCCEEDED");
+    // And the deleted Region holds nothing: no index, and so no view.
+    emulator
+        .call(doomed, "GetIndex", json!({}))
+        .await
+        .failed("the deleted Region", 404, "ResourceNotFoundException");
+    let views = emulator.call(doomed, "ListViews", json!({})).await;
+    assert_eq!(
+        views.ok("the deleted Region")["Views"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "case \"the deleted Region\": expected no views, got {}",
+        views.body
+    );
+}
