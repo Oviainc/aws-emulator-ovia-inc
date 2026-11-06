@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/collaboration_configured_model_algorithm_associations.rs"]
+mod collaboration_configured_model_algorithm_associations;
 #[path = "all/collaboration_ml_input_channels.rs"]
 mod collaboration_ml_input_channels;
 #[path = "all/collaboration_trained_model_inference_jobs.rs"]

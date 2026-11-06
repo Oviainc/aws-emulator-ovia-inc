@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCollaborationConfiguredModelAlgorithmAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCollaborationConfiguredModelAlgorithmAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Pages over the persisted configured model algorithm associations of one
+//! collaboration in [`crate::state`], one
+//! `CollaborationConfiguredModelAlgorithmAssociationSummary` per record, in the one
+//! stable order the store's ARN keys give. A collaboration holding none — every
+//! collaboration, until an association is created in it — is reported as an empty
+//! list, not as a refusal: the operation models no not-found error for a
+//! collaboration. `nextToken` is the ARN the next page resumes at, so following it to
+//! the end enumerates every association of that collaboration exactly once.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCollaborationConfiguredModelAlgorithmAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This operation only reports: an association carries no status, so there is no
+//! clock-owed transition for a reader to materialise and nothing here writes.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +155,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCollaborationConfiguredModelAlgorithmAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCollaborationConfiguredModelAlgorithmAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCollaborationConfiguredModelAlgorithmAssociations"))
+        // This operation reports on the store; the region the request was signed for is
+        // the endpoint it reached, and a Clean Rooms ML endpoint is regional.
+        let region = crate::state::request_region(ctx.parts());
+        // See `CreateTrainingDataset` for why an engine with no store for this service
+        // answers the scaffold's 501.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        // The token is the ARN the next page starts at. `NextToken` is modelled only as
+        // a 1..10240 string, so a token this operation never issued is refused with the
+        // modelled `ValidationException` rather than silently serving page one.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_configured_model_algorithm_association_arn(token) {
+                return Err(
+                    ListCollaborationConfiguredModelAlgorithmAssociationsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "nextToken {token:?} is not a token returned by \
+                                 ListCollaborationConfiguredModelAlgorithmAssociations"
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // `maxResults` is modelled `@range(min: 1, max: 100)`; `page_bound` is the one
+        // place this service resolves a bound the request may not carry.
+        let page_size = crate::state::page_bound(
+            input.max_results,
+            crate::state::CONFIGURED_MODEL_ALGORITHM_ASSOCIATION_PAGE_LIMIT,
+        );
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The walk — resume at the token, report one collaboration's records in the one
+        // stable order its ARN keys give — is `crate::state::collaboration_page`, shared
+        // with the sibling collaboration-scoped lists rather than copied beside them.
+        let (collaboration_configured_model_algorithm_associations, next_token) =
+            crate::state::collaboration_page(
+                store.configured_model_algorithm_associations.values_mut(),
+                &input.collaboration_identifier,
+                &region,
+                page_size,
+                input.next_token.as_deref(),
+                now,
+            );
+
+        Ok(ListCollaborationConfiguredModelAlgorithmAssociationsOutput {
+            next_token,
+            collaboration_configured_model_algorithm_associations,
+        })
     }
 }

@@ -12,7 +12,9 @@
 //!
 //! The configured model algorithm is the custom-model link: `CreateConfiguredModelAlgorithm`
 //! persists the container configuration a trained model is built from, and
-//! `GetConfiguredModelAlgorithm` reports it back from that one record.
+//! `GetConfiguredModelAlgorithm` reports it back from that one record. The
+//! association of such an algorithm is held the same way: it is created under a
+//! membership and listed through the collaboration that membership belongs to.
 //!
 //! The ML input channel is the collaboration-scoped link of the same chain: a
 //! channel is created under a membership, and every member of the collaboration
@@ -31,10 +33,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CollaborationMLInputChannelSummary, CollaborationTrainedModelInferenceJobSummary,
-    CollaborationTrainedModelSummary, ConflictException, ContainerConfig, Dataset,
-    IncrementalTrainingDataChannelOutput, InferenceContainerConfig, InferenceOutputConfiguration,
-    PayerConfiguration, ResourceNotFoundException, TrainingDatasetSummary,
+    CollaborationConfiguredModelAlgorithmAssociationSummary, CollaborationMLInputChannelSummary,
+    CollaborationTrainedModelInferenceJobSummary, CollaborationTrainedModelSummary,
+    ConflictException, ContainerConfig, Dataset, IncrementalTrainingDataChannelOutput,
+    InferenceContainerConfig, InferenceOutputConfiguration, PayerConfiguration,
+    ResourceNotFoundException, TrainingDatasetSummary,
 };
 
 /// The region a minted ARN names when the request carries no SigV4 credential
@@ -101,6 +104,12 @@ pub const TRAINED_MODEL_PAGE_LIMIT: i32 = 100;
 /// `ListCollaborationTrainedModelInferenceJobsRequest$maxResults` is modelled
 /// `@range(min: 1, max: 100)`.
 pub const TRAINED_MODEL_INFERENCE_JOB_PAGE_LIMIT: i32 = 100;
+
+/// The largest page `ListCollaborationConfiguredModelAlgorithmAssociations`
+/// serves, and the page size it uses when the request names no `maxResults`:
+/// `ListCollaborationConfiguredModelAlgorithmAssociationsRequest$maxResults` is
+/// modelled `@range(min: 1, max: 100)`.
+pub const CONFIGURED_MODEL_ALGORITHM_ASSOCIATION_PAGE_LIMIT: i32 = 100;
 
 /// A status change the clock owes a resource: the instant it falls due, and the
 /// status the resource carries from then on.
@@ -651,6 +660,90 @@ pub struct ConfiguredModelAlgorithm {
     pub update_time: SystemTime,
 }
 
+/// One Clean Rooms ML configured model algorithm association, as this emulator
+/// persists it.
+///
+/// The association is the collaboration-scoped link of the custom-model chain: a
+/// configured model algorithm is associated under a membership, and every member
+/// of the collaboration that membership belongs to sees it through the
+/// collaboration-scoped reads — which is why the collaboration is held on the
+/// record beside the membership its ARN names, exactly as [`TrainedModel`] holds
+/// it.
+///
+/// `CollaborationConfiguredModelAlgorithmAssociationSummary` and
+/// `GetCollaborationConfiguredModelAlgorithmAssociationResponse` model no status
+/// member at all: the association is metadata pointing at an algorithm, so the
+/// create has nothing to do asynchronously and the clock owes the record no
+/// transition.
+#[derive(Debug, Clone)]
+pub struct ConfiguredModelAlgorithmAssociation {
+    /// The `ConfiguredModelAlgorithmAssociationArn` this record is keyed by.
+    pub arn: String,
+    /// The region the create was signed for, which the ARN names. A regional
+    /// endpoint reports only its own region's resources, so this is the scope
+    /// every read of this record is checked against.
+    pub region: String,
+    /// The membership the association was created under, which its ARN names.
+    pub membership_identifier: String,
+    /// The collaboration that membership belongs to. It is the scope
+    /// `ListCollaborationConfiguredModelAlgorithmAssociations` reports in: an
+    /// association is visible to that call only through the collaboration it was
+    /// created in.
+    pub collaboration_identifier: String,
+    pub name: String,
+    /// The configured model algorithm the association points at.
+    pub configured_model_algorithm_arn: String,
+    pub description: Option<String>,
+    /// The account of the member that created the association.
+    pub creator_account_id: String,
+    pub create_time: SystemTime,
+    pub update_time: SystemTime,
+}
+
+impl ConfiguredModelAlgorithmAssociation {
+    /// The `CollaborationConfiguredModelAlgorithmAssociationSummary` projection
+    /// `ListCollaborationConfiguredModelAlgorithmAssociations` returns.
+    pub fn to_collaboration_summary(
+        &self,
+    ) -> CollaborationConfiguredModelAlgorithmAssociationSummary {
+        CollaborationConfiguredModelAlgorithmAssociationSummary {
+            create_time: ::aws_smithy_types::DateTime::from(self.create_time),
+            update_time: ::aws_smithy_types::DateTime::from(self.update_time),
+            configured_model_algorithm_association_arn: self.arn.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            membership_identifier: self.membership_identifier.clone(),
+            collaboration_identifier: self.collaboration_identifier.clone(),
+            configured_model_algorithm_arn: self.configured_model_algorithm_arn.clone(),
+            creator_account_id: self.creator_account_id.clone(),
+        }
+    }
+}
+
+impl CollaborationScoped for ConfiguredModelAlgorithmAssociation {
+    type Summary = CollaborationConfiguredModelAlgorithmAssociationSummary;
+
+    fn page_key(&self) -> &str {
+        &self.arn
+    }
+
+    fn scope_region(&self) -> &str {
+        &self.region
+    }
+
+    fn scope_collaboration(&self) -> &str {
+        &self.collaboration_identifier
+    }
+
+    /// Nothing: the association carries no status, so the clock owes it no
+    /// transition to materialise.
+    fn settle_now(&mut self, _now: SystemTime) {}
+
+    fn summary(&self) -> Self::Summary {
+        self.to_collaboration_summary()
+    }
+}
+
 /// Which kind of resource a `TaggableArn` names a record of in this store.
 ///
 /// `TaggableArn` is one pattern over every resource Clean Rooms ML tags, and
@@ -681,6 +774,11 @@ pub struct ComAmazonawsCleanroomsmlAwsstarkcontrolserviceState {
     /// list that pages over them the one stable total order its pagination
     /// token indexes into.
     pub configured_model_algorithms: BTreeMap<String, ConfiguredModelAlgorithm>,
+    /// Every configured model algorithm association, keyed by its ARN, which
+    /// gives the collaboration- and membership-scoped lists that page over them
+    /// the one stable total order their pagination tokens index into.
+    pub configured_model_algorithm_associations:
+        BTreeMap<String, ConfiguredModelAlgorithmAssociation>,
     /// Every ML input channel, keyed by its ARN, which gives the
     /// collaboration- and membership-scoped lists the one stable total order
     /// their pagination tokens index into.
@@ -923,6 +1021,24 @@ pub fn trained_model_inference_job_arn(
     )
 }
 
+/// The ARN of the configured model algorithm association with resource id `id`,
+/// created under the membership `membership_identifier` names, in `region`.
+///
+/// `ConfiguredModelAlgorithmAssociationArn` nests the association under its
+/// membership (`membership/{uuid}/configured-model-algorithm-association/{id}`),
+/// so the membership an association belongs to is readable from its ARN.
+pub fn configured_model_algorithm_association_arn(
+    membership_identifier: &str,
+    id: &str,
+    region: &str,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("membership/{membership_identifier}/configured-model-algorithm-association/{id}"),
+    )
+}
+
 /// The resource portion of `value` when it is shaped like a Clean Rooms ML ARN
 /// (`^arn:aws[-a-z]*:cleanrooms-ml:[-a-z0-9]+:[0-9]{12}:` and a non-empty
 /// remainder), and `None` otherwise.
@@ -1041,6 +1157,15 @@ pub fn is_trained_model_arn(value: &str) -> bool {
 /// model inference jobs, which carries the ARN the next page resumes at.
 pub fn is_trained_model_inference_job_arn(value: &str) -> bool {
     is_membership_nested_arn(value, "trained-model-inference-job")
+}
+
+/// True when `value` is shaped like a `ConfiguredModelAlgorithmAssociationArn`
+/// (`^arn:aws[-a-z]*:cleanrooms-ml:[-a-z0-9]+:[0-9]{12}:membership/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/configured-model-algorithm-association/[-a-zA-Z0-9_/.]+$`),
+/// for the same reason: it is the `nextToken` of a list that pages over
+/// configured model algorithm associations, which carries the ARN the next page
+/// resumes at.
+pub fn is_configured_model_algorithm_association_arn(value: &str) -> bool {
+    is_membership_nested_arn(value, "configured-model-algorithm-association")
 }
 
 /// The region this request was signed for — what a minted ARN names.
