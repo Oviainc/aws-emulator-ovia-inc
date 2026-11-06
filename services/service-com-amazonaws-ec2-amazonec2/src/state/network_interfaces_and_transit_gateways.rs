@@ -9,6 +9,34 @@
 
 use super::*;
 
+/// Whether an interface of type `interface_type` has a source/destination check at all.
+///
+/// The check is about the IP traffic an interface sends and receives — "source/destination
+/// checks … ensure that the instance is either the source or the destination of any traffic
+/// that it receives" (`NetworkInterface$SourceDestCheck`) — so an interface type that
+/// carries no IP addresses has none: "EFA-only network interfaces do not support IP
+/// addresses" ([`NETWORK_INTERFACE_TYPE_EFA_ONLY`]). Every other type does.
+///
+/// The one definition of that rule, read by the operations that CHANGE the attribute
+/// (`ModifyNetworkInterfaceAttribute` and `ResetNetworkInterfaceAttribute`), so they refuse
+/// the same interfaces in the same words
+/// ([`interface_type_cannot_change_source_dest_check`]).
+pub fn interface_type_has_source_dest_check(interface_type: &str) -> bool {
+    interface_type != NETWORK_INTERFACE_TYPE_EFA_ONLY
+}
+
+/// Refuse a change to the source/destination check of an interface whose type does not have
+/// one ([`interface_type_has_source_dest_check`]): HTTP 400 `InvalidParameterValue`.
+///
+/// The sentence the real service answers there, whose one variable part is the interface's
+/// TYPE, read off the stored record rather than from the request — the request names the
+/// interface by id and never its type.
+pub fn interface_type_cannot_change_source_dest_check<E>(interface_type: &str) -> Scaffolded<E> {
+    invalid_parameter_value(format!(
+        "Interface type: {interface_type} cannot modify source destination check"
+    ))
+}
+
 /// The id prefix EC2 mints a network interface with, as
 /// [`network_interface_id_is_well_formed`] reads one: `eni-`, carried here without the
 /// separator [`ComAmazonawsEc2Amazonec2State::next_id`] adds.

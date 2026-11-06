@@ -1,15 +1,44 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyNetworkInterfaceAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyNetworkInterfaceAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyNetworkInterfaceAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes ONE attribute of one stored elastic network interface.
+//!
+//! "Modifies the specified network interface attribute. You can specify only one attribute
+//! at a time": every member of the request beside the interface id and `DryRun` names one
+//! attribute, so the members that are PRESENT are the attributes the request asks to
+//! modify — exactly one of them — and the value it carries is written onto the stored
+//! `NetworkInterface` record `CreateNetworkInterface` wrote, which
+//! `DescribeNetworkInterfaceAttribute` and `DescribeNetworkInterfaces` report. So a
+//! modification round-trips through either read, and no other attribute of the interface
+//! moves.
+//!
+//! Each attribute is resolved against the store BEFORE anything is written
+//! ([`Change`]), so a refused request leaves the interface exactly as it was and a
+//! `DryRun` of a request that would have succeeded writes nothing at all.
+//!
+//! The refusals, in the order this handler makes them:
+//!
+//! * `MissingParameter` (HTTP 400) for a request that names no attribute to modify, and for
+//!   one whose attribute carries no value to write.
+//! * `InvalidParameterCombination` (HTTP 400) for a request that names more than one
+//!   attribute, and for members that cannot be given together.
+//! * `InvalidNetworkInterfaceId.Malformed` (HTTP 400) for a value that is not a network
+//!   interface id at all ([`crate::state::network_interface_id_is_well_formed`]) — there is
+//!   nothing to look up — then `InvalidNetworkInterfaceID.NotFound` (HTTP 400) for a
+//!   well-formed id this account holds no interface for: the order every operation of this
+//!   crate that resolves an interface id keeps.
+//! * `InvalidGroup.NotFound` / `InvalidSubnetID.NotFound` (HTTP 400) for a security group or
+//!   subnet the new set names that the interface's own VPC does not hold, and
+//!   `InvalidParameterValue` for one of another VPC.
+//! * `InvalidNetworkInterfaceAttachmentId.Malformed` / `InvalidAttachmentID.NotFound` (HTTP
+//!   400) for an attachment id that is not one this service issued, or that is not the
+//!   attachment holding this interface.
+//! * `InvalidParameterValue` (HTTP 400) for a timeout outside the range its member
+//!   documents, for an interface whose TYPE has no source/destination check to change
+//!   ([`crate::state::interface_type_has_source_dest_check`]), and for a primary IPv6 the
+//!   interface's subnet or state cannot carry.
+//! * `DryRunOperation` (HTTP 412) for a dry run of a request that would have succeeded.
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +126,132 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state;
+
+// The five attributes `NetworkInterfaceAttribute` names, and how a stored interface holds
+// an AWS-assigned public IPv4 address, are defined once in the operation that REPORTS them
+// — so the write and the read of one attribute spell it one way and cannot drift apart.
+use super::describe_network_interface_attribute::{
+    AMAZON_ASSIGNED_IP_OWNER_ID, ATTRIBUTE_ASSOCIATE_PUBLIC_IP_ADDRESS, ATTRIBUTE_ATTACHMENT,
+    ATTRIBUTE_DESCRIPTION, ATTRIBUTE_GROUP_SET, ATTRIBUTE_SOURCE_DEST_CHECK,
+};
+
+/// The `AssociatedSubnetIds` member, as the wire names it.
+///
+/// This and the three constants below name attributes a network interface has that the
+/// model's `NetworkInterfaceAttribute` catalog — the five
+/// `DescribeNetworkInterfaceAttribute` reports, imported above — does not: they are
+/// modifiable but not describable one at a time, and are read back through
+/// `DescribeNetworkInterfaces`.
+pub const ATTRIBUTE_ASSOCIATED_SUBNET_IDS: &str = "associatedSubnetIds";
+
+/// The `ConnectionTrackingSpecification` member (see [`ATTRIBUTE_ASSOCIATED_SUBNET_IDS`]).
+pub const ATTRIBUTE_CONNECTION_TRACKING_SPECIFICATION: &str = "connectionTrackingSpecification";
+
+/// The `EnaSrdSpecification` member (see [`ATTRIBUTE_ASSOCIATED_SUBNET_IDS`]).
+pub const ATTRIBUTE_ENA_SRD_SPECIFICATION: &str = "enaSrdSpecification";
+
+/// The `EnablePrimaryIpv6` member (see [`ATTRIBUTE_ASSOCIATED_SUBNET_IDS`]).
+pub const ATTRIBUTE_ENABLE_PRIMARY_IPV6: &str = "enablePrimaryIpv6";
+
+/// Every attribute of a network interface this operation can modify: one per member of
+/// `ModifyNetworkInterfaceAttributeRequest` beside the interface id and `DryRun`, which is
+/// the set a request names exactly one of.
+pub const MODIFIABLE_ATTRIBUTES: [&str; 9] = [
+    ATTRIBUTE_DESCRIPTION,
+    ATTRIBUTE_SOURCE_DEST_CHECK,
+    ATTRIBUTE_GROUP_SET,
+    ATTRIBUTE_ATTACHMENT,
+    ATTRIBUTE_ASSOCIATE_PUBLIC_IP_ADDRESS,
+    ATTRIBUTE_ENABLE_PRIMARY_IPV6,
+    ATTRIBUTE_CONNECTION_TRACKING_SPECIFICATION,
+    ATTRIBUTE_ASSOCIATED_SUBNET_IDS,
+    ATTRIBUTE_ENA_SRD_SPECIFICATION,
+];
+
+/// What a request naming two attributes at once is refused with: "you can specify only one
+/// attribute at a time" is a rule about the request as a whole, so the sentence carries no
+/// variable part.
+pub const ONE_ATTRIBUTE_AT_A_TIME: &str = "Only one attribute can be specified at a time";
+
+/// "Timeout (in seconds) for idle TCP connections in an established state. Min: 60 seconds.
+/// Max: 432000 seconds (5 days)"
+/// (`ConnectionTrackingSpecificationRequest$TcpEstablishedTimeout`), as the inclusive bounds
+/// [`timeout_in_range`] holds that member to.
+pub const TCP_ESTABLISHED_TIMEOUT_SECONDS: (i32, i32) = (60, 432_000);
+
+/// "Timeout (in seconds) for idle UDP flows classified as streams which have seen more than
+/// one request-response transaction. Min: 60 seconds. Max: 180 seconds (3 minutes)"
+/// (`ConnectionTrackingSpecificationRequest$UdpStreamTimeout`).
+pub const UDP_STREAM_TIMEOUT_SECONDS: (i32, i32) = (60, 180);
+
+/// "Timeout (in seconds) for idle UDP flows that have seen traffic only in a single
+/// direction or a single request-response transaction. Min: 30 seconds. Max: 60 seconds"
+/// (`ConnectionTrackingSpecificationRequest$UdpTimeout`).
+pub const UDP_TIMEOUT_SECONDS: (i32, i32) = (30, 60);
+
+/// The ONE change a request asks for, resolved from the request and the store before
+/// anything is written.
+///
+/// Resolving first and writing second is what makes a refusal leave the interface untouched
+/// and a `DryRun` write nothing: every lookup, range and combination the request has to
+/// satisfy is answered while this value is built, and the write below is then a single
+/// assignment per attribute.
+#[derive(Debug)]
+enum Change {
+    /// The new description, which is the empty string for a member carrying no value.
+    Description(String),
+    /// The new source/destination check.
+    SourceDestCheck(bool),
+    /// The new set of security groups, resolved to the identifiers the interface reports.
+    Groups(Vec<GroupIdentifier>),
+    /// A change to the attachment that holds the interface: the id it was resolved by, and
+    /// per member either a new value or `None` for "left as it stands". The ENA queue count
+    /// is an `Option` of an `Option` because "the default number of the ENA queues" is the
+    /// attachment carrying no count of its own.
+    Attachment {
+        attachment_id: String,
+        delete_on_termination: Option<bool>,
+        ena_queue_count: Option<Option<i32>>,
+    },
+    /// Whether AWS assigns the interface a public IPv4 address.
+    AssociatePublicIpAddress(bool),
+    /// Whether the interface's first IPv6 GUA address is its primary IPv6 address, with the
+    /// address to assign first when the interface holds none.
+    PrimaryIpv6 {
+        enabled: bool,
+        assign: Option<String>,
+    },
+    /// The new connection tracking configuration.
+    ConnectionTracking(ConnectionTrackingConfiguration),
+    /// The new set of associated subnets.
+    AssociatedSubnets(Vec<String>),
+    /// The new ENA Express configuration of the attachment that holds the interface.
+    EnaSrd(AttachmentEnaSrdSpecification),
+}
+
+/// One connection tracking timeout, held to the inclusive range its own member documents
+/// ([`TCP_ESTABLISHED_TIMEOUT_SECONDS`] and the two beside it).
+///
+/// A member the request left out asks for no timeout at all and is answered `None`; one
+/// outside its range is refused with `InvalidParameterValue` naming the member, the value
+/// and the range, the way this crate refuses every member value outside a documented bound.
+fn timeout_in_range(
+    member: &str,
+    value: Option<i32>,
+    (minimum, maximum): (i32, i32),
+) -> Result<Option<i32>, ModifyNetworkInterfaceAttributeError> {
+    match value {
+        Some(seconds) if !(minimum..=maximum).contains(&seconds) => {
+            Err(state::invalid_parameter_value(format!(
+                "Value ({seconds}) for parameter {member} is invalid. \
+                 It must be between {minimum} and {maximum} seconds"
+            )))
+        }
+        other => Ok(other),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -183,18 +338,562 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyNetworkInterfaceAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyNetworkInterfaceAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyNetworkInterfaceAttribute"))
+        // `ctx` carries request metadata only; this operation reads none of it — the
+        // interface is named by id and the Region it sits in is read off the stored record.
+        let _ = ctx;
+
+        // "You can specify only one attribute at a time": every member beside the interface
+        // id and `DryRun` names one attribute, so the members that are PRESENT are the
+        // attributes this request asks to modify. A request naming none asks for no
+        // modification at all, and one naming two asks for a change this operation does not
+        // make in a single call — neither is answered with a 200 that wrote something else.
+        let named: Vec<&str> = [
+            (ATTRIBUTE_DESCRIPTION, input.description.is_some()),
+            (
+                ATTRIBUTE_SOURCE_DEST_CHECK,
+                input.source_dest_check.is_some(),
+            ),
+            (
+                ATTRIBUTE_GROUP_SET,
+                input
+                    .groups
+                    .as_deref()
+                    .is_some_and(|groups| !groups.is_empty()),
+            ),
+            (ATTRIBUTE_ATTACHMENT, input.attachment.is_some()),
+            (
+                ATTRIBUTE_ASSOCIATE_PUBLIC_IP_ADDRESS,
+                input.associate_public_ip_address.is_some(),
+            ),
+            (
+                ATTRIBUTE_ENABLE_PRIMARY_IPV6,
+                input.enable_primary_ipv6.is_some(),
+            ),
+            (
+                ATTRIBUTE_CONNECTION_TRACKING_SPECIFICATION,
+                input.connection_tracking_specification.is_some(),
+            ),
+            (
+                ATTRIBUTE_ASSOCIATED_SUBNET_IDS,
+                input
+                    .associated_subnet_ids
+                    .as_deref()
+                    .is_some_and(|ids| !ids.is_empty()),
+            ),
+            (
+                ATTRIBUTE_ENA_SRD_SPECIFICATION,
+                input.ena_srd_specification.is_some(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(attribute, named)| named.then_some(attribute))
+        .collect();
+        let [attribute] = named.as_slice() else {
+            return Err(if named.is_empty() {
+                state::missing_parameter(format!(
+                    "The request must name an attribute to modify: {attributes}",
+                    attributes = MODIFIABLE_ATTRIBUTES.join(" | "),
+                ))
+            } else {
+                state::invalid_parameter_combination(ONE_ATTRIBUTE_AT_A_TIME)
+            });
+        };
+
+        let network_interface_id = input.network_interface_id.as_str();
+        // A value that is not a network interface id at all is refused BEFORE the store is
+        // asked about it, the way this crate orders the two for every interface id
+        // (`DescribeNetworkInterfaceAttribute`, `DeleteNetworkInterface`).
+        if !state::network_interface_id_is_well_formed(network_interface_id) {
+            return Err(state::invalid_network_interface_id_malformed(
+                network_interface_id,
+            ));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // A move the clock has made due happened at that instant whether or not anybody
+        // called — a completed detachment took the attachment away — so it is applied before
+        // the interface is read: this writes onto the record the same instant's
+        // `DescribeNetworkInterfaces` reports.
+        store.materialize_due_transitions();
+
+        // "The ID of the network interface" (`NetworkInterfaceId`): a well-formed id this
+        // account holds no interface for has no attribute to modify.
+        let Some(interface) = store.network_interfaces.get(network_interface_id) else {
+            return Err(state::invalid_network_interface_id_not_found(
+                network_interface_id,
+            ));
+        };
+        // What the resolution below reads off the STORED interface: its network, its zone,
+        // the description it is charged for, the addresses it holds and who owns the public
+        // IPv4 address it is associated with. Read once, so no refusal and no choice below
+        // re-reads the record.
+        let vpc_id = interface.vpc_id.clone().unwrap_or_default();
+        let availability_zone = interface.availability_zone.clone().unwrap_or_default();
+        let subnet_id = interface.subnet_id.clone().unwrap_or_default();
+        let interface_type = interface.interface_type.clone().unwrap_or_default();
+        let stored_description_bytes = interface.description.as_deref().map_or(0, str::len);
+        let ipv6_addresses_held = interface.ipv6_addresses.iter().flatten().count();
+        let primary_ipv6_held = interface
+            .ipv6_addresses
+            .iter()
+            .flatten()
+            .any(|address| address.is_primary_ipv6 == Some(true));
+        let association_owner = interface
+            .association
+            .as_ref()
+            .and_then(|association| association.ip_owner_id.clone());
+        let holding_attachment = store
+            .network_interface_attachment(network_interface_id)
+            .is_some();
+
+        // The ONE change this request asks for, resolved against the store. Nothing is
+        // written while it is built, so every refusal below leaves the interface as it was.
+        let change = match *attribute {
+            ATTRIBUTE_DESCRIPTION => {
+                // "A description for the network interface" (`Description`), carried as an
+                // `AttributeValue`: the text replaces the stored description, and a member
+                // with no value at all clears it to the empty description an interface
+                // created without one carries.
+                let description = input
+                    .description
+                    .as_ref()
+                    .and_then(|attribute| attribute.value.clone())
+                    .unwrap_or_default();
+                // Caller-chosen text replacing caller-chosen text, so the store's byte
+                // budget is asked about the NET change the way every replacement path of
+                // this crate asks it.
+                if store.would_exceed_stored_bytes_after_refund(
+                    description.len(),
+                    stored_description_bytes,
+                ) {
+                    return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                        "This emulator holds {held} of at most {max} bytes of \
+                         caller-supplied data, so it cannot store a description of {asked} \
+                         bytes",
+                        held = store.stored_bytes(),
+                        max = state::MAX_STORED_BYTES,
+                        asked = description.len(),
+                    )));
+                }
+                Change::Description(description)
+            }
+            ATTRIBUTE_SOURCE_DEST_CHECK => {
+                // "Enable or disable source/destination checks" (`SourceDestCheck`), an
+                // `AttributeBooleanValue` whose `Value` is what to set it to: the attribute
+                // named without one says nothing about what to write.
+                let Some(value) = input
+                    .source_dest_check
+                    .as_ref()
+                    .and_then(|attribute| attribute.value)
+                else {
+                    return Err(state::missing_parameter(format!(
+                        "The parameter {ATTRIBUTE_SOURCE_DEST_CHECK} must have a value"
+                    )));
+                };
+                // An interface whose TYPE carries no IP addresses has no source/destination
+                // check to enable or disable, so the change is refused rather than written
+                // onto a record no traffic is judged against — the one reading of that rule
+                // and the one wording of its refusal, which
+                // `ResetNetworkInterfaceAttribute` answers too.
+                if !state::interface_type_has_source_dest_check(&interface_type) {
+                    return Err(state::interface_type_cannot_change_source_dest_check(
+                        &interface_type,
+                    ));
+                }
+                Change::SourceDestCheck(value)
+            }
+            ATTRIBUTE_GROUP_SET => {
+                // "Changes the security groups for the network interface. The new set of
+                // groups you specify replaces the current set. You must specify at least
+                // one group … You must specify the ID of the security group, not the name"
+                // (`Groups`). A group has to be a group of the interface's OWN VPC — a
+                // security group only applies within its VPC — and the set is held to the
+                // number AWS documents per interface: the same resolution
+                // `CreateNetworkInterface` makes of the same member.
+                let requested =
+                    state::deduplicate_ids(input.groups.as_deref().unwrap_or_default());
+                if requested.len() > state::MAX_SECURITY_GROUPS_PER_INSTANCE {
+                    return Err(state::invalid_parameter_value(format!(
+                        "The request names {asked} security groups, above the maximum of \
+                         {max} per network interface",
+                        asked = requested.len(),
+                        max = state::MAX_SECURITY_GROUPS_PER_INSTANCE,
+                    )));
+                }
+                let mut groups: Vec<GroupIdentifier> = Vec::with_capacity(requested.len());
+                for group_id in &requested {
+                    let Some(group) = store
+                        .security_groups
+                        .get(group_id)
+                        .filter(|group| group.vpc_id.as_deref() == Some(vpc_id.as_str()))
+                    else {
+                        return Err(state::invalid_group_not_found(group_id));
+                    };
+                    groups.push(GroupIdentifier {
+                        group_id: group.group_id.clone(),
+                        group_name: group.group_name.clone(),
+                    });
+                }
+                Change::Groups(groups)
+            }
+            ATTRIBUTE_ATTACHMENT => {
+                // "Information about the interface attachment. If modifying the delete on
+                // termination attribute, you must specify the ID of the interface
+                // attachment" (`Attachment`).
+                let Some(changes) = input.attachment.as_ref() else {
+                    return Err(state::internal_error(
+                        "the attachment changes named a moment ago could not be read back",
+                    ));
+                };
+                if let Some(count) = changes.ena_queue_count {
+                    if changes.default_ena_queue_count == Some(true) {
+                        return Err(state::invalid_parameter_combination(
+                            "You cannot specify both enaQueueCount and \
+                             defaultEnaQueueCount",
+                        ));
+                    }
+                    // "The number of ENA queues to be created with the instance"
+                    // (`EnaQueueCount`), which the model bounds nowhere: a number of queues
+                    // cannot be below zero.
+                    if count < 0 {
+                        return Err(state::invalid_parameter_value(format!(
+                            "Invalid value '{count}' for enaQueueCount. It cannot be \
+                             negative"
+                        )));
+                    }
+                }
+                let ena_queue_count = match (changes.ena_queue_count, changes.default_ena_queue_count)
+                {
+                    (Some(count), _) => Some(Some(count)),
+                    // "The default number of the ENA queues" (`DefaultEnaQueueCount`): the
+                    // attachment goes back to carrying no count of its own, which is what
+                    // an attachment nobody asked a count for holds.
+                    (None, Some(true)) => Some(None),
+                    _ => None,
+                };
+                if changes.delete_on_termination.is_none() && ena_queue_count.is_none() {
+                    return Err(state::missing_parameter(format!(
+                        "The parameter {ATTRIBUTE_ATTACHMENT} must name a change to make: \
+                         deleteOnTermination, enaQueueCount or defaultEnaQueueCount"
+                    )));
+                }
+                let Some(attachment_id) = changes.attachment_id.as_deref() else {
+                    return Err(state::missing_parameter(
+                        "The request must contain the parameter attachment.attachmentId",
+                    ));
+                };
+                // A value this service never issued as an attachment id is refused before
+                // any attachment is looked up, the way `DetachNetworkInterface` resolves the
+                // same id.
+                if !store.network_interface_attachment_id_is_well_formed(attachment_id) {
+                    return Err(state::invalid_network_interface_attachment_id_malformed(
+                        attachment_id,
+                    ));
+                }
+                // And it has to be the attachment that holds THIS interface: an id naming
+                // another interface's attachment names no attachment of the one the request
+                // modifies.
+                if store.network_interface_of_attachment(attachment_id)
+                    != Some(network_interface_id)
+                {
+                    return Err(state::invalid_attachment_id_not_found(attachment_id));
+                }
+                Change::Attachment {
+                    attachment_id: attachment_id.to_string(),
+                    delete_on_termination: changes.delete_on_termination,
+                    ena_queue_count,
+                }
+            }
+            ATTRIBUTE_ASSOCIATE_PUBLIC_IP_ADDRESS => {
+                // "Indicates whether to assign a public IPv4 address to a network
+                // interface" (`AssociatePublicIpAddress`). What a stored interface holds
+                // about such an address is its association's OWNER — AWS owns one it
+                // assigned itself, where an Elastic IP is owned by the account that
+                // allocated it (`DescribeNetworkInterfaceAttribute`) — so an Elastic IP
+                // association is not this attribute's to replace or take away: that is
+                // `AssociateAddress` and `DisassociateAddress`.
+                if association_owner
+                    .as_deref()
+                    .is_some_and(|owner| owner != AMAZON_ASSIGNED_IP_OWNER_ID)
+                {
+                    return Err(state::invalid_parameter_combination(format!(
+                        "The network interface '{network_interface_id}' is associated with \
+                         an Elastic IP address, which must be disassociated before its \
+                         public IPv4 addressing can be changed"
+                    )));
+                }
+                Change::AssociatePublicIpAddress(
+                    input.associate_public_ip_address.unwrap_or(false),
+                )
+            }
+            ATTRIBUTE_ENABLE_PRIMARY_IPV6 => {
+                let enabled = input.enable_primary_ipv6.unwrap_or(false);
+                // "Once you enable an IPv6 GUA address to be a primary IPv6, you cannot
+                // disable it" (`EnablePrimaryIpv6`).
+                if !enabled && primary_ipv6_held {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Value (false) for parameter {ATTRIBUTE_ENABLE_PRIMARY_IPV6} is \
+                         invalid. Once you enable an IPv6 GUA address to be a primary \
+                         IPv6, you cannot disable it"
+                    )));
+                }
+                // "Amazon Web Services will automatically assign an IPv6 address associated
+                // with the ENI … to be the primary IPv6 address", and "the first IPv6 GUA
+                // address associated with the ENI becomes the primary IPv6 address": an
+                // interface that already holds one makes that address primary, and one that
+                // holds none is first assigned an address out of its subnet's own IPv6
+                // range — the range every IPv6 address of this crate comes out of
+                // (`AssignIpv6Addresses`).
+                let assign = if enabled && ipv6_addresses_held == 0 {
+                    // "If you're modifying a network interface in a dual-stack or IPv6-only
+                    // subnet": a subnet with no IPv6 CIDR block has no GUA address to make
+                    // primary.
+                    let Some(block) = store.subnet_ipv6_cidr_block(&subnet_id) else {
+                        return Err(state::invalid_parameter_value(format!(
+                            "Value (true) for parameter {ATTRIBUTE_ENABLE_PRIMARY_IPV6} is \
+                             invalid. The subnet '{subnet_id}' does not have an associated \
+                             IPv6 CIDR block"
+                        )));
+                    };
+                    let taken_addresses = store.assigned_ipv6_addresses();
+                    let taken_prefixes = store.assigned_ipv6_prefixes();
+                    let Some(chosen) =
+                        state::free_subnet_ipv6_addresses(&block, &taken_addresses, &taken_prefixes, 1)
+                    else {
+                        return Err(state::insufficient_free_ipv6_addresses());
+                    };
+                    chosen.into_iter().next()
+                } else {
+                    None
+                };
+                Change::PrimaryIpv6 { enabled, assign }
+            }
+            ATTRIBUTE_CONNECTION_TRACKING_SPECIFICATION => {
+                // "A connection tracking specification"
+                // (`ConnectionTrackingSpecification`): three idle timeouts, each held to
+                // the inclusive range its own member documents.
+                let Some(asked) = input.connection_tracking_specification.as_ref() else {
+                    return Err(state::internal_error(
+                        "the connection tracking specification named a moment ago could \
+                         not be read back",
+                    ));
+                };
+                let tracking = ConnectionTrackingConfiguration {
+                    tcp_established_timeout: timeout_in_range(
+                        "tcpEstablishedTimeout",
+                        asked.tcp_established_timeout,
+                        TCP_ESTABLISHED_TIMEOUT_SECONDS,
+                    )?,
+                    udp_stream_timeout: timeout_in_range(
+                        "udpStreamTimeout",
+                        asked.udp_stream_timeout,
+                        UDP_STREAM_TIMEOUT_SECONDS,
+                    )?,
+                    udp_timeout: timeout_in_range(
+                        "udpTimeout",
+                        asked.udp_timeout,
+                        UDP_TIMEOUT_SECONDS,
+                    )?,
+                };
+                if tracking.tcp_established_timeout.is_none()
+                    && tracking.udp_stream_timeout.is_none()
+                    && tracking.udp_timeout.is_none()
+                {
+                    return Err(state::missing_parameter(format!(
+                        "The parameter {ATTRIBUTE_CONNECTION_TRACKING_SPECIFICATION} must \
+                         name a timeout to set: tcpEstablishedTimeout, udpStreamTimeout or \
+                         udpTimeout"
+                    )));
+                }
+                Change::ConnectionTracking(tracking)
+            }
+            ATTRIBUTE_ASSOCIATED_SUBNET_IDS => {
+                // "A list of subnet IDs to associate with the network interface"
+                // (`AssociatedSubnetIds`): the new set replaces the stored one, and each
+                // subnet has to be a subnet of the interface's own VPC — an interface
+                // cannot be associated with a network it is not in.
+                let requested =
+                    state::deduplicate_ids(input.associated_subnet_ids.as_deref().unwrap_or_default());
+                // The list carries no `@length`, so the number a caller may send is
+                // unbounded; it is held to the number of subnets this store holds at all
+                // ([`crate::state::MAX_SUBNETS`]) BEFORE any of them is looked up, so one
+                // request cannot ask for work the account's own subnets cannot justify.
+                if requested.len() > state::MAX_SUBNETS {
+                    return Err(state::invalid_parameter_value(format!(
+                        "The request names {asked} subnets, above the maximum of {max} this \
+                         account holds",
+                        asked = requested.len(),
+                        max = state::MAX_SUBNETS,
+                    )));
+                }
+                for subnet in &requested {
+                    let Some(stored) = store.subnets.get(subnet) else {
+                        return Err(state::invalid_subnet_id_not_found(subnet));
+                    };
+                    if stored.vpc_id.as_deref() != Some(vpc_id.as_str()) {
+                        return Err(state::invalid_parameter_value(format!(
+                            "network interface {network_interface_id} and subnet {subnet} \
+                             belong to different networks"
+                        )));
+                    }
+                }
+                Change::AssociatedSubnets(requested)
+            }
+            ATTRIBUTE_ENA_SRD_SPECIFICATION => {
+                // "Updates the ENA Express configuration for the network interface that's
+                // attached to the instance" (`EnaSrdSpecification`): ENA Express is a
+                // setting of the ATTACHMENT — the shape the attachment reports it under is
+                // `AttachmentEnaSrdSpecification` — so an interface that nothing holds has
+                // none to update.
+                if !holding_attachment {
+                    return Err(state::invalid_parameter_combination(format!(
+                        "The network interface '{network_interface_id}' is not attached to \
+                         an instance, so its ENA Express configuration cannot be updated"
+                    )));
+                }
+                let Some(asked) = input.ena_srd_specification.as_ref() else {
+                    return Err(state::internal_error(
+                        "the ENA Express specification named a moment ago could not be \
+                         read back",
+                    ));
+                };
+                Change::EnaSrd(AttachmentEnaSrdSpecification {
+                    ena_srd_enabled: asked.ena_srd_enabled,
+                    ena_srd_udp_specification: asked.ena_srd_udp_specification.as_ref().map(
+                        |udp| AttachmentEnaSrdUdpSpecification {
+                            ena_srd_udp_enabled: udp.ena_srd_udp_enabled,
+                        },
+                    ),
+                })
+            }
+            // The arms above are every member of [`MODIFIABLE_ATTRIBUTES`], and the one
+            // attribute was selected from that list, so nothing else reaches here.
+            other => {
+                return Err(state::internal_error(format!(
+                    "'{other}' is not an attribute of a network interface"
+                )))
+            }
+        };
+
+        // The request is one that would have succeeded, so a dry run stops HERE, having
+        // resolved every value and written nothing: "If you have the required permissions,
+        // the error response is DryRunOperation" (`DryRun`).
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The public IPv4 address an enabled `associatePublicIpAddress` needs, minted out of
+        // Amazon's own pool through the store's one mint — a caller cannot specify which
+        // address AWS assigns it — and only for an interface that holds none, so enabling
+        // the attribute twice keeps the address the first call assigned.
+        let assigned_association = match &change {
+            Change::AssociatePublicIpAddress(true) if association_owner.is_none() => {
+                let Some(public_ip) = store.mint_elastic_ip() else {
+                    return Err(state::internal_error(
+                        "Amazon's pool of IPv4 addresses has no free address left to assign",
+                    ));
+                };
+                let region = state::region_of_zone_name(&availability_zone).to_string();
+                Some(NetworkInterfaceAssociation {
+                    // An address AWS assigned itself is no allocation of the account's, so
+                    // it has neither an allocation nor an association id: both belong to an
+                    // Elastic IP the account allocated and associated.
+                    allocation_id: None,
+                    association_id: None,
+                    ip_owner_id: Some(AMAZON_ASSIGNED_IP_OWNER_ID.to_string()),
+                    public_dns_name: Some(state::public_dns_name(&public_ip, &region)),
+                    public_ip: Some(public_ip),
+                    customer_owned_ip: None,
+                    carrier_ip: None,
+                })
+            }
+            _ => None,
+        };
+        // The budget follows the record: the old description's bytes go back and the new
+        // one's are charged, so replacing a description grows the store by the difference
+        // and never by the whole new text.
+        if let Change::Description(description) = &change {
+            store.release_stored_bytes(stored_description_bytes);
+            store.add_stored_bytes(description.len());
+        }
+
+        // The interface was read under this same lock a moment ago, so a miss here is the
+        // store losing a record between two reads of one lock.
+        let Some(interface) = store.network_interfaces.get_mut(network_interface_id) else {
+            return Err(state::internal_error(
+                "the network interface checked a moment ago could not be read back",
+            ));
+        };
+        // ONE assignment per attribute, onto the record both describes report: exactly the
+        // attribute the request named moves, and every other one is left as it stands.
+        match change {
+            Change::Description(description) => interface.description = Some(description),
+            Change::SourceDestCheck(value) => interface.source_dest_check = Some(value),
+            Change::Groups(groups) => interface.groups = Some(groups),
+            Change::Attachment {
+                attachment_id,
+                delete_on_termination,
+                ena_queue_count,
+            } => {
+                let Some(attachment) = interface.attachment.as_mut().filter(|attachment| {
+                    attachment.attachment_id.as_deref() == Some(attachment_id.as_str())
+                }) else {
+                    return Err(state::internal_error(format!(
+                        "the attachment '{attachment_id}' resolved a moment ago could not \
+                         be read back"
+                    )));
+                };
+                if let Some(value) = delete_on_termination {
+                    attachment.delete_on_termination = Some(value);
+                }
+                if let Some(count) = ena_queue_count {
+                    attachment.ena_queue_count = count;
+                }
+            }
+            Change::AssociatePublicIpAddress(enabled) => {
+                if enabled {
+                    // `None` when the interface already holds an AWS-assigned address: the
+                    // one it holds stays.
+                    if let Some(association) = assigned_association {
+                        interface.association = Some(association);
+                    }
+                } else if association_owner.as_deref() == Some(AMAZON_ASSIGNED_IP_OWNER_ID) {
+                    interface.association = None;
+                }
+            }
+            Change::PrimaryIpv6 { enabled, assign } => {
+                let addresses = interface.ipv6_addresses.get_or_insert_with(Vec::new);
+                if let Some(address) = assign {
+                    addresses.push(NetworkInterfaceIpv6Address {
+                        ipv6_address: Some(address),
+                        // "An IPv6-enabled public hostname for a network interface"
+                        // (`PublicIpv6DnsName`): reported for an interface with public DNS
+                        // names, which no operation of this crate turns on.
+                        public_ipv6_dns_name: None,
+                        is_primary_ipv6: None,
+                    });
+                }
+                // "The first IPv6 GUA address associated with the ENI becomes the primary
+                // IPv6 address", so exactly one address of the interface carries it.
+                for (index, address) in addresses.iter_mut().enumerate() {
+                    address.is_primary_ipv6 = Some(enabled && index == 0);
+                }
+            }
+            Change::ConnectionTracking(tracking) => {
+                interface.connection_tracking_configuration = Some(tracking);
+            }
+            Change::AssociatedSubnets(subnets) => interface.associated_subnets = Some(subnets),
+            Change::EnaSrd(specification) => {
+                let Some(attachment) = interface.attachment.as_mut() else {
+                    return Err(state::internal_error(
+                        "the attachment checked a moment ago could not be read back",
+                    ));
+                };
+                attachment.ena_srd_specification = Some(specification);
+            }
+        }
+
+        Ok(ModifyNetworkInterfaceAttributeOutput)
     }
 }

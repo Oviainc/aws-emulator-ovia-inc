@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetNetworkInterfaceAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetNetworkInterfaceAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetNetworkInterfaceAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Puts ONE attribute of one stored elastic network interface back to its default.
+//!
+//! "Resets a network interface attribute. You can specify only one attribute at a time":
+//! the one attribute a network interface has a reset for is its source/destination check —
+//! `SourceDestCheck` is the member that NAMES it, "the source/destination checking
+//! attribute. Resets the value to true" — so the request carries that attribute's name and
+//! the stored `NetworkInterface` record goes back to
+//! [`crate::state::DEFAULT_SOURCE_DEST_CHECK`], which `DescribeNetworkInterfaceAttribute`
+//! and `DescribeNetworkInterfaces` then report. Every other attribute of the interface is
+//! left exactly as it stands, including one `ModifyNetworkInterfaceAttribute` wrote.
+//!
+//! The refusals, in the order this handler makes them — the order
+//! `ResetInstanceAttribute` already keeps for an attribute reset and
+//! `DescribeNetworkInterfaceAttribute` for an interface id:
+//!
+//! * `MissingParameter` (HTTP 400) for a request that names no attribute at all: the model
+//!   leaves `SourceDestCheck` optional, so a request carrying none names nothing to reset.
+//! * `InvalidParameterValue` (HTTP 400) for a `SourceDestCheck` that carries a value: the
+//!   member names the attribute to reset by being there and takes no value of its own
+//!   ([`takes_no_value_message`]).
+//! * `InvalidNetworkInterfaceId.Malformed` (HTTP 400) for a value that is not a network
+//!   interface id at all, then `InvalidNetworkInterfaceID.NotFound` (HTTP 400) for a
+//!   well-formed id this account holds no interface for.
+//! * `InvalidParameterValue` (HTTP 400) for an interface whose TYPE has no
+//!   source/destination check to reset
+//!   ([`crate::state::interface_type_has_source_dest_check`]).
+//! * `DryRunOperation` (HTTP 412) for a dry run of a request that would have succeeded.
 //!
 //! ## Shape of an operation
 //!
@@ -64,6 +83,37 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state;
+
+// The attribute this operation resets is spelled once, in the operation that REPORTS the
+// attributes of a network interface, so the reset and the read cannot drift apart.
+use super::describe_network_interface_attribute::ATTRIBUTE_SOURCE_DEST_CHECK;
+
+/// The one attribute of a network interface this operation resets: `sourceDestCheck`, the
+/// only one `ResetNetworkInterfaceAttributeRequest` has a member for ("the
+/// source/destination checking attribute. Resets the value to true").
+///
+/// The member is what NAMES that attribute: it is a FLAG rather than a value — the EC2 API
+/// Reference's own example request for this operation carries `&SourceDestCheck` with no
+/// value at all — so its presence selects the attribute and anything it carries beside the
+/// empty string is a value this parameter does not take ([`takes_no_value_message`]).
+pub const RESETTABLE_NETWORK_INTERFACE_ATTRIBUTE: &str = ATTRIBUTE_SOURCE_DEST_CHECK;
+
+/// Refuse a `SourceDestCheck` that carries a value: HTTP 400 `InvalidParameterValue`.
+///
+/// The parameter names the attribute to reset by being there and carries nothing, so a
+/// value for it — even the attribute's own name — is a value the parameter does not take.
+/// Worded in the template EC2 words a refused member value in: the value the REQUEST sent,
+/// bounded by [`crate::state::echoed_resource_id`], the parameter it was sent for, and why
+/// it was refused.
+pub fn takes_no_value_message(value: &str) -> String {
+    format!(
+        "Value ({value}) for parameter {RESETTABLE_NETWORK_INTERFACE_ATTRIBUTE} is invalid. \
+         This parameter takes no value",
+        value = state::echoed_resource_id(value),
+    )
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -151,18 +201,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetNetworkInterfaceAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetNetworkInterfaceAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetNetworkInterfaceAttribute"))
+        // `ctx` carries request metadata only; this operation reads none of it — the
+        // interface is named by id.
+        let _ = ctx;
+
+        // "The source/destination checking attribute" (`SourceDestCheck`): the member names
+        // the attribute to reset, so a request carrying none names nothing to reset and is
+        // refused rather than answered with a 200 that reset nothing.
+        let Some(attribute) = input.source_dest_check.as_deref() else {
+            return Err(state::missing_parameter(format!(
+                "The request must contain the parameter \
+                 {RESETTABLE_NETWORK_INTERFACE_ATTRIBUTE}"
+            )));
+        };
+        // "You can specify only one attribute at a time", and the attribute this request
+        // names is the one the member it carries IS
+        // ([`RESETTABLE_NETWORK_INTERFACE_ATTRIBUTE`]) — the parameter is a flag, so what it
+        // carries names nothing further and a value for it is refused with the code EC2
+        // answers a value it will not take, rather than resetting an attribute the request
+        // did not name.
+        if !attribute.is_empty() {
+            return Err(state::invalid_parameter_value(takes_no_value_message(
+                attribute,
+            )));
+        }
+
+        let network_interface_id = input.network_interface_id.as_str();
+        // A value that is not a network interface id at all is refused BEFORE the store is
+        // asked about it, the way this crate orders the two for every interface id.
+        if !state::network_interface_id_is_well_formed(network_interface_id) {
+            return Err(state::invalid_network_interface_id_malformed(
+                network_interface_id,
+            ));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // A move the clock has made due happened at that instant whether or not anybody
+        // called, so it is applied before the interface is written: this resets the record
+        // the same instant's `DescribeNetworkInterfaces` reports.
+        store.materialize_due_transitions();
+
+        // A well-formed id this account holds no interface for has no attribute to reset.
+        let Some(interface) = store.network_interfaces.get(network_interface_id) else {
+            return Err(state::invalid_network_interface_id_not_found(
+                network_interface_id,
+            ));
+        };
+        // An interface whose TYPE carries no IP addresses has no source/destination check to
+        // put back to its default, so the reset is refused rather than written onto a record
+        // no traffic is judged against — the same reading of that rule, and the same wording,
+        // `ModifyNetworkInterfaceAttribute` answers for a change to the attribute.
+        let interface_type = interface.interface_type.clone().unwrap_or_default();
+        if !state::interface_type_has_source_dest_check(&interface_type) {
+            return Err(state::interface_type_cannot_change_source_dest_check(
+                &interface_type,
+            ));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE, having
+        // resolved the interface and written nothing: "If you have the required permissions,
+        // the error response is DryRunOperation" (`DryRun`).
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The interface was read under this same lock a moment ago, so a miss here is the
+        // store losing a record between two reads of one lock.
+        let Some(interface) = store.network_interfaces.get_mut(network_interface_id) else {
+            return Err(state::internal_error(
+                "the network interface checked a moment ago could not be read back",
+            ));
+        };
+        // "Resets the value to true" (`SourceDestCheck`), which is the default every
+        // interface of this store is created with
+        // ([`crate::state::DEFAULT_SOURCE_DEST_CHECK`]) — so a reset leaves the attribute
+        // where a create would have left it, whatever a modification had made of it.
+        interface.source_dest_check = Some(state::DEFAULT_SOURCE_DEST_CHECK);
+
+        Ok(ResetNetworkInterfaceAttributeOutput)
     }
 }

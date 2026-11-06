@@ -15,6 +15,13 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `ModifyNetworkInterfaceAttribute` writes onto one stored network interface and what
+// `ResetNetworkInterfaceAttribute` puts back to its default, each read back through the
+// describes that report the same record. Declared beside `prefix_lists` for the reason the
+// note above gives: the sorted neighbourhood and the tail of this file are where every new
+// ec2 suite inserts its lines.
+#[path = "all/modify_network_interface_attribute.rs"]
+mod modify_network_interface_attribute;
 // Which network ACL a subnet is associated with, changed by `ReplaceNetworkAclAssociation`
 // and read back through `DescribeNetworkAcls`: the one association the moved subnet is left
 // with, the new association id the call answers and the next move names, the cross-VPC
