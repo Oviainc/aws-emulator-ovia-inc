@@ -176,9 +176,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "UpdateGeneratedTemplate",
             ));
         };
-        let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
 
+        // "If true, update the resource properties in the generated template with their
+        // current live state": what this account holds live includes the resources the
+        // services that OWN them report and no stack of this service manages
+        // (`crate::state::resource_inventory`), so a refresh reads them too. Read before the
+        // store is locked, since it calls those services, and only for a request that asks
+        // for a refresh at all.
+        let inventory = if input.refresh_all_resources == Some(true) {
+            crate::state::resource_inventory::read(ctx, &region).await
+        } else {
+            Vec::new()
+        };
+
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // Settled FIRST, so this update is computed over the record as the clock already
         // leaves it rather than over a generation it has concluded since.
@@ -255,7 +267,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // in the request's Region right now, so a refresh reports what they carry at this
         // call rather than what they carried when the template was generated.
         if input.refresh_all_resources == Some(true) {
-            let live = store.scannable_resources(&region);
+            let live = crate::state::resource_inventory::merged(
+                store.scannable_resources(&region),
+                inventory,
+            );
             for resource in &mut resources {
                 if let Some(found) = live_state(resource, stack_id.as_deref(), &live) {
                     resource.resource_identifier = found.resource_identifier.clone();
@@ -310,7 +325,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// holds it.
 ///
 /// What a resource of this account looks like right now is the set a resource scan of the
-/// Region finds ([`crate::state::ComAmazonawsCloudformationCloudformationState::scannable_resources`]),
+/// Region finds ([`crate::state::resource_inventory::merged`] over this service's live stack
+/// records and the inventory the owning services report),
 /// so a row is matched against that set by what identifies it: the primary-identifier value
 /// the record already holds for it, or — for a row the base stack contributed, which carries
 /// no identifier of its own — the logical id that stack declares it under. A row nothing live

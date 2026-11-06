@@ -13,8 +13,10 @@
 //!
 //! The other modelled refusal, `ResourceScanLimitExceededException`, has no reachable path:
 //! its documented reasons are a daily quota the model carries no number for, a ten-minute
-//! wait after a scan that FAILED (a scan here reads this service's own store, so none fails)
-//! and a twenty-four-hour wait after a scan that exceeded 100,000 resources, which is far
+//! wait after a scan that FAILED (a scan here reads what this account holds, and a service
+//! that will not answer a listing leaves that resource type out rather than failing the scan,
+//! so none fails) and a twenty-four-hour wait after a scan that exceeded 100,000 resources,
+//! which is far
 //! above the resources this store can hold at all
 //! ([`crate::state::MAX_CONCURRENT_RESOURCES`]). What bounds the records a caller can create
 //! is [`crate::state::resource_scans::MAX_RESOURCE_SCANS`], oldest reclaimed first.
@@ -167,7 +169,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "StartResourceScan",
             ));
         };
-        let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
 
         // "The scan filters to use": one entry per filter, carrying the resource types that
@@ -188,42 +189,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let mut store = state.lock();
-        // Settled FIRST, so the exclusivity below meters the scan that is really still
-        // running at this instant rather than one the clock has already concluded.
-        store.settle(now);
-
-        // A retry under the token of a scan that is still RUNNING is not a new scan: "specify
-        // this token if you plan to retry requests so that CloudFormation knows that you're
-        // not attempting to start a new resource scan", so the request answers that scan's id
-        // and writes nothing.
-        if let Some(token) = input.client_request_token.as_deref() {
-            if let Some(scan) = store.resource_scan_by_token(&region, token) {
-                return Ok(StartResourceScanOutput {
-                    resource_scan_id: Some(scan.resource_scan_id.clone()),
-                });
+        // What the gates of this call make of the store, applied BEFORE the inventory is read
+        // and again before the record is written: a start the exclusivity refuses, and a retry
+        // that answers a running scan's id, must not read anything — and a scan that started
+        // while this call was reading must still refuse it.
+        let gate = |store: &crate::state::ComAmazonawsCloudformationCloudformationState| {
+            // A retry under the token of a scan that is still RUNNING is not a new scan:
+            // "specify this token if you plan to retry requests so that CloudFormation knows
+            // that you're not attempting to start a new resource scan", so the request answers
+            // that scan's id and writes nothing.
+            if let Some(token) = input.client_request_token.as_deref() {
+                if let Some(scan) = store.resource_scan_by_token(&region, token) {
+                    return Some(Ok(scan.resource_scan_id.clone()));
+                }
             }
-        }
-
-        // "A resource scan is currently in progress. Only one can be run at a time for an
-        // account in a Region" — metered in the Region the request was signed for, the way
-        // every CloudFormation quota is. Refused BEFORE anything is written, so a refused
-        // call leaves no scan behind.
-        if store.resource_scan_in_flight(&region).is_some() {
-            return Err(
-                StartResourceScanErrorModeled::ResourceScanInProgressException(
+            // "A resource scan is currently in progress. Only one can be run at a time for an
+            // account in a Region" — metered in the Region the request was signed for, the way
+            // every CloudFormation quota is. Refused BEFORE anything is written, so a refused
+            // call leaves no scan behind.
+            store.resource_scan_in_flight(&region).is_some().then(|| {
+                Err(StartResourceScanErrorModeled::ResourceScanInProgressException(
                     ResourceScanInProgressException {
                         message: Some(scans::SCAN_IN_PROGRESS.to_string()),
                     },
-                )
-                .into(),
-            );
+                ))
+            })
+        };
+        // The answer a gate decided, as this operation answers it.
+        let answered = |gated: Result<String, StartResourceScanErrorModeled>| match gated {
+            Ok(resource_scan_id) => Ok(StartResourceScanOutput {
+                resource_scan_id: Some(resource_scan_id),
+            }),
+            Err(refusal) => Err(refusal.into()),
+        };
+
+        {
+            let mut store = state.lock();
+            // Settled FIRST, so the exclusivity meters the scan that is really still running
+            // at this instant rather than one the clock has already concluded.
+            store.settle(::std::time::SystemTime::now());
+            if let Some(gated) = gate(&store) {
+                return answered(gated);
+            }
         }
 
-        // What the scan READS: the resources this account and Region holds right now. A scan
-        // is a point-in-time read, so the rows are taken here and nothing recomputes them
-        // later; the filters decide which of them it LISTS.
-        let read = store.scannable_resources(&region);
+        // What this account holds in the Region right now, as the services that OWN those
+        // resources report them — the inventory a scan of an account and Region is OVER,
+        // which is where a resource nothing in CloudFormation created is found. Read with the
+        // store unlocked, since it calls those services.
+        let inventory = crate::state::resource_inventory::read(ctx, &region).await;
+
+        // The instant the scan is recorded as having started, taken after the inventory was
+        // read so the span its conclusion is due at is measured from the record.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+        // The gates again, over the store as it stands now: another call may have started a
+        // scan while this one was reading, and that scan is the one in flight.
+        if let Some(gated) = gate(&store) {
+            return answered(gated);
+        }
+
+        // What the scan READS: the resources this account and Region holds right now — every
+        // resource of every live stack of the Region, and every resource of the account's own
+        // inventory no stack records. A scan is a point-in-time read, so the rows are taken
+        // here and nothing recomputes them later; the filters decide which of them it LISTS,
+        // and whether a stack manages a row is what `ManagedByStack` reports of it.
+        let read = crate::state::resource_inventory::merged(
+            store.scannable_resources(&region),
+            inventory,
+        );
         let resources_read = read.len();
         let resources: Vec<scans::FoundResource> = read
             .into_iter()

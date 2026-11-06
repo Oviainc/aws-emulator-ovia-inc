@@ -330,6 +330,10 @@ pub mod hook_results;
 /// summaries of.
 pub mod resource_scans;
 
+/// The resources this account holds in one Region as the services that OWN them report
+/// them, which is what a resource scan reads beside this service's own stack records.
+pub mod resource_inventory;
+
 /// The Hook invocations planned for one change set, which `DescribeChangeSetHooks`
 /// reports.
 pub mod change_set_hooks;

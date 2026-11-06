@@ -199,7 +199,10 @@ use super::provisioner::{provisioner_for, Provisioner};
 use super::StoredResource;
 
 mod cognito_identity_pool;
-mod dynamodb_table;
+/// `AWS::DynamoDB::Table`: visible to the rest of this service's state because the type's
+/// own NAME lives here, beside the arm that provisions it, and more than one module answers
+/// about that type ([`super::resource_inventory`]).
+pub(super) mod dynamodb_table;
 mod ec2_vpc_network;
 mod iam_policy;
 mod lambda_event_source_mapping;

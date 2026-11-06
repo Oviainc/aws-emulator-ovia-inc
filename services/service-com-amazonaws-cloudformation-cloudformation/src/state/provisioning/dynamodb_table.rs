@@ -71,7 +71,7 @@ use crate::state::StoredResource;
 mod settings;
 
 /// The resource type this module provisions.
-pub(super) const DYNAMODB_TABLE: &str = "AWS::DynamoDB::Table";
+pub(crate) const DYNAMODB_TABLE: &str = "AWS::DynamoDB::Table";
 
 /// The SigV4 signing name of the service that owns it, which is what routes the in-process
 /// call to Amazon DynamoDB's own handlers (`awsService.endpointPrefix`/`sigv4Name`).

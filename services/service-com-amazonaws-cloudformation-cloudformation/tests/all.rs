@@ -241,6 +241,8 @@ mod reserved_stack_tag_keys;
 mod resource_deletion_policies;
 #[path = "all/resource_scan_discovery.rs"]
 mod resource_scan_discovery;
+#[path = "all/resource_scan_inventory.rs"]
+mod resource_scan_inventory;
 #[path = "all/resource_scan_lifecycle.rs"]
 mod resource_scan_lifecycle;
 #[path = "all/resource_scan_related_resources.rs"]

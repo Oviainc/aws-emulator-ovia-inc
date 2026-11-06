@@ -39,12 +39,18 @@
 //!
 //! ## What a scan READS
 //!
-//! The resources of this account and Region that this service holds a record of: every
-//! resource of every live stack of that Region
-//! ([`crate::state::ComAmazonawsCloudformationCloudformationState::scannable_resources`]).
-//! Each one is therefore managed by a CloudFormation stack, which is what `ScannedResource`'s
-//! `ManagedByStack` reports of it, and the stack that manages it is recorded on the row — the
-//! record of which resources belong TOGETHER, which is what
+//! The resources of this account and Region, wherever they are held: every resource of every
+//! live stack of that Region
+//! ([`crate::state::ComAmazonawsCloudformationCloudformationState::scannable_resources`]) and
+//! every resource the services that OWN them report for that Region
+//! ([`crate::state::resource_inventory`]), the two merged into one row per resource
+//! ([`crate::state::resource_inventory::merged`]).
+//!
+//! A row therefore records the stack that manages the resource only where one does, which is
+//! what `ScannedResource`'s `ManagedByStack` reports of it: a resource created straight
+//! through its owning service's API is in no stack and is reported as the unmanaged resource
+//! it is — the resources a scan exists to DISCOVER. The stack recorded on a managed row is
+//! also the record of which resources belong TOGETHER, which is what
 //! [`StoredResourceScan::related_resources`] answers `ListResourceScanRelatedResources` from.
 //!
 //! A scan is a POINT-IN-TIME read: the rows are taken when the scan starts and nothing
@@ -173,14 +179,17 @@ pub struct FoundResource {
     /// "The type of the resource, such as `AWS::DynamoDB::Table`"
     /// (`ScannedResource$ResourceType`).
     pub resource_type: String,
-    /// The resource's physical id in the service that owns it — the value the stack recorded
-    /// for it, which is what names the resource outside CloudFormation.
+    /// The resource's physical id in the service that owns it — the value a stack recorded
+    /// for it, or the one that service reports it under, which is what names the resource
+    /// outside CloudFormation.
     pub physical_resource_id: String,
-    /// The logical id the stack that manages this resource declares it under.
+    /// The logical id the stack that manages this resource declares it under; EMPTY for a
+    /// resource no stack manages, which declares no logical id for it.
     pub logical_resource_id: String,
     /// The ARN of the stack that manages the resource, which is what
     /// `ScannedResource$ManagedByStack` reports the presence of ("if `true`, the resource is
-    /// managed by a CloudFormation stack").
+    /// managed by a CloudFormation stack") — EMPTY for a resource CloudFormation does not
+    /// manage.
     pub stack_id: String,
     /// `ScannedResource$ResourceIdentifier`: "the key is the name of one of the primary
     /// identifiers for the resource … the value is the value of that primary identifier" —
@@ -189,9 +198,9 @@ pub struct FoundResource {
     /// ([`primary_identifier`]) when the row is taken, so a read reports it rather than
     /// recomputing it.
     pub resource_identifier: BTreeMap<String, String>,
-    /// The tags the resource carries in the service that owns it: the ones its own
-    /// declaration asked for, plus the stack-level tags CloudFormation propagates to the
-    /// resources it creates and the ones it records itself
+    /// The tags the resource carries in the service that owns it: for a resource a stack
+    /// deployed, the ones its own declaration asked for plus the stack-level tags
+    /// CloudFormation propagates to the resources it creates and the ones it records itself
     /// ([`crate::state::provisioning::StackProvenance::tags_for`]) — the set a request's
     /// `TagKey` and `TagValue` select on. Taken from the resource when the row is taken, like
     /// every other member of a row, so a read reports it rather than recomputing it.
