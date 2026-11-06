@@ -620,19 +620,15 @@ impl<'a> FirewallRuleMatchSource<'a> {
             _ => None,
         }
     }
-
-    /// The one id this request names its rule by, or `None` when it carries
-    /// both ids or neither — in both of which it names no single rule.
-    pub fn match_source_id(&self) -> Option<&'a str> {
-        self.match_source().map(|(_, id)| id)
-    }
 }
 
-/// How the service words the member a request named its rule by, inside the
-/// sentence it reports when no rule of the group answers to it: the modelled
-/// member read as words, `FirewallDomainListId` for a domain-list rule and
-/// `FirewallThreatProtectionId` for a DNS Firewall Advanced one.
+/// How the service words `FirewallDomainListId`, the member a domain-list rule
+/// is named by, inside the sentence it reports when no rule of the group
+/// answers to it: the modelled member read as words.
 pub const FIREWALL_RULE_DOMAIN_LIST_MEMBER: &str = "Firewall domain list ID";
+
+/// The same for `FirewallThreatProtectionId`, the member a DNS Firewall
+/// Advanced rule is named by.
 pub const FIREWALL_RULE_THREAT_PROTECTION_MEMBER: &str = "Firewall threat protection ID";
 
 /// Why no single stored rule answers to what a request named.
@@ -648,7 +644,8 @@ pub enum FirewallRuleLookupFault {
     ResourceNotFound(ResourceNotFoundException),
 }
 
-/// Where among `group`'s rules the rule the request names sits.
+/// Where among `group`'s rules the rule the request names sits, beside the
+/// member it was named by and the id it carried there.
 ///
 /// This is the whole of what naming one stored rule means: a rule is addressed
 /// by what it matches on — `FirewallDomainListId` names a domain-list rule and
@@ -656,10 +653,15 @@ pub enum FirewallRuleLookupFault {
 /// name different rules, so a request that carries both or neither names none —
 /// and among the rules of one group that match the SAME source, the `Qtype` the
 /// request names is what tells them apart.
-pub fn locate_firewall_rule(
+///
+/// The match source travels back with the index because a request that reaches
+/// a rule named exactly one member, and what a LATER refusal about that rule
+/// states is that member and that id: carrying it out of here is what saves
+/// every caller from re-deriving a pair this function already proved.
+pub fn locate_firewall_rule<'a>(
     group: &FirewallRuleGroupRecord,
-    named: &FirewallRuleMatchSource<'_>,
-) -> Result<usize, FirewallRuleLookupFault> {
+    named: &FirewallRuleMatchSource<'a>,
+) -> Result<(usize, (&'static str, &'a str)), FirewallRuleLookupFault> {
     let Some((match_source_member, match_source_id)) = named.match_source() else {
         return Err(FirewallRuleLookupFault::Validation(ValidationException {
             message: Some(format!(
@@ -693,7 +695,7 @@ pub fn locate_firewall_rule(
                 match_source_id,
             ),
         )),
-        [only] => Ok(*only),
+        [only] => Ok((*only, (match_source_member, match_source_id))),
         // Among rules of one group that match the same source, the `Qtype` the
         // request names is what tells them apart — a rule that evaluates every
         // query type stores none, so a request that names none names that rule.
@@ -706,7 +708,7 @@ pub fn locate_firewall_rule(
                     == named.qtype
             });
             match (evaluating_the_qtype.next(), evaluating_the_qtype.next()) {
-                (Some(only), None) => Ok(only),
+                (Some(only), None) => Ok((only, (match_source_member, match_source_id))),
                 _ => Err(FirewallRuleLookupFault::Validation(ValidationException {
                     message: Some(format!(
                         "More than one rule of firewall rule group {} matches \
@@ -1016,10 +1018,11 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
             qtype: request.qtype,
             action: FIREWALL_RULE_ACTION_WORD_UPDATE,
         };
-        let index = locate_firewall_rule(group, &named)?;
-        // A request that named no single rule was refused above, so the rule
-        // this update is about always has the member and the id it was named by.
-        let (match_source_member, match_source_id) = named.match_source().unwrap_or_default();
+        // The rule the entry named, beside the member it named it by and the id
+        // it carried there — what a refusal about that rule states, carried out
+        // of the lookup that proved them rather than re-derived here.
+        let (index, (match_source_member, match_source_id)) =
+            locate_firewall_rule(group, &named)?;
 
         let Some(stored) = group.rules.get(index).map(|record| record.to_rule(now)) else {
             return Err(FirewallRuleUpdateRefusal::ResourceNotFound(
@@ -1234,7 +1237,7 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
                 firewall_rule_group_not_found(named.firewall_rule_group_id),
             ));
         };
-        let index = locate_firewall_rule(group, &named)?;
+        let (index, _) = locate_firewall_rule(group, &named)?;
         let record = group.rules.remove(index);
         // The group's own `ModificationTime` moves with the rules it holds: a
         // group a rule was just removed from has changed.
