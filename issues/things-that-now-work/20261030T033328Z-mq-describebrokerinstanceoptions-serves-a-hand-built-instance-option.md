@@ -59,3 +59,18 @@ Model checked with smithy_query (services/service-com-amazonaws-mq-mq/smithy-mod
 2. Compare the JSON body's $.brokerInstanceOptions list element by element with the recorded response.
 3. Observe: 15 elements instead of the recorded 21; element order grouped by engineType rather than by hostInstanceType; storageType emitted as 'EBS'/'EFS' where the recording has 'ebs'/'efs'; supportedEngineVersions patch-level and ascending ('5.15.16','5.16.7','5.17.6','5.18.4') where the recording has major.minor newest-first ('5.19','5.18') and RabbitMQ '3.13'; supportedDeploymentModes ['SINGLE_INSTANCE'] on every element where the recording adds ACTIVE_STANDBY_MULTI_AZ (ActiveMQ) / CLUSTER_MULTI_AZ (RabbitMQ) on the mq.m5 sizes; availabilityZones carrying three zones instead of the region's full zone set.
 4. Re-replay the same fixture step after the fix; every $.brokerInstanceOptions index must match.
+
+## Resolution
+Fixed in the handler and the two helpers it shares: the catalog is now grouped by host instance
+type, then engine type, then storage type; `storageType` is rendered in the lower-case spelling the
+catalog publishes; `supportedEngineVersions` reports the offered versions newest first at
+MAJOR.MINOR granularity; `supportedDeploymentModes` lists SINGLE_INSTANCE first and then the
+engine's own highly available mode wherever that combination offers it; and `availabilityZones`
+reports the signed Region's whole zone set, identical on every element. Replaying the fixture step,
+recorded elements 0..11 and 20 now match element for element (0 of 21 matched before).
+
+The catalog's remaining MEMBERSHIP gap — the eight recorded elements at indices 12..19, whose host
+instance types the replay withholds — is tracked as its own report,
+`20261107T120000Z-mq-describebrokerinstanceoptions-catalog-is-missing-eight-published-instance-option-combinations.md`,
+which records what is known about them and the candidate families already ruled out. Acceptance
+step 4 above is met for every index that report does not own.

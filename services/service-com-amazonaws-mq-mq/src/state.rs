@@ -1217,22 +1217,44 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// How many Availability Zones this emulator reports a Region as having. AWS
-/// documents "every Region has a minimum of three zones", and the number a given
-/// Region has is not in this service's model, so the emulator reports the
-/// documented minimum for every Region rather than a per-Region table it would
-/// have to invent.
-pub const AVAILABILITY_ZONES_PER_REGION: usize = 3;
+/// The Availability Zone letters every Region has: AWS documents that every Region has
+/// a minimum of three zones, and most Regions' zone names end in these letters.
+pub const COMMON_AVAILABILITY_ZONE_LETTERS: &str = "abc";
 
-/// The Availability Zone names of `region`, in order.
+/// The Regions whose Availability Zone set is not [`COMMON_AVAILABILITY_ZONE_LETTERS`],
+/// and the letters their zone names end in.
+///
+/// Source: AWS's published "Regions and Availability Zones" list (the zones each Region
+/// offers). The letters are held rather than a count because a Region's zone letters are
+/// not always consecutive. A Region this table does not name has the three zones above.
+/// The zone set is a property of the Region, not of this service, so it is kept here
+/// rather than in the operation that reports zones.
+const AVAILABILITY_ZONE_LETTERS_BY_REGION: &[(&str, &str)] = &[
+    ("us-east-1", "abcdef"),
+    ("us-west-2", "abcd"),
+    ("ap-northeast-1", "acd"),
+    ("ap-northeast-2", "abcd"),
+];
+
+/// The letters `region`'s Availability Zone names end in.
+pub fn availability_zone_letters(region: &str) -> &'static str {
+    AVAILABILITY_ZONE_LETTERS_BY_REGION
+        .iter()
+        .find(|(named, _)| *named == region)
+        .map_or(COMMON_AVAILABILITY_ZONE_LETTERS, |(_, letters)| *letters)
+}
+
+/// Every Availability Zone name of `region`, in order.
 ///
 /// An AWS zone name is its Region's code followed by a letter
 /// (`us-east-1a`), so the names follow from the Region the caller signed for
-/// ([`request_region`]) and the zone count above — never from the request body.
+/// ([`request_region`]) and that Region's zone letters — never from the request
+/// body. The list is the Region's FULL zone set: a caller reading it to place a
+/// broker sees every zone the Region offers.
 pub fn availability_zones_in_region(region: &str) -> Vec<String> {
-    (0..AVAILABILITY_ZONES_PER_REGION)
-        .filter_map(|index| u8::try_from(index).ok())
-        .map(|index| format!("{region}{}", char::from(b'a' + index)))
+    availability_zone_letters(region)
+        .chars()
+        .map(|letter| format!("{region}{letter}"))
         .collect()
 }
 

@@ -28,12 +28,38 @@ use service_com_amazonaws_mq_mq::ops::types::{
     BROKER_STORAGE_TYPE_VALUES, DEPLOYMENT_MODE_VALUES, ENGINE_TYPE_VALUES,
 };
 use service_com_amazonaws_mq_mq::state::{
-    invalid_page_token_message, availability_zones_in_region, DEFAULT_MAX_RESULTS,
-    DEPLOYMENT_MODE_SINGLE_INSTANCE, ENGINE_TYPE_RABBITMQ, MAX_MAX_RESULTS, MIN_MAX_RESULTS,
-    STORAGE_TYPE_EFS,
+    availability_zones_in_region, invalid_page_token_message, published_engine_versions,
+    DEFAULT_MAX_RESULTS, DEPLOYMENT_MODE_ACTIVE_STANDBY_MULTI_AZ,
+    DEPLOYMENT_MODE_CLUSTER_MULTI_AZ, DEPLOYMENT_MODE_SINGLE_INSTANCE, ENGINE_TYPE_RABBITMQ,
+    MAX_MAX_RESULTS, MIN_MAX_RESULTS, STORAGE_TYPE_EFS,
 };
 
 use crate::broker_lifecycle::{create_body, Mq};
+
+/// A storage type as this catalog renders it: Amazon MQ publishes the instance-option
+/// catalog's `storageType` in lower case, not in the upper-case spelling the
+/// `BrokerStorageType` enum uses for a broker's own storage type.
+fn rendered(storage_type: &str) -> String {
+    storage_type.to_ascii_lowercase()
+}
+
+/// Where one entry sits in the order the catalog reports: by host instance type, then by
+/// engine type as the model enumerates them, then by storage type.
+fn order_key(case: &str, entry: &Value) -> (String, usize, usize) {
+    let engine_type = member(case, entry, "engineType");
+    let storage_type = member(case, entry, "storageType");
+    (
+        member(case, entry, "hostInstanceType"),
+        ENGINE_TYPE_VALUES
+            .iter()
+            .position(|value| *value == engine_type)
+            .unwrap_or(usize::MAX),
+        BROKER_STORAGE_TYPE_VALUES
+            .iter()
+            .position(|value| rendered(value) == storage_type)
+            .unwrap_or(usize::MAX),
+    )
+}
 
 /// The operation's modelled path (`smithy_query(query="operation",
 /// operation="DescribeBrokerInstanceOptions")`: `GET /v1/broker-instance-options`).
@@ -131,23 +157,29 @@ async fn the_catalog_is_well_formed_and_covers_every_modelled_engine_type() {
             "case {case:?}: engineType must be one of {ENGINE_TYPE_VALUES:?}, got \
              {engine_type:?}"
         );
+        // The catalog renders `storageType` in the lower-case spelling Amazon MQ
+        // publishes for it, not the upper-case `BrokerStorageType` enum name a broker's
+        // own storage type carries.
+        let rendered_storage_types: Vec<String> =
+            BROKER_STORAGE_TYPE_VALUES.iter().map(|v| rendered(v)).collect();
         assert!(
-            BROKER_STORAGE_TYPE_VALUES.contains(&storage_type.as_str()),
-            "case {case:?}: storageType must be one of {BROKER_STORAGE_TYPE_VALUES:?}, got \
+            rendered_storage_types.contains(&storage_type),
+            "case {case:?}: storageType must be one of {rendered_storage_types:?}, got \
              {storage_type:?}"
         );
         // `BrokerStorageType`'s own documentation: "EFS is not supported for RabbitMQ
         // engine type".
         assert!(
-            engine_type != ENGINE_TYPE_RABBITMQ || storage_type != STORAGE_TYPE_EFS,
+            engine_type != ENGINE_TYPE_RABBITMQ || storage_type != rendered(STORAGE_TYPE_EFS),
             "case {case:?}: {ENGINE_TYPE_RABBITMQ} is not offered on {STORAGE_TYPE_EFS}, got \
              {entry:?}"
         );
 
         let modes = members(case, entry, "supportedDeploymentModes");
-        assert!(
-            modes.contains(&DEPLOYMENT_MODE_SINGLE_INSTANCE.to_string()),
-            "case {case:?}: every option supports {DEPLOYMENT_MODE_SINGLE_INSTANCE}, got \
+        assert_eq!(
+            modes.first().map(String::as_str),
+            Some(DEPLOYMENT_MODE_SINGLE_INSTANCE),
+            "case {case:?}: every option offers {DEPLOYMENT_MODE_SINGLE_INSTANCE} first, got \
              {modes:?}"
         );
         for mode in &modes {
@@ -157,12 +189,50 @@ async fn the_catalog_is_well_formed_and_covers_every_modelled_engine_type() {
                  {DEPLOYMENT_MODE_VALUES:?}, got {mode:?}"
             );
         }
-
-        let versions = members(case, entry, "supportedEngineVersions");
-        assert!(
-            !versions.is_empty(),
-            "case {case:?}: expected at least one supported engine version, got {versions:?}"
+        // Beyond the single-instance mode, an entry carries its ENGINE's highly
+        // available mode: ActiveMQ's active/standby pair wherever the entry's storage is
+        // the shared file system, RabbitMQ's cluster on every size but the burstable one.
+        let highly_available: Vec<&str> = modes
+            .iter()
+            .map(String::as_str)
+            .filter(|mode| *mode != DEPLOYMENT_MODE_SINGLE_INSTANCE)
+            .collect();
+        let expected_highly_available: Vec<&str> = if engine_type == ENGINE_TYPE_RABBITMQ {
+            (!host_instance_type.ends_with(".micro"))
+                .then_some(DEPLOYMENT_MODE_CLUSTER_MULTI_AZ)
+                .into_iter()
+                .collect()
+        } else {
+            (storage_type == rendered(STORAGE_TYPE_EFS))
+                .then_some(DEPLOYMENT_MODE_ACTIVE_STANDBY_MULTI_AZ)
+                .into_iter()
+                .collect()
+        };
+        assert_eq!(
+            highly_available, expected_highly_available,
+            "case {case:?}: unexpected highly available deployment mode in {modes:?}"
         );
+
+        // The versions are the ones the service offers for creation on that engine,
+        // newest first and at MAJOR.MINOR granularity.
+        let versions = members(case, entry, "supportedEngineVersions");
+        let mut offered: Vec<String> = published_engine_versions(&engine_type)
+            .iter()
+            .map(|version| (*version).to_string())
+            .collect();
+        offered.reverse();
+        assert_eq!(
+            versions, offered,
+            "case {case:?}: expected the offered versions newest first, got {versions:?}"
+        );
+        for version in &versions {
+            assert_eq!(
+                version.split('.').count(),
+                2,
+                "case {case:?}: a version a broker can be created with is MAJOR.MINOR, got \
+                 {version:?}"
+            );
+        }
 
         let Some(zones) = entry.get("availabilityZones").and_then(Value::as_array) else {
             panic!("case {case:?}: expected an availabilityZones array, got {entry:?}");
@@ -197,6 +267,135 @@ async fn the_catalog_is_well_formed_and_covers_every_modelled_engine_type() {
              type, got {keys:?}"
         );
     }
+
+    // The catalog is grouped by host instance type and only then by engine type and
+    // storage type, which is what makes a `nextToken` offset name the same entry on a
+    // later call.
+    let order: Vec<(String, usize, usize)> = catalog
+        .iter()
+        .map(|entry| order_key(case, entry))
+        .collect();
+    let mut ascending = order.clone();
+    ascending.sort();
+    assert_eq!(
+        order, ascending,
+        "case {case:?}: the catalog is reported by (hostInstanceType, engineType, \
+         storageType) ascending"
+    );
+}
+
+#[tokio::test]
+async fn the_zones_of_an_entry_are_the_signed_regions_whole_zone_set() {
+    // Each row: a Region and the Availability Zones AWS publishes for it, written out
+    // (AWS's "Regions and Availability Zones" list). The names are literals so that a
+    // change to the emulator's own Region table is caught, and the rows span a Region
+    // with six zones, Regions with four, a Region whose zone letters are not
+    // consecutive, and Regions with three — including Regions the recorded call never
+    // signed for.
+    let rows: [(&str, &[&str]); 5] = [
+        (
+            "us-east-1",
+            &[
+                "us-east-1a",
+                "us-east-1b",
+                "us-east-1c",
+                "us-east-1d",
+                "us-east-1e",
+                "us-east-1f",
+            ],
+        ),
+        (
+            "us-west-2",
+            &["us-west-2a", "us-west-2b", "us-west-2c", "us-west-2d"],
+        ),
+        (
+            "ap-northeast-1",
+            &["ap-northeast-1a", "ap-northeast-1c", "ap-northeast-1d"],
+        ),
+        ("eu-west-1", &["eu-west-1a", "eu-west-1b", "eu-west-1c"]),
+        ("sa-east-1", &["sa-east-1a", "sa-east-1b", "sa-east-1c"]),
+    ];
+
+    for (region, zones) in rows {
+        let case = &format!("{region} ({} zones)", zones.len());
+        let mq = Mq::new(region);
+        let catalog = whole_catalog(case, &mq).await;
+        let expected: Vec<Value> = zones.iter().map(|name| json!({"name": name})).collect();
+        assert_eq!(
+            availability_zones_in_region(region),
+            zones.iter().map(|z| (*z).to_string()).collect::<Vec<String>>(),
+            "case {case:?}: expected the Region's published zone set {zones:?}, got {:?}",
+            availability_zones_in_region(region)
+        );
+        assert!(
+            !catalog.is_empty(),
+            "case {case:?}: expected the catalog to hold entries"
+        );
+        for entry in &catalog {
+            assert_eq!(
+                entry.get("availabilityZones"),
+                Some(&Value::Array(expected.clone())),
+                "case {case:?}: expected every entry to carry the Region's whole zone set \
+                 {zones:?}, got {entry:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_storage_type_filter_selects_the_same_entries_in_either_case() {
+    let mq = Mq::new("us-west-2");
+    let catalog = whole_catalog("unfiltered", &mq).await;
+
+    // Each row: a storage type the model enumerates, spelled as the catalog renders it
+    // (the lower-case spelling the recorded catalog serves) and as the model spells it
+    // (an emulator choice: the recording does not show whether the filter takes the enum
+    // name, and refusing the value a client read from its own model would make the
+    // filter unusable). Both name the same storage type, so both must select the entries
+    // the catalog reports for it.
+    for storage_type in BROKER_STORAGE_TYPE_VALUES {
+        let expected: Vec<Value> = catalog
+            .iter()
+            .filter(|entry| member("unfiltered", entry, "storageType") == rendered(storage_type))
+            .cloned()
+            .collect();
+        assert!(
+            !expected.is_empty(),
+            "case {storage_type:?}: the catalog must report entries for every modelled \
+             storage type"
+        );
+        for spelling in [rendered(storage_type), storage_type.to_string()] {
+            let query = format!("maxResults={MAX_MAX_RESULTS}&storageType={spelling}");
+            let case = &query;
+            let (status, body) = describe(&mq, &query).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected 200, got {status} {body:?}"
+            );
+            let got = entries(case, &body);
+            assert_eq!(
+                got, expected,
+                "case {case:?}: expected the {} entries stored with {storage_type}, got {}",
+                expected.len(),
+                got.len()
+            );
+        }
+    }
+
+    // A value outside the modelled set is still refused, in either case.
+    for spelling in ["sdd", "SDD"] {
+        let query = format!("storageType={spelling}");
+        let case = &query;
+        let (status, code, body) = describe_with_code(&mq, &query).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} {body:?}"
+        );
+        assert_eq!(
+            code, "BadRequestException",
+            "case {case:?}: expected the modelled error code, got {code:?} {body:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -219,7 +418,7 @@ async fn each_filter_selects_exactly_the_matching_catalog_entries() {
         .chain(ENGINE_TYPE_VALUES.iter().map(|v| Some((*v).to_string())))
         .collect();
     let storage_filters: Vec<Option<String>> = std::iter::once(None)
-        .chain(BROKER_STORAGE_TYPE_VALUES.iter().map(|v| Some((*v).to_string())))
+        .chain(BROKER_STORAGE_TYPE_VALUES.iter().map(|v| Some(rendered(v))))
         .collect();
     let host_filters: Vec<Option<String>> = std::iter::once(None)
         .chain(host_instance_types.into_iter().map(Some))

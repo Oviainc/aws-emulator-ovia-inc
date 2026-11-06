@@ -176,8 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(bad_request)?;
         }
         if let Some(storage_type) = storage_type {
-            state::validate_enum("storageType", storage_type, BROKER_STORAGE_TYPE_VALUES)
-                .map_err(bad_request)?;
+            validate_catalog_storage_type(storage_type).map_err(bad_request)?;
         }
 
         // `maxResults` carries the modelled `@range(min: 1, max: 100)`, which this
@@ -212,7 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|option| {
                 selected_by(option.engine_type.as_deref(), engine_type)
                     && selected_by(option.host_instance_type.as_deref(), host_instance_type)
-                    && selected_by(option.storage_type.as_deref(), storage_type)
+                    && selected_by(
+                        option.storage_type.as_deref(),
+                        storage_type.map(catalog_storage_type).as_deref(),
+                    )
             })
             .collect();
 
@@ -240,114 +242,168 @@ fn selected_by(value: Option<&str>, filter: Option<&str>) -> bool {
     filter.is_none_or(|filter| value == Some(filter))
 }
 
+/// Refuse a `storageType` filter that names no `BrokerStorageType` value.
+///
+/// The filter is compared with the entries through the catalog's own rendering
+/// ([`catalog_storage_type`]), so a caller that feeds back the value this listing served
+/// is accepted — that lower-case spelling is what the catalog publishes. A caller that
+/// spells the value the way the model does is accepted too, which the recorded catalog
+/// does not show either way and the emulator therefore chooses, so that one member's
+/// rendering cannot make the filter unusable. Anything outside the value set is refused
+/// with the sentence every enumerated member of this service is refused with.
+fn validate_catalog_storage_type(storage_type: &str) -> Result<(), state::Invalid> {
+    // Exactly the two spellings the member has: the one the model declares and the one
+    // this catalog renders. Any other spelling, cased or not, is outside the value set.
+    if BROKER_STORAGE_TYPE_VALUES
+        .iter()
+        .any(|value| *value == storage_type || catalog_storage_type(value) == storage_type)
+    {
+        return Ok(());
+    }
+    // Outside the set: refused with the sentence every enumerated member of this
+    // service is refused with, naming the value the request sent and the values the
+    // model declares.
+    state::validate_enum("storageType", storage_type, BROKER_STORAGE_TYPE_VALUES)
+}
+
 /// The page size this operation reports when the request names none, from the output
 /// member's own documentation: "The maximum number of instance options that can be
 /// returned per page (20 by default)" — the same default every listing of this service
 /// uses ([`state::DEFAULT_MAX_RESULTS`]).
 const DEFAULT_PAGE_SIZE: i32 = state::DEFAULT_MAX_RESULTS as i32;
 
-/// The host instance types and engine versions Amazon MQ publishes for ONE engine.
+/// One host instance type Amazon MQ offers, and the engines offered on it.
 ///
-/// The engine types are the model's own `EngineType` value set
-/// (`ENGINE_TYPE_VALUES`, from `smithy_query(query="shape", shape="EngineType")`); the
-/// instance types and versions are the ones the Amazon MQ Developer Guide publishes per
-/// engine (its "Broker instance types" table, and the engine's version-support page).
-struct PublishedEngineOptions {
-    engine_type: &'static str,
-    /// Smallest first, as the instance-type table lists them.
-    host_instance_types: &'static [&'static str],
-    /// The engine versions a broker on this engine can be created with, from the
-    /// service's own published lists.
-    engine_versions: &'static [&'static str],
+/// The engine types are the model's own `EngineType` value set (`ENGINE_TYPE_VALUES`,
+/// from `smithy_query(query="shape", shape="EngineType")`); the instance types, and
+/// which engine runs on each, are the ones Amazon MQ publishes (the Developer Guide's
+/// "Broker instance types" tables, one per engine).
+struct PublishedHostInstanceType {
+    host_instance_type: &'static str,
+    engine_types: &'static [&'static str],
 }
 
-/// Amazon MQ's published instance-option catalog, per engine — see
-/// [`PublishedEngineOptions`] for where each column comes from. The engine versions are
-/// the service's own published lists ([`state::published_engine_versions`]), shared with
-/// the operations that default an `EngineVersion` to the latest of them. The storage
-/// types and deployment modes of one entry are not a column here: they follow from the
-/// engine and the instance type ([`offers_storage_type`], [`supports_deployment_mode`]).
-const PUBLISHED_ENGINE_OPTIONS: &[PublishedEngineOptions] = &[
-    PublishedEngineOptions {
-        engine_type: state::ENGINE_TYPE_ACTIVEMQ,
-        host_instance_types: &[
-            "mq.t2.micro",
-            "mq.t3.micro",
-            "mq.m5.large",
-            "mq.m5.xlarge",
-            "mq.m5.2xlarge",
-            "mq.m5.4xlarge",
-        ],
-        engine_versions: state::ACTIVEMQ_ENGINE_VERSIONS,
+/// Amazon MQ's published host instance types, in the order the catalog reports them.
+///
+/// The catalog is grouped by host instance type and only then by engine type, so this
+/// table IS the reported order: the rows are the published instance types in ascending
+/// name order, and each row's engines in the order the model enumerates them. The
+/// storage types, deployment modes and engine versions of one entry are not columns
+/// here: they follow from the engine and the instance type ([`offers_storage_type`],
+/// [`highly_available_deployment_mode`], [`state::published_engine_versions`]).
+///
+/// WHICH combinations the service offers is recorded behaviour — the model constrains
+/// only the enums — so these rows are the combinations the recorded catalog serves: the
+/// four `mq.m5` sizes on both engines, and the burstable `micro` size on ActiveMQ only,
+/// which is why that row names one engine. The recorded catalog serves further
+/// combinations whose host instance types are not identifiable from it (the recording
+/// reports which elements differ, never a value); they are tracked as their own issue,
+/// and adding them is a row each here rather than a code change.
+const PUBLISHED_HOST_INSTANCE_TYPES: &[PublishedHostInstanceType] = &[
+    PublishedHostInstanceType {
+        host_instance_type: "mq.m5.2xlarge",
+        engine_types: ENGINE_TYPE_VALUES,
     },
-    PublishedEngineOptions {
-        engine_type: state::ENGINE_TYPE_RABBITMQ,
-        host_instance_types: &[
-            "mq.t3.micro",
-            "mq.m5.large",
-            "mq.m5.xlarge",
-            "mq.m5.2xlarge",
-            "mq.m5.4xlarge",
-        ],
-        engine_versions: state::RABBITMQ_ENGINE_VERSIONS,
+    PublishedHostInstanceType {
+        host_instance_type: "mq.m5.4xlarge",
+        engine_types: ENGINE_TYPE_VALUES,
+    },
+    PublishedHostInstanceType {
+        host_instance_type: "mq.m5.large",
+        engine_types: ENGINE_TYPE_VALUES,
+    },
+    PublishedHostInstanceType {
+        host_instance_type: "mq.m5.xlarge",
+        engine_types: ENGINE_TYPE_VALUES,
+    },
+    PublishedHostInstanceType {
+        host_instance_type: "mq.t3.micro",
+        engine_types: &[state::ENGINE_TYPE_ACTIVEMQ],
     },
 ];
 
-/// The instance types Amazon MQ offers for single-instance brokers only: the burstable
-/// micro sizes, which the Developer Guide's instance-type table marks as suitable for
-/// evaluation rather than for a highly available deployment.
-const SINGLE_INSTANCE_ONLY_HOST_INSTANCE_TYPES: &[&str] = &["mq.t2.micro", "mq.t3.micro"];
-
-/// The instance-type family Amazon MQ for ActiveMQ offers EBS storage on — the Developer
-/// Guide's storage-type guidance: EBS is available on the `mq.m5` sizes.
-const EBS_HOST_INSTANCE_TYPE_PREFIX: &str = "mq.m5.";
+/// The burstable host instance types the catalog holds — the `micro` sizes Amazon MQ
+/// offers for evaluation rather than for production throughput. They are the sizes the
+/// service offers no block storage and no RabbitMQ cluster on.
+fn is_burstable(host_instance_type: &str) -> bool {
+    host_instance_type.ends_with(".micro")
+}
 
 /// Whether `engine_type` on `host_instance_type` is offered with `storage_type`.
 ///
 /// RabbitMQ is EBS-only — `BrokerStorageType`'s own documentation
 /// (`smithy_query(query="shape", shape="BrokerStorageType")`): "EFS is not supported for
-/// RabbitMQ engine type". ActiveMQ is offered on EFS at every size and on EBS on the
-/// `mq.m5` family.
+/// RabbitMQ engine type". ActiveMQ is offered on its shared EFS storage at every size
+/// and on block storage from the smallest non-burstable size up.
 fn offers_storage_type(engine_type: &str, host_instance_type: &str, storage_type: &str) -> bool {
     match (engine_type, storage_type) {
         (state::ENGINE_TYPE_RABBITMQ, storage) => storage == state::STORAGE_TYPE_EBS,
         (_, state::STORAGE_TYPE_EFS) => true,
-        (_, _) => host_instance_type.starts_with(EBS_HOST_INSTANCE_TYPE_PREFIX),
+        (_, _) => !is_burstable(host_instance_type),
     }
 }
 
-/// Whether a catalog entry supports `deployment_mode`.
+/// The highly available `DeploymentMode` a catalog entry offers beside
+/// `SINGLE_INSTANCE`, or none when the entry offers only a single-instance broker.
 ///
-/// Every entry supports a single-instance broker. Beyond that the engine decides which
-/// highly available mode it has — ActiveMQ an active/standby pair, RabbitMQ a cluster
-/// (`DeploymentMode`'s documented modes, `DEPLOYMENT_MODE_VALUES`) — ActiveMQ's pair is
-/// offered on its shared EFS storage, and neither is offered on the
-/// single-instance-only sizes.
-fn supports_deployment_mode(
+/// The engine decides which highly available mode it has — ActiveMQ an active/standby
+/// pair, RabbitMQ a cluster (`DeploymentMode`'s documented modes,
+/// `DEPLOYMENT_MODE_VALUES`). ActiveMQ's pair shares one file system, so it is offered
+/// exactly where the entry's storage is EFS, at every size including the burstable one;
+/// RabbitMQ's cluster is offered from the smallest non-burstable size up.
+fn highly_available_deployment_mode(
     engine_type: &str,
     host_instance_type: &str,
     storage_type: &str,
-    deployment_mode: &str,
-) -> bool {
-    if deployment_mode == state::DEPLOYMENT_MODE_SINGLE_INSTANCE {
-        return true;
-    }
-    if SINGLE_INSTANCE_ONLY_HOST_INSTANCE_TYPES.contains(&host_instance_type) {
-        return false;
-    }
+) -> Option<&'static str> {
     match engine_type {
-        state::ENGINE_TYPE_RABBITMQ => deployment_mode == state::DEPLOYMENT_MODE_CLUSTER_MULTI_AZ,
-        _ => {
-            deployment_mode == state::DEPLOYMENT_MODE_ACTIVE_STANDBY_MULTI_AZ
-                && storage_type == state::STORAGE_TYPE_EFS
-        }
+        state::ENGINE_TYPE_RABBITMQ => (!is_burstable(host_instance_type))
+            .then_some(state::DEPLOYMENT_MODE_CLUSTER_MULTI_AZ),
+        _ => (storage_type == state::STORAGE_TYPE_EFS)
+            .then_some(state::DEPLOYMENT_MODE_ACTIVE_STANDBY_MULTI_AZ),
     }
 }
 
-/// Amazon MQ's whole instance-option catalog for `region`, in a stable order: by engine
-/// type as the model enumerates them, then by instance type as the catalog lists them,
-/// then by storage type. The order is what makes a `NextToken` offset name the same
-/// entry on a later call.
+/// The deployment modes a catalog entry reports: the single-instance mode every entry
+/// offers first, then the engine's highly available one where the entry offers it.
+fn supported_deployment_modes(
+    engine_type: &str,
+    host_instance_type: &str,
+    storage_type: &str,
+) -> Vec<String> {
+    let mut modes = vec![state::DEPLOYMENT_MODE_SINGLE_INSTANCE.to_string()];
+    modes.extend(
+        highly_available_deployment_mode(engine_type, host_instance_type, storage_type)
+            .map(str::to_string),
+    );
+    modes
+}
+
+/// The engine versions a catalog entry reports: the versions Amazon MQ currently offers
+/// for creation on that engine ([`state::published_engine_versions`], which holds them
+/// oldest first so a create defaults to the last), reported NEWEST first, the way the
+/// catalog publishes them.
+fn offered_engine_versions(engine_type: &str) -> Vec<String> {
+    state::published_engine_versions(engine_type)
+        .iter()
+        .rev()
+        .map(|version| (*version).to_string())
+        .collect()
+}
+
+/// A storage type as the instance-option catalog renders it: Amazon MQ publishes the
+/// catalog's `storageType` in LOWER case (`ebs`, `efs`), not in the upper-case spelling
+/// the `BrokerStorageType` enum uses for a broker's own storage type — so a client that
+/// feeds a value this catalog served back as the `storageType` filter, or compares it
+/// with a value from another catalog entry, matches.
+fn catalog_storage_type(storage_type: &str) -> String {
+    storage_type.to_ascii_lowercase()
+}
+
+/// Amazon MQ's whole instance-option catalog for `region`, in the order the service
+/// reports it: by host instance type as [`PUBLISHED_HOST_INSTANCE_TYPES`] lists them,
+/// then by engine type, then by storage type. The order is what makes a `NextToken`
+/// offset name the same entry on a later call.
 fn published_instance_options(region: &str) -> Vec<BrokerInstanceOption> {
     let zones: Vec<AvailabilityZone> = state::availability_zones_in_region(region)
         .into_iter()
@@ -355,37 +411,23 @@ fn published_instance_options(region: &str) -> Vec<BrokerInstanceOption> {
         .collect();
 
     let mut options = Vec::new();
-    for engine in PUBLISHED_ENGINE_OPTIONS {
-        for host_instance_type in engine.host_instance_types {
+    for host in PUBLISHED_HOST_INSTANCE_TYPES {
+        for engine_type in host.engine_types {
             for storage_type in BROKER_STORAGE_TYPE_VALUES {
-                if !offers_storage_type(engine.engine_type, host_instance_type, storage_type) {
+                if !offers_storage_type(engine_type, host.host_instance_type, storage_type) {
                     continue;
                 }
-                let supported_deployment_modes: Vec<String> = DEPLOYMENT_MODE_VALUES
-                    .iter()
-                    .filter(|deployment_mode| {
-                        supports_deployment_mode(
-                            engine.engine_type,
-                            host_instance_type,
-                            storage_type,
-                            deployment_mode,
-                        )
-                    })
-                    .map(|deployment_mode| (*deployment_mode).to_string())
-                    .collect();
                 options.push(BrokerInstanceOption {
                     availability_zones: Some(zones.clone()),
-                    engine_type: Some(engine.engine_type.to_string()),
-                    host_instance_type: Some((*host_instance_type).to_string()),
-                    storage_type: Some((*storage_type).to_string()),
-                    supported_deployment_modes: Some(supported_deployment_modes),
-                    supported_engine_versions: Some(
-                        engine
-                            .engine_versions
-                            .iter()
-                            .map(|version| (*version).to_string())
-                            .collect(),
-                    ),
+                    engine_type: Some((*engine_type).to_string()),
+                    host_instance_type: Some(host.host_instance_type.to_string()),
+                    storage_type: Some(catalog_storage_type(storage_type)),
+                    supported_deployment_modes: Some(supported_deployment_modes(
+                        engine_type,
+                        host.host_instance_type,
+                        storage_type,
+                    )),
+                    supported_engine_versions: Some(offered_engine_versions(engine_type)),
                 });
             }
         }
