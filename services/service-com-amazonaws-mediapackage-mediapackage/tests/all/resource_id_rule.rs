@@ -35,7 +35,8 @@ use service_com_amazonaws_mediapackage_mediapackage::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::{
-    call, create_channel, emulator, error_code, SeededGenerator, ACCOUNT, REGION,
+    call, create_channel, emulator, error_code, SeededGenerator, ACCOUNT,
+    CROSS_ACCOUNT_HARVEST_ROLE, REGION,
 };
 
 /// The floor the service publishes for an id, so the empty string is no id at all.
@@ -114,7 +115,7 @@ impl Created {
                 "s3Destination": {
                     "bucketName": "harvest-bucket",
                     "manifestKey": "index.m3u8",
-                    "roleArn": format!("arn:aws:iam::{ACCOUNT}:role/HarvestRole")
+                    "roleArn": CROSS_ACCOUNT_HARVEST_ROLE
                 }
             }),
         }

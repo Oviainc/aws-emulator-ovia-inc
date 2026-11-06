@@ -20,7 +20,9 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::channel_lifecycle::{call_in, emulator, error_code, ACCOUNT, REGION};
+use crate::channel_lifecycle::{
+    call_in, emulator, error_code, CROSS_ACCOUNT_HARVEST_ROLE, REGION,
+};
 
 /// One paginated listing of this service: the collection it enumerates and the output
 /// member its items arrive in.
@@ -113,7 +115,7 @@ async fn seed(router: &MultiServiceRouter, region: &str) {
                 "s3Destination": {
                     "bucketName": "harvest-bucket",
                     "manifestKey": "index.m3u8",
-                    "roleArn": format!("arn:aws:iam::{ACCOUNT}:role/HarvestRole")
+                    "roleArn": CROSS_ACCOUNT_HARVEST_ROLE
                 }
             })),
         )

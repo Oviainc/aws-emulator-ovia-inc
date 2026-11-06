@@ -31,7 +31,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_mediapackage_mediapackage::state;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::channel_lifecycle::{call, create_channel, emulator, error_code, ACCOUNT};
+use crate::channel_lifecycle::{
+    call, create_channel, emulator, error_code, CROSS_ACCOUNT_HARVEST_ROLE,
+};
 
 /// The channels this suite harvests from, with the endpoint each one holds and the jobs
 /// submitted against that endpoint — two channels, so a channel filter has something to
@@ -100,7 +102,7 @@ async fn provision(router: &MultiServiceRouter) {
                     "s3Destination": {
                         "bucketName": "filter-harvests",
                         "manifestKey": "harvests/index.m3u8",
-                        "roleArn": format!("arn:aws:iam::{ACCOUNT}:role/HarvestRole")
+                        "roleArn": CROSS_ACCOUNT_HARVEST_ROLE
                     }
                 })),
             )

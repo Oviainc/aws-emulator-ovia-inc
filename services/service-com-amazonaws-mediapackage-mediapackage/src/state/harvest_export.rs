@@ -141,6 +141,11 @@ async fn export(
 
 /// The Amazon S3 client a harvest writes its output with, addressed to `region`.
 ///
+/// Shared with [`super::harvest_destination`], which asks the same object store, through the
+/// same seam, whether the destination a submission names is one it holds: the destination a
+/// job is pre-flighted against and the one its export writes to are then reached by one
+/// client construction rather than two.
+///
 /// The transport is the emulator's own in-process callback, so the `endpoint_url` below is
 /// an ADDRESS the in-process router reads rather than a host any resolver looks up: this
 /// client reaches the emulator's own Amazon S3 and nothing else, whatever bucket or key a
@@ -150,7 +155,7 @@ async fn export(
 /// need a sleep implementation this client is not given. The same goes for caching the
 /// identity: the credentials the callback hands over are used directly, and they only sign
 /// this operation's in-process calls.
-fn s3_client(
+pub(super) fn s3_client(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> ::aws_sdk_s3::Client {

@@ -13,12 +13,14 @@
 //!    `EndTime` are modelled as plain `__string`, so text that is not an ISO-8601 instant
 //!    at all is refused as that member's own failure.
 //! 2. DESTINATION ROLE. MediaPackage writes the harvested content to the caller's bucket
-//!    AS the role `S3Destination.RoleArn` names, so a submission naming a role whose trust
-//!    policy withholds `sts:AssumeRole` from `mediapackage.amazonaws.com` is refused the
-//!    same way and persists nothing. The role is resolved against the account's IAM
-//!    records — the very records `CreateRole` wrote, in the same engine — and an ARN those
-//!    records hold no role for is no evidence of a missing trust, so such a submission is
-//!    accepted.
+//!    AS the role `S3Destination.RoleArn` names, so a submission naming a role the service
+//!    could not act as is refused the same way and persists nothing: one whose trust policy
+//!    withholds `sts:AssumeRole` from `mediapackage.amazonaws.com`, and one of THIS account
+//!    that the account's IAM records hold no role for at all — there is no role to assume,
+//!    so the harvest could never be written. The role is resolved against the account's IAM
+//!    records — the very records `CreateRole` wrote, in the same engine — and an ARN of
+//!    ANOTHER account stays exempt, because this emulator holds no record of another
+//!    account's roles and so establishes nothing about one.
 //!
 //! Every case drives real HTTP through the `MultiServiceRouter` — the same dispatch the
 //! served emulator uses — over ONE engine carrying both MediaPackage's store and IAM's, so
@@ -28,7 +30,8 @@
 //! The rows differ along what each rule generalises over: the window's direction and span,
 //! how the two instants are spelled, which member is unreadable, and the form of the trust
 //! policy (another principal, an explicit deny, a policy granting nothing, a wildcard
-//! action, a list of principals, and a role the store does not hold).
+//! action, a list of principals), plus the two roles no `CreateRole` created: one of this
+//! account and one of another.
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -40,7 +43,7 @@ use std::sync::Arc;
 /// request exactly as every other suite in this target does, so the two cannot drift.
 /// Only the ROUTER differs here, and `call` takes it as an argument. `urlencode` is this
 /// target's one percent-encoder, which is the escaping IAM's awsQuery body needs too.
-use crate::channel_lifecycle::{call, error_code};
+use crate::channel_lifecycle::{call, error_code, ACCOUNT, OTHER_ACCOUNT};
 use crate::resource_tags::urlencode;
 
 /// The channel, endpoint and bucket every row harvests from and to.
@@ -407,30 +410,39 @@ async fn a_window_is_harvestable_only_when_its_end_is_later_than_its_start() {
     }
 }
 
-/// One destination-role row: how the role's trust policy is written (or that no role is
-/// created at all), and whether the submission is accepted.
+/// Which role a destination-role row names.
+enum Named {
+    /// A role this account HOLDS, created by `CreateRole` with this trust policy.
+    Held(String),
+    /// A role ARN of THIS account that no `CreateRole` ever created, so the account's IAM
+    /// records hold no role for it.
+    AbsentFromThisAccount,
+    /// A role ARN of ANOTHER account, whose roles this emulator holds no record of.
+    AnotherAccount,
+}
+
+/// One destination-role row: which role the submission names, and whether it is accepted.
 struct Role {
     case: &'static str,
-    /// The trust policy document, or `None` for a role ARN the IAM store holds nothing
-    /// for.
-    document: Option<String>,
+    named: Named,
     accepted: bool,
 }
 
 /// Rows spanning the forms a trust policy takes around ONE rule — whether it grants this
-/// principal `sts:AssumeRole`. The reading of a policy document is property-tested where
-/// it lives (`services/common/src/iam_trust_policy.rs`); these rows pin what MediaPackage
-/// DOES with each answer.
+/// principal `sts:AssumeRole` — and the two ways an ARN names no role this emulator holds.
+/// The reading of a policy document is property-tested where it lives
+/// (`services/common/src/iam_trust_policy.rs`); these rows pin what MediaPackage DOES with
+/// each answer.
 fn roles() -> Vec<Role> {
     vec![
         Role {
             case: "a policy naming the principal and the action",
-            document: Some(assumable()),
+            named: Named::Held(assumable()),
             accepted: true,
         },
         Role {
             case: "a policy naming the principal among several",
-            document: Some(policy(
+            named: Named::Held(policy(
                 "Allow",
                 "[\"sts:TagSession\",\"sts:AssumeRole\"]",
                 &format!("[\"s3.amazonaws.com\",\"{PRINCIPAL}\"]"),
@@ -439,12 +451,12 @@ fn roles() -> Vec<Role> {
         },
         Role {
             case: "a policy allowing the principal every action",
-            document: Some(policy("Allow", "\"*\"", &format!("\"{PRINCIPAL}\""))),
+            named: Named::Held(policy("Allow", "\"*\"", &format!("\"{PRINCIPAL}\""))),
             accepted: true,
         },
         Role {
             case: "a policy naming another service's principal only",
-            document: Some(policy(
+            named: Named::Held(policy(
                 "Allow",
                 "\"sts:AssumeRole\"",
                 "\"mediaconvert.amazonaws.com\"",
@@ -453,7 +465,7 @@ fn roles() -> Vec<Role> {
         },
         Role {
             case: "a policy explicitly denying the principal",
-            document: Some(policy(
+            named: Named::Held(policy(
                 "Deny",
                 "\"sts:AssumeRole\"",
                 &format!("\"{PRINCIPAL}\""),
@@ -462,7 +474,7 @@ fn roles() -> Vec<Role> {
         },
         Role {
             case: "a policy naming an action that is not assuming the role",
-            document: Some(policy(
+            named: Named::Held(policy(
                 "Allow",
                 "\"s3:PutObject\"",
                 &format!("\"{PRINCIPAL}\""),
@@ -471,12 +483,17 @@ fn roles() -> Vec<Role> {
         },
         Role {
             case: "a policy carrying no statement at all",
-            document: Some("{\"Version\":\"2012-10-17\",\"Statement\":[]}".to_string()),
+            named: Named::Held("{\"Version\":\"2012-10-17\",\"Statement\":[]}".to_string()),
             accepted: false,
         },
         Role {
-            case: "a role ARN the IAM store holds no role for",
-            document: None,
+            case: "a role ARN of this account that the IAM store holds no role for",
+            named: Named::AbsentFromThisAccount,
+            accepted: false,
+        },
+        Role {
+            case: "a role ARN of another account",
+            named: Named::AnotherAccount,
             accepted: true,
         },
     ]
@@ -488,11 +505,16 @@ async fn a_destination_role_the_service_cannot_assume_is_refused_and_persists_no
     provision(&router).await;
 
     for (index, role) in roles().into_iter().enumerate() {
-        let role_arn = match &role.document {
-            Some(document) => {
+        let role_arn = match &role.named {
+            Named::Held(document) => {
                 create_role(&router, &format!("mediapackage-harvest-{index}"), document).await
             }
-            None => format!("arn:aws:iam::000000000000:role/unknown-to-iam-{index}"),
+            Named::AbsentFromThisAccount => {
+                format!("arn:aws:iam::{ACCOUNT}:role/unknown-to-iam-{index}")
+            }
+            Named::AnotherAccount => {
+                format!("arn:aws:iam::{OTHER_ACCOUNT}:role/unknown-to-iam-{index}")
+            }
         };
         let id = format!("role-{index}");
         let (status, answered) = submit(

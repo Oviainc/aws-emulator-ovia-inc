@@ -31,7 +31,9 @@ use service_com_amazonaws_mediapackage_mediapackage::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::channel_lifecycle::{call, create_channel, emulator, error_code, ACCOUNT};
+use crate::channel_lifecycle::{
+    call, create_channel, emulator, error_code, CROSS_ACCOUNT_HARVEST_ROLE,
+};
 
 /// The channel every endpoint below packages.
 const CHANNEL_ID: &str = "startover-channel";
@@ -170,7 +172,7 @@ fn submission(id: &str, endpoint: &str) -> Value {
         "s3Destination": {
             "bucketName": "startover-harvests",
             "manifestKey": "harvests/index.m3u8",
-            "roleArn": format!("arn:aws:iam::{ACCOUNT}:role/HarvestRole")
+            "roleArn": CROSS_ACCOUNT_HARVEST_ROLE
         }
     })
 }

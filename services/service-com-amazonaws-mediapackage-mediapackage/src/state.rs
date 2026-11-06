@@ -16,6 +16,7 @@
 //! into parallel structs, so a stored packaging configuration is byte-for-byte what a
 //! later read renders.
 
+pub mod harvest_destination;
 pub mod harvest_export;
 
 use crate::ops::types::{
@@ -3034,7 +3035,10 @@ pub fn assumable_role_requirement() -> String {
 /// withholds the grant is refused.
 ///
 /// ONE function for every such member: the rule is about the role, not about the operation
-/// that named it, so `member` is the only thing that differs between its callers.
+/// that named it, so `member` is the only thing that differs between its callers. A role
+/// the service has to act as to carry out the work the request asks it to do NOW — the
+/// destination role a harvest's own output is written as — is resolved one step further
+/// than this: see [`harvest_role_refusal`].
 pub fn assume_role_refusal(member: &str, role_arn: &str, iam: &IamState) -> Option<ServiceError> {
     let role = iam.roles.values().find(|role| role.arn == role_arn)?;
     let document = role.assume_role_policy_document.as_deref()?;
@@ -3047,8 +3051,38 @@ pub fn assume_role_refusal(member: &str, role_arn: &str, iam: &IamState) -> Opti
     }
 }
 
-/// [`assume_role_refusal`] for a harvest job's destination role.
+/// Whether `role_arn` names a role of THIS account that the account's IAM records hold no
+/// role for.
+///
+/// Which account a role ARN names is the shared reading every service that resolves a
+/// caller-supplied role ARN uses ([`::service_common::iam_role::role_name`]): it answers a
+/// role name only for an ARN of this account (an empty account field included), and nothing
+/// for one of ANOTHER account, whose roles are not this emulator's IAM to be asked about. So
+/// `false` covers both "this emulator holds the role" and "this emulator could not know".
+fn role_absent_from_this_account(role_arn: &str, iam: &IamState) -> bool {
+    ::service_common::iam_role::role_name(role_arn).is_some()
+        && !iam.roles.values().any(|role| role.arn == role_arn)
+}
+
+/// [`assume_role_refusal`] for a harvest job's destination role, which is resolved one step
+/// further than a role an endpoint write merely records.
+///
+/// MediaPackage carries a submitted harvest out ITSELF, writing the harvested manifest to
+/// the caller's bucket as this role ([`harvest_export`]), so a submission naming a role the
+/// service could not act as is refused up front. A role of THIS account that the account's
+/// IAM records hold no role for ([`role_absent_from_this_account`]) is one of those: there
+/// is no role to assume, so the harvest could never be written, and the refusal is the one
+/// this service words for every member naming a role it cannot act as
+/// ([`assumable_role_requirement`]) — "no such role" and "a trust that withholds the grant"
+/// are the same fact about the harvest. An ARN of another account stays exempt, because this
+/// emulator holds no record of another account's roles and so establishes nothing about it.
 pub fn harvest_role_refusal(role_arn: &str, iam: &IamState) -> Option<ServiceError> {
+    if role_absent_from_this_account(role_arn, iam) {
+        return Some(member_invalid(
+            HARVEST_ROLE_MEMBER,
+            assumable_role_requirement(),
+        ));
+    }
     assume_role_refusal(HARVEST_ROLE_MEMBER, role_arn, iam)
 }
 

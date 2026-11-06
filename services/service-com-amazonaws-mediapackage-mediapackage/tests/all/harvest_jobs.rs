@@ -18,7 +18,10 @@
 //!    terminal status it reaches is decided by whether the harvest's output reached its
 //!    destination, which `tests/all/harvest_export.rs` is the suite for — the submits
 //!    here name buckets no object store holds, so their harvests produce nothing and the
-//!    jobs fail.
+//!    jobs fail. (Nothing holds an object store HERE, so nothing answers about the
+//!    destination either and no submit is refused for it; the destination pre-flight is
+//!    `tests/all/harvest_destination.rs`, and the roles below are of another account for
+//!    the reason `channel_lifecycle::CROSS_ACCOUNT_HARVEST_ROLE` states.)
 //! 3. `ListHarvestJobs` filters by `IncludeChannelId` or by `IncludeStatus` — never by
 //!    both, which it refuses (`tests/all/mutually_exclusive_list_filters.rs`) — BEFORE
 //!    paging, so the filtered pages carry exactly the matching jobs, in id order, with a
@@ -42,7 +45,8 @@ use smithy_server_runtime::MultiServiceRouter;
 /// transition the clock owes, and hold it open or bring it forward, so the transient
 /// window is deterministic instead of raced against the wall clock.
 use crate::channel_lifecycle::{
-    call, create_channel, emulator_with_engine as fixture, error_code, ACCOUNT, REGION,
+    call, create_channel, emulator_with_engine as fixture, error_code, ACCOUNT,
+    CROSS_ACCOUNT_HARVEST_ROLE, OTHER_ACCOUNT, REGION,
 };
 
 /// The channels this suite's endpoints package, and the endpoint each channel holds.
@@ -125,7 +129,7 @@ fn submits() -> Vec<Submit> {
                 "s3Destination": {
                     "bucketName": "harvest-bucket",
                     "manifestKey": "index.m3u8",
-                    "roleArn": format!("arn:aws:iam::{ACCOUNT}:role/HarvestRole")
+                    "roleArn": CROSS_ACCOUNT_HARVEST_ROLE
                 }
             }),
         },
@@ -139,7 +143,7 @@ fn submits() -> Vec<Submit> {
                 "s3Destination": {
                     "bucketName": "another-harvest-bucket",
                     "manifestKey": "harvests/2026/02/03/index.mpd",
-                    "roleArn": format!("arn:aws:iam::{ACCOUNT}:role/service-role/Harvester")
+                    "roleArn": format!("arn:aws:iam::{OTHER_ACCOUNT}:role/service-role/Harvester")
                 }
             }),
         },
@@ -153,7 +157,7 @@ fn submits() -> Vec<Submit> {
                 "s3Destination": {
                     "bucketName": "sports.harvests",
                     "manifestKey": "live-to-vod/game-7/index.m3u8",
-                    "roleArn": format!("arn:aws:iam::{ACCOUNT}:role/Harvest-Role_2")
+                    "roleArn": format!("arn:aws:iam::{OTHER_ACCOUNT}:role/Harvest-Role_2")
                 }
             }),
         },
@@ -167,7 +171,7 @@ fn submits() -> Vec<Submit> {
                 "s3Destination": {
                     "bucketName": "harvest-bucket",
                     "manifestKey": "minute/index.m3u8",
-                    "roleArn": format!("arn:aws:iam::{ACCOUNT}:role/HarvestRole")
+                    "roleArn": CROSS_ACCOUNT_HARVEST_ROLE
                 }
             }),
         },

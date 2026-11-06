@@ -23,7 +23,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 // The crate's shared test client. `call_in` is the region-parameterised round trip, which
 // this suite needs because the Region a request is served in is its subject.
-use crate::channel_lifecycle::{call_in, emulator, error_code, ACCOUNT};
+use crate::channel_lifecycle::{call_in, emulator, error_code, ACCOUNT, CROSS_ACCOUNT_HARVEST_ROLE};
 // The tagging operations address a resource by ARN inside one percent-encoded path
 // segment; the escaping lives once, in the tagging suite.
 use crate::resource_tags::{tags_path, urlencode};
@@ -122,7 +122,7 @@ fn harvest_body(endpoint_id: &str) -> Value {
         "s3Destination": {
             "bucketName": "harvest-bucket",
             "manifestKey": "index.m3u8",
-            "roleArn": format!("arn:aws:iam::{ACCOUNT}:role/HarvestRole")
+            "roleArn": CROSS_ACCOUNT_HARVEST_ROLE
         }
     })
 }

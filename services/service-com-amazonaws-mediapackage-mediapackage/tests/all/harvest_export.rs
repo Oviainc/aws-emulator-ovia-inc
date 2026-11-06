@@ -19,8 +19,11 @@
 //! The rows differ along what the rule generalises over: the endpoint's PACKAGING FORMAT
 //! (and so which manifest format is written), the length and form of the harvested window,
 //! the shape of the destination key (bare, nested, dotted) and which bucket it is in. The
-//! failure side varies how the destination cannot be written: a bucket the account does not
-//! hold, and an assembly with no object store at all.
+//! failure side varies how the destination stops being writable AFTER the submission was
+//! accepted: a bucket the account no longer holds (deleted between the submit and the
+//! instant the harvest fell due), and an assembly with no object store at all. A destination
+//! that could not be written to WHEN THE JOB WAS SUBMITTED is refused outright rather than
+//! submitted — `tests/all/harvest_destination.rs` is the suite for that pre-flight.
 
 use std::sync::Arc;
 
@@ -29,7 +32,7 @@ use service_com_amazonaws_mediapackage_mediapackage::state;
 use service_com_amazonaws_mediapackage_mediapackage::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::channel_lifecycle::{call, create_channel, ACCOUNT, REGION};
+use crate::channel_lifecycle::{call, create_channel, CROSS_ACCOUNT_HARVEST_ROLE, REGION};
 use crate::harvest_jobs::{hold_transitions_open, make_transitions_due};
 
 /// A SigV4 credential scope naming Amazon S3, which is what claims a request for the
@@ -58,7 +61,10 @@ fn emulator_with_object_storage() -> (MultiServiceRouter, Arc<engine::InMemoryEn
 
 /// One path-style request to the emulator's Amazon S3 front door, answering the status,
 /// the `Content-Type` it was served with and the body bytes.
-async fn s3(
+///
+/// Shared with `tests/all/harvest_destination.rs`, which provisions and reads the same
+/// destinations through the same front door.
+pub(crate) async fn s3(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -84,7 +90,7 @@ async fn s3(
 
 /// `PUT /<bucket>` — `CreateBucket`, naming this Region so the endpoint the request was
 /// sent to can serve it.
-async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
+pub(crate) async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
     let body = format!(
         "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <LocationConstraint>{REGION}</LocationConstraint>\
@@ -99,8 +105,19 @@ async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
     );
 }
 
+/// `DELETE /<bucket>` — `DeleteBucket`, which a bucket holding no object accepts (204).
+async fn delete_bucket(router: &MultiServiceRouter, bucket: &str) {
+    let (status, _, served) = s3(router, "DELETE", &format!("/{bucket}"), &[]).await;
+    assert_eq!(
+        status,
+        204,
+        "the destination bucket {bucket:?} must be removable, got {status} {:?}",
+        String::from_utf8_lossy(&served)
+    );
+}
+
 /// `GET /<bucket>/<key>` — `GetObject`, answering the status, the media type and the bytes.
-async fn get_object(
+pub(crate) async fn get_object(
     router: &MultiServiceRouter,
     bucket: &str,
     key: &str,
@@ -234,7 +251,7 @@ async fn submit(
             "s3Destination": {
                 "bucketName": bucket,
                 "manifestKey": row.manifest_key,
-                "roleArn": format!("arn:aws:iam::{ACCOUNT}:role/HarvestRole")
+                "roleArn": CROSS_ACCOUNT_HARVEST_ROLE
             }
         })),
     )
@@ -337,15 +354,18 @@ async fn a_harvest_writes_its_top_level_manifest_and_then_reports_success() {
 #[tokio::test]
 async fn a_harvest_whose_manifest_cannot_be_placed_reports_failure() {
     let (router, engine) = emulator_with_object_storage();
-    // The destination bucket of each row is NEVER created, so the object store answers
-    // that it holds no such bucket and the harvest has nowhere to write. The rows differ
-    // along the shape of the name, so the outcome is not a property of one spelling.
-    let absent_buckets = ["harvest-missing", "harvest.missing-2", "missing3"];
+    // The destination of each row is created — a submission naming a bucket the account does
+    // not hold is refused outright — and then DELETED while the job is still harvesting, so
+    // by the time the clock makes the export due the manifest has nowhere to go. The rows
+    // differ along the shape of the name, so the outcome is not a property of one spelling.
+    let doomed_buckets = ["harvest-doomed", "harvest.doomed-2", "doomed3"];
 
-    for (row, bucket) in rows().into_iter().zip(absent_buckets) {
+    for (row, bucket) in rows().into_iter().zip(doomed_buckets) {
         let case = row.case;
         create_endpoint(&router, &row).await;
+        create_bucket(&router, bucket).await;
         submit(&router, &engine, &row, bucket).await;
+        delete_bucket(&router, bucket).await;
 
         make_transitions_due(&engine);
         assert_eq!(

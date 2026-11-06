@@ -33,7 +33,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::channel_lifecycle::{call, error_code, ACCOUNT, REGION};
+use crate::channel_lifecycle::{call, error_code, CROSS_ACCOUNT_HARVEST_ROLE, REGION};
 use crate::harvest_job_rejections::{create_role, emulator, policy, PRINCIPAL};
 
 /// The channel every endpoint below packages.
@@ -381,9 +381,10 @@ async fn seed(router: &MultiServiceRouter) {
                 "s3Destination": {
                     "bucketName": "wording-harvests",
                     "manifestKey": "harvests/index.m3u8",
-                    // An ARN the IAM store holds no role for is no evidence of a missing
-                    // trust, so the submission is accepted.
-                    "roleArn": format!("arn:aws:iam::{ACCOUNT}:role/HarvestRole")
+                    // A role of ANOTHER account is one this emulator holds no record of, so
+                    // it establishes nothing about it and the submission is accepted (see
+                    // `channel_lifecycle::CROSS_ACCOUNT_HARVEST_ROLE`).
+                    "roleArn": CROSS_ACCOUNT_HARVEST_ROLE
                 }
             })),
         )

@@ -31,6 +31,23 @@ pub(crate) const REGION: &str = "eu-west-1";
 /// The emulator's canonical placeholder account id (`emulator_account_id`).
 pub(crate) const ACCOUNT: &str = "000000000000";
 
+/// An account id that is NOT this emulator's own ([`ACCOUNT`]), for a value that has to name
+/// a resource of another account.
+pub(crate) const OTHER_ACCOUNT: &str = "210987654321";
+
+/// A harvest destination role in ANOTHER account ([`OTHER_ACCOUNT`]).
+///
+/// `CreateHarvestJob` pre-flights the destination it would write the harvested manifest to,
+/// and a role of THIS account that the account's IAM records hold no role for is one
+/// MediaPackage could not act as, so such a submission is refused
+/// (`state::harvest_role_refusal`). This emulator holds no record of ANOTHER account's
+/// roles, so it establishes nothing about one and refuses nothing for it — which is what
+/// lets the suites whose subject is not the destination (paging, filters, Region isolation,
+/// the id rule, the refusal wording) submit a job without provisioning IAM. The destination
+/// rule itself, with roles a real `CreateRole` created and buckets a real `CreateBucket`
+/// created, is `tests/all/harvest_destination.rs`.
+pub(crate) const CROSS_ACCOUNT_HARVEST_ROLE: &str = "arn:aws:iam::210987654321:role/HarvestRole";
+
 /// A fresh emulator holding only this service, with request authentication off (these
 /// tests exercise behaviour, not signing).
 pub(crate) fn emulator() -> MultiServiceRouter {

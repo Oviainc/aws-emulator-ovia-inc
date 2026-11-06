@@ -31,6 +31,8 @@ mod duration_floor_one_implementation;
 mod empty_response_framing;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/harvest_destination.rs"]
+mod harvest_destination;
 #[path = "all/harvest_export.rs"]
 mod harvest_export;
 #[path = "all/harvest_job_rejections.rs"]

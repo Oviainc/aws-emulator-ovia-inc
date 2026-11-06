@@ -31,7 +31,8 @@ use smithy_server_runtime::MultiServiceRouter;
 /// window in which a job is still harvesting is deterministic rather than raced against
 /// the wall clock.
 use crate::channel_lifecycle::{
-    call, call_in, create_channel, emulator_with_engine as fixture, error_code, ACCOUNT, REGION,
+    call, call_in, create_channel, emulator_with_engine as fixture, error_code,
+    CROSS_ACCOUNT_HARVEST_ROLE, REGION,
 };
 /// Writing the emulator's OWN stored due instant lives once, in the harvest-job suite.
 use crate::harvest_jobs::{hold_transitions_open, make_transitions_due};
@@ -62,7 +63,7 @@ pub(crate) fn job_body(id: &str, endpoint: &str) -> Value {
         "s3Destination": {
             "bucketName": "harvest-bucket",
             "manifestKey": format!("{id}/index.m3u8"),
-            "roleArn": format!("arn:aws:iam::{ACCOUNT}:role/HarvestRole")
+            "roleArn": CROSS_ACCOUNT_HARVEST_ROLE
         }
     })
 }

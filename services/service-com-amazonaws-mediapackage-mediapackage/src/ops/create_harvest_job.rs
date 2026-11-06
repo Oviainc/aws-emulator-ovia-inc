@@ -12,7 +12,7 @@
 //! manifest, into the destination bucket) and which modelled terminal status the outcome
 //! of that write decides.
 //!
-//! ## What this handler decides about the harvest window, the endpoint and the destination role
+//! ## What this handler decides about the harvest window, the endpoint and the destination
 //!
 //! A submission is accepted only when it can be carried out, and every check happens
 //! before the store is touched, so a refused submission persists nothing:
@@ -29,25 +29,31 @@
 //!   so an endpoint whose startover playback is disabled retains nothing to harvest and
 //!   the submission is refused ([`crate::state::OriginEndpointRecord::startover_enabled`],
 //!   read off the stored endpoint);
-//! * the DESTINATION ROLE is the identity MediaPackage writes the harvested content as, so
-//!   the value has to BE an IAM role ARN ([`crate::state::IAM_ROLE_ARN`]) and the role's
-//!   trust policy has to grant `mediapackage.amazonaws.com` `sts:AssumeRole`. The role is
-//!   resolved against the account's IAM records in the same engine and read through the one
-//!   shared trust-policy evaluator ([`crate::state::harvest_role_refusal`]).
+//! * the DESTINATION is where the harvest's own output goes, so it is pre-flighted before
+//!   the job exists ([`crate::state::harvest_destination`]): the ROLE is the identity
+//!   MediaPackage writes as, so the value has to BE an IAM role ARN
+//!   ([`crate::state::IAM_ROLE_ARN`]) and has to name a role this service could act as —
+//!   one the account's IAM records hold, whose trust policy grants
+//!   `mediapackage.amazonaws.com` `sts:AssumeRole` ([`crate::state::harvest_role_refusal`])
+//!   — and the BUCKET has to be a name Amazon S3 holds a bucket under and a bucket this
+//!   account HOLDS, which is asked of Amazon S3 itself through its own front door.
 //!
-//! All three answer the modelled `UnprocessableEntityException` (422) keyed by the member
+//! All of them answer the modelled `UnprocessableEntityException` (422) keyed by the member
 //! the caller has to fix. Whether the harvest window lies INSIDE the endpoint's startover
 //! period is NOT decided here: nothing published states that bound for this service in a
 //! form this emulator can apply, so guessing it would refuse submissions AWS accepts.
 //!
-//! The three are decided in the order listed, which is the order a submission failing
-//! several of them is told to fix them in: a precondition read off the STORED endpoint the
-//! request acts on is reported before a refusal about a role the service would have to
-//! assume, because the role is not what such a caller has to fix. The role verdict is
-//! computed against the IAM store BEFORE this service's guard is taken (so the two stores
-//! are only ever locked in one order) and HELD until the endpoint has been resolved and its
-//! precondition decided — exactly as `UpdateOriginEndpoint` holds the same verdict until it
-//! has resolved the endpoint its request addresses.
+//! They are decided in the order listed, which is the order a submission failing several of
+//! them is told to fix them in: a precondition read off the STORED endpoint the request acts
+//! on is reported before a refusal about the destination the service would have to write to,
+//! because the destination is not what such a caller has to fix; and of the destination, the
+//! role before the bucket, since a submission the service could not write as cannot be
+//! written anywhere. The destination verdicts are computed against the OTHER services' own
+//! records (the account's IAM store, the account's object store) BEFORE this service's guard
+//! is taken — so no two orders of the same two locks exist, and the object store's front
+//! door never waits on this service's lock — and HELD until the endpoint has been resolved
+//! and its precondition decided, exactly as `UpdateOriginEndpoint` holds the same role
+//! verdict until it has resolved the endpoint its request addresses.
 //!
 //! ## Shape of an operation
 //!
@@ -253,18 +259,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // producing a job id for a harvest that cannot happen. The role has to BE an IAM
         // role ARN — a value that is not one names no role to assume, which is a value in
         // the request and nothing to do with any stored resource, so it is judged here with
-        // the request's other members.
+        // the request's other members. The bucket is judged the same way for the same
+        // reason: a value outside Amazon S3's published naming rules names no bucket
+        // anywhere, so no provisioning could make such a submission servable.
         crate::state::check_arn_member(
             crate::state::HARVEST_ROLE_MEMBER,
             &input.s3_destination.role_arn,
             crate::state::IAM_ROLE_ARN,
         )?;
+        crate::state::harvest_destination::check_bucket_name(&input.s3_destination.bucket_name)?;
         // Whether the service could ACT AS that role is decided against the account's IAM
         // records — a different store in the same engine, and no IAM handler reads this one;
         // its guard is taken and released BEFORE this service's, so no two orders of the
         // same two locks exist. The ANSWER is held and reported below, after the endpoint
         // the submission harvests has been resolved and its own precondition decided, so a
-        // submission failing both is told to fix the endpoint rather than the role.
+        // submission failing both is told to fix the endpoint rather than the destination.
         let iam = crate::state::iam_state(&*self.engine).ok_or_else(|| {
             CreateHarvestJobErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -275,6 +284,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let role_refusal =
             crate::state::harvest_role_refusal(&input.s3_destination.role_arn, &iam.lock());
 
+        // MediaPackage is regional: this job belongs to the Region this request is served
+        // in, the endpoint it names resolves only among that Region's records, and the
+        // destination is resolved in that Region's object store.
+        let region = crate::state::request_region(ctx.parts());
+        // Whether the account HOLDS the destination bucket is Amazon S3's own answer, asked
+        // through its front door with no guard held, and held like the role's verdict above.
+        // It is not asked at all for a submission the role already refuses: the role is
+        // reported first, so nothing is resolved for a destination the service could not
+        // write as.
+        let bucket_refusal = if role_refusal.is_some() {
+            None
+        } else {
+            crate::state::harvest_destination::bucket_refusal(
+                ctx,
+                &region,
+                &input.s3_destination.bucket_name,
+            )
+            .await
+        };
+
         let now = std::time::SystemTime::now();
         // The clock, not this call, carries a submitted job's harvest out and moves its
         // status: materialise first what was already due, so the duplicate-id rule below
@@ -284,9 +313,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::harvest_export::settle_due_harvests(&state, ctx, now).await;
 
         let mut state = state.lock();
-        // MediaPackage is regional: this job belongs to the Region this request is served
-        // in, and the endpoint it names resolves only among that Region's records.
-        let region = crate::state::request_region(ctx.parts());
 
         // A HarvestJob harvests ONE origin endpoint: an `OriginEndpointId` naming no
         // stored endpoint OF THIS REGION has nothing to harvest, so the job is not
@@ -306,10 +332,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !endpoint.startover_enabled() {
             return Err(crate::state::startover_required("originEndpointId").into());
         }
-        // The endpoint being harvested holds up its end, so the destination role is now the
-        // thing the caller has to fix, and the verdict read off the IAM store above is
-        // reported.
+        // The endpoint being harvested holds up its end, so the destination is now the thing
+        // the caller has to fix, and the verdicts read off the other services' records above
+        // are reported — the role first, then the bucket.
         if let Some(refusal) = role_refusal {
+            return Err(refusal.into());
+        }
+        if let Some(refusal) = bucket_refusal {
             return Err(refusal.into());
         }
         // The channel harvested is the one the STORED endpoint packages; the request does
