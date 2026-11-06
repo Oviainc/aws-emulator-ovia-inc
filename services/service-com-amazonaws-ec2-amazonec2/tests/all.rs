@@ -836,6 +836,10 @@ mod ipam_prefix_list_resolvers;
 mod ipam_prefix_list_resolver_targets;
 #[path = "all/ipam_routing_policy_registrations.rs"]
 mod ipam_routing_policy_registrations;
+// The RPKI validation `GetIpamRouteProtectionFindings` reports for the BYOIP routes an IPAM
+// manages.
+#[path = "all/ipam_route_protection_findings.rs"]
+mod ipam_route_protection_findings;
 // What `ModifyHosts` applies to the Dedicated Hosts it names, what it leaves as it was, which
 // hosts it reports unsuccessful, and what the request itself is refused for. Declared here
 // rather than in sorted position for the reason the header gives: the `modify_*` neighbourhood

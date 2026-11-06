@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIpamRouteProtectionFindings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIpamRouteProtectionFindings`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: reports the RPKI validation of the BYOIP routes the IPAM named by `IpamId`
+//! manages, out of [`crate::state`] — one finding per route announcement (a prefix and the
+//! ASN that originates it), narrowed by the request's `Filters` and served one
+//! `MaxResults`-sized page at a time. A reporting operation: the only write it makes is to
+//! materialise the state transitions the clock has ALREADY made due, which were owed at the
+//! same instant whether or not anybody called. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIpamRouteProtectionFindings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +144,667 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIpamRouteProtectionFindings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIpamRouteProtectionFindingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIpamRouteProtectionFindings"))
+        // `ctx` carries request metadata only; this operation reads none of it — a finding
+        // reports the Region of the IPAM pool the route is managed in
+        // (`IpamRouteProtectionFinding$ResourceRegion`), so the store is not per-Region. The
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state::{
+            self, CompiledFilter, MatchBudget, PageTokenRule, MAX_FILTERS,
+            MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE,
+        };
+
+        // The request's own FORM first, before anything is resolved and before the DryRun arm
+        // below: "not an IPAM id at all" is a malformed request rather than an IPAM that does
+        // not exist, which is the order every resource of this crate asks the two questions in
+        // (`crate::state::require_well_formed_id`).
+        let ipam_id = input.ipam_id.as_str();
+        state::require_well_formed_id(
+            state::IPAM_ID_PREFIX,
+            ipam_id,
+            state::INVALID_IPAM_ID_MALFORMED,
+        )?;
+
+        // "The token for the next page of results"
+        // (`GetIpamRouteProtectionFindingsRequest$NextToken`) — anything else is refused
+        // rather than read as a position. These are the findings of ONE IPAM, so each walk has
+        // its own position order and the token is SCOPED to the IPAM it was minted for: a
+        // token from another IPAM's walk is refused rather than resumed inside this one.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_scoped_page_token(token, ipam_id)
+                    .ok_or_else(|| state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // Matching cost is filters x values x held values x reported findings and the model
+        // bounds none of them (`Filters` is a plain `FilterList`), so the request-controlled
+        // factors are capped here, before any work proportional to them is done — and their
+        // PRODUCT is charged to one [`MatchBudget`] below, which is the bound the per-factor
+        // caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not resolve is refused whether or not any finding
+        // would have matched it, so an unsupported filter can never read as "no findings".
+        // Each filter's values are parsed into their wildcard patterns ONCE here, not once per
+        // candidate.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !is_documented_filter(name) {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "Checks whether you have the required permissions for the operation, without
+        // actually making the request" (`GetIpamRouteProtectionFindingsRequest$DryRun`). Every
+        // caller of this emulator is permitted, so a dry run reports that outcome and reads
+        // nothing. It sits AFTER every parameter has been validated: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused is refused with
+        // that reason instead.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // The clock-owed transitions this read is allowed to apply — the same call every other
+        // report in this crate makes: a range a provision answered as `pending-provision` is
+        // `provisioned` once its due instant has passed, whether or not anybody called, so
+        // applying it here changes nothing a later caller would not have seen anyway.
+        store.materialize_due_transitions();
+
+        // An IPAM id the account holds no IPAM for is an error, not an empty report: there is
+        // no IPAM whose routes could be sampled.
+        let Some(ipam) = store.ipams.get(ipam_id) else {
+            return Err(state::invalid_ipam_id_not_found(ipam_id));
+        };
+        // The pools of THIS IPAM, which is what decides whose routes these findings are: a
+        // pool names its IPAM by `IpamPool$IpamArn` (the modelled [`IpamPool`] carries no IPAM
+        // id at all), the same member the scope count is recounted by.
+        let ipam_arn = ipam.ipam_arn.clone().unwrap_or_default();
+        let pools: ::std::collections::BTreeMap<&str, &IpamPool> = store
+            .ipam_pools
+            .iter()
+            .filter(|(_, pool)| pool.ipam_arn.as_deref() == Some(ipam_arn.as_str()))
+            .map(|(pool_id, pool)| (pool_id.as_str(), pool))
+            .collect();
+
+        // The ROA data this sample is validated against, read once for the whole call rather
+        // than once per route.
+        let roas = published_roas(&store, ipam_id);
+
+        // "The time when the route was last sampled" and "the time when the ROA data was last
+        // sampled" (`IpamRouteProtectionFinding$SampleTime` / `$RoaSampleTime`): this call
+        // samples the routes and the authorizations the store holds as they stand, so both are
+        // the instant that sample was taken, and every finding of one sample carries it.
+        let sample_time = state::system_time_to_date_time(::std::time::SystemTime::now());
+
+        // Every route the IPAM manages, validated against those ROAs, with every filter then
+        // holding ("If you specify multiple filters, the filters are joined with an AND" —
+        // `Filter`). Every comparison — the validation's as well as the filtering's — is
+        // charged to ONE budget, so the PRODUCT of routes, published authorizations, filters,
+        // values, held values and value length is bounded however many of each the account
+        // holds and the caller combines, which is also what bounds how long this holds the
+        // state lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<SelectedFinding> = Vec::new();
+        for (cidr, route) in &store.byoip_cidrs {
+            if budget.exhausted() {
+                break;
+            }
+            // "The ID of the IPAM pool associated with the CIDR" (`ByoipCidr$IpamPoolId`),
+            // which `MoveByoipCidrToIpam` is what writes: a range in no pool of this IPAM is no
+            // route of this IPAM.
+            let Some(pool) = route
+                .byoip_cidr
+                .ipam_pool_id
+                .as_deref()
+                .and_then(|pool_id| pools.get(pool_id))
+            else {
+                continue;
+            };
+            // Which ROAs COVER a prefix is a fact of the prefix and not of who announces it, so
+            // the address ranges are compared once per route and each announcement below only
+            // asks which of the covering ones authorize ITS ASN. The comparisons are charged
+            // before they run, their count being known: one per published ROA.
+            if !budget.spend_steps(u64::try_from(roas.len()).unwrap_or(u64::MAX)) {
+                break;
+            }
+            let covering: Vec<&PublishedRoa> = roas
+                .iter()
+                .filter(|roa| state::cidr_block_contains_block(&roa.prefix, cidr))
+                .collect();
+            for asn in route_origin_asns(route) {
+                if budget.exhausted() {
+                    break;
+                }
+                let finding =
+                    route_protection_finding(cidr, route, pool, asn, &covering, sample_time);
+                if state::matches_every_filter(&selectors, &mut budget, &|name| {
+                    filter_values(&finding, name)
+                }) {
+                    selected.push(SelectedFinding {
+                        position: finding_position(cidr, asn),
+                        finding,
+                    });
+                }
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as a
+        // result: the request asked for more work than one call will do, and is told so rather
+        // than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "Validating this IPAM's route announcements against the authorizations it \
+                     has published, under the request's filters, would take more than \
+                     {MAX_FILTER_MATCH_STEPS} comparisons; narrow the filters"
+                ),
+            ));
+        }
+
+        // Page in route-announcement order, which the cursor names a position in: one
+        // announcement is one prefix originated by one ASN, so that pair is a total order over
+        // the sample and the cursor always advances. The store is an ordered map, so its
+        // iteration order already satisfies the prefix half; sorting here establishes the
+        // invariant the cursor depends on at the point of use.
+        selected.sort_by(|left, right| left.position.cmp(&right.position));
+        selected.dedup_by(|left, right| left.position == right.position);
+
+        // "The maximum number of results to return in a single call. If not specified, all
+        // available results are returned" (`GetIpamRouteProtectionFindingsRequest$MaxResults`):
+        // a request naming no page size is not paged at all, which is the `None`
+        // [`state::scoped_page_from_cursor`] takes — and with it the answer carries no token,
+        // because there is no next page to ask for. The model's `range 5..1000` has already
+        // refused anything outside it, so the only value that cannot convert is one the
+        // boundary validator would have rejected.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .map(|max_results| max_results.min(MAX_PAGE_SIZE));
+
+        // The page and "the token to use to retrieve the next page of results"
+        // (`GetIpamRouteProtectionFindingsResult$NextToken`) both come from the crate's one
+        // pager: a cursor naming the last announcement of the page just answered, and a token
+        // only when a further announcement follows it.
+        let (page, next_token) = state::scoped_page_from_cursor(
+            ipam_id,
+            &selected,
+            cursor.as_deref(),
+            limit,
+            PageTokenRule::WhenAnotherItemFollows,
+            |selected| selected.position.as_str(),
+        );
+
+        Ok(GetIpamRouteProtectionFindingsOutput {
+            // "The ID of the IPAM" (`GetIpamRouteProtectionFindingsResult$IpamId`): the IPAM
+            // this report is of, which the store holds.
+            ipam_id: Some(ipam_id.to_string()),
+            route_protection_findings: Some(
+                page.iter()
+                    .map(|selected| selected.finding.clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
+
+/// One finding of the sample, beside the position the page cursor names it by.
+///
+/// The position is carried rather than read off the finding because it spans TWO of its
+/// members — the prefix and the originating ASN — and the pager takes one `&str` per item.
+#[derive(Debug, Clone)]
+struct SelectedFinding {
+    /// This announcement's position in the sample's order ([`finding_position`]).
+    position: String,
+    /// The finding as the model shapes it.
+    finding: IpamRouteProtectionFinding,
+}
+
+/// What separates the prefix from the originating ASN in the position one announcement is
+/// paged by: a character neither an address prefix nor an ASN carries, so the two halves
+/// cannot run together and the position order is the (prefix, ASN) order it stands for.
+const FINDING_POSITION_SEPARATOR: char = '|';
+
+/// The position of the announcement of `cidr` by `asn` in the sample's order.
+fn finding_position(cidr: &str, asn: Option<&str>) -> String {
+    format!(
+        "{cidr}{FINDING_POSITION_SEPARATOR}{asn}",
+        asn = asn.unwrap_or_default()
+    )
+}
+
+/// One Route Origin Authorization the IPAM has published to the RPKI, as the validation below
+/// reads it.
+///
+/// Read off the routing policy registrations the IPAM's internet registry associations hold —
+/// "contains information about a routing policy registration that represents a Route Origin
+/// Authorization (ROA) managed through IPAM" (`IpamRoutingPolicyRegistration`) — so what this
+/// report validates against and what `GetIpamRoutingPolicyRegistrations` reports cannot
+/// disagree.
+#[derive(Debug, Clone)]
+struct PublishedRoa {
+    /// "The IP address prefix in CIDR notation authorized by the ROA"
+    /// (`IpamRoutingPolicyRegistration$Cidr`), in the canonical form the store keys it by.
+    prefix: String,
+    /// "The Autonomous System Numbers (ASNs) authorized to originate the prefix"
+    /// (`IpamRoutingPolicyRegistration$Asns`).
+    asns: Vec<String>,
+    /// The longest prefix those ASNs are authorized to announce ([`authorized_max_length`]).
+    max_length: u32,
+}
+
+/// The ROAs the IPAM `ipam_id` names has published, out of the store.
+///
+/// An association names its IPAM by `IpamInternetRegistryAssociation$IpamId`, so the
+/// registrations under the associations of THIS IPAM are the authorizations its routes are
+/// validated against. Which registrations the registry still holds is the crate's one reading
+/// of that question
+/// ([`crate::state::IpamInternetRegistryAssociationRecord::held_registration_cidrs`]): one
+/// whose withdrawal has only been started is still an authorization the registry has not
+/// dropped, and one whose withdrawal has finished is not.
+fn published_roas(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    ipam_id: &str,
+) -> Vec<PublishedRoa> {
+    let mut published: Vec<PublishedRoa> = Vec::new();
+    for record in store.ipam_internet_registry_associations.values() {
+        if record.view.ipam_id.as_deref() != Some(ipam_id) {
+            continue;
+        }
+        for cidr in record.held_registration_cidrs() {
+            let Some(registration) = record.registrations.get(cidr) else {
+                continue;
+            };
+            // A prefix this emulator cannot read as an address prefix authorizes nothing: the
+            // validation below is a comparison of address ranges, and a value that names no
+            // range has none to compare.
+            let Some(prefix_length) = crate::state::cidr_block_prefix_length(cidr) else {
+                continue;
+            };
+            published.push(PublishedRoa {
+                prefix: cidr.to_string(),
+                asns: registration.view.asns.clone().unwrap_or_default(),
+                max_length: authorized_max_length(&registration.view, prefix_length),
+            });
+        }
+    }
+    published
+}
+
+/// The longest prefix one ROA authorizes its ASNs to announce, from the registration that
+/// published it and the length `prefix_length` of the prefix it is for.
+///
+/// "Specifies whether to permit more specific route announcements than the CIDR prefix. When
+/// enabled, ASNs can announce sub-prefixes of the authorized CIDR up to the specified maximum
+/// length. Default: false" (`IpamRoutingPolicyRegistration$PermitMoreSpecificAnnouncements`),
+/// and "the maximum prefix length that the ASNs are authorized to announce" (`$MaxLength`): a
+/// registration that permits no more specific announcement authorizes the prefix itself and
+/// nothing longer, and one that does, but names no maximum, authorizes no more than that
+/// either. A maximum SHORTER than the prefix would authorize less than the prefix the ROA is
+/// for, which is not something a maximum length can say, so the prefix's own length is the
+/// floor.
+fn authorized_max_length(
+    registration: &IpamRoutingPolicyRegistration,
+    prefix_length: u32,
+) -> u32 {
+    if !registration
+        .permit_more_specific_announcements
+        .unwrap_or(false)
+    {
+        return prefix_length;
+    }
+    registration
+        .max_length
+        .and_then(|max_length| u32::try_from(max_length).ok())
+        .unwrap_or(prefix_length)
+        .max(prefix_length)
+}
+
+/// The ASNs that originate the route `route` carries, one per announcement this report has a
+/// finding for.
+///
+/// "The BYOIP CIDR associations with ASNs" (`ByoipCidr$AsnAssociations`) is where the account
+/// records which of its own ASNs advertises a range — "after the association succeeds, the ASN
+/// is eligible for advertisement" (`AssociateIpamByoasn`) — so each association the range
+/// still holds ([`crate::state::asn_association_is_held`]) is one announcement of it. A range
+/// holding none is still a route, announced by an ASN this emulator keeps no record of, so it
+/// has ONE finding whose originating ASN is absent.
+fn route_origin_asns(route: &crate::state::ByoipCidrRecord) -> Vec<Option<&str>> {
+    let mut asns: Vec<Option<&str>> = route
+        .byoip_cidr
+        .asn_associations
+        .iter()
+        .flatten()
+        .filter(|association| {
+            association
+                .state
+                .as_deref()
+                .is_none_or(crate::state::asn_association_is_held)
+        })
+        .filter_map(|association| association.asn.as_deref())
+        .map(Some)
+        .collect();
+    asns.sort_unstable();
+    asns.dedup();
+    if asns.is_empty() {
+        asns.push(None);
+    }
+    asns
+}
+
+/// One announcement of `cidr` by `asn`, as this report reports it.
+///
+/// Every member is read off the STORED range and the stored IPAM pool managing it, so what
+/// this report says about a range and what `DescribeByoipCidrs` says about it cannot disagree.
+/// `sample_time` is passed in rather than read here, so every finding of one sample carries
+/// the one instant that sample was taken at.
+fn route_protection_finding(
+    cidr: &str,
+    route: &crate::state::ByoipCidrRecord,
+    pool: &IpamPool,
+    asn: Option<&str>,
+    covering_roas: &[&PublishedRoa],
+    sample_time: ::aws_smithy_types::DateTime,
+) -> IpamRouteProtectionFinding {
+    let (rpki_status, mut covering) = rpki_validation(covering_roas, cidr, asn);
+    // One order for the authorizations of one finding, so two calls report them the same way.
+    covering.sort_by(|left, right| {
+        (&left.prefix, &left.asn, left.max_length).cmp(&(&right.prefix, &right.asn, right.max_length))
+    });
+    IpamRouteProtectionFinding {
+        // "The ID of the resource owner" and "the Amazon Web Services Region of the resource"
+        // (`$ResourceOwnerId` / `$ResourceRegion`): the account that owns the pool managing
+        // this route, and the Region that pool allocates in — "the locale of the IPAM pool"
+        // (`IpamPool$Locale`), which for a pool that names none is the Region of the IPAM
+        // itself (`IpamPool$IpamRegion`).
+        resource_owner_id: pool.owner_id.clone(),
+        resource_region: pool.locale.clone().or_else(|| pool.ipam_region.clone()),
+        ipam_pool_id: pool.ipam_pool_id.clone(),
+        // The prefix as the store spells it, which is the canonical form every BYOIP operation
+        // keys a range by, so one range is reported one way however it was named.
+        cidr: Some(cidr.to_string()),
+        // "The state of the BYOIP CIDR" (`$State`, the `IpamByoipCidrState` enum): the state
+        // the stored range is in. Every `ByoipCidrState` word is a member of that enum too
+        // (`crate::ops::types::BYOIP_CIDR_STATE_VALUES` and `IPAM_BYOIP_CIDR_STATE_VALUES` are
+        // the same catalog), so the stored word is reported as it stands.
+        state: route.byoip_cidr.state.clone(),
+        advertisement_type: advertisement_type_of(
+            route.byoip_cidr.advertisement_type.as_deref(),
+        )
+        .map(str::to_string),
+        network_border_group: route.byoip_cidr.network_border_group.clone(),
+        // "The ID of the BYOIP pool" (`$PoolId`): the public IPv4 pool the range is in, which
+        // a range IPAM manages has left (`MoveByoipCidrToIpam` clears `ByoipCidr$PoolId`), so
+        // this is absent for exactly those ranges the store holds in no such pool.
+        pool_id: route.byoip_cidr.pool_id.clone(),
+        asn: asn.map(str::to_string),
+        rpki_status: Some(rpki_status.to_string()),
+        // "The RPKI enforcement strength for the route" (`$RpkiStrength`, `strict` |
+        // `permissive`): no member of any request or stored resource of this API sets an
+        // enforcement strength — the enum is reached from this finding alone — so there is
+        // nothing in the account's state for this report to read one from.
+        rpki_strength: None,
+        roas: Some(covering),
+        // "The overlapping routes detected for this prefix" (`$RouteOverlaps`): an overlap is
+        // another announcement of a prefix overlapping this one, and the only announcements
+        // this emulator holds are the account's own ranges, which cannot overlap — a provision
+        // that would overlap a range the account already holds is refused
+        // (`crate::state::ComAmazonawsEc2Amazonec2State::byoip_cidr_overlapping`). So no
+        // overlap can have been detected, which the modelled list says with no entries (its
+        // `@length` admits none).
+        route_overlaps: Some(Vec::new()),
+        sample_time: Some(sample_time),
+        roa_sample_time: Some(sample_time),
+    }
+}
+
+/// The `IpamRpkiStatus` of the announcement of `cidr` by `asn`, and the ROAs that cover it.
+///
+/// Route origin validation, as the model states it: "`valid` - the route has a matching ROA
+/// that covers the prefix and origin ASN", "`invalid` - the route has a ROA for the prefix, but
+/// the origin ASN or prefix length does not match", "`unknown` - no ROA exists for the prefix,
+/// so RPKI validation cannot be performed" (`IpamRouteProtectionFinding$RpkiStatus`).
+///
+/// `covering_roas` are the ROAs that COVER the announced prefix — every address of it is an
+/// address of the authorized prefix — which the caller resolves once per prefix. One of them
+/// MATCHES the announcement ("specifies whether the ROA matches the route announcement" —
+/// `IpamRouteOriginAuthorization$Match`) when it also authorizes the originating ASN and the
+/// announced prefix is no longer than the maximum length it authorizes
+/// ([`authorized_max_length`]).
+fn rpki_validation(
+    covering_roas: &[&PublishedRoa],
+    cidr: &str,
+    asn: Option<&str>,
+) -> (&'static str, Vec<IpamRouteOriginAuthorization>) {
+    let announced_length = crate::state::cidr_block_prefix_length(cidr);
+    let mut covering: Vec<IpamRouteOriginAuthorization> = Vec::new();
+    let mut matched = false;
+    for roa in covering_roas {
+        // One authorization per ASN the ROA names, because "the Autonomous System Number (ASN)
+        // authorized by the ROA" (`IpamRouteOriginAuthorization$Asn`) is one ASN; a ROA naming
+        // none authorizes nobody to originate the prefix, and still covers it.
+        let authorized: Vec<Option<&str>> = if roa.asns.is_empty() {
+            vec![None]
+        } else {
+            roa.asns.iter().map(|asn| Some(asn.as_str())).collect()
+        };
+        for authorized_asn in authorized {
+            let matches = authorized_asn.is_some()
+                && authorized_asn == asn
+                && announced_length.is_some_and(|length| length <= roa.max_length);
+            matched |= matches;
+            covering.push(IpamRouteOriginAuthorization {
+                asn: authorized_asn.map(str::to_string),
+                prefix: Some(roa.prefix.clone()),
+                max_length: i32::try_from(roa.max_length).ok(),
+                r#match: Some(matches),
+                // "The expiration date of the ROA" (`$Expiration`): a routing policy
+                // registration carries no validity of its own
+                // (`smithy_query(query="shape",shape="IpamRoutingPolicyRegistration")`), so
+                // the account's state holds no expiry for this authorization.
+                expiration: None,
+            });
+        }
+    }
+    let status = if covering.is_empty() {
+        RPKI_STATUS_UNKNOWN
+    } else if matched {
+        RPKI_STATUS_VALID
+    } else {
+        RPKI_STATUS_INVALID
+    };
+    (status, covering)
+}
+
+/// A route with a matching ROA: the `IpamRpkiStatus` catalog's `valid` member (the generated
+/// catalog is `crate::ops::types::IPAM_RPKI_STATUS_VALUES`).
+const RPKI_STATUS_VALID: &str = "valid";
+
+/// A route a ROA covers but does not authorize as announced (same catalog).
+const RPKI_STATUS_INVALID: &str = "invalid";
+
+/// A route no ROA covers, so there is nothing to validate it against (same catalog).
+const RPKI_STATUS_UNKNOWN: &str = "unknown";
+
+/// The `ByoipCidr$AdvertisementType` of a range advertised from a single location: "`unicast`:
+/// IP is advertised from a single location (regional services like EC2)".
+const BYOIP_ADVERTISEMENT_TYPE_UNICAST: &str = "unicast";
+
+/// The `ByoipCidr$AdvertisementType` of a range advertised from many: "`anycast`: IP is
+/// advertised from multiple global locations simultaneously (global services like
+/// CloudFront)".
+const BYOIP_ADVERTISEMENT_TYPE_ANYCAST: &str = "anycast";
+
+/// The `IpamByoipAdvertisementType` of a route advertised from a single location: "`regional` -
+/// the IP address is advertised from a single location (regional services such as Amazon EC2)"
+/// (the generated catalog is `crate::ops::types::IPAM_BYOIP_ADVERTISEMENT_TYPE_VALUES`).
+const ADVERTISEMENT_TYPE_REGIONAL: &str = "regional";
+
+/// The `IpamByoipAdvertisementType` of a route advertised from many: "`global` - the IP address
+/// is advertised from multiple global locations simultaneously (global services such as Amazon
+/// CloudFront)" (same catalog).
+const ADVERTISEMENT_TYPE_GLOBAL: &str = "global";
+
+/// How a route's advertisement method is spelled by `IpamByoipAdvertisementType`, given how the
+/// stored range spells it in `ByoipCidr$AdvertisementType`.
+///
+/// The two catalogs name the same two methods in different words, and say so in the same
+/// sentence: `unicast` and `regional` are both "advertised from a single location (regional
+/// services … EC2)", `anycast` and `global` both "advertised from multiple global locations
+/// simultaneously (global services … CloudFront)". A range the store holds no advertisement
+/// method for has none to report, and so does one spelled in neither word.
+fn advertisement_type_of(advertisement_type: Option<&str>) -> Option<&'static str> {
+    match advertisement_type? {
+        BYOIP_ADVERTISEMENT_TYPE_UNICAST => Some(ADVERTISEMENT_TYPE_REGIONAL),
+        BYOIP_ADVERTISEMENT_TYPE_ANYCAST => Some(ADVERTISEMENT_TYPE_GLOBAL),
+        _ => None,
+    }
+}
+
+/// The filter names this operation resolves.
+///
+/// `GetIpamRouteProtectionFindingsRequest$Filters` documents no list of its own — "One or more
+/// filters to apply to the results" is all of it
+/// (`smithy_query(query="doc",shape="GetIpamRouteProtectionFindingsRequest",member="Filters")`)
+/// — so the names are the ones EC2's filtering convention gives: each member of the resource
+/// the operation reports, spelled in kebab-case. This list is therefore derived mechanically
+/// from the `IpamRouteProtectionFinding` shape
+/// (`smithy_query(query="shape",shape="IpamRouteProtectionFinding")`), one entry per SCALAR
+/// member. `Roas` and `RouteOverlaps` are lists of STRUCTURES, which have no single value to
+/// compare a filter value against, so their own members are named instead. A finding carries no
+/// tags, so there is no `tag:` set here. Every entry must be answered by [`filter_values`].
+const IPAM_ROUTE_PROTECTION_FINDING_FILTERS: [&str; 17] = [
+    "advertisement-type",
+    "asn",
+    "cidr",
+    "ipam-pool-id",
+    "network-border-group",
+    "pool-id",
+    "resource-owner-id",
+    "resource-region",
+    "roa-asn",
+    "roa-max-length",
+    "roa-prefix",
+    "roa-sample-time",
+    "route-overlap-asn",
+    "route-overlap-prefix",
+    "rpki-status",
+    "rpki-strength",
+    "sample-time",
+];
+
+/// Is `name` a filter this operation resolves? "Filter names are case-sensitive"
+/// (`Filter$Name`), so the comparison is exact.
+fn is_documented_filter(name: &str) -> bool {
+    IPAM_ROUTE_PROTECTION_FINDING_FILTERS.contains(&name)
+}
+
+/// The values the EC2 filter `name` compares against one finding.
+///
+/// A filter naming an attribute this finding does not carry compares against NO values, so it
+/// selects nothing — the same answer AWS gives for, say, `pool-id` on a route no public IPv4
+/// pool holds. A number and a timestamp are compared as the wire spells them
+/// (`crate::state::filter_timestamp_values`), which is how a client would send the filter
+/// value.
+fn filter_values<'a>(
+    finding: &'a IpamRouteProtectionFinding,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "advertisement-type" => text(finding.advertisement_type.as_deref()),
+        "asn" => text(finding.asn.as_deref()),
+        "cidr" => text(finding.cidr.as_deref()),
+        "ipam-pool-id" => text(finding.ipam_pool_id.as_deref()),
+        "network-border-group" => text(finding.network_border_group.as_deref()),
+        "pool-id" => text(finding.pool_id.as_deref()),
+        "resource-owner-id" => text(finding.resource_owner_id.as_deref()),
+        "resource-region" => text(finding.resource_region.as_deref()),
+        "roa-asn" => finding
+            .roas
+            .iter()
+            .flatten()
+            .filter_map(|roa| roa.asn.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "roa-max-length" => finding
+            .roas
+            .iter()
+            .flatten()
+            .filter_map(|roa| roa.max_length)
+            .map(|max_length| Cow::Owned(max_length.to_string()))
+            .collect(),
+        "roa-prefix" => finding
+            .roas
+            .iter()
+            .flatten()
+            .filter_map(|roa| roa.prefix.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "roa-sample-time" => crate::state::filter_timestamp_values(finding.roa_sample_time),
+        "route-overlap-asn" => finding
+            .route_overlaps
+            .iter()
+            .flatten()
+            .filter_map(|overlap| overlap.asn.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "route-overlap-prefix" => finding
+            .route_overlaps
+            .iter()
+            .flatten()
+            .filter_map(|overlap| overlap.prefix.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "rpki-status" => text(finding.rpki_status.as_deref()),
+        "rpki-strength" => text(finding.rpki_strength.as_deref()),
+        "sample-time" => crate::state::filter_timestamp_values(finding.sample_time),
+        // Unreachable: `is_documented_filter` has already refused every other name. An
+        // unresolvable name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+// The AND/OR evaluation of the whole `Filters` member is
+// `crate::state::matches_every_filter`, the one place this crate defines it: "if you specify
+// multiple filters, the filters are joined with an AND" (`Filter`), and within one filter "if
+// you specify multiple values for a filter, the values are joined with an OR"
+// (`Filter$Values`), each value matched case-sensitively with EC2's `*`/`?` wildcards and every
+// comparison charged to the call's one `crate::state::MatchBudget`. Only the per-operation
+// lookup differs, which is `filter_values` above.
