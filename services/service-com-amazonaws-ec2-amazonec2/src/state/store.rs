@@ -2837,6 +2837,24 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// disagree about one Region. PRIVATE, like the single-word setting above, so those
     /// accessors are the only way in.
     pub(super) ebs_encryption_by_default_regions: BTreeSet<String>,
+    /// Whether this account has access to the EC2 SERIAL CONSOLE of its instances.
+    ///
+    /// ONE value for the whole account rather than a map keyed by Region, because the
+    /// setting is an account-level fact of the account itself: "access to the EC2 serial
+    /// console of ALL instances is enabled for your account"
+    /// (`GetSerialConsoleAccessStatusResult$SerialConsoleAccessEnabled`) — the doc of the
+    /// operation that reports it names no Region at all, unlike the EBS encryption-by-default
+    /// setting above, whose own doc scopes it to "your account in the current Region". A
+    /// single `bool` therefore also needs no storage ceiling: nothing a caller sends can grow
+    /// it.
+    ///
+    /// Starts `false`: "By default, access to the EC2 serial console is disabled for your
+    /// account" (`GetSerialConsoleAccessStatus`). Read it through
+    /// [`Self::serial_console_access_enabled`] and write it through
+    /// [`Self::set_serial_console_access_enabled`], so the operation that reports it and the
+    /// two that change it cannot disagree. PRIVATE, like the settings above, so those
+    /// accessors are the only way in.
+    pub(super) serial_console_access_enabled: bool,
     /// The default credit option this account has SET for each burstable instance family,
     /// by Region and then by instance family.
     ///
@@ -3248,6 +3266,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // No Region has EBS encryption by default turned on until something enables
             // it there, so a fresh account holds the empty set.
             ebs_encryption_by_default_regions: BTreeSet::new(),
+            // "By default, access to the EC2 serial console is disabled for your account"
+            // (`GetSerialConsoleAccessStatus`), so a fresh account has it off until
+            // `EnableSerialConsoleAccess` turns it on.
+            serial_console_access_enabled: false,
             // An account that has never called `ModifyDefaultCreditSpecification` has set
             // no family's default anywhere, so every family is reported at AWS's own
             // default for it and the map starts empty.

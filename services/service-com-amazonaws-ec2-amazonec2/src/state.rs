@@ -1900,6 +1900,13 @@ pub use instance_event_windows::*;
 mod classic_link;
 pub use classic_link::*;
 
+/// The account's access to the EC2 serial console of its instances — the one flag
+/// `EnableSerialConsoleAccess` and `DisableSerialConsoleAccess` move and
+/// `GetSerialConsoleAccessStatus` reports. Everything it holds is inherent methods of
+/// [`ComAmazonawsEc2Amazonec2State`], so there is nothing to re-export: a handler reaches
+/// them on the store itself like every other accessor here.
+mod serial_console_access;
+
 /// The Reserved Instances the account holds and the modifications of them — the two stores,
 /// the form of their ids, their ceilings, their refusals and the clock-owed
 /// `processing` -> `fulfilled` move of a modification — in a module of its own, re-exported

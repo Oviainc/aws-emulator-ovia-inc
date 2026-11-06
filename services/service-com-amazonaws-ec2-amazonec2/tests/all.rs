@@ -15,6 +15,14 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The account's EC2 serial console access: the one persisted account-level boolean
+// `EnableSerialConsoleAccess` and `DisableSerialConsoleAccess` move and
+// `GetSerialConsoleAccessStatus` reports, with the `ManagedBy` every value carries and the
+// `DryRun` each of the three refuses without writing. Declared beside `prefix_lists` for the
+// reason the note above gives: the sorted neighbourhood and the tail of this file are where
+// every new ec2 suite inserts its lines.
+#[path = "all/serial_console_access.rs"]
+mod serial_console_access;
 // What `ModifyNetworkInterfaceAttribute` writes onto one stored network interface and what
 // `ResetNetworkInterfaceAttribute` puts back to its default, each read back through the
 // describes that report the same record. Declared beside `prefix_lists` for the reason the
