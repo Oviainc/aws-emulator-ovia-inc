@@ -180,7 +180,8 @@ use crate::ops::types::{
     BadRequestException, BrokerCountUpdateInfo, BrokerEBSVolumeInfo, BrokerNodeGroupInfo,
     BrokerNodeInfo,
     BrokerSoftwareInfo,
-    ChannelLoggingInfo, ClientAuthentication, ClientVpcConnection, ClusterInfo, ClusterOperationInfo,
+    ChannelInfo, ChannelLoggingInfo, ClientAuthentication, ClientVpcConnection, ClusterInfo,
+    ClusterOperationInfo,
     ClusterOperationV2,
     ClusterOperationV2Provisioned, ConflictException, Configuration,
     ConfigurationInfo, ConfigurationRevision, ConnectivityInfo, ConsumerGroupReplicationUpdate,
@@ -2122,6 +2123,72 @@ pub const DESTINATION_TYPE_ICEBERG: &str = "ICEBERG";
 /// Amazon S3 bucket.
 pub const DESTINATION_TYPE_S3: &str = "S3";
 
+/// The smallest `DataFreshnessInSeconds` a channel destination may buffer for,
+/// from that member's own documentation on BOTH destination configurations
+/// ("The maximum time, in seconds, that records buffer in MSK before being
+/// flushed to the destination. Allowed range: 300 to 900. Default: 600.":
+/// `smithy_query(query="shape",shape="S3DestinationConfiguration")`). The bound
+/// belongs to the member, not to one destination kind, so it is named once here
+/// and applied wherever a channel destination carries the member.
+pub const MIN_DATA_FRESHNESS_SECONDS: i32 = 300;
+
+/// The largest `DataFreshnessInSeconds` a channel destination may buffer for,
+/// from the same documented range as [`MIN_DATA_FRESHNESS_SECONDS`].
+pub const MAX_DATA_FRESHNESS_SECONDS: i32 = 900;
+
+/// Whether `seconds` is a `DataFreshnessInSeconds` a channel destination may run
+/// with: inside the documented range, inclusive of both published bounds.
+pub fn is_data_freshness_in_range(seconds: i32) -> bool {
+    (MIN_DATA_FRESHNESS_SECONDS..=MAX_DATA_FRESHNESS_SECONDS).contains(&seconds)
+}
+
+/// What MSK answers a channel destination whose `DataFreshnessInSeconds` falls
+/// outside the documented range: one sentence naming the two published bounds,
+/// with neither the submitted value nor the destination kind in it, since the
+/// rule is the member's and reads the same whichever destination carried it.
+///
+/// Built FROM [`MIN_DATA_FRESHNESS_SECONDS`] and
+/// [`MAX_DATA_FRESHNESS_SECONDS`], so the sentence and the check that produces
+/// it cannot disagree about the range.
+pub fn data_freshness_range_message() -> String {
+    format!(
+        "Data freshness must be between {MIN_DATA_FRESHNESS_SECONDS} and \
+         {MAX_DATA_FRESHNESS_SECONDS} seconds."
+    )
+}
+
+/// The refusal a channel admission answers an out-of-range
+/// `DataFreshnessInSeconds` with: a `BadRequestException` (HTTP 400) carrying
+/// [`data_freshness_range_message`] and naming, in `invalidParameter`, the
+/// member at fault by the wire name the request itself carries.
+///
+/// Built HERE rather than in each handler so the create and a later update
+/// cannot drift apart on how the one member-level rule is refused.
+pub fn data_freshness_out_of_range() -> BadRequestException {
+    BadRequestException {
+        invalid_parameter: Some("dataFreshnessInSeconds".to_string()),
+        message: Some(data_freshness_range_message()),
+    }
+}
+
+/// What MSK answers a channel create whose `ChannelName` a channel of the target
+/// cluster already holds: a `BadRequestException` (HTTP 400) — a channel name is
+/// part of the request MSK validates, so the loser of a race for one name is
+/// refused as a bad request rather than as a generic conflict — whose sentence
+/// names the REQUESTED channel name and nothing else, neither the cluster nor
+/// the ARN of the channel already holding the name.
+///
+/// Built from the request's own name, which is the template's one variable part.
+pub fn channel_name_already_exists(name: &str) -> BadRequestException {
+    BadRequestException {
+        // The member at fault, by the wire name `CreateChannelRequest` carries.
+        invalid_parameter: Some("channelName".to_string()),
+        message: Some(format!(
+            "A channel with name '{name}' already exists for this cluster."
+        )),
+    }
+}
+
 /// Why [`ComAmazonawsKafkaKafkaState::register_channel`] refused to register a
 /// channel. Every variant leaves the registry exactly as it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3630,6 +3697,42 @@ impl Channel {
             cluster_operation_arn: Some(self.in_flight_cluster_operation_arn().to_string()),
             tags: Some(self.tags.clone().into_iter().collect()),
         }
+    }
+
+    /// The channel as `ListChannels` summarises it, from the SAME stored record
+    /// `DescribeChannel` reports: a listing and a read of one channel can only
+    /// agree if they render the same fields of one record.
+    ///
+    /// `ClusterOperationArn` is "the ARN of the in-flight cluster operation.
+    /// Returned only while the channel is in CREATING, UPDATING, or DELETING"
+    /// (`ChannelInfo$ClusterOperationArn`), so a channel whose provisioning has
+    /// settled reports none: there is no operation in flight on it.
+    pub fn to_channel_info(&self) -> ChannelInfo {
+        ChannelInfo {
+            channel_arn: self.arn.clone(),
+            channel_name: self.name.clone(),
+            status: self.status.clone(),
+            creation_time: ::aws_smithy_types::DateTime::from(self.creation_time),
+            destination_type: self.destination_type.clone(),
+            cluster_operation_arn: (self.status != CHANNEL_STATUS_ACTIVE)
+                .then(|| self.in_flight_cluster_operation_arn().to_string()),
+        }
+    }
+
+    /// Whether this channel streams the topic called `name`.
+    ///
+    /// A channel names its source topics by ARN, and a topic's NAME is the final
+    /// segment of that ARN, so the comparison is made on that segment — which is
+    /// what `ListChannelsRequest$TopicNameFilter` ("Filters results to channels
+    /// whose topic name matches the specified value") is matched against.
+    pub fn streams_topic_named(&self, name: &str) -> bool {
+        self.topic_configuration_list.iter().any(|configuration| {
+            configuration
+                .topic_arn
+                .split('/')
+                .next_back()
+                .is_some_and(|topic| topic == name)
+        })
     }
 }
 

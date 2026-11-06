@@ -4,14 +4,19 @@
 //! Mints a channel that streams one cluster topic to Amazon S3 or Apache Iceberg and
 //! registers it in [`crate::state::ComAmazonawsKafkaKafkaState`]. A channel is a
 //! sub-resource of the cluster named in the request path, so a cluster this endpoint's
-//! region does not hold is a `NotFoundException`, and a channel name already taken
-//! within that cluster is a `ConflictException`.
+//! region does not hold is a `NotFoundException`.
 //!
 //! The documented request rules this refuses with `BadRequestException`: exactly one
 //! topic configuration (`CreateChannelRequest$TopicConfigurationList` — "Currently
-//! exactly one topic must be specified") and exactly one destination
+//! exactly one topic must be specified"), exactly one destination
 //! (`s3DestinationConfiguration` and `icebergDestinationConfiguration` are documented
-//! as mutually exclusive, and a channel has to deliver somewhere).
+//! as mutually exclusive, and a channel has to deliver somewhere), a
+//! `dataFreshnessInSeconds` inside the range its member documents on either
+//! destination ([`crate::state::is_data_freshness_in_range`]), and a `channelName` no
+//! channel of that cluster already holds
+//! ([`crate::state::channel_name_already_exists`]) — a channel name is part of the
+//! request MSK validates, so two callers racing for one name leave the loser with a
+//! bad request rather than a generic conflict.
 //!
 //! The `Tags` the request carries go through the same admission check a later
 //! `TagResource` on the channel uses ([`crate::state::tag_write_violation`]): a key
@@ -241,6 +246,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // "Allowed range: 300 to 900" — documented on `DataFreshnessInSeconds`
+        // of BOTH destination configurations, so the bound is checked wherever
+        // the member arrives rather than per destination kind. A value outside
+        // it is a delivery configuration the channel could never run with, so
+        // nothing is minted for it.
+        let submitted_freshness = [
+            input
+                .s3_destination_configuration
+                .as_ref()
+                .and_then(|destination| destination.data_freshness_in_seconds),
+            input
+                .iceberg_destination_configuration
+                .as_ref()
+                .and_then(|destination| destination.data_freshness_in_seconds),
+        ];
+        if submitted_freshness
+            .into_iter()
+            .flatten()
+            .any(|seconds| !crate::state::is_data_freshness_in_range(seconds))
+        {
+            return Err(CreateChannelErrorModeled::BadRequestException(
+                crate::state::data_freshness_out_of_range(),
+            )
+            .into());
+        }
+
         // The tag rules apply wherever a caller supplies tags, so the set a
         // create carries goes through the same admission check `TagResource`
         // uses — against an empty stored set, because the channel this request
@@ -284,14 +315,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A channel name identifies a channel WITHIN a cluster, so a name already
-        // in use under THIS cluster is a conflict; the same name under another
-        // cluster is a different channel.
+        // in use under THIS cluster is refused as a bad request naming that name;
+        // the same name under another cluster is a different channel. Decided
+        // under the one lock the insertion below takes, so of two callers racing
+        // for one name exactly one mints a channel and the other is refused.
         if state
             .channel_arn_for_name(&input.cluster_arn, &input.channel_name, now)
             .is_some()
         {
-            return Err(CreateChannelErrorModeled::ConflictException(
-                crate::state::name_already_exists("channelName"),
+            return Err(CreateChannelErrorModeled::BadRequestException(
+                crate::state::channel_name_already_exists(&input.channel_name),
             )
             .into());
         }

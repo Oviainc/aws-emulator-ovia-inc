@@ -18,9 +18,9 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_kafka_kafka::state::{
-    CLUSTER_ACTIVATION_DELAY, CLUSTER_UPDATE_DELAY, CONFIGURATION_ARN_NOT_FOUND_MESSAGE,
-    CONFIGURATION_DELETION_DELAY, CONFIGURATION_STATES_A_CHANGE_IS_ACCEPTED_FROM,
-    VPC_CONNECTION_ACTIVATION_DELAY,
+    CHANNEL_ACTIVATION_DELAY, CLUSTER_ACTIVATION_DELAY, CLUSTER_UPDATE_DELAY,
+    CONFIGURATION_ARN_NOT_FOUND_MESSAGE, CONFIGURATION_DELETION_DELAY,
+    CONFIGURATION_STATES_A_CHANGE_IS_ACCEPTED_FROM, VPC_CONNECTION_ACTIVATION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -216,6 +216,68 @@ impl Emulator {
             None,
         )
         .await
+    }
+
+    /// `CreateChannel` under `cluster_arn`, signed for `region`. The channel
+    /// operations are bound under the cluster's own ARN, so every channel suite
+    /// addresses them through these four rather than rebuilding the URIs.
+    pub async fn create_channel_in(&self, region: &str, cluster_arn: &str, body: Value) -> Reply {
+        self.call_in(
+            region,
+            "POST",
+            &format!("/v1/clusters/{}/channels", pct(cluster_arn)),
+            Some(body),
+        )
+        .await
+    }
+
+    /// `CreateChannel` in the suite's region.
+    pub async fn create_channel(&self, cluster_arn: &str, body: Value) -> Reply {
+        self.create_channel_in(REGION, cluster_arn, body).await
+    }
+
+    /// `DescribeChannel`, signed for `region` — a channel is addressable only
+    /// under the cluster that holds it and only from that cluster's region.
+    pub async fn describe_channel_in(
+        &self,
+        region: &str,
+        cluster_arn: &str,
+        channel_arn: &str,
+    ) -> Reply {
+        self.call_in(
+            region,
+            "GET",
+            &format!(
+                "/v1/clusters/{}/channels/{}",
+                pct(cluster_arn),
+                pct(channel_arn)
+            ),
+            None,
+        )
+        .await
+    }
+
+    /// `DescribeChannel` in the suite's region.
+    pub async fn describe_channel(&self, cluster_arn: &str, channel_arn: &str) -> Reply {
+        self.describe_channel_in(REGION, cluster_arn, channel_arn)
+            .await
+    }
+
+    /// `ListChannels` under `cluster_arn`, signed for `region`, with `query`
+    /// appended as given (`""` for a request carrying no query member).
+    pub async fn list_channels_in(&self, region: &str, cluster_arn: &str, query: &str) -> Reply {
+        self.call_in(
+            region,
+            "GET",
+            &format!("/v1/clusters/{}/channels{query}", pct(cluster_arn)),
+            None,
+        )
+        .await
+    }
+
+    /// `ListChannels` in the suite's region.
+    pub async fn list_channels(&self, cluster_arn: &str, query: &str) -> Reply {
+        self.list_channels_in(REGION, cluster_arn, query).await
     }
 
     pub async fn list(&self, query: &str) -> Reply {
@@ -601,6 +663,54 @@ pub fn assert_name_already_exists(
     );
 }
 
+/// What Amazon MSK answers a channel create whose `ChannelName` a channel of the
+/// target cluster already holds. Written out here rather than imported from the
+/// implementation, so an assertion cannot agree with a constant that is wrong:
+/// the connectives are fixed and the submitted name is the template's one
+/// variable part.
+pub fn channel_name_already_exists_message(name: &str) -> String {
+    format!("A channel with name '{name}' already exists for this cluster.")
+}
+
+/// Assert `reply` is the refusal a channel create answers a name already taken
+/// in its cluster with: HTTP 400 `BadRequestException` carrying
+/// [`channel_name_already_exists_message`] for the submitted `name` and naming
+/// `channelName` in `invalidParameter`.
+///
+/// `existing`, the ARN of the channel already holding the name, is asserted
+/// ABSENT from the message: a channel name the caller sent is its own, while the
+/// identity of the resource holding it is not part of what the refusal says.
+///
+/// Shared by every suite that races or repeats a channel name, so none of them
+/// can drift from another about what that refusal is.
+pub fn assert_channel_name_already_exists(reply: &Reply, case: &str, name: &str, existing: &str) {
+    assert_eq!(
+        (reply.status, reply.error_code()),
+        (400, "BadRequestException"),
+        "case {case}: expected 400 BadRequestException for the channel name {name:?} already \
+         taken, got {} {}",
+        reply.status,
+        reply.body
+    );
+    assert_eq!(
+        reply.error_message(),
+        channel_name_already_exists_message(name),
+        "case {case}: expected the already-exists sentence for {name:?}, got {:?}",
+        reply.error_message()
+    );
+    assert!(
+        !reply.error_message().contains(existing),
+        "case {case}: the message must not disclose the existing ARN ({existing:?}), got {:?}",
+        reply.error_message()
+    );
+    assert_eq!(
+        reply.at("/invalidParameter").as_str(),
+        Some("channelName"),
+        "case {case}: the refusal must name channelName as the parameter at fault, got {}",
+        reply.body
+    );
+}
+
 /// Assert `reply` is the refusal every operation of the MSK configuration family
 /// answers an `Arn` it resolves to no configuration of `region` with: HTTP 400
 /// `BadRequestException`, naming the `arn` parameter at fault by its WIRE name,
@@ -852,6 +962,14 @@ impl ClusterRequest {
 /// timer feature; nothing else has to make progress here.
 pub fn sleep_past_activation() {
     std::thread::sleep(CLUSTER_ACTIVATION_DELAY + Duration::from_millis(250));
+}
+
+/// Sleep past the emulator's own `CREATING` -> `ACTIVE` span for a CHANNEL, which
+/// is its own span, so a later read sees a settled channel. Shared by every
+/// channel suite for the same reason [`sleep_past_activation`] is shared by the
+/// cluster ones.
+pub fn sleep_past_channel_activation() {
+    std::thread::sleep(CHANNEL_ACTIVATION_DELAY + Duration::from_millis(250));
 }
 
 /// One row of a `CreateConfiguration` table: the member values one request

@@ -13,12 +13,12 @@
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_kafka_kafka::state::{
-    CHANNEL_ACTIVATION_DELAY, MAX_CHANNELS_PER_CLUSTER, TOPIC_CONFIGURATIONS_PER_CHANNEL,
+    MAX_CHANNELS_PER_CLUSTER, TOPIC_CONFIGURATIONS_PER_CHANNEL,
 };
 
 use crate::kafka_harness::{
-    assert_name_already_exists, pct, reported_instant_secs, sleep_past_activation, ClusterRequest,
-    Emulator, Reply, ACCOUNT, REGION,
+    assert_channel_name_already_exists, pct, reported_instant_secs, sleep_past_activation,
+    sleep_past_channel_activation, ClusterRequest, Emulator, Reply, ACCOUNT, REGION,
 };
 
 /// A role ARN a channel assumes to write to its destination. Any role ARN does:
@@ -301,12 +301,7 @@ async fn create_channel_in(
     request: &ChannelRequest,
 ) -> Reply {
     emulator
-        .call_in(
-            region,
-            "POST",
-            &format!("/v1/clusters/{}/channels", pct(cluster_arn)),
-            Some(request.to_json()),
-        )
+        .create_channel_in(region, cluster_arn, request.to_json())
         .await
 }
 
@@ -323,16 +318,7 @@ async fn describe_channel_in(
     channel_arn: &str,
 ) -> Reply {
     emulator
-        .call_in(
-            region,
-            "GET",
-            &format!(
-                "/v1/clusters/{}/channels/{}",
-                pct(cluster_arn),
-                pct(channel_arn)
-            ),
-            None,
-        )
+        .describe_channel_in(region, cluster_arn, channel_arn)
         .await
 }
 
@@ -397,13 +383,6 @@ fn assert_channel_arn(arn: &str, cluster_arn: &str, channel_name: &str, case: &s
     );
 }
 
-/// Sleep past the emulator's own `CREATING` -> `ACTIVE` span for a channel, so a
-/// later read sees a settled channel. `std::thread::sleep` because the workspace's
-/// tokio carries no timer feature; nothing else has to make progress here.
-fn sleep_past_channel_activation() {
-    std::thread::sleep(CHANNEL_ACTIVATION_DELAY + std::time::Duration::from_millis(250));
-}
-
 /// RULE: a created channel is persisted whole under the cluster it streams from,
 /// and `DescribeChannel` reports every member from that record — the submitted
 /// value where the request carried one, nothing where it did not — with the
@@ -421,7 +400,7 @@ async fn describe_reports_exactly_what_was_created() {
                 compression: "GZIP",
                 storage_class: "INTELLIGENT_TIERING",
                 output_prefix: Some("records/"),
-                freshness: Some(60),
+                freshness: Some(300),
             },
             topics: vec![TopicRow {
                 topic: "payments",
@@ -623,8 +602,9 @@ async fn describe_reports_exactly_what_was_created() {
 
 /// RULE: a channel name identifies at most one channel WITHIN a cluster, so a
 /// create under a name already taken in that cluster is refused with
-/// `ConflictException` (HTTP 409) and leaves the existing channel untouched —
-/// while the same name under another cluster is a different channel.
+/// `BadRequestException` (HTTP 400) naming that name, and leaves the existing
+/// channel untouched — while the same name under another cluster is a different
+/// channel.
 #[tokio::test]
 async fn a_repeated_channel_name_conflicts_within_its_cluster() {
     let emulator = Emulator::new();
@@ -666,17 +646,11 @@ async fn a_repeated_channel_name_conflicts_within_its_cluster() {
     for (first, second) in &rows {
         let arn = create_channel_ok(&emulator, &first_cluster, first).await;
         let reply = create_channel(&emulator, &first_cluster, second).await;
-        // The conflict is the service's one fixed sentence for a taken name,
-        // blaming the channel-name parameter by its wire name.
-        assert_name_already_exists(
-            &reply,
-            &format!("{second:?}"),
-            "channelName",
-            &second.name,
-            &arn,
-        );
+        // The refusal is a bad request naming the channel name the second call
+        // submitted, blaming the channel-name parameter by its wire name.
+        assert_channel_name_already_exists(&reply, &format!("{second:?}"), &second.name, &arn);
 
-        // The conflict changed nothing: the stored channel is still the first one.
+        // The refused create changed nothing: the stored channel is still the first one.
         let described = describe_channel(&emulator, &first_cluster, &arn).await;
         assert_eq!(
             described.at("/destinationType").as_str(),

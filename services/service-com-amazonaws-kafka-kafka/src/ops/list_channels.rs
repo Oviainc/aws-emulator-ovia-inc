@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListChannels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListChannels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListChannels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the channels one cluster holds, in the registry's own order (by channel
+//! ARN, which carries the channel name), out of the records `CreateChannel`
+//! persisted: the cluster is resolved first (a `ClusterArn` that is not an MSK
+//! cluster ARN is a bad request, and a well-formed one this endpoint's region
+//! holds no cluster for is a 404 rather than an empty page, which would claim the
+//! cluster exists and holds nothing), then `TopicNameFilter` keeps the channels
+//! streaming that topic ([`crate::state::Channel::streams_topic_named`]) and
+//! `MaxResults` / `NextToken` page what is left.
+//!
+//! Each entry is rendered from the stored record by
+//! [`crate::state::Channel::to_channel_info`], so this listing and
+//! `DescribeChannel` cannot disagree about a channel. Reporting only: the one
+//! write it makes is through
+//! [`crate::state::ComAmazonawsKafkaKafkaState::settled_channels_in`], which
+//! materialises the transitions the clock already owed this cluster's channels.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +89,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The largest page `MaxResults` may ask for, from that member's `range` in the
+// model (1..100), and the size used when the request names none. The crate's own
+// bound, shared with every other listing rather than restated here.
+use crate::state::MAX_RESULTS_LIMIT;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -121,6 +132,38 @@ impl From<ListChannelsErrorModeled> for ListChannelsError {
     }
 }
 
+/// Marker that prefixes this listing's page-token plaintext, so a token minted
+/// for some other list cannot be mistaken for one of these. The cluster the
+/// token was minted for is part of the plaintext, so one cluster's page cannot
+/// resume another cluster's channel listing.
+const NEXT_TOKEN_PREFIX: &str = "kafka:channels:";
+
+/// Separates the cluster ARN a token was minted for from the channel ARN the page
+/// stopped at. An MSK ARN cannot contain it, so the plaintext splits back into
+/// exactly two fields.
+const NEXT_TOKEN_SEPARATOR: char = '#';
+
+/// Encode the cluster and the channel ARN a page stopped at as a token, through
+/// the crate's one page-token codec ([`crate::state::encode_page_token`]).
+fn encode_next_token(cluster_arn: &str, last_channel: &str) -> String {
+    crate::state::encode_page_token(
+        NEXT_TOKEN_PREFIX,
+        &format!("{cluster_arn}{NEXT_TOKEN_SEPARATOR}{last_channel}"),
+    )
+}
+
+/// The channel ARN a token resumes after, or `None` when the token is not one
+/// this operation minted FOR THIS CLUSTER: a token carries the list it was minted
+/// from, so one cluster's page token cannot resume another cluster's listing.
+fn decode_next_token(token: &str, cluster_arn: &str) -> Option<String> {
+    let plaintext = crate::state::decode_page_token(NEXT_TOKEN_PREFIX, token)?;
+    let (arn, last_channel) = plaintext.split_once(NEXT_TOKEN_SEPARATOR)?;
+    if arn != cluster_arn {
+        return None;
+    }
+    Some(last_channel.to_string())
+}
+
 /// The `ListChannels` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -157,18 +200,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListChannels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListChannelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListChannels"))
+        // Decided FIRST, on the ARN as submitted and from the request alone: the
+        // caller holds no resource-based policy over a cluster of another account,
+        // so such a request is refused rather than answered out of what this
+        // registry happens to hold under that ARN. See
+        // [`crate::state::authorization`].
+        crate::state::authorization::authorize_operation(Self::NAME, &input.cluster_arn)?;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListChannelsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(ListChannelsErrorModeled::BadRequestException(
+                crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
+            )
+            .into());
+        }
+
+        // A token names the channel the previous page stopped at; the next page
+        // starts after it in the registry's own order, so a channel created or
+        // removed between pages shifts nothing already returned.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match decode_next_token(token, &input.cluster_arn) {
+                Some(arn) => Some(arn),
+                None => {
+                    return Err(ListChannelsErrorModeled::BadRequestException(
+                        BadRequestException {
+                            invalid_parameter: Some("NextToken".to_string()),
+                            message: Some("The pagination token is not valid.".to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // Absent `MaxResults` pages at the largest size the model allows, and no
+        // request may ask for a longer page than that range permits.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_RESULTS_LIMIT))
+            .unwrap_or(MAX_RESULTS_LIMIT as usize)
+            .clamp(1, MAX_RESULTS_LIMIT as usize);
+
+        let mut state = state.lock();
+
+        // Channels are listed FROM a cluster, so an endpoint that holds no cluster
+        // for this ARN has no list to serve — which is a missing resource, not an
+        // empty page.
+        if state.cluster_in(&region, &input.cluster_arn).is_none() {
+            return Err(
+                ListChannelsErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut page: Vec<ChannelInfo> = Vec::with_capacity(page_size);
+        let mut last_arn: Option<String> = None;
+        let mut more_remain = false;
+        for channel in state
+            .settled_channels_in(&region, &input.cluster_arn, now)
+            .into_iter()
+            .filter(|channel| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|last| channel.arn.as_str() > last)
+            })
+        {
+            if input
+                .topic_name_filter
+                .as_deref()
+                .is_some_and(|topic| !channel.streams_topic_named(topic))
+            {
+                continue;
+            }
+            if page.len() == page_size {
+                more_remain = true;
+                break;
+            }
+            page.push(channel.to_channel_info());
+            last_arn = Some(channel.arn.clone());
+        }
+
+        // The token is minted from the REGISTRY KEY the resume comparison uses,
+        // not from the rendered `ChannelInfo`, so the two can never disagree and a
+        // full page can never be mistaken for the last one.
+        let next_token = match more_remain {
+            true => last_arn
+                .as_deref()
+                .map(|last| encode_next_token(&input.cluster_arn, last)),
+            false => None,
+        };
+
+        Ok(ListChannelsOutput {
+            channels: Some(page),
+            next_token,
+        })
     }
 }

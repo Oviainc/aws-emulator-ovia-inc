@@ -14,11 +14,12 @@
 //! which the channel suites each build for their own rows, is local.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_kafka_kafka::state::{
-    CHANNEL_ACTIVATION_DELAY, CHANNEL_DELETION_DELAY, RESOURCE_NOT_FOUND_MESSAGE,
-};
+use service_com_amazonaws_kafka_kafka::state::{CHANNEL_DELETION_DELAY, RESOURCE_NOT_FOUND_MESSAGE};
 
-use crate::kafka_harness::{pct, vpc_connection_uri, ClusterRequest, Emulator, Reply, ACCOUNT, REGION};
+use crate::kafka_harness::{
+    assert_channel_name_already_exists, pct, sleep_past_channel_activation, vpc_connection_uri,
+    ClusterRequest, Emulator, Reply, ACCOUNT, REGION,
+};
 
 /// A well-formed channel ARN under the cluster `cluster`/`cluster_id` that no
 /// create ever minted. `with_id` appends a channel id after the channel name, the
@@ -95,39 +96,12 @@ fn channel_body(name: &str, iceberg: bool, tags: &[(&str, &str)]) -> Value {
 
 /// `CreateChannel` under `cluster_arn`.
 async fn create_channel(emulator: &Emulator, cluster_arn: &str, body: Value) -> Reply {
-    emulator
-        .call(
-            "POST",
-            &format!("/v1/clusters/{}/channels", pct(cluster_arn)),
-            Some(body),
-        )
-        .await
-}
-
-/// `DescribeChannel`, signed for `region`.
-async fn describe_channel_in(
-    emulator: &Emulator,
-    region: &str,
-    cluster_arn: &str,
-    channel_arn: &str,
-) -> Reply {
-    emulator
-        .call_in(
-            region,
-            "GET",
-            &format!(
-                "/v1/clusters/{}/channels/{}",
-                pct(cluster_arn),
-                pct(channel_arn)
-            ),
-            None,
-        )
-        .await
+    emulator.create_channel(cluster_arn, body).await
 }
 
 /// `DescribeChannel` in the suite's region.
 async fn describe_channel(emulator: &Emulator, cluster_arn: &str, channel_arn: &str) -> Reply {
-    describe_channel_in(emulator, REGION, cluster_arn, channel_arn).await
+    emulator.describe_channel(cluster_arn, channel_arn).await
 }
 
 /// `DeleteChannel`, signed for `region` — the model binds it to
@@ -189,13 +163,6 @@ async fn create_channel_ok(
         .unwrap_or_else(|| panic!("case {case}: CreateChannel returned no clusterOperationArn"))
         .to_string();
     (arn, operation)
-}
-
-/// Sleep past the emulator's own `CREATING` -> `ACTIVE` span for a channel.
-/// `std::thread::sleep` because the workspace's tokio carries no timer feature;
-/// nothing else has to make progress here.
-fn sleep_past_channel_activation() {
-    std::thread::sleep(CHANNEL_ACTIVATION_DELAY + std::time::Duration::from_millis(250));
 }
 
 /// Sleep past the span the emulator gives a channel's asynchronous delete, so a
@@ -416,12 +383,12 @@ async fn a_removed_channels_name_is_free_again() {
         );
 
         // Still in the registry, so the name is still taken.
-        let conflict = create_channel(&emulator, &cluster, channel_body(name, iceberg, &[])).await;
-        assert_eq!(
-            (conflict.status, conflict.error_code()),
-            (409, "ConflictException"),
-            "case {name}: a DELETING channel still holds its name, got {} {}",
-            conflict.status, conflict.body
+        let taken = create_channel(&emulator, &cluster, channel_body(name, iceberg, &[])).await;
+        assert_channel_name_already_exists(
+            &taken,
+            &format!("{name} while DELETING"),
+            name,
+            &first,
         );
 
         sleep_past_channel_deletion();

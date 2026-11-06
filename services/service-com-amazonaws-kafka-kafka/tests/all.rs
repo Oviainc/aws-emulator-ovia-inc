@@ -19,10 +19,14 @@ mod broker_reboot;
 mod broker_storage_update;
 #[path = "all/broker_type_update.rs"]
 mod broker_type_update;
+#[path = "all/channel_admission.rs"]
+mod channel_admission;
 #[path = "all/channel_deletion.rs"]
 mod channel_deletion;
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
+#[path = "all/channel_listing.rs"]
+mod channel_listing;
 #[path = "all/client_vpc_connection_listing.rs"]
 mod client_vpc_connection_listing;
 #[path = "all/cluster_arn_refusal.rs"]

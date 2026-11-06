@@ -1503,6 +1503,40 @@ impl ComAmazonawsKafkaKafkaState {
         Some(channel)
     }
 
+    /// The channels `cluster_arn` holds, as an endpoint for `region` sees them at
+    /// `now`, in the registry's own order (by channel ARN, which carries the
+    /// channel name) — the listing counterpart of [`Self::settled_channel_in`].
+    ///
+    /// Reporting only, and the writes are the ones the clock already owed: the
+    /// removals this cluster's channels were due are materialised first, so a
+    /// channel every other reader calls gone is not listed, and each remaining
+    /// channel's `CREATING` -> `ACTIVE` transition is applied if it was due — both
+    /// owed at this instant whether or not anybody listed.
+    pub fn settled_channels_in(
+        &mut self,
+        region: &str,
+        cluster_arn: &str,
+        now: SystemTime,
+    ) -> Vec<&Channel> {
+        self.prune_removed_channels(cluster_arn, now);
+        let arns: Vec<String> = self
+            .channel_arns_by_cluster
+            .get(cluster_arn)
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        for arn in &arns {
+            if let Some(channel) = self.channels.get_mut(arn) {
+                channel.settle(now);
+            }
+        }
+        arns.iter()
+            .filter_map(|arn| self.channels.get(arn))
+            .filter(|channel| channel.region == region)
+            .collect()
+    }
+
     /// Accept the deletion of the channel `channel_arn` names under
     /// `cluster_arn`, as an endpoint for `region` sees it, handing back the record
     /// as the caller must now see it: `DELETING`, with the instant the clock owes
