@@ -20,10 +20,11 @@
 //!
 //! The rows span what the rule generalises over: how many stages follow the source, what
 //! the delivered key looks like, whether the deploy extracts the artifact, and how many
-//! entries and bytes the artifact carries. The source object is uploaded only AFTER the
-//! pipelines exist, so the run a pipeline's own creation starts fails at its source and
-//! delivers nothing: every object this suite observes was delivered by the execution the
-//! test started.
+//! entries and bytes the artifact carries. In those rows the source object is uploaded
+//! only AFTER the pipelines exist, so the run a pipeline's own creation starts fails at
+//! its source and delivers nothing: every object they observe was delivered by the
+//! execution the test started. The last test is the other side of that — the run a
+//! CREATION starts, which the service drives the same way.
 //!
 //! The harness comes from `tests/all/execution_engine.rs`, so every assertion goes
 //! through the same router the production emulator builds.
@@ -353,5 +354,75 @@ async fn a_disabled_inbound_transition_is_the_only_thing_that_withholds_a_delive
         "case \"the released pipeline\": enabling the transition must let the service \
          deliver the same bytes, got {} bytes",
         held_body.len()
+    );
+}
+
+/// The rule holds for whichever call starts an execution, not only for the explicit
+/// start: creating a pipeline runs it once (`ExecutionTrigger$triggerType` carries
+/// `CreatePipeline` for exactly that run), so that run too is carried to its delivery
+/// with no further call from the client.
+#[tokio::test]
+async fn the_run_a_pipeline_s_own_creation_starts_is_driven_the_same_way() {
+    let emulator = Emulator::new();
+    let pipeline = "unattended-creation-run";
+    let key = "deployed/created.zip";
+
+    emulator.bucket(&artifact_bucket(pipeline)).await;
+    emulator.bucket(SOURCE_BUCKET).await;
+    emulator.bucket(DEPLOY_BUCKET).await;
+    // The source object exists BEFORE the pipeline does, so the run the creation starts
+    // has something to read: it is the only execution of this pipeline there will be.
+    let archive = zip_of(&[("created.txt", b"delivered by the creation run".as_slice())]);
+    emulator
+        .put_object(SOURCE_BUCKET, SOURCE_KEY, &archive)
+        .await;
+
+    emulator
+        .ok(
+            "CreatePipeline",
+            &declaration(
+                pipeline,
+                json!([
+                    source_stage(SOURCE_BUCKET, SOURCE_KEY, ARTIFACT),
+                    deploy_stage("Deploy", ARTIFACT, DEPLOY_BUCKET, key, false),
+                ]),
+                None,
+            ),
+        )
+        .await;
+
+    // No CodePipeline call from here until the object is read.
+    let body = delivered(&emulator, DEPLOY_BUCKET, key, "the creation run").await;
+    assert!(
+        body == archive,
+        "case \"the creation run\": the delivered object must carry the source bytes, got \
+         {} bytes",
+        body.len()
+    );
+
+    let listed = emulator
+        .ok("ListPipelineExecutions", &json!({"pipelineName": pipeline}))
+        .await;
+    let summaries = listed["pipelineExecutionSummaries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "case \"the creation run\": creating the pipeline starts exactly one execution, \
+         got {listed}"
+    );
+    assert_eq!(
+        summaries[0]["trigger"]["triggerType"],
+        json!("CreatePipeline"),
+        "case \"the creation run\": the execution that delivered is the creation's own, \
+         got {listed}"
+    );
+    assert_eq!(
+        summaries[0]["status"],
+        json!("Succeeded"),
+        "case \"the creation run\": every action ran, so the execution must report \
+         Succeeded, got {listed}"
     );
 }
