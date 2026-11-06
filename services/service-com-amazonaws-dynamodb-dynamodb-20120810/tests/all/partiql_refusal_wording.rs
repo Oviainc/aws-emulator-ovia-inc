@@ -763,3 +763,224 @@ async fn a_transaction_read_that_addresses_no_one_item_states_that_rule() {
         );
     }
 }
+
+/// One row per defect CLASS, to be stated the same way whichever entry point carried
+/// the statement.
+///
+/// Every class here is one a statement earns while it is READ, so it is the statement's
+/// own defect rather than anything about the request that carried it — which is why one
+/// sentence answers for all three surfaces.
+fn cross_surface_rows() -> Vec<Row> {
+    let requires_path = |function: &str| {
+        format!("Operator or function requires a document path; operator or function: {function}")
+    };
+    let operand_count = |function: &str| {
+        format!(
+            "Incorrect number of operands for operator or function; operator or function: \
+             {function}"
+        )
+    };
+    // 39 digits: one past the documented 38 significant digits an N carries.
+    const THIRTY_NINE_DIGITS: &str = "123456789012345678901234567890123456789";
+    let unknown_function = format!("SELECT * FROM {TABLE} WHERE made_up_function(pk)");
+    vec![
+        Row {
+            case: "a misspelled verb",
+            statement: format!("INSRT INTO \"{TABLE}\" VALUE {{'pk':'q'}}"),
+            parameters: Value::Null,
+            expected: parse_failure("Unexpected token after expression"),
+        },
+        Row {
+            case: "a single-quoted table name",
+            statement: format!("SELECT * FROM '{TABLE}'"),
+            parameters: Value::Null,
+            expected: parse_failure("Expected identifier for simple path"),
+        },
+        Row {
+            case: "an unknown function",
+            expected: format!(
+                "Unrecognized function: made_up_function at {}",
+                position_of(&unknown_function, "made_up_function")
+            ),
+            statement: unknown_function,
+            parameters: Value::Null,
+        },
+        Row {
+            case: "a function given a literal where it reads a path",
+            statement: format!("SELECT * FROM {TABLE} WHERE attribute_exists('pk')"),
+            parameters: Value::Null,
+            expected: requires_path("attribute_exists"),
+        },
+        Row {
+            case: "a call carrying one operand too many",
+            statement: format!("SELECT * FROM {TABLE} WHERE size(pk, n) > 1"),
+            parameters: Value::Null,
+            expected: operand_count("size"),
+        },
+        Row {
+            case: "a three-component FROM path",
+            statement: format!("SELECT * FROM {TABLE}.a.b"),
+            parameters: Value::Null,
+            expected: "A path may contain at most 2 components in the FROM clause".to_string(),
+        },
+        Row {
+            case: "a number literal past the stored precision",
+            statement: format!("INSERT INTO {TABLE} VALUE {{'pk': 'z', 'n': {THIRTY_NINE_DIGITS}}}"),
+            parameters: Value::Null,
+            expected: "Attempting to store more than 38 significant digits in a Number".to_string(),
+        },
+        Row {
+            case: "a parameter list that does not fill the markers",
+            statement: format!("SELECT * FROM {TABLE} WHERE pk = ?"),
+            parameters: json!([{"S": "a"}, {"S": "b"}]),
+            expected: "Number of parameters in request and statement don't match.".to_string(),
+        },
+    ]
+}
+
+/// The statement one slot of a request carries, with its `Parameters` when the row
+/// sends any: the shape `BatchStatementRequest` and `ParameterizedStatement` share.
+fn slot_request(row: &Row) -> Value {
+    let mut request = json!({"Statement": row.statement});
+    if !row.parameters.is_null() {
+        request["Parameters"] = row.parameters.clone();
+    }
+    request
+}
+
+#[tokio::test]
+async fn one_class_states_one_sentence_whichever_surface_carried_the_statement() {
+    let router = seeded().await;
+
+    for row in cross_surface_rows() {
+        // On its own: the sentence for the class, and nothing of the request that
+        // carried it.
+        let alone = refused(&router, row.case, slot_request(&row)).await;
+        assert_eq!(
+            alone, row.expected,
+            "case {} through ExecuteStatement: expected {:?}, got {alone:?}",
+            row.case, row.expected
+        );
+
+        // In a batch: the same sentence, in the slot that carried the statement, under
+        // the per-slot code for a statement this service refused.
+        let (status, answered) = call(
+            &router,
+            "BatchExecuteStatement",
+            json!({"Statements": [slot_request(&row)]}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {} through BatchExecuteStatement: a batch answers 200 whatever its slots \
+             say, got {status} with {answered}",
+            row.case
+        );
+        let slot = &answered["Responses"][0];
+        assert_eq!(
+            slot["Error"]["Code"].as_str(),
+            Some("ValidationError"),
+            "case {} through BatchExecuteStatement: expected the per-slot ValidationError \
+             code, got {slot}",
+            row.case
+        );
+        assert_eq!(
+            slot["Error"]["Message"].as_str(),
+            Some(row.expected.as_str()),
+            "case {} through BatchExecuteStatement: expected the slot message {:?}, got {slot}",
+            row.case,
+            row.expected
+        );
+
+        // In a transaction: the same sentence, behind the slot of `TransactStatements`
+        // the request stated the statement at.
+        let (status, answered) = call(
+            &router,
+            "ExecuteTransaction",
+            json!({"TransactStatements": [slot_request(&row)]}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {} through ExecuteTransaction: expected HTTP 400, got {status} with {answered}",
+            row.case
+        );
+        assert_eq!(
+            error_code(&answered),
+            "ValidationException",
+            "case {} through ExecuteTransaction: expected ValidationException, got {answered}",
+            row.case
+        );
+        let prefixed = format!("Validation failed in TransactStatements[0]: {}", row.expected);
+        assert_eq!(
+            message(&answered),
+            prefixed,
+            "case {} through ExecuteTransaction: expected {prefixed:?}, got {answered}",
+            row.case
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_reported_position_is_counted_in_the_statements_own_lines_and_characters() {
+    let router = seeded().await;
+
+    // The rows differ in what the line and the column are counted off: a statement
+    // written over several lines, one indented, one whose text before the offending run
+    // holds characters wider than a byte, and one whose own string literal carries the
+    // line break — so a row asserts the position is a fact of the TEXT rather than an
+    // offset into it.
+    let rows: Vec<(&str, String, &str)> = vec![
+        (
+            "an unknown function on the third line",
+            format!("SELECT *\nFROM {TABLE}\nWHERE made_up_function(pk)"),
+            "made_up_function",
+        ),
+        (
+            "an unknown function behind leading indentation",
+            format!("SELECT *\n    FROM {TABLE}\n        WHERE other_fn(pk)"),
+            "other_fn",
+        ),
+        (
+            "an unknown function after characters wider than a byte",
+            format!("SELECT * FROM {TABLE} WHERE n = 'piñata señal' AND magnitude(n)"),
+            "magnitude",
+        ),
+        (
+            "an unknown function after a literal that carries the line break",
+            format!("SELECT * FROM {TABLE} WHERE n = 'one\ntwo' AND twice(n)"),
+            "twice",
+        ),
+    ];
+    for (case, statement, name) in &rows {
+        let stated = refused(&router, case, json!({"Statement": statement})).await;
+        let expected = format!(
+            "Unrecognized function: {name} at {}",
+            position_of(statement, name)
+        );
+        assert_eq!(
+            stated, expected,
+            "case {case}: statement {statement:?} expected {expected:?}, got {stated:?}"
+        );
+    }
+
+    // The positioned sentence a write through an index qualifier earns reports the whole
+    // source path, counted off the line that spells it.
+    let statement = format!("DELETE\nFROM \"keyed\".\"{INDEX}\"\nWHERE pk = 'a' AND sk = 1");
+    let path = format!("\"keyed\".\"{INDEX}\"");
+    let stated = refused(
+        &router,
+        "a source path on the second line",
+        json!({"Statement": statement}),
+    )
+    .await;
+    let expected = format!(
+        "FROM clause may only contain a single table name in data manipulation statements at {}",
+        position_of(&statement, &path)
+    );
+    assert_eq!(
+        stated, expected,
+        "case a source path on the second line: statement {statement:?} expected \
+         {expected:?}, got {stated:?}"
+    );
+}
