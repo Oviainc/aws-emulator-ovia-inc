@@ -131,6 +131,9 @@ mod trace_segment_destination;
 #[path = "all/unconvertible_time_member.rs"]
 mod unconvertible_time_member;
 
+#[path = "all/unissued_pagination_token_message.rs"]
+mod unissued_pagination_token_message;
+
 #[path = "all/update_group.rs"]
 mod update_group;
 

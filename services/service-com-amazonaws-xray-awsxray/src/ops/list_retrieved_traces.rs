@@ -277,11 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 {
                     offset
                 }
-                _ => {
-                    return Err(refuse(format!(
-                        "NextToken `{token}` was not issued by this service for this RetrievalToken"
-                    )))
-                }
+                _ => return Err(refuse(crate::state::invalid_next_token_message(token))),
             },
         };
 

@@ -194,9 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 _ => {
                     return Err(BatchGetTracesErrorModeled::InvalidRequestException(
                         InvalidRequestException {
-                            message: Some(format!(
-                                "NextToken `{token}` was not issued by this service for these TraceIds"
-                            )),
+                            message: Some(crate::state::invalid_next_token_message(token)),
                         },
                     )
                     .into())

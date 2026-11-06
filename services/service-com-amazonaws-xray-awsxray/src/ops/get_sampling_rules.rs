@@ -176,9 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(|| {
                     GetSamplingRulesErrorModeled::InvalidRequestException(
                         InvalidRequestException {
-                            message: Some(format!(
-                                "NextToken `{token}` was not issued by this service"
-                            )),
+                            message: Some(crate::state::invalid_next_token_message(token)),
                         },
                     )
                 })?,

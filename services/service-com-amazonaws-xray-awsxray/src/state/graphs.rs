@@ -656,7 +656,7 @@ pub fn page_service_graph(
     resume: Option<&str>,
     page_size: usize,
 ) -> Result<ServiceGraphPage, String> {
-    let unissued = |token: &str| format!("NextToken `{token}` was not issued by this service");
+    let unissued = super::invalid_next_token_message;
     let from = match resume {
         Some(token) => {
             let reference: i32 = token.parse().map_err(|_| unissued(token))?;

@@ -201,11 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resume = match input.next_token.as_deref() {
             None => 0,
             Some(token) => token.parse::<usize>().ok().filter(|at| *at <= events.len()).ok_or_else(
-                || {
-                    refuse(format!(
-                        "NextToken `{token}` was not issued by this service"
-                    ))
-                },
+                || refuse(crate::state::invalid_next_token_message(token)),
             )?,
         };
 

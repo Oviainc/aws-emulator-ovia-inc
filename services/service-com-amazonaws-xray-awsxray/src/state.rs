@@ -89,6 +89,7 @@
 pub mod filter;
 pub mod group_scope;
 pub mod graphs;
+pub mod pagination;
 pub mod query_window;
 pub mod retrievals;
 pub mod sampling_rules;
@@ -98,6 +99,7 @@ pub mod sampling_statistics;
 // here, so every handler keeps reaching the store through `crate::state::…` and
 // no caller has to know which part a record, a bound or a wording lives in.
 pub use graphs::*;
+pub use pagination::*;
 pub use query_window::*;
 pub use retrievals::*;
 pub use sampling_rules::*;

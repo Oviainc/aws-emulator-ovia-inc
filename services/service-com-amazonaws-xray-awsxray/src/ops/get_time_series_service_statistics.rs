@@ -230,9 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resume = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(token.parse::<i64>().map_err(|_| {
-                unsupported(format!(
-                    "NextToken `{token}` was not issued by this service"
-                ))
+                unsupported(crate::state::invalid_next_token_message(token))
             })?),
         };
 

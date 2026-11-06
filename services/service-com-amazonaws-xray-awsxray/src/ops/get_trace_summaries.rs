@@ -369,9 +369,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .next_back()
                     .is_some_and(|last| token <= last.as_str());
                 if !within_keyspace {
-                    return Err(invalid_request(format!(
-                        "NextToken `{token}` was not issued by this service"
-                    )));
+                    return Err(invalid_request(
+                        crate::state::invalid_next_token_message(token),
+                    ));
                 }
             }
 
