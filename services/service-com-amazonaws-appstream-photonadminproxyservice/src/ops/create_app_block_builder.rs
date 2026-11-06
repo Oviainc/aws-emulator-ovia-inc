@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAppBlockBuilder
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAppBlockBuilder`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAppBlockBuilder::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: persists a [`crate::state::AppBlockBuilderRecord`] in this service's
+//! store and returns the modelled `AppBlockBuilder` rendered FROM that record. A freshly
+//! created builder is `STOPPED` — `StartAppBlockBuilder` documents that a builder can
+//! only be started once it is associated with an app block, and a create associates none.
+//! A duplicate `Name` answers `ResourceAlreadyExistsException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +191,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAppBlockBuilder` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAppBlockBuilderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAppBlockBuilder"))
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_implemented("CreateAppBlockBuilder")
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = state.lock();
+
+        // `Name` is "the unique name for the app block builder", so a name the account
+        // already holds addresses the builder it has rather than minting a second one.
+        if state.app_block_builders.contains_key(&input.name) {
+            return Err(
+                CreateAppBlockBuilderErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(crate::state::resource_already_exists_message(
+                            crate::state::APP_BLOCK_BUILDER_KIND,
+                            &input.name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // CC-02 growth bound: the store must not grow per request without a ceiling.
+        if state.app_block_builders.len() >= crate::state::MAX_RECORDS_PER_STORE {
+            return Err(CreateAppBlockBuilderErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::limit_exceeded_message("app block builders")),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::AppBlockBuilderRecord {
+            arn: crate::state::app_block_builder_arn(&region, &input.name),
+            name: input.name.clone(),
+            display_name: input.display_name,
+            description: input.description,
+            platform: input.platform,
+            instance_type: input.instance_type,
+            enable_default_internet_access: input.enable_default_internet_access,
+            iam_role_arn: input.iam_role_arn,
+            vpc_config: input.vpc_config,
+            // A builder is created stopped: nothing can start one that is associated with
+            // no app block, so this is where a created builder stays until a caller
+            // associates an app block and starts it.
+            state: crate::state::APP_BLOCK_BUILDER_STATE_CREATED.to_string(),
+            created_time: crate::state::now(),
+            // A freshly created builder carries no errors, and has changed state for no
+            // reason yet.
+            app_block_builder_errors: Vec::new(),
+            state_change_reason: None,
+            access_endpoints: input.access_endpoints.unwrap_or_default(),
+            disable_imdsv1: input.disable_imdsv1,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        let app_block_builder = record.to_app_block_builder();
+        state.app_block_builders.insert(record.name.clone(), record);
+        Ok(CreateAppBlockBuilderOutput {
+            app_block_builder: Some(app_block_builder),
+        })
     }
 }

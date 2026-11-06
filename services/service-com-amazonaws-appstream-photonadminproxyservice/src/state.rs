@@ -15,6 +15,10 @@
 //! `DescribeThemeForStack` renders the stored record back, and `DeleteThemeForStack`
 //! removes it — as does deleting the stack itself, which is what the branding belongs to.
 //!
+//! App block builders live here as well: `CreateAppBlockBuilder` writes one
+//! [`AppBlockBuilderRecord`] under the name it allocates and
+//! `DescribeAppBlockBuilders` renders the stored records back, a page at a time.
+//!
 //! Usage reporting lives here too: it is ONE account-and-Region-wide setting, so
 //! `CreateUsageReportSubscription` writes the single [`UsageReportSubscriptionRecord`]
 //! this struct holds and `DescribeUsageReportSubscriptions` renders that same record
@@ -46,9 +50,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
-    AccessEndpoint, AgentAccessConfig, AppBlock, ApplicationSettingsResponse,
-    ComputeCapacityStatus, ContentRedirection, DomainJoinInfo, ErrorDetails, Fleet, FleetError,
-    LastReportGenerationExecutionError, S3Location, ScriptDetails, Stack, StackError,
+    AccessEndpoint, AgentAccessConfig, AppBlock, AppBlockBuilder, AppBlockBuilderStateChangeReason,
+    ApplicationSettingsResponse, ComputeCapacityStatus, ContentRedirection, DomainJoinInfo,
+    ErrorDetails, Fleet, FleetError, LastReportGenerationExecutionError, ResourceError, S3Location,
+    ScriptDetails, Stack, StackError,
     StorageConnector, StreamingExperienceSettings, Theme, ThemeFooterLink, UsageReportSubscription,
     User, UserSetting, UserStackAssociation, UserStackAssociationError, VolumeConfig, VpcConfig,
 };
@@ -70,6 +75,15 @@ pub const DEFAULT_FLEET_TYPE: &str = "ON_DEMAND";
 /// owes no transition out of.
 pub const FLEET_STATE_CREATED: &str = "STOPPED";
 
+/// The `AppBlockBuilderState` a freshly created app block builder carries.
+///
+/// A builder is created stopped: `StartAppBlockBuilder`'s doc states that "an app block
+/// builder can only be started when it's associated with an app block", and a create
+/// associates none — so nothing the clock owes can start it, and `STOPPED` is a terminal
+/// status here. The value is `AppBlockBuilderState`'s
+/// (`APP_BLOCK_BUILDER_STATE_VALUES` in `ops/types/shared_types.rs`).
+pub const APP_BLOCK_BUILDER_STATE_CREATED: &str = "STOPPED";
+
 /// How many records one `DescribeStacks`/`DescribeFleets` page carries.
 ///
 /// The model declares `NextToken` on both operations but publishes no page limit, so
@@ -77,13 +91,23 @@ pub const FLEET_STATE_CREATED: &str = "STOPPED";
 /// follows `NextToken` sees every record exactly once, in a stable order.
 pub const DESCRIBE_PAGE_SIZE: usize = 50;
 
+/// How many records one `DescribeAppBlockBuilders` page carries.
+///
+/// That operation's `MaxResults` is documented as "the maximum size of each page of
+/// results. The maximum value is 25", so 25 is the page AWS itself publishes for this
+/// read: a request asking for more is answered with this page and the token that resumes
+/// after it.
+pub const APP_BLOCK_BUILDER_PAGE_SIZE: usize = 25;
+
 /// The maximum number of records this emulator keeps in ANY ONE of its caller-driven
-/// stores (stacks, fleets, fleet/stack associations, user pool users).
+/// stores (stacks, fleets, app blocks, app block builders, fleet/stack associations, user
+/// pool users).
 ///
 /// This is NOT AWS's service quota — AppStream's published stack and fleet limits are
 /// per-account and adjustable, and nothing here claims to reproduce them. It is the
 /// emulator's own memory ceiling: every successful `CreateStack`, `CreateFleet`,
-/// `AssociateFleet`, `CreateUser` and `BatchAssociateUserStack` inserts a record that
+/// `CreateAppBlock`, `CreateAppBlockBuilder`, `AssociateFleet`, `CreateUser` and
+/// `BatchAssociateUserStack` inserts a record that
 /// lives until a caller deletes it, so without a ceiling a caller could grow the process
 /// until the host runs out of memory. Each of those handlers checks the store it writes
 /// against this ceiling before inserting, and a request that would cross it is refused
@@ -109,6 +133,11 @@ pub const STACK_KIND: &str = "stack";
 
 /// The word AWS's refusal sentences use for a fleet.
 pub const FLEET_KIND: &str = "fleet";
+
+/// The word AWS's refusal sentences use for an app block builder — one word, unlike the
+/// hyphenated `resource-type` segment its ARN carries
+/// ([`APP_BLOCK_BUILDER_ARN_RESOURCE_TYPE`]).
+pub const APP_BLOCK_BUILDER_KIND: &str = "appblockbuilder";
 
 /// The words AWS's refusal sentences use for an app block, the `<kind>` slot of
 /// [`resource_not_found_message`] and [`resource_already_exists_message`].
@@ -275,6 +304,9 @@ pub const STACK_ARN_RESOURCE_TYPE: &str = "stack";
 /// The ARN `resource-type` segment of a fleet.
 pub const FLEET_ARN_RESOURCE_TYPE: &str = "fleet";
 
+/// The ARN `resource-type` segment of an app block builder.
+pub const APP_BLOCK_BUILDER_ARN_RESOURCE_TYPE: &str = "app-block-builder";
+
 /// The ARN `resource-type` segment of an app block, the segment before the app block's
 /// name in `arn:aws:appstream:<region>:<account>:app-block/<name>`.
 pub const APP_BLOCK_ARN_RESOURCE_TYPE: &str = "app-block";
@@ -316,6 +348,7 @@ pub fn tagged_resource_not_found_message(resource_arn: &str) -> String {
     let kind = match resource_type.as_str() {
         STACK_ARN_RESOURCE_TYPE => STACK_KIND.to_string(),
         FLEET_ARN_RESOURCE_TYPE => FLEET_KIND.to_string(),
+        APP_BLOCK_BUILDER_ARN_RESOURCE_TYPE => APP_BLOCK_BUILDER_KIND.to_string(),
         APP_BLOCK_ARN_RESOURCE_TYPE => APP_BLOCK_KIND.to_string(),
         other => other.replace('-', " "),
     };
@@ -344,6 +377,15 @@ pub fn stack_arn(region: &str, name: &str) -> String {
 /// `arn:aws:appstream:<region>:<account>:fleet/<name>`.
 pub fn fleet_arn(region: &str, name: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("fleet/{name}"))
+}
+
+/// `arn:aws:appstream:<region>:<account>:app-block-builder/<name>`.
+pub fn app_block_builder_arn(region: &str, name: &str) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{APP_BLOCK_BUILDER_ARN_RESOURCE_TYPE}/{name}"),
+    )
 }
 
 /// `arn:aws:appstream:<region>:<account>:app-block/<name>`.
@@ -574,6 +616,63 @@ impl FleetRecord {
             session_script_s3_location: self.session_script_s3_location.clone(),
             max_sessions_per_instance: self.max_sessions_per_instance,
             root_volume_config: self.root_volume_config.clone(),
+            disable_imdsv1: self.disable_imdsv1,
+        }
+    }
+}
+
+/// A persisted AppStream app block builder — the instance that packages applications
+/// into app blocks, written by `CreateAppBlockBuilder` and rendered back by
+/// `DescribeAppBlockBuilders`.
+#[derive(Debug, Clone)]
+pub struct AppBlockBuilderRecord {
+    pub arn: String,
+    pub name: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    /// One of `APP_BLOCK_BUILDER_PLATFORM_TYPE_VALUES`.
+    pub platform: String,
+    pub instance_type: String,
+    pub enable_default_internet_access: Option<bool>,
+    pub iam_role_arn: Option<String>,
+    /// The MODELLED sub-shape rather than a copy of its members, so what a Describe
+    /// returns is literally what the create persisted.
+    pub vpc_config: VpcConfig,
+    /// One of `APP_BLOCK_BUILDER_STATE_VALUES`; [`APP_BLOCK_BUILDER_STATE_CREATED`] for a
+    /// freshly created builder.
+    pub state: String,
+    pub created_time: ::aws_smithy_types::DateTime,
+    /// The errors that stopped the builder reaching its state; empty while none has
+    /// occurred.
+    pub app_block_builder_errors: Vec<ResourceError>,
+    /// Why the builder last changed state; `None` until something changed it.
+    pub state_change_reason: Option<AppBlockBuilderStateChangeReason>,
+    pub access_endpoints: Vec<AccessEndpoint>,
+    pub disable_imdsv1: Option<bool>,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl AppBlockBuilderRecord {
+    /// Render the stored record as the modelled `AppBlockBuilder` every reader returns.
+    pub fn to_app_block_builder(&self) -> AppBlockBuilder {
+        AppBlockBuilder {
+            arn: self.arn.clone(),
+            name: self.name.clone(),
+            display_name: self.display_name.clone(),
+            description: self.description.clone(),
+            platform: self.platform.clone(),
+            instance_type: self.instance_type.clone(),
+            enable_default_internet_access: self.enable_default_internet_access,
+            iam_role_arn: self.iam_role_arn.clone(),
+            vpc_config: self.vpc_config.clone(),
+            state: self.state.clone(),
+            created_time: Some(self.created_time),
+            // A builder with no errors and no state change behind it reports neither:
+            // these members describe something that happened, so until it has, they are
+            // ABSENT rather than present-and-empty.
+            app_block_builder_errors: reported(&self.app_block_builder_errors),
+            state_change_reason: self.state_change_reason.clone(),
+            access_endpoints: reported(&self.access_endpoints),
             disable_imdsv1: self.disable_imdsv1,
         }
     }
@@ -834,6 +933,9 @@ pub struct ComAmazonawsAppstreamPhotonadminproxyserviceState {
     pub themes: BTreeMap<String, ThemeRecord>,
     /// Fleets by `Name`.
     pub fleets: BTreeMap<String, FleetRecord>,
+    /// App block builders by `Name`. `BTreeMap` so every Describe page walks a stable
+    /// order.
+    pub app_block_builders: BTreeMap<String, AppBlockBuilderRecord>,
     /// App blocks by `Name` — the name a `CreateAppBlock` mints the resource under, which
     /// is also what a `DeleteAppBlock` names. `BTreeMap` so every page of a read walks a
     /// stable order.
@@ -912,6 +1014,11 @@ impl ComAmazonawsAppstreamPhotonadminproxyserviceState {
                 .get(&name)
                 .filter(|record| record.arn == resource_arn)
                 .map(|record| &record.tags),
+            APP_BLOCK_BUILDER_ARN_RESOURCE_TYPE => self
+                .app_block_builders
+                .get(&name)
+                .filter(|record| record.arn == resource_arn)
+                .map(|record| &record.tags),
             APP_BLOCK_ARN_RESOURCE_TYPE => self
                 .app_blocks
                 .get(&name)
@@ -936,6 +1043,11 @@ impl ComAmazonawsAppstreamPhotonadminproxyserviceState {
                 .map(|record| &mut record.tags),
             FLEET_ARN_RESOURCE_TYPE => self
                 .fleets
+                .get_mut(&name)
+                .filter(|record| record.arn == resource_arn)
+                .map(|record| &mut record.tags),
+            APP_BLOCK_BUILDER_ARN_RESOURCE_TYPE => self
+                .app_block_builders
                 .get_mut(&name)
                 .filter(|record| record.arn == resource_arn)
                 .map(|record| &mut record.tags),

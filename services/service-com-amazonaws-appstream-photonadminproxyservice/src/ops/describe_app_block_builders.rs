@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAppBlockBuilders
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAppBlockBuilders`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAppBlockBuilders::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: renders the [`crate::state::AppBlockBuilderRecord`]s this service holds
+//! back as modelled `AppBlockBuilder`s, a page at a time. A request that names `Names`
+//! reports exactly those builders and answers `ResourceNotFoundException` (HTTP 404) for
+//! a name the account does not hold; one that names none reports every stored builder.
 //!
 //! ## Shape of an operation
 //!
@@ -141,20 +136,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAppBlockBuilders` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAppBlockBuildersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAppBlockBuilders"))
+        // `MaxResults` is "the maximum size of each page of results", so a page of fewer
+        // than one record is not a size this operation can answer with. The model puts no
+        // `@range` on the member (`smithy_query(query="operation",
+        // operation="DescribeAppBlockBuilders")` reports `MaxResults` as a plain
+        // `Integer`), so the boundary validator passes any value through and this is where
+        // the rule is enforced.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "MaxResults must be at least 1, was {max_results}"
+                )));
+            }
+            // Clamped to the page this operation publishes, so no request sizes the page
+            // it is answered with: a caller asking for more still sees every record by
+            // following the token.
+            Some(max_results) => usize::try_from(max_results)
+                .unwrap_or(crate::state::APP_BLOCK_BUILDER_PAGE_SIZE)
+                .min(crate::state::APP_BLOCK_BUILDER_PAGE_SIZE),
+            None => crate::state::APP_BLOCK_BUILDER_PAGE_SIZE,
+        };
+
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_implemented("DescribeAppBlockBuilders")
+        })?;
+        // A read: the guard is only ever read through, so a Describe can never change
+        // what a later caller sees.
+        let state = state.lock();
+
+        let selected: ::std::collections::BTreeSet<String> = match &input.names {
+            Some(names) => {
+                for name in names {
+                    if !state.app_block_builders.contains_key(name) {
+                        return Err(
+                            DescribeAppBlockBuildersErrorModeled::ResourceNotFoundException(
+                                ResourceNotFoundException {
+                                    message: Some(crate::state::resource_not_found_message(
+                                        crate::state::APP_BLOCK_BUILDER_KIND,
+                                        name,
+                                    )),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                }
+                names.iter().cloned().collect()
+            }
+            None => state.app_block_builders.keys().cloned().collect(),
+        };
+
+        let page = crate::state::paginate_sized(&selected, input.next_token.as_deref(), page_size)
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(
+                    "NextToken is not a pagination token this service issued",
+                )
+            })?;
+        let app_block_builders: Vec<AppBlockBuilder> = page
+            .names
+            .iter()
+            .filter_map(|name| state.app_block_builders.get(name))
+            .map(crate::state::AppBlockBuilderRecord::to_app_block_builder)
+            .collect();
+
+        Ok(DescribeAppBlockBuildersOutput {
+            app_block_builders: Some(app_block_builders),
+            next_token: page.next_token,
+        })
     }
 }
