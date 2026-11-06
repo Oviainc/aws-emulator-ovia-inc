@@ -8,18 +8,18 @@
 //!
 //! The rules under test:
 //!
-//! * a PackagingGroup that any stored PackagingConfiguration still names in its
-//!   `PackagingGroupId` cannot be deleted: the delete is refused with the modelled
-//!   `UnprocessableEntityException` (HTTP 422, `errorKind client`) and the refusal has
-//!   NO effect — the group still reads back byte-for-byte, keeps its tags, and every
-//!   configuration and asset it holds is still stored;
-//! * the protection is keyed on the configurations stored AT DELETE TIME and on the
-//!   group the request addresses: deleting the dependent configurations first lets the
-//!   identical delete succeed (`204 No Content`, then `DescribePackagingGroup` 404 and
-//!   the tags gone), and a configuration attached to a DIFFERENT group protects nothing;
-//! * Assets are not part of the protection: a group holding only assets deletes;
+//! * a PackagingGroup that any stored child resource still names in its
+//!   `PackagingGroupId` — a PackagingConfiguration or an Asset — cannot be deleted: the
+//!   delete is refused with the modelled `UnprocessableEntityException` (HTTP 422,
+//!   `errorKind client`) and the refusal has NO effect — the group still reads back
+//!   byte-for-byte, keeps its tags, and every configuration and asset it holds is still
+//!   stored;
+//! * the protection is keyed on the children stored AT DELETE TIME and on the group the
+//!   request addresses: deleting the dependent children first lets the identical delete
+//!   succeed (`204 No Content`, then `DescribePackagingGroup` 404 and the tags gone),
+//!   and a child attached to a DIFFERENT group protects nothing;
 //! * an `Id` this service holds no PackagingGroup under is the ADDRESSED resource
-//!   missing — 404 `NotFoundException` — whatever configurations the service holds.
+//!   missing — 404 `NotFoundException` — whatever children the service holds.
 
 use std::sync::Arc;
 
@@ -185,11 +185,27 @@ async fn delete_config(router: &MultiServiceRouter, id: &str) {
         None,
     )
     .await;
+    // Every delete of this service answers 204 No Content.
     assert_eq!(
         answer.status, DELETE_SUCCESS,
         "DeletePackagingConfiguration {id:?}: expected {DELETE_SUCCESS}, got {} body {}",
         answer.status, answer.body
     );
+}
+
+/// `DeleteAsset`'s answer for `id`, asserting the teardown succeeded.
+async fn delete_asset(router: &MultiServiceRouter, id: &str) {
+    let answer = call(router, "DELETE", &format!("/assets/{id}"), None).await;
+    assert_eq!(
+        answer.status, DELETE_SUCCESS,
+        "DeleteAsset {id:?}: expected {DELETE_SUCCESS}, got {} body {}",
+        answer.status, answer.body
+    );
+}
+
+/// The id of the `index`th asset a row populates its group with.
+fn asset_id(index: usize) -> String {
+    format!("asset-{index}")
 }
 
 /// One row of the dependency table: how the group under test was populated.
@@ -198,19 +214,19 @@ struct Row {
     /// What this row is about, named in every assertion it drives.
     case: &'static str,
     /// `(configuration id, packaging format)` of each configuration created IN the
-    /// group under test — the dependents the refusal must key off.
+    /// group under test — one of the two dependent classes the refusal keys off.
     configs: Vec<(&'static str, &'static str)>,
-    /// How many assets the group also holds. Assets are not dependents.
+    /// How many assets the group holds — the other dependent class.
     assets: usize,
 }
 
 /// The group every row populates and then tries to delete.
 const GROUP: &str = "protected-group";
 
-/// The rows span the dependent COUNT (one, two, four), the packaging FORMAT of each
-/// dependent (each of the four the model declares), the FORM of the dependent's id, and
-/// whether the group also holds assets — because the rule is about whether a
-/// configuration still names the group, not about any of those.
+/// The rows span the dependent CLASS (configurations only, assets only, both), the
+/// dependent COUNT (one, two, three, four), the packaging FORMAT of each dependent
+/// configuration (each of the four the model declares) and the FORM of its id — because
+/// the rule is about whether ANY child still names the group, not about any of those.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -238,6 +254,16 @@ fn rows() -> Vec<Row> {
             ],
             assets: 1,
         },
+        Row {
+            case: "one asset, no configuration",
+            configs: Vec::new(),
+            assets: 1,
+        },
+        Row {
+            case: "three assets, no configuration",
+            configs: Vec::new(),
+            assets: 3,
+        },
     ]
 }
 
@@ -250,7 +276,7 @@ async fn populate(row: &Row) -> (Arc<engine::InMemoryEngine>, MultiServiceRouter
         create_config(&router, id, GROUP, format).await;
     }
     for index in 0..row.assets {
-        create_asset(&router, &format!("asset-{index}"), GROUP).await;
+        create_asset(&router, &asset_id(index), GROUP).await;
     }
     (engine, router)
 }
@@ -266,8 +292,19 @@ fn stored_counts(engine: &Arc<engine::InMemoryEngine>) -> (usize, usize, usize) 
     )
 }
 
+/// The message a refused delete carries for `row`: the per-member line this service
+/// composes, naming the dependency class the caller has to clear first. Assets are
+/// reported first, in the order a caller has to remove them.
+fn expected_refusal_message(row: &Row) -> &'static str {
+    if row.assets > 0 {
+        "id cannot be deleted because it has attached assets"
+    } else {
+        "id cannot be deleted because it has attached packaging configurations"
+    }
+}
+
 #[tokio::test]
-async fn a_group_a_configuration_references_cannot_be_deleted() {
+async fn a_group_a_child_resource_references_cannot_be_deleted() {
     for row in rows() {
         let (engine, router) = populate(&row).await;
         let case = row.case;
@@ -287,26 +324,28 @@ async fn a_group_a_configuration_references_cannot_be_deleted() {
                 (refused.status, refused.errortype.as_str()),
                 (UNPROCESSABLE.1, UNPROCESSABLE.0),
                 "case {case:?} attempt {attempt}: DeletePackagingGroup with {} \
-                 configuration(s) still stored: expected HTTP {} / {}, got HTTP {} / {:?} \
-                 body {}",
+                 configuration(s) and {} asset(s) still stored: expected HTTP {} / {}, \
+                 got HTTP {} / {:?} body {}",
                 row.configs.len(),
+                row.assets,
                 UNPROCESSABLE.1,
                 UNPROCESSABLE.0,
                 refused.status,
                 refused.errortype,
                 refused.body
             );
-            // The refusal states what is wrong with the request; the text itself is
-            // not a requirement, only that a client is told something.
-            assert!(
-                refused.body["message"].as_str().is_some_and(|m| !m.is_empty()),
-                "case {case:?} attempt {attempt}: the refusal must carry a message, got {}",
+            assert_eq!(
+                refused.body["message"].as_str(),
+                Some(expected_refusal_message(&row)),
+                "case {case:?} attempt {attempt}: expected the refusal to name the \
+                 dependency class, got {}",
                 refused.body
             );
         }
 
         // NOTHING changed: the group reads back exactly as before (ARN, CreatedAt,
-        // tags, derived counts included), and the store holds every child it held.
+        // tags, derived counts included), and the store holds every child it held,
+        // each still naming the group.
         let after = describe_group(&router, GROUP).await;
         assert_eq!(
             after.status, 200,
@@ -319,6 +358,18 @@ async fn a_group_a_configuration_references_cannot_be_deleted() {
             "case {case:?}: a refused delete must not change the group, before {} after {}",
             before.body, after.body
         );
+        for index in 0..row.assets {
+            let id = asset_id(index);
+            let asset = call(&router, "GET", &format!("/assets/{id}"), None).await;
+            assert_eq!(
+                (asset.status, asset.body["packagingGroupId"].as_str()),
+                (200, Some(GROUP)),
+                "case {case:?}: DescribeAsset {id:?} after the refused delete must still \
+                 name the group, got HTTP {} body {}",
+                asset.status,
+                asset.body
+            );
+        }
         let counts_after = stored_counts(&engine);
         assert_eq!(
             counts_after, counts_before,
@@ -336,10 +387,20 @@ async fn the_identical_delete_succeeds_once_the_last_dependent_is_gone() {
         let case = row.case;
 
         // Each dependent removed in turn: while ANY is still stored the delete is
-        // refused, so the protection is about the set being non-empty, not about a
-        // particular configuration.
-        let mut remaining = row.configs.len();
-        for (id, _) in &row.configs {
+        // refused, so the protection is about the set of children being non-empty, not
+        // about a particular child or class. Each child carries its CLASS, so the
+        // teardown reaches the right delete even for an asset and a configuration
+        // sharing an id.
+        let mut remaining = row.assets + row.configs.len();
+        let children: Vec<(bool, String)> = (0..row.assets)
+            .map(|index| (true, asset_id(index)))
+            .chain(
+                row.configs
+                    .iter()
+                    .map(|(id, _)| (false, (*id).to_string())),
+            )
+            .collect();
+        for (is_asset, child) in &children {
             let refused = delete_group(&router, GROUP).await;
             assert_eq!(
                 (refused.status, refused.errortype.as_str()),
@@ -352,16 +413,20 @@ async fn the_identical_delete_succeeds_once_the_last_dependent_is_gone() {
                 refused.errortype,
                 refused.body
             );
-            delete_config(&router, id).await;
+            if *is_asset {
+                delete_asset(&router, child).await;
+            } else {
+                delete_config(&router, child).await;
+            }
             remaining -= 1;
         }
 
         let accepted = delete_group(&router, GROUP).await;
         assert_eq!(
             accepted.status, DELETE_SUCCESS,
-            "case {case:?}: with no dependent left (the group still holds {} asset(s)), \
-             DeletePackagingGroup: expected {DELETE_SUCCESS}, got {} body {}",
-            row.assets, accepted.status, accepted.body
+            "case {case:?}: with no dependent left, DeletePackagingGroup: expected \
+             {DELETE_SUCCESS}, got {} body {}",
+            accepted.status, accepted.body
         );
 
         let gone = describe_group(&router, GROUP).await;
@@ -390,18 +455,18 @@ async fn the_identical_delete_succeeds_once_the_last_dependent_is_gone() {
         );
 
         // The accepted delete forgot the group's tags, so a group later created with
-        // the same id inherits none — and the assets it held are still their own
-        // resources.
+        // the same id inherits none — and every child was removed by its own delete,
+        // never cascaded by the group's.
         let (configs, assets, _) = stored_counts(&engine);
         assert_eq!(
             configs, 0,
-            "case {case:?}: every dependent was deleted before the group, {configs} left"
+            "case {case:?}: every dependent was deleted before the group, {configs} \
+             configuration(s) left"
         );
         assert_eq!(
-            assets, row.assets,
-            "case {case:?}: deleting the group must not cascade to its assets, {assets} \
-             of {} left",
-            row.assets
+            assets, 0,
+            "case {case:?}: every dependent was deleted before the group, {assets} \
+             asset(s) left"
         );
         let recreated = call(
             &router,
@@ -426,13 +491,14 @@ async fn the_identical_delete_succeeds_once_the_last_dependent_is_gone() {
 }
 
 #[tokio::test]
-async fn only_configurations_of_the_addressed_group_protect_it() {
-    // (case, how many assets the group under test holds — it holds no configuration
-    // of its own in any row, while ANOTHER group holds one of every format)
+async fn only_children_of_the_addressed_group_protect_it() {
+    // (case, how many assets ANOTHER group holds — the group under test holds no child
+    // of its own in any row, while that other group holds one configuration of every
+    // modelled format plus this many assets)
     let cases: [(&str, usize); 3] = [
-        ("no dependents, no assets", 0),
-        ("no dependents, one asset", 1),
-        ("no dependents, three assets", 3),
+        ("another group with configurations only", 0),
+        ("another group with configurations and one asset", 1),
+        ("another group with configurations and three assets", 3),
     ];
 
     for (case, assets) in cases {
@@ -440,8 +506,8 @@ async fn only_configurations_of_the_addressed_group_protect_it() {
         let router = router_over(engine.clone());
         create_group(&router, GROUP).await;
         create_group(&router, "other-group").await;
-        // The other group's configurations name THEIR group, so they must not protect
-        // this one whatever their format or count.
+        // The other group's children name THEIR group, so they must not protect this
+        // one whatever their class, format or count.
         for (index, format) in ["hlsPackage", "dashPackage", "cmafPackage", "mssPackage"]
             .into_iter()
             .enumerate()
@@ -449,14 +515,14 @@ async fn only_configurations_of_the_addressed_group_protect_it() {
             create_config(&router, &format!("other-cfg-{index}"), "other-group", format).await;
         }
         for index in 0..assets {
-            create_asset(&router, &format!("asset-{index}"), GROUP).await;
+            create_asset(&router, &asset_id(index), "other-group").await;
         }
 
         let accepted = delete_group(&router, GROUP).await;
         assert_eq!(
             accepted.status, DELETE_SUCCESS,
-            "case {case:?}: a group no configuration references must delete \
-             (it holds {assets} asset(s)): expected {DELETE_SUCCESS}, got {} body {}",
+            "case {case:?}: a group no child of its own references must delete: expected \
+             {DELETE_SUCCESS}, got {} body {}",
             accepted.status, accepted.body
         );
         let gone = describe_group(&router, GROUP).await;
@@ -466,18 +532,19 @@ async fn only_configurations_of_the_addressed_group_protect_it() {
              body {}",
             NOT_FOUND.1, gone.status, gone.body
         );
-        // The other group and its configurations are untouched.
+        // The other group and its children are untouched.
         let other = describe_group(&router, "other-group").await;
         assert_eq!(
             other.status, 200,
             "case {case:?}: the other group must be untouched, got {} body {}",
             other.status, other.body
         );
-        let (configs, _, _) = stored_counts(&engine);
+        let (configs, stored_assets, _) = stored_counts(&engine);
         assert_eq!(
-            configs, 4,
-            "case {case:?}: the other group's four configurations must still be stored, \
-             {configs} left"
+            (configs, stored_assets),
+            (4, assets),
+            "case {case:?}: the other group's four configurations and {assets} asset(s) \
+             must still be stored, got {configs} and {stored_assets}"
         );
     }
 }

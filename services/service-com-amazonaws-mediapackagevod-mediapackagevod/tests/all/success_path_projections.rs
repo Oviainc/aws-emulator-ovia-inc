@@ -478,9 +478,9 @@ async fn configure_logs_is_persisted_and_reported_by_every_later_read() {
 /// the following read is a 404 `NotFoundException` with a message and the
 /// `x-amzn-errortype` header — whatever the group held when it was deleted.
 ///
-/// A PackagingConfiguration still naming the group PROTECTS it (the delete is then
-/// refused with 422 — see `tests/all/packaging_group_deletion.rs`), so the rows that
-/// create one delete it first; this test is about what the accepted delete removes.
+/// A PackagingConfiguration or an Asset still naming the group PROTECTS it (the delete
+/// is then refused with 422 — see `tests/all/packaging_group_deletion.rs`), so the rows
+/// that create one delete it first; this test is about what the accepted delete removes.
 #[tokio::test]
 async fn delete_packaging_group_makes_every_later_read_not_found() {
     // (case, what the group holds when it is deleted)
@@ -511,13 +511,20 @@ async fn delete_packaging_group_makes_every_later_read_not_found() {
             create_asset(&router, "a", &group).await;
         }
 
-        // The dependent configuration is removed through its own operation, which is
-        // what lets the group's delete be accepted at all.
+        // Each dependent is removed through its own operation, which is what lets the
+        // group's delete be accepted at all.
         if case.contains("configuration") || case.contains("both") {
             let (status, body) = call(&router, "DELETE", "/packaging_configurations/cfg", None).await;
             assert_eq!(
                 status, 204,
                 "case {case:?}: DeletePackagingConfiguration cfg, got {status}, body {body}"
+            );
+        }
+        if case.contains("asset") || case.contains("both") {
+            let (status, body) = call(&router, "DELETE", "/assets/a", None).await;
+            assert_eq!(
+                status, 204,
+                "case {case:?}: DeleteAsset a, got {status}, body {body}"
             );
         }
 

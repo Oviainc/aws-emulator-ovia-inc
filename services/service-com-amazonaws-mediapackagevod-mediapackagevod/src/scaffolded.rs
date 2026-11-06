@@ -298,6 +298,20 @@ impl UnprocessableEntity {
         }
     }
 
+    /// The same violation, worded with the FIXED sentence this service states for a
+    /// refusal class instead of the composed `<member_name> <phrase>` line.
+    ///
+    /// Some refusal classes are worded by a sentence that interpolates nothing from
+    /// the request, names no input member and echoes no offending value; the
+    /// per-attribute `errors` map still attributes the violation to the member at
+    /// fault, so a client rendering per field is unaffected. Reach for this only where
+    /// the fixed wording is recorded, and keep [`Self::member`]'s composed line
+    /// everywhere else.
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = message.into();
+        self
+    }
+
     /// Violations of SEVERAL input members in ONE refusal, or `None` when
     /// `violations` is empty — nothing was violated, so there is nothing to refuse.
     ///

@@ -31,6 +31,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_mediapackagevod_mediapackagevod::state as vod;
+
 /// The region the test signs for; it only has to be a legal credential scope.
 const REGION: &str = "us-west-2";
 
@@ -386,7 +388,8 @@ async fn an_empty_id_is_attributed_to_the_id_member() {
     }
 }
 
-/// A cursor this service never issued is a violation of the member it arrived in.
+/// A cursor this service never issued is attributed to the member it arrived in, and
+/// worded by the fixed sentence this refusal class carries.
 #[tokio::test]
 async fn a_forged_pagination_cursor_is_attributed_to_its_member() {
     let router = router();
@@ -412,10 +415,12 @@ async fn a_forged_pagination_cursor_is_attributed_to_its_member() {
             "case {case:?}: expected the violation attributed to `nextToken`, got {}",
             answer.errors()
         );
+        // The MESSAGE of this refusal class is a fixed sentence: it names no member
+        // and echoes no token, unlike the composed per-member line above.
         assert_eq!(
             answer.message(),
-            "next_token is not a cursor this service issued",
-            "case {case:?}: expected the member-and-constraint message, got {:?}",
+            vod::INVALID_NEXT_TOKEN_MESSAGE,
+            "case {case:?}: expected the fixed invalid-cursor message, got {:?}",
             answer.message()
         );
     }

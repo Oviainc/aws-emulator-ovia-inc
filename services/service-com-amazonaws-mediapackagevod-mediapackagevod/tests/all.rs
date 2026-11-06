@@ -17,6 +17,8 @@ mod arn_documented_members;
 mod arn_member_validation;
 #[path = "all/asset_listing.rs"]
 mod asset_listing;
+#[path = "all/attached_asset_protection.rs"]
+mod attached_asset_protection;
 #[path = "all/configure_logs.rs"]
 mod configure_logs;
 #[path = "all/describe_packaging_configuration.rs"]
@@ -61,3 +63,5 @@ mod success_path_projections;
 mod tag_key_length_bounds;
 #[path = "all/tag_restrictions.rs"]
 mod tag_restrictions;
+#[path = "all/unissued_pagination_cursor.rs"]
+mod unissued_pagination_cursor;

@@ -1325,26 +1325,27 @@ async fn list_packaging_groups_max_results_and_next_token_follow_their_modelled_
     );
 }
 
-/// A packaging group is removed only while no PackagingConfiguration references it, and
-/// its tags go with it.
+/// A packaging group is removed only while no child resource references it, and its
+/// tags go with it.
 ///
-/// A PackagingConfiguration names the group it packages for by `PackagingGroupId`
-/// (`CreatePackagingConfiguration` refuses one that resolves to no stored group), and
-/// the service protects that reference: while any stored configuration still names the
-/// group, `DeletePackagingGroup` is refused with the modelled
+/// A PackagingConfiguration and an Asset each name the group they belong to by
+/// `PackagingGroupId` (both creates refuse one that resolves to no stored group), and
+/// the service protects that reference: while any stored child still names the group,
+/// `DeletePackagingGroup` is refused with the modelled
 /// `UnprocessableEntityException` (422) and the group is left exactly as it was —
-/// recorded as behavioural unit
-/// `mediapackage-vod.delete-packaging-group-with-dependent-configs-rejected`. Delete the
+/// recorded as behavioural units
+/// `mediapackage-vod.delete-packaging-group-with-dependent-configs-rejected` and
+/// `mediapackage-vod.delete-packaging-group-with-attached-asset-rejected`. Delete the
 /// dependents first and the identical delete succeeds, answering 204 (the status
 /// `src/ops/delete_packaging_group.rs` documents against the model's 202), after which
 /// the group reads back the modelled `NotFoundException` (404) and its tags are gone
-/// with it. Nothing is cascaded: the assets the group held are still their own
-/// resources, each addressed by its own id.
+/// with it. Nothing is cascaded: each child is removed by its own delete.
 ///
-/// The rows span the dependent count (none, one, several), the packaging format each
-/// dependent was created with, and whether the group also holds assets. The full
-/// dependency table — the refusal's effect-freedom, the id forms, and a configuration
-/// of ANOTHER group protecting nothing — is `tests/all/packaging_group_deletion.rs`.
+/// The rows span the dependent class (configurations, assets, both, neither), the
+/// dependent count (none, one, several) and the packaging format each configuration was
+/// created with. The full dependency table — the refusal's effect-freedom, its message,
+/// the id forms, and a child of ANOTHER group protecting nothing — is
+/// `tests/all/packaging_group_deletion.rs`.
 #[tokio::test]
 async fn a_packaging_group_is_deletable_only_while_nothing_references_it() {
     // (case, the package blocks of the configurations created in the group, how many
@@ -1384,13 +1385,14 @@ async fn a_packaging_group_is_deletable_only_while_nothing_references_it() {
             create_asset(&router, &format!("asset-{index}"), "del-group").await;
         }
 
-        // While a dependent is stored the delete is refused and removes nothing.
-        if !packages.is_empty() {
+        // While a child is stored the delete is refused and removes nothing.
+        if !packages.is_empty() || assets > 0 {
             let (status, body) = call(&router, "DELETE", "/packaging_groups/del-group", None).await;
             assert_eq!(
                 status, 422,
-                "case {case:?}: DeletePackagingGroup with {} configuration(s) still \
-                 stored must be refused as unprocessable, got {status} and body {body}",
+                "case {case:?}: DeletePackagingGroup with {} configuration(s) and {assets} \
+                 asset(s) still stored must be refused as unprocessable, got {status} and \
+                 body {body}",
                 packages.len()
             );
             let (status, described) =
@@ -1402,6 +1404,14 @@ async fn a_packaging_group_is_deletable_only_while_nothing_references_it() {
             );
             // The dependents are deleted through their own operation, which is what
             // lifts the protection.
+            for index in 0..assets {
+                let (status, body) =
+                    call(&router, "DELETE", &format!("/assets/asset-{index}"), None).await;
+                assert_eq!(
+                    status, 204,
+                    "case {case:?}: DeleteAsset asset-{index}, got {status} and body {body}"
+                );
+            }
             for index in 0..packages.len() {
                 let (status, body) = call(
                     &router,
@@ -1422,11 +1432,11 @@ async fn a_packaging_group_is_deletable_only_while_nothing_references_it() {
         assert_eq!(
             status, 204,
             "case {case:?}: expected the recorded 204 No Content for a group holding no \
-             configuration and {assets} asset(s) (the model declares 202 — see \
+             child (the model declares 202 — see \
              `src/ops/delete_packaging_group.rs`), got {status} and body {body}"
         );
-        // Nothing is cascaded: the assets the group held are still stored, each its own
-        // resource addressed by its own id, and the state the engine holds says so.
+        // Nothing is cascaded: every child was removed by its own delete before the
+        // group's, and the state the engine holds says so.
         {
             let store = engine.state::<vod::ComAmazonawsMediapackagevodMediapackagevodState>();
             let state = store.lock();
@@ -1435,12 +1445,12 @@ async fn a_packaging_group_is_deletable_only_while_nothing_references_it() {
             assert_eq!(
                 held_configs, 0,
                 "case {case:?}: every dependent was deleted before the group, \
-                 {held_configs} left"
+                 {held_configs} configuration(s) left"
             );
             assert_eq!(
-                held_assets, assets,
-                "case {case:?}: deleting the group must not remove its assets, \
-                 {held_assets} of {assets} left"
+                held_assets, 0,
+                "case {case:?}: every dependent was deleted before the group, \
+                 {held_assets} asset(s) left"
             );
         }
 

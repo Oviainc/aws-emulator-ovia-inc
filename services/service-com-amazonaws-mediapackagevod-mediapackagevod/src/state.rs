@@ -968,6 +968,16 @@ fn page_token_check(listing: &str, last_id: &str) -> String {
     digest_hex(&format!("{listing}-cursor/{last_id}"), PAGE_TOKEN_CHECK_LEN)
 }
 
+/// The message the refusal of an unusable `NextToken` carries, for every listing of
+/// this service.
+///
+/// FIXED text: the recorded refusal of a `nextToken` this service never issued
+/// interpolates nothing from the request — it neither names the input member nor
+/// echoes the offending token — so it is NOT composed by the per-member
+/// `<member_name> <phrase>` form the other parameter refusals of this service use.
+/// The per-attribute `errors` map still attributes it to `nextToken`.
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "Invalid NextToken";
+
 /// The id a `NextToken` names as the resume point of `listing`, or the refusal a
 /// cursor this listing did not issue gets.
 ///
@@ -984,6 +994,7 @@ pub fn resume_after(
                 "nextToken",
                 "is not a cursor this service issued",
             )
+            .with_message(INVALID_NEXT_TOKEN_MESSAGE)
         }),
     }
 }

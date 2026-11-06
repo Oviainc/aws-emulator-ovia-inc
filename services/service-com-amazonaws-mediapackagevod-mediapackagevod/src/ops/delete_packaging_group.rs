@@ -4,8 +4,8 @@
 //! IMPLEMENTED: removes the stored PackagingGroup (and the tags stored for it), so a
 //! following `DescribePackagingGroup` answers 404. `Id` naming no stored group is
 //! `NotFoundException` (404); an `Id` naming a group a stored PackagingConfiguration
-//! still references is `UnprocessableEntityException` (422) and the group is left
-//! exactly as it was — see NOTE ON ATTACHED CHILDREN below.
+//! or a stored Asset still references is `UnprocessableEntityException` (422) and the
+//! group is left exactly as it was — see NOTE ON ATTACHED CHILDREN below.
 //!
 //! NOTE ON THE SUCCESS STATUS: the model declares `@http` code 202 for this operation
 //! (and the issue report that asked for this handler quotes that 202), but AWS answers
@@ -18,15 +18,21 @@
 //! (`DeleteAsset` and `DeletePackagingConfiguration` keep the 202 their own models
 //! declare: no recording contradicts those.)
 //!
-//! NOTE ON ATTACHED CHILDREN: a PackagingGroup that a stored PackagingConfiguration
-//! still names in its `PackagingGroupId` is PROTECTED: the delete is refused with the
-//! modelled `UnprocessableEntityException` (HTTP 422) and nothing about the group
-//! changes — it stays readable through `DescribePackagingGroup` and keeps its tags.
-//! RECORDED behaviour: behavioural unit
-//! `mediapackage-vod.delete-packaging-group-with-dependent-configs-rejected` creates a
-//! group, creates a configuration against it and asserts that the delete raises
-//! `UnprocessableEntityException` while a following `DescribePackagingGroup` still
-//! returns the group; the same delete succeeds once the configuration has been deleted.
+//! NOTE ON ATTACHED CHILDREN: a PackagingGroup any stored child resource still names
+//! in its `PackagingGroupId` — a PackagingConfiguration or an Asset — is PROTECTED:
+//! the delete is refused with the modelled `UnprocessableEntityException` (HTTP 422)
+//! and nothing about the group changes — it stays readable through
+//! `DescribePackagingGroup`, keeps its tags, and every child stays stored and keeps
+//! naming the group. The two classes are independent: either alone refuses the delete,
+//! and the delete succeeds only once BOTH are empty for that group in that Region.
+//! RECORDED behaviour: behavioural units
+//! `mediapackage-vod.delete-packaging-group-with-dependent-configs-rejected` (a
+//! configuration attached) and
+//! `mediapackage-vod.delete-packaging-group-with-attached-asset-rejected` (an asset
+//! attached and NO configuration) both create the dependent, assert that the delete
+//! raises `UnprocessableEntityException` while a following `DescribePackagingGroup`
+//! still returns the group, and then see the identical delete succeed once the
+//! dependent has been deleted.
 //!
 //! This reconciles an earlier note in this module which claimed the opposite from the
 //! wire corpus: replaying `mediapackage-vod-packaging-configuration-multi-format`
@@ -36,13 +42,13 @@
 //! `DescribePackagingGroup` poll for 404), so the 422 came from configurations that were
 //! still stored only because `DeletePackagingConfiguration` was an unimplemented 501
 //! stub at the time — not from AWS accepting a delete of a group with attached children.
-//! The check below therefore keys STRICTLY off configurations actually stored at delete
-//! time: a teardown that removes its configurations first gets its 204.
+//! The check below therefore keys STRICTLY off the children actually stored at delete
+//! time: a teardown that removes its assets and configurations first gets its 204.
 //!
-//! Assets are NOT part of the refusal: no recording or model text shows a group holding
-//! only Assets refused, so an asset-holding group still deletes (204) and the group's
-//! Assets, like a protected group's configurations, are never cascaded — each is a
-//! resource addressed by its own id with its own delete operation.
+//! Nothing is CASCADED by a successful delete: a group's children are each a resource
+//! addressed by its own id with its own delete operation, which is why the delete is
+//! refused rather than removing them — the caller clears the children first (assets,
+//! then configurations, then the group).
 //!
 //! ## Shape of an operation
 //!
@@ -205,14 +211,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // Referential integrity: a configuration of this same Region still names this
+        // Referential integrity: a child resource of this same Region still names this
         // group in its `PackagingGroupId`, so removing the group would orphan it.
         // Refused with the modelled 422 before anything is written, so neither the
-        // group nor its tags are touched on this path.
-        if state.configuration_count(&region, &input.id) > 0 {
+        // group nor its tags are touched on this path. The two dependency classes are
+        // INDEPENDENT: either one alone protects the group, and the refusal names the
+        // class the caller has to clear first.
+        let attached = if state.asset_count(&region, &input.id) > 0 {
+            Some("assets")
+        } else if state.configuration_count(&region, &input.id) > 0 {
+            Some("packaging configurations")
+        } else {
+            None
+        };
+        if let Some(class) = attached {
             return Err(crate::scaffolded::UnprocessableEntity::member(
                 "id",
-                "cannot be deleted because it has attached packaging configurations",
+                format!("cannot be deleted because it has attached {class}"),
             )
             .into());
         }
