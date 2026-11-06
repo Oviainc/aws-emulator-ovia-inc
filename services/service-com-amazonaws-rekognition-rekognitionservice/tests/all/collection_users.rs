@@ -90,6 +90,7 @@ async fn list_users(
 ) -> Vec<(String, String)> {
     let mut users = Vec::new();
     let mut token: Option<String> = None;
+    let mut pages = 0;
     loop {
         let mut body = json!({ "CollectionId": collection_id });
         if let Some(cursor) = &token {
@@ -106,6 +107,15 @@ async fn list_users(
         if token.is_none() {
             return users;
         }
+        // A page carries at least one user while users remain, so the walk cannot need
+        // more pages than the collection may hold: a handler that minted a cursor
+        // forever fails here instead of hanging the run.
+        pages += 1;
+        assert!(
+            pages <= state::MAX_USERS_PER_COLLECTION,
+            "case {collection_id}: paging must terminate, walked {} user(s) over {pages} pages",
+            users.len()
+        );
     }
 }
 
