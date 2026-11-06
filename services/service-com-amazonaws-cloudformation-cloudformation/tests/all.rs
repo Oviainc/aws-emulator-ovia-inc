@@ -31,6 +31,8 @@ mod bucket_notification_configuration;
 mod callback_signature;
 #[path = "all/cancelled_update.rs"]
 mod cancelled_update;
+#[path = "all/cdk_deployed_table_estate.rs"]
+mod cdk_deployed_table_estate;
 #[path = "all/cdk_metadata_resource_type.rs"]
 mod cdk_metadata_resource_type;
 #[path = "all/change_set_early_validation.rs"]

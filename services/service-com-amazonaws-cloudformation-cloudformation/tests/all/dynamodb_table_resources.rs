@@ -34,7 +34,11 @@ const DYNAMODB_JSON: &str = "application/x-amz-json-1.0";
 
 /// Call one DynamoDB operation through the same router, signed for `dynamodb` the way a
 /// client's SDK signs it: the status and the parsed answer document.
-async fn dynamodb(
+///
+/// The ONE DynamoDB caller of this crate's suites, so no suite spells that calling
+/// convention twice: `cdk_deployed_table_estate.rs` reads a table deployed through a change
+/// set back through it.
+pub(crate) async fn dynamodb(
     router: &MultiServiceRouter,
     operation: &str,
     request: &Value,
@@ -62,7 +66,7 @@ async fn dynamodb(
 
 /// The `Table` description DynamoDB answers `DescribeTable` with, or `None` where that
 /// service holds no such table.
-async fn describe_table(router: &MultiServiceRouter, name: &str) -> Option<Value> {
+pub(crate) async fn describe_table(router: &MultiServiceRouter, name: &str) -> Option<Value> {
     let (status, document) = dynamodb(router, "DescribeTable", &json!({"TableName": name})).await;
     if status == 200 {
         return document.get("Table").cloned();
