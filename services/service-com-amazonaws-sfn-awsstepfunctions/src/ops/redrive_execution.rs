@@ -335,11 +335,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Region, exactly as the first attempt's did.
             let region = crate::state::arn_region(&context.state_machine_arn);
             // And they are made as the SAME execution role the first attempt ran as,
-            // which is the one the record was started with.
+            // which is the one the record was started with — assumed again for this
+            // attempt, so a role that can no longer be assumed fails the task.
+            let unassumable = crate::state::task_authorization::unassumable_role(
+                ctx.callback(),
+                &region,
+                &context.role_arn,
+            )
+            .await;
             let role = crate::state::task_authorization::role_gate(
                 &self.engine,
                 &region,
                 &context.role_arn,
+                unassumable,
             );
             crate::state::integration::interpret(ctx, &region, role, move |tasks| {
                 crate::state::plan_redrive(

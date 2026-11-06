@@ -21,8 +21,9 @@
 //! `Resource` asks for (the fire-and-forget `states:startExecution` and the run-a-job
 //! `states:startExecution.sync:2`), and the TARGET the request names.
 //!
-//! A role this account does not hold shows nothing about the call — it may belong to
-//! another account — so the call is made, which the last test pins.
+//! A wildcard grant lets the call be made, which the last test pins. Whether the role
+//! can be ASSUMED at all is the question before this one, and
+//! `tests/all/execution_role_assumption.rs` holds it.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -476,15 +477,12 @@ async fn a_tasks_call_is_made_only_when_the_execution_role_allows_it() {
     }
 }
 
-/// A wildcard grant allows the call, and a role this account does not hold shows
-/// nothing about it, so the call is made.
+/// A wildcard grant allows the call, so it is made.
 ///
-/// The rows are the two ways a call goes ahead for a reason other than a statement
-/// naming its exact resource: a grant written with IAM's own wildcards, and no role
-/// record to read at all — a role ARN may belong to another account, which is evidence
-/// of nothing.
+/// The row is the way a call goes ahead for a reason other than a statement naming its
+/// exact resource: a grant written with IAM's own wildcards.
 #[tokio::test]
-async fn a_wildcard_grant_and_an_unknown_role_both_let_the_call_be_made() {
+async fn a_wildcard_grant_lets_the_call_be_made() {
     let chain = Chain::new();
     let child_arn = chain
         .machine(
@@ -498,13 +496,7 @@ async fn a_wildcard_grant_and_an_unknown_role_both_let_the_call_be_made() {
         "Statement": [{ "Effect": "Allow", "Action": "states:*", "Resource": "*" }]
     });
     let wildcard_role = chain.role("WildcardRole", &wildcard).await;
-    let rows: [(&str, String); 2] = [
-        ("a wildcard grant", wildcard_role),
-        (
-            "a role this account does not hold",
-            "arn:aws:iam::000000000000:role/NotHeldHere".to_string(),
-        ),
-    ];
+    let rows: [(&str, String); 1] = [("a wildcard grant", wildcard_role)];
 
     for (index, (case, role_arn)) in rows.into_iter().enumerate() {
         let parent = chain

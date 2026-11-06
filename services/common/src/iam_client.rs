@@ -31,10 +31,25 @@ pub fn iam_client(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> ::aws_sdk_iam::Client {
+    iam_client_through(ctx.callback(), region)
+}
+
+/// [`iam_client`] from the emulator callback itself rather than from a request's own
+/// context.
+///
+/// The question is the same and so is the transport; what differs is who is asking. A
+/// service that resolves an IAM entity OUTSIDE the request that named it — on a task it
+/// spawned, which holds a clone of the callback and no `OperationContext` — reaches IAM
+/// through this, so there is still one construction of this hop.
+#[must_use]
+pub fn iam_client_through(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+) -> ::aws_sdk_iam::Client {
     let config = ::aws_sdk_iam::Config::builder()
         .behavior_version(::aws_sdk_iam::config::BehaviorVersion::latest())
-        .http_client(ctx.callback().http_client())
-        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(callback.http_client())
+        .credentials_provider(callback.aws_credentials_provider())
         .region(::aws_sdk_iam::config::Region::new(region.to_string()))
         .endpoint_url(format!("https://iam.{region}.amazonaws.com"))
         .retry_config(::aws_sdk_iam::config::retry::RetryConfig::disabled())

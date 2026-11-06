@@ -152,8 +152,13 @@ use serde_json_path::JsonPath;
 use super::integration::{Failed, Tasks};
 
 mod diagnose;
+mod intrinsics;
 mod walk;
 pub use diagnose::*;
+// The intrinsic-function evaluator is this module's own: `intrinsics` holds the parser
+// and the functions, and the names stay reachable unqualified from here and from the
+// walk, as they were when they lived in this file.
+use intrinsics::*;
 
 /// The ASL predefined error name for a failure the interpreter itself raises
 /// ("States.Runtime — an execution failed due to some exception that could not be
@@ -208,11 +213,13 @@ pub const QUERY_EVALUATION_ERROR: &str = "States.QueryEvaluationError";
 pub const EXPRESS_RUN_A_JOB_UNSUPPORTED: &str =
     "Express state machine does not support '.sync' service integration";
 
-/// [`EXPRESS_RUN_A_JOB_UNSUPPORTED`] as the state `name` reports it.
-fn express_run_a_job_refusal(name: &str) -> Failure {
-    runtime(format!(
-        "An error occurred while executing the state '{name}'. \
-         {EXPRESS_RUN_A_JOB_UNSUPPORTED}"
+/// [`EXPRESS_RUN_A_JOB_UNSUPPORTED`] as the state `name`, entered at the event
+/// `entered_at`, reports it ([`executing_state`]).
+fn express_run_a_job_refusal(name: &str, entered_at: i64) -> Failure {
+    runtime(executing_state(
+        name,
+        entered_at,
+        EXPRESS_RUN_A_JOB_UNSUPPORTED,
     ))
 }
 
@@ -228,12 +235,92 @@ fn express_run_a_job_refusal(name: &str) -> Failure {
 pub const EXPRESS_CALLBACK_UNSUPPORTED: &str =
     "Express state machine does not support '.waitForTaskToken' service integration";
 
-/// [`EXPRESS_CALLBACK_UNSUPPORTED`] as the state `name` reports it.
-fn express_callback_refusal(name: &str) -> Failure {
-    runtime(format!(
-        "An error occurred while executing the state '{name}'. \
-         {EXPRESS_CALLBACK_UNSUPPORTED}"
-    ))
+/// [`EXPRESS_CALLBACK_UNSUPPORTED`] as the state `name`, entered at the event
+/// `entered_at`, reports it ([`executing_state`]).
+fn express_callback_refusal(name: &str, entered_at: i64) -> Failure {
+    runtime(executing_state(name, entered_at, EXPRESS_CALLBACK_UNSUPPORTED))
+}
+
+/// How this service reports a diagnosis the interpreter raised WHILE EXECUTING a
+/// state: the state's own name, the id of the history event that state was ENTERED at,
+/// and then the diagnosis itself.
+///
+/// It is the ONE wrapper every such diagnosis is reported under, because the diagnosis
+/// alone says only WHAT could not be run and not WHERE: a definition may declare many
+/// states that evaluate the same expression, so the state name and the event id are
+/// what a reader — an operator or an automated triage — follows back to the state that
+/// failed and to its place in the execution's own history.
+fn executing_state(name: &str, entered_at: i64, diagnosis: &str) -> String {
+    format!(
+        "An error occurred while executing the state '{name}' (entered at the event id \
+         #{entered_at}). {diagnosis}"
+    )
+}
+
+/// The id the FIRST event of an execution's history carries: the service numbers them
+/// from one, which is where every walk's own numbering starts from.
+pub const FIRST_EVENT_ID: i64 = 1;
+
+/// The opening of the diagnosis [`no_results_for_path`] words, which is what tells a
+/// cause this module raised ABOUT A STATE'S OWN EXPRESSION from every other failure a
+/// state reports ([`diagnosed`]).
+const INVALID_PATH_OPENING: &str = "Invalid path '";
+
+/// The diagnosis for a reference path that selected no value: the path that could not
+/// be resolved, and that nothing came of resolving it.
+///
+/// It names no state, because the path is written in a state and the state names
+/// itself around this ([`executing_state`]) — the one place that knows which state is
+/// being executed and which history event entered it.
+fn no_results_for_path(path: &str) -> String {
+    format!("{INVALID_PATH_OPENING}{path}' : No results for path: {path}")
+}
+
+/// `fault` as the state it happened IN reports it: a diagnosis this module worded
+/// about that state's own expression is reported under [`executing_state`], naming the
+/// state and the event id it was entered at.
+///
+/// Every OTHER failure is carried exactly as it was raised, because it already says
+/// where it belongs: a `Fail` state's declared error and cause are the definition's
+/// own, a task's failure is what the invoked service answered, and a failure a nested
+/// `Map` iteration or `Parallel` branch raised was already wrapped by the state inside
+/// it that raised it.
+fn diagnosed(name: &str, entered_at: i64, fault: Fault) -> Fault {
+    let wrapped = fault
+        .failure
+        .cause
+        .as_deref()
+        .filter(|cause| names_its_state(cause))
+        .map(|cause| executing_state(name, entered_at, cause));
+    match wrapped {
+        Some(cause) => Fault {
+            at: fault.at,
+            failure: Failure {
+                error: fault.failure.error,
+                cause: Some(cause),
+            },
+        },
+        None => fault,
+    }
+}
+
+/// Whether `cause` is a diagnosis this module worded about the expression of the state
+/// being executed, so that state names itself around it ([`diagnosed`]) rather than
+/// carrying a name of its own.
+fn names_its_state(cause: &str) -> bool {
+    cause.starts_with(INVALID_PATH_OPENING)
+}
+
+/// What a `Wait` state's members failing to evaluate reports.
+///
+/// A path diagnosis is one the state names itself around ([`diagnosed`]); every other
+/// reason — a figure out of range, a member of the wrong type — names the state here,
+/// which is the only place a `Wait`'s own reading of its members knows it from.
+fn wait_failure(name: &str, why: String) -> Failure {
+    if names_its_state(&why) {
+        return runtime(why);
+    }
+    runtime(format!("state '{name}': {why}"))
 }
 
 /// The most state transitions one execution makes before the interpreter stops it.
@@ -1715,11 +1802,15 @@ fn scan_expression(expression: &str, into: &mut BTreeSet<String>) {
 /// `tasks` is what a `Task` state's service integration is performed by: the walk
 /// asks for the call and the operation running the walk makes it
 /// ([`super::integration::interpret`]).
+///
+/// `first_event_id` is the id the first history event this walk records will carry,
+/// which a cause naming the event a state was entered at reports.
 pub fn run(
     definition: &str,
     input: &str,
     start: SystemTime,
     context: &Context,
+    first_event_id: i64,
     tasks: &dyn Tasks,
 ) -> Run {
     interpret(
@@ -1729,6 +1820,7 @@ pub fn run(
         context,
         Entry::Start,
         Duration::ZERO,
+        first_event_id,
         tasks,
     )
     .0
@@ -1749,12 +1841,14 @@ pub fn run(
 /// service-integration call again, or schedules its activity task again, rather than
 /// being handed a result ([`resume`] is the walk that is handed one). `tasks` is the
 /// same seam [`run`] takes, so that call is made exactly as the first attempt's was.
+#[allow(clippy::too_many_arguments)]
 pub fn redrive(
     definition: &str,
     input: &str,
     start: SystemTime,
     context: &Context,
     from: &RedriveStep,
+    first_event_id: i64,
     tasks: &dyn Tasks,
 ) -> Run {
     let state_input = serde_json::from_str(&from.state_input).unwrap_or(Value::Null);
@@ -1765,6 +1859,7 @@ pub fn redrive(
         context,
         Entry::At(from.state_name.clone(), state_input),
         Duration::ZERO,
+        first_event_id,
         tasks,
     )
     .0;
@@ -1806,6 +1901,7 @@ pub fn redrive(
 ///
 /// `None` when the definition declares no such state any more, so there is nothing to
 /// continue from.
+#[allow(clippy::too_many_arguments)]
 pub fn resume(
     definition: &str,
     input: &str,
@@ -1813,6 +1909,7 @@ pub fn resume(
     context: &Context,
     reply: &ActivityReply,
     elapsed: Duration,
+    first_event_id: i64,
     tasks: &dyn Tasks,
 ) -> Option<Run> {
     let state_input: Value = serde_json::from_str(&reply.state_input).ok()?;
@@ -1823,6 +1920,7 @@ pub fn resume(
         context,
         Entry::Reply(reply.clone(), state_input),
         elapsed,
+        first_event_id,
         tasks,
     );
     applied.then_some(run)
@@ -1847,6 +1945,7 @@ pub fn resume(
 ///
 /// `None` when the definition declares no such state any more, so there is nothing to
 /// continue from.
+#[allow(clippy::too_many_arguments)]
 pub fn resume_job(
     definition: &str,
     input: &str,
@@ -1854,6 +1953,7 @@ pub fn resume_job(
     context: &Context,
     reply: &JobReply,
     elapsed: Duration,
+    first_event_id: i64,
     tasks: &dyn Tasks,
 ) -> Option<Run> {
     let state_input: Value = serde_json::from_str(&reply.state_input).ok()?;
@@ -1864,6 +1964,7 @@ pub fn resume_job(
         context,
         Entry::Job(reply.clone(), state_input),
         elapsed,
+        first_event_id,
         tasks,
     );
     applied.then_some(run)
@@ -1886,6 +1987,7 @@ pub fn resume_job(
 ///
 /// `None` when the definition declares no such state any more, so there is nothing to
 /// continue from.
+#[allow(clippy::too_many_arguments)]
 pub fn resume_callback(
     definition: &str,
     input: &str,
@@ -1893,6 +1995,7 @@ pub fn resume_callback(
     context: &Context,
     reply: &CallbackReply,
     elapsed: Duration,
+    first_event_id: i64,
     tasks: &dyn Tasks,
 ) -> Option<Run> {
     let state_input: Value = serde_json::from_str(&reply.state_input).ok()?;
@@ -1903,6 +2006,7 @@ pub fn resume_callback(
         context,
         Entry::Callback(reply.clone(), state_input),
         elapsed,
+        first_event_id,
         tasks,
     );
     applied.then_some(run)
@@ -1939,6 +2043,9 @@ enum Entry {    /// At the definition's `StartAt`, with the execution's own inpu
 ///
 /// `elapsed` is the span the execution had already spent before this walk's first
 /// state, which a definition-level `TimeoutSeconds` counts.
+///
+/// `first_event_id` is the id the first event this walk records carries
+/// ([`Interpreter::first_event_id`]).
 #[allow(clippy::too_many_arguments)]
 fn interpret(
     definition: &str,
@@ -1947,6 +2054,7 @@ fn interpret(
     context: &Context,
     entry: Entry,
     elapsed: Duration,
+    first_event_id: i64,
     tasks: &dyn Tasks,
 ) -> (Run, bool) {
     let document: Value = match serde_json::from_str(definition) {
@@ -2075,6 +2183,7 @@ fn interpret(
         deadline: super::after(super::now(), MAX_INTERPRET_DURATION),
         retry_count: 0,
         steps: Vec::new(),
+        first_event_id,
         start,
         base_context: context.value(&input_value, start),
         tasks,
@@ -2474,6 +2583,12 @@ struct Interpreter<'tasks> {
     /// them at zero.
     retry_count: u64,
     steps: Vec<Step>,
+    /// The id the FIRST history event this walk records carries: the events of one
+    /// execution are numbered in order, and a walk that continues an execution
+    /// continues that numbering rather than restarting it (the caller reads the last
+    /// id the history holds off the record and hands it on). It is what a cause naming
+    /// the event a state was entered at reports ([`Interpreter::next_event_id`]).
+    first_event_id: i64,
     /// When the execution started, which a `Wait` state's `Timestamp` is measured
     /// against.
     start: SystemTime,
@@ -3326,9 +3441,13 @@ fn expression(text: &str, input: &Value, context: &Value) -> Result<Value, Failu
 
 /// Evaluate a JSONPath against the state's input, or against the context object when
 /// it begins with `$$`.
+///
+/// A path the document does not carry a value for is the state's own failure, reported
+/// with [`no_results_for_path`] — which the state that evaluated it names itself
+/// around ([`diagnosed`]).
 fn select(path: &str, input: &Value, context: &Value) -> Result<Value, Failure> {
     let selected = select_optional(path, input, context)?;
-    selected.ok_or_else(|| runtime(format!("the path '{path}' selected no value")))
+    selected.ok_or_else(|| runtime(no_results_for_path(path)))
 }
 
 /// [`select`], telling a value the document does not carry (`Ok(None)`) apart from a
@@ -3889,394 +4008,6 @@ fn glob_matches(pattern: &str, text: &str) -> Result<bool, Failure> {
 // Intrinsic functions
 // ---------------------------------------------------------------------------
 
-/// Evaluate an intrinsic function invocation (`States.Format('{}', $.name)`).
-fn intrinsic(text: &str, input: &Value, context: &Value) -> Result<Value, Failure> {
-    invoke_intrinsic(text, input, context, 1)
-}
-
-/// [`intrinsic`], carrying how deeply the invocation nests.
-///
-/// This is this crate's own parser for ASL's intrinsic syntax, over text that is a
-/// value of a definition the model bounds only at 1 MiB — and the nesting lives
-/// inside ONE JSON string, so `serde_json`'s own recursion limit does not bound it.
-/// Both the length of the invocation ([`MAX_EXPRESSION_CHARS`]) and how deeply it
-/// nests ([`MAX_EXPRESSION_DEPTH`]) are therefore bounded here, and an invocation
-/// past either is reported with [`RUNTIME_ERROR`] rather than parsed.
-fn invoke_intrinsic(
-    text: &str,
-    input: &Value,
-    context: &Value,
-    depth: usize,
-) -> Result<Value, Failure> {
-    let text = text.trim();
-    if depth > MAX_EXPRESSION_DEPTH {
-        return Err(runtime(format!(
-            "an intrinsic-function invocation nests more than the {MAX_EXPRESSION_DEPTH} \
-             levels this service evaluates"
-        )));
-    }
-    if text.len() > MAX_EXPRESSION_CHARS {
-        return Err(runtime(format!(
-            "an intrinsic-function invocation of {} bytes is longer than the \
-             {MAX_EXPRESSION_CHARS} this service evaluates",
-            text.len()
-        )));
-    }
-    let open = text
-        .find('(')
-        .ok_or_else(|| runtime(format!("'{text}' is not an intrinsic-function invocation")))?;
-    if !text.ends_with(')') {
-        return Err(runtime(format!(
-            "the intrinsic invocation '{text}' is not closed"
-        )));
-    }
-    let name = text[..open].trim();
-    let arguments = split_arguments(&text[open + 1..text.len() - 1])
-        .map_err(|why| runtime(format!("'{text}': {why}")))?;
-    // Each argument may select a whole document, and an invocation may carry as many
-    // arguments as its text has room for, so the arguments are measured as they are
-    // evaluated and bounded together: the function below cannot be handed more than a
-    // state's output may carry, so it cannot build more either.
-    let mut spent = 0usize;
-    let mut values = Vec::with_capacity(arguments.len());
-    for argument in &arguments {
-        let value = argument_value(argument, input, context, depth)?;
-        spent = spent.saturating_add(measure_payload(&value, "an intrinsic argument")?);
-        if spent > MAX_PAYLOAD_BYTES {
-            return Err(runtime(format!(
-                "'{name}' was given at least {spent} bytes of arguments, more than the \
-                 {MAX_PAYLOAD_BYTES} a state's output may carry"
-            )));
-        }
-        values.push(value);
-    }
-    let result =
-        apply_intrinsic(name, &values).map_err(|why| runtime(format!("'{text}': {why}")))?;
-    // And what it built is bounded too, because a function may expand what it was
-    // given.
-    measure_payload(&result, "an intrinsic function")?;
-    Ok(result)
-}
-
-/// Split an intrinsic's argument list on the commas that are not inside a nested
-/// invocation or a single-quoted string.
-fn split_arguments(text: &str) -> Result<Vec<String>, String> {
-    let mut arguments = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0usize;
-    let mut quoted = false;
-    let mut characters = text.chars();
-    while let Some(character) = characters.next() {
-        match character {
-            '\\' if quoted => {
-                current.push(character);
-                if let Some(escaped) = characters.next() {
-                    current.push(escaped);
-                }
-            }
-            '\'' => {
-                quoted = !quoted;
-                current.push(character);
-            }
-            '(' if !quoted => {
-                depth += 1;
-                current.push(character);
-            }
-            ')' if !quoted => {
-                depth = depth.checked_sub(1).ok_or("unbalanced ')'")?;
-                current.push(character);
-            }
-            ',' if !quoted && depth == 0 => {
-                arguments.push(std::mem::take(&mut current));
-            }
-            other => current.push(other),
-        }
-    }
-    if quoted {
-        return Err("an unterminated quoted string".to_string());
-    }
-    if depth != 0 {
-        return Err("an unclosed '('".to_string());
-    }
-    if !current.trim().is_empty() || !arguments.is_empty() {
-        arguments.push(current);
-    }
-    Ok(arguments)
-}
-
-/// One intrinsic argument: a nested invocation, a path, a quoted string, or a JSON
-/// literal. `depth` is the nesting of the invocation this argument belongs to.
-fn argument_value(
-    text: &str,
-    input: &Value,
-    context: &Value,
-    depth: usize,
-) -> Result<Value, Failure> {
-    let text = text.trim();
-    if text.starts_with("States.") && text.contains('(') {
-        return invoke_intrinsic(text, input, context, depth + 1);
-    }
-    if text.starts_with('$') {
-        return select(text, input, context);
-    }
-    if let Some(quoted) = text.strip_prefix('\'').and_then(|rest| rest.strip_suffix('\'')) {
-        // "escape ... the following characters: ' { } \" with a backslash.
-        let mut unescaped = String::with_capacity(quoted.len());
-        let mut characters = quoted.chars();
-        while let Some(character) = characters.next() {
-            if character == '\\' {
-                if let Some(escaped) = characters.next() {
-                    unescaped.push(escaped);
-                }
-            } else {
-                unescaped.push(character);
-            }
-        }
-        return Ok(Value::String(unescaped));
-    }
-    serde_json::from_str(text).map_err(|error| {
-        runtime(format!(
-            "'{text}' is not a path, a quoted string or a JSON literal: {error}"
-        ))
-    })
-}
-
-/// Apply one intrinsic function to its evaluated arguments.
-///
-/// The set below is every documented intrinsic except `States.Hash`, which is
-/// DECLINED: the algorithms it names include MD5 and SHA-1, and this emulator does
-/// not take a dependency on broken hash functions to evaluate a state's payload
-/// template. Like any other name this closed allow-list does not carry, it is
-/// reported with [`RUNTIME_ERROR`] rather than approximated.
-fn apply_intrinsic(name: &str, arguments: &[Value]) -> Result<Value, String> {
-    let argument = |index: usize| -> Result<&Value, String> {
-        arguments
-            .get(index)
-            .ok_or_else(|| format!("'{name}' needs at least {} arguments", index + 1))
-    };
-    // A JSON number is finite by construction, but the arithmetic below is only
-    // total for a finite value, so the guard is stated rather than assumed.
-    let number = |index: usize| -> Result<f64, String> {
-        argument(index)?
-            .as_f64()
-            .filter(|number| number.is_finite())
-            .ok_or_else(|| format!("argument {} of '{name}' must be a finite number", index + 1))
-    };
-    let string = |index: usize| -> Result<String, String> {
-        argument(index)?
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| format!("argument {} of '{name}' must be a string", index + 1))
-    };
-    let array = |index: usize| -> Result<Vec<Value>, String> {
-        let items = argument(index)?
-            .as_array()
-            .cloned()
-            .ok_or_else(|| format!("argument {} of '{name}' must be an array", index + 1))?;
-        if items.len() > MAX_ARRAY_ITEMS {
-            return Err(format!(
-                "argument {} of '{name}' carries {} items, more than the {MAX_ARRAY_ITEMS} this \
-                 function walks",
-                index + 1,
-                items.len()
-            ));
-        }
-        Ok(items)
-    };
-
-    match name {
-        "States.Format" => {
-            let template = string(0)?;
-            let mut rendered = String::with_capacity(template.len());
-            let mut next = 1usize;
-            let mut characters = template.chars().peekable();
-            while let Some(character) = characters.next() {
-                match character {
-                    '\\' => {
-                        if let Some(escaped) = characters.next() {
-                            rendered.push(escaped);
-                        }
-                    }
-                    '{' if characters.peek() == Some(&'}') => {
-                        characters.next();
-                        let value = argument(next)?;
-                        next += 1;
-                        match value {
-                            Value::String(text) => rendered.push_str(text),
-                            other => rendered.push_str(&other.to_string()),
-                        }
-                    }
-                    other => rendered.push(other),
-                }
-            }
-            Ok(Value::String(rendered))
-        }
-        "States.StringToJson" => {
-            let text = string(0)?;
-            serde_json::from_str(&text).map_err(|error| format!("{text:?} is not JSON: {error}"))
-        }
-        "States.JsonToString" => Ok(Value::String(argument(0)?.to_string())),
-        "States.Array" => Ok(Value::Array(arguments.to_vec())),
-        "States.ArrayPartition" => {
-            let items = array(0)?;
-            let size = number(1)?;
-            if size < 1.0 {
-                return Err("the chunk size must be a positive whole number".to_string());
-            }
-            Ok(Value::Array(
-                items
-                    .chunks(size as usize)
-                    .map(|chunk| Value::Array(chunk.to_vec()))
-                    .collect(),
-            ))
-        }
-        "States.ArrayContains" => {
-            let items = array(0)?;
-            let looked_for = argument(1)?;
-            Ok(Value::Bool(items.iter().any(|item| item == looked_for)))
-        }
-        "States.ArrayRange" => {
-            let (start, end, step) = (number(0)?, number(1)?, number(2)?);
-            if step == 0.0 {
-                return Err("the step must not be zero".to_string());
-            }
-            let mut values = Vec::new();
-            let mut current = start;
-            while (step > 0.0 && current <= end) || (step < 0.0 && current >= end) {
-                values.push(json_number(current));
-                current += step;
-                // The array is built from three numbers, so nothing the caller sent
-                // bounds its length: this does.
-                if values.len() > MAX_ARRAY_RANGE_VALUES {
-                    return Err(format!(
-                        "the range is longer than the {MAX_ARRAY_RANGE_VALUES} values this \
-                         function builds"
-                    ));
-                }
-            }
-            Ok(Value::Array(values))
-        }
-        "States.ArrayGetItem" => {
-            let items = array(0)?;
-            let index = number(1)?;
-            if index < 0.0 {
-                return Err("the index must not be negative".to_string());
-            }
-            items
-                .get(index as usize)
-                .cloned()
-                .ok_or_else(|| format!("index {index} is past the end of the array"))
-        }
-        "States.ArrayLength" => Ok(json!(array(0)?.len())),
-        "States.ArrayUnique" => {
-            // Compared by the canonical TEXT of each value, through a set, so the
-            // pass is O(n log n) rather than the O(n^2) a linear scan per item would
-            // cost on an array the execution input sized.
-            let mut seen = BTreeSet::new();
-            let mut unique: Vec<Value> = Vec::new();
-            for item in array(0)? {
-                if seen.insert(item.to_string()) {
-                    unique.push(item);
-                }
-            }
-            Ok(Value::Array(unique))
-        }
-        "States.JsonMerge" => {
-            let mut merged = argument(0)?
-                .as_object()
-                .cloned()
-                .ok_or_else(|| format!("argument 1 of '{name}' must be a JSON object"))?;
-            let second = argument(1)?
-                .as_object()
-                .ok_or_else(|| format!("argument 2 of '{name}' must be a JSON object"))?;
-            let deep = argument(2)?.as_bool().unwrap_or(false);
-            if deep {
-                return Err("a deep merge is not one this service performs".to_string());
-            }
-            for (key, value) in second {
-                merged.insert(key.clone(), value.clone());
-            }
-            Ok(Value::Object(merged))
-        }
-        "States.MathAdd" => Ok(json_number(number(0)? + number(1)?)),
-        "States.MathRandom" => {
-            let (start, end) = (number(0)?, number(1)?);
-            if end < start {
-                return Err("the end of the range must not be below its start".to_string());
-            }
-            let mut seed = match arguments.get(2).and_then(Value::as_f64) {
-                Some(seed) => seed as u64,
-                None => super::now_nanos(),
-            };
-            // Both bounds are caller-chosen finite numbers, so every step of this is
-            // saturating: a float-to-integer cast saturates, and the two additions
-            // would otherwise overflow for a range near the integer maxima.
-            let span = ((end - start) as u64).saturating_add(1);
-            let drawn = super::splitmix64(&mut seed) % span.max(1);
-            let drawn = i64::try_from(drawn).unwrap_or(i64::MAX);
-            Ok(json!((start as i64).saturating_add(drawn)))
-        }
-        // "States.Base64Encode ... encode data based on MIME Base64 encoding scheme.
-        // You can use this function to pass data to other AWS services without using
-        // an AWS Lambda function", with a documented 10,000-character input limit.
-        "States.Base64Encode" => {
-            let text = string(0)?;
-            if text.len() > MAX_BASE64_CHARS {
-                return Err(format!(
-                    "the input is {} characters, more than the {MAX_BASE64_CHARS} this function \
-                     encodes",
-                    text.len()
-                ));
-            }
-            Ok(Value::String(::aws_smithy_types::base64::encode(text)))
-        }
-        "States.Base64Decode" => {
-            let text = string(0)?;
-            if text.len() > MAX_BASE64_CHARS {
-                return Err(format!(
-                    "the input is {} characters, more than the {MAX_BASE64_CHARS} this function \
-                     decodes",
-                    text.len()
-                ));
-            }
-            let decoded = ::aws_smithy_types::base64::decode(&text)
-                .map_err(|error| format!("the input is not MIME Base64: {error}"))?;
-            String::from_utf8(decoded)
-                .map(Value::String)
-                .map_err(|error| format!("the decoded data is not UTF-8 text: {error}"))
-        }
-        "States.StringSplit" => {
-            let text = string(0)?;
-            let delimiters: Vec<char> = string(1)?.chars().collect();
-            let parts = text
-                .split(|character| delimiters.contains(&character))
-                .filter(|part| !part.is_empty())
-                .map(|part| Value::String(part.to_string()))
-                .collect();
-            Ok(Value::Array(parts))
-        }
-        "States.UUID" => {
-            let mut seed = super::now_nanos();
-            let high = super::splitmix64(&mut seed);
-            let low = super::splitmix64(&mut seed);
-            Ok(Value::String(super::uuid_v4(high, low)))
-        }
-        other => Err(format!(
-            "'{other}' is an intrinsic function this emulator does not evaluate, so nothing was \
-             run for it"
-        )),
-    }
-}
-
-/// A number an intrinsic computed, as the JSON value the wire carries: a whole
-/// result is a whole number, which is what the service's own intrinsics return.
-fn json_number(value: f64) -> Value {
-    if value.fract() == 0.0 && value.abs() < 9_007_199_254_740_992.0 {
-        return json!(value as i64);
-    }
-    json!(value)
-}
-
 // ---------------------------------------------------------------------------
 // One state, tested by itself (`TestState`)
 // ---------------------------------------------------------------------------
@@ -4529,6 +4260,10 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         // it reads through `$$.State.RetryCount`.
         retry_count: test.retries_taken,
         steps: Vec::new(),
+        // `TestState` keeps no history: the state under test is the first thing this
+        // walk would record, so a diagnosis it raises names the id the first event of
+        // a history carries.
+        first_event_id: FIRST_EVENT_ID,
         start: test.start,
         base_context,
         // `TestState` tests ONE state, with no execution around it: a state whose

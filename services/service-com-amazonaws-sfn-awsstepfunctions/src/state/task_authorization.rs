@@ -53,12 +53,91 @@
 //! documents DO state is decided in IAM's own order: an explicit `Deny` refuses, a
 //! grant allows, and policies that state nothing about the call withhold it, because
 //! the documents in force on a role are the authority on what it may do.
+//!
+//! ## Assuming the role at all
+//!
+//! Acting as the role is itself a call this service makes, BEFORE any of the above:
+//! Step Functions assumes the `roleArn` through `sts:AssumeRole` to get credentials
+//! for the work, so a role it cannot assume is a `Task` that fails rather than a call
+//! made as nobody. That is the deploy-time/run-time split the service exposes
+//! deliberately — `CreateStateMachine` does not require the role to exist, and the
+//! data plane does — and it is decided from what IAM ANSWERS about the role
+//! ([`::service_common::iam_role::role_is_unassumable_through`], the tree's one
+//! reading of a caller-supplied execution role): this account holding no such role, or
+//! holding one whose trust policy lets NEITHER of this service's two principals
+//! ([`SERVICE_PRINCIPAL`] and the Region's own, [`regional_service_principal`]) assume
+//! it, are both answers that the assume fails. Everything else — an ARN naming no role
+//! of this account, an emulator with no IAM to ask — is evidence of nothing and leaves
+//! the execution to run.
 
 use ::std::sync::Arc;
 
 use ::service_common::iam_authorization::{self as iam, Decision};
 
-use super::integration::{access_request, Call, Failed, RoleGate};
+use super::integration::{access_request, Call, Failed, RoleGate, TASK_FAILED_ERROR};
+
+/// The GLOBAL service principal Step Functions assumes a state machine's execution
+/// role as.
+pub const SERVICE_PRINCIPAL: &str = "states.amazonaws.com";
+
+/// The REGIONAL service principal of the same service, which a trust policy may name
+/// instead: the service assumes the role as either, so a role trusting the Region's own
+/// principal is one it can act as.
+fn regional_service_principal(region: &str) -> String {
+    format!("states.{region}.amazonaws.com")
+}
+
+/// What a `Task` state fails with when the execution role `role_arn` cannot be
+/// assumed, or `None` when nothing of the kind can be shown (see the module docs).
+///
+/// The failure is the task's own — ASL's [`TASK_FAILED_ERROR`] — because the work the
+/// state names is what did not happen, and the cause is the service's own sentence for
+/// an execution role it cannot act as, which names both of the principals it tried to
+/// assume the role as.
+///
+/// It is resolved ONCE per walk, where the walk is started, because every `Task` state
+/// of that walk acts as the same role: the credentials a real execution assumes are
+/// held for the run rather than fetched per state.
+pub async fn unassumable_role(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    role_arn: &str,
+) -> Option<Failed> {
+    if role_arn.is_empty() {
+        return None;
+    }
+    // Either principal getting the role is enough, so the Region's own is asked about
+    // only where the global one was refused.
+    let regional = regional_service_principal(region);
+    for principal in [SERVICE_PRINCIPAL, regional.as_str()] {
+        let unassumable = ::service_common::iam_role::role_is_unassumable_through(
+            callback,
+            region,
+            role_arn,
+            principal,
+        )
+        .await;
+        if !unassumable {
+            return None;
+        }
+    }
+    Some(Failed {
+        error: TASK_FAILED_ERROR.to_string(),
+        cause: unassumable_role_cause(&regional, role_arn),
+    })
+}
+
+/// The sentence the service refuses an execution role it cannot assume with.
+///
+/// It names the two principals the assume was attempted as — the global one and
+/// `regional`, the Region's own — and the role itself, so an operator reading the
+/// failure knows which role reference to act on.
+fn unassumable_role_cause(regional: &str, role_arn: &str) -> String {
+    format!(
+        "Neither the global service principal {SERVICE_PRINCIPAL}, nor the regional one \
+         {regional}, is not authorized to assume the provided role {role_arn}."
+    )
+}
 
 /// The IAM store a state machine's `roleArn` is resolved against.
 ///
@@ -84,22 +163,34 @@ const ACCESS_DENIED_STATUS: u16 = 400;
 /// what the ARN the access request is over is formed in
 /// ([`super::integration::TargetNaming`]).
 ///
-/// The gate is consulted once per call the walk asks for, so a statement withdrawn
-/// between two states of one execution stops granting from the next call: nothing is
-/// read in advance and nothing is cached.
+/// `unassumable` is the refusal [`unassumable_role`] resolved for this walk's role: a
+/// role this service cannot assume fails EVERY call of the walk, whatever the call
+/// asks for, because the credentials the work would be done with are the ones that
+/// assume would have minted. It is therefore answered before the policies in force on
+/// the role are read at all.
+///
+/// Apart from that, the gate is consulted once per call the walk asks for, so a
+/// statement withdrawn between two states of one execution stops granting from the
+/// next call: nothing is read in advance and nothing is cached.
 pub fn role_gate<Eng: Send + Sync + 'static>(
     engine: &Arc<Eng>,
     region: &str,
     role_arn: &str,
+    unassumable: Option<Failed>,
 ) -> Option<RoleGate> {
     if role_arn.is_empty() {
         return None;
     }
-    iam_state(&**engine)?;
+    if unassumable.is_none() {
+        iam_state(&**engine)?;
+    }
     let engine = Arc::clone(engine);
     let region = region.to_string();
     let role_arn = role_arn.to_string();
     Some(Arc::new(move |call: &Call, request: &::serde_json::Value| {
+        if let Some(refused) = &unassumable {
+            return Some(refused.clone());
+        }
         let targets = call.targets?;
         let iam = iam_state(&*engine)?;
         let (action, resource) = access_request(call, request, &region)?;

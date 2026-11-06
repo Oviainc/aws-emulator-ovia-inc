@@ -193,6 +193,11 @@ impl Interpreter<'_> {
     }
 
     /// Run one state: `raw` is its input, `at` the offset it is entered at.
+    ///
+    /// A diagnosis the interpreter raises about this state's own expression is
+    /// reported under the state's name and the id of the event it was ENTERED at
+    /// ([`diagnosed`]), which is read here — before the state records anything — so
+    /// the state that failed can be followed back to its place in the history.
     pub(super) fn step(
         &mut self,
         name: &str,
@@ -200,6 +205,40 @@ impl Interpreter<'_> {
         raw: Value,
         at: Duration,
         scope: &Scope,
+    ) -> Result<StateStep, Fault> {
+        let entered = self.next_event_id();
+        self.run_state(name, state, raw, at, scope, entered)
+            .map_err(|fault| diagnosed(name, entered, fault))
+    }
+
+    /// The id the next history event this walk records will carry.
+    ///
+    /// The walk's events are numbered in order from [`Interpreter::first_event_id`],
+    /// so the id of the one about to be recorded is that first id plus the ones
+    /// recorded before it. A walk that CONTINUES an execution from a reply reports
+    /// only the steps that FOLLOW the point the reply was applied at
+    /// ([`Resumed::index`]) — the ones before it were recorded by the call that
+    /// suspended the execution — so those are the steps counted here.
+    pub(super) fn next_event_id(&self) -> i64 {
+        let recorded = self
+            .steps
+            .len()
+            .saturating_sub(self.resumed.map_or(0, |resumed| resumed.index));
+        self.first_event_id
+            .saturating_add(i64::try_from(recorded).unwrap_or(i64::MAX))
+    }
+
+    /// [`Interpreter::step`]'s own work: `entered` is the id of the event this state
+    /// records on being entered.
+    #[allow(clippy::too_many_arguments)]
+    fn run_state(
+        &mut self,
+        name: &str,
+        state: &Map<String, Value>,
+        raw: Value,
+        at: Duration,
+        scope: &Scope,
+        entered: i64,
     ) -> Result<StateStep, Fault> {
         let state_type = state.get("Type").and_then(Value::as_str).unwrap_or_default();
         // A state's name is a caller-chosen object key that lands in every history
@@ -270,7 +309,7 @@ impl Interpreter<'_> {
                 self.push_entered("WaitStateEntered", name, at, &raw);
                 let waited = self
                     .wait_duration(state, language, &effective, &context, at)
-                    .map_err(|why| runtime(format!("state '{name}': {why}")).at(at))?;
+                    .map_err(|why| wait_failure(name, why).at(at))?;
                 let at = at + waited;
                 let value = self
                     .produced(state, language, &raw, &effective, None, &context, false)
@@ -330,7 +369,7 @@ impl Interpreter<'_> {
                 Err(Failure { error, cause }.at(at))
             }
             "Map" => self.map_state(name, state, language, raw, effective, &context, at),
-            "Task" => self.task_state(name, state, language, raw, effective, &context, at),
+            "Task" => self.task_state(name, state, language, raw, effective, &context, at, entered),
             // `Parallel` is the only type left: the list above is exhaustive.
             _ => self.parallel_state(name, state, language, raw, effective, &context, at),
         }
@@ -1297,6 +1336,9 @@ impl Interpreter<'_> {
     /// and `Catch` apply to it exactly as they apply to a `Map`'s or a `Parallel`'s
     /// work — and what no call is made for is not faked, but reported as the failure
     /// it is.
+    ///
+    /// `entered` is the id of the event this state records on being entered, which the
+    /// refusals that name this state report ([`executing_state`]).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn task_state(
         &mut self,
@@ -1307,6 +1349,7 @@ impl Interpreter<'_> {
         effective: Value,
         context: &Value,
         at: Duration,
+        entered: i64,
     ) -> Result<StateStep, Fault> {
         // The activity task is decided FIRST, before this state's own history event:
         // that path records its own, and the work there is a worker's rather than a
@@ -1439,7 +1482,7 @@ impl Interpreter<'_> {
                 name,
                 &resource_type,
                 &action,
-                express_run_a_job_refusal(name),
+                express_run_a_job_refusal(name, entered),
                 at,
             ));
         }
@@ -1471,7 +1514,7 @@ impl Interpreter<'_> {
                 name,
                 &resource_type,
                 &action,
-                express_callback_refusal(name),
+                express_callback_refusal(name, entered),
                 at,
             ));
         }

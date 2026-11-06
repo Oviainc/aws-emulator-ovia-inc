@@ -375,11 +375,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let execution_input = execution_input.clone();
             let region = crate::state::arn_region(&machine_arn);
             // The states after the reply call as the SAME execution role the states
-            // before it did.
+            // before it did, which this service assumes again for this continuation.
+            let unassumable = crate::state::task_authorization::unassumable_role(
+                ctx.callback(),
+                &region,
+                &context.role_arn,
+            )
+            .await;
             let role = crate::state::task_authorization::role_gate(
                 &self.engine,
                 &region,
                 &context.role_arn,
+                unassumable,
             );
             crate::state::integration::interpret(ctx, &region, role, move |tasks| match &reply {
                 Answered::Activity(reply) => crate::state::plan_reply(

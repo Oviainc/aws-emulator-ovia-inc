@@ -551,15 +551,14 @@ async fn a_tasks_dynamodb_call_is_made_only_when_the_execution_role_allows_it() 
     }
 }
 
-/// A wildcard grant allows the call, and a role this account does not hold shows
-/// nothing about it, so the call is made.
+/// A wildcard grant allows the call, so it is made.
 ///
-/// The two ways a DynamoDB call goes ahead for a reason other than a statement naming
-/// its exact table: a grant written with IAM's own wildcards, and no role record to
-/// read at all — a role ARN may belong to another account, which is evidence of
-/// nothing.
+/// The way a DynamoDB call goes ahead for a reason other than a statement naming its
+/// exact table: a grant written with IAM's own wildcards. Whether the role can be
+/// ASSUMED at all is the question before this one, which
+/// `tests/all/execution_role_assumption.rs` holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_wildcard_grant_and_an_unknown_role_both_let_the_dynamodb_call_be_made() {
+async fn a_wildcard_grant_lets_the_dynamodb_call_be_made() {
     let chain = Chain::new();
     chain.create_table("wildcard").await;
     let wildcard = json!({
@@ -567,13 +566,7 @@ async fn a_wildcard_grant_and_an_unknown_role_both_let_the_dynamodb_call_be_made
         "Statement": [{ "Effect": "Allow", "Action": "dynamodb:*", "Resource": "*" }]
     });
     let wildcard_role = chain.role("WildcardDynamoDbRole", &wildcard).await;
-    let rows: [(&str, String); 2] = [
-        ("a wildcard grant", wildcard_role),
-        (
-            "a role this account does not hold",
-            "arn:aws:iam::000000000000:role/NotHeldHere".to_string(),
-        ),
-    ];
+    let rows: [(&str, String); 1] = [("a wildcard grant", wildcard_role)];
 
     for (index, (case, role_arn)) in rows.into_iter().enumerate() {
         let pk = format!("wildcard-{index}");

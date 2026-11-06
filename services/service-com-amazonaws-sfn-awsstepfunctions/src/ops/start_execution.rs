@@ -438,8 +438,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // own Region, which is the Region its execution reports.
         // What this execution's `Task` states may do is what the policies in force on
         // the state machine's execution role allow them: the calls below are made as
-        // that role ([`crate::state::task_authorization`]).
-        let role = crate::state::task_authorization::role_gate(&self.engine, &region, &role_arn);
+        // that role ([`crate::state::task_authorization`]) — which this service has to
+        // ASSUME before it makes any of them, so a role it cannot assume fails the
+        // first `Task` of the execution instead of its work being done as nobody.
+        let unassumable =
+            crate::state::task_authorization::unassumable_role(ctx.callback(), &region, &role_arn)
+                .await;
+        let role = crate::state::task_authorization::role_gate(
+            &self.engine,
+            &region,
+            &role_arn,
+            unassumable,
+        );
         let interpreted = {
             let definition = definition.clone();
             let execution_input = execution_input.clone();

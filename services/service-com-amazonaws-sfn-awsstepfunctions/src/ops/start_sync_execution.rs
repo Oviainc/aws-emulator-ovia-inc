@@ -383,7 +383,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // run-a-job (`.sync`) integration pattern.
             express: true,
         };
-        let role = crate::state::task_authorization::role_gate(&self.engine, &region, &role_arn);
+        // The calls this execution's `Task` states make are made as the state
+        // machine's execution role, which this service assumes first: a role it cannot
+        // assume fails the task rather than having its work done as nobody.
+        let unassumable =
+            crate::state::task_authorization::unassumable_role(ctx.callback(), &region, &role_arn)
+                .await;
+        let role = crate::state::task_authorization::role_gate(
+            &self.engine,
+            &region,
+            &role_arn,
+            unassumable,
+        );
         let interpreted = {
             let definition = definition.clone();
             let execution_input = execution_input.clone();

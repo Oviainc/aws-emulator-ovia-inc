@@ -77,6 +77,8 @@ mod execution_interpreter;
 mod execution_key_state;
 #[path = "all/execution_redrive.rs"]
 mod execution_redrive;
+#[path = "all/execution_role_assumption.rs"]
+mod execution_role_assumption;
 #[path = "all/express_run_a_job_refusal.rs"]
 mod express_run_a_job_refusal;
 #[path = "all/history_event_provenance.rs"]
@@ -151,5 +153,7 @@ mod task_target_authorization;
 mod terminal_runtime_errors;
 #[path = "all/test_state.rs"]
 mod test_state;
+#[path = "all/unresolved_path_cause.rs"]
+mod unresolved_path_cause;
 #[path = "all/update_state_machine_alias_effects.rs"]
 mod update_state_machine_alias_effects;

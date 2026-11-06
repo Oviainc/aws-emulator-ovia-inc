@@ -189,10 +189,24 @@ pub async fn role_is_unassumable(
     role_arn: &str,
     service_principal: &str,
 ) -> bool {
+    role_is_unassumable_through(ctx.callback(), region, role_arn, service_principal).await
+}
+
+/// [`role_is_unassumable`] asked through the emulator callback rather than through a
+/// request's own context, for a service that resolves the role on a task of its own.
+///
+/// The question, the grounds and the answer are [`role_is_unassumable`]'s; only who is
+/// asking differs ([`crate::iam_client::iam_client_through`]).
+pub async fn role_is_unassumable_through(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    role_arn: &str,
+    service_principal: &str,
+) -> bool {
     let Some(role_name) = role_name(role_arn) else {
         return false;
     };
-    match role_answer(ctx, region, role_name).await {
+    match role_answer(callback, region, role_name).await {
         // IAM reported the role: it is assumable only if the trust policy it carries
         // admits the principal. A role with no readable grant is refused — that IS what
         // IAM answered about it.
@@ -231,7 +245,7 @@ pub async fn held_role_is_unassumable(
     let Some(role_name) = role_name(role_arn) else {
         return false;
     };
-    match role_answer(ctx, region, role_name).await {
+    match role_answer(ctx.callback(), region, role_name).await {
         RoleAnswer::Held(document) => trust_withholds(document.as_deref(), service_principal),
         RoleAnswer::Absent | RoleAnswer::Unknown => false,
     }
@@ -281,7 +295,7 @@ pub async fn role_pass_is_unauthorized(
     let Some(role_name) = role_name(role_arn) else {
         return true;
     };
-    match role_answer(ctx, region, role_name).await {
+    match role_answer(ctx.callback(), region, role_name).await {
         RoleAnswer::Held(document) => !document.is_some_and(|document| {
             crate::iam_trust_policy::grants_service_principal(
                 &document,
@@ -309,13 +323,14 @@ enum RoleAnswer {
     Unknown,
 }
 
-/// The in-process `GetRole` both readings are grounded in ([`crate::iam_client`]).
+/// The in-process `GetRole` every reading above is grounded in
+/// ([`crate::iam_client`]).
 async fn role_answer(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     role_name: &str,
 ) -> RoleAnswer {
-    let answer = crate::iam_client::iam_client(ctx, region)
+    let answer = crate::iam_client::iam_client_through(callback, region)
         .get_role()
         .role_name(role_name)
         .send()

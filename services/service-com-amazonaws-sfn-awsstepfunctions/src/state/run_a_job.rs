@@ -219,8 +219,16 @@ async fn resolve<Eng: Send + Sync + 'static>(
         let input = input.clone();
         let region = region.clone();
         // The states after the job call as the execution role the states before it
-        // did, which is the role the state machine carries.
-        let role = super::task_authorization::role_gate(engine, &region, &context.role_arn);
+        // did, which is the role the state machine carries — assumed again for this
+        // continuation, so a role that cannot be assumed fails the task.
+        let unassumable =
+            super::task_authorization::unassumable_role(callback, &region, &context.role_arn).await;
+        let role = super::task_authorization::role_gate(
+            engine,
+            &region,
+            &context.role_arn,
+            unassumable,
+        );
         integration::interpret_through(callback, depth, &region, role, move |tasks| {
             super::plan_job_reply(
                 &definition,
