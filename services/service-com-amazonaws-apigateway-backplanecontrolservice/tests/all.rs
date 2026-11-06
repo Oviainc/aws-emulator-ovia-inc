@@ -366,3 +366,8 @@ mod setting_refusal_sentences;
 // refusal of this control plane carries.
 #[path = "all/refusal_contract_sentences.rs"]
 mod refusal_contract_sentences;
+// Appended for the reason the note above gives: what removing ONE usage plan key changes —
+// the plan stops metering that API key, at the gate as well as in the reads — and what a
+// contended removal of one association resolves to.
+#[path = "all/delete_usage_plan_key.rs"]
+mod delete_usage_plan_key;

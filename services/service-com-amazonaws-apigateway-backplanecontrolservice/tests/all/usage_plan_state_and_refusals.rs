@@ -49,7 +49,9 @@ use crate::usage_plan_lifecycle::{create_usage_plan, get_usage_plan, tag_map};
 
 /// The modelled success status of `DeleteUsagePlan` and `DeleteUsagePlanKey`: both answer
 /// 202 (`smithy_query(query="operation", operation="DeleteUsagePlan,DeleteUsagePlanKey")`).
-const DELETE_STATUS: u16 = 202;
+///
+/// `pub(crate)` for the sibling `delete_usage_plan_key` suite; see [`meter_key`].
+pub(crate) const DELETE_STATUS: u16 = 202;
 
 /// The modelled success status of `TagResource` and `UntagResource`: both answer 204.
 const TAG_STATUS: u16 = 204;
@@ -67,7 +69,9 @@ const INVALID_KEY_TYPE: &str = "Invalid Usage Plan key type specified. Must be o
 /// that still names no stored association: a usage plan key is addressed under the plan
 /// that meters it, so a pair resolving to nothing resolves to no usage plan key of that
 /// plan.
-const NO_SUCH_USAGE_PLAN_KEY: &str = "Invalid Usage Plan ID specified";
+///
+/// `pub(crate)` for the sibling `delete_usage_plan_key` suite; see [`meter_key`].
+pub(crate) const NO_SUCH_USAGE_PLAN_KEY: &str = "Invalid Usage Plan ID specified";
 
 /// The refusal for a `keyId` that names no API key of the account at all: the identifier
 /// that does not resolve is the API key's, whichever plan the request addressed.
@@ -130,7 +134,9 @@ async fn delete_plan(gateway: &Gateway, plan: &str) -> Answer {
 }
 
 /// `DeleteUsagePlanKey` for one `(usagePlanId, keyId)` pair.
-async fn delete_plan_key(gateway: &Gateway, plan: &str, key_id: &str) -> Answer {
+///
+/// `pub(crate)` for the sibling `delete_usage_plan_key` suite; see [`meter_key`].
+pub(crate) async fn delete_plan_key(gateway: &Gateway, plan: &str, key_id: &str) -> Answer {
     gateway
         .call("DELETE", &format!("/usageplans/{plan}/keys/{key_id}"), None)
         .await
@@ -166,7 +172,11 @@ async fn created_key_id(gateway: &Gateway, name: &str) -> String {
 
 /// `CreateUsagePlanKey` for the one key type a `UsagePlanKey` takes, asserting the
 /// modelled 201.
-async fn meter_key(gateway: &Gateway, plan: &str, key_id: &str) {
+///
+/// `pub(crate)` for the sibling `delete_usage_plan_key` suite, which meters a key to assert
+/// what DELETING the association changes at the `execute-api` gate: one helper, so the two
+/// suites cannot associate a key two ways.
+pub(crate) async fn meter_key(gateway: &Gateway, plan: &str, key_id: &str) {
     let answer = create_usage_plan_key(gateway, plan, key_id, API_KEY_TYPE).await;
     assert_eq!(
         answer.status, 201,
@@ -176,7 +186,9 @@ async fn meter_key(gateway: &Gateway, plan: &str, key_id: &str) {
 }
 
 /// The `id` of every usage plan key the plan's collection reports, in page order.
-async fn metered_key_ids(gateway: &Gateway, plan: &str, case: &str) -> Vec<String> {
+///
+/// `pub(crate)` for the sibling `delete_usage_plan_key` suite; see [`meter_key`].
+pub(crate) async fn metered_key_ids(gateway: &Gateway, plan: &str, case: &str) -> Vec<String> {
     let answer = list_keys(gateway, plan, "").await;
     assert_eq!(
         answer.status, 200,
