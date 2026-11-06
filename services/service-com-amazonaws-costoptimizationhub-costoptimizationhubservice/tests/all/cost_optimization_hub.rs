@@ -45,16 +45,34 @@ fn router_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 /// A router whose store records the caller as the MANAGEMENT account of the
 /// organization it holds.
 ///
-/// Which account is the management account is an Organizations fact, and this
-/// emulator has no Organizations control plane to learn it from, so the store
-/// starts with no organization recorded
-/// (`state::organization_management_account_id`) and every caller is a member
-/// account. A suite that needs the management-account arm of an organization
-/// rule — being allowed to set the organization-wide
-/// `memberAccountDiscountVisibility` preference, and so to reach the savings
-/// estimation mode that preference gates — records the organization here.
+/// Which accounts an organization has is an Organizations fact, and this
+/// emulator records none of its own, so the store starts with no organization
+/// (`state::organization_management_account_id`) and no read of the caller's
+/// reaches past its own account. A suite that needs the organization view — the
+/// enrollment or the recommendations of accounts other than the caller's —
+/// records the organization here, and records the member accounts it needs
+/// beside it.
 pub(crate) fn management_account_router() -> MultiServiceRouter {
     management_account_router_with_store().0
+}
+
+/// The account that manages the organization a [`member_account_router`]'s
+/// caller belongs to: an account OTHER than the one the emulator presents, so
+/// the caller is a member of an organization it does not manage.
+pub(crate) const OTHER_MANAGEMENT_ACCOUNT: &str = "111122223333";
+
+/// A router whose store records the caller as a MEMBER account: the organization
+/// it holds is managed by [`OTHER_MANAGEMENT_ACCOUNT`], so the organization-wide
+/// preferences belong to that account and not to the caller.
+///
+/// This is the refusing arm of the rule that the organization-wide
+/// `memberAccountDiscountVisibility` preference belongs to the account paying
+/// for the spend it is about: the account the emulator presents pays its own
+/// bills unless this store says another account pays them.
+pub(crate) fn member_account_router() -> MultiServiceRouter {
+    let (router, store) = router_with_store();
+    store.lock().organization_management_account_id = Some(OTHER_MANAGEMENT_ACCOUNT.to_string());
+    router
 }
 
 /// This service's store, as a suite that has to record what no operation
@@ -65,9 +83,8 @@ pub(crate) type Store = engine::ServiceState<
 
 /// A [`router`] together with the store behind it, for a suite that has to
 /// record what no operation creates — the organization's MEMBER accounts, this
-/// emulator having no Organizations control plane — while leaving the caller a
-/// member account itself (no organization recorded), which is the arm of an
-/// organization rule that refuses.
+/// emulator recording none of its own — while leaving the store with no
+/// organization, which is the state every client of the emulator meets.
 pub(crate) fn router_with_store() -> (MultiServiceRouter, Store) {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let store = cost_optimization_hub::state::service_state(&*engine)
@@ -89,9 +106,10 @@ pub(crate) fn management_account_router_with_store() -> (MultiServiceRouter, Sto
 /// Enable the organization-wide member-account discount visibility over the
 /// wire, which is the state `savingsEstimationMode=AfterDiscounts` requires.
 ///
-/// The caller must be the organization's management account
-/// ([`management_account_router`]); the call is the same `UpdatePreferences` a
-/// client makes.
+/// The caller must own the preference — the account the emulator presents does
+/// unless the store records another account as its organization's management
+/// account ([`member_account_router`]); the call is the same `UpdatePreferences`
+/// a client makes.
 pub(crate) async fn enable_member_account_discount_visibility(router: &MultiServiceRouter) {
     let updated = ok(
         router,
@@ -374,8 +392,12 @@ pub(crate) async fn enrolled_router() -> MultiServiceRouter {
 
 /// An enrolled router whose caller is the organization's management account and
 /// whose member-account discount visibility is enabled — the state a test needs
-/// to put the account into the discount-adjusted savings estimation mode
-/// ([`management_account_router`]).
+/// to put the account into the discount-adjusted savings estimation mode, and
+/// the organization view beside it ([`management_account_router`]).
+///
+/// The visibility itself needs no recorded organization: the account the
+/// emulator presents owns that preference and sets it over the wire
+/// (`organization_wide_preference_owner`).
 pub(crate) async fn enrolled_router_with_discounts_visible() -> MultiServiceRouter {
     let router = enrolled(management_account_router()).await;
     enable_member_account_discount_visibility(&router).await;

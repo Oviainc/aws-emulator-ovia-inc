@@ -323,8 +323,8 @@ async fn a_caller_that_is_not_the_management_account_resolves_its_own_ids_only()
     )
     .await);
 
-    // Which account is the management account is an Organizations fact; with
-    // none recorded, every caller is a member account.
+    // Which accounts an organization has is an Organizations fact; with none
+    // recorded, no caller has the organization's view.
     organization.store.lock().organization_management_account_id = None;
 
     for id in &own_rows {

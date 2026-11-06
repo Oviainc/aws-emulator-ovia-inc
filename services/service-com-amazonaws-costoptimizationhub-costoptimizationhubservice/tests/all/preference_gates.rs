@@ -8,9 +8,11 @@
 //! account belongs to rather than about the values a request carries:
 //!
 //! 1. `memberAccountDiscountVisibility` is a preference of the organization,
-//!    not of one account, so only the organization's management account may set
-//!    it and only that account is reported the member by a read. Every other
-//!    account's request for it is refused with the operation's modelled
+//!    not of one account, so it belongs to the account that pays for the spend
+//!    it is about — the organization's management account, or an account in no
+//!    organization another account manages, which pays its own bills. Only that
+//!    account may set it and only it is reported the member by a read; every
+//!    other account's request for it is refused with the operation's modelled
 //!    `ValidationException` (400) and changes nothing.
 //! 2. `savingsEstimationMode` = `AfterDiscounts` reports figures net of the
 //!    discounts member accounts' spend carries, so it is available only while
@@ -41,8 +43,9 @@ use cost_optimization_hub::state::{
 };
 
 use crate::cost_optimization_hub::{
-    assert_stated_rule_refusal, call, error_code, fields, management_account_router, ok,
-    preferences_record, router, DISCOUNT_VISIBILITY_ALL, FIELD_VALIDATION_SUMMARY,
+    assert_stated_rule_refusal, call, error_code, fields, management_account_router,
+    member_account_router, ok, preferences_record, router, DISCOUNT_VISIBILITY_ALL,
+    FIELD_VALIDATION_SUMMARY,
 };
 
 /// Assert one refused `UpdatePreferences`: HTTP 400 and the stated-rule refusal
@@ -66,13 +69,14 @@ async fn read(router: &MultiServiceRouter) -> Value {
 // Rule 1 — the organization-wide preference is the management account's
 // ---------------------------------------------------------------------------
 
-/// A member account cannot set `memberAccountDiscountVisibility`, whichever
-/// value of the member's enum it asks for and whatever else the request
-/// carries: the write is refused, the record is untouched, and a read never
-/// reports the member for that account.
+/// A member account — one whose organization is managed by ANOTHER account —
+/// cannot set `memberAccountDiscountVisibility`, whichever value of the member's
+/// enum it asks for and whatever else the request carries: the write is refused,
+/// the record is untouched, and a read never reports the member for that
+/// account.
 #[tokio::test]
 async fn the_discount_visibility_preference_is_refused_to_a_member_account() {
-    let router = router();
+    let router = member_account_router();
 
     // A preference the account IS allowed to write, so the rows below are shown
     // to leave a populated record untouched rather than an empty one.
@@ -168,10 +172,11 @@ async fn the_management_account_sets_the_discount_visibility_preference() {
 /// The refusal of rule 1 is distinguishable from the refusal of a value outside
 /// the member's enum: both are 400 `ValidationException`, but only the
 /// constraint walk's carries the fixed field-validation summary, and the field
-/// entries differ.
+/// entries differ. Driven by the caller the rule refuses — a member account —
+/// so both refusals are of the same member.
 #[tokio::test]
 async fn the_two_refusals_of_the_same_member_are_distinguishable() {
-    let router = router();
+    let router = member_account_router();
 
     let (status, out_of_enum) = call(
         &router,

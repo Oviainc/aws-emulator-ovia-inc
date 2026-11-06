@@ -31,6 +31,8 @@ mod one_view_for_every_recommendation_reader;
 mod order_by_fidelity;
 #[path = "all/organization_enrollment.rs"]
 mod organization_enrollment;
+#[path = "all/organization_wide_preference_owner.rs"]
+mod organization_wide_preference_owner;
 #[path = "all/page_token_rule.rs"]
 mod page_token_rule;
 #[path = "all/preference_gates.rs"]
