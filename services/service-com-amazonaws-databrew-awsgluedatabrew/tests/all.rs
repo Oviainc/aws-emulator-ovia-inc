@@ -35,6 +35,8 @@ mod recipe_publishing;
 mod recipe_version_resolution;
 #[path = "all/resource_not_found_message.rs"]
 mod resource_not_found_message;
+#[path = "all/schedule_delete.rs"]
+mod schedule_delete;
 #[path = "all/schedule_lifecycle.rs"]
 mod schedule_lifecycle;
 #[path = "all/schedule_refusal_wording.rs"]
