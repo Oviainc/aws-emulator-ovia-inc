@@ -196,15 +196,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(_) => "deleted",
             None => "unchanged",
         };
+        let resource = bucket.arn.clone();
         // The lock covers the state change only; everything below is owned.
         drop(store);
 
-        // The access record for a state-changing operation: who, what and the
-        // outcome. Metadata only.
+        // The access record for a state-changing operation: who, what it
+        // changed and the outcome. Metadata only.
         ::tracing::info!(
             target: crate::state::AUDIT_TARGET,
             operation = Self::NAME,
             caller = ?crate::state::request_caller(ctx.parts()),
+            resource = resource.as_str(),
             outcome,
             "table bucket metrics configuration deleted",
         );

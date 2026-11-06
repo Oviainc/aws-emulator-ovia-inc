@@ -154,7 +154,12 @@ fn cases() -> Vec<Case> {
 
 /// Create a table bucket, a namespace and one table in it, and answer the
 /// table's ARN. Every table this API creates is customer-created.
-async fn create_table(emulator: &Emulator, region: &str, bucket: &str, table: &str) -> String {
+pub(crate) async fn create_table(
+    emulator: &Emulator,
+    region: &str,
+    bucket: &str,
+    table: &str,
+) -> String {
     let created = emulator
         .create_table_bucket(region, &json!({ "name": bucket }))
         .await;
@@ -194,7 +199,7 @@ async fn create_table(emulator: &Emulator, region: &str, bucket: &str, table: &s
 
 /// Mark the table `table_arn` one Amazon Web Services manages, the only kind
 /// that takes a record-expiration configuration.
-fn mark_managed(emulator: &Emulator, table_arn: &str) {
+pub(crate) fn mark_managed(emulator: &Emulator, table_arn: &str) {
     let store = emulator.engine.state::<S3TablesState>();
     let mut store = store.lock();
     let table = store

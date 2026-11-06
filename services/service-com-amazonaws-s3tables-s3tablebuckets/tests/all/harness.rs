@@ -30,6 +30,10 @@ use smithy_server_runtime::MultiServiceRouter;
 /// restated so an ARN assertion reads whole.
 pub const ACCOUNT: &str = "000000000000";
 
+/// The access key id every request this harness sends presents in its SigV4
+/// credential scope, which is the identity an audit record attributes a call to.
+pub const PRESENTED_AKID: &str = "AKIDTESTS3TABLES";
+
 /// One response, reduced to what a client branches on.
 #[derive(Debug)]
 pub struct Reply {
@@ -117,7 +121,7 @@ impl Emulator {
             serde_json::to_vec(value).expect("a request body serializes")
         });
         let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential=AKIDTESTS3TABLES/20260101/{region}/s3tables/aws4_request, \
+            "AWS4-HMAC-SHA256 Credential={PRESENTED_AKID}/20260101/{region}/s3tables/aws4_request, \
              SignedHeaders=host;x-amz-date, Signature=0000"
         );
         let request = http::Request::builder()

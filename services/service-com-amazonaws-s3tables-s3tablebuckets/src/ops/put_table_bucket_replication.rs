@@ -250,25 +250,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect(),
             version_token: version_token.clone(),
         };
-        match store.table_buckets.get_mut(&input.table_bucket_arn) {
+        let resource = match store.table_buckets.get_mut(&input.table_bucket_arn) {
             // The whole configuration is applied as ONE replacement, so a
             // bucket is never left carrying a mix of two callers' rules.
-            Some(bucket) => bucket.replication = Some(stored),
+            Some(bucket) => {
+                bucket.replication = Some(stored);
+                bucket.arn.clone()
+            }
             // Unreachable while this call holds the store's lock: the bucket was
             // resident a few lines above and nothing else can have removed it in
             // between.
             None => return Err(not_found(crate::state::BUCKET_NOT_FOUND_MESSAGE)),
-        }
+        };
         // The lock covers the state change only; everything below is owned.
         drop(store);
 
-        // The access record for a state-changing operation: who, what and the
-        // outcome. Metadata only — never the role or a destination the
-        // configuration names.
+        // The access record for a state-changing operation: who, what it
+        // changed and the outcome. Metadata only — never the role or a
+        // destination the configuration names.
         ::tracing::info!(
             target: crate::state::AUDIT_TARGET,
             operation = Self::NAME,
             caller = ?crate::state::request_caller(ctx.parts()),
+            resource = resource.as_str(),
             outcome = if configured.is_some() { "replaced" } else { "created" },
             "table bucket replication configuration set",
         );
