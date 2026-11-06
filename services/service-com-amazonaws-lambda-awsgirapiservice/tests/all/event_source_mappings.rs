@@ -27,6 +27,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
@@ -357,6 +358,131 @@ pub(crate) async fn create_timed_function(
         "case {case:?}: expected CreateFunction {name:?} to answer 201, got {} {}",
         answer.status,
         answer.text()
+    );
+}
+
+/// The runtime a function whose package RUNS is created with, and the handler that package
+/// exposes — the pair [`create_running_function`] uploads.
+pub(crate) const RUNNING_RUNTIME: &str = "python3.12";
+/// See [`RUNNING_RUNTIME`].
+pub(crate) const RUNNING_HANDLER: &str = "lambda_function.lambda_handler";
+
+/// How long a suite waits for work the CLOCK owes — a function going `Active`, a mapping
+/// settling into the state its setting asks for — before it is a failure.
+pub(crate) const CLOCK_BUDGET: Duration = Duration::from_secs(30);
+
+/// How long between two looks while waiting for one of those.
+pub(crate) const LOOK_AGAIN: Duration = Duration::from_millis(50);
+
+/// Create a function whose deployment package RUNS `source` as its python handler, with
+/// `timeout` seconds to run in and the environment `variables` states, and wait until it
+/// reports `Active`.
+///
+/// The ONE creator of a running function in the suites over an event source: a handler's own
+/// run is what makes a delivery observable, so every such suite goes through this rather than
+/// carrying its own copy of the create and the wait.
+pub(crate) async fn create_running_function(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    source: &str,
+    timeout: i64,
+    variables: &Value,
+) {
+    let created = call(
+        router,
+        "POST",
+        FUNCTIONS_URI,
+        &json!({
+            "FunctionName": name,
+            "Role": ROLE,
+            "Runtime": RUNNING_RUNTIME,
+            "Handler": RUNNING_HANDLER,
+            "Timeout": timeout,
+            "Environment": { "Variables": variables },
+            "Code": {
+                "ZipFile": base64::engine::general_purpose::STANDARD
+                    .encode(crate::synchronous_invoke_run::package(source)),
+            },
+        }),
+    )
+    .await;
+    assert_eq!(
+        created.status,
+        201,
+        "case {case:?}: expected CreateFunction {name:?} to answer 201, got {} {}",
+        created.status,
+        created.text()
+    );
+    await_function_active(router, case, name).await;
+}
+
+/// Wait until the function `name` reports `State` `Active` with no update still in progress,
+/// which is when a mapping on it polls and when its code is the code it was last given.
+pub(crate) async fn await_function_active(router: &MultiServiceRouter, case: &str, name: &str) {
+    let deadline = Instant::now() + CLOCK_BUDGET;
+    loop {
+        let read = call(
+            router,
+            "GET",
+            &format!("{FUNCTIONS_URI}/{name}/configuration"),
+            &Value::Null,
+        )
+        .await;
+        let settled = read.string("State").as_deref() == Some("Active")
+            && read.string("LastUpdateStatus").as_deref() != Some("InProgress");
+        if settled {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the function {name:?} never became Active: {}",
+            read.text()
+        );
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
+/// Wait until the mapping `uuid` names reports `state` as its `State`.
+pub(crate) async fn await_mapping_state(
+    router: &MultiServiceRouter,
+    case: &str,
+    uuid: &str,
+    state: &str,
+) {
+    let deadline = Instant::now() + CLOCK_BUDGET;
+    loop {
+        let read = get_mapping(router, uuid).await;
+        if read.string("State").as_deref() == Some(state) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the mapping must settle into {state}, got {}",
+            read.text()
+        );
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
+/// `SendMessage` of `body` to the queue `url` addresses, carrying `group` as its
+/// `MessageGroupId` when there is one — which a FIFO queue requires and a standard queue
+/// takes no notice of.
+pub(crate) async fn send_message(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+    body: &str,
+    group: Option<&str>,
+) {
+    let mut request = json!({ "QueueUrl": url, "MessageBody": body });
+    if let Some(group) = group {
+        request["MessageGroupId"] = json!(group);
+    }
+    let (status, sent) = call_sqs(router, "SendMessage", &request).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected SendMessage to answer 200, got {status} {sent}"
     );
 }
 

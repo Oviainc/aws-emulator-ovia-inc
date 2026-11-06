@@ -329,8 +329,10 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
         } else {
             let payload = queue_event(&invoking, &polled);
             // What the attempt came to for the batch's messages: the ones it PROCESSED, or
-            // why it processed none of them. An attempt that processed none of the messages
-            // it was handed is the failure case below.
+            // why it processed none of them. The report reading below answers a non-empty set
+            // for every report it could read, so the guard on an empty one is belt and
+            // braces: it keeps this pass from recording a successful attempt that consumed
+            // nothing, whatever a future reading answers.
             let attempt = hand_over_batch(callback, session, &target, &payload, &invoking)
                 .await
                 .and_then(|processed| {
