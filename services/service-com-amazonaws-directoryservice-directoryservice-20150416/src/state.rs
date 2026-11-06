@@ -23,7 +23,8 @@
 //!   directory's LDAP security leaving `Enabling`, a
 //!   registered certificate leaving `Registering`, an organization directory share
 //!   leaving `Sharing` (and an unshared one leaving the store), a schema extension
-//!   leaving `Initializing`, a domain controller leaving `Creating` (and a retired one
+//!   leaving `Initializing` or `CancelInProgress`, a domain controller leaving
+//!   `Creating` (and a retired one
 //!   leaving the store)).
 //!   Every handler calls it before reading or writing, so a reporting operation reports
 //!   what the clock already owed and nothing more.
@@ -418,6 +419,34 @@ pub const SCHEMA_EXTENSION_STATUS_INITIALIZING: &str = "Initializing";
 /// The `SchemaExtensionStatus` an extension reaches once [`TRANSITION_SPAN`] has
 /// elapsed: the `Completed` value of the modelled `SchemaExtensionStatus` enum.
 pub const SCHEMA_EXTENSION_STATUS_COMPLETED: &str = "Completed";
+
+/// The `SchemaExtensionStatus` an extension carries between `CancelSchemaExtension` and
+/// [`TRANSITION_SPAN`]: the `CancelInProgress` value of the modelled
+/// `SchemaExtensionStatus` enum.
+///
+/// The cancel answers while the extension is still being wound back — the enum carries
+/// both the transient `CancelInProgress` and the settled
+/// [`SCHEMA_EXTENSION_STATUS_CANCELLED`] — so the move to the settled status is owed by
+/// the clock rather than by any later call, on the same span the start's transition uses.
+pub const SCHEMA_EXTENSION_STATUS_CANCEL_IN_PROGRESS: &str = "CancelInProgress";
+
+/// The `SchemaExtensionStatus` a cancelled extension settles on once
+/// [`TRANSITION_SPAN`] has elapsed: the `Cancelled` value of the modelled
+/// `SchemaExtensionStatus` enum.
+pub const SCHEMA_EXTENSION_STATUS_CANCELLED: &str = "Cancelled";
+
+/// The `SchemaExtensionStatus` values an extension can be cancelled in.
+///
+/// `CancelSchemaExtension`'s own documentation: "A schema extension can be canceled
+/// during any of the following states; Initializing, CreatingSnapshot, and
+/// UpdatingSchema" — and "Once a schema extension has started replicating to all domain
+/// controllers, the task can no longer be canceled", so every other value of the
+/// modelled enum is past the point of no return (or already finished).
+pub const CANCELLABLE_SCHEMA_EXTENSION_STATUSES: [&str; 3] = [
+    SCHEMA_EXTENSION_STATUS_INITIALIZING,
+    "CreatingSnapshot",
+    "UpdatingSchema",
+];
 
 /// The most schema extensions this emulator keeps for one directory.
 ///
@@ -1941,6 +1970,23 @@ pub struct SchemaExtensionRecord {
 }
 
 impl SchemaExtensionRecord {
+    /// Whether this extension is still early enough in its application to be cancelled:
+    /// its status is one of [`CANCELLABLE_SCHEMA_EXTENSION_STATUSES`].
+    pub fn is_cancellable(&self) -> bool {
+        CANCELLABLE_SCHEMA_EXTENSION_STATUSES.contains(&self.status.as_str())
+    }
+
+    /// Cancel this extension as of `now`: it enters the transient
+    /// [`SCHEMA_EXTENSION_STATUS_CANCEL_IN_PROGRESS`] and owes the clock the move to
+    /// [`SCHEMA_EXTENSION_STATUS_CANCELLED`] one [`TRANSITION_SPAN`] later, which is what
+    /// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`]
+    /// materialises — so a caller listing straight after the cancel still sees the
+    /// winding back under way, and the status the start owed is no longer owed.
+    pub fn cancel(&mut self, now: SystemTime) {
+        self.status = SCHEMA_EXTENSION_STATUS_CANCEL_IN_PROGRESS.to_string();
+        self.status_due_at = Some(now + TRANSITION_SPAN);
+    }
+
     /// This schema extension as the modelled `SchemaExtensionInfo` structure.
     pub fn to_info(&self, directory_id: &str) -> SchemaExtensionInfo {
         SchemaExtensionInfo {
@@ -2462,20 +2508,28 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                     setting.status_due_at = None;
                 }
             }
-            // The status transition `StartSchemaExtension` owes: the transient
-            // `Initializing` settles on `Completed`, which is when the extension first
-            // has an end instant to report. The move to `Cancelled` belongs to
-            // `CancelSchemaExtension`, which is still scaffolded, so it lands with that
-            // handler rather than as a branch nothing can reach.
+            // The status transitions the schema-extension writes owe: the transient
+            // `Initializing` a start answers in settles on `Completed`, and the transient
+            // `CancelInProgress` a cancel answers in settles on `Cancelled`. Either way
+            // the extension is finished with, which is when it first has an end instant to
+            // report.
             for extension in directory.schema_extensions.values_mut() {
                 let Some(due) = extension.status_due_at else {
                     continue;
                 };
-                if now >= due && extension.status == SCHEMA_EXTENSION_STATUS_INITIALIZING {
-                    extension.status = SCHEMA_EXTENSION_STATUS_COMPLETED.to_string();
-                    extension.end_date_time = Some(due);
-                    extension.status_due_at = None;
+                if now < due {
+                    continue;
                 }
+                let settled = match extension.status.as_str() {
+                    SCHEMA_EXTENSION_STATUS_INITIALIZING => SCHEMA_EXTENSION_STATUS_COMPLETED,
+                    SCHEMA_EXTENSION_STATUS_CANCEL_IN_PROGRESS => {
+                        SCHEMA_EXTENSION_STATUS_CANCELLED
+                    }
+                    _ => continue,
+                };
+                extension.status = settled.to_string();
+                extension.end_date_time = Some(due);
+                extension.status_due_at = None;
             }
             // The status transitions the domain-controller writes owe: the transient
             // `Creating` a placement answers in settles on `Active`, the status a
@@ -3211,6 +3265,19 @@ pub fn no_such_domain_controller(domain_controller_id: &str) -> String {
 /// [`refusal`] appends the request id.
 pub fn no_such_certificate(certificate_id: &str, directory_id: &str) -> String {
     format!("Certificate {certificate_id} does not exist for directory {directory_id}")
+}
+
+/// The `EntityDoesNotExistException` message for an id that names no schema extension of
+/// the directory the request asked about.
+///
+/// A schema extension is an extension OF a directory, so — like
+/// [`no_such_certificate`] — the message names both ids the request sent and nothing
+/// else, so the caller can tell which id was rejected. [`refusal`] appends the request
+/// id.
+pub fn no_such_schema_extension(schema_extension_id: &str, directory_id: &str) -> String {
+    format!(
+        "Schema extension {schema_extension_id} does not exist for directory {directory_id}"
+    )
 }
 
 /// The `EntityDoesNotExistException` message for an id that names no stored assessment.

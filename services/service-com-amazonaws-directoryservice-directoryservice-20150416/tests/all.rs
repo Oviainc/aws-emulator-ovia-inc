@@ -65,6 +65,8 @@ mod pagination_token_refusal;
 mod refusal_wording;
 #[path = "all/request_id_header.rs"]
 mod request_id_header;
+#[path = "all/schema_extension_cancellation.rs"]
+mod schema_extension_cancellation;
 #[path = "all/schema_extensions.rs"]
 mod schema_extensions;
 #[path = "all/shared_directories.rs"]

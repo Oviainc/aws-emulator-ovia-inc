@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelSchemaExtension
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelSchemaExtension`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelSchemaExtension::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancels a schema extension `StartSchemaExtension` persisted for a stored directory:
+//! the stored record enters the transient `CancelInProgress` and owes the clock the move
+//! to `Cancelled`, which
+//! [`crate::state::ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`]
+//! materialises and `ListSchemaExtensions` then reports. An extension past the states
+//! this operation documents as cancellable is refused rather than wound back.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +138,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelSchemaExtension` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelSchemaExtensionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelSchemaExtension"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        // A schema extension is an extension OF a directory, so the directory is
+        // resolved first: an id naming none is the modelled "specified entity could not
+        // be found", worded by this service's shared diagnostic for that failure.
+        let directory = store
+            .directories
+            .get_mut(&input.directory_id)
+            .ok_or_else(|| {
+                CancelSchemaExtensionErrorModeled::EntityDoesNotExistException(
+                    crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
+                )
+            })?;
+
+        // The extension is looked up WITHIN that directory, so an id that names an
+        // extension of another directory is as absent as one that names none at all.
+        let extension = directory
+            .schema_extensions
+            .get_mut(&input.schema_extension_id)
+            .ok_or_else(|| {
+                CancelSchemaExtensionErrorModeled::EntityDoesNotExistException(
+                    crate::state::refusal(crate::state::no_such_schema_extension(
+                        &input.schema_extension_id,
+                        &input.directory_id,
+                    )),
+                )
+            })?;
+
+        // "Once a schema extension has started replicating to all domain controllers, the
+        // task can no longer be canceled. A schema extension can be canceled during any
+        // of the following states; Initializing, CreatingSnapshot, and UpdatingSchema."
+        // The decision is taken from the STORED status, so it holds for every status the
+        // record can reach, however it got there — including a cancel this emulator is
+        // still winding back and one the clock has already completed. The model declares
+        // no state-specific error for this operation, so it is the generic
+        // `ClientException` that reports it, naming the status that refused the cancel and
+        // the states that admit one.
+        if !extension.is_cancellable() {
+            let message = format!(
+                "Schema extension {id} is in status {status} and can no longer be canceled; a \
+                 schema extension can be canceled only while it is in {cancellable}",
+                id = input.schema_extension_id,
+                status = extension.status,
+                cancellable =
+                    crate::state::CANCELLABLE_SCHEMA_EXTENSION_STATUSES.join(", ")
+            );
+            return Err(
+                CancelSchemaExtensionErrorModeled::ClientException(crate::state::refusal(
+                    message,
+                ))
+                .into(),
+            );
+        }
+
+        // The cancel answers before the extension has finished being wound back, so the
+        // record is left in the transient status with the move to the settled one owed by
+        // the clock.
+        extension.cancel(now);
+
+        // This operation's result structure carries no members: the state the cancel wrote
+        // is what `ListSchemaExtensions` reports.
+        Ok(CancelSchemaExtensionOutput {})
     }
 }
