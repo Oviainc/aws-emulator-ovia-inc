@@ -21,3 +21,5 @@ mod key_usage_and_replication;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stop_key_usage.rs"]
+mod stop_key_usage;
