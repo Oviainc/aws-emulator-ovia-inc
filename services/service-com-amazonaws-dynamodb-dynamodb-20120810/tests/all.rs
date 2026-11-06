@@ -97,8 +97,12 @@ mod paging_start_keys;
 mod parallel_scan_segment_refusals;
 #[path = "all/partiql_refusal_wording.rs"]
 mod partiql_refusal_wording;
+#[path = "all/partiql_statement_boundaries.rs"]
+mod partiql_statement_boundaries;
 #[path = "all/partiql_statements.rs"]
 mod partiql_statements;
+#[path = "all/partiql_transaction_responses.rs"]
+mod partiql_transaction_responses;
 #[path = "all/partiql_transactions.rs"]
 mod partiql_transactions;
 #[path = "all/probe.rs"]

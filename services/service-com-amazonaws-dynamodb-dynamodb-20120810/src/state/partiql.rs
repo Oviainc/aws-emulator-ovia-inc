@@ -117,36 +117,52 @@ impl Position {
 /// that is not a name from text that carries on past a complete statement. Each phrase
 /// below is the PartiQL parser's own for that position.
 ///
-/// The first three are the phrases this surface is RECORDED answering with. The last
-/// two cover the positions no recorded answer names — a keyword the grammar requires,
-/// and a token the grammar admits nowhere there — with the reference parser's own
-/// phrase for each, so the class a client sees is still the class that failed; a
-/// recording that names either position is what would settle its wording.
+/// The phrases this surface is RECORDED answering with are
+/// [`Self::NotDataManipulation`], [`Self::Identifier`], [`Self::TrailingToken`],
+/// [`Self::UnexpectedTerm`], [`Self::FromAfterSelectList`], [`Self::AfterSemicolon`] and
+/// the EMPTY phrase of [`Self::Unterminated`]. [`Self::Keyword`] covers the keyword
+/// positions no recorded answer names, with the reference parser's own phrase, so the
+/// class a client sees is still the class that failed; a recording that names one of those
+/// positions is what would settle its wording, the way the `FROM` of a `SELECT` list has
+/// its own phrase above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParseDefect {
-    /// The text reads as an expression rather than as a statement that reads or writes
-    /// items — which is what this surface runs.
+    /// The text states none of the verbs that read or write items, so it reads as an
+    /// expression rather than as the data manipulation this surface runs.
     NotDataManipulation,
     /// A NAME was required there — a table, an index, an attribute or an alias — and
     /// what the statement spells is not one (a string literal, say).
     Identifier,
     /// A keyword the grammar requires at that position is not there.
     Keyword,
-    /// The statement is complete and the text carries on.
+    /// The `FROM` a `SELECT` list must be followed by is not there — the one keyword
+    /// position the parser phrases by naming the keyword and the clause it follows.
+    FromAfterSelectList,
+    /// Text carries on past the `;` that ended the one query a statement states.
+    AfterSemicolon,
+    /// A statement that opens with a data-manipulation verb is complete and the text
+    /// carries on past it.
     TrailingToken,
     /// The token at that position is not one the grammar admits there.
     UnexpectedTerm,
+    /// The text STOPS inside a quoted run — a string literal or a quoted name the
+    /// statement never closes — so there is no token at the position to name and the
+    /// parser reports no phrase for it at all.
+    Unterminated,
 }
 
 impl ParseDefect {
-    /// The parser's phrase for this defect.
+    /// The parser's phrase for this defect, which is EMPTY where it reports none.
     fn phrase(self) -> &'static str {
         match self {
             Self::NotDataManipulation => "Expected data manipulation",
             Self::Identifier => "Expected identifier for simple path",
             Self::Keyword => "Expected keyword",
+            Self::FromAfterSelectList => "Expected FROM after SELECT list",
+            Self::AfterSemicolon => "Unexpected token after semicolon. (Only one query is allowed.)",
             Self::TrailingToken => "Unexpected token after expression",
             Self::UnexpectedTerm => "Unexpected term",
+            Self::Unterminated => "",
         }
     }
 }
@@ -154,7 +170,9 @@ impl ParseDefect {
 /// How a statement this dialect cannot parse is refused: a `ValidationException`
 /// carrying the fixed sentence DynamoDB states a parse defect with, followed by the
 /// parser's own phrase for the position the parse stopped at. The statement itself is
-/// not echoed back.
+/// not echoed back, and a defect the parser reports no phrase for leaves the sentence's
+/// tail empty — the fixed text, its colon and the space that separates the two are the
+/// whole of what such a refusal states.
 fn statement_parse_error(defect: ParseDefect) -> RequestError {
     RequestError::Validation(format!(
         "Statement wasn't well formed, can't be processed: {}",
@@ -215,6 +233,17 @@ fn single_table_in_data_manipulation(at: Position) -> RequestError {
 /// `INSERT`'s target has the same shape.
 fn unsupported_on_an_index() -> RequestError {
     RequestError::Validation("This operation is not supported on an index".to_string())
+}
+
+/// How a statement that binds an ALIAS to the table it names is refused.
+///
+/// PartiQL's grammar lets a source bind a name — `FROM table AS t`, or the same binding
+/// with the keyword left out, `FROM table t` — and DynamoDB's statement surface serves
+/// no such binding: every path of a statement names an attribute of the item, so a name
+/// standing for the table is something no clause can read. The sentence is fixed and
+/// names neither the alias nor the table.
+fn aliasing_unsupported() -> RequestError {
+    RequestError::Validation("Aliasing is not supported".to_string())
 }
 
 /// How a source path naming more than a table and an index of it is refused: the two
@@ -403,6 +432,8 @@ enum Token {
     Comma,
     Dot,
     Colon,
+    /// `;`, which ends the one query a statement states.
+    Semicolon,
     Minus,
     Plus,
 }
@@ -540,6 +571,10 @@ fn tokenize(statement: &str) -> Result<Lexemes, RequestError> {
                 tokens.push(Token::Colon);
                 at += 1;
             }
+            ';' => {
+                tokens.push(Token::Semicolon);
+                at += 1;
+            }
             '-' => {
                 tokens.push(Token::Minus);
                 at += 1;
@@ -598,8 +633,9 @@ fn quoted(
         text.push(character);
         index += 1;
     }
-    // An unterminated literal is a statement that does not parse.
-    Err(statement_parse_error(ParseDefect::UnexpectedTerm))
+    // The text stops inside the run: there is no token at the position the parse
+    // stopped at, so the refusal names no phrase for it.
+    Err(statement_parse_error(ParseDefect::Unterminated))
 }
 
 /// Read one numeric lexeme starting at `at`: digits, an optional fraction and an
@@ -920,10 +956,23 @@ pub fn parse_statement(
         parameters,
         used_parameters: 0,
         depth: 0,
+        aliased: false,
     };
     let parsed = parser.statement()?;
+    // "Only one query is allowed": a `;` ends the query, so text after it is a second
+    // one — or a token belonging to nothing — and is refused as such rather than as a
+    // token after the expression.
+    if parser.accept(&Token::Semicolon) && !parser.at_end() {
+        return Err(statement_parse_error(ParseDefect::AfterSemicolon));
+    }
     if !parser.at_end() {
         return Err(unexpected_token_after_statement());
+    }
+    // A statement that READ as a whole statement and bound a name to its table is one
+    // this surface does not serve: the binding is refused after the text has parsed, so
+    // text that never parsed still reports its own parse defect.
+    if parser.aliased {
+        return Err(aliasing_unsupported());
     }
     // "The parameters for the PartiQL statement, if any" (`Parameters`): a request
     // that sends more values than the statement has markers for has sent a statement
@@ -946,6 +995,10 @@ struct StatementParser<'t> {
     parameters: &'t [AttributeValue],
     used_parameters: usize,
     depth: usize,
+    /// Whether the statement bound an alias to the table it names. The binding is part
+    /// of the grammar, so it is READ here and refused once the whole statement has
+    /// parsed ([`aliasing_unsupported`]).
+    aliased: bool,
 }
 
 impl StatementParser<'_> {
@@ -1115,29 +1168,11 @@ impl StatementParser<'_> {
         if self.accept_word("delete") {
             return self.delete().map(PartiqlStatement::Delete);
         }
-        Err(self.not_a_data_manipulation())
-    }
-
-    /// The refusal a statement that opens with no data-manipulation verb earns.
-    ///
-    /// PartiQL reads text that states no such verb as an EXPRESSION, and this surface
-    /// runs statements that read or write items — so the defect is the text being an
-    /// expression when the expression accounts for all of it, and the first token the
-    /// expression does not account for when it does not.
-    fn not_a_data_manipulation(&mut self) -> RequestError {
-        let start = self.at;
-        let read = self.disjunction();
-        // The text accounted for as an expression reaches the end of the statement: what
-        // is left is an expression and no manipulation of data. Text the expression does
-        // not reach is the token it stopped at.
-        if self.at_end() {
-            return statement_parse_error(ParseDefect::NotDataManipulation);
-        }
-        if self.at > start {
-            return statement_parse_error(ParseDefect::TrailingToken);
-        }
-        read.err()
-            .unwrap_or_else(|| statement_parse_error(ParseDefect::TrailingToken))
+        // Text that opens with none of the four verbs states no manipulation of data,
+        // whatever the rest of it reads as: this surface runs statements that read or
+        // write items, so the verb the statement opens with is what decides whether it
+        // is one at all.
+        Err(statement_parse_error(ParseDefect::NotDataManipulation))
     }
 
     /// `SELECT (* | attribute, …) FROM source [WHERE predicate] [ORDER BY attribute
@@ -1161,8 +1196,14 @@ impl StatementParser<'_> {
             }
             Some(items)
         };
-        self.expect_word("from")?;
-        let source = self.read_source()?;
+        // The `FROM` that follows a projection list is the one keyword position the
+        // parser names in its phrase, rather than reporting a keyword generically.
+        if !self.accept_word("from") {
+            return Err(statement_parse_error(ParseDefect::FromAfterSelectList));
+        }
+        // A `SELECT` carries on with its own `WHERE` or `ORDER BY`; any other name here
+        // binds the source ([`Self::read_table_alias`]).
+        let source = self.read_source(&["where", "order"])?;
         let (table, index) = (source.table, source.index);
         let filter = self.where_clause()?;
         let order_by = if self.accept_word("order") {
@@ -1195,7 +1236,7 @@ impl StatementParser<'_> {
     /// `INSERT INTO source VALUE tuple`.
     fn insert(&mut self) -> Result<InsertStatement, RequestError> {
         self.expect_word("into")?;
-        let table = self.write_target()?;
+        let table = self.write_target(&["value", "values"])?;
         if !self.accept_word("value") {
             self.expect_word("values")?;
         }
@@ -1217,7 +1258,7 @@ impl StatementParser<'_> {
     /// therefore a token the grammar has no place for, and the statement is refused as
     /// one token past its expression rather than read as a list.
     fn update(&mut self) -> Result<UpdateStatement, RequestError> {
-        let table = self.write_target()?;
+        let table = self.write_target(&["set", "remove"])?;
         let mut clauses = Vec::new();
         loop {
             if self.accept_word("set") {
@@ -1250,7 +1291,7 @@ impl StatementParser<'_> {
     /// `DELETE FROM source WHERE predicate [RETURNING values]`.
     fn delete(&mut self) -> Result<DeleteStatement, RequestError> {
         self.expect_word("from")?;
-        let source = self.read_source()?;
+        let source = self.read_source(&["where", "returning"])?;
         let table = source.table;
         if source.index.is_some() {
             return Err(single_table_in_data_manipulation(source.position));
@@ -1281,7 +1322,7 @@ impl StatementParser<'_> {
     /// The source a `FROM` clause names — a `SELECT`'s and a `DELETE`'s: `table` or
     /// `table.index`, either part quoted or bare, with the position the statement spells
     /// the whole path at.
-    fn read_source(&mut self) -> Result<StatementSource, RequestError> {
+    fn read_source(&mut self, continues: &[&str]) -> Result<StatementSource, RequestError> {
         let opens_at = self.position();
         let table = self.identifier()?;
         let index = if self.accept(&Token::Dot) {
@@ -1296,22 +1337,58 @@ impl StatementParser<'_> {
                 FROM_PATH_ARITY_MESSAGE.to_string(),
             ));
         }
-        Ok(StatementSource {
+        let source = StatementSource {
             table,
             index,
             position: opens_at.through(self.previous_position()),
-        })
+        };
+        self.read_table_alias(continues);
+        Ok(source)
     }
 
     /// The target a write names DIRECTLY — an `INSERT`'s `INTO` and an `UPDATE`'s own
     /// source. There is no `FROM` clause here, so a qualifier of any length addresses an
     /// index rather than the table, and no write goes through one.
-    fn write_target(&mut self) -> Result<String, RequestError> {
+    fn write_target(&mut self, continues: &[&str]) -> Result<String, RequestError> {
         let table = self.identifier()?;
         if self.peek() == Some(&Token::Dot) {
             return Err(unsupported_on_an_index());
         }
+        self.read_table_alias(continues);
         Ok(table)
+    }
+
+    /// Read the ALIAS a statement binds to the table it has just named, when it states
+    /// one, and remember that it did.
+    ///
+    /// A binding is `AS name`, or the same name with the keyword left out; `continues`
+    /// names the keywords the statement itself carries on with at this position, so a
+    /// word that is none of them — and a `"quoted"` name, which is never a keyword —
+    /// binds the table rather than continuing the statement. The binding is part of the
+    /// grammar and is therefore READ rather than refused here: a statement that does not
+    /// parse past it earns its own parse defect, and one that parses whole is refused for
+    /// the binding ([`aliasing_unsupported`], applied once the statement is read).
+    fn read_table_alias(&mut self, continues: &[&str]) {
+        if self.accept_word("as") {
+            self.aliased = true;
+            // The name the binding states, when it states one: text that is no name
+            // leaves the statement to fail on its own defect.
+            if matches!(self.peek(), Some(Token::Word(_) | Token::Quoted(_))) {
+                self.at += 1;
+            }
+            return;
+        }
+        let binds = match self.peek() {
+            Some(Token::Word(word)) => !continues
+                .iter()
+                .any(|keyword| word.eq_ignore_ascii_case(keyword)),
+            Some(Token::Quoted(_)) => true,
+            _ => false,
+        };
+        if binds {
+            self.aliased = true;
+            self.at += 1;
+        }
     }
 
     /// `RETURNING (ALL | MODIFIED) (OLD | NEW) *`.

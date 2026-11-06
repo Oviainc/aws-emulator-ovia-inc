@@ -329,7 +329,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // figure is the one the transaction's own items weigh, reported as the
                 // read it was.
                 return Ok(ExecuteTransactionOutput {
-                    responses: Some(vec![ItemResponse::default(); parsed.len()]),
+                    // The repeat re-applies nothing, so no statement of it produced an
+                    // item to report ([`reported_responses`]).
+                    responses: reported_responses(parsed.iter().map(|_| None)),
                     consumed_capacity: completed
                         .ledger
                         .consumed_capacity(requested_capacity, crate::state::CapacityKind::Read),
@@ -932,18 +934,30 @@ fn write_transaction(
     }
 
     Ok(ExecuteTransactionOutput {
-        // A write reports one response per statement either way: what its `RETURNING`
-        // clause asked for, or nothing when it states none.
-        responses: Some(
-            planned
-                .into_iter()
-                .map(|statement| ItemResponse {
-                    item: statement.reported,
-                })
-                .collect(),
-        ),
+        // A write reports what its `RETURNING` clause asked to see, and a statement that
+        // states no such clause produced nothing to report ([`reported_responses`]).
+        responses: reported_responses(planned.into_iter().map(|statement| statement.reported)),
         consumed_capacity: (!consumed.is_empty()).then_some(consumed),
     })
+}
+
+/// The `Responses` member a transaction reports, over the item each of its statements
+/// PRODUCED.
+///
+/// `ItemResponse` carries a single optional `Item` and nothing else, so an entry for a
+/// statement that produced no item states nothing a caller can read: the list holds one
+/// entry per item a statement produced, and a transaction where none did reports an
+/// empty list rather than a run of empty structures.
+fn reported_responses(
+    produced: impl IntoIterator<Item = Option<crate::state::Item>>,
+) -> Option<Vec<ItemResponse>> {
+    Some(
+        produced
+            .into_iter()
+            .flatten()
+            .map(|item| ItemResponse { item: Some(item) })
+            .collect(),
+    )
 }
 
 /// One statement of a write transaction, resolved against the state as it stood before

@@ -133,10 +133,10 @@ fn parse_rows() -> Vec<Row> {
             expected: parse_failure("Unexpected token after expression"),
         },
         Row {
-            case: "a misspelled verb leaves the rest unaccounted for",
+            case: "a misspelled verb states no data manipulation",
             statement: format!("INSRT INTO \"{TABLE}\" VALUE {{'pk':'a'}}"),
             parameters: Value::Null,
-            expected: parse_failure("Unexpected token after expression"),
+            expected: parse_failure("Expected data manipulation"),
         },
         Row {
             case: "the text reads as an expression and nothing more",
@@ -157,10 +157,10 @@ fn parse_rows() -> Vec<Row> {
             expected: parse_failure("Expected identifier for simple path"),
         },
         Row {
-            case: "a keyword the grammar requires is missing",
+            case: "the FROM a SELECT list must be followed by is missing",
             statement: format!("SELECT * {TABLE}"),
             parameters: Value::Null,
-            expected: parse_failure("Expected keyword"),
+            expected: parse_failure("Expected FROM after SELECT list"),
         },
         Row {
             // A function the dialect DOES define, standing where only a name may stand:
@@ -500,7 +500,7 @@ async fn a_batch_slot_states_the_same_sentence_its_own_statement_earns() {
         (
             "a misspelled verb",
             format!("INSRT INTO \"{TABLE}\" VALUE {{'pk':'q'}}"),
-            parse_failure("Unexpected token after expression"),
+            parse_failure("Expected data manipulation"),
         ),
         (
             "an unknown function",
@@ -650,7 +650,7 @@ async fn a_transaction_states_the_slot_a_statement_was_sent_in() {
         (
             "a misspelled verb",
             format!("INSRT INTO \"{TABLE}\" VALUE {{'pk':'q'}}"),
-            parse_failure("Unexpected token after expression"),
+            parse_failure("Expected data manipulation"),
         ),
         (
             "a single-quoted table name",
@@ -788,7 +788,7 @@ fn cross_surface_rows() -> Vec<Row> {
             case: "a misspelled verb",
             statement: format!("INSRT INTO \"{TABLE}\" VALUE {{'pk':'q'}}"),
             parameters: Value::Null,
-            expected: parse_failure("Unexpected token after expression"),
+            expected: parse_failure("Expected data manipulation"),
         },
         Row {
             case: "a single-quoted table name",

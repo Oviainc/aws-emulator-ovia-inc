@@ -204,10 +204,14 @@ async fn a_write_transaction_lands_every_statement_or_none() {
         }),
     )
     .await;
+    // Neither `INSERT` states a `RETURNING` clause, so neither produced an item: an
+    // `ItemResponse` carries nothing but an item, so the transaction reports no entry at
+    // all rather than one empty structure per statement.
     assert_eq!(
-        responses(&applied).len(),
-        2,
-        "case multi-table INSERT: one response per statement, got {applied}"
+        responses(&applied),
+        Vec::<Value>::new(),
+        "case multi-table INSERT: a write returning no image reports no response entry, got \
+         {applied}"
     );
     // "Transactional write requests require two write capacity units": each statement
     // writes one small item, so each entry is twice the one unit the same single-item
