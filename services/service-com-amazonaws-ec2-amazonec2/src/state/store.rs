@@ -2245,6 +2245,16 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Starts EMPTY: a route server has no association until `AssociateRouteServer` makes
     /// one.
     pub route_server_associations: BTreeMap<(String, String), RouteServerAssociationRecord>,
+    /// Which route tables each of the account's route servers may install its learned routes
+    /// into, by the (`RouteServerId`, `RouteTableId`) pair the propagation IS — see
+    /// [`RouteServerPropagationRecord`] and the module docs. One entry per pair, because a
+    /// pair either propagates or does not; ordered by route server and then by route table,
+    /// which is the order `GetRouteServerPropagations` reports one route server's
+    /// propagations in.
+    ///
+    /// Starts EMPTY: a route server propagates into no route table until
+    /// `EnableRouteServerPropagation` says so.
+    pub route_server_propagations: BTreeMap<(String, String), RouteServerPropagationRecord>,
     /// The account's Allowed AMIs setting in each Region a caller has configured it in, by
     /// Region name — see the module docs. A Region with no entry has the setting an account
     /// that never enabled the feature has ([`AllowedImagesSettings::default`]), so a read
@@ -3098,6 +3108,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             route_server_peer_available_at: BTreeMap::new(),
             route_server_peer_deleted_at: BTreeMap::new(),
             route_server_associations: BTreeMap::new(),
+            route_server_propagations: BTreeMap::new(),
             allowed_images_settings: BTreeMap::new(),
             fpga_images: BTreeMap::new(),
             fpga_image_client_tokens: HashMap::new(),

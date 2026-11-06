@@ -980,6 +980,12 @@
 //! age, derived by [`RouteServerAssociationRecord::view_at`] like a route server's own two
 //! states.
 //!
+//! [`ComAmazonawsEc2Amazonec2State::route_server_propagations`] holds which route tables
+//! each of those route servers may install its learned routes into, keyed by the (route
+//! server, route table) pair that IS the propagation — see the
+//! [`route_server_propagations`] module, which owns that store's record, its derived states
+//! and the association rule a propagation is only valid under.
+//!
 //! ## Account-level settings
 //!
 //! A setting is not a resource: it has no id, nothing creates or deletes it, and an
@@ -1766,7 +1772,7 @@ use crate::ops::types::{
     Region, ReplaceRootVolumeTask, RequestLaunchTemplateData, RevokedSecurityGroupRule,
     RouteServer, RouteServerBfdStatus,
     RouteServerBgpOptions, RouteServerBgpStatus, RouteServerEndpoint, RouteServerPeer,
-    RouteServerAssociation, RouteTable,
+    RouteServerAssociation, RouteServerPropagation, RouteTable,
     RunInstancesOutput, SecondaryInterface, SecondaryInterfaceAttachment,
     SecondaryInterfaceIpv4Address, SecondaryNetwork,
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
@@ -2172,6 +2178,12 @@ mod nat_gateways_and_vpn_connections;
 mod spot_fleets;
 mod spot_instance_requests;
 mod store_image_tasks_and_route_servers;
+/// Which route tables each route server may install its learned routes into: the
+/// propagation store's record, the states the clock derives for it, and the association
+/// that backs one — in a file of its own rather than as more lines here. Everything it
+/// declares is re-exported below, so a handler reaches it as
+/// `crate::state::route_server_propagations_at` like any helper of this module.
+mod route_server_propagations;
 mod image_block_public_access_and_metadata_defaults;
 mod image_usage_report_store;
 mod capacity_billing_and_recycle_bins;
@@ -2213,6 +2225,7 @@ pub use capacity_billing_and_recycle_bins::*;
 pub use image_usage_report_store::*;
 pub use image_block_public_access_and_metadata_defaults::*;
 pub use store_image_tasks_and_route_servers::*;
+pub use route_server_propagations::*;
 pub use spot_instance_requests::*;
 pub use spot_fleets::*;
 pub use nat_gateways_and_vpn_connections::*;

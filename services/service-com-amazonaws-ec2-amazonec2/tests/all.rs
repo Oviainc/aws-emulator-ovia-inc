@@ -1166,6 +1166,11 @@ mod ipam_byoasns;
 // associating a route server with a VPC, and reading one route server's associations back.
 #[path = "all/route_server_associations.rs"]
 mod route_server_associations;
+// Declared LAST for the same reason: the route server PROPAGATION slice — which route tables
+// a route server may install its learned routes into, and reading one route server's
+// propagations back.
+#[path = "all/route_server_propagations.rs"]
+mod route_server_propagations;
 // every new ec2 suite inserts its lines. What `DeleteTrafficMirrorSession` deletes out of
 // the Traffic Mirror session store, and what it refuses.
 #[path = "all/traffic_mirror_sessions.rs"]
