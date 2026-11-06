@@ -33,7 +33,13 @@
 //! or quality, no demographic attribute and no orientation correction. The feature vector
 //! AWS stores for a face is not among them, so the operations that would match a
 //! submitted image against the faces a collection holds (`SearchFacesByImage`,
-//! `SearchUsersByImage`, `RecognizeCelebrities`, …) stay unimplemented 501s.
+//! `SearchUsersByImage`, …) stay unimplemented 501s.
+//!
+//! Where an operation PARTITIONS the faces of a submitted image by an identity nothing here
+//! holds, the detector still answers for the part it measured: `RecognizeCelebrities`
+//! reports every face it measured as an unrecognized face — the side the operation itself
+//! puts a face it does not recognise on — and names no celebrity, rather than refusing the
+//! call or inventing one.
 //!
 //! The one comparison this emulator can make about stored faces is IDENTITY:
 //! [`image_signature`] digests what an image is, so two indexed faces can be told to have

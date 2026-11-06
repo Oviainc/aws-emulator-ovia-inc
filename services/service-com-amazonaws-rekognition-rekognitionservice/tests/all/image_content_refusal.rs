@@ -14,10 +14,10 @@
 //! the request carried.
 //!
 //! The table spans what the rule generalises over: which image operation is called
-//! (`DetectFaces`, `IndexFaces` — the operations of this service that take ONE `Image` and
-//! are implemented; `CompareFaces`, which takes two, is covered the same way in the
-//! comparison suite) and what else the request carries beside the image (nothing, and each
-//! operation's own optional members at several values). A contrast table pins the other
+//! (`DetectFaces`, `IndexFaces`, `RecognizeCelebrities` — the operations of this service
+//! that take ONE `Image` and are implemented; `CompareFaces`, which takes two, is covered
+//! the same way in the comparison suite) and what else the request carries beside the image
+//! (nothing, and each operation's own optional members at several values). A contrast table pins the other
 //! side of the rule: an image that DOES identify content is never answered with this
 //! refusal, whether that content turns out to be readable, to violate the model's own
 //! constraint on it, to be undecodable, or to be an S3 object the store does not serve.
@@ -147,6 +147,10 @@ async fn an_image_with_no_content_source_is_refused_with_the_fixed_wording() {
                 "DetectionAttributes": ["ALL"],
             }),
         ),
+        // `RecognizeCelebrities` models no input member beside the image
+        // (`smithy_query(query="operation",operation="RecognizeCelebrities")`), so the
+        // image is all one of its requests can carry.
+        ("RecognizeCelebrities", "nothing else", json!({})),
     ];
 
     for (operation, extra_case, extra) in extras {
@@ -211,6 +215,27 @@ async fn an_image_that_identifies_content_is_never_the_no_content_refusal() {
             json!({ "CollectionId": COLLECTION, "Image": bytes_image(&png) }),
             200,
             "",
+        ),
+        (
+            "RecognizeCelebrities on readable inline bytes",
+            "RecognizeCelebrities",
+            json!({ "Image": bytes_image(&png) }),
+            200,
+            "",
+        ),
+        (
+            "RecognizeCelebrities on inline bytes that are no image",
+            "RecognizeCelebrities",
+            json!({ "Image": bytes_image(b"not-an-image-at-all") }),
+            400,
+            "InvalidImageFormatException",
+        ),
+        (
+            "RecognizeCelebrities on an S3 object the store does not serve",
+            "RecognizeCelebrities",
+            json!({ "Image": { "S3Object": { "Bucket": "no-such-bucket", "Name": "no-such-key" } } }),
+            400,
+            "InvalidS3ObjectException",
         ),
         (
             // An S3 address identifies content as much as inline bytes do, so this is

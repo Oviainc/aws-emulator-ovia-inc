@@ -134,7 +134,7 @@ use std::io::Cursor;
 use ::image::{ImageFormat, Limits};
 
 use super::image_source::{self, UnreadableImage};
-use crate::ops::types::{BoundingBox, FaceDetail, Image, ImageQuality, Landmark, Pose};
+use crate::ops::types::{BoundingBox, ComparedFace, FaceDetail, Image, ImageQuality, Landmark, Pose};
 
 /// The most faces one answer reports: `DetectFaces` "detects the 100 largest faces in the
 /// image".
@@ -764,6 +764,25 @@ impl MeasuredFace {
             .as_ref()
             .and_then(|quality| quality.sharpness)
             .unwrap_or_default()
+    }
+}
+
+/// A detected face as the `ComparedFace` the operations that report one carry it as:
+/// "provides face metadata for target image faces that are analyzed by `CompareFaces` and
+/// `RecognizeCelebrities`" (`smithy_query(query="shape",shape="ComparedFace")`). Every
+/// member the detector measured is carried across unchanged; `Emotions` and `Smile` are a
+/// classifier's judgement and no classifier runs here, so they stay absent rather than
+/// being filled in. One conversion, so the two operations that report a compared face
+/// report the same face.
+pub fn compared_face(detail: &FaceDetail) -> ComparedFace {
+    ComparedFace {
+        bounding_box: detail.bounding_box.clone(),
+        confidence: detail.confidence,
+        landmarks: detail.landmarks.clone(),
+        pose: detail.pose.clone(),
+        quality: detail.quality.clone(),
+        emotions: None,
+        smile: None,
     }
 }
 

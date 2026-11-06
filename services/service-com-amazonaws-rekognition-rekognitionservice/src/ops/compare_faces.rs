@@ -174,6 +174,10 @@ use super::types::*;
 // one carries its `Code` member beside its `Message`.
 use crate::state::modeled_error::ModeledError;
 
+// A reported face is built by the one conversion every operation that reports a
+// `ComparedFace` shares, so two operations cannot drift apart over what a face carries.
+use crate::state::face_detection::compared_face;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -330,21 +334,6 @@ async fn comparable_faces(
         .map_err(unreadable_error)?;
     faces.retain(|face| face.meets_quality_bar(bar));
     Ok(faces)
-}
-
-/// A detected face as the `ComparedFace` this operation reports it as: the members the
-/// detector measured, carried across unchanged. `Emotions` and `Smile` are a classifier's
-/// judgement and no classifier runs here, so they stay absent rather than being filled in.
-fn compared_face(detail: &FaceDetail) -> ComparedFace {
-    ComparedFace {
-        bounding_box: detail.bounding_box.clone(),
-        confidence: detail.confidence,
-        landmarks: detail.landmarks.clone(),
-        pose: detail.pose.clone(),
-        quality: detail.quality.clone(),
-        emotions: None,
-        smile: None,
-    }
 }
 
 /// The refusal for an image this operation found no comparable face in: "if no faces are
