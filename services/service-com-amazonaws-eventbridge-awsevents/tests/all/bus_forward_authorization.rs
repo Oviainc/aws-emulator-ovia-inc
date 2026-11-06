@@ -30,10 +30,13 @@
 //! publication not having happened.
 //!
 //! The harness (the router with EventBridge, SQS, IAM and CloudWatch on one
-//! engine) is the one `target_dispatch` owns. The rule and publication helpers
-//! below are this suite's own because every call here NAMES a bus — the source
-//! bus, the destination bus — where that suite's helpers address the account's
-//! default one and are pinned by the suites that use them.
+//! engine) is the one `target_dispatch` owns. The rule and bus helpers below are
+//! this suite's rather than that one's because every call here NAMES a bus — the
+//! source bus, the destination bus — where that suite's helpers address the
+//! account's default one and are pinned by the suites that use them; they are
+//! `pub(crate)` because `bus_forward_failure_accounting`, which pins what a
+//! refused forward is ACCOUNTED as, builds the same three rules over the same two
+//! buses.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
@@ -47,27 +50,27 @@ use crate::target_dispatch::{
 
 /// The bus the event is published onto, and the bus the forwarding rule's target
 /// names.
-const SOURCE_BUS: &str = "forwarding-bus";
-const DESTINATION_BUS: &str = "destination-bus";
+pub(crate) const SOURCE_BUS: &str = "forwarding-bus";
+pub(crate) const DESTINATION_BUS: &str = "destination-bus";
 
 /// The rules: the one whose target is the destination bus, the twin control on
 /// the source bus, and the one on the destination bus that would deliver the
 /// forwarded copy to a queue.
-const FORWARDING_RULE: &str = "forwards";
-const CONTROL_RULE: &str = "control";
-const RECEIVING_RULE: &str = "receives";
+pub(crate) const FORWARDING_RULE: &str = "forwards";
+pub(crate) const CONTROL_RULE: &str = "control";
+pub(crate) const RECEIVING_RULE: &str = "receives";
 
 /// The id of the one target each rule carries.
-const TARGET_ID: &str = "t1";
+pub(crate) const TARGET_ID: &str = "t1";
 
 /// The role the forward is made under. Its own inline policy ALLOWS the
 /// publication, so every row below turns on the destination bus's policy alone.
-const FORWARDING_ROLE: &str = "bus-forward-role";
+pub(crate) const FORWARDING_ROLE: &str = "bus-forward-role";
 const PUT_EVENTS_ACTION: &str = "events:PutEvents";
 
 /// The ARN of the bus `name` of the Region every call here is signed for, as a
 /// target and as a policy statement's resource name it.
-fn bus_arn(name: &str) -> String {
+pub(crate) fn bus_arn(name: &str) -> String {
     format!(
         "arn:aws:events:{REGION}:{}:event-bus/{name}",
         engine::emulator_account_id()
@@ -85,7 +88,7 @@ fn other_role_arn() -> String {
 
 /// The ARN of the rule `name` on the bus `bus`, as a dead-letter message names
 /// the rule whose delivery failed.
-fn rule_arn(bus: &str, name: &str) -> String {
+pub(crate) fn rule_arn(bus: &str, name: &str) -> String {
     format!(
         "arn:aws:events:{REGION}:{}:rule/{bus}/{name}",
         engine::emulator_account_id()
@@ -93,7 +96,7 @@ fn rule_arn(bus: &str, name: &str) -> String {
 }
 
 /// Create the bus `name`.
-async fn given_bus(emulator: &Emulator, case: &str, name: &str) {
+pub(crate) async fn given_bus(emulator: &Emulator, case: &str, name: &str) {
     let (status, created) = events(emulator, "CreateEventBus", &json!({ "Name": name })).await;
     assert_eq!(
         status, 200,
@@ -103,7 +106,13 @@ async fn given_bus(emulator: &Emulator, case: &str, name: &str) {
 
 /// A rule called `name` on `bus` matching every event published below, carrying
 /// `targets`.
-async fn given_rule(emulator: &Emulator, case: &str, bus: &str, name: &str, targets: Value) {
+pub(crate) async fn given_rule(
+    emulator: &Emulator,
+    case: &str,
+    bus: &str,
+    name: &str,
+    targets: Value,
+) {
     let pattern = json!({ "source": [SOURCE], "detail-type": [DETAIL_TYPE] }).to_string();
     let (status, body) = events(
         emulator,

@@ -33,6 +33,8 @@ mod archive_replay;
 mod archive_state_is_settled;
 #[path = "all/bus_forward_authorization.rs"]
 mod bus_forward_authorization;
+#[path = "all/bus_forward_failure_accounting.rs"]
+mod bus_forward_failure_accounting;
 #[path = "all/bus_policy_publication_authorization.rs"]
 mod bus_policy_publication_authorization;
 #[path = "all/client_error_wording.rs"]
