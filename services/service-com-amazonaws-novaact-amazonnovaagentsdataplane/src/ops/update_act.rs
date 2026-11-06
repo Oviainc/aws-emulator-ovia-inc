@@ -89,8 +89,9 @@ use super::types::*;
 
 /// How this service states a status an act's current status does not admit: the act is in a
 /// state this update did not expect. Fixed text with nothing interpolated, so the refusal
-/// reads the same whichever act and whichever status a caller named.
-pub const ACT_IN_UNEXPECTED_STATE: &str = "Act in unexpected state";
+/// reads the same whichever act and whichever status a caller named. Private: the sentence
+/// belongs to this operation, and the wire cases spell it out themselves.
+const ACT_IN_UNEXPECTED_STATE: &str = "Act in unexpected state";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
