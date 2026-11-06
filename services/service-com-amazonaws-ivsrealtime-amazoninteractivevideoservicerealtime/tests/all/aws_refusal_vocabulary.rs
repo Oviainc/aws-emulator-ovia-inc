@@ -41,6 +41,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_ivsrealtime_amazoninteractivevideoservicerealtime::EmulatedService;
 
+use crate::attributes_measure::{
+    json_punctuation, json_size, oversized_message, MAX_ATTRIBUTES_BYTES,
+};
+
 /// The region every request in this suite is signed for, and so the region every fixture
 /// is created in: a resource is addressed through the region holding it.
 const REGION: &str = "us-east-1";
@@ -66,11 +70,6 @@ const VALIDATION_CODE: &str = "ValidationException";
 /// The modelled `@length` maximum of `Tags` (`smithy_query(query="shape", shape="Tags")`):
 /// the tags one resource carries.
 const MAX_TAGS: usize = 50;
-
-/// The documented maximum size of an `attributes` map, from
-/// `smithy_query(query="doc", shape="CreateParticipantTokenRequest", member="attributes")`:
-/// "The maximum length of this field is 1 KB total."
-const MAX_ATTRIBUTES_BYTES: usize = 1024;
 
 /// The documented default lifetime of a participant token, from
 /// `smithy_query(query="doc", shape="CreateParticipantTokenRequest", member="duration")`:
@@ -721,21 +720,6 @@ async fn the_capability_default_is_applied_even_though_it_is_not_reported() {
     }
 }
 
-/// The JSON punctuation a map of `pairs` entries carries, which the measured size counts
-/// beside the keys and values themselves: the two braces, the two quotes around each key
-/// and each value, the colon in every entry and the comma between entries.
-fn json_punctuation(pairs: usize) -> usize {
-    2 + pairs * 5 + pairs.saturating_sub(1)
-}
-
-/// The size the documented `attributes` bound is measured on: the bytes the map occupies
-/// as JSON, which is the form the request carried it in.
-fn json_size(map: &BTreeMap<String, String>) -> usize {
-    serde_json::to_string(map)
-        .expect("a map of strings serializes")
-        .len()
-}
-
 /// RULE 3 on the 1 KB `attributes` budget: the measure is the map's JSON encoding, and a
 /// map past it is refused in the member-constraint envelope naming `attributes` and the
 /// size that was measured.
@@ -808,10 +792,7 @@ async fn the_attributes_budget_is_measured_on_the_json_encoding() {
                 "case {case:?}: the admitted map must be reported unchanged, got {reported:?}"
             );
         } else {
-            let expected = member_constraint(
-                "attributes",
-                &format!("attributes is required to have a maximum size of 1 KB, found {size} bytes"),
-            );
+            let expected = oversized_message("attributes", size);
             assert_eq!(
                 (reply.status, reply.code.as_str(), reply.message.as_str()),
                 (400, VALIDATION_CODE, expected.as_str()),

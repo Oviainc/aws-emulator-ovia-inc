@@ -35,11 +35,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_ivsrealtime_amazoninteractivevideoservicerealtime::EmulatedService;
 
-/// The documented maximum total size of an `attributes` map. The model states it on
-/// `StartParticipantReplicationRequest$attributes` and on the field that reports the
-/// composed map, `Participant$attributes`: "The maximum length of this field is 1 KB
-/// total."
-const MAX_ATTRIBUTES_BYTES: usize = 1024;
+use crate::attributes_measure::{json_size, oversized_message, raw_total, MAX_ATTRIBUTES_BYTES};
 
 /// The operation whose composition this suite bounds.
 const OPERATION: &str = "StartParticipantReplication";
@@ -241,29 +237,6 @@ fn pair(key: &str, value_bytes: usize) -> BTreeMap<String, String> {
     BTreeMap::from([(key.to_string(), "v".repeat(value_bytes))])
 }
 
-/// The size the rule measures: the bytes the map occupies as JSON — the braces, the
-/// quoted keys, the colons, the commas and the quoted values — which is the form every
-/// request carries one in.
-fn size_of(map: &BTreeMap<String, String>) -> usize {
-    serde_json::to_string(map)
-        .expect("a map of strings serializes")
-        .len()
-}
-
-/// The JSON punctuation a map of `pairs` entries carries, which the measured size counts
-/// beside the keys and values themselves: the two braces, the two quotes around each key
-/// and each value, the colon in every entry and the comma between entries.
-fn json_punctuation(pairs: usize) -> usize {
-    2 + pairs * 5 + pairs.saturating_sub(1)
-}
-
-/// The keys-and-values total a map of `pairs` entries needs for its JSON encoding to be
-/// exactly `json_total` bytes — how a row below lands a COMPOSITION of several entries on
-/// the bound.
-fn raw_total(pairs: usize, json_total: usize) -> usize {
-    json_total - json_punctuation(pairs)
-}
-
 /// The map `StartParticipantReplication` stores: the participant's own attributes with the
 /// request's merged over them, an overlapping key taking the request's value.
 fn composed(
@@ -273,14 +246,6 @@ fn composed(
     let mut merged = token.clone();
     merged.extend(requested.iter().map(|(k, v)| (k.clone(), v.clone())));
     merged
-}
-
-/// The sentence this service states the bound with, for the composed size.
-fn expected_message(size: usize) -> String {
-    format!(
-        "Request member: attributes failed to satisfy the constraints: attributes is \
-         required to have a maximum size of 1 KB, found {size} bytes"
-    )
 }
 
 /// One row of the class: the attributes the publisher's token carries and the attributes
@@ -401,7 +366,7 @@ async fn the_composed_replica_attributes_are_bounded_and_reported() {
         let case = row.case;
         let requested = row.requested.clone().unwrap_or_default();
         let merged = composed(&row.token, &requested);
-        let merged_size = size_of(&merged);
+        let merged_size = json_size(&merged);
 
         // Fresh stages per row: a replication this store already holds is a conflict,
         // which would answer about something other than the bound.
@@ -443,7 +408,7 @@ async fn the_composed_replica_attributes_are_bounded_and_reported() {
                 "case {case:?}: expected the replica to report the composed attributes \
                  {merged:?}, got {reported:?}"
             );
-            let reported_size = size_of(&reported);
+            let reported_size = json_size(&reported);
             assert!(
                 reported_size <= MAX_ATTRIBUTES_BYTES,
                 "case {case:?}: expected the reported attributes within \
@@ -461,7 +426,7 @@ async fn the_composed_replica_attributes_are_bounded_and_reported() {
                 "case {case:?}: expected ValidationException, got {response}"
             );
             let stated = member(&response, "message");
-            let expected = expected_message(merged_size);
+            let expected = oversized_message("attributes", merged_size);
             assert_eq!(
                 stated, expected,
                 "case {case:?}: expected the stated bound {expected:?}, got {stated:?}"
@@ -538,7 +503,7 @@ async fn the_same_total_is_refused_as_one_map_elsewhere() {
     let stage_arn = emulator.stage(case, "one-map").await;
     let mut one_map = attributes("t", 2, 600);
     one_map.extend(attributes("r", 2, 600));
-    let size = size_of(&one_map);
+    let size = json_size(&one_map);
 
     let probes: Vec<(&str, Value)> = vec![
         (
@@ -563,7 +528,7 @@ async fn the_same_total_is_refused_as_one_map_elsewhere() {
             "case {case:?}: {operation} must answer ValidationException, got {response}"
         );
         let stated = member(&response, "message");
-        let expected = expected_message(size);
+        let expected = oversized_message("attributes", size);
         assert_eq!(
             stated, expected,
             "case {case:?}: {operation} must state {expected:?}, got {stated:?}"

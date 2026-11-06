@@ -494,10 +494,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
             Self::Stated(e) => e.modeled.query_error_code(),
-            // Same reason: the synthetic shape carries no `awsQueryError` trait.
-            Self::Unmodeled(_) => None,
-            // Same reason: the synthetic shape carries no `awsQueryError` trait.
-            Self::ValidationException(_) => None,
+            // Same reason as the scaffold signal: neither synthetic shape carries an
+            // `awsQueryError` trait.
+            Self::Unmodeled(_) | Self::ValidationException(_) => None,
         }
     }
 }

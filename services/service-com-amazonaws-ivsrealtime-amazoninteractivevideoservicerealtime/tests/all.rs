@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/at_most_one_member_sets.rs"]
 mod at_most_one_member_sets;
+#[path = "all/attributes_measure.rs"]
+mod attributes_measure;
 #[path = "all/attributes_size_limit.rs"]
 mod attributes_size_limit;
 #[path = "all/aws_refusal_vocabulary.rs"]

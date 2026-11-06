@@ -24,18 +24,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_ivsrealtime_amazoninteractivevideoservicerealtime::EmulatedService;
 
-/// The documented maximum total size of an `attributes` map. The model states it on
-/// `CreateParticipantTokenRequest$attributes`, `ParticipantTokenConfiguration$attributes`,
-/// `CreateIngestConfigurationRequest$attributes` and
-/// `StartParticipantReplicationRequest$attributes`, each "The maximum length of this field
-/// is 1 KB total."
-/// (`smithy_query(query="doc",shape="CreateParticipantTokenRequest",member="attributes")`).
-const MAX_ATTRIBUTES_BYTES: usize = 1024;
-
-/// How the refusal SPELLS that maximum: the model states the bound in kilobytes ("The
-/// maximum length of this field is 1 KB total."), and the refusal quotes it in those
-/// words.
-const MAX_ATTRIBUTES_SIZE_LABEL: &str = "1 KB";
+use crate::attributes_measure::{json_size, oversized_message, raw_total, MAX_ATTRIBUTES_BYTES};
 
 /// The capability that makes a participant a publisher, from
 /// `smithy_query(query="shape",shape="ParticipantTokenCapability")` — the one
@@ -144,18 +133,11 @@ fn pairs_of(shape: Shape) -> usize {
     }
 }
 
-/// The JSON punctuation a map of `pairs` entries carries, which the measured size counts
-/// beside the keys and values themselves: the two braces, the two quotes around each key
-/// and each value, the colon in every entry and the comma between entries.
-fn json_punctuation(pairs: usize) -> usize {
-    2 + pairs * 5 + pairs.saturating_sub(1)
-}
-
-/// An `attributes` map of `shape` whose JSON encoding is exactly `total` bytes — keys,
-/// values and the punctuation around them. Nothing in these maps needs escaping, so the
-/// keys and values carry `total` minus that punctuation.
+/// An `attributes` map of `shape` whose JSON encoding is exactly `total` bytes: the keys
+/// and values carry `total` minus the punctuation `raw_total`
+/// (`crate::attributes_measure`) accounts for, since nothing in these maps needs escaping.
 fn attributes(shape: Shape, total: usize) -> BTreeMap<String, String> {
-    let total = total - json_punctuation(pairs_of(shape));
+    let total = raw_total(pairs_of(shape), total);
     let mut map = BTreeMap::new();
     match shape {
         Shape::OneLongValue => {
@@ -193,24 +175,6 @@ fn attributes(shape: Shape, total: usize) -> BTreeMap<String, String> {
         }
     }
     map
-}
-
-/// The size the rule measures: the bytes the map occupies as JSON — the braces, the
-/// quoted keys, the colons, the commas and the quoted values — which is the form every
-/// request carries one in.
-fn size_of(map: &BTreeMap<String, String>) -> usize {
-    serde_json::to_string(map)
-        .expect("a map of strings serializes")
-        .len()
-}
-
-/// The sentence this service states the bound with, for the dotted `member` path the map
-/// arrived in and the size it measured.
-fn expected_message(member: &str, size: usize) -> String {
-    format!(
-        "Request member: {member} failed to satisfy the constraints: {member} is required \
-         to have a maximum size of {MAX_ATTRIBUTES_SIZE_LABEL}, found {size} bytes"
-    )
 }
 
 /// Assert one call's verdict against the rule: accepted under the bound, and refused past
@@ -251,7 +215,7 @@ fn expectation(member: &str, size: usize) -> Expectation {
     if size <= MAX_ATTRIBUTES_BYTES {
         Expectation::Accepted
     } else {
-        Expectation::Refused(expected_message(member, size))
+        Expectation::Refused(oversized_message(member, size))
     }
 }
 
@@ -289,7 +253,7 @@ async fn create_participant_token_bounds_its_attributes_map() {
     for shape in shapes() {
         for total in totals() {
             let map = attributes(shape, total);
-            let size = size_of(&map);
+            let size = json_size(&map);
             let case = format!("CreateParticipantToken, {shape:?} of {size} bytes");
             let (status, response) = emulator
                 .call(
@@ -327,7 +291,7 @@ async fn create_stage_bounds_each_participant_token_configuration() {
             // path the refusal names is exercised beyond the first entry.
             for position in [1usize, 3] {
                 let map = attributes(shape, total);
-                let size = size_of(&map);
+                let size = json_size(&map);
                 let case =
                     format!("CreateStage, {shape:?} of {size} bytes at entry {position}");
                 let mut configurations: Vec<Value> = Vec::new();
@@ -381,7 +345,7 @@ async fn create_ingest_configuration_bounds_its_attributes_map() {
     for shape in shapes() {
         for total in totals() {
             let map = attributes(shape, total);
-            let size = size_of(&map);
+            let size = json_size(&map);
             let case = format!("CreateIngestConfiguration, {shape:?} of {size} bytes");
             let (status, response) = emulator
                 .call(
@@ -419,7 +383,7 @@ async fn start_participant_replication_bounds_its_attributes_map() {
     for shape in shapes() {
         for total in totals() {
             let map = attributes(shape, total);
-            let size = size_of(&map);
+            let size = json_size(&map);
             let case = format!("StartParticipantReplication, {shape:?} of {size} bytes");
             // A fresh publisher per row: a replication this store already holds is a
             // conflict, which would answer about something other than the bound.

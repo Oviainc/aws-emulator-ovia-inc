@@ -39,6 +39,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_ivsrealtime_amazoninteractivevideoservicerealtime::EmulatedService;
 
+use crate::attributes_measure::{oversized_message, MAX_ATTRIBUTES_BYTES};
+
 /// The account id every ARN this emulator mints carries (`engine::emulator_account_id`),
 /// and so the account every ARN built by hand here carries too.
 const ACCOUNT: &str = "000000000000";
@@ -60,11 +62,6 @@ const REPLICATION_STATES: [&str; 2] = ["ACTIVE", "STOPPED"];
 /// `StartParticipantReplicationRequest$reconnectWindowSeconds` doc ("replication will
 /// continue to be `ACTIVE`").
 const STARTED_REPLICATION_STATE: &str = "ACTIVE";
-
-/// The documented maximum size of an `attributes` map, from
-/// `StartParticipantReplicationRequest$attributes`: "The maximum length of this field is
-/// 1 KB total."
-const MAX_ATTRIBUTES_BYTES: usize = 1024;
 
 /// `ReconnectWindowSeconds`' modelled `@range`, from
 /// `smithy_query(query="operation",operation="StartParticipantReplication")`: `0..300`.
@@ -846,11 +843,7 @@ async fn a_start_this_store_cannot_honour_is_refused_as_modelled() {
             }),
             status: 400,
             code: "ValidationException",
-            message: Some(format!(
-                "Request member: attributes failed to satisfy the constraints: attributes \
-                 is required to have a maximum size of 1 KB, found {} bytes",
-                MAX_ATTRIBUTES_BYTES + 1
-            )),
+            message: Some(oversized_message("attributes", MAX_ATTRIBUTES_BYTES + 1)),
         },
         RefusalCase {
             case: "a reconnect window one second past the modelled maximum",

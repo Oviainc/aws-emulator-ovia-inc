@@ -37,6 +37,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_ivsrealtime_amazoninteractivevideoservicerealtime::EmulatedService;
 
+use crate::attributes_measure::MAX_ATTRIBUTES_BYTES;
+
 /// The account id every ARN this emulator mints carries (`engine::emulator_account_id`),
 /// and so the account every ARN built by hand here carries too.
 const ACCOUNT: &str = "000000000000";
@@ -61,11 +63,6 @@ const INGEST_CONFIGURATION_ARN_MAX_LENGTH: usize = 128;
 /// to the stage associated with the ingest configuration"). Nothing publishes to an
 /// emulated stage.
 const NO_PUBLISHER_STATE: &str = "INACTIVE";
-
-/// The documented maximum size of an `attributes` map, from
-/// `CreateIngestConfigurationRequest$attributes`: "The maximum length of this field is
-/// 1 KB total."
-const MAX_ATTRIBUTES_BYTES: usize = 1024;
 
 /// The values `IngestProtocol` accepts, from
 /// `smithy_query(query="shape",shape="IngestProtocol")`.
