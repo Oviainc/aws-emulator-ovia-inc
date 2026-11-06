@@ -242,25 +242,14 @@ impl User {
         }
     }
 
-    /// The attributes of this user that `names` asks for, matched case
-    /// insensitively and reported under the names they are stored as.
-    ///
-    /// `None` when nothing was asked for or nothing asked for is held: `Attributes`
-    /// is modelled `@length(min: 1, max: 25)`, so an empty map is not a value this
-    /// member can carry.
+    /// The attributes of this user that `names` asks for. See
+    /// [`project_attributes`], which is the one projection rule every object's
+    /// `OtherAttributes` is reported through.
     pub fn projected_attributes(
         &self,
         names: Option<&[String]>,
     ) -> Option<HashMap<String, AttributeValue>> {
-        let names = names?;
-        let wanted: BTreeSet<String> = names.iter().map(|name| fold(name)).collect();
-        let projected: HashMap<String, AttributeValue> = self
-            .other_attributes
-            .iter()
-            .filter(|(name, _)| wanted.contains(&fold(name)))
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
-        (!projected.is_empty()).then_some(projected)
+        project_attributes(&self.other_attributes, names)
     }
 }
 
@@ -289,7 +278,39 @@ impl Group {
             group_scope: self.group_scope.clone(),
         }
     }
+
+    /// The attributes of this group that `names` asks for. See
+    /// [`project_attributes`], which is the one projection rule every object's
+    /// `OtherAttributes` is reported through.
+    pub fn projected_attributes(
+        &self,
+        names: Option<&[String]>,
+    ) -> Option<HashMap<String, AttributeValue>> {
+        project_attributes(&self.other_attributes, names)
+    }
 }
+
+/// The attributes of a stored object that `names` asks for, matched case
+/// insensitively (AD attribute names are case insensitive) and reported under the
+/// names they are stored as.
+///
+/// `None` when nothing was asked for or nothing asked for is held: `Attributes` is
+/// modelled `@length(min: 1, max: 25)`, so an empty map is not a value that member
+/// can carry.
+pub fn project_attributes(
+    stored: &BTreeMap<String, AttributeValue>,
+    names: Option<&[String]>,
+) -> Option<HashMap<String, AttributeValue>> {
+    let names = names?;
+    let wanted: BTreeSet<String> = names.iter().map(|name| fold(name)).collect();
+    let projected: HashMap<String, AttributeValue> = stored
+        .iter()
+        .filter(|(name, _)| wanted.contains(&fold(name)))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    (!projected.is_empty()).then_some(projected)
+}
+
 
 /// One member of a group: which object is in it, and what kind of object that is.
 ///
