@@ -7,12 +7,13 @@
 //! The rule under test: the application-provider catalogue is AWS's own data (the modelled
 //! `ApplicationProviderArn` pins the owner segment to the literal `aws` and no operation
 //! of this service creates, updates or deletes an entry), so an enumeration of it reports
-//! the entries in the CATALOGUE'S OWN order — the read imposes no order of its own — and a
-//! caller that names no `MaxResults` asked for no page size, so it is answered with ONE
-//! page holding every entry and no `NextToken`. A client therefore resolves any provider,
-//! including the generic customer-managed OAuth 2.0 one `CreateApplication` accepts, from
-//! a single unparameterised call, and the application it then creates round-trips through
-//! `DescribeApplication`.
+//! the entries in the CATALOGUE'S OWN order — the read imposes no order of its own — one
+//! PAGE at a time: at most the caller's `MaxResults`, or this service's default page size
+//! when the caller named none, with a `NextToken` whenever entries remain. A client
+//! therefore resolves a provider the first page carries, including the generic
+//! customer-managed OAuth 2.0 one `CreateApplication` accepts (the catalogue's first
+//! entry), from a single unparameterised call, and the application it then creates
+//! round-trips through `DescribeApplication`.
 //!
 //! `application_providers.rs` owns the catalogue's per-entry projection and its paging over
 //! every `MaxResults` the model admits; this suite is the one that spans resolving from a
@@ -37,6 +38,10 @@ use crate::ssoadmin_permission_sets::{call, error_code, router, seeded_instance_
 /// (`smithy_query(query="operation", operation="ListApplicationProviders")`).
 const MAX_RESULTS_MIN: i64 = 1;
 const MAX_RESULTS_MAX: i64 = 100;
+
+/// The page size an enumeration that names no `MaxResults` is served with: this service's
+/// own default, the one every paginated read of this crate applies.
+const DEFAULT_PAGE_SIZE: i64 = state::MAX_PAGE_SIZE as i64;
 
 /// The provider ARN of the generic customer-managed OAuth 2.0 application provider: the
 /// one provider `CreateApplication` accepts ("creates an OAuth 2.0 customer managed
@@ -65,15 +70,15 @@ fn page_arns(body: &Value) -> Vec<String> {
         .collect()
 }
 
-/// RULE — ONE call that names no `MaxResults` carries the WHOLE catalogue, in the
-/// catalogue's own order, with no `NextToken`.
+/// RULE — ONE call that names no `MaxResults` carries the catalogue's FIRST PAGE, in the
+/// catalogue's own order, with a `NextToken` whenever entries remain beyond it.
 ///
-/// The table is every entry of the catalogue: both published id forms (an AWS managed
+/// The table is every entry of that page: both published id forms (an AWS managed
 /// provider under its service slug and a pre-integrated application under
 /// `catalog/<Name>`), the entry the recorded cases resolve (`custom`) and the entries they
 /// never name.
 #[tokio::test]
-async fn one_unparameterised_call_reports_the_whole_catalogue_in_one_page() {
+async fn one_unparameterised_call_reports_the_catalogues_first_page() {
     let router = router();
     let (status, body) = list(&router, &json!({})).await;
     assert_eq!(
@@ -81,32 +86,44 @@ async fn one_unparameterised_call_reports_the_whole_catalogue_in_one_page() {
         "ListApplicationProviders expected 200, got {status} {body}"
     );
 
+    let catalogue = catalogue_arns();
+    let expected: Vec<String> = catalogue
+        .iter()
+        .take(DEFAULT_PAGE_SIZE as usize)
+        .cloned()
+        .collect();
     let reported = page_arns(&body);
     assert_eq!(
-        reported,
-        catalogue_arns(),
-        "one call with no MaxResults must report the whole catalogue in its own order, got \
-         {} of {} entries",
+        reported, expected,
+        "one call with no MaxResults must report the catalogue's first {DEFAULT_PAGE_SIZE} \
+         entries in its own order, got {} of {} entries",
         reported.len(),
-        state::BUILT_IN_APPLICATION_PROVIDERS.len()
+        catalogue.len()
     );
-    assert_eq!(
-        body["NextToken"],
-        Value::Null,
-        "a page that holds the whole catalogue leaves nothing to resume, got {body}"
-    );
-
-    // Every entry of the catalogue is on that one page — the generic customer-managed
-    // OAuth 2.0 provider among them, which is what a resolve-then-create client needs.
-    for arn in catalogue_arns() {
+    if catalogue.len() > expected.len() {
         assert!(
-            reported.contains(&arn),
-            "case {arn:?}: the single unparameterised page must carry every catalogue entry"
+            body["NextToken"].as_str().is_some_and(|token| !token.is_empty()),
+            "entries remain beyond the first page, so it must carry a NextToken, got {body}"
+        );
+    } else {
+        assert_eq!(
+            body["NextToken"],
+            Value::Null,
+            "a page that holds the whole catalogue leaves nothing to resume, got {body}"
+        );
+    }
+
+    // Every entry of that page is reported once — the generic customer-managed OAuth 2.0
+    // provider among them, which is what a resolve-then-create client needs.
+    for arn in &expected {
+        assert!(
+            reported.contains(arn),
+            "case {arn:?}: the first unparameterised page must carry this catalogue entry"
         );
     }
     assert!(
         reported.iter().any(|arn| arn == CUSTOM_PROVIDER_ARN),
-        "the single unparameterised page must carry {CUSTOM_PROVIDER_ARN}, the only \
+        "the first unparameterised page must carry {CUSTOM_PROVIDER_ARN}, the only \
          provider CreateApplication accepts, got {} entries",
         reported.len()
     );
@@ -197,7 +214,7 @@ async fn the_first_page_is_the_catalogues_first_entries_for_every_page_size() {
         let reported = page_arns(&body);
         let expected: Vec<String> = catalogue
             .iter()
-            .take(size.unwrap_or(catalogue.len() as i64) as usize)
+            .take(size.unwrap_or(DEFAULT_PAGE_SIZE) as usize)
             .cloned()
             .collect();
         assert_eq!(

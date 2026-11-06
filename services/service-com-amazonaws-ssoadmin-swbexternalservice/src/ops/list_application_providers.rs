@@ -11,9 +11,9 @@
 //! service models no operation that creates, updates or deletes one, so the catalog is
 //! fixed and this handler writes nothing. Reported in the catalog's OWN order — the order
 //! of a service-published catalog is the service's data, not something this read imposes
-//! — in ONE page holding every entry when the caller named no `MaxResults`, and otherwise
-//! paged by it with a `NextToken` that resumes from the entry the previous page ended on,
-//! absent on the last page.
+//! — one PAGE at a time: at most the caller's `MaxResults`, or this service's default page
+//! size when the caller named none, with a `NextToken` that resumes from the entry the
+//! previous page ended on reported whenever entries remain and absent on the last page.
 //!
 //! ## Shape of an operation
 //!
@@ -190,9 +190,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .map(|provider| (provider.arn(), provider.to_shape()));
 
-        // A caller that named no `MaxResults` asked for no page size, so the whole
-        // catalog comes back in one page; a cursor whose entry the catalog no longer
-        // holds is the same bad request as a cursor of another enumeration.
+        // Paged like every other enumeration of this service: at most the caller's
+        // `MaxResults`, and at most the default page size when the caller named none, with
+        // the continuation token the remaining entries are reached through. A cursor whose
+        // entry the catalog no longer holds is the same bad request as a cursor of another
+        // enumeration.
         let (application_providers, next_token) = crate::state::page_in_published_order(
             crate::state::CURSOR_APPLICATION_PROVIDERS,
             catalog,

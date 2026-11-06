@@ -103,6 +103,8 @@ mod customer_managed_policy_reference_order;
 mod customer_managed_policy_references;
 #[path = "all/discovered_instance_surface.rs"]
 mod discovered_instance_surface;
+#[path = "all/enumeration_default_page_size.rs"]
+mod enumeration_default_page_size;
 #[path = "all/inline_policy.rs"]
 mod inline_policy;
 #[path = "all/inline_policy_delete.rs"]

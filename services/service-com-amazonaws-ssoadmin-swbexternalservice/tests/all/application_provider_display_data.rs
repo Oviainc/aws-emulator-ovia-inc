@@ -75,23 +75,40 @@ async fn describe(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
     .await
 }
 
-/// Every entry `ListApplicationProviders` reports in the single page a call that names no
-/// `MaxResults` is answered with.
+/// Every entry `ListApplicationProviders` reports, read by paging the enumeration to its
+/// end: a response carries at most one page, so the whole catalog is reached by following
+/// the `NextToken` until it is absent.
 async fn list_all(router: &MultiServiceRouter) -> Vec<Value> {
-    let (status, body) = call(router, "ListApplicationProviders", &json!({})).await;
-    assert_eq!(
-        status, 200,
-        "ListApplicationProviders expected 200, got {status} {body}"
-    );
-    assert!(
-        body["NextToken"].is_null(),
-        "a call that names no MaxResults must answer the whole catalog in one page, got a \
-         NextToken: {body}"
-    );
-    body["ApplicationProviders"]
-        .as_array()
-        .unwrap_or_else(|| panic!("no ApplicationProviders in {body}"))
-        .clone()
+    let mut entries: Vec<Value> = Vec::new();
+    let mut next_token: Option<String> = None;
+    loop {
+        let mut request = json!({});
+        if let Some(token) = next_token.as_deref() {
+            request["NextToken"] = json!(token);
+        }
+        let (status, body) = call(router, "ListApplicationProviders", &request).await;
+        assert_eq!(
+            status, 200,
+            "ListApplicationProviders expected 200, got {status} {body}"
+        );
+        entries.extend(
+            body["ApplicationProviders"]
+                .as_array()
+                .unwrap_or_else(|| panic!("no ApplicationProviders in {body}"))
+                .iter()
+                .cloned(),
+        );
+        assert!(
+            entries.len() <= state::BUILT_IN_APPLICATION_PROVIDERS.len(),
+            "paging must not report more than the catalog, got {} entries",
+            entries.len()
+        );
+        match body["NextToken"].as_str() {
+            Some(token) => next_token = Some(token.to_string()),
+            None => break,
+        }
+    }
+    entries
 }
 
 /// RULE 1 — a provider's `Description` is its `DisplayName` as an application, and its

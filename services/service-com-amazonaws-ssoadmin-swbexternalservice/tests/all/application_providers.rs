@@ -12,12 +12,12 @@
 //! CATALOGUE'S OWN order (the order of a service-published catalogue is the service's
 //! data, not something this read imposes), every entry carrying the COMPLETE `DisplayData`
 //! the shape declares (`DisplayName`, `Description` and an `https` `IconUrl`) and a
-//! `ResourceServerConfig` exactly when the entry publishes access scopes. A caller that
-//! names no `MaxResults` asked for no page size, so the whole catalogue comes back in ONE
-//! page; any `MaxResults` the model's `range(1..100)` admits pages it, with a `NextToken`
-//! reported whenever entries remain and ABSENT on the last page. A `NextToken` this
-//! enumeration did not issue is refused with the modelled `ValidationException` (400),
-//! and it writes nothing.
+//! `ResourceServerConfig` exactly when the entry publishes access scopes. The enumeration
+//! is PAGED: a response carries at most the effective page size — the caller's
+//! `MaxResults` when it named one, this service's default page size
+//! ([`state::MAX_PAGE_SIZE`]) when it named none — with a `NextToken` reported whenever
+//! entries remain and ABSENT on the last page. A `NextToken` this enumeration did not
+//! issue is refused with the modelled `ValidationException` (400), and it writes nothing.
 //!
 //! The tables span what the rule generalises over: the page size (both published bounds,
 //! one past each bound, sizes that divide the catalogue and sizes that do not, and the
@@ -25,6 +25,7 @@
 //! crate so the test tracks it rather than restating it — `custom` and
 //! `catalog/Statuspage` are the entries the recorded cases cite, the rest are entries
 //! they do not), and the ways a cursor can be foreign.
+//! `enumeration_default_page_size.rs` owns the default page size itself.
 //!
 //! Every call goes through `MultiServiceRouter::dispatch`, so the modelled constraints
 //! and the `X-Amz-Target` routing are exercised rather than bypassed. The harness is the
@@ -40,6 +41,10 @@ use crate::ssoadmin_permission_sets::{call, error_code, router, seeded_instance_
 /// (`smithy_query(query="operation", operation="ListApplicationProviders")`).
 const MAX_RESULTS_MIN: i64 = 1;
 const MAX_RESULTS_MAX: i64 = 100;
+
+/// The page size an enumeration that names no `MaxResults` is served with: this service's
+/// own default, the one every paginated read of this crate applies.
+const DEFAULT_PAGE_SIZE: i64 = state::MAX_PAGE_SIZE as i64;
 
 /// Whether `arn` has the shape the model's `ApplicationProviderArn` pattern requires:
 /// `^arn:aws(-[a-z]{1,5}){0,3}:sso::aws:applicationProvider/[a-zA-Z0-9-/]+$`, length
@@ -107,8 +112,8 @@ fn arns(providers: &[Value]) -> Vec<String> {
 }
 
 /// Every entry of the catalogue, read by paging the enumeration to its end with
-/// `max_results` per page (or in the single page a call that names no `MaxResults` is
-/// answered with), plus the number of pages it took.
+/// `max_results` per page (or with this service's default page size when the caller names
+/// none), plus the number of pages it took.
 async fn enumerate(
     router: &MultiServiceRouter,
     max_results: Option<i64>,
@@ -134,13 +139,12 @@ async fn enumerate(
             .as_array()
             .unwrap_or_else(|| panic!("case {case:?}: no ApplicationProviders in {body}"))
             .clone();
-        if let Some(limit) = max_results.map(|size| size as usize) {
-            assert!(
-                page.len() <= limit,
-                "case {case:?}: a page holds at most {limit} providers, got {} in {body}",
-                page.len()
-            );
-        }
+        let limit = max_results.unwrap_or(DEFAULT_PAGE_SIZE) as usize;
+        assert!(
+            page.len() <= limit,
+            "case {case:?}: a page holds at most {limit} providers, got {} in {body}",
+            page.len()
+        );
         entries.extend(page.iter().cloned());
         pages += 1;
         assert!(
@@ -154,12 +158,6 @@ async fn enumerate(
                     "case {case:?}: NextToken must satisfy the modelled Token pattern, \
                      got {token:?}"
                 );
-                let limit = max_results.unwrap_or_else(|| {
-                    panic!(
-                        "case {case:?}: a call that names no MaxResults must answer the \
-                         whole catalogue in one page, got a NextToken: {body}"
-                    )
-                }) as usize;
                 assert_eq!(
                     page.len(),
                     limit,
@@ -175,8 +173,9 @@ async fn enumerate(
     (entries, pages)
 }
 
-/// RULE — a single call that names no `MaxResults` reports exactly the catalogue, once
-/// per entry, in the catalogue's own order, in ONE page.
+/// RULE — paging the enumeration a caller that names no `MaxResults` drives reports
+/// exactly the catalogue, once per entry, in the catalogue's own order, in pages of this
+/// service's default size.
 #[tokio::test]
 async fn the_whole_catalogue_is_reported_once_per_entry_in_catalogue_order() {
     let router = router();
@@ -189,10 +188,11 @@ async fn the_whole_catalogue_is_reported_once_per_entry_in_catalogue_order() {
          got {} entries",
         reported.len()
     );
+    let expected_pages = reported.len().div_ceil(DEFAULT_PAGE_SIZE as usize);
     assert_eq!(
-        pages, 1,
-        "a call that names no MaxResults must answer the whole catalogue in one page, got \
-         {pages} pages for {} entries",
+        pages, expected_pages,
+        "a call that names no MaxResults is served pages of {DEFAULT_PAGE_SIZE}, so {} \
+         entries take {expected_pages} page(s), got {pages}",
         reported.len()
     );
 }
