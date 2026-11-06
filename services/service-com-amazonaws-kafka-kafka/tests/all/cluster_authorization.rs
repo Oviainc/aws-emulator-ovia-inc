@@ -206,6 +206,12 @@ fn cluster_calls() -> Vec<ClusterCall> {
             None,
         ),
         ClusterCall::control("ListClusterOperations", "GET", "/operations", None),
+        ClusterCall::control(
+            "RebootBroker",
+            "PUT",
+            "/reboot-broker",
+            Some(json!({ "brokerIds": ["1"] })),
+        ),
         ClusterCall::control("CreateChannel", "POST", "/channels", Some(channel_body())),
         ClusterCall::control(
             "DescribeChannel",

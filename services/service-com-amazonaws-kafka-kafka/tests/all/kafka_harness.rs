@@ -31,10 +31,22 @@ pub const REGION: &str = "us-west-2";
 /// The account id every generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`).
 pub const ACCOUNT: &str = "000000000000";
 
+/// The access key id the calls below sign with unless a suite names another.
+///
+/// It names no session and no IAM user, so a request carrying it speaks for the
+/// account's own published credential — the caller every suite but an
+/// authorization one drives the service as.
+pub const DEFAULT_ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
+
 /// The kafka service mounted in a router, driven over HTTP exactly as the emulator
 /// serves it.
 pub struct Emulator {
     router: MultiServiceRouter,
+    /// The engine the service was mounted on, so a suite whose rule is about state
+    /// another service OWNS (the IAM policies of the calling principal, the STS
+    /// session its credential names) can write that state through that service's own
+    /// store, as the handlers read it.
+    pub engine: Arc<engine::InMemoryEngine>,
 }
 
 /// One HTTP answer, parsed.
@@ -76,9 +88,9 @@ impl Emulator {
         // but they are not signed.
         router.set_request_authentication(false);
         router.register_service(service_com_amazonaws_kafka_kafka::EmulatedService::new(
-            engine,
+            Arc::clone(&engine),
         ));
-        Self { router }
+        Self { router, engine }
     }
 
     pub async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
@@ -89,6 +101,20 @@ impl Emulator {
     /// the ARNs and endpoints of anything it creates.
     pub async fn call_in(
         &self,
+        region: &str,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> Reply {
+        self.call_as_in(DEFAULT_ACCESS_KEY_ID, region, method, uri, body)
+            .await
+    }
+
+    /// The same call, signed for `region` with `access_key_id` — the credential
+    /// whose principal the service authorizes the request as.
+    pub async fn call_as_in(
+        &self,
+        access_key_id: &str,
         region: &str,
         method: &str,
         uri: &str,
@@ -105,7 +131,7 @@ impl Emulator {
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{region}/kafka/aws4_request, \
+                    "AWS4-HMAC-SHA256 Credential={access_key_id}/20240101/{region}/kafka/aws4_request, \
                      SignedHeaders=host, Signature=0123456789abcdef"
                 ),
             )

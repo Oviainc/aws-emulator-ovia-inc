@@ -146,6 +146,12 @@ pub mod network;
 /// reads is held here.
 pub mod authorization;
 
+/// What the CALLING PRINCIPAL's own identity-based policies say about the action a
+/// request asks for, decided before anything the request names is resolved. It
+/// reads the IAM and STS stores for the principal the credential speaks for, which
+/// is held by those services rather than here, so it sits beside this module too.
+pub mod identity_authorization;
+
 /// The preconditions Amazon MSK checks on the TARGET CLUSTER before it manages a
 /// VPC connection to it: the cluster's state, and the client authentication the
 /// connection asks for. Each is a function of one cluster record and the request,
@@ -258,6 +264,14 @@ pub const OPERATION_TYPE_UPDATE_SECURITY: &str = "UPDATE_SECURITY";
 /// The `OperationType` an `UpdateMonitoring` call records, in the same form.
 pub const OPERATION_TYPE_UPDATE_MONITORING: &str = "UPDATE_MONITORING";
 
+/// The `OperationType` a `RebootBroker` call records.
+///
+/// A reboot acts on a NODE of the cluster rather than on one of its settings —
+/// `RebootBrokerRequest`'s own documentation is "Reboots a node." — which is the
+/// operation type Amazon MSK files such a call under, in the same
+/// SCREAMING_SNAKE_CASE form as the update types above.
+pub const OPERATION_TYPE_REBOOT_NODE: &str = "REBOOT_NODE";
+
 /// The state MSK reports for a cluster operation that is still running.
 pub const OPERATION_STATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
 
@@ -322,9 +336,12 @@ pub fn cluster_has_broker_nodes(state: &str) -> bool {
 /// How long a cluster update (`UpdateConnectivity`, `UpdateStorage`,
 /// `UpdateBrokerStorage` and the
 /// sibling update operations) stays in flight before the cluster leaves
-/// `UPDATING`.
+/// `UPDATING` — and equally how long a `RebootBroker` stays in flight before the
+/// cluster leaves `REBOOTING_BROKER`, since both are one cluster operation of the
+/// same registry.
 ///
-/// CHOSEN, not documented: the real service reconfigures brokers over minutes.
+/// CHOSEN, not documented: the real service reconfigures or restarts brokers over
+/// minutes.
 /// The project fixes an emulated clock-owed transition at 250–750 ms, so a caller
 /// that describes the cluster immediately still observes `UPDATING`, its active
 /// operation ARN and the pre-update configuration, while a caller that waits sees
@@ -1099,6 +1116,13 @@ pub fn nodes_unavailable_message(state: &str) -> String {
     format!("You can't list nodes for a cluster in {state} state.")
 }
 
+/// The same refusal, for a broker REBOOT: a cluster the service is still
+/// provisioning, updating, rebooting or deleting has no settled brokers to
+/// restart. The subject is this call's own; the form is the family's.
+pub fn brokers_not_rebootable_message(state: &str) -> String {
+    format!("You can't reboot brokers for a cluster in {state} state.")
+}
+
 /// The input member every replicator operation resolves its target through, named
 /// as the wire carries it — what the refusals of those operations report as the
 /// parameter at fault.
@@ -1306,6 +1330,14 @@ pub struct Cluster {
     /// acting on it, and the change the clock owes it. `Some` is exactly what
     /// makes the cluster `UPDATING` with an active operation ARN.
     pub pending_update: Option<PendingUpdate>,
+    /// How many reboot operations have been filed on this cluster.
+    ///
+    /// A reboot generates no new cluster version
+    /// ([`ClusterChange::generates_new_version`]), so [`Self::revision`] cannot
+    /// identify the operation one files: this counter is what a reboot operation's
+    /// ARN is minted from, so two reboots of one cluster name two operations and
+    /// neither can collide with an update's.
+    pub reboots: u64,
     /// The serverless configuration, for a record whose [`Self::cluster_type`] is
     /// [`CLUSTER_TYPE_SERVERLESS`]; `None` for a provisioned cluster. It is what
     /// the `Cluster` shape's `Serverless` member is derived from, so the per-kind
@@ -1448,6 +1480,41 @@ pub enum ClusterChange {
         open_monitoring: Option<OpenMonitoringInfo>,
         logging_info: Option<LoggingInfo>,
     },
+    /// `RebootBroker`: the broker nodes the request named are restarted. It
+    /// carries no attribute, because a reboot changes none: the nodes come back
+    /// under the same placement, endpoints and software, and this API reports no
+    /// per-node status for a reader to see one of them down — so what the reboot
+    /// leaves behind is the cluster's state while it runs
+    /// ([`Self::in_flight_state`]) and the operation record filed for it.
+    BrokerReboot,
+}
+
+impl ClusterChange {
+    /// The `ClusterState` a cluster is in WHILE this change is applied: a cluster
+    /// whose brokers are being rebooted is `REBOOTING_BROKER`, and one an accepted
+    /// update is being applied to is `UPDATING`.
+    ///
+    /// One function of the change itself, so the state a cluster operation puts its
+    /// cluster into and the state its completion is materialised from
+    /// ([`Cluster::settle`]) cannot drift apart.
+    pub fn in_flight_state(&self) -> &'static str {
+        match self {
+            Self::BrokerReboot => CLUSTER_STATE_REBOOTING_BROKER,
+            _ => CLUSTER_STATE_UPDATING,
+        }
+    }
+
+    /// Whether completing this change generates a new cluster version.
+    ///
+    /// "When this update operation is successful, it generates a new cluster
+    /// version" is what every update request's `CurrentVersion` documents, and each
+    /// of those operations quotes the version it updates from. `RebootBroker`
+    /// quotes none — its request carries no `CurrentVersion` member at all — and it
+    /// changes no cluster attribute, so a rebooted cluster is still at the version
+    /// it was.
+    pub fn generates_new_version(&self) -> bool {
+        !matches!(self, Self::BrokerReboot)
+    }
 }
 
 /// The storage attributes one update call asked to change. A member left `None`

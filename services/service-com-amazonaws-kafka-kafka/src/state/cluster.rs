@@ -99,6 +99,8 @@ impl Cluster {
             // `current_version` above is that revision's token.
             revision: 1,
             pending_update: None,
+            // Nothing has rebooted a cluster the create is still provisioning.
+            reboots: 0,
             // A provisioned cluster carries no serverless configuration: the
             // per-kind detail is stored for the kind the record IS.
             serverless: None,
@@ -193,6 +195,7 @@ impl Cluster {
             zookeeper_access_enabled: false,
             revision: 1,
             pending_update: None,
+            reboots: 0,
             serverless: Some(config),
             // Created with no resource-based policy, exactly as a provisioned
             // cluster is.
@@ -320,22 +323,29 @@ impl Cluster {
             self.state = CLUSTER_STATE_ACTIVE.to_string();
         }
         match self.pending_update.take() {
-            // An update completes only for a cluster that is still `UPDATING`
-            // because of it. Any other state means something else now owns the
-            // record, so the change is dropped rather than folded into a
+            // An operation completes only for a cluster that is still in the state
+            // that operation put it in. Any other state means something else now
+            // owns the record, so the change is dropped rather than folded into a
             // cluster that has moved on.
-            Some(update) if now >= update.due && self.state == CLUSTER_STATE_UPDATING => {
+            Some(update)
+                if now >= update.due && self.state == update.change.in_flight_state() =>
+            {
                 // The operation finished when the clock owed it, not when this
                 // caller happened to look, so that instant is what a change
                 // which records a time of its own (a broker node joining the
                 // cluster) carries.
                 let applied_at = update.due;
+                // Read before the change is consumed: whether this operation
+                // generates a new cluster version is the change's own property.
+                let generates_new_version = update.change.generates_new_version();
                 self.apply_change(update.change, applied_at);
                 // "When this update operation is successful, it generates a new
                 // cluster version" (`CurrentVersion` on every update request),
                 // so the version token follows the new revision.
-                self.revision += 1;
-                self.current_version = current_version_token(&self.arn, self.revision);
+                if generates_new_version {
+                    self.revision += 1;
+                    self.current_version = current_version_token(&self.arn, self.revision);
+                }
                 self.state = CLUSTER_STATE_ACTIVE.to_string();
             }
             // Due but no longer this cluster's business: dropped, changing
@@ -677,23 +687,35 @@ impl Cluster {
         submitted.cloned().or_else(|| self.logging_info.clone())
     }
 
-    /// Record `change` as the cluster's one in-flight update and move it to
-    /// `UPDATING`, handing back the ARN of the operation that will apply it.
+    /// Record `change` as the cluster's one in-flight operation and move the
+    /// cluster to the state that change puts it in
+    /// ([`ClusterChange::in_flight_state`]), handing back the ARN of the operation
+    /// that will apply it.
     ///
     /// Reached only through
-    /// [`ComAmazonawsKafkaKafkaState::start_cluster_update`], which files the
-    /// operation this ARN names in the registry: a cluster is `UPDATING` with an
-    /// active operation ARN exactly while it holds a [`PendingUpdate`], and that
-    /// ARN always resolves for a cluster-operation reader, whichever update
-    /// operation recorded it.
-    pub(super) fn begin_update(&mut self, now: SystemTime, change: ClusterChange) -> String {
-        let operation_arn = self.operation_arn(self.revision + 1);
+    /// [`ComAmazonawsKafkaKafkaState::start_cluster_operation`], which files the
+    /// operation this ARN names in the registry: a cluster holds at most one
+    /// [`PendingUpdate`], its reported state while it holds one is that change's
+    /// in-flight state, its active operation ARN is this one, and that ARN always
+    /// resolves for a cluster-operation reader, whichever call recorded it.
+    ///
+    /// The ARN is minted from the revision the change produces, or — for a change
+    /// that produces none ([`ClusterChange::generates_new_version`]) — from the
+    /// cluster's own reboot ordinal, so no two operations of one cluster can share
+    /// an ARN.
+    pub(super) fn begin_operation(&mut self, now: SystemTime, change: ClusterChange) -> String {
+        let operation_arn = if change.generates_new_version() {
+            self.operation_arn(self.revision + 1)
+        } else {
+            self.reboots += 1;
+            self.reboot_operation_arn(self.reboots)
+        };
+        self.state = change.in_flight_state().to_string();
         self.pending_update = Some(PendingUpdate {
             operation_arn: operation_arn.clone(),
             due: now + CLUSTER_UPDATE_DELAY,
             change,
         });
-        self.state = CLUSTER_STATE_UPDATING.to_string();
         operation_arn
     }
 
@@ -783,6 +805,10 @@ impl Cluster {
                 }
                 self.logging_info = self.logging_info_after(logging_info.as_ref());
             }
+            // A reboot restarts the brokers and changes no stored attribute: the
+            // nodes come back under the same placement, endpoints and software, so
+            // completing one only returns the cluster to `ACTIVE` (above).
+            ClusterChange::BrokerReboot => {}
         }
     }
 
@@ -793,8 +819,23 @@ impl Cluster {
     /// function of the cluster and the revision it produces, so one operation
     /// keeps one ARN however often it is reported.
     pub(super) fn operation_arn(&self, revision: u64) -> String {
+        self.operation_arn_of(&format!("operation#{revision}"))
+    }
+
+    /// The ARN of the `reboot`-th reboot operation filed on this cluster, in the
+    /// same form and minted the same way — from the reboot's own ordinal, since a
+    /// reboot produces no revision to name it by.
+    pub(super) fn reboot_operation_arn(&self, reboot: u64) -> String {
+        self.operation_arn_of(&format!("reboot#{reboot}"))
+    }
+
+    /// The ARN of the cluster operation `discriminator` identifies among this
+    /// cluster's: the one minting both forms above go through, so an operation's ARN
+    /// is a pure function of the cluster and that discriminator however it was
+    /// filed, and two operations of one cluster can never share an ARN.
+    fn operation_arn_of(&self, discriminator: &str) -> String {
         let cluster_id = self.arn.rsplit_once('/').map_or("", |(_, id)| id);
-        let digest = stable_digest(&format!("{}#operation#{revision}", self.arn));
+        let digest = stable_digest(&format!("{}#{discriminator}", self.arn));
         ::engine::emulator_arn(
             "kafka",
             &self.region,

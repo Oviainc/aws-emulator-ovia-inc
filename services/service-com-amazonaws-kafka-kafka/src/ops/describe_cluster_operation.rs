@@ -16,8 +16,9 @@
 //!
 //! PARTIAL SCOPE, deliberately: the registry this reads
 //! ([`crate::state::ComAmazonawsKafkaKafkaState::cluster_operations`]) holds the
-//! operations every cluster UPDATE files — they all come through
-//! [`crate::state::ComAmazonawsKafkaKafkaState::start_cluster_update`] — so an
+//! operations every cluster UPDATE and every broker REBOOT files — they all come
+//! through
+//! [`crate::state::ComAmazonawsKafkaKafkaState::start_cluster_operation`] — so an
 //! operation ARN minted by another path, such as the create operation ARN
 //! `CreateChannel` reports, is still answered `NotFoundException` here. Filing
 //! those belongs with those operations' own files (`create_channel.rs`), which

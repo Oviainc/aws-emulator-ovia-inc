@@ -568,11 +568,11 @@ impl ComAmazonawsKafkaKafkaState {
         history
     }
 
-    /// Start an update on the cluster `arn` names, as an endpoint for `region`
-    /// sees it: record the cluster operation, move the cluster to `UPDATING`,
-    /// and hand it the change the clock will apply at [`CLUSTER_UPDATE_DELAY`].
-    /// Answers the new operation's ARN, or `None` when this region holds no
-    /// cluster for `arn`.
+    /// Start a cluster operation on the cluster `arn` names, as an endpoint for
+    /// `region` sees it: record the cluster operation, move the cluster to the
+    /// state that operation puts it in, and hand it the change the clock will
+    /// apply at [`CLUSTER_UPDATE_DELAY`]. Answers the new operation's ARN, or
+    /// `None` when this region holds no cluster for `arn`.
     ///
     /// The cluster is resolved through [`Self::settled_cluster_in_mut`], so a
     /// writer is scoped to its own region exactly as every reader is, and it
@@ -580,15 +580,15 @@ impl ComAmazonawsKafkaKafkaState {
     ///
     /// `plan` turns the stored cluster into what the operation reports and what
     /// it changes: the attributes it touches as they are now, the same
-    /// attributes as the update leaves them, and the change itself.
+    /// attributes as the operation leaves them, and the change itself.
     ///
-    /// The ONE path that starts a cluster update, so an operation ARN an update
-    /// call hands back always names a record this registry holds — whichever
-    /// update began it — and the operation record, the cluster's pending change,
+    /// The ONE path that starts a cluster operation, so an operation ARN such a
+    /// call hands back always names a record this registry holds — whichever call
+    /// began it — and the operation record, the cluster's pending change,
     /// its active operation ARN and its operation history cannot drift apart.
-    /// The history is bounded where every update's record is filed, in
+    /// The history is bounded where every operation's record is filed, in
     /// [`Self::file_cluster_operation`].
-    pub(super) fn start_cluster_update<Plan>(
+    pub(super) fn start_cluster_operation<Plan>(
         &mut self,
         region: &str,
         arn: &str,
@@ -605,8 +605,8 @@ impl ComAmazonawsKafkaKafkaState {
         let cluster_type = cluster.cluster_type.clone();
         let (source_cluster_info, target_cluster_info, change) = plan(cluster);
         // The cluster mints the operation's ARN and holds the pending change:
-        // one in-flight update per cluster, whatever began it.
-        let operation_arn = cluster.begin_update(now, change);
+        // one in-flight operation per cluster, whatever began it.
+        let operation_arn = cluster.begin_operation(now, change);
         let operation = ClusterOperation {
             arn: operation_arn.clone(),
             cluster_arn,
@@ -622,6 +622,30 @@ impl ComAmazonawsKafkaKafkaState {
         Some(operation_arn)
     }
 
+    /// Start a broker REBOOT: the brokers of the cluster `arn` names restart, so
+    /// the cluster is `REBOOTING_BROKER` until the clock owes the operation its
+    /// completion and `ACTIVE` again after it, at the version it already was.
+    ///
+    /// Filed through the same path every cluster operation is, under this call's
+    /// own `OperationType`, so a reboot appears in the cluster's operation history
+    /// and resolves for the cluster-operation readers exactly as an update does. It
+    /// reports no mutable attribute on either side because it changes none: an
+    /// operation describes what it touches.
+    pub fn start_broker_reboot(
+        &mut self,
+        region: &str,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<String> {
+        self.start_cluster_operation(region, arn, now, OPERATION_TYPE_REBOOT_NODE, |_cluster| {
+            (
+                MutableClusterInfo::default(),
+                MutableClusterInfo::default(),
+                ClusterChange::BrokerReboot,
+            )
+        })
+    }
+
     /// Start a storage update: the volume size, provisioned throughput and
     /// storage mode `change` names, reported by an operation of
     /// `operation_type` — `UpdateStorage` and `UpdateBrokerStorage` both come
@@ -634,7 +658,7 @@ impl ComAmazonawsKafkaKafkaState {
         operation_type: &str,
         change: StorageChange,
     ) -> Option<String> {
-        self.start_cluster_update(region, arn, now, operation_type, |cluster| {
+        self.start_cluster_operation(region, arn, now, operation_type, |cluster| {
             let source_cluster_info = cluster.storage_cluster_info();
             let target_cluster_info = cluster.storage_cluster_info_after(&change);
             (
@@ -654,7 +678,7 @@ impl ComAmazonawsKafkaKafkaState {
         now: SystemTime,
         instance_type: String,
     ) -> Option<String> {
-        self.start_cluster_update(
+        self.start_cluster_operation(
             region,
             arn,
             now,
@@ -685,7 +709,7 @@ impl ComAmazonawsKafkaKafkaState {
         // operation record it files nor the pending change it stores can carry a
         // count the model's range does not admit.
         let target = admissible_broker_count(target_number_of_broker_nodes);
-        self.start_cluster_update(
+        self.start_cluster_operation(
             region,
             arn,
             now,
@@ -716,7 +740,7 @@ impl ComAmazonawsKafkaKafkaState {
         kafka_version: String,
         configuration_info: Option<ConfigurationInfo>,
     ) -> Option<String> {
-        self.start_cluster_update(
+        self.start_cluster_operation(
             region,
             arn,
             now,
@@ -751,7 +775,7 @@ impl ComAmazonawsKafkaKafkaState {
         now: SystemTime,
         configuration_info: ConfigurationInfo,
     ) -> Option<String> {
-        self.start_cluster_update(
+        self.start_cluster_operation(
             region,
             arn,
             now,
@@ -779,7 +803,7 @@ impl ComAmazonawsKafkaKafkaState {
         connectivity_info: Option<ConnectivityInfo>,
         zookeeper_access: Option<ZookeeperAccess>,
     ) -> Option<String> {
-        self.start_cluster_update(
+        self.start_cluster_operation(
             region,
             arn,
             now,
@@ -812,7 +836,7 @@ impl ComAmazonawsKafkaKafkaState {
         client_authentication: Option<ClientAuthentication>,
         encryption_info: Option<EncryptionInfo>,
     ) -> Option<String> {
-        self.start_cluster_update(region, arn, now, OPERATION_TYPE_UPDATE_SECURITY, |cluster| {
+        self.start_cluster_operation(region, arn, now, OPERATION_TYPE_UPDATE_SECURITY, |cluster| {
             let source_cluster_info = cluster.security_cluster_info();
             let target_cluster_info = cluster.security_cluster_info_after(
                 client_authentication.as_ref(),
@@ -841,7 +865,7 @@ impl ComAmazonawsKafkaKafkaState {
         open_monitoring: Option<OpenMonitoringInfo>,
         logging_info: Option<LoggingInfo>,
     ) -> Option<String> {
-        self.start_cluster_update(
+        self.start_cluster_operation(
             region,
             arn,
             now,

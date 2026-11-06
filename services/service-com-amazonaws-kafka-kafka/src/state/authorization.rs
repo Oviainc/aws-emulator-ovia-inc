@@ -53,6 +53,14 @@
 //! request nothing grants, and one an attached document explicitly denied — are
 //! built here from the same parts.
 //!
+//! What the CALLER's own identity-based policies say about the action is the other
+//! half of the same question, and it is decided in
+//! [`crate::state::identity_authorization`]: that decision reads the IAM and STS
+//! stores for the principal the request's credential speaks for, where every
+//! decision here is taken from the request alone, which is why the two sit in
+//! separate modules. Both word their refusal from the parts below, so one service
+//! says one thing about an unauthorized request however it was refused.
+//!
 //! The decision is taken by the operations whose target IS a cluster — the ones
 //! whose action applies to it. The TAGGING operations take any MSK resource ARN
 //! instead, and the behavioural record for a foreign-account resource there is the
@@ -62,7 +70,18 @@
 
 /// The IAM action namespace MSK publishes its CONTROL-plane actions under, which
 /// `kafka:<ApiName>` is the action for the API of that name.
-const CONTROL_PLANE_ACTION_NAMESPACE: &str = "kafka";
+pub const CONTROL_PLANE_ACTION_NAMESPACE: &str = "kafka";
+
+/// The IAM action a control-plane call to `operation` asks for: `kafka:<ApiName>`.
+///
+/// One spelling, taken by every decision this service makes about such a call —
+/// the resource-scoped ones here and the identity-based one in
+/// [`crate::state::identity_authorization`] — so the action a refusal names cannot
+/// drift between them. The caller passes its own `Operation::NAME`, so the action
+/// can never drift from the operation taking it either.
+pub fn control_plane_action(operation: &str) -> String {
+    format!("{CONTROL_PLANE_ACTION_NAMESPACE}:{operation}")
+}
 
 /// The IAM action a TOPIC Management call is authorized under.
 ///
@@ -138,10 +157,7 @@ pub fn authorize_operation<E>(
     operation: &str,
     target_arn: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    authorize_action(
-        &format!("{CONTROL_PLANE_ACTION_NAMESPACE}:{operation}"),
-        target_arn,
-    )
+    authorize_action(&control_plane_action(operation), target_arn)
 }
 
 /// The resource an authorization decision is taken over when the request named
@@ -171,7 +187,7 @@ pub fn authorize_target_cluster<E>(
     if crate::state::is_cluster_arn(target_arn) {
         return Ok(());
     }
-    let action = format!("{CONTROL_PLANE_ACTION_NAMESPACE}:{operation}");
+    let action = control_plane_action(operation);
     // A value this account's ARN reading can make nothing of names no resource;
     // one it can read names that resource, whatever kind it is, so the decision
     // reports the resource it was actually taken over.
@@ -224,7 +240,7 @@ pub fn authorize_cluster_policy<E>(
     let Some(policy) = cluster.policy.as_ref() else {
         return Ok(());
     };
-    let action = format!("{CONTROL_PLANE_ACTION_NAMESPACE}:{operation}");
+    let action = control_plane_action(operation);
     let caller = caller_principal();
     let mut principals = vec![caller.clone()];
     principals.extend(::service_common::iam_authorization::account_principals(
@@ -252,7 +268,7 @@ pub fn authorize_cluster_policy<E>(
 /// The refusal an authorization decision leaves, carrying `message`: the code and
 /// status the real service answers, through the unmodeled channel this service's
 /// model gives no shape for.
-fn access_denied<E>(message: String) -> crate::scaffolded::Scaffolded<E> {
+pub(crate) fn access_denied<E>(message: String) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::unmodeled(ACCESS_DENIED_CODE, ACCESS_DENIED_STATUS, message)
 }
 
@@ -261,10 +277,17 @@ fn access_denied<E>(message: String) -> crate::scaffolded::Scaffolded<E> {
 /// was taken over — and no clause about a document, because none of them refused
 /// it; the request simply reaches no grant.
 fn not_authorized(action: &str, resource: &str) -> String {
-    format!(
-        "User: {} is not authorized to perform: {action} on resource: {resource}",
-        caller_principal()
-    )
+    not_authorized_as(&caller_principal(), action, resource)
+}
+
+/// The same sentence about a principal the REQUEST's credential named rather than
+/// the ambient one — the form an identity-based decision needs, since the principal
+/// it refuses is the session that signed the call.
+///
+/// Built here, from the same parts, so a refusal reads alike whichever decision
+/// reached it.
+pub(crate) fn not_authorized_as(principal: &str, action: &str, resource: &str) -> String {
+    format!("User: {principal} is not authorized to perform: {action} on resource: {resource}")
 }
 
 /// The same sentence for a request a resource-based policy explicitly DENIED,

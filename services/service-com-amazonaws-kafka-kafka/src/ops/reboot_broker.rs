@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RebootBroker
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RebootBroker`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RebootBroker::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `RebootBroker` restarts broker nodes of a provisioned cluster. It is
+//! ASYNCHRONOUS: the call files a cluster operation, leaves the cluster
+//! `REBOOTING_BROKER` with that operation as its `ActiveOperationArn`, and the
+//! cluster is `ACTIVE` again once the clock owes that operation its completion.
+//! The reboot changes no cluster attribute — the nodes come back under the same
+//! placement, endpoints and software — so the cluster keeps the `CurrentVersion` it
+//! had, which is why this request quotes none; what the call leaves behind is that
+//! state transition and the operation record, which `DescribeClusterOperation`,
+//! `DescribeClusterOperationV2` and the cluster-operation listings all read.
+//!
+//! The caller's own identity-based policies are consulted FIRST
+//! ([`crate::state::identity_authorization`]), then the resource-scoped decision
+//! every cluster-scoped operation takes ([`crate::state::authorization`]): AWS
+//! authorizes at the IAM layer before the service evaluates the resource, so a
+//! denied caller is told it is not authorized rather than told whether the cluster
+//! exists.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +159,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RebootBroker` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RebootBrokerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RebootBroker"))
+        // AWS authorizes at the IAM layer BEFORE the service evaluates the
+        // resource, so the calling principal's own identity policies decide first,
+        // on the ARN as submitted: a caller they deny is told it is not authorized
+        // rather than told whether this registry holds a cluster for that ARN.
+        if let Some(refusal) = crate::state::identity_authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.cluster_arn,
+        ) {
+            return Err(refusal);
+        }
+        // Then the resource-scoped decision every cluster-scoped operation takes,
+        // also from the request alone: the caller holds no resource-based policy
+        // over a cluster of another account. See [`crate::state::authorization`].
+        crate::state::authorization::authorize_operation(Self::NAME, &input.cluster_arn)?;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RebootBrokerErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // Request-only checks run first, before the registry lock is taken: none
+        // of them depends on stored state.
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(RebootBrokerErrorModeled::BadRequestException(
+                crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
+            )
+            .into());
+        }
+        // "The reboot-broker operation supports rebooting one broker at a time"
+        // (`RebootBrokerRequest$BrokerIds`), so a request naming no broker asks for
+        // nothing and one naming several asks for more than this API performs.
+        let [broker_id] = input.broker_ids.as_slice() else {
+            return Err(bad_request(
+                BROKER_IDS_MEMBER,
+                format!(
+                    "BrokerIds must name exactly one broker, not {}: the reboot-broker \
+                     operation supports rebooting one broker at a time.",
+                    input.broker_ids.len()
+                ),
+            ));
+        };
+
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Resolved through the settling lookup every other operation uses, so the
+        // transitions the clock already owed this cluster — its own provisioning,
+        // and an earlier operation of its own whose completion has come due — are
+        // materialised before this call judges its state.
+        let Some(cluster) = state.settled_cluster_in(&region, &input.cluster_arn, now) else {
+            return Err(
+                RebootBrokerErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        };
+        // Copied out of the record: the checks below are followed by a write, so
+        // the borrow of the registry has to end here.
+        let cluster_state = cluster.state.clone();
+        let is_serverless = cluster.is_serverless();
+        // The brokers the cluster actually holds, which are what a reboot can name.
+        let held_broker_ids: Vec<i32> = cluster.brokers.iter().map(|broker| broker.id).collect();
+
+        // A reboot restarts customer broker nodes, and a serverless cluster has
+        // none of its own: MSK Serverless patches and restarts the brokers itself.
+        if is_serverless {
+            return Err(bad_request(
+                "ClusterArn",
+                crate::state::PROVISIONED_ONLY_MESSAGE.to_string(),
+            ));
+        }
+        // A cluster runs one operation at a time, and one that is still being
+        // provisioned, deleted, updated or rebooted has no settled brokers to
+        // restart. Worded in the form this service words that family of refusals
+        // in, so the service says one thing about one condition.
+        if cluster_state != crate::state::CLUSTER_STATE_ACTIVE {
+            return Err(bad_request(
+                "ClusterArn",
+                crate::state::brokers_not_rebootable_message(&cluster_state),
+            ));
+        }
+        // The broker named has to be one of THIS cluster's nodes: a reboot acts on
+        // a node, so a value naming none of them names nothing to restart. The ids
+        // are the nodes' own (`BrokerNodeInfo$BrokerId`), 1-based and as many as
+        // the cluster holds brokers.
+        if !names_held_broker(broker_id, &held_broker_ids) {
+            return Err(bad_request(
+                BROKER_IDS_MEMBER,
+                format!(
+                    "The cluster has no broker with the id {broker_id}; its broker ids are 1 \
+                     through {}.",
+                    held_broker_ids.len()
+                ),
+            ));
+        }
+
+        // The registry starts the operation: it files the cluster operation, moves
+        // the cluster to REBOOTING_BROKER and stores the instant the reboot comes
+        // due — the same path every cluster operation of this service is filed
+        // through, so one cluster holds one in-flight operation whatever began it.
+        let Some(operation_arn) = state.start_broker_reboot(&region, &input.cluster_arn, now)
+        else {
+            return Err(RebootBrokerErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some(
+                        "the cluster vanished while its reboot was starting".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        Ok(RebootBrokerOutput {
+            cluster_arn: Some(input.cluster_arn),
+            cluster_operation_arn: Some(operation_arn),
+        })
     }
+}
+
+/// The member a refusal about the brokers to reboot names, spelled as this crate's
+/// refusals spell a request member.
+const BROKER_IDS_MEMBER: &str = "BrokerIds";
+
+/// Whether `broker_id`, as the request spelled it, names one of the broker nodes
+/// `held` lists.
+///
+/// A broker id is a number (`BrokerNodeInfo$BrokerId`), so the comparison is on the
+/// number the value denotes rather than on its text: a value that denotes no number
+/// names no broker.
+fn names_held_broker(broker_id: &str, held: &[i32]) -> bool {
+    broker_id
+        .trim()
+        .parse::<i32>()
+        .is_ok_and(|id| held.contains(&id))
+}
+
+/// Refuse the request with the modeled `BadRequestException`, naming the member at
+/// fault and what was wrong with it — the caller has to fix the request from this
+/// text alone.
+fn bad_request(parameter: &str, message: String) -> RebootBrokerError {
+    RebootBrokerErrorModeled::BadRequestException(BadRequestException {
+        invalid_parameter: Some(parameter.to_string()),
+        message: Some(message),
+    })
+    .into()
 }

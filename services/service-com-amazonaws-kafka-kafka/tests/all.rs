@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/broker_count_update.rs"]
 mod broker_count_update;
+#[path = "all/broker_reboot.rs"]
+mod broker_reboot;
 #[path = "all/broker_storage_update.rs"]
 mod broker_storage_update;
 #[path = "all/broker_type_update.rs"]
