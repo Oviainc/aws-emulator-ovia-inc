@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_batch_awsbatchv20160810::state;
 
 use crate::job_lifecycle::{arn, compute_environment, error_code, error_message, job_queue, Batch};
-use crate::refusal_contract::assert_uuid_shaped;
+use crate::refusal_contract::{assert_uuid_shaped, enveloped};
 
 /// The routes of the quota-share operations under test (`smithy_query(query="operation",
 /// operation="DeleteQuotaShare,DescribeQuotaShare,UpdateQuotaShare,CreateQuotaShare,
@@ -49,12 +49,6 @@ const LIST: &str = "/v1/listquotashares";
 /// `ResponseMetadata.RequestId` off.
 const REQUEST_ID_HEADER: &str = "x-amzn-requestid";
 
-/// The prefix of Batch's frontend envelope: the fixed text of a refusal that layer raises.
-const ENVELOPE_PREFIX: &str = "Error executing request, Exception : ";
-
-/// The segment that envelope names the refused call's request id in.
-const ENVELOPE_REQUEST_ID: &str = ", RequestId: ";
-
 /// The rule a `quotaShareArn` of the wrong shape broke, as the quota-share plane states it.
 const ARN_PATTERN_DETAIL: &str = "Quota Share arn should match a valid Quota Share arn pattern";
 
@@ -64,11 +58,60 @@ const MUST_BE_DISABLED: &str = "Quota Share must be DISABLED before deleting.";
 /// The queue the shares under test hang off.
 const QUEUE: &str = "jq-share-delete-contract";
 
-/// How long to wait for a clock-owed transition to fall due: the span the clock owes it
-/// ([`state::JOB_PHASE_MILLIS`]), with margin for a slow machine.
-async fn wait_for_the_clock() {
+/// How long a clock-owed transition may take before this suite calls it stuck: the span the
+/// clock owes it ([`state::JOB_PHASE_MILLIS`]), with margin for a slow machine.
+fn deadline() -> Duration {
     let span = u64::try_from(state::JOB_PHASE_MILLIS).unwrap_or(500);
-    tokio::time::sleep(Duration::from_millis(span * 3)).await;
+    Duration::from_millis(span * 6)
+}
+
+/// How long to leave between two polls of a clock-owed transition.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Poll `DescribeQuotaShare` until the share reports `wanted` as its `(state, status)`, and
+/// answer what it then reports.
+///
+/// Polling rather than sleeping a fixed multiple of the span: the transition is owed by the
+/// clock, so the only thing this waits for is the instant it falls due.
+async fn until_settled(
+    batch: &Batch,
+    case: &str,
+    reference: &str,
+    wanted: (&str, &str),
+) -> Value {
+    let give_up = tokio::time::Instant::now() + deadline();
+    loop {
+        let body = described(batch, case, reference).await;
+        if (body["state"].as_str(), body["status"].as_str()) == (Some(wanted.0), Some(wanted.1)) {
+            return body;
+        }
+        assert!(
+            tokio::time::Instant::now() < give_up,
+            "case {case}: expected the share to settle at {wanted:?} within {:?}, got {body}",
+            deadline()
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Poll `DescribeQuotaShare` until the share's reader reports `reference` nonexistent — the
+/// removal a delete left owed to the clock having fallen due — and answer that refusal.
+async fn until_removed(batch: &Batch, case: &str, reference: &str) -> Value {
+    let give_up = tokio::time::Instant::now() + deadline();
+    loop {
+        let (status, body) = batch
+            .call(DESCRIBE, json!({"quotaShareArn": reference}))
+            .await;
+        if status == 400 {
+            return body;
+        }
+        assert!(
+            tokio::time::Instant::now() < give_up,
+            "case {case}: expected the removal to fall due within {:?}, got {status} {body}",
+            deadline()
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// Create the queue the shares hang off, over a compute environment of its own.
@@ -213,10 +256,16 @@ async fn a_quota_share_arn_of_the_wrong_shape_is_refused_by_every_taker() {
     queue(&batch).await;
 
     // A real share none of these calls names: every refusal below must leave it exactly as it
-    // is. The clock has settled it first, so what it reports is stable.
+    // is. The share is read once the clock has settled its create, so what it reports is
+    // stable.
     let bystander = share(&batch, "qs-bystander", json!({"state": "ENABLED"})).await;
-    wait_for_the_clock().await;
-    let before = described(&batch, "the bystander share", &bystander).await;
+    let before = until_settled(
+        &batch,
+        "the bystander share",
+        &bystander,
+        (state::STATE_ENABLED, state::STATUS_VALID),
+    )
+    .await;
 
     let mut reported_ids: Vec<String> = Vec::new();
     for (label, identifier) in malformed_identifiers() {
@@ -241,11 +290,18 @@ async fn a_quota_share_arn_of_the_wrong_shape_is_refused_by_every_taker() {
                 .unwrap_or_default()
                 .to_string();
             assert_uuid_shaped(&case, &reported);
+            // The envelope's shape is read through the one reader of it this target holds
+            // (`refusal_contract::enveloped`), so the fixed text is written down once.
+            let (detail, stated) = enveloped(&case, &message);
             assert_eq!(
-                message,
-                format!("{ENVELOPE_PREFIX}{ARN_PATTERN_DETAIL}{ENVELOPE_REQUEST_ID}{reported}"),
-                "case {case}: expected the enveloped ARN-pattern refusal naming this call's \
-                 own request id {reported:?}, got {message:?}"
+                detail, ARN_PATTERN_DETAIL,
+                "case {case}: expected the ARN-pattern rule as the envelope's detail, got \
+                 {message:?}"
+            );
+            assert_eq!(
+                stated, reported,
+                "case {case}: the refusal must name this call's OWN request id, got {stated:?} \
+                 in the message and {reported:?} in the header"
             );
             reported_ids.push(reported);
         }
@@ -398,11 +454,7 @@ async fn a_share_that_still_accepts_submissions_must_be_disabled_before_it_is_de
         let message = error_message(&refused);
         assert_eq!(
             message, MUST_BE_DISABLED,
-            "case {case}: expected the precondition's own sentence, got {message:?}"
-        );
-        assert!(
-            !message.starts_with(ENVELOPE_PREFIX) && !message.contains(ENVELOPE_REQUEST_ID),
-            "case {case}: this refusal is stated bare, got {message:?}"
+            "case {case}: expected the precondition's own sentence, stated bare, got {message:?}"
         );
 
         // The refusal wrote nothing: the share keeps its name and its state, no removal was
@@ -436,16 +488,13 @@ async fn a_share_that_still_accepts_submissions_must_be_disabled_before_it_is_de
                 json!({"quotaShareArn": reference, "state": "DISABLED"}),
             )
             .await;
-        wait_for_the_clock().await;
-        let settled = described(&batch, case, &reference).await;
-        assert_eq!(
-            (
-                settled["state"].as_str(),
-                settled["status"].as_str()
-            ),
-            (Some(state::STATE_DISABLED), Some(state::STATUS_VALID)),
-            "case {case}: expected the disabling update to settle, got {settled}"
-        );
+        until_settled(
+            &batch,
+            case,
+            &reference,
+            (state::STATE_DISABLED, state::STATUS_VALID),
+        )
+        .await;
 
         let (status, accepted) = batch
             .call(DELETE, json!({"quotaShareArn": reference}))
@@ -468,7 +517,9 @@ async fn a_share_that_still_accepts_submissions_must_be_disabled_before_it_is_de
 
     // The removal is owed by the clock; once it falls due the dead identifier names nothing,
     // for the reader and the updater alike.
-    wait_for_the_clock().await;
+    for (case, reference) in &dead {
+        until_removed(&batch, case, reference).await;
+    }
     let listed = listed_arns(&batch).await;
     for (case, reference) in &dead {
         assert!(
