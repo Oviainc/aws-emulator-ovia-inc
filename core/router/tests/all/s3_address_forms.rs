@@ -25,6 +25,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use smithy_server_runtime::MultiServiceRouter;
 
+use super::query_wire::opt_element;
+
 /// The Region every call here is signed for.
 const REGION: &str = "us-east-1";
 
@@ -38,12 +40,10 @@ struct Answer {
 }
 
 impl Answer {
-    /// The text of `<name>…</name>` in the body, or the empty string.
+    /// The text of `<name>…</name>` in the body, or the empty string — read with this test
+    /// crate's one XML text reader ([`super::query_wire::opt_element`]).
     fn element(&self, name: &str) -> String {
-        self.body
-            .split_once(&format!("<{name}>"))
-            .and_then(|(_before, rest)| rest.split_once(&format!("</{name}>")))
-            .map_or(String::new(), |(text, _after)| text.to_string())
+        opt_element(&self.body, name).unwrap_or_default()
     }
 }
 
