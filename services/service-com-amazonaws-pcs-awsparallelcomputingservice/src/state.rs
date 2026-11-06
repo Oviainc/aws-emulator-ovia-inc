@@ -574,24 +574,25 @@ impl ComAmazonawsPcsAwsparallelcomputingserviceState {
     /// queue inside one — or `None` when no stored resource carries that ARN.
     ///
     /// Tags live on the record they belong to (see [`ClusterRecord::tags`]), so a create
-    /// that carried tags, a later tag write and a tag read all see one set. The ARN is
-    /// matched against the one the create MINTED, so a resource is reachable by exactly
-    /// the ARN the service handed out for it.
+    /// that carried tags, a later tag write and a tag read all see one set. The lookup is
+    /// DIRECT: the ARN names the cluster it belongs to and the resource id at its tail
+    /// ([`arn_cluster_id`], [`arn_resource`]), so neither the cluster map nor a cluster's
+    /// children are scanned. The record found that way still has to carry exactly the ARN
+    /// the request named, so a resource is reachable by exactly the ARN the service
+    /// handed out for it and not by one that merely ends in the same id.
     pub fn tags_by_arn(&self, arn: &str) -> Option<&HashMap<String, String>> {
-        for cluster in self.clusters.values() {
-            if cluster.arn == arn {
-                return Some(&cluster.tags);
-            }
-            if let Some(group) = cluster
-                .compute_node_groups
-                .values()
-                .find(|group| group.arn == arn)
-            {
-                return Some(&group.tags);
-            }
-            if let Some(queue) = cluster.queues.values().find(|queue| queue.arn == arn) {
-                return Some(&queue.tags);
-            }
+        let (kind, resource_id) = arn_resource(arn);
+        let cluster = self.clusters.get(arn_cluster_id(arn)?)?;
+        if kind == CLUSTER {
+            return (cluster.arn == arn).then_some(&cluster.tags);
+        }
+        if kind == QUEUE {
+            let queue = cluster.queues.get(&resource_id)?;
+            return (queue.arn == arn).then_some(&queue.tags);
+        }
+        if kind == COMPUTE_NODE_GROUP {
+            let group = cluster.compute_node_groups.get(&resource_id)?;
+            return (group.arn == arn).then_some(&group.tags);
         }
         None
     }
@@ -599,20 +600,18 @@ impl ComAmazonawsPcsAwsparallelcomputingserviceState {
     /// [`Self::tags_by_arn`], mutably: the one write path the tagging operations take,
     /// so no two of them can disagree about where a resource's tags live.
     pub fn tags_by_arn_mut(&mut self, arn: &str) -> Option<&mut HashMap<String, String>> {
-        for cluster in self.clusters.values_mut() {
-            if cluster.arn == arn {
-                return Some(&mut cluster.tags);
-            }
-            if let Some(group) = cluster
-                .compute_node_groups
-                .values_mut()
-                .find(|group| group.arn == arn)
-            {
-                return Some(&mut group.tags);
-            }
-            if let Some(queue) = cluster.queues.values_mut().find(|queue| queue.arn == arn) {
-                return Some(&mut queue.tags);
-            }
+        let (kind, resource_id) = arn_resource(arn);
+        let cluster = self.clusters.get_mut(arn_cluster_id(arn)?)?;
+        if kind == CLUSTER {
+            return (cluster.arn == arn).then_some(&mut cluster.tags);
+        }
+        if kind == QUEUE {
+            let queue = cluster.queues.get_mut(&resource_id)?;
+            return (queue.arn == arn).then_some(&mut queue.tags);
+        }
+        if kind == COMPUTE_NODE_GROUP {
+            let group = cluster.compute_node_groups.get_mut(&resource_id)?;
+            return (group.arn == arn).then_some(&mut group.tags);
         }
         None
     }
@@ -1065,6 +1064,23 @@ pub fn arn_resource(arn: &str) -> (ResourceKind, String) {
         _ => UNNAMED_RESOURCE,
     };
     (kind, resource_id.to_string())
+}
+
+/// The id of the cluster a PCS ARN belongs to: the segment after `cluster/` in its
+/// resource part, which every PCS ARN carries because a compute node group and a queue
+/// are both nested in a cluster ([`compute_node_group_arn`], [`queue_arn`]). `None` when
+/// the resource part does not start with the `cluster` segment, which no ARN the service
+/// mints can.
+///
+/// What makes an ARN-keyed lookup direct: the cluster the ARN names is the entry of
+/// [`ComAmazonawsPcsAwsparallelcomputingserviceState::clusters`] under this id.
+pub fn arn_cluster_id(arn: &str) -> Option<&str> {
+    let resource_part = arn.splitn(6, ':').nth(5)?;
+    let mut segments = resource_part.split('/');
+    if segments.next()? != CLUSTER.resource_type {
+        return None;
+    }
+    segments.next()
 }
 
 /// The modelled `ServiceQuotaExceededException` (HTTP 402) for a tag set past

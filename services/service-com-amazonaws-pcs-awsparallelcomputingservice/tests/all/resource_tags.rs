@@ -607,6 +607,25 @@ async fn the_tagging_operations_refuse_an_arn_no_resource_carries() {
                 .replace(REGION, "eu-west-1"),
             "AWS PCS couldn't find the cluster you specified.",
         ),
+        // A child id that EXISTS, under a cluster id that does not: a resource is reached
+        // by exactly the ARN the service minted for it, never by one that merely ends in
+        // the same id.
+        (
+            "queue",
+            created.queue_arn.replace(
+                &created.cluster_id,
+                "pcs_0000000000000000",
+            ),
+            "AWS PCS couldn't find the queue you specified.",
+        ),
+        (
+            "computenodegroup",
+            created.compute_node_group_arn.replace(
+                &created.cluster_id,
+                "pcs_0000000000000000",
+            ),
+            "AWS PCS couldn't find the compute node group you specified.",
+        ),
     ];
 
     for (resource_type, arn, message) in &absent {
