@@ -15,6 +15,8 @@
 mod audit_records;
 #[path = "all/constraint_refusals.rs"]
 mod constraint_refusals;
+#[path = "all/fixed_error_sentences.rs"]
+mod fixed_error_sentences;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/namespace_and_table_lifecycle.rs"]

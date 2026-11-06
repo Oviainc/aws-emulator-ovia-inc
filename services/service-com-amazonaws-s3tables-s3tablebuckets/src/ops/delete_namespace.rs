@@ -180,25 +180,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.table_bucket_arn)
             .ok_or_else(|| {
                 DeleteNamespaceErrorModeled::NotFoundException(NotFoundException {
-                    message: Some("The specified table bucket does not exist.".to_string()),
+                    message: Some(crate::state::BUCKET_NOT_FOUND_MESSAGE.to_string()),
                 })
             })?;
         let namespace = bucket.namespaces.get(&input.namespace).ok_or_else(|| {
             DeleteNamespaceErrorModeled::NotFoundException(NotFoundException {
-                message: Some("The specified namespace does not exist.".to_string()),
+                message: Some(crate::state::NAMESPACE_NOT_FOUND_MESSAGE.to_string()),
             })
         })?;
 
         // A namespace is deleted only once it holds nothing: the tables in it
-        // are what a delete would otherwise orphan, so the delete conflicts with
-        // the writes that created them.
+        // are what a delete would otherwise orphan. The refusal is stated by the
+        // one fixed sentence this service states that class with.
         if !namespace.tables.is_empty() {
             return Err(DeleteNamespaceErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "The namespace {} is not empty. Delete the tables it contains before \
-                     deleting it.",
-                    input.namespace
-                )),
+                message: Some(crate::state::NAMESPACE_NOT_EMPTY_MESSAGE.to_string()),
             })
             .into());
         }

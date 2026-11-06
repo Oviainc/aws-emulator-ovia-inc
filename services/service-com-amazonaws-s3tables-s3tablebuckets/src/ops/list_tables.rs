@@ -204,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let bucket = store
             .table_buckets
             .get(&input.table_bucket_arn)
-            .ok_or_else(|| not_found("The specified table bucket does not exist."))?;
+            .ok_or_else(|| not_found(crate::state::BUCKET_NOT_FOUND_MESSAGE))?;
 
         // `namespace` and `prefix` narrow WHICH stored tables are listed; the
         // order is the stored one — namespace, then table name — so a resumed
@@ -214,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(namespace) => vec![bucket
                 .namespaces
                 .get(namespace)
-                .ok_or_else(|| not_found("The specified namespace does not exist."))?],
+                .ok_or_else(|| not_found(crate::state::NAMESPACE_NOT_FOUND_MESSAGE))?],
         };
         let ordered = namespaces.into_iter().flat_map(|namespace| {
             namespace

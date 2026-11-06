@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.table_bucket_arn)
             .ok_or_else(|| {
                 GetTableBucketErrorModeled::NotFoundException(NotFoundException {
-                    message: Some("The specified table bucket does not exist.".to_string()),
+                    message: Some(crate::state::BUCKET_NOT_FOUND_MESSAGE.to_string()),
                 })
             })?;
 

@@ -1103,6 +1103,23 @@ pub const MULTIPART_NAMESPACE_MESSAGE: &str = "Multipart namespaces are not supp
 pub const NAMESPACE_ALREADY_EXISTS_MESSAGE: &str =
     "A namespace with an identical name already exists in the bucket.";
 
+/// How this service states a table bucket name that is already taken in the
+/// account and Region the create addresses: the conflict with a previous write
+/// the model's `ConflictException` (HTTP 409) names. FIXED text, as
+/// [`NAMESPACE_ALREADY_EXISTS_MESSAGE`] — it states that the name is taken and
+/// owned by this account, not which name was asked for, and it says "bucket"
+/// rather than "table bucket".
+pub const BUCKET_ALREADY_EXISTS_MESSAGE: &str =
+    "The bucket that you tried to create already exists, and you own it.";
+
+/// How this service states a table name that is already taken in the namespace
+/// the create addresses: the conflict with a previous write the model's
+/// `ConflictException` (HTTP 409) names. FIXED text, as
+/// [`NAMESPACE_ALREADY_EXISTS_MESSAGE`] — it states that the name is taken, not
+/// which name was asked for and not which namespace holds it.
+pub const TABLE_ALREADY_EXISTS_MESSAGE: &str =
+    "A table with an identical name already exists in the namespace.";
+
 /// How this service states a value that cannot be a table bucket ARN at all —
 /// the members the model constrains with `TableBucketARN`. FIXED text, as
 /// [`INVALID_TABLE_BUCKET_NAME_MESSAGE`].
@@ -1130,10 +1147,30 @@ pub const METRICS_CONFIGURATION_NOT_FOUND_MESSAGE: &str = "No such metric config
 pub const REPLICATION_CONFIGURATION_NOT_FOUND_MESSAGE: &str =
     "The specified replication configuration does not exist.";
 
+/// How this service states a namespace the addressed table bucket does not
+/// hold: the `NotFoundException` (HTTP 404) the namespace and table operations
+/// model. FIXED text, as [`BUCKET_NOT_FOUND_MESSAGE`] does for a table bucket.
+pub const NAMESPACE_NOT_FOUND_MESSAGE: &str = "The specified namespace does not exist.";
+
 /// How this service states a table the store does not hold: the
 /// `NotFoundException` (HTTP 404) the table operations model. FIXED text, as
 /// [`BUCKET_NOT_FOUND_MESSAGE`] does for a table bucket.
 pub const TABLE_NOT_FOUND_MESSAGE: &str = "The specified table does not exist.";
+
+/// How this service states a delete of a table bucket that still holds
+/// namespaces: the client request error the model's `BadRequestException`
+/// (HTTP 400) names, since emptying the bucket — not retrying — is what makes
+/// the delete possible. FIXED text, as [`BUCKET_NOT_FOUND_MESSAGE`] — it names
+/// the class of the failure, takes nothing from the request, and says "bucket"
+/// rather than "table bucket".
+pub const BUCKET_NOT_EMPTY_MESSAGE: &str = "The bucket that you tried to delete is not empty.";
+
+/// How this service states a delete of a namespace that still holds tables,
+/// the namespace-level counterpart of [`BUCKET_NOT_EMPTY_MESSAGE`]: the same
+/// fixed form, naming the resource by its class noun and taking nothing from
+/// the request.
+pub const NAMESPACE_NOT_EMPTY_MESSAGE: &str =
+    "The namespace that you tried to delete is not empty.";
 
 /// How this service states a presented `versionToken` that is not the one the
 /// configuration it addresses currently carries: the conflict with a previous
@@ -1141,6 +1178,14 @@ pub const TABLE_NOT_FOUND_MESSAGE: &str = "The specified table does not exist.";
 /// token is neither echoed nor named.
 pub const VERSION_TOKEN_MISMATCH_MESSAGE: &str =
     "The specified version token does not match the configuration.";
+
+/// How this service states a presented `versionToken` that is not the one the
+/// table it addresses currently carries, the table counterpart of
+/// [`VERSION_TOKEN_MISMATCH_MESSAGE`]: the conflict with a previous write the
+/// model's `ConflictException` (HTTP 409) names. FIXED text — the token is
+/// neither echoed nor named, and neither is the table.
+pub const TABLE_VERSION_TOKEN_MISMATCH_MESSAGE: &str =
+    "Provided version token does not match the table version token.";
 
 /// How this service states a record expiration call on a table that takes no
 /// record expiration configuration: the `MethodNotAllowedException` (HTTP 405)

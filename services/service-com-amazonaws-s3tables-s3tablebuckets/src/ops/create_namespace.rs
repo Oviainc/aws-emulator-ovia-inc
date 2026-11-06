@@ -127,7 +127,7 @@ fn bad_request(message: String) -> CreateNamespaceError {
 /// created in does not exist.
 fn no_such_table_bucket() -> CreateNamespaceError {
     CreateNamespaceErrorModeled::NotFoundException(NotFoundException {
-        message: Some("The specified table bucket does not exist.".to_string()),
+        message: Some(crate::state::BUCKET_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

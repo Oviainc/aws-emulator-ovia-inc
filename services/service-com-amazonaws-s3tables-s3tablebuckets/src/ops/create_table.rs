@@ -249,25 +249,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let bucket = store
             .table_buckets
             .get(&input.table_bucket_arn)
-            .ok_or_else(|| not_found("The specified table bucket does not exist."))?;
+            .ok_or_else(|| not_found(crate::state::BUCKET_NOT_FOUND_MESSAGE))?;
         let bucket_arn = bucket.arn.clone();
         let bucket_id = bucket.bucket_id.clone();
         let namespace = bucket
             .namespaces
             .get(&input.namespace)
-            .ok_or_else(|| not_found("The specified namespace does not exist."))?;
+            .ok_or_else(|| not_found(crate::state::NAMESPACE_NOT_FOUND_MESSAGE))?;
         let namespace_id = namespace.namespace_id.clone();
         let namespace_names = namespace.namespace.clone();
 
         // A table name is unique within its namespace: a second create of a
         // resident name is the conflict with a previous write the model's
-        // `ConflictException` (HTTP 409) names.
+        // `ConflictException` (HTTP 409) names, stated by the one fixed sentence
+        // this service states that class with.
         if namespace.tables.contains_key(&input.name) {
             return Err(CreateTableErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "A table with the name {} already exists in the namespace {}.",
-                    input.name, input.namespace
-                )),
+                message: Some(crate::state::TABLE_ALREADY_EXISTS_MESSAGE.to_string()),
             })
             .into());
         }
@@ -339,7 +337,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .table_buckets
             .get_mut(&input.table_bucket_arn)
             .and_then(|bucket| bucket.namespaces.get_mut(&input.namespace))
-            .ok_or_else(|| not_found("The specified namespace does not exist."))?;
+            .ok_or_else(|| not_found(crate::state::NAMESPACE_NOT_FOUND_MESSAGE))?;
         namespace.tables.insert(input.name.clone(), table);
         // The index the `tableArn` addressing mode resolves through.
         store.tables_by_arn.insert(
@@ -355,7 +353,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // response a caller sees is one the store can serve again.
         let stored = store
             .table_by_arn(&table_arn)
-            .ok_or_else(|| not_found("The specified table does not exist."))?;
+            .ok_or_else(|| not_found(crate::state::TABLE_NOT_FOUND_MESSAGE))?;
         let output = CreateTableOutput {
             table_arn: stored.table_arn.clone(),
             version_token: stored.version_token.clone(),

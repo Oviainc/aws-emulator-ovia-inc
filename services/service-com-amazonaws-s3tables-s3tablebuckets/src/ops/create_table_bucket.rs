@@ -228,14 +228,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A table bucket name is unique within an account and Region, and the
         // store is keyed by the ARN that carries both. A second create of a
         // resident name is the conflict with a previous write the model's
-        // `ConflictException` (HTTP 409) names.
+        // `ConflictException` (HTTP 409) names, stated by the one fixed sentence
+        // this service states that class with.
         if store.table_buckets.contains_key(&arn) {
             return Err(CreateTableBucketErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "A table bucket with the name {} already exists.",
-                        input.name
-                    )),
+                    message: Some(crate::state::BUCKET_ALREADY_EXISTS_MESSAGE.to_string()),
                 },
             )
             .into());

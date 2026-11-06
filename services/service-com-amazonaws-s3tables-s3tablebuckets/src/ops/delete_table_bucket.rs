@@ -177,21 +177,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.table_bucket_arn)
             .ok_or_else(|| {
                 DeleteTableBucketErrorModeled::NotFoundException(NotFoundException {
-                    message: Some("The specified table bucket does not exist.".to_string()),
+                    message: Some(crate::state::BUCKET_NOT_FOUND_MESSAGE.to_string()),
                 })
             })?;
 
         // A table bucket is deleted only once it holds nothing: the namespaces
         // in it, and the tables in those, are what a delete would otherwise
-        // orphan, so the delete conflicts with the writes that created them.
+        // orphan. The refusal is the CLIENT's request error the model's
+        // `BadRequestException` (HTTP 400) names rather than the retryable
+        // write conflict of `ConflictException` — emptying the bucket is what
+        // makes the delete possible, and no retry of the same request can — and
+        // it is stated by the one fixed sentence this service states that class
+        // with.
         if !bucket.namespaces.is_empty() {
-            return Err(DeleteTableBucketErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "The table bucket {} is not empty. Delete the namespaces it contains \
-                         before deleting it.",
-                        bucket.name
-                    )),
+            return Err(DeleteTableBucketErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::BUCKET_NOT_EMPTY_MESSAGE.to_string()),
                 },
             )
             .into());

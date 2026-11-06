@@ -513,9 +513,14 @@ async fn a_name_is_unique_per_region_and_a_repeat_conflicts() {
             "case {region:?}: the refusal must be the modeled conflict, got {actual:?}",
             actual = repeat.error_code
         );
-        assert!(
-            repeat.message().contains(NAME),
-            "case {region:?}: the conflict must name the bucket, got {message:?}",
+        assert_eq!(
+            repeat.message(),
+            // The one sentence this service states a taken table bucket name
+            // with; the suite that owns the refusal wording is
+            // `fixed_error_sentences.rs`.
+            "The bucket that you tried to create already exists, and you own it.",
+            "case {region:?}: the conflict must carry the service's fixed sentence, got \
+             {message:?}",
             message = repeat.message()
         );
     }

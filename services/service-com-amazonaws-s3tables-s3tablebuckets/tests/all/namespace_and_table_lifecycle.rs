@@ -894,17 +894,19 @@ async fn a_delete_removes_one_record_and_is_refused_while_children_remain() {
         version_tokens.push((table, created.text("versionToken"), created.text("tableARN")));
     }
 
-    // A container that still holds records cannot be deleted.
+    // A container that still holds records cannot be deleted. A bucket that
+    // still holds namespaces is the CLIENT's request error: emptying it, not
+    // retrying, is what makes the delete possible.
     let bucket_in_use = emulator.delete_table_bucket(REGION, &bucket_arn).await;
     assert_eq!(
-        bucket_in_use.status, 409,
+        bucket_in_use.status, 400,
         "a bucket that still holds namespaces must not be deleted, got {status} {body}",
         status = bucket_in_use.status,
         body = bucket_in_use.body
     );
     assert_eq!(
         bucket_in_use.error_code.as_deref(),
-        Some("ConflictException"),
+        Some("BadRequestException"),
         "the refusal must carry the modeled error code, got {actual:?}",
         actual = bucket_in_use.error_code
     );
@@ -1035,7 +1037,7 @@ async fn a_delete_removes_one_record_and_is_refused_while_children_remain() {
     );
     assert_eq!(
         emulator.delete_table_bucket(REGION, &bucket_arn).await.status,
-        409,
+        400,
         "the bucket still holds a namespace, so it still cannot be deleted"
     );
 

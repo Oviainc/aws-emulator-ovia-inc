@@ -149,7 +149,7 @@ impl From<GetTableErrorModeled> for GetTableError {
 /// addresses.
 fn no_such_table() -> GetTableError {
     GetTableErrorModeled::NotFoundException(NotFoundException {
-        message: Some("The specified table does not exist.".to_string()),
+        message: Some(crate::state::TABLE_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

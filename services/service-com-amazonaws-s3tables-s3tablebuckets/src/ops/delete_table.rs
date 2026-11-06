@@ -188,30 +188,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let namespace = store
             .table_buckets
             .get_mut(&input.table_bucket_arn)
-            .ok_or_else(|| not_found("The specified table bucket does not exist."))?
+            .ok_or_else(|| not_found(crate::state::BUCKET_NOT_FOUND_MESSAGE))?
             .namespaces
             .get_mut(&input.namespace)
-            .ok_or_else(|| not_found("The specified namespace does not exist."))?;
+            .ok_or_else(|| not_found(crate::state::NAMESPACE_NOT_FOUND_MESSAGE))?;
         let table = namespace
             .tables
             .get(&input.name)
-            .ok_or_else(|| not_found("The specified table does not exist."))?;
+            .ok_or_else(|| not_found(crate::state::TABLE_NOT_FOUND_MESSAGE))?;
 
         // `versionToken` is the caller's view of the table. When the request
         // carries one that is not the table's current token, the table has been
         // written since the caller read it, which is the conflict with a
-        // previous write the model's `ConflictException` (HTTP 409) names.
+        // previous write the model's `ConflictException` (HTTP 409) names,
+        // stated by the one fixed sentence this service states that class with.
         if input
             .version_token
             .as_deref()
             .is_some_and(|presented| presented != table.version_token)
         {
             return Err(DeleteTableErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "The version token provided for the table {} does not match its current \
-                     version token.",
-                    input.name
-                )),
+                message: Some(crate::state::TABLE_VERSION_TOKEN_MISMATCH_MESSAGE.to_string()),
             })
             .into());
         }

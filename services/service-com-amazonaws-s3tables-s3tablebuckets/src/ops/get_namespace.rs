@@ -171,12 +171,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.table_bucket_arn)
             .ok_or_else(|| {
                 GetNamespaceErrorModeled::NotFoundException(NotFoundException {
-                    message: Some("The specified table bucket does not exist.".to_string()),
+                    message: Some(crate::state::BUCKET_NOT_FOUND_MESSAGE.to_string()),
                 })
             })?;
         let namespace = bucket.namespaces.get(&input.namespace).ok_or_else(|| {
             GetNamespaceErrorModeled::NotFoundException(NotFoundException {
-                message: Some("The specified namespace does not exist.".to_string()),
+                message: Some(crate::state::NAMESPACE_NOT_FOUND_MESSAGE.to_string()),
             })
         })?;
 
