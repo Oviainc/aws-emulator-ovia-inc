@@ -79,6 +79,62 @@ pub struct SentimentFilter {
     pub negate: Option<bool>,
 }
 
+/// What a rule's `Negate` flag records when the request that stored the rule left it
+/// out: `false`, the half of the flag that flags the PRESENCE of what the filter
+/// describes.
+///
+/// The flag is an either/or over the two things a filter can match, so every one of its
+/// four filters documents both halves: "Set to `TRUE` to flag the absence of the phrase
+/// that you specified in your request. Set to `FALSE` to flag the presence", and the
+/// same sentence pair for silence ("`TRUE` to flag periods of speech ... `FALSE` to flag
+/// periods of silence"), interruptions and sentiments
+/// (`smithy_query(query="shape",
+/// shape="NonTalkTimeFilter,InterruptionFilter,TranscriptFilter,SentimentFilter")`). A
+/// rule that names no flag therefore matches the presence of what it describes, which is
+/// this value.
+const NEGATE_WHEN_OMITTED: bool = false;
+
+impl Rule {
+    /// This rule as the service RECORDS it: the same filter with its `Negate` flag
+    /// materialized as [`NEGATE_WHEN_OMITTED`] when the request left the member out, and
+    /// carrying exactly the flag the request sent when it named one.
+    ///
+    /// `Negate` carries no `@default` on any of the union's four filters, so nothing
+    /// before a handler fills it in and a rule recorded exactly as the request spelled it
+    /// would report no flag at all — leaving a caller that reads the flag to decide
+    /// whether the rule matches a presence or an absence with no answer, and losing the
+    /// flag when the reported rules are sent back into an update. Applied to every member
+    /// of the union rather than the filters one request happens to use, since all four
+    /// model the same optional flag.
+    pub fn with_recorded_negate(self) -> Self {
+        match self {
+            Self::NonTalkTimeFilter(mut filter) => {
+                filter.negate = Some(filter.negate.unwrap_or(NEGATE_WHEN_OMITTED));
+                Self::NonTalkTimeFilter(filter)
+            }
+            Self::InterruptionFilter(mut filter) => {
+                filter.negate = Some(filter.negate.unwrap_or(NEGATE_WHEN_OMITTED));
+                Self::InterruptionFilter(filter)
+            }
+            Self::TranscriptFilter(mut filter) => {
+                filter.negate = Some(filter.negate.unwrap_or(NEGATE_WHEN_OMITTED));
+                Self::TranscriptFilter(filter)
+            }
+            Self::SentimentFilter(mut filter) => {
+                filter.negate = Some(filter.negate.unwrap_or(NEGATE_WHEN_OMITTED));
+                Self::SentimentFilter(filter)
+            }
+        }
+    }
+}
+
+/// Every rule of `rules` as the service records it ([`Rule::with_recorded_negate`]), in
+/// the order the request listed them — what an operation that stores a category's rules
+/// stores.
+pub fn recorded_rules(rules: Vec<Rule>) -> Vec<Rule> {
+    rules.into_iter().map(Rule::with_recorded_negate).collect()
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.transcribe#Tag")]
 #[derive(Debug, Clone, Default)]
 pub struct Tag {

@@ -270,7 +270,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let record = crate::state::CallAnalyticsCategoryRecord {
             name: input.category_name.clone(),
-            rules: input.rules,
+            // The rules as this request listed them, each with its filter's `Negate`
+            // flag materialized ([`Rule::with_recorded_negate`]): the flag is RECORDED,
+            // so every operation that reports this category reports it as a boolean —
+            // exactly as the input type's own default is recorded just below.
+            rules: recorded_rules(input.rules),
             // "If you do not include InputType, your category is created as a post-call
             // category by default" — the default is RECORDED, so every operation that
             // reports this category reports the same input type.

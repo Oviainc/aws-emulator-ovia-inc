@@ -28,6 +28,7 @@
 
 use serde_json::{json, Value};
 
+use crate::call_analytics_rule_negate::as_recorded;
 use crate::call_analytics_rule_time_ranges::{missing_companion_message, whole_rule};
 use crate::transcription_jobs::Transcribe;
 
@@ -214,7 +215,8 @@ async fn an_update_refusal_names_the_missing_companion_and_keeps_the_stored_rule
             .await;
         let found = properties(&read, case)["Rules"].clone();
         assert_eq!(
-            found, replacement,
+            found,
+            as_recorded(&replacement),
             "case {case:?}: an accepted update must replace the stored rules, got \
              {found:?}"
         );

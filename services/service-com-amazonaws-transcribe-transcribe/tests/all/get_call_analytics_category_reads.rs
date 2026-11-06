@@ -34,6 +34,7 @@
 use serde_json::{json, Value};
 
 use crate::call_analytics_categories::{non_talk_time_rule, sentiment_rule, transcript_rule};
+use crate::call_analytics_rule_negate::as_recorded;
 use crate::transcription_jobs::{Reply, Transcribe};
 
 /// The status this service's awsJson1_1 wire protocol puts on every client error.
@@ -162,9 +163,9 @@ fn describes(found: &Value, row: &Stored) {
     );
     assert_eq!(
         found.get("Rules"),
-        Some(&row.rules),
-        "case {case:?}: the read must report the rules stored under this name, got \
-         {found:?}"
+        Some(&as_recorded(&row.rules)),
+        "case {case:?}: the read must report the rules stored under this name, as the \
+         service records them, got {found:?}"
     );
     assert_eq!(
         found.get("InputType"),

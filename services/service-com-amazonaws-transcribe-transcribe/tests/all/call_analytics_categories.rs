@@ -27,6 +27,7 @@
 
 use serde_json::{json, Value};
 
+use crate::call_analytics_rule_negate::as_recorded;
 use crate::transcription_jobs::{Reply, Transcribe};
 
 /// The modelled client error this family's refusals carry — a category it does not hold
@@ -224,8 +225,9 @@ fn describes(found: &Value, row: &Row) {
     );
     assert_eq!(
         found.get("Rules"),
-        Some(&Value::Array(row.rules.clone())),
-        "case {case:?}: the category must report the rules it was created with, got {found:?}"
+        Some(&as_recorded(&Value::Array(row.rules.clone()))),
+        "case {case:?}: the category must report the rules it was created with, as it \
+         records them, got {found:?}"
     );
     assert_eq!(
         found.get("Tags").cloned(),
@@ -466,7 +468,7 @@ async fn category_names_are_case_sensitive() {
             .await;
         assert_eq!(
             properties(&read, case).get("Rules"),
-            Some(&json!([transcript_rule(name)])),
+            Some(&as_recorded(&json!([transcript_rule(name)]))),
             "case {case:?}: {name} must report its own rules, got {:?}",
             read.body
         );

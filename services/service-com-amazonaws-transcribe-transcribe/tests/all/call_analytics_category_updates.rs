@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::call_analytics_rule_negate::as_recorded;
 use crate::transcription_jobs::{Reply, Transcribe};
 
 /// The status this service's awsJson1_1 wire protocol puts on every client error.
@@ -214,9 +215,9 @@ async fn an_update_replaces_every_rule_and_keeps_the_rest_of_the_category() {
 
             assert_eq!(
                 property(&updated_properties, case, "Rules"),
-                *replacement,
-                "case {case:?}: the updated rules must be exactly the request's, got \
-                 {updated_properties:?}"
+                as_recorded(replacement),
+                "case {case:?}: the updated rules must be exactly the request's, as the \
+                 service records them, got {updated_properties:?}"
             );
             assert_eq!(
                 property(&updated_properties, case, "CategoryName"),
@@ -356,7 +357,7 @@ async fn an_update_naming_the_other_input_type_is_refused_and_changes_nothing() 
             updated.ok_status(case, 200);
             assert_eq!(
                 properties(&updated, case)["Rules"],
-                rules(1),
+                as_recorded(&rules(1)),
                 "case {case:?}: an update naming the stored input type must replace the \
                  rules, got {:?}",
                 updated.body
@@ -437,7 +438,7 @@ async fn an_update_of_a_category_this_account_does_not_hold_is_refused() {
         .await;
     assert_eq!(
         properties(&read, case)["Rules"],
-        rules(2),
+        as_recorded(&rules(2)),
         "case {case:?}: the created category must keep its own rules, got {:?}",
         read.body
     );

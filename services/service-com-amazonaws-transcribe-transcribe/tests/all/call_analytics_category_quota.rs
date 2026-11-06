@@ -40,6 +40,7 @@ use service_com_amazonaws_transcribe_transcribe::state::{
 use crate::call_analytics_categories::{
     interruption_rule, non_talk_time_rule, sentiment_rule, transcript_rule,
 };
+use crate::call_analytics_rule_negate::as_recorded;
 use crate::transcription_jobs::Transcribe;
 
 /// The modelled client error this service answers for a category the Region a request
@@ -298,7 +299,7 @@ async fn a_delete_frees_exactly_one_slot() {
         let properties = read.ok(case)["CategoryProperties"].clone();
         assert_eq!(
             properties.get("Rules"),
-            Some(&Value::Array(probe.rules.clone())),
+            Some(&as_recorded(&Value::Array(probe.rules.clone()))),
             "case {case:?}: the category in the freed slot must report the rules it was \
              created with, got {properties:?}"
         );

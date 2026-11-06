@@ -37,6 +37,8 @@ mod call_analytics_job_start_preconditions;
 mod call_analytics_job_tagging;
 #[path = "all/call_analytics_jobs.rs"]
 mod call_analytics_jobs;
+#[path = "all/call_analytics_rule_negate.rs"]
+mod call_analytics_rule_negate;
 #[path = "all/call_analytics_rule_time_ranges.rs"]
 mod call_analytics_rule_time_ranges;
 #[path = "all/channel_definition_distinctness.rs"]

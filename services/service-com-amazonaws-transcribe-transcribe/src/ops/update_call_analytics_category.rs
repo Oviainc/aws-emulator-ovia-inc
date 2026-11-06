@@ -219,8 +219,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The overwrite: the rules the request carries REPLACE the stored ones, so the
-        // stored set is exactly this request's — never the two appended.
-        record.rules = input.rules;
+        // stored set is exactly this request's — never the two appended — and each one
+        // is recorded with its filter's `Negate` flag materialized, the same way the
+        // create records the rules it stores ([`Rule::with_recorded_negate`]).
+        record.rules = recorded_rules(input.rules);
         record.last_update_time = now;
 
         ::tracing::info!(

@@ -25,6 +25,7 @@
 
 use serde_json::{json, Value};
 
+use crate::call_analytics_rule_negate::as_recorded;
 use crate::transcription_jobs::Transcribe;
 
 /// The modelled client error a half-specified range is refused with, and the status
@@ -328,9 +329,9 @@ async fn a_create_whose_rule_time_ranges_are_whole_is_accepted_and_read_back() {
             let found = read.ok(&case)["CategoryProperties"]["Rules"].clone();
             assert_eq!(
                 found,
-                Value::Array(rules),
+                as_recorded(&Value::Array(rules)),
                 "case {case:?}: the category must report the rules it was created with, \
-                 got {found:?}"
+                 as it records them, got {found:?}"
             );
         }
     }
@@ -401,7 +402,7 @@ async fn an_update_with_a_half_specified_rule_time_range_is_refused_and_changes_
             let found = updated.ok(&case)["CategoryProperties"]["Rules"].clone();
             assert_eq!(
                 found,
-                Value::Array(replacement),
+                as_recorded(&Value::Array(replacement)),
                 "case {case:?}: an accepted update must replace the stored rules, got \
                  {found:?}"
             );
