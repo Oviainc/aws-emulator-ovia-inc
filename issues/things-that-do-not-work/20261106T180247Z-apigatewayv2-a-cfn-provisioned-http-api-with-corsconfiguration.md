@@ -1,0 +1,49 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: apigatewayv2.deploy-apigatewayv2-1-http-api-cors-removed-in-place-then-api-replaced
+Issue-Shape-Id: com.amazonaws.apigatewayv2#ApiGatewayV2
+Issue-Key: apigatewayv2.deploy-apigatewayv2-1-http-api-cors-removed-in-place-then-api-replaced|_poll_http#18|Timeout|time.sleep(interval_s)
+Issue-Commit: aced2d7a7a8791505dae5681e5c5c62e3a68d2ec
+
+# apigatewayv2: a CFN-provisioned HTTP API with CorsConfiguration never completes the CORS-removed-in-place-then-replaced lifecycle — the check hangs instead of serving/refusing
+
+> _Note: this issue was identified against the code base at commit `aced2d7a7a8791505dae5681e5c5c62e3a68d2ec`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+UpdateApi
+
+## Description
+Cause 1 of 1: an HTTP API provisioned by a CloudFormation stack with an AWS::ApiGatewayV2::Api CorsConfiguration, a Lambda AWS_PROXY route 'GET /a' and an AutoDeploy $default stage never carries the whole in-place-update-then-replacement lifecycle to a terminal answer. The replayed check makes no forward progress and is killed by the harness ('Check timed out after 60.0s'), so none of the stages below is reached in a state a client could observe.
+
+Failing check id: apigatewayv2.deploy-apigatewayv2-1-http-api-cors-removed-in-place-then-api-replaced
+
+AWS: the lifecycle this check replays is specified stage by stage.
+(a) Smithy (services/service-com-amazonaws-apigatewayv2-apigatewayv2/smithy-model/com-amazonaws-apigatewayv2-apigatewayv2.json): GetApi — GET /v2/apis/{ApiId}, 200, output members ApiId/ApiEndpoint/ProtocolType/Description/CorsConfiguration (target Cors, jsonName corsConfiguration); errors NotFoundException (404) and TooManyRequestsException (429). So after the create phase GetApi must answer 200 with ProtocolType 'HTTP', the Description the template declared for that phase, and CorsConfiguration.AllowOrigins/AllowMethods exactly as declared.
+(b) Data plane with CORS configured: the real GET on the $default stage invoke URL answers 200 with the integration's body AND stamps Access-Control-Allow-Origin set to the allowed origin; an OPTIONS preflight (Origin + Access-Control-Request-Method + Access-Control-Request-Headers) is answered by the gateway itself with 204, echoing Access-Control-Allow-Origin, listing the configured method in Access-Control-Allow-Methods and carrying Access-Control-Max-Age equal to the configured MaxAge. The fixed text here is the header names, the 204 status and the fact that the values are echoed; the origin, method list and max-age value are taken from the API's CorsConfiguration, never from one recording.
+(c) Smithy UpdateApi — PATCH /v2/apis/{ApiId}, 200, input member CorsConfiguration (target Cors). Removing CorsConfiguration from the template is an in-place Modify (the change set reports Replacement 'False' for that logical id, and only that logical id changes): the physical ApiId is preserved, GetApi stops returning CorsConfiguration at all (the member is absent, not an empty object), the preflight stops being gateway-answered and falls through to route matching — with no OPTIONS route that is 404 and NO Access-Control-Allow-Origin header — while GET /a keeps answering 200 with the integration body and no CORS headers.
+(d) Repointing the Route's ApiId at a new Api logical id replaces the Route (change set: Action Modify, Replacement 'True', detail target ApiId with RequiresRecreation 'Always'), removes the old Api (Action Remove) and adds the new one (Action Add). The new ApiId differs from the old, the Route's physical id differs, GetRoutes on the new Api lists exactly RouteKey 'GET /a', and the new endpoint serves the same integration at 200.
+(e) GetApi on the Api the update deleted must be refused NotFoundException / HTTP 404 with message 'Invalid API identifier specified <account>:<apiId>' — fixed text 'Invalid API identifier specified ', then the caller's account id and the requested ApiId from the request, colon-joined; those two values come from the request and state, not from any recording. The deleted Api's execute-api hostname must stop routing and answer 404.
+
+Emulator: the replay never gets far enough to produce any of (a)–(e). The check is aborted at the 60 s harness budget with no AWS error and no HTTP status — i.e. a call in the create/serve prefix (stack create to CREATE_COMPLETE, GetApi, or the poll of GET /a on the $default AutoDeploy stage) never returns a terminal result, so the emulator neither serves the CORS-configured route nor refuses it. All of the CORS-removal and Api-replacement assertions downstream are consequently unexercised.
+
+Why: a client that deploys an HTTP API by CloudFormation and then drives it gets no answer at all on this path. Browser clients never see the preflight contract (204 + echoed Access-Control-Allow-Origin/Allow-Methods/Max-Age while configured, 404 + no CORS headers once removed), stack-update tooling cannot tell an in-place Modify from a replacement, and code that relies on the deleted Api being refused with NotFoundException ('Invalid API identifier specified <account>:<apiId>') and on its endpoint 404ing instead hangs until its own socket timeout — which clients read as an availability failure rather than as the modelled refusal.
+
+Fix: the apigatewayv2 execute-api data plane for CFN-provisioned HTTP APIs and its CORS layer (gateway-answered OPTIONS preflight and Access-Control-* stamping on real responses), the UpdateApi handler's CorsConfiguration clear-on-absent semantics and its state, plus the CloudFormation AWS::ApiGatewayV2::Api/Route update path (in-place Modify vs ApiId-driven replacement, and cleanup deletion of the replaced Api so GetApi and the endpoint both refuse). Note: open issue 20261024T120951Z-apigatewayv2-the-execute-api-http-and-websocket-data-planes-remain-open.md and 20261027T053233Z-apigatewayv2-9-net-new-root-causes-api-mapping.md describe adjacent data-plane/CFN-materialisation defects, but the suite did not attribute this check to either, so it is filed here as its own cause.
+
+Traces: apigatewayv2.deploy-apigatewayv2-1-http-api-cors-removed-in-place-then-api-replaced (verdict mismatch, 'Check timed out after 60.0s'); the check body is the one that asserts (a)–(e) in that order.
+
+## Evidence
+Expected (AWS): create phase — GetApi 200 with ProtocolType 'HTTP', Description 'sim2real phase cors', CorsConfiguration.AllowOrigins == [the stack's AllowedOrigin] and AllowMethods == ['GET']; GET <invoke-url>/a 200 with the Lambda body (route key 'GET /a', payload version '2.0') and header access-control-allow-origin == the allowed origin; OPTIONS <invoke-url>/a with Origin/Access-Control-Request-Method/Access-Control-Request-Headers -> 204 with access-control-allow-origin echoed, 'GET' present in access-control-allow-methods and access-control-max-age == the configured MaxAge (300 in this template). Update #1 — change set lists only the Api logical id, Action 'Modify', Replacement 'False'; ApiId unchanged; GetApi Description 'sim2real phase nocors' and no CorsConfiguration member; OPTIONS -> 404 with no access-control-allow-origin; GET -> 200 with no access-control-allow-origin. Update #2 — change set: old Api Action 'Remove', new Api Action 'Add', Route Action 'Modify' with Replacement 'True' and detail ('ApiId','Always'); new ApiId != old; Route physical id changed; GetRoutes(new) == {'GET /a'}; new endpoint 200; GetApi(old) -> ClientError NotFoundException, HTTP 404, Message 'Invalid API identifier specified <account>:<old-apiId>'; old endpoint -> 404.
+
+Actual (emulator): the check produces none of these. It is aborted by the harness: 'Error: Check timed out after 60.0s'. No HTTP status, no error code and no error message are returned on the path at all — a call in the stack-create / GetApi / GET-/a prefix never reaches a terminal state within the budget, so neither the served 200+CORS headers nor the later 404/NotFoundException refusals are ever observable.
+
+## Steps to Reproduce
+1. Boot the emulator from this checkout and run the behavioral suite.
+2. Replay check apigatewayv2.deploy-apigatewayv2-1-http-api-cors-removed-in-place-then-api-replaced (service heading: apigatewayv2).
+3. Equivalent by hand: CreateStack from deployments/http-api-lambda-cors-update-replace.yaml with Phase=cors (parameters ApiName/FunctionName/RoleName/AllowedOrigin, Capabilities CAPABILITY_NAMED_IAM) and wait for CREATE_COMPLETE; read ApiIdOut.
+4. GetApi(ApiId=<ApiIdOut>) — expect 200 with ProtocolType HTTP and the declared CorsConfiguration.
+5. GET <api_url>/$default/a with header Origin: <AllowedOrigin> — expect 200 plus access-control-allow-origin: <AllowedOrigin>. Then OPTIONS the same URL with Origin + Access-Control-Request-Method: GET + Access-Control-Request-Headers: content-type — expect 204 with the echoed origin, GET in access-control-allow-methods and access-control-max-age: 300.
+6. CreateChangeSet(ChangeSetType=UPDATE) for Phase=nocors and DescribeChangeSet — expect only the Api logical id, Action Modify, Replacement False. UpdateStack to Phase=nocors, wait UPDATE_COMPLETE, then GetApi (no CorsConfiguration), OPTIONS (404, no CORS headers) and GET (200, no CORS headers).
+7. CreateChangeSet for Phase=replaced and DescribeChangeSet — expect old Api Remove, new Api Add, Route Modify/Replacement True with ('ApiId','Always'). UpdateStack, then GetApi on the OLD ApiId — expect NotFoundException 404 'Invalid API identifier specified <account>:<old-apiId>' — and GET the old endpoint — expect 404.
+8. Observe instead that the run never reaches a terminal answer and is killed at the 60 s budget.
