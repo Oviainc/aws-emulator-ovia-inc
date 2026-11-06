@@ -355,11 +355,15 @@ impl SnapshotRecord {
 }
 
 /// `Status` values this crate names. The full value set is `AUTH_VALUES`' sibling
-/// `STATUS_VALUES` in `ops::types`; these are the three the cluster lifecycle uses.
+/// `STATUS_VALUES` in `ops::types`; these are the ones the cluster and snapshot
+/// lifecycles use.
 pub const STATUS_CREATING: &str = "CREATING";
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 pub const STATUS_UPDATING: &str = "UPDATING";
 pub const STATUS_DELETING: &str = "DELETING";
+/// The status a snapshot being copied from another snapshot carries until the clock
+/// owes it `ACTIVE`; `CopyClusterSnapshot` is the only operation that starts it.
+pub const STATUS_COPYING: &str = "COPYING";
 
 /// The `OptInType` values the maintenance-action opt-in path names.
 ///

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CopyClusterSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CopyClusterSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CopyClusterSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a NEW manual cluster snapshot from an existing one: the copy carries its own
+//! `snapshotName`, `snapshotArn` and `snapshotCreationTime`, and takes everything else
+//! — the source cluster it was taken from, that cluster's creation time, its
+//! administrator user name, network identifiers and the configuration a restore needs —
+//! from the snapshot being copied, so it outlives both the source snapshot and the
+//! source cluster. An unknown `snapshotArn` is `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +165,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CopyClusterSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CopyClusterSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CopyClusterSnapshot"))
+        use crate::state;
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(CopyClusterSnapshotErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: state::STORE_UNREACHABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let region = state::request_region(ctx.parts());
+        // Caller-sized values are bounded BEFORE they are stored. The target name is
+        // stored twice — on the record and as the key of the name index — so it is
+        // bounded here as well as by its modelled member length.
+        state::validate_snapshot_name("targetSnapshotName", &input.target_snapshot_name)
+            .map_err(CopyClusterSnapshotErrorModeled::ValidationException)?;
+        if let Some(tags) = input.tags.as_ref() {
+            state::validate_tags("tags", tags)
+                .map_err(CopyClusterSnapshotErrorModeled::ValidationException)?;
+        }
+        if let Some(key) = input.kms_key_id.as_deref() {
+            state::validate_kms_key_id("kmsKeyId", key)
+                .map_err(CopyClusterSnapshotErrorModeled::ValidationException)?;
+        }
+
+        let mut guard = store.lock();
+        // The snapshot being copied is resolved FIRST, so a request naming a snapshot
+        // that does not exist is a 404 rather than a quota or name conflict. Everything
+        // the copy inherits is taken here, in one lookup.
+        let Some(source) = guard.snapshots.get_mut(&input.snapshot_arn) else {
+            return Err(CopyClusterSnapshotErrorModeled::ResourceNotFoundException(
+                state::not_found(state::ResourceKind::ClusterSnapshot, &input.snapshot_arn),
+            )
+            .into());
+        };
+        // Completes the transition the clock already made due on the snapshot being
+        // read, which was owed at this instant whether or not anybody called.
+        source.settle_due();
+        let cluster_arn = source.cluster_arn.clone();
+        let cluster_creation_time = source.cluster_creation_time.clone();
+        let admin_user_name = source.admin_user_name.clone();
+        // Absent a `kmsKeyId` the copy is encrypted with the same key as the source
+        // snapshot, as `CopyClusterSnapshotInput$kmsKeyId` documents. Every snapshot
+        // this service holds carries a key — an explicit one or the AWS-owned sentinel
+        // — so there is no unencrypted source for which a named key is refused.
+        let kms_key_id = input.kms_key_id.unwrap_or_else(|| source.kms_key_id.clone());
+        let subnet_ids = source.subnet_ids.clone();
+        let vpc_security_group_ids = source.vpc_security_group_ids.clone();
+        // The copy is independent of the snapshot it was made from, so it carries its
+        // own record of the source cluster's configuration and a later delete of the
+        // source snapshot leaves a restore from the copy intact.
+        let source_config = source.source_config.clone();
+        // `copyTags` defaults to false, so the copy starts with no tags of the source's
+        // unless the request asked for them; the request's own `tags` are then assigned
+        // to the new snapshot, and win on a key both carry.
+        let mut tags = if input.copy_tags.unwrap_or(false) {
+            source.tags.clone()
+        } else {
+            ::std::collections::BTreeMap::new()
+        };
+        tags.extend(input.tags.unwrap_or_default());
+        state::ensure_tag_capacity("tags", tags.len())
+            .map_err(CopyClusterSnapshotErrorModeled::ValidationException)?;
+
+        // The snapshot map is reclaimed only by DeleteClusterSnapshot, so the record
+        // count is capped.
+        state::ensure_snapshot_capacity(guard.snapshots.len())
+            .map_err(CopyClusterSnapshotErrorModeled::ServiceQuotaExceededException)?;
+        if let Some(existing_arn) = guard.snapshot_names.get(&input.target_snapshot_name) {
+            return Err(CopyClusterSnapshotErrorModeled::ConflictException(
+                state::conflict(
+                    state::ResourceKind::ClusterSnapshot,
+                    existing_arn,
+                    format!(
+                        "A cluster snapshot named {} already exists",
+                        input.target_snapshot_name
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let snapshot_id = state::new_resource_id();
+        let snapshot_arn = state::ResourceKind::ClusterSnapshot.arn(&region, &snapshot_id);
+        let record = state::SnapshotRecord {
+            snapshot_name: input.target_snapshot_name,
+            snapshot_arn: snapshot_arn.clone(),
+            // The copy records the cluster the SOURCE snapshot was taken from: the copy
+            // is of that cluster's data, and no new cluster is involved.
+            cluster_arn,
+            // The copy is taken now; the source cluster's creation time is the source
+            // snapshot's, because it describes that cluster and not this copy.
+            snapshot_creation_time: state::now_utc(),
+            cluster_creation_time,
+            status: state::STATUS_COPYING.to_string(),
+            // A snapshot the caller asked for is MANUAL, whatever the type of the one it
+            // was copied from: AWS reserves AUTOMATED for the ones it takes itself.
+            snapshot_type: state::SNAPSHOT_TYPE_MANUAL.to_string(),
+            admin_user_name,
+            kms_key_id,
+            subnet_ids,
+            vpc_security_group_ids,
+            tags,
+            source_config,
+            // Reported COPYING, with ACTIVE owed by the clock.
+            settles_at: Some(state::settle_instant()),
+        };
+
+        let snapshot = record.as_snapshot();
+        guard
+            .snapshot_names
+            .insert(record.snapshot_name.clone(), snapshot_arn.clone());
+        guard.snapshots.insert(snapshot_arn, record);
+        drop(guard);
+
+        Ok(CopyClusterSnapshotOutput { snapshot })
     }
 }

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
+#[path = "all/cluster_snapshot_copy.rs"]
+mod cluster_snapshot_copy;
 #[path = "all/cluster_snapshot_listing.rs"]
 mod cluster_snapshot_listing;
 #[path = "all/concurrent_cluster_modification.rs"]
