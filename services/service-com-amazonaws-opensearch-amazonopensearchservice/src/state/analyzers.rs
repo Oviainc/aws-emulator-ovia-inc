@@ -8,7 +8,7 @@
 //! anything else cannot be parsed, so it is refused and nothing of it is stored — the
 //! rule this module states, for every operation that writes a field mapping.
 
-use super::indexes::SCHEMA_ANALYSIS;
+use super::indexes::{sections_named, SCHEMA_ANALYSIS};
 use super::*;
 
 /// The members of a field mapping that name an analyzer BY NAME: a text field's
@@ -85,9 +85,12 @@ pub const BUILT_IN_ANALYZERS: &[&str] = &[
 ///
 /// Only what is under a `mappings` section is read: an `analyzer` member elsewhere in a
 /// schema is an analysis setting's own structure (`analysis.analyzer.<name>` is where one
-/// is DEFINED), not a reference to a name. Within that section every nesting level is
-/// walked, because a field mapping reaches an analyzer at any depth — an object field's
-/// property, a multi-field, a dynamic template's mapping.
+/// is DEFINED), not a reference to a name. Those sections are looked for WHEREVER they
+/// appear, the same reading [`super::indexes::sections_named`] gives the analysis
+/// settings, since what reaches the cluster is the whole document rather than one fixed
+/// shape; and within a section every nesting level is walked, because a field mapping
+/// reaches an analyzer at any depth — an object field's property, a multi-field, a
+/// dynamic template's mapping.
 ///
 /// A member carrying something other than a name refers to no analyzer name, so it is
 /// left to the rules about what a mapping member may hold. Iterative rather than
@@ -95,28 +98,10 @@ pub const BUILT_IN_ANALYZERS: &[&str] = &[
 pub fn mapping_analyzer_references(schema: &::aws_smithy_types::Document) -> Vec<String> {
     use ::aws_smithy_types::Document;
 
-    // The mapping sections first, wherever they appear — the same reading
-    // [`package_references`] makes of the analysis sections.
-    let mut mappings: Vec<&Document> = Vec::new();
-    let mut pending = vec![schema];
-    while let Some(node) = pending.pop() {
-        match node {
-            Document::Object(members) => {
-                for (name, child) in members {
-                    if name == SCHEMA_MAPPINGS {
-                        mappings.push(child);
-                    } else {
-                        pending.push(child);
-                    }
-                }
-            }
-            Document::Array(elements) => pending.extend(elements.iter()),
-            _ => {}
-        }
-    }
-
+    // Each matched section is walked whole below, so one nested inside another is not
+    // reported separately.
     let mut referenced: BTreeSet<String> = BTreeSet::new();
-    let mut pending = mappings;
+    let mut pending = sections_named(schema, SCHEMA_MAPPINGS, false);
     while let Some(node) = pending.pop() {
         match node {
             Document::Object(members) => {
@@ -142,29 +127,16 @@ pub fn mapping_analyzer_references(schema: &::aws_smithy_types::Document) -> Vec
 ///
 /// The analysis sections are looked for wherever they appear, for the reason
 /// [`SCHEMA_ANALYSIS`] gives: the same settings reach the cluster both directly under
-/// the index's settings and under the `index` section inside them. Iterative rather than
-/// recursive, so a deeply nested document costs no stack.
+/// the index's settings and under the `index` section inside them. Only each section's
+/// own analyzer member is read, so a section nested inside another is reported as a
+/// section of its own.
 pub fn configured_analyzers(schema: &::aws_smithy_types::Document) -> BTreeSet<String> {
     use ::aws_smithy_types::Document;
 
     let mut configured: BTreeSet<String> = BTreeSet::new();
-    let mut pending = vec![schema];
-    while let Some(node) = pending.pop() {
-        match node {
-            Document::Object(members) => {
-                for (name, child) in members {
-                    if name == SCHEMA_ANALYSIS {
-                        if let Some(Document::Object(defined)) =
-                            object_member(child, ANALYSIS_ANALYZERS)
-                        {
-                            configured.extend(defined.keys().cloned());
-                        }
-                    }
-                    pending.push(child);
-                }
-            }
-            Document::Array(elements) => pending.extend(elements.iter()),
-            _ => {}
+    for section in sections_named(schema, SCHEMA_ANALYSIS, true) {
+        if let Some(Document::Object(defined)) = object_member(section, ANALYSIS_ANALYZERS) {
+            configured.extend(defined.keys().cloned());
         }
     }
     configured

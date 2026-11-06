@@ -630,6 +630,46 @@ impl PackageReference {
     }
 }
 
+/// Every sub-document of `schema` that a member named `name` carries, wherever in the
+/// schema that member appears.
+///
+/// ONE statement of the walk every reading of a named schema section makes — the
+/// analysis settings ([`package_references`]) and the field mappings
+/// ([`crate::state::mapping_analyzer_references`], [`crate::state::configured_analyzers`])
+/// — so where a section is looked for is decided in one place. `descend` says whether a
+/// section nested INSIDE a matched one is reported as a section of its own: a reading that
+/// then walks the whole matched subtree needs it false, one that reads only each section's
+/// own members needs it true. Iterative rather than recursive, so a deeply nested document
+/// costs no stack, and each pending entry is one borrow.
+pub(super) fn sections_named<'a>(
+    schema: &'a ::aws_smithy_types::Document,
+    name: &str,
+    descend: bool,
+) -> Vec<&'a ::aws_smithy_types::Document> {
+    use ::aws_smithy_types::Document;
+
+    let mut found: Vec<&Document> = Vec::new();
+    let mut pending = vec![schema];
+    while let Some(node) = pending.pop() {
+        match node {
+            Document::Object(members) => {
+                for (member, child) in members {
+                    if member == name {
+                        found.push(child);
+                        if !descend {
+                            continue;
+                        }
+                    }
+                    pending.push(child);
+                }
+            }
+            Document::Array(elements) => pending.extend(elements.iter()),
+            _ => {}
+        }
+    }
+    found
+}
+
 /// Every package file `schema`'s analysis settings name by path.
 ///
 /// An index's analysis settings reference a custom dictionary package's content BY the
@@ -642,24 +682,9 @@ pub fn package_references(schema: &::aws_smithy_types::Document) -> Vec<PackageR
     use ::aws_smithy_types::Document;
 
     // The analysis sections first: a path setting outside one names no analyzer's
-    // content, so only what is under them is read out.
-    let mut analysis: Vec<&Document> = Vec::new();
-    let mut pending = vec![schema];
-    while let Some(node) = pending.pop() {
-        match node {
-            Document::Object(members) => {
-                for (name, child) in members {
-                    if name == SCHEMA_ANALYSIS {
-                        analysis.push(child);
-                    } else {
-                        pending.push(child);
-                    }
-                }
-            }
-            Document::Array(elements) => pending.extend(elements.iter()),
-            _ => {}
-        }
-    }
+    // content, so only what is under them is read out. Each matched section is walked
+    // whole below, so one nested inside another is not reported separately.
+    let analysis = sections_named(schema, SCHEMA_ANALYSIS, false);
 
     let mut references: Vec<PackageReference> = Vec::new();
     let mut pending = analysis;
