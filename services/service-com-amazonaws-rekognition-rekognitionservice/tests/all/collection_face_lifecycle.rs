@@ -21,7 +21,9 @@
 //!   the collection reports the same values;
 //! * `DeleteFaces` reports in `DeletedFaces` the ids it removed and reserves
 //!   `UnsuccessfulFaceDeletions` for faces the collection still holds, so a `FaceId` the
-//!   collection never held is reported in NEITHER list, wherever it sits in the request.
+//!   collection never held is reported in NEITHER list, wherever it sits in the request —
+//!   including one this service minted for ANOTHER collection, which the delete leaves
+//!   where it is.
 //!
 //! Every assertion goes over HTTP and reads only the status, the wire error code and the
 //! JSON body, and every image is DRAWN by the test, so an answer that was not computed from
@@ -64,6 +66,34 @@ fn collection_id_forms() -> Vec<(&'static str, String)> {
         ),
         ("the longest id the model allows", "z9".repeat(127) + "y"),
     ]
+}
+
+/// Index the one-face portrait `seed` draws into `collection_id` and answer the `FaceId`
+/// the service minted for it, having checked the face carries what was measured.
+async fn enrol_one_face(
+    router: &MultiServiceRouter,
+    case: &str,
+    collection_id: &str,
+    seed: u32,
+) -> String {
+    let reply = call(
+        router,
+        "IndexFaces",
+        json!({
+            "CollectionId": collection_id,
+            "Image": bytes_image(&one_face_png(seed)),
+        }),
+    )
+    .await;
+    let records = reply.list("FaceRecords");
+    assert_eq!(
+        records.len(),
+        1,
+        "case {case:?}: the portrait's one face must be enrolled, got {:?}",
+        reply.body
+    );
+    let (face_id, _, _) = assert_measured(case, &face_of(case, &records[0]));
+    face_id
 }
 
 /// A `FaceId` of the modelled form
@@ -515,27 +545,16 @@ async fn delete_faces_ignores_ids_the_collection_never_held() {
 
     let mut stored = Vec::new();
     for seed in 11..16u32 {
-        let reply = call(
-            &router,
-            "IndexFaces",
-            json!({
-                "CollectionId": collection_id,
-                "Image": bytes_image(&one_face_png(seed)),
-            }),
-        )
-        .await;
-        let records = reply.list("FaceRecords");
-        assert_eq!(
-            records.len(),
-            1,
-            "seed {seed}: the portrait's one face must be enrolled, got {:?}",
-            reply.body
-        );
-        let case = format!("seed {seed}");
-        let (face_id, _, _) = assert_measured(&case, &face_of(&case, &records[0]));
-        stored.push(face_id);
+        stored.push(enrol_one_face(&router, &format!("seed {seed}"), collection_id, seed).await);
     }
     let mut held = stored.len() as i64;
+
+    // A second collection with a face of its own, so "an id this collection never held" also
+    // covers an id this service DID mint — for somewhere else. A face is held by exactly one
+    // collection, so deleting from this one must not reach the other's.
+    let other_collection = "mixed-deletes-other";
+    seed_collection(&router, "the other collection", other_collection).await;
+    let other_face = enrol_one_face(&router, "the other collection", other_collection, 21).await;
 
     // Rows differ along where the never-indexed ids sit in the request, how many of them
     // there are, and whether any stored id is named beside them — including the id of a face
@@ -573,6 +592,11 @@ async fn delete_faces_ignores_ids_the_collection_never_held() {
             "an id this collection held and already lost",
             vec![stored[0].clone(), stored[4].clone()],
             vec![stored[4].clone()],
+        ),
+        (
+            "an id another collection holds",
+            vec![other_face.clone()],
+            vec![],
         ),
     ];
 
@@ -653,4 +677,18 @@ async fn delete_faces_ignores_ids_the_collection_never_held() {
             "case {case:?}: the collection lists exactly the surviving faces, got {listed:?}"
         );
     }
+
+    // Nothing the other collection holds was touched by any of those requests: a face
+    // belongs to one collection, so naming its id in another collection's delete removes
+    // nothing anywhere.
+    let other_listed: Vec<String> = listed_faces(&router, "the other collection", other_collection)
+        .await
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect();
+    assert_eq!(
+        other_listed,
+        vec![other_face],
+        "the other collection must still hold its own face, got {other_listed:?}"
+    );
 }
