@@ -13,8 +13,8 @@
 use std::collections::BTreeMap;
 
 use crate::ops::types::{
-    Descriptors, DiscoverableRegistryRecordSummary, RegistryRecordSummary, ValidationException,
-    ValidationExceptionField,
+    Descriptors, DiscoverableRegistryRecordSummary, RegistryRecordSummary,
+    ResourceNotFoundException, ValidationException, ValidationExceptionField,
 };
 use ::aws_smithy_types::{DateTime, Document};
 
@@ -99,6 +99,23 @@ pub fn field_validation(member: &str, message: &str) -> ValidationException {
             name: member.to_string(),
             message: message.to_string(),
         }]),
+    }
+}
+
+/// The fixed text of the refusal a discovery read answers for a registry this
+/// service does not hold. The identifier follows it and is the only variable part.
+const REGISTRY_NOT_FOUND: &str = "Registry not found: ";
+
+/// The modelled `ResourceNotFoundException` a discovery read answers when the
+/// `RegistryIdentifier` it was given names no registry this store holds.
+///
+/// Shared by every operation that resolves a registry, so one refusal is worded
+/// one way. The identifier is stated exactly as the request supplied it — a bare
+/// registry id or the registry's full ARN — never the id parsed back out of it,
+/// so a caller reads its own value back.
+pub fn registry_not_found(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("{REGISTRY_NOT_FOUND}{identifier}")),
     }
 }
 

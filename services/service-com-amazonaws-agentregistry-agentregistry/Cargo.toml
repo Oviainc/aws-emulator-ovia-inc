@@ -23,6 +23,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Hex codec for the opaque `nextToken` ListDiscoverableRegistryRecords mints.
 hex = { workspace = true }
+# The shared home for how a service states the framework's constraint refusal.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

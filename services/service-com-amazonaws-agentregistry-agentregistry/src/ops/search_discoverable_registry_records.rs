@@ -219,9 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(registry) = state.registry(registry_id) else {
                 return Err(
                     SearchDiscoverableRegistryRecordsErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(format!("Registry {registry_id} was not found.")),
-                        },
+                        crate::state::registry_not_found(registry_id),
                     )
                     .into(),
                 );

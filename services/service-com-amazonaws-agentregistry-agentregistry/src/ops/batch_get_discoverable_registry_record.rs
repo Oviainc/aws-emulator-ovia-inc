@@ -193,12 +193,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut errors = Vec::new();
 
         for entry in &input.entries {
-            // A registry this store does not hold is reported per record, like any
-            // other record that cannot be retrieved: the model's own doc says records
-            // that cannot be retrieved are "reported individually in the `errors` list
-            // rather than failing the entire request".
+            // The entry's registry is resolved BEFORE any of its record ids: the
+            // model's `errors` list reports records that could not be retrieved from
+            // a registry, so a registry that does not exist at all is the whole
+            // call's failure and not a per-record error. Answering 200 there would
+            // make a deleted or mistyped registry indistinguishable from one holding
+            // none of the requested records.
+            let Some(registry) = state.registry(&entry.registry_id) else {
+                return Err(registry_not_found(&entry.registry_id));
+            };
             let registry_id = crate::state::registry_id_from_identifier(&entry.registry_id);
-            let registry = state.registry(&entry.registry_id);
             for requested in &entry.record_ids {
                 // A record ARN names its own registry; one that names a different
                 // registry than the entry does not resolve here, the same as any
@@ -207,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::record_identifier_parts(requested);
                 let in_scope = named_registry.is_none_or(|named| named == registry_id);
                 let record = in_scope
-                    .then(|| registry.and_then(|registry| registry.discoverable_record(record_id)))
+                    .then(|| registry.discoverable_record(record_id))
                     .flatten();
                 match record {
                     Some(record) => registry_records.push(record.summary()),
@@ -254,6 +258,16 @@ const MAX_RECORD_IDS_PER_ENTRY: usize = 100;
 fn field_validation(member: &str, message: &str) -> BatchGetDiscoverableRegistryRecordError {
     BatchGetDiscoverableRegistryRecordErrorModeled::ValidationException(
         crate::state::field_validation(member, message),
+    )
+    .into()
+}
+
+/// The modelled 404 `ResourceNotFoundException` for an entry naming a registry
+/// this service does not hold, worded by the one shared constructor every
+/// discovery read answers that refusal through.
+fn registry_not_found(identifier: &str) -> BatchGetDiscoverableRegistryRecordError {
+    BatchGetDiscoverableRegistryRecordErrorModeled::ResourceNotFoundException(
+        crate::state::registry_not_found(identifier),
     )
     .into()
 }

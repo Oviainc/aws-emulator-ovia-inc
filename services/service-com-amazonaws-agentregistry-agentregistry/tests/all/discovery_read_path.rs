@@ -25,13 +25,13 @@ use service_com_amazonaws_agentregistry_agentregistry::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The registry the single-registry cases read.
-const REGISTRY: &str = "abc123def456";
+pub(crate) const REGISTRY: &str = "abc123def456";
 /// A second registry, holding more records than a default page, so the documented
 /// page defaults are observable.
-const BULK_REGISTRY: &str = "bulkreg00001";
+pub(crate) const BULK_REGISTRY: &str = "bulkreg00001";
 /// A registry that exists but holds no *discoverable* record, so a refusal can be
 /// shown not to depend on what the store holds.
-const EMPTY_REGISTRY: &str = "emptyreg0001";
+pub(crate) const EMPTY_REGISTRY: &str = "emptyreg0001";
 /// How many records `BULK_REGISTRY` holds.
 const BULK_RECORDS: usize = 12;
 
@@ -45,7 +45,7 @@ const UPDATED_AT_SECS: i64 = 1_769_990_400;
 const DISCOVERABLE: [&str; 3] = ["rec000000001", "rec000000002", "rec000000004"];
 
 /// A router serving this service over a freshly seeded store.
-fn seeded_router() -> MultiServiceRouter {
+pub(crate) fn seeded_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     seed(&engine);
     let mut router = MultiServiceRouter::new();
@@ -193,7 +193,7 @@ fn document_object(entries: &[(&str, Document)]) -> Document {
 
 /// POST `path` with `body` through the router, returning the HTTP status and the
 /// parsed response body.
-async fn post(router: &MultiServiceRouter, path: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn post(router: &MultiServiceRouter, path: &str, body: &Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("https://agent-registry.us-east-1.amazonaws.com{path}"))
@@ -225,28 +225,30 @@ async fn post(router: &MultiServiceRouter, path: &str, body: &Value) -> (u16, Va
     (status, parsed)
 }
 
-fn list_path(registry: &str) -> String {
+pub(crate) fn list_path(registry: &str) -> String {
     format!(
         "/registries/{}/discoverable-records-list",
         encode_label(registry)
     )
 }
 
-/// The `@httpLabel` form of an identifier. A non-greedy label is percent-encoded
-/// on the wire, so the `:` and `/` of a registry ARN arrive escaped.
-fn encode_label(value: &str) -> String {
+/// The `@httpLabel` form of an identifier: every byte outside the unreserved set is
+/// percent-encoded, so the `:` and `/` of a registry ARN arrive escaped and so does
+/// the space or punctuation a malformed identifier carries.
+pub(crate) fn encode_label(value: &str) -> String {
     value
-        .chars()
-        .map(|c| match c {
-            ':' => "%3A".to_string(),
-            '/' => "%2F".to_string(),
-            other => other.to_string(),
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(byte).to_string()
+            }
+            other => format!("%{other:02X}"),
         })
         .collect()
 }
 
 /// The `recordId`s of a response's `registryRecords`, in response order.
-fn record_ids(case: &str, body: &Value) -> Vec<String> {
+pub(crate) fn record_ids(case: &str, body: &Value) -> Vec<String> {
     body["registryRecords"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: registryRecords must be a list, got {body}"))
@@ -676,27 +678,29 @@ async fn batch_get_reports_each_unresolvable_record_without_failing_the_call() {
 #[tokio::test]
 async fn batch_get_serializes_both_required_lists_even_when_one_is_empty() {
     let router = seeded_router();
-    let cases: [(&str, Value, usize, usize); 3] = [
+    // (case, the registry the entry names, the record ids it asks for, records, errors)
+    let cases: [(&str, &str, Value, usize, usize); 3] = [
         (
             "all resolve",
+            REGISTRY,
             json!(["rec000000001", "rec000000002"]),
             2,
             0,
         ),
-        ("none resolve", json!(["zzz999999999"]), 0, 1),
+        ("none resolve", REGISTRY, json!(["zzz999999999"]), 0, 1),
         (
-            "unknown registry",
+            // A registry that EXISTS but exposes none of the requested records: the
+            // per-record `errors` list is for exactly this, while a registry the
+            // store does not hold is refused outright (pinned by
+            // `tests/all/registry_read_refusals.rs`).
+            "registry with no discoverable record",
+            EMPTY_REGISTRY,
             json!(["rec000000001"]),
             0,
             1,
         ),
     ];
-    for (case, record_ids_requested, records, errors) in cases {
-        let registry_id = if case == "unknown registry" {
-            "999999999999"
-        } else {
-            REGISTRY
-        };
+    for (case, registry_id, record_ids_requested, records, errors) in cases {
         let (status, body) = post(
             &router,
             "/discoverable-records-batch",

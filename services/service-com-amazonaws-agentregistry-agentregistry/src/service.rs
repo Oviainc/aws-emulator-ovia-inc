@@ -40,6 +40,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_schema_server::ViolationKind;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
@@ -97,16 +98,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. What this service states, and all it states, is in
+        // [`stated_refusal`]: the envelope, the error count, the member paths and
+        // every requirement sentence stay the framework's, and an authentication
+        // refusal keeps its own code and wording.
+        stated_refusal(refusal)
     }
 
     fn override_routing_error(
@@ -136,4 +133,88 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+/// How this service states the framework's constraint refusal, or `None` to keep the
+/// framework's own wording for anything that is not one.
+///
+/// Three rules, and nothing else:
+///
+/// * NO clause quotes a value. Every one names the member it was stated at and the
+///   requirement that member's value had to satisfy, whatever the request carried —
+///   so the sentence a caller reads back is the same for every value outside the same
+///   bound, and nothing of a request is echoed into it.
+/// * a constraint the ELEMENTS of a collection member declare is stated at that
+///   MEMBER, with the element shape's whole declared set nested inside it
+///   ([`element_set`]) rather than at the one element that offended.
+/// * a `@pattern` is quoted as this service advertises the expression: without the
+///   pair of whole-value anchors the model wraps it in, so a caller that re-applies
+///   the expression it was handed back uses the same one. The CHECK still runs the
+///   model's pattern as written; only the rendering drops the pair.
+///
+/// The envelope, its error count, the clause, the member paths, the grouping and every
+/// requirement sentence belong to the shared home for this wording and to the framework
+/// behind it — none of them is spelled here, so this service cannot drift from the
+/// others that state the same sentences. An authentication refusal is a different
+/// failure with its own code and status and nothing about it is this service's to word.
+fn stated_refusal(refusal: &Refusal) -> Option<Refused> {
+    service_common::validation_message::aws_validation_refusal_over_elements_stating_withholding(
+        refusal,
+        service_common::validation::unanchored,
+        // Every clause, whatever member or class it is about.
+        |_| true,
+        element_set,
+    )
+}
+
+/// Every shape of this service whose own members a refused COLLECTION is looked up in:
+/// the three operation inputs, and the structures they nest.
+///
+/// A member schema carries its own traits and not the members of the shape it targets,
+/// so a list declared inside a structure is reached by handing that structure over
+/// itself. `RegistryRecordsEntry` declares `recordIds` and `RegistryRecordFilter`
+/// declares `values`; they are the only structures this model's inputs nest
+/// (`smithy_query(query="closure")`).
+const COLLECTION_MEMBER_SHAPES: &[&::aws_smithy_schema::Schema] = &[
+    crate::ops::types::BATCH_GET_DISCOVERABLE_REGISTRY_RECORD_INPUT_SCHEMA,
+    crate::ops::types::LIST_DISCOVERABLE_REGISTRY_RECORDS_INPUT_SCHEMA,
+    crate::ops::types::SEARCH_DISCOVERABLE_REGISTRY_RECORDS_INPUT_SCHEMA,
+    crate::ops::types::REGISTRY_RECORDS_ENTRY_SCHEMA,
+    crate::ops::types::REGISTRY_RECORD_FILTER_SCHEMA,
+];
+
+/// The requirement a clause states at the collection member `collection` for a
+/// constraint one of its ELEMENTS broke — the element shape's whole declared set,
+/// nested — or `None` when no shape of this model declares one for that member, which
+/// leaves the framework's own per-element clause standing (a list of STRUCTURES, whose
+/// elements declare no constraint of their own, is one such member).
+///
+/// The set is the element shape's WHOLE set and not just the constraint a value
+/// happened to break, because it is a property of the model rather than of the request.
+/// `collection` is the member path the clause is stated at, so a member declared inside
+/// a nested structure is looked up under the last segment of that path.
+fn element_set(collection: &str) -> Option<String> {
+    use service_common::validation_message::{element_constraint_set, element_set_requirement};
+
+    let member = collection
+        .rsplit_once('.')
+        .map_or(collection, |(_, member)| member);
+    let declared = element_constraint_set(COLLECTION_MEMBER_SHAPES, member)?;
+    let requirements: Vec<String> = declared.into_iter().map(stated_requirement).collect();
+    Some(element_set_requirement(&requirements))
+}
+
+/// One requirement of an element shape as this service states it: the sentence is the
+/// framework's own, with the one rendering this service chooses applied first, so a
+/// requirement nested in a collection's clause reads exactly like the same requirement
+/// stated at a member the walk reported.
+fn stated_requirement(declared: ViolationKind) -> String {
+    service_common::validation_message::requirement(match declared {
+        // The CHECK always ran the model's pattern as written; only the rendering of
+        // the expression drops the whole-value anchors.
+        ViolationKind::Pattern(pattern) => {
+            ViolationKind::Pattern(service_common::validation::unanchored(&pattern))
+        }
+        other => other,
+    })
 }

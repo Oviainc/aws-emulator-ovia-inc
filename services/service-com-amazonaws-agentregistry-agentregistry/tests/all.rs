@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/discovery_read_path.rs"]
 mod discovery_read_path;
+#[path = "all/registry_read_refusals.rs"]
+mod registry_read_refusals;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

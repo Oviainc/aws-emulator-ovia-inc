@@ -1292,6 +1292,36 @@ pub fn aws_validation_refusal_over_elements_withholding(
     )
 }
 
+/// [`aws_validation_refusal_over_elements_stating`], with the members whose value the
+/// refusal WITHHOLDS chosen by the caller too — the entry point for a service that states
+/// BOTH halves at once: the nested requirement of a grouped clause, and the value half of
+/// every other clause.
+///
+/// The two choices are the ones [`aws_validation_refusal_over_elements_stating`] and
+/// [`aws_validation_refusal_over_elements_withholding`] take one each, composed over the one
+/// [`grouped_refusal`] body. A service needs both when its list members sit INSIDE
+/// structures its schemas name under their own member names — so the set has to be stated
+/// rather than looked up by the member path the clause is stated at — AND its recordings
+/// quote no value in any clause, which `|_| true` states. A grouped clause states no value
+/// either way, so the two rules compose rather than overlap, and everything neither covers —
+/// the grouping, the envelope, the member paths, the `@pattern` rendering and every other
+/// requirement — is that same body's and the framework's.
+pub fn aws_validation_refusal_over_elements_stating_withholding(
+    refusal: &Refusal,
+    quote_pattern: impl Fn(&str) -> String,
+    withholds_value: impl Fn(&str) -> bool,
+    element_set: impl Fn(&str) -> Option<String>,
+) -> Option<Refused> {
+    grouped_refusal(
+        refusal,
+        &[],
+        &quote_pattern,
+        &|_| None,
+        &withholds_value,
+        &element_set,
+    )
+}
+
 /// The constraints the ELEMENT shape of the collection member `collection` declares, in the
 /// order a clause states them — for a service that renders the requirement SENTENCES itself
 /// instead of delegating the whole refusal to [`aws_validation_refusal_over_elements`].
@@ -1587,15 +1617,16 @@ pub fn envelope_over(clauses: &[String]) -> Option<String> {
 mod tests {
     use super::{
         api_parameter_path, aws_validation_refusal, aws_validation_refusal_over_elements,
-        aws_validation_refusal_with, aws_validation_refusal_withholding,
-        aws_validation_refusal_withholding_violations, aws_validation_refusal_withholding_with,
-        enum_value_not_found, envelope_over, float_value_text, in_float_value_rendering,
-        in_pattern_first_order, map_key_refusal, map_key_refusal_quoting, must_be_at_least,
-        must_be_at_most, must_be_one_of, must_match_pattern, parameter_pattern_mismatch,
+        aws_validation_refusal_over_elements_stating_withholding, aws_validation_refusal_with,
+        aws_validation_refusal_withholding, aws_validation_refusal_withholding_violations,
+        aws_validation_refusal_withholding_with, element_set_requirement, enum_value_not_found,
+        envelope_over, float_value_text, in_float_value_rendering, in_pattern_first_order,
+        map_key_refusal, map_key_refusal_quoting, must_be_at_least, must_be_at_most,
+        must_be_one_of, must_match_pattern, parameter_pattern_mismatch,
         parameter_pattern_refusal, parameter_value_mismatch, parameters_value_mismatch,
         pattern_mismatch, pattern_requirement_unstated, property_count_refusal,
-        quoting_the_submitted_collection, quoting_the_whole_submitted_value, string_too_long,
-        string_too_short,
+        quoting_the_submitted_collection, quoting_the_whole_submitted_value, requirement,
+        string_too_long, string_too_short,
     };
     use crate::validation::unanchored_grouping_alternation;
     use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
@@ -2928,6 +2959,89 @@ mod tests {
                 stated.message
             );
         }
+    }
+
+    /// RULE: the two choices the caller-stating entry point takes COMPOSE — a violation at
+    /// a collection ELEMENT is stated at the member the caller's set names, and the value
+    /// half of every OTHER clause is dropped where the caller withholds it, including the
+    /// `null` an absent member is otherwise stated with.
+    ///
+    /// The rows span what the composition generalises over: an element of a NESTED
+    /// collection (the member path a caller-stated set is asked for), a scalar in another
+    /// class, an absent required member, and the same refusal with nothing withheld.
+    #[test]
+    fn a_stated_element_set_and_a_withheld_value_compose() {
+        let nested_set = element_set_requirement(&[
+            requirement(ViolationKind::MaxLength(2048)),
+            requirement(ViolationKind::Pattern("[a-z]+".to_owned())),
+        ]);
+        let refusal = Refusal::Invalid(vec![
+            violation(
+                "entries.1.member.recordIds.2.member",
+                ViolationKind::Pattern("^[a-z]+$".to_owned()),
+                "NOPE",
+            ),
+            violation("maxResults", ViolationKind::MaxValue("20".to_owned()), "21"),
+            Violation {
+                path: "entries".to_owned(),
+                kind: ViolationKind::MissingRequiredMember,
+                value: None,
+                sensitive: false,
+            },
+        ]);
+        // The set is asked for by the member path the clause is stated at, which is the
+        // nested one a caller looks its own shapes up by.
+        let element_set = |collection: &str| {
+            (collection == "entries.1.member.recordIds").then(|| nested_set.clone())
+        };
+
+        let withheld = aws_validation_refusal_over_elements_stating_withholding(
+            &refusal,
+            crate::validation::unanchored,
+            |_| true,
+            element_set,
+        )
+        .expect("a constraint refusal is stated");
+        assert_eq!(
+            withheld.message,
+            format!(
+                "3 validation errors detected: Value at 'entries.1.member.recordIds' failed \
+                 to satisfy constraint: {nested_set}; Value at 'maxResults' failed to satisfy \
+                 constraint: Member must have value less than or equal to 20; Value at \
+                 'entries' failed to satisfy constraint: Member must not be null"
+            ),
+            "expected every clause to name its member and its requirement alone, got {:?}",
+            withheld.message
+        );
+
+        let quoted = aws_validation_refusal_over_elements_stating_withholding(
+            &refusal,
+            crate::validation::unanchored,
+            |_| false,
+            element_set,
+        )
+        .expect("a constraint refusal is stated");
+        assert_eq!(
+            quoted.message,
+            format!(
+                "3 validation errors detected: Value at 'entries.1.member.recordIds' failed \
+                 to satisfy constraint: {nested_set}; Value '21' at 'maxResults' failed to \
+                 satisfy constraint: Member must have value less than or equal to 20; Value \
+                 null at 'entries' failed to satisfy constraint: Member must not be null"
+            ),
+            "expected a grouped clause to state no value while the others keep theirs, got {:?}",
+            quoted.message
+        );
+        assert!(
+            aws_validation_refusal_over_elements_stating_withholding(
+                &Refusal::Unauthenticated,
+                crate::validation::unanchored,
+                |_| true,
+                element_set,
+            )
+            .is_none(),
+            "expected an unauthenticated caller to keep the framework's 403 wording"
+        );
     }
 
     /// RULE: with no element set to read, nothing is grouped — the refusal is the one
