@@ -405,7 +405,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The lock is then RELEASED, so the copy below — the only part whose cost grows
         // with a caller-chosen API rather than with the request — does not run with the
         // store held against every other caller.
-        let (ids, sequence, snapshot, source_root) = {
+        let (resource_ids, id, root_resource_id, sequence, snapshot, source_root) = {
             let mut store = state.lock();
 
             if store.rest_apis.len() >= crate::state::MAX_REST_APIS {
@@ -452,17 +452,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             };
 
-            // One id for the API, one for its root resource, and one per non-root
-            // resource copied from the source.
-            let ids = store.reserve_ids(2 + snapshot.len());
+            // The API's own id and the id of the ROOT RESOURCE it is created with are
+            // minted at the width a record of the account carries, as a created API
+            // reports them; the resources COPIED from the source are records held inside
+            // the API, so their ids carry the narrower width.
+            let resource_ids = store.reserve_sub_resource_ids(snapshot.len());
+            let api_id = store.mint_id();
+            let root_resource_id = store.mint_id();
             let sequence = store.next_sequence();
-            (ids, sequence, snapshot, source_root)
+            (
+                resource_ids,
+                api_id,
+                root_resource_id,
+                sequence,
+                snapshot,
+                source_root,
+            )
         };
 
         // Built with the store lock RELEASED.
-        let mut minted = ids.into_iter();
-        let id = minted.next().ok_or_else(crate::state::state_unavailable)?;
-        let root_resource_id = minted.next().ok_or_else(crate::state::state_unavailable)?;
+        let mut minted = resource_ids.into_iter();
 
         let mut resources = BTreeMap::new();
         resources.insert(

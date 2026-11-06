@@ -1429,12 +1429,12 @@ fn imported_integration(
     warnings: &mut Vec<String>,
 ) -> Option<GetIntegrationOutput> {
     use super::put_integration::{
-        validate_integration, DEFAULT_CONNECTION_TYPE, DEFAULT_PASSTHROUGH_BEHAVIOR,
+        complete_integration, validate_integration, DEFAULT_PASSTHROUGH_BEHAVIOR,
         DEFAULT_TIMEOUT_IN_MILLIS,
     };
 
     let declared = operation.member(INTEGRATION_EXTENSION)?;
-    let integration = GetIntegrationOutput {
+    let mut integration = GetIntegrationOutput {
         // The extension writes the enumerated values in either case (`aws_proxy`,
         // `AWS_PROXY`), and the stored record carries the modelled spelling.
         r#type: declared
@@ -1446,12 +1446,14 @@ fn imported_integration(
         uri: declared
             .string_member("uri")
             .map(|uri| scope.resolved(uri.trim())),
-        connection_type: Some(
-            declared
-                .string_member("connectionType")
-                .map(|kind| kind.to_ascii_uppercase())
-                .unwrap_or_else(|| DEFAULT_CONNECTION_TYPE.to_string()),
-        ),
+        // `connectionType` names "the type of the network connection to the integration
+        // endpoint", and an imported integration has the one its own definition declares:
+        // the member's documented default (INTERNET) belongs to the request member of the
+        // call that sets an integration up, so an extension that declares no connection
+        // type imports an integration that reports none.
+        connection_type: declared
+            .string_member("connectionType")
+            .map(|kind| kind.to_ascii_uppercase()),
         connection_id: declared.string_member("connectionId"),
         credentials: declared
             .string_member("credentials")
@@ -1492,6 +1494,7 @@ fn imported_integration(
         response_transfer_mode: declared.string_member("responseTransferMode"),
         integration_target: declared.string_member("integrationTarget"),
     };
+    complete_integration(&mut integration);
     if let Err(reason) = validate_integration(&integration, method) {
         warn(
             warnings,
@@ -2104,7 +2107,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // One id and one creation rank per resource the import creates, so the imported
         // resources are listed in the order the definition declares them.
-        let ids = store.reserve_ids(planned.len());
+        let ids = store.reserve_sub_resource_ids(planned.len());
         let sequences: Vec<u64> = (0..planned.len())
             .map(|_| store.next_sequence())
             .collect();

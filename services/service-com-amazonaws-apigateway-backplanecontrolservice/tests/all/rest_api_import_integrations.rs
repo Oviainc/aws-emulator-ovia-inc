@@ -51,7 +51,9 @@ type ImportRow<'a> = (
 );
 
 /// The id of the resource at `path` in `api`.
-async fn resource_at(gateway: &Gateway, api: &str, path: &str, case: &str) -> String {
+///
+/// `pub(crate)` for the reason [`json_operation`] gives.
+pub(crate) async fn resource_at(gateway: &Gateway, api: &str, path: &str, case: &str) -> String {
     let resources = resources_by_path(gateway, api, case).await;
     let (_, resource) = resources
         .iter()
@@ -70,15 +72,19 @@ async fn resource_at(gateway: &Gateway, api: &str, path: &str, case: &str) -> St
 
 /// An operation object declaring `integration` as its API Gateway integration extension,
 /// in JSON.
-fn json_operation(integration: &str) -> String {
+///
+/// `pub(crate)` so the sibling `integration_representation` suite, which asserts what an
+/// imported integration REPORTS, declares an extension the same way.
+pub(crate) fn json_operation(integration: &str) -> String {
     format!(
         "{{\"responses\": {{\"200\": {{\"description\": \"ok\"}}}}, \
           \"x-amazon-apigateway-integration\": {integration}}}"
     )
 }
 
-/// A whole JSON definition for one path carrying one operation.
-fn json_definition(title: &str, path: &str, verb: &str, operation: &str) -> String {
+/// A whole JSON definition for one path carrying one operation. `pub(crate)` for the
+/// reason [`json_operation`] gives.
+pub(crate) fn json_definition(title: &str, path: &str, verb: &str, operation: &str) -> String {
     format!(
         "{{\"openapi\": \"3.0.1\", \"info\": {{\"title\": \"{title}\"}}, \
           \"paths\": {{\"{path}\": {{\"{verb}\": {operation}}}}}}}"

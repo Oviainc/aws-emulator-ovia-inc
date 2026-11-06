@@ -312,7 +312,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         )?;
 
-        let id = store.mint_id();
+        // A `Resource` lives inside one REST API, so its id carries that width rather
+        // than the API's own.
+        let id = store.mint_sub_resource_id();
         let sequence = store.next_sequence();
 
         let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {

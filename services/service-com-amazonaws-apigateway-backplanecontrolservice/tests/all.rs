@@ -372,3 +372,12 @@ mod delete_usage_plan_key;
 // signed with credentials whose principal is allowed no `execute-api:Invoke`.
 #[path = "all/stage_invoke_identity_policy.rs"]
 mod stage_invoke_identity_policy;
+// Appended for the reason the note above gives: what an `Integration` and an
+// `IntegrationResponse` REPORT in every reading of them — the transfer mode, the
+// connection type an imported definition declares, and the empty mapping template.
+#[path = "all/integration_representation.rs"]
+mod integration_representation;
+// Appended for the reason the note above gives: the WIDTH and alphabet of the identifier
+// each kind of record this control plane mints is addressed by.
+#[path = "all/minted_identifier_widths.rs"]
+mod minted_identifier_widths;

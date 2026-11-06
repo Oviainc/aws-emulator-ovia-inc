@@ -246,6 +246,28 @@ pub const DEFAULT_CONNECTION_TYPE: &str = "INTERNET";
 /// VPC_LINK as the connection type".
 pub const VPC_LINK_CONNECTION_TYPE: &str = "VPC_LINK";
 
+/// The `responseTransferMode` an integration carries when nothing set one: the mode that
+/// buffers the integration's response rather than streaming it, which is the first of the
+/// two values the modelled `ResponseTransferMode` enum declares (`BUFFERED | STREAM`) and
+/// the mode every integration has until one asks for the other.
+pub const DEFAULT_RESPONSE_TRANSFER_MODE: &str = "BUFFERED";
+
+/// Complete `integration` with the members the service reports a value for on EVERY
+/// stored `Integration`, whatever created it, so that no reader of the record has to
+/// default them: `responseTransferMode` is one, "the response transfer mode of the
+/// integration", which is [`DEFAULT_RESPONSE_TRANSFER_MODE`] until an integration asks to
+/// stream.
+///
+/// Called by every path that writes an integration — this operation, the patch
+/// (`UpdateIntegration`, where a `remove` of such a member puts the service's value back),
+/// and the import of an API definition — so one stored record is reported the same way
+/// however it came to be.
+pub fn complete_integration(integration: &mut GetIntegrationOutput) {
+    if integration.response_transfer_mode.is_none() {
+        integration.response_transfer_mode = Some(DEFAULT_RESPONSE_TRANSFER_MODE.to_string());
+    }
+}
+
 /// The values `passthroughBehavior` takes. Hand-written because the model types the
 /// member as a bare `String`; the set is the one the member's own documentation lists:
 /// "The valid value is one of the following: WHEN_NO_MATCH … WHEN_NO_TEMPLATES … NEVER".
@@ -366,7 +388,7 @@ fn integration_of(
     // `type`, `connectionType`, `contentHandling` and `responseTransferMode` are modelled
     // enums, so the boundary validator has already refused anything outside their value
     // sets by the time this runs.
-    let integration = GetIntegrationOutput {
+    let mut integration = GetIntegrationOutput {
         r#type: Some(input.r#type.clone()),
         // An HTTP verb is case-insensitive on the wire, so the integration's own method
         // is stored uppercased, the way a method's verb is.
@@ -408,6 +430,7 @@ fn integration_of(
         response_transfer_mode: input.response_transfer_mode.clone(),
         integration_target: input.integration_target.clone(),
     };
+    complete_integration(&mut integration);
     validate_integration(&integration, method)?;
     Ok(integration)
 }

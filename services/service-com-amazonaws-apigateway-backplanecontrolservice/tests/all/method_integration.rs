@@ -18,8 +18,9 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::ops::put_integration::{
-    DEFAULT_CONNECTION_TYPE, DEFAULT_PASSTHROUGH_BEHAVIOR, DEFAULT_TIMEOUT_IN_MILLIS,
-    MAX_TIMEOUT_IN_MILLIS, MIN_TIMEOUT_IN_MILLIS, PASSTHROUGH_BEHAVIORS, VPC_LINK_CONNECTION_TYPE,
+    DEFAULT_CONNECTION_TYPE, DEFAULT_PASSTHROUGH_BEHAVIOR, DEFAULT_RESPONSE_TRANSFER_MODE,
+    DEFAULT_TIMEOUT_IN_MILLIS, MAX_TIMEOUT_IN_MILLIS, MIN_TIMEOUT_IN_MILLIS, PASSTHROUGH_BEHAVIORS,
+    VPC_LINK_CONNECTION_TYPE,
 };
 
 use crate::rest_api_lifecycle::{
@@ -175,7 +176,8 @@ async fn an_integration_put_on_a_method_is_persisted_and_read_back_member_for_me
     // value of the modelled `IntegrationType`), which optional members the request
     // carries, the connection type, and the timeout on each published bound. The
     // expected body carries `"cacheNamespace": null` where the service fills the member
-    // in from the resource id, which the loop substitutes.
+    // in from the resource id, which the loop substitutes, and every row carries the
+    // `responseTransferMode` the service reports on an integration that asked for none.
     let cases: Vec<(&str, &str, &str, Value, Value)> = vec![
         (
             "a mock integration with nothing else set",
@@ -185,6 +187,7 @@ async fn an_integration_put_on_a_method_is_persisted_and_read_back_member_for_me
             json!({
                 "type": "MOCK",
                 "connectionType": DEFAULT_CONNECTION_TYPE,
+                "responseTransferMode": DEFAULT_RESPONSE_TRANSFER_MODE,
                 "passthroughBehavior": DEFAULT_PASSTHROUGH_BEHAVIOR,
                 "timeoutInMillis": DEFAULT_TIMEOUT_IN_MILLIS,
                 "cacheNamespace": null,
@@ -204,6 +207,7 @@ async fn an_integration_put_on_a_method_is_persisted_and_read_back_member_for_me
             json!({
                 "type": "MOCK",
                 "connectionType": DEFAULT_CONNECTION_TYPE,
+                "responseTransferMode": DEFAULT_RESPONSE_TRANSFER_MODE,
                 "requestTemplates": { "application/json": "{\"statusCode\": 200}" },
                 "passthroughBehavior": "NEVER",
                 "timeoutInMillis": MIN_TIMEOUT_IN_MILLIS,
@@ -226,6 +230,7 @@ async fn an_integration_put_on_a_method_is_persisted_and_read_back_member_for_me
                 "httpMethod": "GET",
                 "uri": "https://example.com/pets",
                 "connectionType": DEFAULT_CONNECTION_TYPE,
+                "responseTransferMode": DEFAULT_RESPONSE_TRANSFER_MODE,
                 "requestParameters": { "integration.request.querystring.breed": "method.request.querystring.breed" },
                 "passthroughBehavior": DEFAULT_PASSTHROUGH_BEHAVIOR,
                 "timeoutInMillis": DEFAULT_TIMEOUT_IN_MILLIS,
@@ -250,6 +255,7 @@ async fn an_integration_put_on_a_method_is_persisted_and_read_back_member_for_me
                 "httpMethod": "PUT",
                 "uri": "http://example.com/pets",
                 "connectionType": DEFAULT_CONNECTION_TYPE,
+                "responseTransferMode": DEFAULT_RESPONSE_TRANSFER_MODE,
                 "contentHandling": "CONVERT_TO_TEXT",
                 "passthroughBehavior": DEFAULT_PASSTHROUGH_BEHAVIOR,
                 "timeoutInMillis": MAX_TIMEOUT_IN_MILLIS,
@@ -275,6 +281,7 @@ async fn an_integration_put_on_a_method_is_persisted_and_read_back_member_for_me
                 "httpMethod": "POST",
                 "uri": aws_integration_uri("dynamodb:action/PutItem"),
                 "connectionType": DEFAULT_CONNECTION_TYPE,
+                "responseTransferMode": DEFAULT_RESPONSE_TRANSFER_MODE,
                 "credentials": "arn:aws:iam::123456789012:role/apigateway-dynamodb",
                 "passthroughBehavior": "WHEN_NO_TEMPLATES",
                 "timeoutInMillis": DEFAULT_TIMEOUT_IN_MILLIS,
@@ -300,6 +307,7 @@ async fn an_integration_put_on_a_method_is_persisted_and_read_back_member_for_me
                     "lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:pets/invocations"
                 ),
                 "connectionType": DEFAULT_CONNECTION_TYPE,
+                "responseTransferMode": DEFAULT_RESPONSE_TRANSFER_MODE,
                 "passthroughBehavior": DEFAULT_PASSTHROUGH_BEHAVIOR,
                 "timeoutInMillis": DEFAULT_TIMEOUT_IN_MILLIS,
                 "cacheNamespace": null,
@@ -323,6 +331,7 @@ async fn an_integration_put_on_a_method_is_persisted_and_read_back_member_for_me
                 "uri": "nlb-pets.elb.us-east-1.amazonaws.com",
                 "connectionType": VPC_LINK_CONNECTION_TYPE,
                 "connectionId": "abc123",
+                "responseTransferMode": DEFAULT_RESPONSE_TRANSFER_MODE,
                 "passthroughBehavior": DEFAULT_PASSTHROUGH_BEHAVIOR,
                 "timeoutInMillis": DEFAULT_TIMEOUT_IN_MILLIS,
                 "cacheNamespace": null,

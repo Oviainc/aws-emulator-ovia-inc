@@ -161,7 +161,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use super::put_integration::{validate_integration, MAX_TEMPLATE_CHARS, PASSTHROUGH_BEHAVIORS};
+use super::put_integration::{
+    complete_integration, validate_integration, MAX_TEMPLATE_CHARS, PASSTHROUGH_BEHAVIORS,
+};
 use super::put_method::method_key;
 use crate::state::{
     patch_bool, patch_enum_string, patch_i32_checked, patch_optional_string,
@@ -511,6 +513,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for patch in &patches {
             apply_patch(&mut updated, patch).map_err(patch_failure)?;
         }
+        // A member the service reports a value for on every integration keeps one through
+        // a patch that cleared it: the patched record carries the same service-filled
+        // members a created one does.
+        complete_integration(&mut updated);
         // The rules an `Integration`'s members publish hold of the record however it came
         // to be, so the patched record is checked against the same ones `PutIntegration`
         // checks a created one against, before anything is written.

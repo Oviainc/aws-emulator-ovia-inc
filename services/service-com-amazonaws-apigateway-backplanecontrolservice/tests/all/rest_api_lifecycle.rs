@@ -316,7 +316,7 @@ async fn a_created_rest_api_is_persisted_and_read_back_member_for_member() {
     assert_eq!(
         root.len(),
         10,
-        "case CreateRestApi(full input): a resource id is 10 characters, got {root:?}"
+        "case CreateRestApi(full input): a root resource id is 10 characters, got {root:?}"
     );
     assert_ne!(
         id, root,
@@ -458,21 +458,27 @@ async fn a_child_resources_path_is_its_parents_path_plus_its_own_path_part() {
 }
 
 #[tokio::test]
-async fn every_minted_id_is_distinct_and_ten_lowercase_alphanumerics() {
+async fn every_minted_id_is_distinct_and_lowercase_alphanumeric_at_its_records_width() {
     // The input space of the id rule is the creation sequence itself, so the loop
     // enumerates it exhaustively rather than sampling: 60 APIs, each with a root
-    // resource, plus a child resource apiece — 180 minted ids.
+    // resource, plus a child resource apiece — 180 minted ids. An API and the root
+    // resource it is created with are ten characters wide, and a resource created inside
+    // the API is six, so each id is checked at the width its record carries.
     let gateway = Gateway::new();
     let mut minted: BTreeSet<String> = BTreeSet::new();
     for n in 0..60 {
         let (api, root) = create_api(&gateway, &format!("api-{n}")).await;
         let child = create_resource(&gateway, &api, &root, "child").await;
         let child_id = string_member(&child, "id", &format!("resource of api-{n}"));
-        for id in [api, root, child_id] {
+        for (record, width, id) in [
+            ("the API", 10, api),
+            ("its root resource", 10, root),
+            ("its child resource", 6, child_id),
+        ] {
             assert_eq!(
                 id.len(),
-                10,
-                "case api-{n}: every minted id is 10 characters, got {id:?}"
+                width,
+                "case api-{n}: the id of {record} is {width} characters, got {id:?}"
             );
             assert!(
                 id.chars()

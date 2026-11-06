@@ -111,6 +111,7 @@
 pub mod invoke;
 pub mod mapping_template;
 pub mod query_coercion;
+pub mod rendered_templates;
 pub mod resource_policy;
 mod validation;
 
@@ -393,6 +394,46 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for StageDataPlane<Eng> {
     }
 }
 
+/// The answer as this service renders it: an `IntegrationResponse` in it reports a content
+/// type whose mapping template is empty with a null template, which the schema-driven
+/// serialization of a `MapOfStringToString` cannot write
+/// ([`rendered_templates::with_empty_templates_as_null`]).
+///
+/// Anything else is returned untouched — status, headers and every byte of the body
+/// exactly as the modelled walk wrote them: a failure, a streamed body, a body that is not
+/// a rendering carrying such a template.
+fn with_rendered_templates(mut resp: RtResponse) -> RtResponse {
+    if resp.status().as_u16() >= 400 {
+        return resp;
+    }
+    let rewritten = {
+        // A modelled response body is built in memory by the serializer, so the bytes are
+        // readable here; a streamed body is not one and is left alone.
+        let Some(bytes) = resp.body().bytes() else {
+            return resp;
+        };
+        match rendered_templates::with_empty_templates_as_null(bytes) {
+            Some(rewritten) => rewritten,
+            None => return resp,
+        }
+    };
+    // Only a renderer that advertised a length needs it corrected, and the length is
+    // REMOVED rather than left describing the body before the rewrite if a decimal count
+    // is somehow not a valid header value.
+    if resp.headers().get("content-length").is_some() {
+        let length = rewritten.len().to_string();
+        if resp
+            .headers_mut()
+            .try_insert("content-length", length)
+            .is_err()
+        {
+            resp.headers_mut().remove("content-length");
+        }
+    }
+    *resp.body_mut() = aws_smithy_types::body::SdkBody::from(rewritten);
+    resp
+}
+
 /// One modelled operation, served so that a refused request is stated the way this
 /// service states it: every validation path rooted at THIS operation's input shape.
 ///
@@ -493,7 +534,7 @@ where
                     .definition()
                     .refusal_response(ProtocolError::Invalid(refused), Some(stated), req);
             }
-            self.operation.run(svc, req, ctx).await
+            with_rendered_templates(self.operation.run(svc, req, ctx).await)
         })
     }
 

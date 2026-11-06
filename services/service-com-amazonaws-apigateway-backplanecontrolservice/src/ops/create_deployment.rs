@@ -342,8 +342,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Minted only once the request is known to be servable, so a refused call burns
         // no identifier. The store lock has been held since the checks above, so the
-        // API is still there.
-        let id = store.mint_id();
+        // API is still there. A `Deployment` lives inside one REST API, so its id
+        // carries that width rather than the API's own.
+        let id = store.mint_sub_resource_id();
         let sequence = store.next_sequence();
         let api = store
             .rest_apis

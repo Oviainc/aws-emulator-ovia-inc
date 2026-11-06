@@ -500,14 +500,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // One id for the API, one for its root resource, and one per planned resource;
-        // one creation rank for the API, and one per planned resource so the imported
-        // resources are listed in the order the definition declares them.
-        let ids = store.reserve_ids(2 + planned.len());
-        let mut minted = ids.into_iter();
-        let id = minted.next().ok_or_else(crate::state::state_unavailable)?;
-        let root_resource_id = minted.next().ok_or_else(crate::state::state_unavailable)?;
-        let resource_ids: Vec<String> = minted.collect();
+        // The API's own id and the id of the ROOT RESOURCE it is created with are minted
+        // at the width a record of the account carries, as a created API reports them;
+        // the resources the definition declares are records held inside the API, so their
+        // ids carry the narrower width. One creation rank for the API, and one per planned
+        // resource so the imported resources are listed in the order the definition
+        // declares them.
+        let resource_ids = store.reserve_sub_resource_ids(planned.len());
+        let id = store.mint_id();
+        let root_resource_id = store.mint_id();
         let sequence = store.next_sequence();
         let sequences: Vec<u64> = (0..planned.len()).map(|_| store.next_sequence()).collect();
 
