@@ -340,7 +340,9 @@ async fn a_read_or_a_refused_write_leaves_the_last_written_instant_alone() {
             "a merge that would carry the record past the per-resource tag cap",
             Call::Write(Write::Tag(onto_the_cap)),
             400,
-            Some("ValidationException"),
+            // The tagging front end's own count refusal, not this service's modelled
+            // input error (`tag_count_front_end` owns that rule).
+            Some("BadRequestException"),
         ),
     ];
 

@@ -195,12 +195,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that reads only the request is made there, so the answer to a bad tag set
         // does not depend on whether the store holds the ARN. A key in the namespace
         // AWS reserves for its own generated tags, a key outside the length bound a
-        // tag key may hold, a value longer than a tag value may be and a map
-        // carrying more entries than one resource may hold at all are each bad
+        // tag key may hold and a value longer than a tag value may be are each bad
         // requests — the modelled `ValidationException` (HTTP 400) — whether the
-        // target exists or not, and nothing is stored either way. Only the part of
-        // the per-resource cap that needs the record — whether merging onto the tags
-        // it already holds would pass the cap — is left to the merge below.
+        // target exists or not, and a map carrying more entries than one resource
+        // may hold at all is the tagging front end's own HTTP 400
+        // `BadRequestException` (`crate::state::TagRefusal`). Nothing is stored
+        // either way. Only the part of the per-resource cap that needs the record —
+        // whether merging onto the tags it already holds would pass the cap — is
+        // left to the merge below, which answers that same count refusal.
         //
         // `TagConstraints::Unconstrained` because this operation's `tags` member
         // targets the map the model leaves unconstrained; the character class the
@@ -217,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &incoming,
                     crate::state::TagConstraints::Unconstrained,
                 )
-                .map_err(TagResourceErrorModeled::ValidationException)
+                .map_err(|why| why.into_error(TagResourceErrorModeled::ValidationException))
             },
             |record| {
                 // The merge is computed before anything is stored, so a refused
@@ -234,7 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &incoming,
                     crate::state::TagConstraints::Unconstrained,
                 )
-                .map_err(TagResourceErrorModeled::ValidationException)?;
+                .map_err(|why| why.into_error(TagResourceErrorModeled::ValidationException))?;
                 record.tags = merged;
                 Ok(TagResourceOutput {})
             },

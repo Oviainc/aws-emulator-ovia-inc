@@ -189,6 +189,51 @@ fn is_oversized_sensitive_payload(violation: &Violation) -> bool {
         && names_a_sensitive_member(&violation.path)
 }
 
+/// The members of this model that carry a tag MAP, each as the whole trail a
+/// validation path spells it with, from the operation input down.
+///
+/// `smithy_query(query="shape",shape="TagsMap,Tags")`: the tag maps of this model are
+/// reached as `PutDeploymentParameterRequest$tags` (the constrained `TagsMap`,
+/// `length max 50`) and `TagResourceRequest$tags` (`Tags`, which the model leaves
+/// unconstrained), so both are reported at the path `tags`.
+///
+/// Spelled as the whole trail for the reason [`SENSITIVE_MEMBER_PATHS`] gives: only a
+/// STRUCTURE member contributes a segment the model named, so a path ending in a
+/// caller's own tag KEY (`tags.<that key>`, where a violation on an entry's value is
+/// reported) is not this member and keeps the modelled answer.
+const TAG_MAP_MEMBER_PATHS: &[&str] = &["tags"];
+
+/// The tagging front end's own refusal for `violations`, or `None` when none of them
+/// is one of its.
+///
+/// AWS's per-resource tag COUNT is a limit of the tagging front end that runs ahead of
+/// this service's modelled input validation, not a rule of this service: its recorded
+/// answer carries the generic `BadRequestException` identity
+/// ([`crate::scaffolded::BAD_REQUEST_CODE`]) and the one fixed sentence
+/// [`crate::state::too_many_tags`] states, rather than the modelled
+/// `ValidationException` an SDK unmarshals into a typed error. The model restates that
+/// count for its constrained copy of the tag map, which is why the violation reaches
+/// this service's refusal path at all — so it is recognised here, on the MAP's own
+/// length violation, and handed the identity the front end gives it.
+///
+/// Because that layer runs first, its refusal takes precedence over every other
+/// violation of the same request; the service's own modelled validation answers what
+/// is left. The sentence is the same one the handlers state for the half of the limit
+/// that needs the stored record, so no layer can word this refusal differently.
+fn tagging_front_end_refusal(violations: &[Violation]) -> Option<crate::scaffolded::BadRequest> {
+    violations
+        .iter()
+        .any(is_tag_count_violation)
+        .then(crate::state::too_many_tags)
+}
+
+/// Whether `violation` is a tag map past the number of entries the map a tagging
+/// member targets admits — the MAP's own `@length` maximum, not a bound on one entry.
+fn is_tag_count_violation(violation: &Violation) -> bool {
+    matches!(violation.kind, ViolationKind::MaxLength(_))
+        && TAG_MAP_MEMBER_PATHS.contains(&violation.path.as_str())
+}
+
 /// One refusal the front door answers with, as a pre-dispatch operation.
 ///
 /// WHY this is a seam and not a line in a handler: the refusal happens BEFORE the
@@ -561,10 +606,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // An authentication refusal keeps the framework's wording: it is not an
         // input-constraint failure.
         match refusal {
-            Refusal::Invalid(violations) => Some(Refused {
-                code: VALIDATION_EXCEPTION.to_string(),
-                message: constraint_envelope(violations)?,
-            }),
+            Refusal::Invalid(violations) => {
+                // The tagging front end's count bound runs ahead of this service's
+                // modelled validation, so its own identity answers first — the same
+                // refusal `ServedOperation` renders in full, worded from the one place
+                // that states it, so the two paths cannot disagree.
+                if let Some(refused) = tagging_front_end_refusal(violations) {
+                    return Some(Refused {
+                        code: crate::scaffolded::BAD_REQUEST_CODE.to_string(),
+                        message: refused.message,
+                    });
+                }
+                Some(Refused {
+                    code: VALIDATION_EXCEPTION.to_string(),
+                    message: constraint_envelope(violations)?,
+                })
+            }
             _ => None,
         }
     }

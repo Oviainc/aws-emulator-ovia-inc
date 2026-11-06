@@ -706,17 +706,19 @@ async fn a_put_outside_the_modelled_constraints_is_refused() {
     // catalog it serves.
     provision(&engine, "AWSMarketplace", "a", &["p"]);
 
-    let too_many: serde_json::Map<String, Value> = (0..=MAX_TAGS_PER_RESOURCE)
-        .map(|i| (format!("key-{i:02}"), json!("v")))
-        .collect();
+    // A `tags` map past the number of entries one resource holds is NOT a row here:
+    // that count is the tagging front end's limit and carries its own wire identity,
+    // which the `tag_count_front_end` suite pins.
 
     // Each row breaks exactly one modelled constraint of `PutDeploymentParameter`'s
     // input: `Catalog` (`^[a-zA-Z_-]+$`, len 1..64), `ResourceId`
     // (`^[A-Za-z0-9_/-]+$`, len 1..64), `DeploymentParameterName` (len 1..400),
-    // `SecretString`'s MINIMUM (len 1..15000), `TagsMap` (len ..50), or
-    // `@required`. `SecretString`'s MAXIMUM is deliberately absent: an oversized
-    // `@sensitive` payload is refused one layer earlier, by the front door, with
-    // HTTP 403 `ForbiddenException` — the `front_door_forbidden` suite pins it.
+    // `SecretString`'s MINIMUM (len 1..15000), `TagKey`/`TagValue` or `@required`.
+    // `SecretString`'s MAXIMUM is deliberately absent: an oversized `@sensitive`
+    // payload is refused one layer earlier, by the front door, with HTTP 403
+    // `ForbiddenException` — the `front_door_forbidden` suite pins it. So is
+    // `TagsMap`'s entry COUNT: that limit is the tagging front end's and carries its
+    // own identity (`tag_count_front_end`).
     let over_long_catalog = "c".repeat(65);
     let over_long_product = "p".repeat(65);
 
@@ -809,16 +811,6 @@ async fn a_put_outside_the_modelled_constraints_is_refused() {
             json!({ "agreementId": "a1", "deploymentParameter": { "name": "N", "secretString": "" } }),
         ),
         (
-            "one tag past the modelled cap",
-            "AWSMarketplace",
-            "prod-1",
-            json!({
-                "agreementId": "a1",
-                "deploymentParameter": { "name": "N", "secretString": "s" },
-                "tags": too_many,
-            }),
-        ),
-        (
             "a tag value one character past its maximum",
             "AWSMarketplace",
             "prod-1",
@@ -907,27 +899,38 @@ async fn a_tag_write_past_the_tagging_limits_is_refused_and_stores_nothing() {
     // `TAG_VALUE_MAX_LEN`, and the record may not pass `MAX_TAGS_PER_RESOURCE`. The
     // keys and values those limits ADMIT — spaces, letters outside ASCII, an empty
     // value — are the `unconstrained_tag_characters` suite's rule.
+    //
+    // The limits differ in WHOSE they are, which is what the expected code per row
+    // says: a bound on what a tag IS is this service's own modelled input error,
+    // while the COUNT of tags a resource may hold is the tagging front end's, with
+    // its own unmodelled identity (`tag_count_front_end` owns that rule).
     let over_the_cap: BTreeMap<String, String> = (0..MAX_TAGS_PER_RESOURCE)
         .map(|i| (format!("extra-{i:02}"), "v".to_string()))
         .collect();
-    let refused: Vec<(&str, BTreeMap<String, String>)> = vec![
-        ("an empty key", tag_map(&[("", "v")])),
+    let refused: Vec<(&str, BTreeMap<String, String>, &str)> = vec![
+        ("an empty key", tag_map(&[("", "v")]), "ValidationException"),
         (
             "a key one character past its maximum",
             [("k".repeat(TAG_KEY_MAX_LEN + 1), "v".to_string())]
                 .into_iter()
                 .collect(),
+            "ValidationException",
         ),
         (
             "a value one character past its maximum",
             [("k".to_string(), "v".repeat(TAG_VALUE_MAX_LEN + 1))]
                 .into_iter()
                 .collect(),
+            "ValidationException",
         ),
-        ("a merge one entry past the cap", over_the_cap),
+        (
+            "a merge one entry past the cap",
+            over_the_cap,
+            "BadRequestException",
+        ),
     ];
 
-    for (case, tags) in refused {
+    for (case, tags, expected_code) in refused {
         let (status, answer) = tag(&router, &arn, &tags).await;
         assert_eq!(
             status, 400,
@@ -935,8 +938,8 @@ async fn a_tag_write_past_the_tagging_limits_is_refused_and_stores_nothing() {
         );
         assert_eq!(
             error_code(&answer),
-            "ValidationException",
-            "case {case:?}: expected ValidationException, got {answer:?}"
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {answer:?}"
         );
         let (_, listed) = list_tags(&router, &arn).await;
         assert_eq!(

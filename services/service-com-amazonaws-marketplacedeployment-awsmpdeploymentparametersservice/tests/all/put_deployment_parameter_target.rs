@@ -9,8 +9,10 @@
 //! against the agreements the account holds before it mints or updates anything:
 //! a triple the store holds is the create-or-update the operation documents, and
 //! a triple it does not hold is the modelled `ResourceNotFoundException`
-//! (HTTP 404) naming the segment that did not resolve — the product before the
-//! agreement — with nothing written and no token consumed.
+//! (HTTP 404) naming the segment that did not resolve — the agreement before the
+//! product, which is the order the operation is targeted by (the
+//! `unresolved_target_precedence` suite owns that precedence) — with nothing
+//! written and no token consumed.
 //!
 //! The target is the whole triple, so two requests differing in any one of its
 //! segments are two different resolutions: two resources when both resolve, and a
@@ -187,7 +189,12 @@ async fn a_put_is_404_until_its_target_is_held_and_is_served_once_it_is() {
         let token = row_token(index);
         for (shape, body) in request_shapes(row.agreement_id, &token) {
             let (status, answer) = put(&router, CATALOG, row.product_id, &body).await;
-            assert_target_not_found(&format!("{case} with {shape}"), "ProductId", status, &answer);
+            assert_target_not_found(
+                &format!("{case} with {shape}"),
+                "AgreementId",
+                status,
+                &answer,
+            );
         }
     }
     // A refused write stores nothing and records no target: the refusal is the
@@ -252,7 +259,7 @@ async fn a_put_is_404_until_its_target_is_held_and_is_served_once_it_is() {
 }
 
 #[tokio::test]
-async fn the_refusal_names_the_product_before_the_agreement() {
+async fn the_refusal_names_the_agreement_before_the_product() {
     let (router, engine) = emulator();
     // Two agreements over overlapping products, so each row below differs from a
     // held target in exactly one segment and the suite can tell the two blames
@@ -262,15 +269,16 @@ async fn the_refusal_names_the_product_before_the_agreement() {
     provision(&engine, CATALOG, "agmt-two", &["prod-shared"]);
 
     // (case, productId, agreementId, the member the refusal must name). The
-    // product is judged first: a product no agreement of the catalog covers is
-    // blamed on `ProductId`, whatever the agreement is; otherwise the request's
-    // agreement is what does not reach it.
+    // agreement is judged first — it is the target the operation is targeted by —
+    // so an agreement the account does not hold is blamed on `AgreementId`,
+    // whatever the product is; otherwise the agreement resolves and the product it
+    // does not cover is what the refusal names.
     let rows: Vec<(&str, &str, &str, &str)> = vec![
         (
             "neither identifier is held",
             "prod-unknown",
             "agmt-unknown",
-            "ProductId",
+            "AgreementId",
         ),
         (
             "a product nothing covers, under a held agreement",
@@ -294,7 +302,7 @@ async fn the_refusal_names_the_product_before_the_agreement() {
             "a covered product, under an agreement covering other products",
             "prod-one",
             "agmt-two",
-            "AgreementId",
+            "ProductId",
         ),
         (
             "an agreement differing from a held one only in case",
@@ -431,36 +439,15 @@ async fn a_modelled_constraint_is_refused_before_the_target_is_resolved() {
     let (router, engine) = emulator();
     provision(&engine, CATALOG, "agmt-held", &["prod-held"]);
 
-    let too_many: serde_json::Map<String, Value> = (0..=MAX_TAGS_PER_RESOURCE)
-        .map(|i| (format!("key-{i:02}"), json!("v")))
-        .collect();
-
     // Each row breaks one modelled constraint of the input. The pairs cover both
     // sides of the target store: a target the account holds, and one it does not —
     // the answer is the 400, which is what "before the target is resolved" means.
     // An oversized `@sensitive` payload is NOT here: it is refused one layer
-    // earlier, with the front door's 403 (`front_door_forbidden`).
+    // earlier, with the front door's 403 (`front_door_forbidden`). Neither is a
+    // `tags` map past the number of tags one resource holds: that count is the
+    // tagging front end's own limit, refused with its own identity ahead of this
+    // service's modelled validation (`tag_count_front_end`).
     let rows: Vec<(&str, &str, &str, Value)> = vec![
-        (
-            "tags one past the modelled cap, target held",
-            CATALOG,
-            "prod-held",
-            json!({
-                "agreementId": "agmt-held",
-                "deploymentParameter": { "name": "N", "secretString": "s" },
-                "tags": too_many.clone(),
-            }),
-        ),
-        (
-            "tags one past the modelled cap, target not held",
-            CATALOG,
-            "prod-unknown",
-            json!({
-                "agreementId": "agmt-unknown",
-                "deploymentParameter": { "name": "N", "secretString": "s" },
-                "tags": too_many,
-            }),
-        ),
         (
             "catalog outside its pattern, target not held",
             "Not-A-Real-Catalog!",
@@ -540,7 +527,7 @@ async fn a_write_refused_for_its_target_consumes_no_idempotency_token() {
     // Refused because nothing holds its target, so the write never happens and the
     // token is never bound to one.
     let (status, answer) = put(&router, CATALOG, "prod-later", &body).await;
-    assert_target_not_found("the token's first attempt", "ProductId", status, &answer);
+    assert_target_not_found("the token's first attempt", "AgreementId", status, &answer);
     let stored = stored_parameters(&engine);
     assert_eq!(
         stored, 0,
@@ -650,7 +637,7 @@ async fn the_target_ledger_is_bounded_and_refuses_a_target_past_its_ceiling() {
     let (status, answer) = put(&router, CATALOG, &last_product, &body(&last_agreement)).await;
     assert_target_not_found(
         "a write against a target the ledger refused",
-        "ProductId",
+        "AgreementId",
         status,
         &answer,
     );

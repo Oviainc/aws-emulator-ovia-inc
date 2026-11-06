@@ -264,11 +264,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `TagsMap` states are all bad requests, answered here rather than at the
         // merge below — which runs the same judgement, so no stored record can
         // disagree with it. Nothing is stored either way.
+        //
+        // A set past the NUMBER of tags one resource holds keeps the tagging front
+        // end's own identity rather than this service's modelled error
+        // (`crate::state::TagRefusal`), which is why the refusal is lifted through
+        // the channel instead of being wrapped in a modelled variant here.
         if let Some(tags) = input.tags.as_ref() {
             if let Err(why) =
                 crate::state::validate_tags_member(tags, crate::state::TagConstraints::TagsMap)
             {
-                return Err(PutDeploymentParameterErrorModeled::ValidationException(why).into());
+                return Err(why.into_error(PutDeploymentParameterErrorModeled::ValidationException));
             }
         }
 
@@ -303,17 +308,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // agreement. So the target is a precondition this operation RESOLVES: a
         // request whose triple the store does not hold is the modelled
         // `ResourceNotFoundException` (HTTP 404), blamed on the segment that did
-        // not resolve (the product first, then the agreement), and nothing is
-        // written for it.
+        // not resolve (the agreement first, then the product it has to cover), and
+        // nothing is written for it.
         //
-        // The modelled input constraints (`tags` at most 50 entries, every
-        // `@pattern`, every `@length`) are already refused with
-        // `ValidationException` (HTTP 400) by the centralized validate step that
-        // runs before this handler — except an oversized `@sensitive` payload,
-        // which the front door refuses with HTTP 403 `ForbiddenException` ahead of
-        // that step (`crate::service`). So a malformed request is a 400 (or that
-        // 403), an unresolved target is this 404, and a well-formed request for a
-        // target the account holds is the create-or-update below.
+        // The modelled input constraints (every `@pattern`, every `@length`) are
+        // already refused with `ValidationException` (HTTP 400) by the centralized
+        // validate step that runs before this handler — except an oversized
+        // `@sensitive` payload, which the front door refuses with HTTP 403
+        // `ForbiddenException` ahead of that step, and a `tags` map past the number
+        // of tags one resource holds, which the tagging front end refuses with its
+        // own HTTP 400 `BadRequestException` (both in `crate::service`). So a
+        // malformed request is a 400, an unresolved target is this 404, and a
+        // well-formed request for a target the account holds is the
+        // create-or-update below.
         if let Some(member) =
             store.unresolved_target(&input.catalog, &input.product_id, &input.agreement_id)
         {
@@ -405,8 +412,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ) {
                     Ok(tags) => tags,
                     Err(why) => {
-                        return Err(PutDeploymentParameterErrorModeled::ValidationException(why)
-                            .into())
+                        return Err(
+                            why.into_error(PutDeploymentParameterErrorModeled::ValidationException)
+                        )
                     }
                 };
                 if !store.has_capacity() {

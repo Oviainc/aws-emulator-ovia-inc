@@ -7,11 +7,17 @@
 //! — a key in the namespace AWS reserves, a key outside the characters a tag key may
 //! hold, a value longer than a tag value may be, a map of more entries than one
 //! resource may hold — is answered the SAME way whether or not the ARN the request
-//! names resolves to a stored record: HTTP 400 with the modelled
-//! `ValidationException`, the same message and the same `fieldName`. Only the part of
+//! names resolves to a stored record: HTTP 400 with the same code, the same message
+//! and the same `fieldName`. Only the part of
 //! the per-resource cap that needs the record — whether the set would pass the cap on
 //! top of the tags the record ALREADY holds — may wait for the record to be resolved;
 //! nothing is stored or changed either way.
+//!
+//! WHICH code a row carries is the other half of the identity, and it is per row: a
+//! bound on what a tag IS is this service's own modelled `ValidationException`, which
+//! names the member it is about, while the COUNT of tags one resource may hold is the
+//! tagging front end's limit, answered with its own unmodelled identity and no member
+//! (`tag_count_front_end` owns that rule).
 //!
 //! The complement holds too: a tag set the request-level judgement ADMITS carries no
 //! verdict of its own, so against a stored record it is the success the merge earns
@@ -33,7 +39,9 @@
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::scaffolded::NOT_FOUND_CODE;
+use service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::scaffolded::{
+    BAD_REQUEST_CODE, NOT_FOUND_CODE,
+};
 use service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::state::{
     MAX_TAGS_PER_RESOURCE, RESERVED_TAG_KEY_PREFIX, TAG_KEY_MAX_LEN, TAG_VALUE_MAX_LEN,
 };
@@ -114,10 +122,13 @@ fn unresolved_arns(live: &str) -> Vec<(&'static str, String)> {
 /// last among them. The non-ASCII row is there because the length bounds count
 /// CHARACTERS, not the bytes UTF-8 took to carry them.
 ///
+/// Each row carries the wire code its own refusal has: the count rows are the tagging
+/// front end's, the rest this service's modelled input error.
+///
 /// `RESERVED_TAG_KEY_PREFIX`, `TAG_KEY_MAX_LEN`, `TAG_VALUE_MAX_LEN` and
 /// `MAX_TAGS_PER_RESOURCE` are the service's own statements of AWS's tagging limits;
 /// the `reserved_tag_keys` and `deployment_parameters` suites pin what each one is.
-fn refused_by_the_input() -> Vec<(&'static str, BTreeMap<String, String>)> {
+fn refused_by_the_input() -> Vec<(&'static str, BTreeMap<String, String>, &'static str)> {
     let long_key = "k".repeat(TAG_KEY_MAX_LEN + 1);
     vec![
         // The COUNT the request itself carries. Applying a tag set can only leave a
@@ -131,27 +142,36 @@ fn refused_by_the_input() -> Vec<(&'static str, BTreeMap<String, String>)> {
             (0..=MAX_TAGS_PER_RESOURCE)
                 .map(|index| (format!("over-{index:03}"), "v".to_string()))
                 .collect(),
+            BAD_REQUEST_CODE,
         ),
         (
             "a map far past the per-resource cap",
             (0..MAX_TAGS_PER_RESOURCE * 4)
                 .map(|index| (format!("over-{index:03}"), "v".to_string()))
                 .collect(),
+            BAD_REQUEST_CODE,
         ),
-        ("an empty key alone", tag_map(&[("", "v")])),
+        (
+            "an empty key alone",
+            tag_map(&[("", "v")]),
+            "ValidationException",
+        ),
         (
             "an empty key beside a legal pair",
             tag_map(&[("", "v"), ("team", "payments")]),
+            "ValidationException",
         ),
         (
             "a key one character past its maximum",
             [(long_key.clone(), "v".to_string())].into_iter().collect(),
+            "ValidationException",
         ),
         (
             "a key far past its maximum",
             [("k".repeat(TAG_KEY_MAX_LEN * 4), "v".to_string())]
                 .into_iter()
                 .collect(),
+            "ValidationException",
         ),
         (
             // Sorts AFTER the legal pair, so the refusal cannot depend on the
@@ -163,30 +183,35 @@ fn refused_by_the_input() -> Vec<(&'static str, BTreeMap<String, String>)> {
             ]
             .into_iter()
             .collect(),
+            "ValidationException",
         ),
         (
             "a key of non-ASCII characters one past its maximum",
             [("é".repeat(TAG_KEY_MAX_LEN + 1), "v".to_string())]
                 .into_iter()
                 .collect(),
+            "ValidationException",
         ),
         (
             "a value one character past its maximum",
             [("k".to_string(), "v".repeat(TAG_VALUE_MAX_LEN + 1))]
                 .into_iter()
                 .collect(),
+            "ValidationException",
         ),
         (
             "a value far past its maximum",
             [("k".to_string(), "v".repeat(TAG_VALUE_MAX_LEN * 4))]
                 .into_iter()
                 .collect(),
+            "ValidationException",
         ),
         (
             "a value of non-ASCII characters one past its maximum",
             [("k".to_string(), "é".repeat(TAG_VALUE_MAX_LEN + 1))]
                 .into_iter()
                 .collect(),
+            "ValidationException",
         ),
         (
             "a key in the namespace AWS reserves",
@@ -196,6 +221,7 @@ fn refused_by_the_input() -> Vec<(&'static str, BTreeMap<String, String>)> {
             )]
             .into_iter()
             .collect(),
+            "ValidationException",
         ),
         (
             "a reserved key beside a legal pair",
@@ -208,6 +234,7 @@ fn refused_by_the_input() -> Vec<(&'static str, BTreeMap<String, String>)> {
             ]
             .into_iter()
             .collect(),
+            "ValidationException",
         ),
     ]
 }
@@ -249,7 +276,7 @@ async fn a_tag_set_the_input_refuses_is_refused_identically_whether_the_arn_reso
     let (router, live) = emulator_with_one_parameter().await;
     let stored = tag_map(&[(STORED_KEY, STORED_VALUE)]);
 
-    for (case, tags) in refused_by_the_input() {
+    for (case, tags, expected_code) in refused_by_the_input() {
         // The answer the SAME tag set earns against the record that exists: the
         // reference every unresolved row below is compared with.
         let (status, resolved) = tag(&router, &live, &tags).await;
@@ -259,14 +286,16 @@ async fn a_tag_set_the_input_refuses_is_refused_identically_whether_the_arn_reso
         );
         assert_eq!(
             error_code(&resolved),
-            "ValidationException",
-            "case {case:?}/resolved: expected ValidationException, got {resolved:?}"
+            expected_code,
+            "case {case:?}/resolved: expected {expected_code}, got {resolved:?}"
         );
-        assert_eq!(
-            field_name(&resolved),
-            "tags",
-            "case {case:?}/resolved: expected fieldName \"tags\", got {resolved:?}"
-        );
+        if expected_code == "ValidationException" {
+            assert_eq!(
+                field_name(&resolved),
+                "tags",
+                "case {case:?}/resolved: expected fieldName \"tags\", got {resolved:?}"
+            );
+        }
 
         for (arn_case, arn) in unresolved_arns(&live) {
             assert_ne!(
@@ -281,8 +310,8 @@ async fn a_tag_set_the_input_refuses_is_refused_identically_whether_the_arn_reso
             );
             assert_eq!(
                 error_code(&answered),
-                "ValidationException",
-                "case {case:?}/{arn_case}: expected ValidationException, got {answered:?}"
+                expected_code,
+                "case {case:?}/{arn_case}: expected {expected_code}, got {answered:?}"
             );
             assert_eq!(
                 message(&answered),
@@ -346,7 +375,7 @@ async fn the_count_the_request_carries_is_judged_at_the_number_a_resource_may_ho
                  {answered:?}"
             );
             let expected_code = if expected_status == 400 {
-                "ValidationException"
+                BAD_REQUEST_CODE
             } else {
                 NOT_FOUND_CODE
             };
@@ -387,7 +416,7 @@ async fn the_record_the_clock_has_expired_answers_exactly_as_an_unknown_arn_does
         .expect("a minted resourceArn")
         .to_string();
 
-    for (case, tags) in refused_by_the_input() {
+    for (case, tags, expected_code) in refused_by_the_input() {
         let (status, answered) = tag(&router, &expired, &tags).await;
         assert_eq!(
             status, 400,
@@ -396,14 +425,16 @@ async fn the_record_the_clock_has_expired_answers_exactly_as_an_unknown_arn_does
         );
         assert_eq!(
             error_code(&answered),
-            "ValidationException",
-            "case {case:?}/expired: expected ValidationException, got {answered:?}"
+            expected_code,
+            "case {case:?}/expired: expected {expected_code}, got {answered:?}"
         );
-        assert_eq!(
-            field_name(&answered),
-            "tags",
-            "case {case:?}/expired: expected fieldName tags, got {answered:?}"
-        );
+        if expected_code == "ValidationException" {
+            assert_eq!(
+                field_name(&answered),
+                "tags",
+                "case {case:?}/expired: expected fieldName tags, got {answered:?}"
+            );
+        }
     }
 
     for (case, tags) in admitted_by_the_input() {

@@ -658,12 +658,16 @@ impl ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState {
     /// Which segment of the target `(catalog, productId, agreementId)` this
     /// account does not hold, or `None` when the whole target resolves.
     ///
-    /// The product is judged FIRST and the agreement second, so a request naming
-    /// neither is blamed on the product: the identifiers nest that way, since a
-    /// product is what an agreement covers. `productId` is unresolved when no
-    /// agreement of this catalog covers it at all; otherwise the request's
-    /// `agreementId` is the segment that does not reach it, whether that id names
-    /// no agreement or one that covers other products.
+    /// The AGREEMENT is judged FIRST and the product second, because that is the
+    /// order the operation targets by: `PutDeploymentParameter` "creates or
+    /// updates a deployment parameter and is targeted by `catalog` and
+    /// `agreementId`" for the product the URI addresses, so the agreement is the
+    /// target a write resolves and the product is what a resolved agreement has
+    /// to cover. `agreementId` is therefore the unresolved segment whenever this
+    /// account holds no agreement of that id in the catalog — which is the case a
+    /// request naming neither a held agreement nor a held product falls in;
+    /// `productId` is the unresolved segment only once the agreement itself
+    /// resolves and does not cover the product the request addresses.
     ///
     /// The returned name is the member as [`target_not_found`] states it.
     pub fn unresolved_target(
@@ -672,18 +676,14 @@ impl ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState {
         product_id: &str,
         agreement_id: &str,
     ) -> Option<&'static str> {
-        if self.holds_target(catalog, product_id, agreement_id) {
-            return None;
-        }
-        let product_covered = self
+        match self
             .agreements
-            .values()
-            .any(|agreement| agreement.catalog == catalog && agreement.covers(product_id));
-        Some(if product_covered {
-            "AgreementId"
-        } else {
-            "ProductId"
-        })
+            .get(&(catalog.to_string(), agreement_id.to_string()))
+        {
+            None => Some("AgreementId"),
+            Some(agreement) if !agreement.covers(product_id) => Some("ProductId"),
+            Some(_) => None,
+        }
     }
 
     /// Materialise the expiry the clock has already made due at `now`: drop every
@@ -859,6 +859,73 @@ pub fn validate_tag_keys_member<'a>(
     }
 }
 
+/// What a tag set a request carries can be refused by — two failures with different
+/// wire identities, kept apart here so no layer of this service can come to answer
+/// one with the other's.
+///
+/// A tag outside a bound on what a tag IS — the namespace AWS reserves, the length a
+/// key or a value may hold, the character class the map a member targets states — is
+/// a violation of this service's OWN modelled input, so it stays the modelled
+/// `ValidationException`, which names the member it is about. The NUMBER of tags one
+/// resource may hold is not this service's rule: it is AWS's per-resource tagging
+/// limit, enforced by the tagging front end that runs ahead of this service's
+/// modelled input validation, and its recorded answer carries the generic
+/// `BadRequestException` identity ([`crate::scaffolded::BAD_REQUEST_CODE`]) with one
+/// fixed sentence ([`too_many_tags`]). The difference is client-visible on restJson1,
+/// where the error SHAPE is resolved from the wire code: a caller's
+/// `catch ValidationException` must not fire for a tag set refused for its size, and
+/// a caller matching the front end's identity must see it.
+#[derive(Debug)]
+pub enum TagRefusal {
+    /// A violation of this service's own modelled input, blamed on the member that
+    /// carried it.
+    Invalid(ValidationException),
+    /// A tag set past the number of tags one resource holds.
+    TooManyTags(crate::scaffolded::BadRequest),
+}
+
+impl TagRefusal {
+    /// This refusal in the calling operation's error channel.
+    ///
+    /// `modelled` is that operation's own `ValidationException` variant, so every
+    /// operation answers the modelled shape it declares, while the count refusal
+    /// keeps the front end's identity — which the model does not declare, so it
+    /// cannot travel as a modelled variant at all.
+    pub fn into_error<E>(
+        self,
+        modelled: impl FnOnce(ValidationException) -> E,
+    ) -> crate::scaffolded::Scaffolded<E> {
+        match self {
+            Self::Invalid(why) => crate::scaffolded::Scaffolded::Modeled(modelled(why)),
+            Self::TooManyTags(refused) => crate::scaffolded::Scaffolded::BadRequest(refused),
+        }
+    }
+}
+
+/// Lets `?` lift this service's modelled input refusals into [`TagRefusal`], so the
+/// judgements that are modelled stay stated as the modelled shape.
+impl From<ValidationException> for TagRefusal {
+    fn from(why: ValidationException) -> Self {
+        Self::Invalid(why)
+    }
+}
+
+/// The tagging front end's refusal of a tag set past [`MAX_TAGS_PER_RESOURCE`]:
+/// HTTP 400 with the code [`crate::scaffolded::BAD_REQUEST_CODE`] and AWS's own fixed
+/// sentence for that limit.
+///
+/// The sentence carries NOTHING from the request — neither the number of tags it sent
+/// nor the member that carried them: the one number in it is the per-resource maximum
+/// itself, read off [`MAX_TAGS_PER_RESOURCE`] so the text cannot drift from the limit
+/// the service keeps. It is the same sentence whichever side of the limit was crossed
+/// — a set already past it on its own, or one only past it once merged onto what a
+/// record already holds — because what the limit is about is the RESULTANT tag set.
+pub fn too_many_tags() -> crate::scaffolded::BadRequest {
+    crate::scaffolded::BadRequest::new(format!(
+        "The resultant tag set must not have more than {MAX_TAGS_PER_RESOURCE} user tags."
+    ))
+}
+
 /// Judge the tag map a request CARRIES, before anything is read or written.
 ///
 /// This is a judgement on the INPUT alone: every entry of `incoming` is held to
@@ -881,7 +948,7 @@ pub fn validate_tag_keys_member<'a>(
 pub fn validate_tags_member(
     incoming: &HashMap<String, String>,
     constraints: TagConstraints,
-) -> Result<(), ValidationException> {
+) -> Result<(), TagRefusal> {
     validate_tag_keys_member(incoming.keys().map(String::as_str), "tags")?;
     let ordered: BTreeMap<&String, &String> = incoming.iter().collect();
     for (key, value) in ordered {
@@ -891,7 +958,8 @@ pub fn validate_tags_member(
                     "the value of tag key '{key}' is longer than the {TAG_VALUE_MAX_LEN} characters a tag value may hold"
                 ),
                 field_name: "tags".to_string(),
-            });
+            }
+            .into());
         }
         // The key side of the constrained map's own `@pattern`. Judged here because
         // the centralized constraint walk reports a map's values and not its keys;
@@ -902,7 +970,8 @@ pub fn validate_tags_member(
                     "tag key '{key}' is outside the {TAG_CHARACTER_CLASS} characters this member's tag keys may hold"
                 ),
                 field_name: "tags".to_string(),
-            });
+            }
+            .into());
         }
     }
     // The part of the per-resource cap the REQUEST alone decides. Applying a tag set
@@ -911,20 +980,16 @@ pub fn validate_tags_member(
     // resource in any state: it is an over-sized input, not a full resource, and so is
     // refused here with everything else the request decides on its own. The cap on the
     // RESULT of merging onto what a record already holds needs the record, so it stays
-    // where the record is known ([`merge_tags`]).
+    // where the record is known ([`merge_tags`]) — and both answer the one refusal
+    // [`too_many_tags`] states, which is the front end's and not this service's
+    // modelled input error ([`TagRefusal`]).
     //
     // It is judged AFTER the walk above deliberately: a request that breaks a bound of
     // one entry AND carries too many entries is told about the entry, which is the
     // narrower fault and the one a caller can see in what it sent. The precedence is
     // the same whatever the store holds, so it is no part of the rule above.
     if incoming.len() > MAX_TAGS_PER_RESOURCE {
-        return Err(ValidationException {
-            message: format!(
-                "the request carries {} tags; a deployment parameter holds at most {MAX_TAGS_PER_RESOURCE}",
-                incoming.len()
-            ),
-            field_name: "tags".to_string(),
-        });
+        return Err(TagRefusal::TooManyTags(too_many_tags()));
     }
     Ok(())
 }
@@ -941,12 +1006,14 @@ pub fn validate_tags_member(
 /// may hold, or a key outside the character class the member's own map shape states.
 /// What this adds is the one limit that needs the record rather than the request:
 /// whether merging onto the tags the record ALREADY holds would pass
-/// [`MAX_TAGS_PER_RESOURCE`].
+/// [`MAX_TAGS_PER_RESOURCE`] — refused as the front end's own count refusal
+/// ([`too_many_tags`], [`TagRefusal`]) and not as this service's modelled input
+/// error, exactly as the request-only half of that same limit is.
 pub fn merge_tags(
     existing: &BTreeMap<String, String>,
     incoming: &HashMap<String, String>,
     constraints: TagConstraints,
-) -> Result<BTreeMap<String, String>, ValidationException> {
+) -> Result<BTreeMap<String, String>, TagRefusal> {
     validate_tags_member(incoming, constraints)?;
     let mut merged = existing.clone();
     let ordered: BTreeMap<&String, &String> = incoming.iter().collect();
@@ -954,13 +1021,7 @@ pub fn merge_tags(
         merged.insert(key.clone(), value.clone());
     }
     if merged.len() > MAX_TAGS_PER_RESOURCE {
-        return Err(ValidationException {
-            message: format!(
-                "the request would leave the resource with {} tags; a deployment parameter holds at most {MAX_TAGS_PER_RESOURCE}",
-                merged.len()
-            ),
-            field_name: "tags".to_string(),
-        });
+        return Err(TagRefusal::TooManyTags(too_many_tags()));
     }
     Ok(merged)
 }
@@ -1136,6 +1197,13 @@ pub fn store_unavailable() -> InternalServerException {
 /// the sequence serves a reporting operation and a mutating one alike — and a change
 /// to any step is a change to all of them.
 ///
+/// `judge_request` and `resolved` answer in the operation's whole error CHANNEL
+/// rather than in its modelled error enum alone, because not every refusal a tagging
+/// request earns is a shape this model declares: the tagging front end's own
+/// refusals — an unaddressable `resourceArn`, a tag set past the per-resource count
+/// ([`too_many_tags`]) — carry their own identity, and funnelling them through the
+/// modelled enum would restate them as this service's `ValidationException`.
+///
 /// This is the REPORTING entry point: it leaves the record's "last written" instant
 /// alone, because reporting a record is not writing it. An operation whose success
 /// writes the record takes [`write_tagged_parameter`], which runs this same sequence
@@ -1144,8 +1212,10 @@ pub fn with_tagged_parameter<Eng, E, T>(
     engine: &Eng,
     resource_arn: &str,
     store_unavailable_as: impl FnOnce(InternalServerException) -> E,
-    judge_request: impl FnOnce() -> Result<(), E>,
-    resolved: impl FnOnce(&mut DeploymentParameterRecord) -> Result<T, E>,
+    judge_request: impl FnOnce() -> Result<(), crate::scaffolded::Scaffolded<E>>,
+    resolved: impl FnOnce(
+        &mut DeploymentParameterRecord,
+    ) -> Result<T, crate::scaffolded::Scaffolded<E>>,
 ) -> Result<T, crate::scaffolded::Scaffolded<E>>
 where
     Eng: Send + Sync + 'static,
@@ -1179,8 +1249,10 @@ pub fn write_tagged_parameter<Eng, E, T>(
     engine: &Eng,
     resource_arn: &str,
     store_unavailable_as: impl FnOnce(InternalServerException) -> E,
-    judge_request: impl FnOnce() -> Result<(), E>,
-    write: impl FnOnce(&mut DeploymentParameterRecord) -> Result<T, E>,
+    judge_request: impl FnOnce() -> Result<(), crate::scaffolded::Scaffolded<E>>,
+    write: impl FnOnce(
+        &mut DeploymentParameterRecord,
+    ) -> Result<T, crate::scaffolded::Scaffolded<E>>,
 ) -> Result<T, crate::scaffolded::Scaffolded<E>>
 where
     Eng: Send + Sync + 'static,
@@ -1207,14 +1279,17 @@ fn resolve_tagged_parameter<Eng, E, T>(
     engine: &Eng,
     resource_arn: &str,
     store_unavailable_as: impl FnOnce(InternalServerException) -> E,
-    judge_request: impl FnOnce() -> Result<(), E>,
-    resolved: impl FnOnce(&mut DeploymentParameterRecord, SystemTime) -> Result<T, E>,
+    judge_request: impl FnOnce() -> Result<(), crate::scaffolded::Scaffolded<E>>,
+    resolved: impl FnOnce(
+        &mut DeploymentParameterRecord,
+        SystemTime,
+    ) -> Result<T, crate::scaffolded::Scaffolded<E>>,
 ) -> Result<T, crate::scaffolded::Scaffolded<E>>
 where
     Eng: Send + Sync + 'static,
 {
     validate_resource_arn(resource_arn)?;
-    judge_request().map_err(crate::scaffolded::Scaffolded::Modeled)?;
+    judge_request()?;
     let Some(state) = service_state(engine) else {
         return Err(crate::scaffolded::Scaffolded::Modeled(store_unavailable_as(
             store_unavailable(),
@@ -1230,7 +1305,7 @@ where
     let Some(record) = store.parameters.get_mut(resource_arn) else {
         return Err(parameter_not_found());
     };
-    resolved(record, now).map_err(crate::scaffolded::Scaffolded::Modeled)
+    resolved(record, now)
 }
 
 /// Record the agreements this account holds ahead of any request.

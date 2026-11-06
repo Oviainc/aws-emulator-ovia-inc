@@ -53,6 +53,8 @@ mod sensitive_member_is_a_modelled_path;
 mod state_roundtrip;
 #[path = "all/support.rs"]
 mod support;
+#[path = "all/tag_count_front_end.rs"]
+mod tag_count_front_end;
 #[path = "all/tag_input_judged_before_lookup.rs"]
 mod tag_input_judged_before_lookup;
 #[path = "all/tag_key_judged_the_same_by_every_member.rs"]
@@ -63,5 +65,7 @@ mod tag_write_last_written;
 mod tagging_resolution_sequence;
 #[path = "all/unconstrained_tag_characters.rs"]
 mod unconstrained_tag_characters;
+#[path = "all/unresolved_target_precedence.rs"]
+mod unresolved_target_precedence;
 #[path = "all/validation_messages.rs"]
 mod validation_messages;

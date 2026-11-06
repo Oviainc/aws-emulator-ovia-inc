@@ -203,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     input.tag_keys.iter().map(String::as_str),
                     "tagKeys",
                 )
-                .map_err(UntagResourceErrorModeled::ValidationException)
+                .map_err(|why| UntagResourceErrorModeled::ValidationException(why).into())
             },
             |record| {
                 // `@idempotent`: removing a key the record does not hold is a no-op,

@@ -48,6 +48,21 @@ use crate::ops::types::{ValidationException, SCHEMA_VALIDATION_EXCEPTION};
 /// because this module renders the response itself.
 const VALIDATION_EXCEPTION_STATUS: u16 = 400;
 
+/// What this service answers a request that was refused before any handler ran.
+///
+/// Two identities, because two layers refuse: this service's own modelled input error,
+/// and the tagging front end that runs ahead of it, whose per-resource tag COUNT bound
+/// carries the generic `BadRequestException` identity instead
+/// ([`super::tagging_front_end_refusal`]).
+enum PreHandlerRefusal {
+    /// The modelled `ValidationException`, with both members the shape marks
+    /// `@required`.
+    Modelled(ValidationException),
+    /// The tagging front end's refusal of a tag set past the number of tags one
+    /// resource holds.
+    TooManyTags(crate::scaffolded::BadRequest),
+}
+
 /// The response this service answers `req` with when the modelled walk refuses it before
 /// a handler runs, or `None` when nothing is refused here.
 ///
@@ -60,19 +75,30 @@ pub(super) fn refusal_response<Eng: Send + Sync + 'static>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
 ) -> Option<RtResponse> {
-    let refused = refusal_for_request::<Eng>(protocol, req)?;
-    protocol
-        .serialize_error(
-            &refused,
-            &SCHEMA_VALIDATION_EXCEPTION,
-            super::VALIDATION_EXCEPTION,
-            VALIDATION_EXCEPTION_STATUS,
-        )
-        .ok()
+    match refusal_for_request::<Eng>(protocol, req)? {
+        PreHandlerRefusal::Modelled(refused) => protocol
+            .serialize_error(
+                &refused,
+                &SCHEMA_VALIDATION_EXCEPTION,
+                super::VALIDATION_EXCEPTION,
+                VALIDATION_EXCEPTION_STATUS,
+            )
+            .ok(),
+        // Not a shape this model declares, so it renders through the synthetic schema
+        // its body takes and carries its own code and status.
+        PreHandlerRefusal::TooManyTags(refused) => protocol
+            .serialize_error(
+                &refused,
+                &crate::scaffolded::BAD_REQUEST_SCHEMA,
+                crate::scaffolded::BAD_REQUEST_CODE,
+                crate::scaffolded::BAD_REQUEST_STATUS,
+            )
+            .ok(),
+    }
 }
 
-/// The modelled `ValidationException` that refuses `req` before the handler of the
-/// operation its routing key names, or `None` when none does.
+/// The refusal `req` earns before the handler of the operation its routing key names,
+/// or `None` when it earns none here.
 ///
 /// One arm per operation this model binds (`smithy_query(query="digest")`: four), because
 /// `ValidationException` is a service-COMMON error — every operation declares it, so each
@@ -83,7 +109,7 @@ pub(super) fn refusal_response<Eng: Send + Sync + 'static>(
 fn refusal_for_request<Eng: Send + Sync + 'static>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
-) -> Option<ValidationException> {
+) -> Option<PreHandlerRefusal> {
     use crate::ops::list_tags_for_resource::ListTagsForResource;
     use crate::ops::put_deployment_parameter::PutDeploymentParameter;
     use crate::ops::tag_resource::TagResource;
@@ -107,12 +133,24 @@ fn refusal_for_request<Eng: Send + Sync + 'static>(
     None
 }
 
-/// The modelled `ValidationException` that refuses `req` before `O`'s handler runs.
+/// The refusal `req` earns before `O`'s handler runs.
 fn refusal_for<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
-) -> Option<ValidationException> {
-    modelled_refusal(&refusing_violations::<O>(protocol, req))
+) -> Option<PreHandlerRefusal> {
+    pre_handler_refusal(&refusing_violations::<O>(protocol, req))
+}
+
+/// `violations` as the refusal the layer that owns them answers with.
+///
+/// The tagging front end's bound is judged FIRST, because that layer runs ahead of this
+/// service's modelled input validation; everything else is this service's own modelled
+/// shape.
+fn pre_handler_refusal(violations: &[Violation]) -> Option<PreHandlerRefusal> {
+    if let Some(refused) = super::tagging_front_end_refusal(violations) {
+        return Some(PreHandlerRefusal::TooManyTags(refused));
+    }
+    modelled_refusal(violations).map(PreHandlerRefusal::Modelled)
 }
 
 /// `violations` as the modelled `ValidationException`: the sentence this service states
@@ -227,5 +265,78 @@ mod tests {
             modelled_refusal(&[violation("", ViolationKind::MinLength(1), Some("x"))]).is_none(),
             "expected a violation naming no member to be declined"
         );
+    }
+
+    /// The tag MAP's own count bound is the tagging front end's refusal, and it is
+    /// answered ahead of every other violation of the same request; a violation on an
+    /// ENTRY of that map is this service's own modelled refusal, as every other
+    /// member's is.
+    #[test]
+    fn the_tag_count_bound_is_the_front_ends_refusal_and_an_entry_is_not() {
+        let cases: Vec<(&str, Vec<Violation>, bool)> = vec![
+            (
+                "the map past its entry count",
+                vec![violation("tags", ViolationKind::MaxLength(50), None)],
+                true,
+            ),
+            (
+                "the map past its entry count beside another broken member",
+                vec![
+                    violation(
+                        "catalog",
+                        ViolationKind::Pattern("^[a-zA-Z_-]+$".to_string()),
+                        Some("AWSMarketplace1"),
+                    ),
+                    violation("tags", ViolationKind::MaxLength(50), None),
+                ],
+                true,
+            ),
+            (
+                "one entry's value past its own bound",
+                vec![violation(
+                    "tags.owner",
+                    ViolationKind::MaxLength(256),
+                    Some("v"),
+                )],
+                false,
+            ),
+            (
+                "a member of the input past its own bound",
+                vec![violation(
+                    "clientToken",
+                    ViolationKind::MaxLength(64),
+                    Some("v"),
+                )],
+                false,
+            ),
+        ];
+
+        for (case, violations, expected_front_end) in cases {
+            let refused = pre_handler_refusal(&violations)
+                .unwrap_or_else(|| panic!("case {case:?}: must be refused"));
+            match refused {
+                PreHandlerRefusal::TooManyTags(refused) => {
+                    assert!(
+                        expected_front_end,
+                        "case {case:?}: expected this service's modelled refusal, got the \
+                         front end's {:?}",
+                        refused.message
+                    );
+                    assert_eq!(
+                        refused.message,
+                        crate::state::too_many_tags().message,
+                        "case {case:?}: expected the one sentence the service states for \
+                         that limit, got {:?}",
+                        refused.message
+                    );
+                }
+                PreHandlerRefusal::Modelled(refused) => assert!(
+                    !expected_front_end,
+                    "case {case:?}: expected the front end's refusal, got the modelled \
+                     {:?}",
+                    refused.message
+                ),
+            }
+        }
     }
 }

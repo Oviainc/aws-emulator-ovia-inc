@@ -35,9 +35,7 @@
 //! suite owns, so what is asserted is what a signed SDK request observes.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::state::{
-    MAX_TAGS_PER_RESOURCE, RESERVED_TAG_KEY_PREFIX,
-};
+use service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::state::RESERVED_TAG_KEY_PREFIX;
 
 use crate::deployment_parameters::{
     call, emulator, error_code, field_name, message, pct, provision, put, tag, untag, CATALOG,
@@ -116,11 +114,6 @@ async fn every_boundary_refusal_names_the_member_it_is_about() {
     let over_long = "c".repeat(65);
     let over_long_id = "p".repeat(65);
     let secret = "s".to_string();
-    // A tag map one entry past `TagsMap`'s modelled maximum, every entry of it valid, so
-    // the only constraint broken is the map's own.
-    let too_many_tags: serde_json::Map<String, Value> = (0..=MAX_TAGS_PER_RESOURCE)
-        .map(|index| (format!("key{index}"), json!("v")))
-        .collect();
 
     let rows: Vec<Row> = vec![
         // A `@pattern` on a member bound to the URI.
@@ -212,18 +205,10 @@ async fn every_boundary_refusal_names_the_member_it_is_about() {
             }),
             "tags.owner",
         ),
-        // The collection ITSELF, over its modelled entry count.
-        Row::new(
-            "a tag map one entry past its modelled maximum",
-            CATALOG,
-            PRODUCT,
-            json!({
-                "agreementId": AGREEMENT,
-                "deploymentParameter": { "name": "N", "secretString": secret },
-                "tags": too_many_tags,
-            }),
-            "tags",
-        ),
+        // A `tags` map past its modelled entry COUNT is deliberately absent: that
+        // limit is the tagging front end's, answered with its own unmodelled identity
+        // and no member at all (`tag_count_front_end` owns that rule), so it is not a
+        // refusal this body states.
         // A `@required` member absent, which is found while READING the request.
         Row::new(
             "a required member of the input absent",
