@@ -133,6 +133,8 @@ mod request_claim;
 mod resource_tag_removal;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/send_bulk_email.rs"]
+mod send_bulk_email;
 #[path = "all/send_list_management_options.rs"]
 mod send_list_management_options;
 #[path = "all/send_suppression_from_feedback.rs"]

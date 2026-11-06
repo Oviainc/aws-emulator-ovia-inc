@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendBulkEmail
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendBulkEmail`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendBulkEmail::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Composes one message per destination from ONE template and sends each of them, while
+//! the account's sending switch is on — and, where the request names a configuration set,
+//! while that set's own switch is on too — from an identity verified for sending. The
+//! template is the request's `DefaultContent`, and each `BulkEmailEntries` entry supplies
+//! what is its own about the message it gets: its destination, the values to substitute
+//! into the template ([`crate::state::template_rendering`]), the headers to add to it and
+//! the tags its events carry. Every accepted entry appends a message of its own to this
+//! service's outbound-message log with a fresh unique `MessageId`, which is what the
+//! entry's result reports, and each message's recipients then do with it what the
+//! account's suppression list and their own mailboxes decide — which is what the
+//! suppression list is written from and what the configuration set's event destinations
+//! are told about ([`crate::state::event_publication`]). An entry nothing could be sent
+//! for carries the `BulkEmailStatus` of what stopped it instead of an id, and the other
+//! entries are sent: only a failure of the REQUEST (the template, the sender, the
+//! configuration set, the account's switches) refuses the whole call. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -125,6 +132,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::event_publication;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -201,18 +209,549 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendBulkEmail` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendBulkEmailErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendBulkEmail"))
+        // The Region whose identity list a send is checked against: SES identities are
+        // per Region, so the Region the call executes in is part of how a failed check is
+        // reported.
+        let region = crate::state::request_region(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no store
+            // at all. That is not a modelled SES state: answer the scaffold's 501 rather
+            // than a throttle an SDK would retry forever.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SendBulkEmail without the shared emulator state",
+            ));
+        };
+
+        // Members that select a resource this slice does not own: the sending
+        // authorization policies, tenants, multi-region endpoints and per-request tracking
+        // overrides they name are kept by operations nobody has written yet. A request
+        // that names one is answered as unwritten, rather than accepted as if the member
+        // had not been sent.
+        for (present, member) in [
+            (
+                input.from_email_address_identity_arn.is_some(),
+                "FromEmailAddressIdentityArn",
+            ),
+            (
+                input
+                    .feedback_forwarding_email_address_identity_arn
+                    .is_some(),
+                "FeedbackForwardingEmailAddressIdentityArn",
+            ),
+            (input.endpoint_id.is_some(), "EndpointId"),
+            (input.tenant_name.is_some(), "TenantName"),
+            (
+                input.configuration_overrides.is_some(),
+                "ConfigurationOverrides",
+            ),
+        ] {
+            if present {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "SendBulkEmail with {member}"
+                )));
+            }
+        }
+
+        // "An object that contains the body of the message. You can specify a template
+        // message": `BulkEmailContent` declares one member, so a bulk send's content IS a
+        // template and content naming none names no message to send.
+        let Some(template) = input.default_content.template.as_ref() else {
+            return Err(bad_request(NO_DEFAULT_TEMPLATE));
+        };
+        if template
+            .attachments
+            .as_ref()
+            .is_some_and(|attachments| !attachments.is_empty())
+        {
+            // "The List of attachments to include in your email. All recipients will
+            // receive the same attachments": assembling a MIME document that carries them
+            // is a capability this slice does not have, and the request is a valid one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SendBulkEmail with template attachments",
+            ));
+        }
+
+        // The values the template's message variables take for a destination the request
+        // states none of its own for. The member is what makes a bulk send's content
+        // complete, so a request that carries a template and no data for it is refused
+        // before anything about any one destination is looked at.
+        let Some(default_template_data) = template.template_data.as_deref() else {
+            return Err(bad_request(MISSING_DEFAULT_TEMPLATE_DATA));
+        };
+        let Some(default_variables) =
+            crate::state::template_rendering::message_variables(default_template_data)
+        else {
+            return Err(bad_request(INVALID_DEFAULT_TEMPLATE_DATA));
+        };
+
+        if input.bulk_email_entries.len() > MAX_DESTINATIONS_PER_REQUEST {
+            return Err(SendBulkEmailErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "A bulk send may address no more than {MAX_DESTINATIONS_PER_REQUEST} \
+                         destinations, but {} were provided.",
+                        input.bulk_email_entries.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The sending identity, which a bulk send states once for every message it sends.
+        let Some(from) = input.from_email_address.clone() else {
+            return Err(bad_request("Missing required header 'From'."));
+        };
+
+        let now = ::std::time::SystemTime::now();
+
+        // Everything about the REQUEST is settled first, under the lock, and the template's
+        // content is copied out of the store: substituting a destination's values into a
+        // template is work the CALLER sizes, so it is not done while the store every other
+        // request shares is locked.
+        let content = {
+            let mut store = state.lock();
+            store.settle(now);
+
+            // The account-level sending switch (`GetAccount`'s `SendingEnabled`, which
+            // `PutAccountSendingAttributes` sets) gates every message this account sends,
+            // so it is read before anything about these particular messages.
+            if !store.account.sending_enabled {
+                return Err(SendBulkEmailErrorModeled::SendingPausedException(
+                    SendingPausedException {
+                        message: Some(
+                            "The message can't be sent because the account's ability to send \
+                             email is currently paused."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+
+            // The configuration set the request names is a resource of this account, and
+            // the set's own sending switch gates every message sent with it: while it is
+            // off, a send naming the set has no ability to send, whatever the account-wide
+            // switch says.
+            if let Some(set_name) = input.configuration_set_name.as_deref() {
+                let Some(configuration_set) = store.configuration_sets.get(set_name) else {
+                    return Err(SendBulkEmailErrorModeled::NotFoundException(
+                        NotFoundException {
+                            message: Some(crate::state::configuration_set_not_found(set_name)),
+                        },
+                    )
+                    .into());
+                };
+                if !configuration_set.sending_enabled {
+                    return Err(SendBulkEmailErrorModeled::SendingPausedException(
+                        SendingPausedException {
+                            message: Some(crate::state::configuration_set_sending_paused(
+                                set_name,
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
+
+            // "The address that you specify has to be verified." An address identity
+            // authorises itself; a domain identity authorises every address in that domain
+            // and its subdomains.
+            let authorised = store
+                .sending_identity(&from)
+                .is_some_and(|identity| identity.verified_for_sending);
+            if !authorised {
+                return Err(SendBulkEmailErrorModeled::MessageRejected(MessageRejected {
+                    message: Some(crate::state::unverified_identities_message(&region, &from)),
+                })
+                .into());
+            }
+
+            template_content(&store, template)?
+        };
+
+        // One message composed per entry, with no lock held: each entry's own values are
+        // substituted into the one template, and an entry that composes no message carries
+        // what stopped it.
+        let default_tags = input.default_email_tags.clone().unwrap_or_default();
+        let mut composed = Vec::new();
+        for entry in &input.bulk_email_entries {
+            composed.push(compose(
+                entry,
+                &content,
+                &default_variables,
+                template,
+                &default_tags,
+            )?);
+        }
+
+        // What each composed message becomes: an id, a log entry, the recipients' own
+        // reactions to it and the events those produce. The quota is charged as the
+        // messages are accepted, so a request whose later entries no longer fit inside it
+        // reports that for exactly those entries.
+        let account_id = crate::state::CallerScope::of(ctx.parts())
+            .account_id
+            .to_string();
+        let mut results = Vec::new();
+        let mut publications = Vec::new();
+        let mut store = state.lock();
+        let quota = store.send_counters.max_24h;
+        let mut charged = store.send_counters.sent_last_24h;
+        for message in composed {
+            let message = match message {
+                Composed::Refused { status, error } => {
+                    results.push(BulkEmailEntryResult {
+                        status: Some(status.to_string()),
+                        error: Some(error),
+                        message_id: None,
+                    });
+                    continue;
+                }
+                Composed::Ready(message) => message,
+            };
+            // Each recipient of each message counts as one message against the account's
+            // 24-hour sending quota.
+            let recipients = (message.to.len() + message.cc.len() + message.bcc.len()) as f64;
+            if charged + recipients > quota {
+                results.push(BulkEmailEntryResult {
+                    status: Some(STATUS_ACCOUNT_DAILY_QUOTA_EXCEEDED.to_string()),
+                    error: Some(crate::state::daily_quota_exceeded(charged, quota)),
+                    message_id: None,
+                });
+                continue;
+            }
+            charged += recipients;
+
+            let sent = crate::state::SentMessage {
+                message_id: store.next_message_id(now),
+                from: Some(from.clone()),
+                to: message.to,
+                cc: message.cc,
+                bcc: message.bcc,
+                subject: message.subject.as_deref().map(
+                    crate::state::ComAmazonawsSesv2SimpleemailserviceV2State::retained_body,
+                ),
+                // Each retained part is capped: a rendered part is as large as the
+                // template that produced it allows, and the log outlives the request.
+                body: message.text.as_deref().map(
+                    crate::state::ComAmazonawsSesv2SimpleemailserviceV2State::retained_body,
+                ),
+                body_html: message.html.as_deref().map(
+                    crate::state::ComAmazonawsSesv2SimpleemailserviceV2State::retained_body,
+                ),
+                configuration_set_name: input.configuration_set_name.clone(),
+                reply_to: input.reply_to_addresses.clone().unwrap_or_default(),
+                // Recorded, not acted on: nothing here forwards a bounce or a complaint as
+                // mail to the address the caller nominated, so that address is part of what
+                // was accepted and readable back from the log.
+                feedback_forwarding: input.feedback_forwarding_email_address.clone(),
+                email_tags: message.tags,
+                headers: message.headers,
+                sent_at: now,
+            };
+            let message_id = sent.message_id.clone();
+            // The copy kept here is what the events of this message are built from, so they
+            // report it exactly as the log holds it even once the log has evicted it.
+            let published = sent.clone();
+            store.record_sent(sent);
+            // What each recipient does with the message, and what the account's suppression
+            // list gains from that: resolved under the lock the send holds, message by
+            // message, exactly as a single send resolves its own.
+            let outcomes = event_publication::outcome::outcomes(&mut store, &published, now);
+            let destinations = published
+                .configuration_set_name
+                .as_deref()
+                .and_then(|set_name| store.configuration_sets.get(set_name))
+                .map(|set| set.event_destinations.values().cloned().collect())
+                .unwrap_or_default();
+            publications.push(event_publication::notification::PublishedSend {
+                account_id: account_id.clone(),
+                region: region.clone(),
+                destinations,
+                message: published,
+                outcomes,
+            });
+            results.push(BulkEmailEntryResult {
+                status: Some(STATUS_SUCCESS.to_string()),
+                error: None,
+                message_id: Some(message_id),
+            });
+        }
+        // The counter is a view of the log these sends just extended, so settling
+        // recomputes it from the log rather than keeping the tally above.
+        store.settle(now);
+        // RELEASE the lock before the events are published: each publication reaches the
+        // service that owns the destination through this same emulator, and every message
+        // it reports is already recorded.
+        drop(store);
+        for publication in publications {
+            event_publication::notification::publish(ctx, publication);
+        }
+
+        Ok(SendBulkEmailOutput {
+            bulk_email_entry_results: results,
+        })
     }
+}
+
+/// Destinations one call may address.
+///
+/// SES documents a limit of 50 destinations in one bulk send, and the model binds
+/// `LimitExceededException` ("There are too many instances of the specified resource
+/// type") to this operation, so a request past it is refused with that rather than
+/// composing a message per entry without end.
+const MAX_DESTINATIONS_PER_REQUEST: usize = 50;
+
+/// `BulkEmailStatus`'s value for an entry SES took: "SUCCESS: Amazon SES accepted the
+/// message, and will attempt to deliver it to the recipients" (the model's own value set
+/// is `crate::ops::types::BULK_EMAIL_STATUS_VALUES`).
+const STATUS_SUCCESS: &str = "SUCCESS";
+
+/// `BulkEmailStatus`'s value for an entry whose own members name no message SES could
+/// compose: "INVALID_PARAMETER".
+const STATUS_INVALID_PARAMETER: &str = "INVALID_PARAMETER";
+
+/// `BulkEmailStatus`'s value for an entry the account's 24-hour quota had no room for:
+/// "ACCOUNT_DAILY_QUOTA_EXCEEDED: You have reached or exceeded the maximum number of
+/// emails you can send from your account in a 24-hour period."
+const STATUS_ACCOUNT_DAILY_QUOTA_EXCEEDED: &str = "ACCOUNT_DAILY_QUOTA_EXCEEDED";
+
+/// `BulkEmailStatus`'s value for an entry nothing was composed for: "FAILED".
+const STATUS_FAILED: &str = "FAILED";
+
+/// How this operation refuses a request whose default content identifies no template at
+/// all — one carrying no `Template` member, and one whose template names neither a stored
+/// template nor content of its own, which are the same absence: there is no template to
+/// compose a message from.
+///
+/// Neither the model nor a recording of this surface states this sentence, so it is worded
+/// as the one recorded sibling condition is — the missing template DATA below — because the
+/// two are the same kind of absence in the same member.
+const NO_DEFAULT_TEMPLATE: &str = "The default template does not exist";
+
+/// How this operation refuses a request whose default template carries no `TemplateData`.
+///
+/// The sentence this surface is RECORDED answering such a call with.
+const MISSING_DEFAULT_TEMPLATE_DATA: &str = "The default template data does not exist";
+
+/// How this operation refuses default template data that is no set of key-value pairs.
+///
+/// Neither the model nor a recording states this sentence either; it names the member and
+/// what the model says it has to be ("this object is a set of key-value pairs").
+const INVALID_DEFAULT_TEMPLATE_DATA: &str =
+    "The default template data is not a valid JSON object";
+
+/// The same, for the values one destination states for itself.
+const INVALID_REPLACEMENT_TEMPLATE_DATA: &str =
+    "The replacement template data is not a valid JSON object";
+
+/// What one entry composed: the message to send, or what stopped it.
+enum Composed {
+    /// The message this entry gets, ready for an id and a log entry.
+    Ready(ComposedMessage),
+    /// Nothing was composed for this entry, and this is what its result reports.
+    Refused {
+        /// The `BulkEmailStatus` of the entry.
+        status: &'static str,
+        /// "A description of an error that prevented a message being sent."
+        error: String,
+    },
+}
+
+/// One destination's message: the template's parts with this destination's values
+/// substituted in, and everything else the entry states about it.
+struct ComposedMessage {
+    /// `Destination$ToAddresses`.
+    to: Vec<String>,
+    /// `Destination$CcAddresses`.
+    cc: Vec<String>,
+    /// `Destination$BccAddresses`.
+    bcc: Vec<String>,
+    /// The rendered subject line.
+    subject: Option<String>,
+    /// The rendered text-only body.
+    text: Option<String>,
+    /// The rendered HTML body.
+    html: Option<String>,
+    /// The headers added to this message, the template's and the entry's merged.
+    headers: Vec<(String, String)>,
+    /// The tags this message's events carry.
+    tags: Vec<(String, String)>,
+}
+
+/// The template content a bulk send composes its messages from.
+///
+/// A template the request names by `TemplateName`, or by the `TemplateArn` that addresses
+/// the same template, is the stored one: a name the account holds no template under is the
+/// modelled 404, worded as every operation over an `EmailTemplateName` words it. Content
+/// the request carries inline is the template itself, and is bounded here the way
+/// `CreateEmailTemplate` bounds a stored one, because a request's own content is never
+/// measured anywhere else.
+fn template_content(
+    store: &crate::state::ComAmazonawsSesv2SimpleemailserviceV2State,
+    template: &Template,
+) -> Result<EmailTemplateContent, SendBulkEmailError> {
+    let named = template.template_name.clone().or_else(|| {
+        template
+            .template_arn
+            .as_deref()
+            .and_then(crate::state::ses_resource_of)
+            .filter(|(resource_type, _)| *resource_type == EMAIL_TEMPLATE_RESOURCE_TYPE)
+            .map(|(_, name)| name.to_string())
+    });
+    if let Some(name) = named {
+        let Some(stored) = store.email_templates.get(&name) else {
+            return Err(SendBulkEmailErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::email_template_not_found(&name)),
+            })
+            .into());
+        };
+        return Ok(stored.content.clone());
+    }
+    let Some(content) = template.template_content.clone() else {
+        return Err(bad_request(NO_DEFAULT_TEMPLATE));
+    };
+    let size = crate::state::email_template_size(&content);
+    if size > crate::state::MAX_EMAIL_TEMPLATE_BYTES {
+        return Err(bad_request(format!(
+            "The template is {size} bytes, which is larger than the maximum template size \
+             of {} bytes.",
+            crate::state::MAX_EMAIL_TEMPLATE_BYTES
+        )));
+    }
+    Ok(content)
+}
+
+/// The resource type an email template's ARN addresses it by, as SES writes the resource
+/// field of one (`crate::state::ses_resource_of`).
+const EMAIL_TEMPLATE_RESOURCE_TYPE: &str = "template";
+
+/// The message `entry` gets, or what stopped it.
+///
+/// What is the ENTRY's own replaces what the request states for every destination, which is
+/// what the "Default…"/"Replacement…" member pair means: the values substituted into the
+/// template are the entry's when it states any, and the request's default otherwise; the
+/// tags its events carry are the entry's when it states any; and its headers are the
+/// template's with the entry's applied over them, which is the rule
+/// `BulkEmailEntry$ReplacementHeaders` documents — "if a header is specified in Template
+/// but not in BulkEmailEntry, the header from Template will be added to the outgoing
+/// email", and a header the entry specifies "takes precedence over any header of the same
+/// name specified in Template", while one the template does not define "will simply be
+/// added to the email as specified in BulkEmailEntry".
+///
+/// An `Err` is a failure of the REQUEST rather than of this entry: the template's own
+/// content is the same for every destination, so a construct this emulator does not render
+/// stops the whole call rather than each entry in turn.
+fn compose(
+    entry: &BulkEmailEntry,
+    content: &EmailTemplateContent,
+    default_variables: &::serde_json::Value,
+    template: &Template,
+    default_tags: &[MessageTag],
+) -> Result<Composed, SendBulkEmailError> {
+    let to = entry.destination.to_addresses.clone().unwrap_or_default();
+    let cc = entry.destination.cc_addresses.clone().unwrap_or_default();
+    let bcc = entry.destination.bcc_addresses.clone().unwrap_or_default();
+    if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+        return Ok(Composed::Refused {
+            status: STATUS_INVALID_PARAMETER,
+            error: "Destination must contain at least one of ToAddresses, CcAddresses or \
+                    BccAddresses."
+                .to_string(),
+        });
+    }
+
+    let replacement = entry
+        .replacement_email_content
+        .as_ref()
+        .and_then(|replacement| replacement.replacement_template.as_ref())
+        .and_then(|replacement| replacement.replacement_template_data.as_deref());
+    let variables = match replacement {
+        None => default_variables.clone(),
+        Some(raw) => match crate::state::template_rendering::message_variables(raw) {
+            Some(variables) => variables,
+            None => {
+                return Ok(Composed::Refused {
+                    status: STATUS_INVALID_PARAMETER,
+                    error: INVALID_REPLACEMENT_TEMPLATE_DATA.to_string(),
+                })
+            }
+        },
+    };
+
+    let rendered = match crate::state::template_rendering::render(content, &variables) {
+        Ok(rendered) => rendered,
+        Err(crate::state::template_rendering::RenderRefusal::Unsupported) => {
+            // The construct is in the TEMPLATE, so it stops every destination alike: the
+            // request is answered as unwritten rather than each entry being told its own
+            // message failed.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SendBulkEmail with a template that uses a section, a partial or a helper call",
+            ));
+        }
+        Err(crate::state::template_rendering::RenderRefusal::TooLarge) => {
+            // An EMULATOR ceiling, reported for the destination that reached it and for no
+            // other: one destination's oversized values must not refuse the messages the
+            // other destinations of the same call were composed for, which a 501 for the
+            // whole request would do. `FAILED` is the modelled status for an entry SES
+            // could not process, and the sentence names the emulator and its bound rather
+            // than claiming anything about the message.
+            return Ok(Composed::Refused {
+                status: STATUS_FAILED,
+                error: format!(
+                    "The message rendered for this destination is larger than the {} bytes \
+                     this emulator renders.",
+                    crate::state::template_rendering::MAX_RENDERED_PART_BYTES
+                ),
+            })
+        }
+    };
+
+    let mut headers: Vec<(String, String)> = template
+        .headers
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|header| (header.name, header.value))
+        .collect();
+    // The entry's headers apply OVER the template's, by the name each one is rather than by
+    // the case it was written in — the one place this service applies a header over another
+    // ([`crate::state::apply_message_headers`]), which is also how a message's own headers
+    // apply over the envelope headers its events report.
+    crate::state::apply_message_headers(
+        &mut headers,
+        entry
+            .replacement_headers
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|header| (header.name, header.value)),
+    );
+
+    let tags: Vec<(String, String)> = entry
+        .replacement_tags
+        .clone()
+        .unwrap_or_else(|| default_tags.to_vec())
+        .into_iter()
+        .map(|tag| (tag.name, tag.value))
+        .collect();
+
+    Ok(Composed::Ready(ComposedMessage {
+        to,
+        cc,
+        bcc,
+        subject: rendered.subject,
+        text: rendered.text,
+        html: rendered.html,
+        headers,
+        tags,
+    }))
+}
+
+/// Refuse the request with this operation's input error: "The input you provided is
+/// invalid."
+fn bad_request(message: impl Into<String>) -> SendBulkEmailError {
+    SendBulkEmailErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

@@ -248,7 +248,22 @@ impl PublishedSend {
     /// names keep the case the caller wrote and the values are read off unchanged. A
     /// simple message was assembled by SES from the members the request supplied, so its
     /// headers are those members.
+    ///
+    /// On top of either, the headers the send SUPPLIED for the message ("the list of
+    /// message headers that will be added to the email message") are headers of the
+    /// message too: each one is added, and one whose name the assembled block already
+    /// carries replaces that value rather than being reported twice, since a message
+    /// carries one header of a name.
     fn headers(&self) -> Vec<(String, String)> {
+        let mut headers = self.assembled_headers();
+        crate::state::apply_message_headers(&mut headers, self.message.headers.iter().cloned());
+        headers
+    }
+
+    /// The headers of the message that are the message's own members: the MIME document's
+    /// header block for a raw message, and the members SES assembles a simple message's
+    /// envelope from for every other.
+    fn assembled_headers(&self) -> Vec<(String, String)> {
         let message = &self.message;
         // Only a raw message is recorded without a subject of its own, because a simple
         // message always carries one ([`crate::state::SentMessage`]).

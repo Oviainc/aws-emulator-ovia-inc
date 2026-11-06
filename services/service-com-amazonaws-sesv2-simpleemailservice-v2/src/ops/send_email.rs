@@ -405,9 +405,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if charged + recipients > quota {
             return Err(SendEmailErrorModeled::TooManyRequestsException(
                 TooManyRequestsException {
-                    message: Some(format!(
-                        "Daily message quota exceeded: {charged} of {quota} recipients already sent in the last 24 hours."
-                    )),
+                    message: Some(crate::state::daily_quota_exceeded(charged, quota)),
                 },
             )
             .into());
@@ -441,6 +439,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into_iter()
                 .map(|tag| (tag.name, tag.value))
                 .collect(),
+            headers: parts.headers,
             sent_at: now,
         };
         let message_id = message.message_id.clone();
@@ -526,7 +525,7 @@ fn bad_request(message: impl Into<String>) -> SendEmailError {
     .into()
 }
 
-/// The subject and the body parts recorded for one message.
+/// The subject, the body parts and the headers recorded for one message.
 struct MessageParts {
     /// The subject, which only a simple message carries as its own member.
     subject: Option<String>,
@@ -534,6 +533,10 @@ struct MessageParts {
     body: Option<String>,
     /// The HTML part of a simple message.
     html: Option<String>,
+    /// `Message$Headers`: "the list of message headers that will be added to the email
+    /// message", which a simple message carries as its own member and a raw message
+    /// writes inside the MIME document itself.
+    headers: Vec<(String, String)>,
 }
 
 /// The subject and body recorded for one message, by content form.
@@ -561,14 +564,26 @@ fn message_parts(content: &EmailContent) -> Result<MessageParts, SendEmailError>
                 subject: Some(simple.subject.data.clone()),
                 body,
                 html,
+                // The headers the request supplied are part of the message that was
+                // accepted, in the order it supplied them, so the events of this send
+                // report them.
+                headers: simple
+                    .headers
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|header| (header.name, header.value))
+                    .collect(),
             })
         }
         // A raw message is already a MIME document: it is recorded as sent (up to
-        // the log's retained size), and its headers are the caller's business.
+        // the log's retained size), and its headers are the caller's business —
+        // they are written inside the document, which is where they are read from.
         (None, Some(raw), None) => Ok(MessageParts {
             subject: None,
             body: Some(String::from_utf8_lossy(&raw.data).into_owned()),
             html: None,
+            headers: Vec::new(),
         }),
         // A templated message is rendered from a stored email template, which
         // `CreateEmailTemplate` and `TestRenderEmailTemplate` own and nobody has

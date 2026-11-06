@@ -43,6 +43,10 @@ mod dedicated_ips;
 /// The suppression-list plane: one suppressed address and how a list's entries are
 /// keyed.
 mod suppression;
+/// The email-template plane's one piece of behaviour: how a template's content becomes a
+/// destination's message, which is the message variables a send supplies substituted into
+/// the template's parts.
+pub mod template_rendering;
 
 pub use configuration_sets::*;
 pub use dedicated_ips::*;
@@ -3625,6 +3629,46 @@ pub fn message_not_found(message_id: &str) -> String {
     format!("Message {message_id} does not exist.")
 }
 
+/// Apply `applied` over the headers `carried`, the way one message header applies over
+/// another of the same name: a name `carried` already holds takes the applied value, in
+/// the place and the spelling the applied header states, and a name it does not hold is
+/// added after the ones it does.
+///
+/// Stated once for every place a message's headers are built from two sources — a bulk
+/// entry's over the template's on the way in, and the message's own over the envelope
+/// headers SES assembles on the way out to an event — so no two of them can disagree about
+/// which headers one message carries. A header name compares without regard to case, as a
+/// mail header name does.
+pub fn apply_message_headers(
+    carried: &mut Vec<(String, String)>,
+    applied: impl IntoIterator<Item = (String, String)>,
+) {
+    for (name, value) in applied {
+        match carried
+            .iter_mut()
+            .find(|(written, _)| written.eq_ignore_ascii_case(&name))
+        {
+            Some(header) => *header = (name, value),
+            None => carried.push((name, value)),
+        }
+    }
+}
+
+/// How this service words the account's 24-hour sending quota being spent, stated once for
+/// every operation that charges a message against it — `TooManyRequestsException` for a
+/// send that was refused for it, and the `Error` of a bulk entry that reports it as that
+/// entry's `BulkEmailStatus`.
+///
+/// Neither the model nor a recording of this surface states the sentence, so it names the
+/// one condition it reports: how much of the quota the window has already charged, and the
+/// quota itself, both read from the account's own counters.
+pub fn daily_quota_exceeded(charged: f64, quota: f64) -> String {
+    format!(
+        "Daily message quota exceeded: {charged} of {quota} recipients already sent in the \
+         last 24 hours."
+    )
+}
+
 /// The status of an export job's run, from the model's `JobStatus` enum.
 ///
 /// The enum also carries `FAILED` ("an error occurred during processing") and
@@ -3977,6 +4021,11 @@ pub struct SentMessage {
     pub feedback_forwarding: Option<String>,
     /// `EmailTags`, in the order they were supplied.
     pub email_tags: Vec<(String, String)>,
+    /// The message headers the send supplied for this message ("the list of message
+    /// headers that will be added to the email message"), in the order they apply to it.
+    /// A published email event reports them beside the headers SES assembles from the
+    /// message's own members ([`event_publication::notification`]).
+    pub headers: Vec<(String, String)>,
     /// When the message was accepted.
     pub sent_at: SystemTime,
 }

@@ -209,6 +209,7 @@ impl Ses {
             reply_to: Vec::new(),
             feedback_forwarding: None,
             email_tags: Vec::new(),
+            headers: Vec::new(),
             sent_at,
         });
     }

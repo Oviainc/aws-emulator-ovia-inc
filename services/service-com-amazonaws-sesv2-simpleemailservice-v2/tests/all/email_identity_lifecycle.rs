@@ -1457,6 +1457,7 @@ async fn the_outbound_log_and_the_sending_quota_are_bounded() {
                 reply_to: Vec::new(),
                 feedback_forwarding: None,
                 email_tags: Vec::new(),
+                headers: Vec::new(),
                 sent_at: long_ago,
             });
         }
