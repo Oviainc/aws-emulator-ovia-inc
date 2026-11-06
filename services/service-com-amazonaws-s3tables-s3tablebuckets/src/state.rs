@@ -354,6 +354,273 @@ pub fn allows_record_expiration(table: &Table) -> bool {
     matches!(table.table_type, TableType::Aws)
 }
 
+/// `TableMaintenanceType` — the maintenance tasks S3 Tables runs on a table.
+/// Values from `com.amazonaws.s3tables#TableMaintenanceType`.
+///
+/// Ordered, because a table's configurations are stored in a map keyed by this
+/// type: a read then reports them in one stable order whatever order they were
+/// written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TableMaintenanceType {
+    /// Rewriting a table's small data files into fewer, larger ones.
+    IcebergCompaction,
+    /// Expiring a table's older snapshots.
+    IcebergSnapshotManagement,
+}
+
+impl TableMaintenanceType {
+    /// Every modeled value, for exhaustiveness checks.
+    pub const ALL: &'static [Self] = &[Self::IcebergCompaction, Self::IcebergSnapshotManagement];
+
+    /// The value as it goes on the wire.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::IcebergCompaction => "icebergCompaction",
+            Self::IcebergSnapshotManagement => "icebergSnapshotManagement",
+        }
+    }
+
+    /// Parse a wire value, or `None` when it names no modeled value.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.as_wire() == value)
+    }
+}
+
+/// `MaintenanceStatus` — whether a maintenance task runs on a table. Values
+/// from `com.amazonaws.s3tables#MaintenanceStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceStatus {
+    /// The task runs.
+    Enabled,
+    /// The task does not run.
+    Disabled,
+}
+
+impl MaintenanceStatus {
+    /// Every modeled value, for exhaustiveness checks.
+    pub const ALL: &'static [Self] = &[Self::Enabled, Self::Disabled];
+
+    /// The value as it goes on the wire.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    /// Parse a wire value, or `None` when it names no modeled value.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.as_wire() == value)
+    }
+}
+
+/// `IcebergCompactionStrategy` — how compaction picks the files it rewrites.
+/// Values from `com.amazonaws.s3tables#IcebergCompactionStrategy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcebergCompactionStrategy {
+    /// The strategy is chosen from the table's own sort order.
+    Auto,
+    /// Files are packed together without reordering records.
+    Binpack,
+    /// Records are rewritten in the table's sort order.
+    Sort,
+    /// Records are rewritten in z-order over the table's sort columns.
+    ZOrder,
+}
+
+impl IcebergCompactionStrategy {
+    /// Every modeled value, for exhaustiveness checks.
+    pub const ALL: &'static [Self] = &[Self::Auto, Self::Binpack, Self::Sort, Self::ZOrder];
+
+    /// The value as it goes on the wire.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Binpack => "binpack",
+            Self::Sort => "sort",
+            Self::ZOrder => "z-order",
+        }
+    }
+
+    /// Parse a wire value, or `None` when it names no modeled value.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.as_wire() == value)
+    }
+}
+
+/// The stored form of the `IcebergCompactionSettings` structure.
+///
+/// Both members are optional on the wire, so both are optional here: what a put
+/// persists is what the caller asked for, and
+/// [`effective_table_maintenance`] is where an absent member's value is
+/// decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionSettings {
+    /// The file size compaction rewrites towards, in MB — a `PositiveInteger`
+    /// the model bounds at `@range(1..2147483647)`, so the boundary has already
+    /// refused a value outside it by the time one is stored.
+    pub target_file_size_mb: Option<i32>,
+    pub strategy: Option<IcebergCompactionStrategy>,
+}
+
+/// The stored form of the `IcebergSnapshotManagementSettings` structure. Both
+/// members are optional for the same reason as on [`CompactionSettings`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotManagementSettings {
+    pub min_snapshots_to_keep: Option<i32>,
+    pub max_snapshot_age_hours: Option<i32>,
+}
+
+/// The stored form of the `TableMaintenanceSettings` union: the settings of ONE
+/// maintenance task, so which task a stored configuration settles is carried by
+/// the value itself and not only by the key it is filed under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceSettings {
+    IcebergCompaction(CompactionSettings),
+    IcebergSnapshotManagement(SnapshotManagementSettings),
+}
+
+impl MaintenanceSettings {
+    /// The maintenance task these settings configure — the union member's own
+    /// name, which is what a put checks against the type it was addressed with.
+    pub fn maintenance_type(&self) -> TableMaintenanceType {
+        match self {
+            Self::IcebergCompaction(..) => TableMaintenanceType::IcebergCompaction,
+            Self::IcebergSnapshotManagement(..) => TableMaintenanceType::IcebergSnapshotManagement,
+        }
+    }
+}
+
+/// The stored form of the `TableMaintenanceConfigurationValue` structure: one
+/// maintenance task's status and settings for one table.
+///
+/// Both members are optional on the wire, so both are optional here, as on
+/// [`RecordExpiration`]: a put persists what the caller asked for and
+/// [`effective_table_maintenance`] is where an absent member's meaning is
+/// decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableMaintenance {
+    pub status: Option<MaintenanceStatus>,
+    pub settings: Option<MaintenanceSettings>,
+}
+
+/// The file size S3 Tables compacts a table towards when nothing asked for
+/// one. The S3 Tables maintenance documentation states the default target file
+/// size for compaction as 512 MB.
+pub const DEFAULT_COMPACTION_TARGET_FILE_SIZE_MB: i32 = 512;
+
+/// The compaction strategy in force when nothing asked for one: the strategy is
+/// derived from the table's own sort order, which the S3 Tables maintenance
+/// documentation states is what compaction does for a table whose strategy was
+/// never set.
+pub const DEFAULT_COMPACTION_STRATEGY: IcebergCompactionStrategy = IcebergCompactionStrategy::Auto;
+
+/// The fewest snapshots snapshot management keeps when nothing asked for a
+/// number: the S3 Tables maintenance documentation states the default minimum
+/// as 1 snapshot.
+pub const DEFAULT_MIN_SNAPSHOTS_TO_KEEP: i32 = 1;
+
+/// The age at which snapshot management expires a snapshot when nothing asked
+/// for an age: the S3 Tables maintenance documentation states the default
+/// maximum snapshot age as 120 hours.
+pub const DEFAULT_MAX_SNAPSHOT_AGE_HOURS: i32 = 120;
+
+/// The maintenance configuration a table runs `kind` under when no put ever set
+/// one on it.
+///
+/// Every S3 Tables table is maintained from the moment it is created — both
+/// tasks are on, under the service's own settings — so a read reports a
+/// configuration for each modeled task whether or not one was ever written, as
+/// [`DEFAULT_RECORD_EXPIRATION`] does for a table's record expiration.
+pub fn default_table_maintenance(kind: TableMaintenanceType) -> TableMaintenance {
+    TableMaintenance {
+        status: Some(MaintenanceStatus::Enabled),
+        settings: Some(match kind {
+            TableMaintenanceType::IcebergCompaction => {
+                MaintenanceSettings::IcebergCompaction(CompactionSettings {
+                    target_file_size_mb: Some(DEFAULT_COMPACTION_TARGET_FILE_SIZE_MB),
+                    strategy: Some(DEFAULT_COMPACTION_STRATEGY),
+                })
+            }
+            TableMaintenanceType::IcebergSnapshotManagement => {
+                MaintenanceSettings::IcebergSnapshotManagement(SnapshotManagementSettings {
+                    min_snapshots_to_keep: Some(DEFAULT_MIN_SNAPSHOTS_TO_KEEP),
+                    max_snapshot_age_hours: Some(DEFAULT_MAX_SNAPSHOT_AGE_HOURS),
+                })
+            }
+        }),
+    }
+}
+
+/// The maintenance configuration in force for one task of a table: the
+/// configuration the store holds for it with every member a put left out filled
+/// in from [`default_table_maintenance`], so a caller that set only a status
+/// still reads the settings the task runs under.
+pub fn effective_task_maintenance(
+    kind: TableMaintenanceType,
+    stored: Option<&TableMaintenance>,
+) -> TableMaintenance {
+    let default = default_table_maintenance(kind);
+    let Some(stored) = stored else {
+        return default;
+    };
+    let settings = match (stored.settings, default.settings) {
+        // A stored setting for the task, with each member the put left out
+        // taken from the task's default.
+        (
+            Some(MaintenanceSettings::IcebergCompaction(stored)),
+            Some(MaintenanceSettings::IcebergCompaction(default)),
+        ) => Some(MaintenanceSettings::IcebergCompaction(CompactionSettings {
+            target_file_size_mb: stored.target_file_size_mb.or(default.target_file_size_mb),
+            strategy: stored.strategy.or(default.strategy),
+        })),
+        (
+            Some(MaintenanceSettings::IcebergSnapshotManagement(stored)),
+            Some(MaintenanceSettings::IcebergSnapshotManagement(default)),
+        ) => Some(MaintenanceSettings::IcebergSnapshotManagement(
+            SnapshotManagementSettings {
+                min_snapshots_to_keep: stored
+                    .min_snapshots_to_keep
+                    .or(default.min_snapshots_to_keep),
+                max_snapshot_age_hours: stored
+                    .max_snapshot_age_hours
+                    .or(default.max_snapshot_age_hours),
+            },
+        )),
+        // The put carried no settings for the task, so it runs under the
+        // task's own defaults. The remaining shape — settings of the OTHER
+        // task filed under this one — cannot be stored: the put refuses that
+        // combination before anything is written, so this arm is reached only
+        // for a configuration that carries no settings.
+        _ => default.settings,
+    };
+    TableMaintenance {
+        status: stored.status.or(default.status),
+        settings,
+    }
+}
+
+/// The whole maintenance configuration in force for a table: one entry per
+/// modeled maintenance task, each resolved by [`effective_task_maintenance`].
+pub fn effective_table_maintenance(
+    stored: &BTreeMap<TableMaintenanceType, TableMaintenance>,
+) -> BTreeMap<TableMaintenanceType, TableMaintenance> {
+    TableMaintenanceType::ALL
+        .iter()
+        .copied()
+        .map(|kind| (kind, effective_task_maintenance(kind, stored.get(&kind))))
+        .collect()
+}
+
 /// The stored form of the `TableBucketReplicationConfiguration` structure: the
 /// role S3 Tables replicates with, the rules that say where to, and the token
 /// that names this state of the configuration.
@@ -465,6 +732,11 @@ pub struct Table {
     /// on it. Only the tables Amazon Web Services manages take one at all, so
     /// on every other table this stays `None` for the life of the record.
     pub record_expiration: Option<RecordExpiration>,
+    /// The maintenance configurations a put has set on this table, keyed by the
+    /// task each settles. A task with no entry runs under the service's own
+    /// defaults, which [`effective_table_maintenance`] is where it is reported
+    /// from — so what is persisted here is what a caller asked for.
+    pub maintenance: BTreeMap<TableMaintenanceType, TableMaintenance>,
     pub tags: BTreeMap<String, String>,
 }
 

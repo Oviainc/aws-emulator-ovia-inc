@@ -326,6 +326,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // record expiration belongs to the tables Amazon Web Services
             // manages on an account's behalf.
             record_expiration: None,
+            // Maintenance is on for every S3 Tables table from the moment it
+            // is created, under the service's own settings, so a freshly
+            // created table carries no configuration of its own: the defaults
+            // belong to the operation that reports them,
+            // `GetTableMaintenanceConfiguration`.
+            maintenance: ::std::collections::BTreeMap::new(),
             tags,
         };
 

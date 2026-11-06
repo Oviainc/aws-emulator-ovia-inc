@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutTableMaintenanceConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutTableMaintenanceConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutTableMaintenanceConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -146,6 +137,85 @@ impl From<PutTableMaintenanceConfigurationErrorModeled> for PutTableMaintenanceC
     }
 }
 
+/// `NotFoundException` (HTTP 404) — no table bucket is stored at the ARN the
+/// request addresses.
+fn no_such_bucket() -> PutTableMaintenanceConfigurationError {
+    PutTableMaintenanceConfigurationErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::BUCKET_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// `NotFoundException` (HTTP 404) — no table is stored at what the request
+/// addresses.
+fn no_such_table() -> PutTableMaintenanceConfigurationError {
+    PutTableMaintenanceConfigurationErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::TABLE_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// `BadRequestException` (HTTP 400) — client input this operation will not
+/// store.
+fn bad_request(message: String) -> PutTableMaintenanceConfigurationError {
+    PutTableMaintenanceConfigurationErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The stored form of the settings the request carries, or `None` when it
+/// carries none.
+///
+/// The settings are a union, so they name the maintenance task they configure
+/// themselves: settings for one task cannot be filed under another, which is
+/// what the mismatch refusal below states.
+fn stored_settings(
+    kind: crate::state::TableMaintenanceType,
+    settings: Option<&TableMaintenanceSettings>,
+) -> Result<Option<crate::state::MaintenanceSettings>, PutTableMaintenanceConfigurationError> {
+    use crate::state::{CompactionSettings, MaintenanceSettings, SnapshotManagementSettings};
+
+    let Some(settings) = settings else {
+        return Ok(None);
+    };
+    let stored = match settings {
+        TableMaintenanceSettings::icebergCompaction(compaction) => {
+            MaintenanceSettings::IcebergCompaction(CompactionSettings {
+                target_file_size_mb: compaction.target_file_size_mb,
+                // A strategy outside the modeled enum is refused at the
+                // boundary, so reaching here with an unknown one would mean the
+                // model changed under us; it is refused as client input rather
+                // than silently stored.
+                strategy: match compaction.strategy.as_deref() {
+                    None => None,
+                    Some(wire) => Some(
+                        crate::state::IcebergCompactionStrategy::from_wire(wire).ok_or_else(
+                            || {
+                                bad_request(format!(
+                                    "The compaction strategy {wire} is not supported."
+                                ))
+                            },
+                        )?,
+                    ),
+                },
+            })
+        }
+        TableMaintenanceSettings::icebergSnapshotManagement(snapshots) => {
+            MaintenanceSettings::IcebergSnapshotManagement(SnapshotManagementSettings {
+                min_snapshots_to_keep: snapshots.min_snapshots_to_keep,
+                max_snapshot_age_hours: snapshots.max_snapshot_age_hours,
+            })
+        }
+    };
+    if stored.maintenance_type() != kind {
+        return Err(bad_request(
+            "The maintenance settings must be the settings of the maintenance type.".to_string(),
+        ));
+    }
+    Ok(Some(stored))
+}
+
 /// The `PutTableMaintenanceConfiguration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -182,18 +252,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutTableMaintenanceConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutTableMaintenanceConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutTableMaintenanceConfiguration"))
+        use crate::state::{MaintenanceStatus, TableMaintenance, TableMaintenanceType};
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutTableMaintenanceConfigurationErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The task this configuration settles. A value outside the modeled enum
+        // is refused at the boundary, so reaching here with an unknown one would
+        // mean the model changed under us; it is refused as client input rather
+        // than silently stored.
+        let kind = TableMaintenanceType::from_wire(&input.r#type).ok_or_else(|| {
+            bad_request(format!(
+                "The maintenance type {wire} is not supported.",
+                wire = input.r#type
+            ))
+        })?;
+        let status = match input.value.status.as_deref() {
+            None => None,
+            Some(wire) => Some(MaintenanceStatus::from_wire(wire).ok_or_else(|| {
+                bad_request(format!("The maintenance status {wire} is not supported."))
+            })?),
+        };
+        let settings = stored_settings(kind, input.value.settings.as_ref())?;
+
+        let mut store = state.lock();
+        // The table is resolved through the bucket the request names, so a
+        // request against a bucket the store does not hold is refused for that
+        // reason rather than reported as a missing table.
+        let table = store
+            .table_buckets
+            .get_mut(&input.table_bucket_arn)
+            .ok_or_else(no_such_bucket)?
+            .namespaces
+            .get_mut(&input.namespace)
+            .and_then(|namespace| namespace.tables.get_mut(&input.name))
+            .ok_or_else(no_such_table)?;
+
+        // The operation REPLACES the configuration of the task it names and
+        // leaves every other task's alone, so what a read reports for this task
+        // afterwards is exactly this request's configuration.
+        table
+            .maintenance
+            .insert(kind, TableMaintenance { status, settings });
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+
+        // The access record for a state-changing operation: who, what and the
+        // outcome. Metadata only.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            maintenance_type = kind.as_wire(),
+            outcome = "configured",
+            "table maintenance configuration set",
+        );
+
+        Ok(PutTableMaintenanceConfigurationOutput)
     }
 }

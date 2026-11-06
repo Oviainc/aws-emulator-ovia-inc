@@ -29,6 +29,8 @@ mod table_bucket_lifecycle;
 mod table_bucket_metrics_configuration;
 #[path = "all/table_bucket_replication.rs"]
 mod table_bucket_replication;
+#[path = "all/table_maintenance_configuration.rs"]
+mod table_maintenance_configuration;
 #[path = "all/table_record_expiration.rs"]
 mod table_record_expiration;
 #[path = "all/wire_forms.rs"]

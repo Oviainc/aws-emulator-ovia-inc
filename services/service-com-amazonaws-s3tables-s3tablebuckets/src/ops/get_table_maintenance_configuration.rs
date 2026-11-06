@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTableMaintenanceConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTableMaintenanceConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTableMaintenanceConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -126,6 +117,52 @@ impl From<GetTableMaintenanceConfigurationErrorModeled> for GetTableMaintenanceC
     }
 }
 
+/// `NotFoundException` (HTTP 404) — no table bucket is stored at the ARN the
+/// request addresses.
+fn no_such_bucket() -> GetTableMaintenanceConfigurationError {
+    GetTableMaintenanceConfigurationErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::BUCKET_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// `NotFoundException` (HTTP 404) — no table is stored at what the request
+/// addresses.
+fn no_such_table() -> GetTableMaintenanceConfigurationError {
+    GetTableMaintenanceConfigurationErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::TABLE_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// One stored maintenance configuration, in the wire form the response's
+/// `configuration` map carries.
+fn wire_value(stored: &crate::state::TableMaintenance) -> TableMaintenanceConfigurationValue {
+    use crate::state::MaintenanceSettings;
+
+    TableMaintenanceConfigurationValue {
+        status: stored.status.map(|status| status.as_wire().to_string()),
+        settings: stored.settings.map(|settings| match settings {
+            MaintenanceSettings::IcebergCompaction(compaction) => {
+                TableMaintenanceSettings::icebergCompaction(IcebergCompactionSettings {
+                    target_file_size_mb: compaction.target_file_size_mb,
+                    strategy: compaction
+                        .strategy
+                        .map(|strategy| strategy.as_wire().to_string()),
+                })
+            }
+            MaintenanceSettings::IcebergSnapshotManagement(snapshots) => {
+                TableMaintenanceSettings::icebergSnapshotManagement(
+                    IcebergSnapshotManagementSettings {
+                        min_snapshots_to_keep: snapshots.min_snapshots_to_keep,
+                        max_snapshot_age_hours: snapshots.max_snapshot_age_hours,
+                    },
+                )
+            }
+        }),
+    }
+}
+
 /// The `GetTableMaintenanceConfiguration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -162,18 +199,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTableMaintenanceConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTableMaintenanceConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTableMaintenanceConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTableMaintenanceConfigurationErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // A pure read: what it answers with is reconstructed from the table's
+        // own record, and nothing in the store is touched.
+        let store = state.lock();
+        let table = store
+            .table_buckets
+            .get(&input.table_bucket_arn)
+            .ok_or_else(no_such_bucket)?
+            .namespaces
+            .get(&input.namespace)
+            .and_then(|namespace| namespace.tables.get(&input.name))
+            .ok_or_else(no_such_table)?;
+
+        // S3 Tables maintains every table from the moment it is created, so the
+        // read reports one entry per modeled maintenance task: the
+        // configuration a put persisted for it, else the one the task runs
+        // under without any.
+        let configuration = crate::state::effective_table_maintenance(&table.maintenance)
+            .iter()
+            .map(|(kind, value)| (kind.as_wire().to_string(), wire_value(value)))
+            .collect();
+
+        Ok(GetTableMaintenanceConfigurationOutput {
+            // The table's OWN ARN, as the store holds it, rather than one built
+            // from what the request carried.
+            table_arn: table.table_arn.clone(),
+            configuration,
+        })
     }
 }
