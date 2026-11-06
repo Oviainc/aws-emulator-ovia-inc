@@ -41,8 +41,6 @@ mod create_default_vpc;
 // What `ReplaceNetworkAclEntry` overwrites: the one rule a network ACL holds at a rule number
 // in a direction, replaced in place and read back through `DescribeNetworkAcls`, beside the
 // rule a replacement may not write and the refusals it answers. Declared beside
-// `prefix_lists` for the reason the note above gives: the sorted neighbourhood and the tail
-// of this file are where every new ec2 suite inserts its lines.
 #[path = "all/replace_network_acl_entry.rs"]
 mod replace_network_acl_entry;
 // The per-VPC VPC Encryption Control slice: what `CreateVpcEncryptionControl` records for one
@@ -140,8 +138,6 @@ mod describe_addresses_attribute;
 // What `CancelConversionTask` cancels — the form it judges a conversion task id by, the
 // states that admit a cancel, the `cancelling` -> `cancelled` move the clock owes an
 // admitted one, and what `DryRun` answers. Declared beside `prefix_lists` for the reason the
-// note above gives: the sorted neighbourhood and the tail of this file are where every new
-// ec2 suite inserts its lines.
 #[path = "all/conversion_task_cancellation.rs"]
 mod conversion_task_cancellation;
 // The two forms an instance id is read in before any lookup, and the two answers a value
@@ -1400,6 +1396,12 @@ mod security_group_rule_prefix_lists;
 // Declared at the tail of this file, which is where every new ec2 suite inserts its lines.
 #[path = "all/modify_ipam.rs"]
 mod modify_ipam;
+// What a SUCCESSFUL delete makes observable on the Network Access Scope, Traffic Mirror filter
+// and route server surfaces: an id that stops resolving for every read of a resource whose
+// shape carries no state, and the `deleting` -> `deleted` states a route server is described
+// in. Declared at the tail of this file, which is where every new ec2 suite inserts its lines.
+#[path = "all/deleted_resources_stop_resolving.rs"]
+mod deleted_resources_stop_resolving;
 // What `MonitorInstances` turns on: the `pending` -> `enabled` move it starts for every
 // distinct instance it names, read back through `DescribeInstances`, and the PARAMETER layer
 // both halves of the monitoring move read their `InstanceIds` list in — a value outside the

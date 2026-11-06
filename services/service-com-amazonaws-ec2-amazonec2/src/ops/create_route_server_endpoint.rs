@@ -178,10 +178,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The ID of the route server for which to create an endpoint" (`RouteServerId`)
         // and "The ID of the subnet to place the route server endpoint into" (`SubnetId`):
         // an id that names no resource of the account is an error, not a resource created
-        // out of thin air. The route server is resolved through the crate's one helper for
-        // that lookup, so a malformed id and an unknown one are told apart here exactly as
-        // `DescribeRouteServers` tells them apart.
-        state::require_known_route_server(&store, &input.route_server_id)?;
+        // out of thin air, and a route server a delete has taken down is no longer something
+        // an endpoint can be created for. The route server is resolved through the crate's
+        // one helper for an operation ACTING on one, so a malformed id and an unknown one are
+        // told apart here exactly as `DescribeRouteServers` tells them apart, and one in a
+        // delete state is refused with the state it is in.
+        state::require_live_route_server(&store, &input.route_server_id)?;
         let Some(subnet) = store.subnets.get(&input.subnet_id) else {
             return Err(state::invalid_subnet_id_not_found(&input.subnet_id));
         };

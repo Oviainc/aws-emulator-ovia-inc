@@ -361,6 +361,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing has asked this route server to change yet, so its `modifying` span is
             // already behind every read.
             modify_settled_at: now,
+            // Nothing has asked it to delete either, so it owes no delete move.
+            deleted_at: None,
         };
         if let Some(token) = input.client_token.clone() {
             store

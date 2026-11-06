@@ -280,11 +280,13 @@ fn refusals() -> Vec<Refusal> {
             code: "InvalidParameter".to_string(),
             status: 400,
         },
-        // Cause 7 — the Network Insights family.
+        // Cause 7 — the Network Insights family. The operation ACTING on the one scope it
+        // names states that the id it was given is not a valid one, which is not the
+        // resource's own not-found code its reads answer.
         Refusal {
             action: "DeleteNetworkInsightsAccessScope",
             params: vec![param("NetworkInsightsAccessScopeId", &access_scope)],
-            code: ec2::state::INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND.to_string(),
+            code: ec2::state::INVALID_PARAMETER_VALUE.to_string(),
             status: 400,
         },
         // Cause 8 — the dependency and state guards.
@@ -587,6 +589,10 @@ async fn a_route_server_a_vpc_holds_cannot_be_deleted_until_it_is_disassociated(
         "case {case:?}: expected HTTP 200 deleting the disassociated route server, got \
          {status} with body {body}"
     );
+    // The delete is observable through the describe: a route server a delete took down is
+    // still REPORTED — `deleting` and `deleted` are both `RouteServerState` members — so the
+    // describe answers it in the non-terminal state the delete put it into rather than as a
+    // route server nothing holds.
     let (status, body) = call(
         &router,
         "DescribeRouteServers",
@@ -594,10 +600,29 @@ async fn a_route_server_a_vpc_holds_cannot_be_deleted_until_it_is_disassociated(
     )
     .await;
     assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 describing the deleted route server, got {status} \
+         with body {body}"
+    );
+    let reported = element(&body, "state").unwrap_or_default();
+    assert_eq!(
+        reported,
+        ec2::state::ROUTE_SERVER_STATE_DELETING,
+        "case {case:?}: expected the deleted route server to be reported deleting, got \
+         {reported:?} in {body}"
+    );
+
+    // Nothing is left to delete, so a second delete is refused for the state it is in.
+    let (status, body) = call(
+        &router,
+        "DeleteRouteServer",
+        &[param("RouteServerId", &route_server)],
+    )
+    .await;
+    assert_eq!(
         error_code(&body),
-        ec2::state::INVALID_ROUTE_SERVER_ID_NOT_FOUND,
-        "case {case:?}: expected the deleted route server to be unknown, got {status} with \
-         body {body}"
+        "IncorrectState",
+        "case {case:?}: expected a second delete to be refused, got {status} with body {body}"
     );
 }
 

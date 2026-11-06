@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The Traffic Mirror filter store: the ids, bounds, byte charge and error channel that
-//! `CreateTrafficMirrorFilter` and `DescribeTrafficMirrorFilters` share.
+//! The Traffic Mirror filter store: the ids, bounds, byte charge and error channel the
+//! Traffic Mirror filter operations share, with the one write and the one removal path a
+//! filter enters and leaves the store by.
 //!
 //! The filters themselves live on the service's one state struct
 //! ([`ComAmazonawsEc2Amazonec2State::traffic_mirror_filters`]) as the MODELLED
@@ -133,5 +134,59 @@ impl ComAmazonawsEc2Amazonec2State {
         self.traffic_mirror_filters
             .insert(traffic_mirror_filter_id.clone(), filter);
         traffic_mirror_filter_id
+    }
+
+    /// Remove the Traffic Mirror filter `traffic_mirror_filter_id` names and answer it as it
+    /// was last reported, or `None` when the store holds no such filter.
+    ///
+    /// The ONE way a filter leaves the store, so a deletion is observable through every path
+    /// that resolves a filter id: [`TrafficMirrorFilter`] carries no state member
+    /// (`smithy_query(query="shape",shape="TrafficMirrorFilter")`), so there is no terminal
+    /// state for a deleted filter to be reported in and the id simply stops resolving.
+    ///
+    /// The answer is the record the removal took OUT of the store, so what a delete reports
+    /// is what the readers reported — never a second copy built beside it. The token that
+    /// named this filter stops naming it, so a later create carrying it mints a new filter
+    /// rather than reporting one nothing holds, and the bytes the record held go back to the
+    /// store's budget on exactly the terms [`Self::insert_traffic_mirror_filter`] took them
+    /// on ([`traffic_mirror_filter_payload_bytes`]).
+    pub fn remove_traffic_mirror_filter(
+        &mut self,
+        traffic_mirror_filter_id: &str,
+    ) -> Option<TrafficMirrorFilter> {
+        let filter = self.traffic_mirror_filters.remove(traffic_mirror_filter_id)?;
+        let client_token = self
+            .traffic_mirror_filter_client_tokens
+            .iter()
+            .find(|(_, named)| named.as_str() == traffic_mirror_filter_id)
+            .map(|(token, _)| token.clone());
+        if let Some(token) = client_token.as_deref() {
+            self.traffic_mirror_filter_client_tokens.remove(token);
+        }
+        self.release_stored_bytes(traffic_mirror_filter_payload_bytes(
+            &filter,
+            client_token.as_deref(),
+        ));
+        Some(filter)
+    }
+
+    /// The ids of the Traffic Mirror sessions that mirror through the filter
+    /// `traffic_mirror_filter_id`, in store order.
+    ///
+    /// "You cannot delete a Traffic Mirror filter that is in use by a Traffic Mirror session"
+    /// (`DeleteTrafficMirrorFilter`): the delete asks this and refuses while the answer is
+    /// not empty, so the filter a stored session names is still there for that session to
+    /// mirror by.
+    pub fn traffic_mirror_sessions_using_filter(
+        &self,
+        traffic_mirror_filter_id: &str,
+    ) -> Vec<String> {
+        self.traffic_mirror_sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.traffic_mirror_filter_id.as_deref() == Some(traffic_mirror_filter_id)
+            })
+            .map(|(session_id, _)| session_id.clone())
+            .collect()
     }
 }

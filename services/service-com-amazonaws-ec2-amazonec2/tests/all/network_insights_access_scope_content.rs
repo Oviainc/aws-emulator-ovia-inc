@@ -923,9 +923,9 @@ async fn a_dry_run_changes_nothing() {
 /// An id the get cannot resolve to a scope of the account is refused rather than answered
 /// with an empty content — a value of a Network Access Scope id's own form that names no
 /// scope of the account and a value that is not such an id at all are refused the one way,
-/// as a bad value of the member that carried it. A dry run of either is refused the same
-/// way, because a dry run of a request that would have been refused is refused with that
-/// reason.
+/// with this resource's own `Invalid<Resource>Id.NotFound`. A dry run of either is refused
+/// the same way, because a dry run of a request that would have been refused is refused with
+/// that reason.
 #[tokio::test]
 async fn the_get_refuses_an_id_naming_no_scope() {
     let (router, _engine) = super::ec2_query::emulator();
@@ -949,8 +949,8 @@ async fn the_get_refuses_an_id_naming_no_scope() {
         ("not an id at all", "scope"),
     ];
     for (case, scope_id) in refused {
-        let expected_code = INVALID_PARAMETER_VALUE;
-        let expected_message = format!("NetworkInsightsAccessScopeId ({scope_id}) is not valid");
+        let expected_code = ec2::state::INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND;
+        let expected_message = format!("{scope_id} does not exist");
         for dry_run in [false, true] {
             let mut params = vec![param("NetworkInsightsAccessScopeId", scope_id)];
             if dry_run {

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNetworkInsightsAccessScope
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteNetworkInsightsAccessScope`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteNetworkInsightsAccessScope::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Deletes the specified Network Access Scope": it resolves the scope the request names and
+//! takes it — with the content stored beside it — OUT of the store, so the id stops resolving
+//! for every reader of this surface.
 //!
 //! ## Shape of an operation
 //!
@@ -164,23 +159,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // anybody called, so those moves are applied before this call reads it.
         store.materialize_due_transitions();
 
-        // An id this account holds no access scope for has nothing to delete, which is the
-        // refusal `DescribeNetworkInsightsAccessScopes` answers for an id it cannot resolve,
-        // worded by the one place this crate words it.
+        // An id this account holds no access scope for has nothing to delete. The operation
+        // ACTING on the one scope it is given states that the `NetworkInsightsAccessScopeId`
+        // it was given is not a valid one — whatever the id's form — which is the refusal the
+        // recorded wire corpus shows this operation answering for an id nothing holds, and
+        // NOT the code the reads of this surface answer for an id they cannot resolve; the
+        // one place this crate words each of the two keeps them apart.
         if !store
             .network_insights_access_scopes
             .contains_key(&input.network_insights_access_scope_id)
         {
-            return Err(state::invalid_network_insights_access_scope_id_not_found(
+            return Err(state::invalid_network_insights_access_scope_id_value(
                 &input.network_insights_access_scope_id,
             ));
         }
 
-        // Taking the access scope out of the store is still unwritten, so the operation
-        // answers the scaffold's 501 rather than a success it cannot back with state. Every
-        // refusal the request earns is minted above, before this point, so a client learns
-        // that its input is wrong from the code the real service answers rather than from
-        // this.
-        Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME))
+        // The delete itself: the scope and the content stored with it are what hold this
+        // access scope, so taking them out of the store IS the delete — the one removal path
+        // does it, so no reader is left resolving the id afterwards.
+        let Some(deleted) =
+            store.remove_network_insights_access_scope(&input.network_insights_access_scope_id)
+        else {
+            return Err(state::internal_error(format!(
+                "the Network Access Scope '{scope_id}' resolved a moment ago is not in the \
+                 store any more",
+                scope_id = input.network_insights_access_scope_id,
+            )));
+        };
+
+        // "The ID of the Network Access Scope"
+        // (`DeleteNetworkInsightsAccessScopeResult$NetworkInsightsAccessScopeId`), read off
+        // the record the removal took out of the store rather than off the request.
+        Ok(DeleteNetworkInsightsAccessScopeOutput {
+            network_insights_access_scope_id: deleted.network_insights_access_scope_id,
+        })
     }
 }

@@ -1027,6 +1027,73 @@ impl ComAmazonawsEc2Amazonec2State {
         Some(route_server_peer_id)
     }
 
+    /// Start taking down the route server `route_server_id` and answer it as the store then
+    /// holds it — `None` when the account holds no route server of that id.
+    ///
+    /// The counterpart of [`Self::begin_route_server_endpoint_deletion`], on the same clock
+    /// and under the same rule: the route server is put into the non-terminal
+    /// [`ROUTE_SERVER_STATE_DELETING`] now and the terminal [`ROUTE_SERVER_STATE_DELETED`]
+    /// falls due one [`TRANSITION_DELAY`] later, which is STORED rather than slept for, so a
+    /// caller reading straight after the delete still sees the route server going down. The
+    /// delete state is reported whatever moves the create or a modification still owed, so a
+    /// route server asked to delete while it was coming up does not come up afterwards.
+    ///
+    /// The record STAYS in the store, because a route server in either delete state is still
+    /// reported — `deleting` and `deleted` are both `RouteServerState` members
+    /// (`smithy_query(query="shape",shape="RouteServerState")`), and the `state` filter of
+    /// `DescribeRouteServers` selects on them — so its caller-chosen bytes stay charged to
+    /// the store's budget, which still holds them, and it still counts against
+    /// [`MAX_STORED_ROUTE_SERVERS`].
+    ///
+    /// Its endpoints and peers are resources OF the route server, so they go down with it on
+    /// the same clock: one already in a delete state is left on the instant its own delete
+    /// set, so a cascade cannot restart a move that was already due.
+    ///
+    /// The `ClientToken` that named this route server keeps naming it, unlike the tokens a
+    /// removal path gives back ([`Self::remove_traffic_mirror_filter`]): the record is still
+    /// there, so a create replayed with that token reports this route server — in the state
+    /// it has reached — rather than minting a second one, and it still counts against
+    /// [`MAX_STORED_ROUTE_SERVERS`] for as long as it is reported.
+    pub fn begin_route_server_deletion(&mut self, route_server_id: &str) -> Option<RouteServer> {
+        let now = Instant::now();
+        let record = self.route_servers.get_mut(route_server_id)?;
+        record.deleted_at = Some(now + TRANSITION_DELAY);
+        let view = record.view_at(now);
+        let endpoints: Vec<String> = self
+            .route_server_endpoints
+            .iter()
+            .filter(|(_, endpoint)| {
+                endpoint.route_server_id.as_deref() == Some(route_server_id)
+                    && !matches!(
+                        endpoint.state.as_deref(),
+                        Some(ROUTE_SERVER_ENDPOINT_STATE_DELETING)
+                            | Some(ROUTE_SERVER_ENDPOINT_STATE_DELETED)
+                    )
+            })
+            .map(|(endpoint_id, _)| endpoint_id.clone())
+            .collect();
+        for endpoint_id in &endpoints {
+            self.begin_route_server_endpoint_deletion(endpoint_id);
+        }
+        let peers: Vec<String> = self
+            .route_server_peers
+            .iter()
+            .filter(|(_, peer)| {
+                peer.route_server_id.as_deref() == Some(route_server_id)
+                    && !matches!(
+                        peer.state.as_deref(),
+                        Some(ROUTE_SERVER_PEER_STATE_DELETING)
+                            | Some(ROUTE_SERVER_PEER_STATE_DELETED)
+                    )
+            })
+            .map(|(peer_id, _)| peer_id.clone())
+            .collect();
+        for peer_id in &peers {
+            self.begin_route_server_peer_deletion(peer_id);
+        }
+        Some(view)
+    }
+
     /// Start taking down the route server peer `route_server_peer_id` and answer it as the
     /// store then holds it — `None` when the account holds no peer of that id.
     ///

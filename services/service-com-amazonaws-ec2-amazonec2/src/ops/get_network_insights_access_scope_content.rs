@@ -146,14 +146,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = service_state.lock();
 
         // "The ID of the Network Access Scope" (`NetworkInsightsAccessScopeId`): an id that
-        // resolves to no scope of the account is refused — whatever its form — rather than
-        // answered with an empty content. The code and wording are a fact of the operation
-        // rather than of the id, so they live in the one place beside the store.
+        // resolves to no scope of the account is refused — whatever its form, and whether it
+        // was never minted or was deleted — rather than answered with an empty content, with
+        // this resource's own `Invalid<Resource>Id.NotFound`. The code and wording live in
+        // the one place beside the store, so this read and the describes cannot drift apart.
         if !store
             .network_insights_access_scopes
             .contains_key(&input.network_insights_access_scope_id)
         {
-            return Err(state::invalid_network_insights_access_scope_id_value(
+            return Err(state::invalid_network_insights_access_scope_id_not_found(
                 &input.network_insights_access_scope_id,
             ));
         }

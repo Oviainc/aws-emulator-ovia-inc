@@ -296,24 +296,30 @@ pub fn network_insights_access_scope_analysis_payload_bytes(
 
 /// Refuse a Network Access Scope id a request named that the account holds no scope under:
 /// HTTP 400 [`INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND`].
+///
+/// The message is the id the REQUEST carried followed by the fixed text " does not exist",
+/// the wording this surface's reads answer — the same template
+/// [`invalid_traffic_mirror_filter_id_not_found`] uses for its own resource — so a client
+/// reading the text sees which id it was.
 pub fn invalid_network_insights_access_scope_id_not_found<E>(scope_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND,
         400,
-        format!("The Network Access Scope ID '{scope_id}' does not exist"),
+        format!("{scope_id} does not exist"),
     )
 }
 
-/// Refuse a Network Access Scope id `GetNetworkInsightsAccessScopeContent` cannot resolve:
-/// HTTP 400 `InvalidParameterValue`, naming the member that carried it and the value.
+/// Refuse a Network Access Scope id the operation ACTING on the one scope it names cannot
+/// resolve: HTTP 400 `InvalidParameterValue`, naming the member that carried it and the
+/// value.
 ///
 /// EC2 answers an id it cannot resolve in one of two ways, and WHICH one is a fact of the
 /// operation rather than of the id — the split [`invalid_id_parameter_value`] records: the
-/// describes answer this resource's own
-/// [`INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND`], while the content get states that
-/// the id it was given is not a valid one — one answer for every id it cannot resolve,
-/// whatever its form. This is the ONE place that second wording lives, so the operation and
-/// the suite that asserts it cannot drift apart.
+/// reads answer this resource's own
+/// [`INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND`], while the delete states that the
+/// id it was given is not a valid one — one answer for every id it cannot resolve, whatever
+/// its form. This is the ONE place that second wording lives, so the operation and the suite
+/// that asserts it cannot drift apart.
 ///
 /// The wording is this operation's own and is NOT
 /// [`invalid_id_parameter_value`]'s ("Value (…) for parameter … is invalid. Expected: …"),
@@ -425,6 +431,50 @@ impl ComAmazonawsEc2Amazonec2State {
         self.network_insights_access_scopes
             .insert(scope_id.clone(), scope);
         Some(scope_id)
+    }
+
+    /// Take the Network Access Scope `scope_id` names OUT of the store, with the content and
+    /// the client token that belong to it, and answer the scope as it was last reported — or
+    /// `None` when the account holds no scope of that id, nothing having been removed.
+    ///
+    /// The ONE way a scope leaves the store, so a deletion is observable through every path
+    /// that resolves a scope id: `NetworkInsightsAccessScope` carries no state member
+    /// (`smithy_query(query="shape",shape="NetworkInsightsAccessScope")`), so there is no
+    /// terminal state for a deleted scope to be reported in and the id simply stops
+    /// resolving.
+    ///
+    /// The content goes with the scope, which is the pair
+    /// [`Self::insert_network_insights_access_scope`] writes together, and the token that
+    /// named this scope stops naming it, so a later create carrying that token mints a new
+    /// scope rather than reporting one nothing holds. The bytes the record held go back to
+    /// the store's budget on exactly the terms the insert took them on
+    /// ([`network_insights_access_scope_payload_bytes`]).
+    pub fn remove_network_insights_access_scope(
+        &mut self,
+        scope_id: &str,
+    ) -> Option<NetworkInsightsAccessScope> {
+        let scope = self.network_insights_access_scopes.remove(scope_id)?;
+        let content = self.network_insights_access_scope_contents.remove(scope_id);
+        let client_token = self
+            .network_insights_access_scope_client_tokens
+            .iter()
+            .find(|(_, named)| named.as_str() == scope_id)
+            .map(|(token, _)| token.clone());
+        if let Some(token) = client_token.as_deref() {
+            self.network_insights_access_scope_client_tokens.remove(token);
+        }
+        // The paths as the insert was given them: the content stores a list naming no path
+        // as absent, so an absent list is the empty one it was charged as.
+        let paths = content.map_or_else(AccessScopePaths::default, |content| AccessScopePaths {
+            match_paths: content.match_paths.unwrap_or_default(),
+            exclude_paths: content.exclude_paths.unwrap_or_default(),
+        });
+        self.release_stored_bytes(network_insights_access_scope_payload_bytes(
+            scope.tags.as_deref().unwrap_or_default(),
+            client_token.as_deref(),
+            &paths,
+        ));
+        Some(scope)
     }
 
     /// Start one Network Access Scope analysis and answer it as it was stored — or `None`

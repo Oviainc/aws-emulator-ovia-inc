@@ -1084,6 +1084,20 @@ pub const ROUTE_SERVER_STATE_AVAILABLE: &str = "available";
 /// `pending` and `deleting`.
 pub const ROUTE_SERVER_STATE_MODIFYING: &str = "modifying";
 
+/// The state a route server whose delete has been asked for is in while it is being taken
+/// down: `RouteServerState`'s `deleting`
+/// (`smithy_query(query="shape",shape="RouteServerState")`).
+pub const ROUTE_SERVER_STATE_DELETING: &str = "deleting";
+
+/// The state a route server a delete took down ends in: `RouteServerState`'s `deleted`, the
+/// enum's terminal delete state.
+///
+/// A deleted route server is still DESCRIBED in that state rather than dropped from the
+/// store, the way a deleted route server endpoint and peer are
+/// ([`ROUTE_SERVER_ENDPOINT_STATE_DELETED`]), which is what lets a caller waiting for the
+/// delete to finish observe it.
+pub const ROUTE_SERVER_STATE_DELETED: &str = "deleted";
+
 /// Route persistence being turned on: `RouteServerPersistRoutesState`'s `enabling`
 /// (`smithy_query(query="shape",shape="RouteServerPersistRoutesState")`).
 pub const PERSIST_ROUTES_STATE_ENABLING: &str = "enabling";
@@ -1211,6 +1225,14 @@ pub struct RouteServerRecord {
     /// instant for a route server no modification has been asked for, which is already
     /// behind every read.
     pub modify_settled_at: Instant,
+    /// The instant from which this route server's `deleting` -> `deleted` move is due, for a
+    /// route server whose delete has been asked for; `None` while none has.
+    ///
+    /// A delete is a clock-owed move like every other: it is `deleting` until this instant
+    /// and `deleted` from it, which [`Self::state_at`] derives, so the record reports the
+    /// state the clock has reached without anybody writing it. Monotonic for the reason
+    /// [`Self::available_at`] is.
+    pub deleted_at: Option<Instant>,
 }
 
 impl RouteServerRecord {
@@ -1228,7 +1250,18 @@ impl RouteServerRecord {
     /// The route server's `RouteServerState` at `now`: `pending` until its create has
     /// settled, `modifying` while a configuration change is being applied, and `available`
     /// once the clock has settled both.
+    ///
+    /// A route server whose delete has been asked for is in the delete states instead,
+    /// whatever the moves its creation or a modification still owed: `deleting` until the
+    /// terminal state falls due and `deleted` from then on, the terminal state it stays in.
     pub fn state_at(&self, now: Instant) -> &'static str {
+        if let Some(deleted_at) = self.deleted_at {
+            return if now < deleted_at {
+                ROUTE_SERVER_STATE_DELETING
+            } else {
+                ROUTE_SERVER_STATE_DELETED
+            };
+        }
         if now < self.available_at {
             ROUTE_SERVER_STATE_PENDING
         } else if now < self.modify_settled_at {
@@ -1287,6 +1320,41 @@ pub fn require_known_route_server<E>(
     }
     if !store.route_servers.contains_key(route_server_id) {
         return Err(invalid_route_server_id_not_found(route_server_id));
+    }
+    Ok(())
+}
+
+/// Resolve a route server an operation is about to ACT on: the id has to be well formed and
+/// name a route server of the account — the two refusals [`require_known_route_server`]
+/// answers, in the same order — AND that route server must not be one a delete has already
+/// taken down. The record is resolved ONCE here, so the state the refusal names is the state
+/// the lookup read.
+///
+/// A deleted route server is still reported, in the terminal `deleted` state, so it still
+/// RESOLVES — but there is nothing left to associate, modify, endpoint or delete, and the
+/// state the caller would have to change is the route server's own, which is what EC2's
+/// `IncorrectState` names ([`incorrect_state_of`]). The ONE place that guard lives, so the
+/// operations acting on a route server cannot disagree about which ones admit a call.
+pub fn require_live_route_server<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    route_server_id: &str,
+) -> Result<(), Scaffolded<E>> {
+    if !route_server_id_is_well_formed(route_server_id) {
+        return Err(invalid_route_server_id_malformed(route_server_id));
+    }
+    let Some(record) = store.route_servers.get(route_server_id) else {
+        return Err(invalid_route_server_id_not_found(route_server_id));
+    };
+    let state = record.state_at(Instant::now());
+    if matches!(
+        state,
+        ROUTE_SERVER_STATE_DELETING | ROUTE_SERVER_STATE_DELETED
+    ) {
+        return Err(incorrect_state_of(
+            ROUTE_SERVER_TAGGABLE_RESOURCE,
+            route_server_id,
+            state,
+        ));
     }
     Ok(())
 }

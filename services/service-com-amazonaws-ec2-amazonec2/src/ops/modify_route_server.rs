@@ -148,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             missing_parameter, persist_routes_duration_invalid, request_region,
-            require_known_route_server, require_service_state, route_server_sns_topic_arn,
+            require_live_route_server, require_service_state, route_server_sns_topic_arn,
             PERSIST_ROUTES_DISABLE, PERSIST_ROUTES_DURATION_RANGE, PERSIST_ROUTES_ENABLE,
             PERSIST_ROUTES_RESET, PERSIST_ROUTES_STATE_DISABLING, PERSIST_ROUTES_STATE_ENABLING,
             PERSIST_ROUTES_STATE_RESETTING, TRANSITION_DELAY,
@@ -197,10 +197,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // An id that names no route server of the account is an error, not a route server
-        // created out of thin air. The crate's one resolver for that lookup tells a
-        // malformed id from an unknown one, and it is asked BEFORE the dry run: an unknown
-        // id is a reason the request would not have succeeded.
-        require_known_route_server(&store, &input.route_server_id)?;
+        // created out of thin air, and a route server a delete has taken down has no
+        // configuration left to change. The crate's one resolver for an operation ACTING on a
+        // route server tells a malformed id from an unknown one and refuses one in a delete
+        // state, and it is asked BEFORE the dry run: each is a reason the request would not
+        // have succeeded.
+        require_live_route_server(&store, &input.route_server_id)?;
         let record = store
             .route_servers
             .get_mut(&input.route_server_id)

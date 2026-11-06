@@ -146,9 +146,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The unique identifier for the route server to be associated" (`RouteServerId`):
         // an id that names no route server of the account is an error, not a route server
-        // created out of thin air. The crate's one resolver for that lookup tells a
-        // malformed id from an unknown one.
-        state::require_known_route_server(&store, &input.route_server_id)?;
+        // created out of thin air, and a route server a delete has taken down has nothing
+        // left to associate. The crate's one resolver for an operation ACTING on a route
+        // server tells a malformed id from an unknown one and refuses one in a delete state.
+        state::require_live_route_server(&store, &input.route_server_id)?;
 
         // "The ID of the VPC to associate with the route server" (`VpcId`), refused with the
         // code every other operation of this service refuses an unknown VPC id with.

@@ -801,6 +801,12 @@
 //! create's `ClientToken` to the scope it created, so a replay of the same request answers
 //! that scope instead of creating a second one.
 //!
+//! `DeleteNetworkInsightsAccessScope` takes a scope back out through the one removal path
+//! ([`ComAmazonawsEc2Amazonec2State::remove_network_insights_access_scope`]), which drops the
+//! content and the client token with it: [`NetworkInsightsAccessScope`] carries no state
+//! member, so a deleted scope has no terminal state to be reported in and its id simply
+//! stops resolving for every reader of this surface.
+//!
 //! [`ComAmazonawsEc2Amazonec2State::network_insights_access_scope_analyses`] holds the
 //! analyses that start has started, keyed by `NetworkInsightsAccessScopeAnalysisId`, as
 //! [`NetworkInsightsAccessScopeAnalysisRecord`]s: the modelled
@@ -955,9 +961,13 @@
 //! `available` move, its `modifying` -> `available` move once a configuration change has
 //! been asked for, and the move its route persistence is within (`enabling` -> `enabled`,
 //! `disabling` -> `disabled`, or a `resetting` that withdraws the persisted routes and
-//! leaves the configuration as it was). Those two words are facts of the record's age, so
+//! leaves the configuration as it was), and the move a delete owes it (`deleting` ->
+//! `deleted`). Those words are facts of the record's age, so
 //! [`RouteServerRecord::view_at`] derives them on read instead of letting two writers
-//! store two different ones. Keyed by `RouteServerId` in a [`BTreeMap`], the same stable
+//! store two different ones. A deleted route server STAYS in the store, reported in the
+//! terminal `deleted` state the model gives it, so a caller waiting for its delete to
+//! finish can observe it; what no longer admits a call is asked through
+//! [`require_live_route_server`]. Keyed by `RouteServerId` in a [`BTreeMap`], the same stable
 //! order the VPC and volume stores are kept in, so a pagination token can name the id the
 //! next page starts at.
 //!
@@ -1811,9 +1821,9 @@ pub mod internet_gateways;
 pub use internet_gateways::*;
 
 /// The Traffic Mirror filter store's own primitives — the id prefix, the bounds, the byte
-/// charge and the error channel `CreateTrafficMirrorFilter` and
-/// `DescribeTrafficMirrorFilters` share. Re-exported, so a handler reaches them as
-/// `crate::state::<item>` like every other primitive of this module.
+/// charge and the error channel the Traffic Mirror filter operations share, with the one
+/// write and the one removal path a filter enters and leaves the store by. Re-exported, so a
+/// handler reaches them as `crate::state::<item>` like every other primitive of this module.
 pub mod traffic_mirror_filters;
 pub use traffic_mirror_filters::*;
 

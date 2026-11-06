@@ -3,9 +3,9 @@
 //! @op DeleteRouteServer
 //!
 //! "Deletes the specified route server": it resolves the route server, refuses one a VPC is
-//! still associated with, and takes the route server — with the endpoints and peers that are
-//! resources OF it — out of the store, so `DescribeRouteServers` no longer reports any of
-//! them.
+//! still associated with and one a delete has already taken down, and starts taking the
+//! route server — with the endpoints and peers that are resources OF it — down, so
+//! `DescribeRouteServers` reports it `deleting` and then in the terminal `deleted` state.
 //!
 //! ## Shape of an operation
 //!
@@ -162,10 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_transitions();
 
         // An id that names no route server of the account is an error, not a delete of
-        // nothing. The crate's one resolver for that lookup tells a malformed id from an
-        // unknown one, and it is asked BEFORE the dry run: an unknown id is a reason the
-        // request would not have succeeded.
-        state::require_known_route_server(&store, &input.route_server_id)?;
+        // nothing, and a route server a delete has already taken down has nothing left to
+        // delete: the crate's one resolver for an operation ACTING on a route server tells a
+        // malformed id from an unknown one and refuses one in a delete state with the state
+        // it is in. It is asked BEFORE the dry run: both are reasons the request would not
+        // have succeeded.
+        state::require_live_route_server(&store, &input.route_server_id)?;
 
         // A route server that is still associated with a VPC is the thing updating that
         // VPC's route tables ("a route server association is the connection established
@@ -196,39 +198,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(state::dry_run_operation());
         }
 
-        // The delete itself: the route server record is the only thing that holds the route
-        // server, so taking it out of the store IS the delete, and its endpoints and peers go
-        // with it — they are resources OF the route server, which is why a live ASSOCIATION
-        // had to be removed first. The answer carries the route server as it was last
-        // reported, with the state a delete leaves it in, so the caller sees what it asked to
-        // be taken away rather than a record built beside it.
-        let Some(record) = store.route_servers.remove(&input.route_server_id) else {
+        // The delete itself: a route server in either delete state is still DESCRIBED, so
+        // the record stays in the store and the delete is a clock-owed move on it —
+        // `deleting` now, the terminal `deleted` one transition span later — which the one
+        // write path applies, cascading to the endpoints and peers that are resources OF this
+        // route server. The answer is the record the store now holds, so a delete and a later
+        // `DescribeRouteServers` cannot drift apart.
+        let Some(view) = store.begin_route_server_deletion(&input.route_server_id) else {
             return Err(state::internal_error(format!(
                 "the route server '{route_server_id}' resolved a moment ago is not in the \
                  store any more",
                 route_server_id = input.route_server_id,
             )));
         };
-        store.route_server_endpoints.retain(|_, endpoint| {
-            endpoint.route_server_id.as_deref() != Some(input.route_server_id.as_str())
-        });
-        store
-            .route_server_peers
-            .retain(|_, peer| peer.route_server_id.as_deref() != Some(input.route_server_id.as_str()));
-        let mut view = record.view_at(now);
-        view.state = Some(ROUTE_SERVER_STATE_DELETING.to_string());
         Ok(DeleteRouteServerOutput {
             route_server: Some(view),
         })
     }
 }
-
-/// A route server whose delete is under way: the `RouteServerState` enum's `deleting` member
-/// (`smithy_query(query="shape",shape="RouteServerState")`, whose members are `pending`,
-/// `available`, `modifying`, `deleting` and `deleted`).
-///
-/// The store holds a route server only while it HAS one, so the record is gone by the time
-/// this state is reported: it is the state of the route server this call took away, which is
-/// what AWS answers a delete with, and a later `DescribeRouteServers` reports no route server
-/// under that id at all.
-const ROUTE_SERVER_STATE_DELETING: &str = "deleting";
