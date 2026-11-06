@@ -49,6 +49,8 @@ mod merge_adjacency;
 mod record_flow;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
+#[path = "all/resource_policy_absence.rs"]
+mod resource_policy_absence;
 #[path = "all/resource_tag_listing.rs"]
 mod resource_tag_listing;
 #[path = "all/resource_tag_removal.rs"]

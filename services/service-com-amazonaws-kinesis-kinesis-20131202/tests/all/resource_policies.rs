@@ -11,9 +11,11 @@
 //! carries none again. One lookup resolves the ARN for all three, across every resource kind
 //! a `ResourceARN` may name (`^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`) — a data
 //! stream, a registered consumer, a channel — so each resource's policy is its own. An ARN
-//! this account and region hold no resource under, and a resource carrying no policy, are both
-//! the modelled `ResourceNotFoundException`; a `Policy` that is no policy document at all is
-//! the modelled `InvalidArgumentException`.
+//! this account and region hold no resource under is the modelled `ResourceNotFoundException`
+//! for all three; a resource that exists and carries no policy has none for the delete to
+//! remove (the same refusal) while the READ is served for it, reporting the empty document —
+//! that half of the rule is [`crate::resource_policy_absence`]'s. A `Policy` that is no policy
+//! document at all is the modelled `InvalidArgumentException`.
 //!
 //! The recorded flows these were derived from attach ONE document to ONE stream and read it
 //! back, and read a stream that carries none — each one row of the tables below. The rows
@@ -26,9 +28,9 @@
 //! [`crate::channel_lifecycle`]', reused rather than copied.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    channel_arn, MAX_RESOURCE_POLICY_BYTES,
-};
+use service_com_amazonaws_kinesis_kinesis_20131202::state::{channel_arn, MAX_RESOURCE_POLICY_BYTES};
+
+use crate::resource_policy_absence::EMPTY_POLICY_DOCUMENT;
 
 use crate::channel_lifecycle::{
     on_demand_stream, past_channel_activation, role_arn, storage_configuration,
@@ -39,15 +41,14 @@ use crate::stream_tags::{
 };
 
 /// The account every resource of this emulator belongs to, which the refusals name.
-fn account() -> &'static str {
+pub(crate) fn account() -> &'static str {
     engine::EMULATOR_ACCOUNT_ID
 }
 
-/// What a `GetResourcePolicy` response must say when the resource the request named carries
-/// no policy, or when it names no resource at all: this service's not-found sentence for a
-/// policy, spelled out here rather than taken from the handler's own helper so a drift away
-/// from the wording fails.
-fn policy_not_found_says(arn: &str) -> String {
+/// What a `DeleteResourcePolicy` refusal must say when the resource the request named carries
+/// no policy to remove: this service's not-found sentence for a policy, spelled out here
+/// rather than taken from the handler's own helper so a drift away from the wording fails.
+pub(crate) fn policy_not_found_says(arn: &str) -> String {
     format!("Policy for resource {arn} under account {} not found.", account())
 }
 
@@ -55,7 +56,7 @@ fn policy_not_found_says(arn: &str) -> String {
 /// principal on `arn`. The shape AWS documents for the member ("It must include the identity
 /// of the principal and the actions allowed on this resource. This is formatted as a JSON
 /// string", `PutResourcePolicyInput$Policy`).
-fn policy_for(arn: &str, sid: &str, action: &str) -> String {
+pub(crate) fn policy_for(arn: &str, sid: &str, action: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -84,7 +85,7 @@ fn policy_of_bytes(total: usize) -> String {
 }
 
 /// Attach `policy` to `arn`, answering the status and body so a case can assert either.
-async fn put(emulator: &Emulator, region: &str, arn: &str, policy: &str) -> (u16, Value) {
+pub(crate) async fn put(emulator: &Emulator, region: &str, arn: &str, policy: &str) -> (u16, Value) {
     emulator
         .call_in(
             region,
@@ -95,14 +96,14 @@ async fn put(emulator: &Emulator, region: &str, arn: &str, policy: &str) -> (u16
 }
 
 /// Read the policy attached to `arn`.
-async fn get(emulator: &Emulator, region: &str, arn: &str) -> (u16, Value) {
+pub(crate) async fn get(emulator: &Emulator, region: &str, arn: &str) -> (u16, Value) {
     emulator
         .call_in(region, "GetResourcePolicy", &json!({ "ResourceARN": arn }))
         .await
 }
 
 /// Detach the policy attached to `arn`.
-async fn delete(emulator: &Emulator, region: &str, arn: &str) -> (u16, Value) {
+pub(crate) async fn delete(emulator: &Emulator, region: &str, arn: &str) -> (u16, Value) {
     emulator
         .call_in(
             region,
@@ -113,7 +114,7 @@ async fn delete(emulator: &Emulator, region: &str, arn: &str) -> (u16, Value) {
 }
 
 /// The `Policy` a served read reports, asserting the read was served at all.
-fn reported_policy(case: &str, status: u16, response: &Value) -> String {
+pub(crate) fn reported_policy(case: &str, status: u16, response: &Value) -> String {
     assert_eq!(
         status, 200,
         "case {case}: expected GetResourcePolicy to answer 200, got {status} with body \
@@ -129,7 +130,7 @@ fn reported_policy(case: &str, status: u16, response: &Value) -> String {
 }
 
 /// A refusal of `operation`, asserting its status, its modelled error code and its message.
-fn assert_refused(case: &str, status: u16, response: &Value, code: &str, says: &str) {
+pub(crate) fn assert_refused(case: &str, status: u16, response: &Value, code: &str, says: &str) {
     assert_eq!(
         status, 400,
         "case {case}: expected the modelled refusal, got {status} with body {response}"
@@ -148,7 +149,7 @@ fn assert_refused(case: &str, status: u16, response: &Value, code: &str, says: &
 }
 
 /// An `ACTIVE` stream named `name`, answering its ARN.
-async fn active_stream(emulator: &Emulator, name: &str) -> String {
+pub(crate) async fn active_stream(emulator: &Emulator, name: &str) -> String {
     emulator
         .ok(
             name,
@@ -388,12 +389,10 @@ async fn every_resource_kind_holds_its_own_policy() {
          {response}"
     );
     let (status, gone) = get(&emulator, REGION, &consumer).await;
-    assert_refused(
-        "consumer after the detach",
-        status,
-        &gone,
-        "ResourceNotFoundException",
-        &policy_not_found_says(&consumer),
+    assert_eq!(
+        reported_policy("consumer after the detach", status, &gone),
+        EMPTY_POLICY_DOCUMENT,
+        "case consumer after the detach: expected the empty document, got {gone}"
     );
     for (case, arn, policy) in rows.iter().filter(|(case, _, _)| *case != "consumer") {
         let (status, read) = get(&emulator, REGION, arn).await;
@@ -406,31 +405,25 @@ async fn every_resource_kind_holds_its_own_policy() {
     }
 }
 
-/// A resource that carries no policy has none to report and none to delete — before any
-/// attach, and again after a detach — and an ARN this account and region hold no resource
-/// under names nothing at all. Every one of them is the modelled `ResourceNotFoundException`,
-/// in the wording for what was not found.
+/// A resource that carries no policy has none for the DELETE to remove — before any attach,
+/// and again after a detach — and an ARN this account and region hold no resource under names
+/// nothing at all, for the read, the delete and the attach alike. Every one of them is the
+/// modelled `ResourceNotFoundException`, in the wording for what was not found. (What the
+/// READ answers for a resource carrying no policy is [`crate::resource_policy_absence`]'s.)
 #[tokio::test]
-async fn an_absent_policy_is_refused_by_both_the_read_and_the_delete() {
+async fn an_absent_policy_is_refused_by_the_delete() {
     let emulator = Emulator::new();
     let held = active_stream(&emulator, "policy-absence").await;
 
-    // Before any attach: nothing to report, nothing to delete.
-    for (case, (status, response)) in [
-        ("read before any attach", get(&emulator, REGION, &held).await),
-        (
-            "delete before any attach",
-            delete(&emulator, REGION, &held).await,
-        ),
-    ] {
-        assert_refused(
-            case,
-            status,
-            &response,
-            "ResourceNotFoundException",
-            &policy_not_found_says(&held),
-        );
-    }
+    // Before any attach: nothing to delete.
+    let (status, response) = delete(&emulator, REGION, &held).await;
+    assert_refused(
+        "delete before any attach",
+        status,
+        &response,
+        "ResourceNotFoundException",
+        &policy_not_found_says(&held),
+    );
 
     // Attached, detached, and absent again: the detach is served once, and a second detach
     // of the same resource has nothing left to remove.
@@ -442,21 +435,14 @@ async fn an_absent_policy_is_refused_by_both_the_read_and_the_delete() {
         status, 200,
         "the detach must be served, got {status} with body {response}"
     );
-    for (case, (status, response)) in [
-        ("read after the detach", get(&emulator, REGION, &held).await),
-        (
-            "delete after the detach",
-            delete(&emulator, REGION, &held).await,
-        ),
-    ] {
-        assert_refused(
-            case,
-            status,
-            &response,
-            "ResourceNotFoundException",
-            &policy_not_found_says(&held),
-        );
-    }
+    let (status, response) = delete(&emulator, REGION, &held).await;
+    assert_refused(
+        "delete after the detach",
+        status,
+        &response,
+        "ResourceNotFoundException",
+        &policy_not_found_says(&held),
+    );
 
     // An ARN naming no resource of this account and region: refused with the sentence this
     // service states for the resource KIND that ARN names, not with the policy one.

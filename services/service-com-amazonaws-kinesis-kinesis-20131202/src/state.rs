@@ -3083,8 +3083,15 @@ pub fn policy_not_json_message(detail: &str) -> String {
     format!("Policy must be a JSON policy document: {detail}.")
 }
 
-/// How a read or a delete states that the resource the request named carries no policy to
-/// report or remove, worded with the fixed tail this service states every not-found with
+/// What a read reports for a resource that carries no resource-based policy: a policy "is
+/// formatted as a JSON string" (`GetResourcePolicyOutput$Policy`) holding "the identity of
+/// the principal and the actions allowed on this resource", so a resource no statement
+/// governs is reported as the JSON object carrying no statement at all. It is never stored:
+/// the stored slot stays empty until an attach writes a document into it.
+pub const EMPTY_RESOURCE_POLICY: &str = "{}";
+
+/// How a delete states that the resource the request named carries no policy to
+/// remove, worded with the fixed tail this service states every not-found with
 /// ("... under account `<account>` not found."): the thing not found is the POLICY of that
 /// resource, and the resource is named the way the request addressed it — by its
 /// `ResourceARN`, the only identifier these operations have.

@@ -12,10 +12,11 @@
 //! (`^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`), the same one the attach and the
 //! detach resolve through
 //! ([`crate::state::ComAmazonawsKinesisKinesis20131202State::resource_policy_by_arn`]), so a
-//! read reports the policy of the resource a write wrote it to. There is nothing to report
-//! for an ARN this account and region hold no resource under, and nothing to report for a
-//! resource that carries no policy: both are the modelled `ResourceNotFoundException`, each
-//! in its own wording.
+//! read reports the policy of the resource a write wrote it to. A resource that carries no
+//! policy is governed by no statement at all, which IS a policy document — the empty one
+//! ([`crate::state::EMPTY_RESOURCE_POLICY`]) — so the read is served for it; only an ARN this
+//! account and region hold no resource under has nothing to report, and that absence of the
+//! RESOURCE is the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -134,9 +135,9 @@ impl From<GetResourcePolicyErrorModeled> for GetResourcePolicyError {
     }
 }
 
-/// The modelled refusal this read answers with when there is nothing to report: the one
-/// error class the model gives it for an absence, carrying the sentence the caller is told
-/// what was not found by.
+/// The modelled refusal this read answers with when the ARN names no resource of this
+/// account and region: the one error class the model gives it for an absence, carrying the
+/// sentence the caller is told what was not found by.
 fn not_found(message: String) -> GetResourcePolicyError {
     GetResourcePolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(message),
@@ -195,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `StreamId` is documented "Not Implemented. Reserved for future use", so no resource
         // carries one and it names nothing: the `ResourceARN` is what this operation
         // addresses a resource by, whichever kind that ARN names.
-        let attached = store
+        let policy = store
             .resource_policy_by_arn(
                 ::std::time::SystemTime::now(),
                 &region,
@@ -204,16 +205,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 not_found(crate::state::resource_not_found_message(&input.resource_arn))
             })?
-            .clone();
-
-        // `Policy` is a REQUIRED output member, so a resource carrying none has nothing this
-        // operation could answer with: the absent policy is reported as absent rather than as
-        // an empty document.
-        let policy = attached.ok_or_else(|| {
-            not_found(crate::state::resource_policy_not_found_message(
-                &input.resource_arn,
-            ))
-        })?;
+            .clone()
+            // The resource exists and carries no policy: what governs it is the empty policy
+            // document, which is what the REQUIRED `Policy` member reports. Nothing is
+            // stored for it, so the next caller still finds the slot empty.
+            .unwrap_or_else(|| crate::state::EMPTY_RESOURCE_POLICY.to_string());
 
         Ok(GetResourcePolicyOutput { policy })
     }
