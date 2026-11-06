@@ -193,23 +193,20 @@ fn host_style_label(host: &str) -> Option<&str> {
 /// addressed by name, so a client that reads an object through a presigned URL addresses it
 /// that way.
 ///
-/// WHICH form a request is in cannot be read off the host's shape, because an endpoint's own
-/// first label may be bucket-shaped and an emulator's endpoint is reached under a name
-/// nothing here knows. So it is resolved against the buckets this emulator HOLDS: the first
-/// host label addresses a bucket when it names one of them and the request's first path
-/// segment does not. A path-style request's first path segment names its bucket, so it is
-/// never read out of the host; and where both could (a bucket whose name is also the
-/// endpoint's first label), the PATH wins, which leaves every request that resolves today
-/// resolving the same way.
+/// WHICH form a request is in cannot be read off the host's shape alone, because an
+/// endpoint's own first label may be bucket-shaped and an emulator's endpoint is reached
+/// under a name nothing here knows. So it is resolved against the buckets this emulator
+/// HOLDS: the first host label addresses a bucket when it names one of them and the
+/// request's first path segment does not. A path-style request's first path segment names
+/// its bucket, so it is never read out of the host; and where both could (a bucket whose
+/// name is also the endpoint's first label), the PATH wins, which leaves every request that
+/// resolves today resolving the same way.
 ///
-/// The LIMIT of resolving it that way: a host-style request naming a bucket this emulator
-/// does NOT hold is read as path-style, so `PUT /` with `Host: new-bucket.<endpoint>` (a
-/// host-style `CreateBucket`) and a read of an absent bucket resolve from the bare path
-/// instead of from the host. Both answer about the address the path names — a create of no
-/// bucket at all, a listing of the account's buckets — rather than about the host's. Serving
-/// them would need the endpoint's own name, which a client configures and never sends, so
-/// the choice here is to leave the requests that resolve today resolving unchanged;
-/// `tests/all/presigned_object_reads.rs` pins the boundary.
+/// What a bucket-shaped host label naming a bucket this emulator does NOT hold resolves to
+/// is not decided here: this answers `None` for it, and the seams that read an address
+/// decide it between them — `tests/all/presigned_object_reads.rs` pins what a read of such
+/// an address is answered (`NoSuchBucket`, the code Amazon S3 answers a bucket that does not
+/// exist with, about the bucket the HOST named).
 pub(crate) fn addressed_in_host<'h>(
     host: &'h str,
     path: &str,

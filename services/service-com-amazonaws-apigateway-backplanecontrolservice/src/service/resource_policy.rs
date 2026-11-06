@@ -9,21 +9,28 @@
 //! integration is reached. An api carrying no document has no resource-based grant to read
 //! and is served exactly as it was before one existed.
 //!
+//! The caller's OWN side of the decision is not here: the identity-based policies in force
+//! on the principal an `AWS_IAM`-authorized credential speaks for are read by the gate
+//! beside this one ([`super::invoke::execute_api_authorization`]), which asks this module
+//! whether the document ALLOWS the call ([`allows_invoke`]) because for a caller in the
+//! api's own account either grant suffices.
+//!
 //! A second action the document decides is the one a request asking for the stage's CACHED
 //! response to be reloaded asks for ([`INVALIDATE_CACHE_ACTION`]): a stage whose method
 //! settings require authorization for a cache-control header reads that grant through
 //! [`authorizes_invalidation`], and what it does with an unauthorized ask is the stage's
 //! own `unauthorizedCacheControlHeaderStrategy` rather than this module's business.
 //!
-//! The DECISION is not made here: it is
+//! The EVALUATION is not written here: it is
 //! [`::service_common::iam_authorization`], the tree's one evaluation of IAM policy
 //! documents, so this data plane and every other service handed the same document decide
 //! alike. What lives here is only what is particular to an invoke:
 //!
 //! * the ACTION it asks for ([`INVOKE_ACTION`]);
-//! * the two spellings the RESOURCE element of such a document names a method by — the
+//! * the two spellings the RESOURCE element of a resource policy names a method by — the
 //!   method's own ARN and the `execute-api:/{stage}/{verb}/{path}` form API Gateway's own
-//!   policy examples are written in — where a value matching EITHER is about this call;
+//!   policy examples are written in — where a value matching EITHER is about this call,
+//!   while an identity-based statement names it by the ARN alone;
 //! * the condition keys an invoke of this emulator can answer for ([`PUBLISHED_KEYS`]): the
 //!   VPC endpoint the request arrived through, which is the one property of a request that
 //!   this data plane reads off the endpoint host it was addressed on. A clause over any
@@ -43,9 +50,9 @@
 //! whatever it signs with. A request to an `AWS_IAM` method ([`Caller::Signed`]) is not
 //! refused on an unstated document: AWS decides that one against the caller's
 //! identity-based policies as well, where either grant suffices, so refusing it here would
-//! deny a call AWS permits. This emulator models no identity-based policies for an invoke
-//! (see [`super::invoke::authorization_refusal`]), which is exactly why the unstated case
-//! is read fail-OPEN there and fail-closed for a method that authorizes nobody.
+//! deny a call AWS permits — that decision is
+//! [`super::invoke::execute_api_authorization`]'s, which is why the unstated case is read
+//! fail-OPEN here and fail-closed for a method that authorizes nobody.
 
 use ::service_common::iam_authorization::{self as iam, Decision, PreparedDocument};
 
@@ -93,8 +100,8 @@ pub enum Caller<'a> {
     /// can be.
     Anonymous,
     /// The method is authorized by IAM and the emulator verified the credential, so the
-    /// request speaks for this principal — whose identity-based policies AWS evaluates
-    /// beside the document.
+    /// request speaks for this principal — whose identity-based policies are evaluated
+    /// beside the document by [`super::invoke::execute_api_authorization`].
     Signed(&'a str),
 }
 
@@ -208,9 +215,8 @@ pub fn allows_invoke(policy: Option<&str>, call: &Call<'_>) -> bool {
 /// `policy` is the document the api carries, `None` for an api carrying none — which
 /// states nothing about the action, and so is read exactly as a document that mentions it
 /// nowhere: a request to a method that authorizes nobody holds no grant at all, while an
-/// IAM-authorized caller may hold an identity-based one this emulator does not model (the
-/// module docs give the whole argument, and it is the same one [`denial`] reads an invoke
-/// by).
+/// IAM-authorized caller may hold an identity-based one, which is the same reading
+/// [`denial`] gives an invoke (the module docs give the whole argument).
 #[must_use]
 pub fn authorizes_invalidation(policy: Option<&str>, call: &Call<'_>) -> bool {
     let stated = policy.map_or(Decision::NotStated, |policy| {
@@ -235,7 +241,7 @@ pub fn invalidation_not_authorized(call: &Call<'_>) -> String {
 ///
 /// See the module docs: for a method that authorizes nobody the document is the only grant
 /// there can be, so an unstated one refuses, while an IAM-authorized caller may hold an
-/// identity-based grant this emulator does not model.
+/// identity-based grant, which [`super::invoke::execute_api_authorization`] decides.
 fn refuses(stated: Decision, call: &Call<'_>) -> bool {
     match stated {
         Decision::Denied => true,
@@ -294,11 +300,15 @@ pub(crate) fn not_authorized(action: &str, principal: &str, method_arn: &str) ->
 
 #[cfg(test)]
 mod tests {
-    //! The two pure rules this module owns: the shape of the resource an invoke names, and
-    //! which decision each kind of document reaches for it. What the data plane then SERVES
-    //! is pinned end to end in `tests/all/private_api_resource_policy.rs`.
+    //! The pure rules this module owns: the shape of the resource an invoke names, and
+    //! which decision each pair of documents reaches for it. What the data plane then SERVES
+    //! is pinned end to end in `tests/all/private_api_resource_policy.rs` and
+    //! `tests/all/stage_invoke_identity_policy.rs`.
 
     use super::*;
+
+    /// The principal a signed row speaks for.
+    const PRINCIPAL: &str = "arn:aws:sts::000000000000:assumed-role/pool-guest/session";
 
     /// One invoke of `GET /whoami` on stage `s` of api `abc1230000`, arriving through
     /// `source_vpce` and speaking for `caller`.
@@ -386,7 +396,7 @@ mod tests {
         let other_path = "{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":\"*\",\
                           \"Action\":\"execute-api:Invoke\",\
                           \"Resource\":\"execute-api:/s/GET/other\"}]}";
-        let signed = Caller::Signed("arn:aws:iam::000000000000:user/emulator");
+        let signed = Caller::Signed(PRINCIPAL);
         // Rows differ along the effect the document states about this call and along the
         // method's own authorization — the two things the reading depends on.
         type Row<'a> = (&'a str, &'a str, Caller<'a>, bool);
@@ -405,6 +415,35 @@ mod tests {
                 refusal.is_none(),
                 *allowed,
                 "case {case}: expected allowed={allowed}, got {refusal:?}"
+            );
+        }
+    }
+
+    /// Whether the document ALLOWS the invoke is a different question from whether it
+    /// refuses it, and it is the one the identity-based gate beside this module asks: an
+    /// unstated document, and no document at all, allow nothing.
+    #[test]
+    fn an_allow_is_reported_only_where_the_document_states_one() {
+        let allow_all = "{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":\"*\",\
+                         \"Action\":\"execute-api:Invoke\",\"Resource\":\"execute-api:/*\"}]}";
+        let other_path = "{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":\"*\",\
+                          \"Action\":\"execute-api:Invoke\",\
+                          \"Resource\":\"execute-api:/s/GET/other\"}]}";
+        let deny_all = "{\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\
+                        \"Action\":\"execute-api:Invoke\",\"Resource\":\"execute-api:/*\"}]}";
+        // Rows differ along what the document states about this call, including carrying no
+        // document at all.
+        let rows: &[(&str, Option<&str>, bool)] = &[
+            ("no document at all", None, false),
+            ("an allow covering the method", Some(allow_all), true),
+            ("an allow of another path", Some(other_path), false),
+            ("an explicit deny", Some(deny_all), false),
+        ];
+        for (case, document, allows) in rows {
+            let read = allows_invoke(*document, &call(None, Caller::Signed(PRINCIPAL)));
+            assert_eq!(
+                read, *allows,
+                "case {case}: expected an explicit allow == {allows}, got {read}"
             );
         }
     }
@@ -430,7 +469,7 @@ mod tests {
             )
         };
         let deny_invalidation = grant("execute-api:InvalidateCache").replace("Allow", "Deny");
-        let signed = Caller::Signed("arn:aws:iam::000000000000:user/emulator");
+        let signed = Caller::Signed(PRINCIPAL);
         // Rows differ along what the document states about the INVALIDATION action — the
         // action itself, another action of the same service, every action, nothing, an
         // explicit deny — and along the method's own authorization, which is what decides

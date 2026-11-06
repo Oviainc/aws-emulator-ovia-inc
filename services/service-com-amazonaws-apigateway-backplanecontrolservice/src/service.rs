@@ -99,6 +99,10 @@
 //! so the operation above declares none. What a method's `authorizationType` requires of the
 //! request is unchanged — `AWS_IAM` still admits only a request that CARRIES a SigV4
 //! credential ([`invoke::carries_sigv4_credential`]), and refuses one that carries none.
+//! WHAT that credential may then do is a second question, answered from the account's own
+//! records ([`invoke::execute_api_authorization`]): a verified credential is not a pass, so
+//! such a method is served only where the identity-based policies in force on the principal
+//! it speaks for, or the api's own document, allow the invoke.
 //!
 //! What the data plane resolves, and what it answers for an integration it cannot perform,
 //! is [`invoke`]'s own documentation; the api's own resource policy, which every invoke is
