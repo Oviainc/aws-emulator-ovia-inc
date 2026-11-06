@@ -563,6 +563,15 @@ pub const DATA_ACCESS_ENABLING: &str = "Enabling";
 /// elapsed: the modelled enum's `Enabled` value.
 pub const DATA_ACCESS_ENABLED: &str = "Enabled";
 
+/// The `DataAccessStatus` a directory carries between `DisableDirectoryDataAccess` and
+/// [`TRANSITION_SPAN`]: the modelled enum's `Disabling` value.
+///
+/// The disable answers before data access has actually been withdrawn — the enum carries
+/// both the transient `Disabling` and the settled [`DATA_ACCESS_DISABLED`] — so the move
+/// back to [`DATA_ACCESS_DISABLED`] is owed by the clock, on the same span the enable's
+/// transition uses.
+pub const DATA_ACCESS_DISABLING: &str = "Disabling";
+
 /// The `CertificateState` a certificate carries between `RegisterCertificate` and
 /// [`TRANSITION_SPAN`]: the first value of the modelled `CertificateState` enum
 /// (`smithy_query(query="shape", shape="CertificateState")` answers `["Registering",
@@ -1833,10 +1842,11 @@ pub struct Directory {
     /// Whether this directory's data is reachable through the Directory Service Data
     /// API, as `DescribeDirectoryDataAccess` reports it: one of the modelled
     /// `DataAccessStatus` values, [`DATA_ACCESS_DISABLED`] until
-    /// `EnableDirectoryDataAccess` records otherwise.
+    /// `EnableDirectoryDataAccess` records otherwise and again once
+    /// `DisableDirectoryDataAccess` has withdrawn it.
     pub data_access_status: String,
-    /// When the data-access status transition an enable owes falls due; `None` once
-    /// there is none left to make. See [`TRANSITION_SPAN`].
+    /// When the data-access status transition an enable or a disable owes falls due;
+    /// `None` once there is none left to make. See [`TRANSITION_SPAN`].
     pub data_access_due_at: Option<SystemTime>,
     /// Creation rank, from
     /// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::next_seq`]. A
@@ -2937,15 +2947,20 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                 route.status != IP_ROUTE_STATUS_REMOVING
                     || route.status_due_at.is_some_and(|due| now < due)
             });
-            // The data-access transition `EnableDirectoryDataAccess` owes: the
-            // transient `Enabling` settles on `Enabled`. The mirrored transition out of
-            // `Disabling` belongs to `DisableDirectoryDataAccess`, which is still
-            // scaffolded, so it lands with that handler rather than as a branch nothing
-            // can reach.
+            // The data-access transitions the toggles owe: the transient `Enabling`
+            // `EnableDirectoryDataAccess` records settles on `Enabled`, and the
+            // transient `Disabling` `DisableDirectoryDataAccess` records settles back on
+            // `Disabled`. Either way the directory keeps a `DataAccessStatus`, so
+            // neither transition removes anything from the store.
             if let Some(due) = directory.data_access_due_at {
-                if now >= due && directory.data_access_status == DATA_ACCESS_ENABLING {
-                    directory.data_access_status = DATA_ACCESS_ENABLED.to_string();
-                    directory.data_access_due_at = None;
+                if now >= due {
+                    if directory.data_access_status == DATA_ACCESS_ENABLING {
+                        directory.data_access_status = DATA_ACCESS_ENABLED.to_string();
+                        directory.data_access_due_at = None;
+                    } else if directory.data_access_status == DATA_ACCESS_DISABLING {
+                        directory.data_access_status = DATA_ACCESS_DISABLED.to_string();
+                        directory.data_access_due_at = None;
+                    }
                 }
             }
             // The state transition `RegisterCertificate` owes: the transient
