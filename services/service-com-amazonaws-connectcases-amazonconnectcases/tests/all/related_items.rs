@@ -13,7 +13,9 @@
 //! `ConnectCase` item links to, the fields a `Custom` item writes values
 //! against, the case field an `Sla` item tracks — is resolved before anything is
 //! stored, and a request whose `type` and `content` describe different kinds of
-//! item is refused.
+//! item is refused — with the service's fixed sentence for a mismatched pair,
+//! led by the type the REQUEST declared, upper-cased, and nothing else
+//! interpolated — and nothing is associated.
 //!
 //! The table below is the class, not one recorded call: its rows differ in the
 //! content type, the shape of the content, how many field values the item
@@ -572,6 +574,166 @@ async fn an_association_is_accepted_at_each_modelled_bound_and_refused_past_it()
         history.len(),
         accepted + 1,
         "case \"bounds\": one recorded association per accepted request, got {history:?}"
+    );
+}
+
+/// One content of every kind an association can carry, as
+/// `(RelatedItemType value, content)`. The model names the six members of
+/// `RelatedItemInputContent` after the six values of `RelatedItemType`
+/// (`smithy_query(query="shape",shape="RelatedItemInputContent,RelatedItemType")`),
+/// so each row is the content that one declared type agrees with and that every
+/// other one contradicts.
+fn content_of_every_kind(text_field: &str, linked_case_id: &str) -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "Comment",
+            json!({ "comment": { "body": "a note", "contentType": "Text/Plain" } }),
+        ),
+        (
+            "ConnectCase",
+            json!({ "connectCase": { "caseId": linked_case_id } }),
+        ),
+        ("Contact", json!({ "contact": { "contactArn": CONTACT_ARN } })),
+        (
+            "Custom",
+            json!({ "custom": { "fields": [
+                { "id": text_field, "value": { "stringValue": "order-4711" } },
+            ] } }),
+        ),
+        ("File", json!({ "file": { "fileArn": FILE_ARN } })),
+        (
+            "Sla",
+            json!({ "sla": { "slaInputConfiguration": {
+                "name": "resolve before the target",
+                "type": "CaseField",
+                "targetSlaMinutes": 60,
+            } } }),
+        ),
+    ]
+}
+
+/// The refusal a mismatched pair earns: the DECLARED type upper-cased, then the
+/// service's fixed sentence, and nothing else — no content kind, no accepted
+/// value list, no domain or case id.
+fn mismatch_message(declared: &str) -> String {
+    format!(
+        "{} type was specified with a mismatched related-item content.",
+        declared.to_uppercase()
+    )
+}
+
+#[tokio::test]
+async fn every_mismatched_type_and_content_pair_is_refused_with_the_services_fixed_sentence() {
+    let emulator = Emulator::new();
+    let (domain_id, template_id, case_id, fields) =
+        domain_with_a_case(&emulator, "related-item-mismatch").await;
+    let text_field = field_of_type(&fields, "Text");
+    let number_field = field_of_type(&fields, "Number");
+    let boolean_field = field_of_type(&fields, "Boolean");
+    let linked_case_id = create_case(&emulator, &domain_id, &template_id, "the linked case").await;
+    let path = related_items_path(&domain_id, &case_id);
+
+    let contents = content_of_every_kind(&text_field, &linked_case_id);
+    // The catalog above is the whole content vocabulary, so the cross product
+    // below is every ordered mismatched pair rather than the one recorded pair.
+    for item_type in RELATED_ITEM_TYPE_VALUES {
+        assert!(
+            contents.iter().any(|(kind, _)| kind == item_type),
+            "the content catalog must carry content of the {item_type} kind"
+        );
+    }
+
+    // (case, declared type, content it contradicts)
+    let mut rows: Vec<(String, &str, Value)> = Vec::new();
+    for declared in RELATED_ITEM_TYPE_VALUES {
+        for (kind, content) in &contents {
+            if kind == declared {
+                continue;
+            }
+            rows.push((
+                format!("{declared} declared with {kind} content"),
+                declared,
+                content.clone(),
+            ));
+        }
+    }
+    // The sentence is the same whatever the contradicting content carries, so
+    // two rows vary the content's own detail as well as its kind.
+    rows.push((
+        "Comment declared with Custom content carrying three values".to_string(),
+        "Comment",
+        json!({ "custom": { "fields": [
+            { "id": text_field, "value": { "stringValue": "first" } },
+            { "id": number_field, "value": { "doubleValue": 12.5 } },
+            { "id": boolean_field, "value": { "booleanValue": true } },
+        ] } }),
+    ));
+    rows.push((
+        "Sla declared with a one-character comment".to_string(),
+        "Sla",
+        json!({ "comment": { "body": "c", "contentType": "Text/Plain" } }),
+    ));
+
+    for (case, declared, content) in &rows {
+        let (status, code, message) = emulator
+            .failure_detail(
+                case,
+                "POST",
+                &path,
+                Some(json!({ "type": declared, "content": content })),
+            )
+            .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected HTTP 400 ValidationException, got {status} {code} with \
+             message {message:?}"
+        );
+        let expected = mismatch_message(declared);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+    }
+
+    // `SearchRelatedItems` is still a scaffolded 501 (its own open stub issue),
+    // so the case's audit history is the reader that shows whether anything was
+    // associated: a refused request leaves the case with only its own creation
+    // recorded.
+    let history = audit_events(&emulator, "after the mismatches", &domain_id, &case_id).await;
+    assert_eq!(
+        history.len(),
+        1,
+        "case \"after the mismatches\": a refused association stores nothing, got {history:?}"
+    );
+
+    // The control: each declared type agrees with the content of its own kind,
+    // and is accepted — so the refusals above are about the contradiction and
+    // not about the operation or the content.
+    let mut accepted = 0;
+    for (kind, content) in &contents {
+        let case = format!("{kind} declared with {kind} content");
+        let created = emulator
+            .ok(
+                &case,
+                "POST",
+                &path,
+                json!({ "type": kind, "content": content }),
+            )
+            .await;
+        let related_item_id = string_at(&created, "relatedItemId", &case);
+        assert!(
+            is_minted_id(&related_item_id),
+            "case {case:?}: an agreeing pair is stored under a minted id, got {created:?}"
+        );
+        accepted += 1;
+    }
+    let history = audit_events(&emulator, "after the agreeing pairs", &domain_id, &case_id).await;
+    assert_eq!(
+        history.len(),
+        accepted + 1,
+        "case \"after the agreeing pairs\": one recorded association per accepted request, \
+         got {history:?}"
     );
 }
 
