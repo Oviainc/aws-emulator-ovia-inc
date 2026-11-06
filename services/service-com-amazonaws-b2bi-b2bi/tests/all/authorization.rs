@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
@@ -67,29 +67,22 @@ impl Emulator {
     /// records one: the identity is the `assumed-role` ARN `sts:GetCallerIdentity` reports.
     fn given_session(&self) {
         let now = SystemTime::now();
-        let store = sts::service_state(&*self.engine).expect("the STS store");
-        store
-            .lock()
-            .insert(sts::Session {
-                access_key_id: SESSION_KEY_ID.to_string(),
-                created_at: now,
-                expires_at: now + Duration::from_secs(SESSION_SECONDS as u64),
-                duration_seconds: SESSION_SECONDS,
-                identity: sts::Identity {
+        let vend = sts::NewSession {
+            role_arn: Some(format!("arn:aws:iam::{ACCOUNT}:role/{ROLE}")),
+            ..sts::NewSession::new(
+                sts::Identity {
                     user_id: sts::role_id(ROLE),
                     account: ACCOUNT.to_string(),
                     arn: format!("arn:aws:sts::{ACCOUNT}:assumed-role/{ROLE}/onboarding-session"),
                 },
-                kind: sts::SessionKind::AssumedRole,
-                source_identity: None,
-                tags: Vec::new(),
-                transitive_tag_keys: Vec::new(),
-                packed_policy_size: None,
-                policies: sts::SessionPolicies::default(),
-                external_id: None,
-                role_arn: Some(format!("arn:aws:iam::{ACCOUNT}:role/{ROLE}")),
-                revoked: false,
-            })
+                sts::SessionKind::AssumedRole,
+                SESSION_SECONDS,
+            )
+        };
+        let store = sts::service_state(&*self.engine).expect("the STS store");
+        store
+            .lock()
+            .insert(vend.into_session(SESSION_KEY_ID, now))
             .expect("the session is recorded");
     }
 

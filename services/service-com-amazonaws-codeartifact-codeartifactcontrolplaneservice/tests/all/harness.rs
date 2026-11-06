@@ -302,30 +302,23 @@ pub fn given_session(
     let now = std::time::SystemTime::now();
     let expires_at =
         now + std::time::Duration::from_secs(u64::try_from(duration_seconds).unwrap_or(0));
-    let store = sts::service_state(&**engine).expect("the STS store");
-    let mut sessions = store.lock();
-    sessions.sessions.remove(access_key_id);
-    sessions
-        .insert(sts::Session {
-            access_key_id: access_key_id.to_string(),
-            created_at: now,
-            expires_at,
-            duration_seconds,
-            identity: sts::Identity {
+    let vend = sts::NewSession {
+        role_arn: Some(role_arn(role)),
+        ..sts::NewSession::new(
+            sts::Identity {
                 user_id: sts::role_id(role),
                 account: ACCOUNT.to_string(),
                 arn: session_arn(role, session),
             },
-            kind: sts::SessionKind::AssumedRole,
-            source_identity: None,
-            tags: Vec::new(),
-            transitive_tag_keys: Vec::new(),
-            packed_policy_size: None,
-            policies: sts::SessionPolicies::default(),
-            external_id: None,
-            role_arn: Some(role_arn(role)),
-            revoked: false,
-        })
+            sts::SessionKind::AssumedRole,
+            duration_seconds,
+        )
+    };
+    let store = sts::service_state(&**engine).expect("the STS store");
+    let mut sessions = store.lock();
+    sessions.sessions.remove(access_key_id);
+    sessions
+        .insert(vend.into_session(access_key_id, now))
         .expect("the session is recorded");
     expires_at
 }

@@ -44,6 +44,9 @@ mod session_audit_records;
 #[path = "all/session_policy_limits.rs"]
 mod session_policy_limits;
 
+#[path = "all/session_record_construction.rs"]
+mod session_record_construction;
+
 #[path = "all/session_tag_conditions.rs"]
 mod session_tag_conditions;
 

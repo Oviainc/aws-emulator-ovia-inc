@@ -27,7 +27,7 @@
 //! from [`super::index_authorization`]; this suite adds no second copy of either.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::User;
@@ -161,29 +161,22 @@ fn given_principals(emulator: &Emulator) {
     let now = SystemTime::now();
     let account = ::engine::emulator_account_id();
     let role_arn = format!("arn:aws:iam::{account}:role/{ROLE}");
-    let sts_store = sts::service_state(&**emulator.engine()).expect("the STS store");
-    sts_store
-        .lock()
-        .insert(sts::Session {
-            access_key_id: SESSION_KEY_ID.to_string(),
-            created_at: now,
-            expires_at: now + Duration::from_secs(SESSION_SECONDS as u64),
-            duration_seconds: SESSION_SECONDS,
-            identity: sts::Identity {
+    let vend = sts::NewSession {
+        role_arn: Some(role_arn.clone()),
+        ..sts::NewSession::new(
+            sts::Identity {
                 user_id: sts::role_id(&role_arn),
                 account: account.to_string(),
                 arn: Principal::Session.arn(),
             },
-            kind: sts::SessionKind::AssumedRole,
-            source_identity: None,
-            tags: Vec::new(),
-            transitive_tag_keys: Vec::new(),
-            packed_policy_size: None,
-            policies: sts::SessionPolicies::default(),
-            external_id: None,
-            role_arn: Some(role_arn),
-            revoked: false,
-        })
+            sts::SessionKind::AssumedRole,
+            SESSION_SECONDS,
+        )
+    };
+    let sts_store = sts::service_state(&**emulator.engine()).expect("the STS store");
+    sts_store
+        .lock()
+        .insert(vend.into_session(SESSION_KEY_ID, now))
         .expect("the session is recorded");
 
     let iam_store = iam::service_state(&**emulator.engine()).expect("the IAM store");

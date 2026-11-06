@@ -51,7 +51,7 @@
 //! in both directions, and a method that authenticates nobody.
 
 use std::collections::BTreeMap;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
@@ -175,31 +175,26 @@ fn given_session(gateway: &Gateway) {
             source_role_template: None,
         },
     );
+    let identity = sts::Identity {
+        user_id: format!("{}:{SESSION}", sts::role_id(&role_arn)),
+        account: ::engine::emulator_account_id().to_string(),
+        arn: session_arn(),
+    };
+    // The vend as STS asked for it, built through the registry's own constructor, so what
+    // is recorded here is exactly what a mint records. No session policy scopes it: what
+    // the credential may do is the role's own policies, which is what each row puts on it.
+    let vend = sts::NewSession {
+        role_arn: Some(role_arn),
+        ..sts::NewSession::new(
+            identity,
+            sts::SessionKind::AssumedRole,
+            i32::try_from(SESSION_SECONDS).unwrap_or(i32::MAX),
+        )
+    };
     let sessions = sts::service_state(gateway.engine()).expect("the STS store");
     sessions
         .lock()
-        .insert(sts::Session {
-            access_key_id: SESSION_KEY_ID.to_string(),
-            created_at: now,
-            expires_at: now + Duration::from_secs(SESSION_SECONDS),
-            duration_seconds: i32::try_from(SESSION_SECONDS).unwrap_or(i32::MAX),
-            identity: sts::Identity {
-                user_id: format!("{}:{SESSION}", sts::role_id(&role_arn)),
-                account: ::engine::emulator_account_id().to_string(),
-                arn: session_arn(),
-            },
-            kind: sts::SessionKind::AssumedRole,
-            source_identity: None,
-            tags: Vec::new(),
-            transitive_tag_keys: Vec::new(),
-            packed_policy_size: None,
-            // No session policy scopes the vend: what the credential may do is the role's
-            // own policies, which is what each row puts on it.
-            policies: sts::SessionPolicies::default(),
-            external_id: None,
-            role_arn: Some(role_arn),
-            revoked: false,
-        })
+        .insert(vend.into_session(SESSION_KEY_ID, now))
         .expect("the vended session is recorded");
 }
 

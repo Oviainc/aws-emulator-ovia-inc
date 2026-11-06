@@ -154,29 +154,22 @@ fn register_principal(
         }
     };
     let now = SystemTime::now();
-    let state = sts::service_state(engine).expect("the in-memory engine carries the STS store");
-    state
-        .lock()
-        .insert(sts::Session {
-            access_key_id: access_key_id.to_string(),
-            created_at: now,
-            expires_at: now + SESSION_LIFETIME,
-            duration_seconds: SESSION_LIFETIME.as_secs() as i32,
-            identity: sts::Identity {
+    let vend = sts::NewSession {
+        role_arn,
+        ..sts::NewSession::new(
+            sts::Identity {
                 user_id,
                 account: ACCOUNT.to_string(),
                 arn: arn.clone(),
             },
             kind,
-            source_identity: None,
-            tags: Vec::new(),
-            transitive_tag_keys: Vec::new(),
-            packed_policy_size: None,
-            policies: sts::SessionPolicies::default(),
-            external_id: None,
-            role_arn,
-            revoked: false,
-        })
+            SESSION_LIFETIME.as_secs() as i32,
+        )
+    };
+    let state = sts::service_state(engine).expect("the in-memory engine carries the STS store");
+    state
+        .lock()
+        .insert(vend.into_session(access_key_id, now))
         .expect("the session registry has room for one session");
     arn
 }

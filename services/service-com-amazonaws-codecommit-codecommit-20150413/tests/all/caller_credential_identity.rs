@@ -202,25 +202,22 @@ impl Credential {
                 now + SESSION_LIFETIME,
             ),
         };
+        let vend = sts::NewSession {
+            role_arn: role,
+            ..sts::NewSession::new(identity, kind, SESSION_LIFETIME.as_secs() as i32)
+        };
         let registry =
             sts::service_state(engine).expect("the in-memory engine carries the STS store");
         registry
             .lock()
             .insert(sts::Session {
-                access_key_id: access_key_id.to_string(),
+                // The vend's own clock, which each form varies: the credential was handed
+                // out a lifetime ago and stops being valid at `expires_at`. Everything
+                // else about the record is what the registry's constructor builds, so a
+                // fact added to a session is recorded here as a mint records it.
                 created_at: now - SESSION_LIFETIME,
                 expires_at,
-                duration_seconds: SESSION_LIFETIME.as_secs() as i32,
-                identity,
-                kind,
-                source_identity: None,
-                tags: Vec::new(),
-                transitive_tag_keys: Vec::new(),
-                packed_policy_size: None,
-                policies: sts::SessionPolicies::default(),
-                external_id: None,
-                role_arn: role,
-                revoked: false,
+                ..vend.into_session(access_key_id, now)
             })
             .expect("the session registry has room for one session");
     }

@@ -65,22 +65,18 @@ fn session(
 ) -> sts_state::Session {
     let created_at = SystemTime::now() - age;
     let account = engine::EMULATOR_ACCOUNT_ID;
-    sts_state::Session {
-        access_key_id: access_key_id.to_string(),
-        created_at,
-        expires_at: created_at + SESSION_DURATION,
-        duration_seconds: i32::try_from(SESSION_DURATION.as_secs()).unwrap_or(i32::MAX),
-        identity: assumed_role_identity(role_name, session_name),
-        kind: sts_state::SessionKind::AssumedRole,
-        source_identity: None,
-        tags: Vec::new(),
-        transitive_tag_keys: Vec::new(),
-        packed_policy_size: None,
-        policies: sts_state::SessionPolicies::default(),
-        external_id: None,
+    // The vend as STS asked for it, recorded through the registry's own constructor: the
+    // expiry is `created_at + DurationSeconds`, which is what `age` puts either side of
+    // the clock.
+    sts_state::NewSession {
         role_arn: Some(format!("arn:aws:iam::{account}:role/{role_name}")),
-        revoked: false,
+        ..sts_state::NewSession::new(
+            assumed_role_identity(role_name, session_name),
+            sts_state::SessionKind::AssumedRole,
+            i32::try_from(SESSION_DURATION.as_secs()).unwrap_or(i32::MAX),
+        )
     }
+    .into_session(access_key_id, created_at)
 }
 
 /// The refusal names the principal of the credential that signed the request: the

@@ -262,6 +262,43 @@ impl NewSession {
             role_arn: None,
         }
     }
+
+    /// The registry record of this session, as minted under `access_key_id` at `now`.
+    ///
+    /// The ONE place a [`Session`] record is built out of what a mint asked for, so every
+    /// recorded session carries the same derived facts however it was recorded — the one
+    /// [`mint_session`] vends a fresh credential for, and the one a caller that already
+    /// holds the access key id records for it. The expiry is `now + duration_seconds`,
+    /// the instant the credential stops being valid, and the record starts un-revoked.
+    ///
+    /// This is a constructor and nothing else: recording the session in the registry, and
+    /// in the account's audit view of its sessions, stays with the caller that does it.
+    ///
+    /// `duration_seconds` is the duration a mint already held to the modelled range
+    /// (`AssumeRole$DurationSeconds` is `range 900..43200`), so a value below zero is not
+    /// reachable from a served request; one reaching here anyway lasts no time at all,
+    /// which is the shortest session this registry can hold rather than a longer one than
+    /// was asked for.
+    #[must_use]
+    pub fn into_session(self, access_key_id: impl Into<String>, now: SystemTime) -> Session {
+        let lasts = Duration::from_secs(u64::try_from(self.duration_seconds).unwrap_or(0));
+        Session {
+            access_key_id: access_key_id.into(),
+            created_at: now,
+            expires_at: now + lasts,
+            duration_seconds: self.duration_seconds,
+            identity: self.identity,
+            kind: self.kind,
+            source_identity: self.source_identity,
+            tags: self.tags,
+            transitive_tag_keys: self.transitive_tag_keys,
+            packed_policy_size: self.packed_policy_size,
+            policies: self.policies,
+            external_id: self.external_id,
+            role_arn: self.role_arn,
+            revoked: false,
+        }
+    }
 }
 
 /// A minted session: the credential to hand back to the caller, and the record this
@@ -2189,29 +2226,13 @@ pub fn mint_session<Eng: Send + Sync + 'static>(
     };
     let (secret_access_key, session_token) =
         (secret_access_key.to_string(), session_token.to_string());
-    let expires_at = now + Duration::from_secs(u64::try_from(request.duration_seconds).unwrap_or(0));
+    let session = request.into_session(minted.id.clone(), now);
 
     let credentials = Credentials {
-        access_key_id: minted.id.clone(),
+        access_key_id: minted.id,
         secret_access_key,
         session_token,
-        expiration: ::aws_smithy_types::DateTime::from_secs(unix_seconds(expires_at)),
-    };
-    let session = Session {
-        access_key_id: minted.id,
-        created_at: now,
-        expires_at,
-        duration_seconds: request.duration_seconds,
-        identity: request.identity,
-        kind: request.kind,
-        source_identity: request.source_identity,
-        tags: request.tags,
-        transitive_tag_keys: request.transitive_tag_keys,
-        packed_policy_size: request.packed_policy_size,
-        policies: request.policies,
-        external_id: request.external_id,
-        role_arn: request.role_arn,
-        revoked: false,
+        expiration: ::aws_smithy_types::DateTime::from_secs(unix_seconds(session.expires_at)),
     };
     if let Err(full) = state.insert(session.clone()) {
         let _ = store.delete(&session.access_key_id);

@@ -30,7 +30,7 @@
 //! is not.
 
 use std::collections::BTreeMap;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -449,29 +449,22 @@ fn session_arn(role: &str, session: &str) -> String {
 fn given_session(emulator: &Emulator, role: &str, session: &str, access_key_id: &str) {
     let now = SystemTime::now();
     let arn = role_arn(role);
-    let store = sts::service_state(&**emulator.engine()).expect("the STS store");
-    store
-        .lock()
-        .insert(sts::Session {
-            access_key_id: access_key_id.to_string(),
-            created_at: now,
-            expires_at: now + Duration::from_secs(SESSION_SECONDS.unsigned_abs().into()),
-            duration_seconds: SESSION_SECONDS,
-            identity: sts::Identity {
+    let vend = sts::NewSession {
+        role_arn: Some(arn.clone()),
+        ..sts::NewSession::new(
+            sts::Identity {
                 user_id: sts::role_id(&arn),
                 account: ::engine::emulator_account_id().to_string(),
                 arn: session_arn(role, session),
             },
-            kind: sts::SessionKind::AssumedRole,
-            source_identity: None,
-            tags: Vec::new(),
-            transitive_tag_keys: Vec::new(),
-            packed_policy_size: None,
-            policies: sts::SessionPolicies::default(),
-            external_id: None,
-            role_arn: Some(arn),
-            revoked: false,
-        })
+            sts::SessionKind::AssumedRole,
+            SESSION_SECONDS,
+        )
+    };
+    let store = sts::service_state(&**emulator.engine()).expect("the STS store");
+    store
+        .lock()
+        .insert(vend.into_session(access_key_id, now))
         .expect("the session is recorded");
 }
 
