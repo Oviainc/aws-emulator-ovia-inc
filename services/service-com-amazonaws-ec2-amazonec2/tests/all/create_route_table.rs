@@ -24,6 +24,10 @@
 //!   tag specification naming another resource type, a client token past the bound this
 //!   crate holds one to — and a `DryRun` of a request that WOULD have succeeded answers
 //!   `DryRunOperation` without creating the table.
+//! * Every bound this create holds a request to is served AT the bound and refused ONE past
+//!   it: the tag count, the tag key and value lengths, and the client token length.
+//! * Caller text carrying the characters that delimit this protocol's XML comes back as it
+//!   was written, from the success envelope and from the message of a refusal quoting it.
 //!
 //! The create side of the route table slice. [`super::vpc_internet_path`] drives the same
 //! operation as one step of a VPC's path to the internet; here it is the subject, with the
@@ -32,8 +36,8 @@
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, DRY_RUN_OPERATION, IDEMPOTENT_PARAMETER_MISMATCH,
     INVALID_VPC_ID_NOT_FOUND, LOCAL_ROUTE_GATEWAY_ID, MAX_CLIENT_TOKEN_CHARS,
-    RESOURCE_TYPE_ROUTE_TABLE, ROUTE_ORIGIN_CREATE_ROUTE_TABLE, ROUTE_STATE_ACTIVE,
-    ROUTE_TABLE_ID_PREFIX,
+    MAX_TAGS_PER_RESOURCE, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS, RESOURCE_TYPE_ROUTE_TABLE,
+    ROUTE_ORIGIN_CREATE_ROUTE_TABLE, ROUTE_STATE_ACTIVE, ROUTE_TABLE_ID_PREFIX,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -676,5 +680,292 @@ async fn a_create_that_cannot_be_honoured_is_refused_and_stores_nothing() {
         created_tables_held(&engine),
         0,
         "a refused create must store no route table at all"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The published bounds, at the bound and one past it
+// ---------------------------------------------------------------------------
+
+/// The form fields asking for `tags` as ONE route-table tag specification, for keys and
+/// values this test builds at runtime (the sibling [`tag_params`] takes the literal pairs a
+/// row writes out).
+fn owned_tag_params(tags: &[(String, String)]) -> Vec<Param> {
+    let borrowed: Vec<(&str, &str)> = tags
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    tag_params(&borrowed)
+}
+
+/// `count` tags, keyed so the order a request names them in is also their sorted order.
+fn many_tags(count: usize) -> Vec<(String, String)> {
+    (0..count)
+        .map(|index| (format!("Key{index:03}"), format!("value-{index}")))
+        .collect()
+}
+
+/// One row of the at-the-bound table: the tag payload to ask for and the client token to
+/// carry, each row sitting on ONE of the bounds this create holds a caller to.
+struct BoundCase {
+    case: String,
+    tags: Vec<(String, String)>,
+    client_token: Option<String>,
+}
+
+/// One row of the one-past-the-bound table: the extra form fields that overshoot a bound, and
+/// the EC2 code and message the refusal must carry.
+struct PastBoundCase {
+    case: String,
+    extra: Vec<Param>,
+    code: &'static str,
+    message: String,
+}
+
+/// A request sitting exactly ON a bound this create holds a caller to is SERVED, and the
+/// table it stores carries what the request asked for.
+///
+/// The bounds are this crate's shared ones, named here rather than written out: the number of
+/// tags one resource holds ([`MAX_TAGS_PER_RESOURCE`]), the length of a tag key and of a tag
+/// value ([`MAX_TAG_KEY_CHARS`] / [`MAX_TAG_VALUE_CHARS`], from `Tag$Key` / `Tag$Value`), and
+/// the length this crate holds a `ClientToken` to ([`MAX_CLIENT_TOKEN_CHARS`]). The rows
+/// differ along which bound they sit on, so each is exercised at its own published value.
+#[tokio::test]
+async fn a_create_is_served_at_each_published_bound() {
+    let (router, engine) = super::ec2_query::emulator();
+    let (vpc_id, vpc_cidr) = default_vpc(&router).await;
+
+    let rows = vec![
+        BoundCase {
+            case: format!("{MAX_TAGS_PER_RESOURCE} tags, as many as one resource holds"),
+            tags: many_tags(MAX_TAGS_PER_RESOURCE),
+            client_token: None,
+        },
+        BoundCase {
+            case: format!("a tag key of {MAX_TAG_KEY_CHARS} characters"),
+            tags: vec![("k".repeat(MAX_TAG_KEY_CHARS), "at the key bound".to_string())],
+            client_token: None,
+        },
+        BoundCase {
+            case: format!("a tag value of {MAX_TAG_VALUE_CHARS} characters"),
+            tags: vec![(
+                "AtValueBound".to_string(),
+                "v".repeat(MAX_TAG_VALUE_CHARS),
+            )],
+            client_token: None,
+        },
+        BoundCase {
+            case: format!("a client token of {MAX_CLIENT_TOKEN_CHARS} characters"),
+            tags: Vec::new(),
+            client_token: Some("t".repeat(MAX_CLIENT_TOKEN_CHARS)),
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case.as_str();
+        let mut params = vec![param("VpcId", &vpc_id)];
+        params.extend(owned_tag_params(&row.tags));
+        if let Some(token) = &row.client_token {
+            params.push(param("ClientToken", token));
+        }
+
+        let (status, body) = create(&router, &params).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 at the bound, got {status} with body {body}"
+        );
+        let route_table_id = member(case, &body, "routeTableId");
+        assert!(
+            is_long_id(ROUTE_TABLE_ID_PREFIX, &route_table_id),
+            "case {case:?}: expected a {ROUTE_TABLE_ID_PREFIX}-<17 hex digits> id, got \
+             {route_table_id:?}"
+        );
+        assert_eq!(
+            element(&body, "clientToken").as_deref(),
+            row.client_token.as_deref(),
+            "case {case:?}: the client token is echoed only when the request carried one, got \
+             {body}"
+        );
+
+        let read_back = describe_one(case, &router, &route_table_id).await;
+        for (reported, source) in [(&body, "the create"), (&read_back, "the describe")] {
+            assert_eq!(
+                reported_tags(case, reported),
+                row.tags,
+                "case {case:?}: {source} must report the tags the create asked for, got \
+                 {reported}"
+            );
+            assert_eq!(
+                reported_routes(case, reported),
+                local_routes(&[vpc_cidr.as_str()], &[]),
+                "case {case:?}: {source} must report the local route for {vpc_cidr}, got \
+                 {reported}"
+            );
+        }
+
+        // A token at the bound is still a token: replayed with the same request it reports
+        // the table it minted rather than minting a second one.
+        if row.client_token.is_some() {
+            let (status, replay) = create(&router, &params).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the replay to be served, got {status} with body {replay}"
+            );
+            assert_eq!(
+                element(&replay, "routeTableId").as_deref(),
+                Some(route_table_id.as_str()),
+                "case {case:?}: expected the replay to report {route_table_id}, got {replay}"
+            );
+        }
+    }
+
+    assert_eq!(
+        created_tables_held(&engine),
+        rows.len(),
+        "each create at a bound stores exactly one route table, so {} must be held, got {}",
+        rows.len(),
+        created_tables_held(&engine)
+    );
+}
+
+/// A request ONE past a bound is refused with the EC2 code for the parameter that is wrong,
+/// and stores nothing — the same bounds as [`a_create_is_served_at_each_published_bound`],
+/// each overshot by one.
+#[tokio::test]
+async fn a_create_one_past_a_published_bound_is_refused_and_stores_nothing() {
+    let (router, engine) = super::ec2_query::emulator();
+    let (vpc_id, _) = default_vpc(&router).await;
+
+    let over_count = many_tags(MAX_TAGS_PER_RESOURCE + 1);
+    let rows = vec![
+        PastBoundCase {
+            case: format!("{} tags", MAX_TAGS_PER_RESOURCE + 1),
+            extra: owned_tag_params(&over_count),
+            code: "TagLimitExceeded",
+            message: format!(
+                "The request carries {count} tags, above the maximum of \
+                 {MAX_TAGS_PER_RESOURCE} per resource",
+                count = MAX_TAGS_PER_RESOURCE + 1,
+            ),
+        },
+        PastBoundCase {
+            case: format!("a tag key of {} characters", MAX_TAG_KEY_CHARS + 1),
+            extra: owned_tag_params(&[(
+                "k".repeat(MAX_TAG_KEY_CHARS + 1),
+                "past the key bound".to_string(),
+            )]),
+            code: "InvalidParameterValue",
+            message: format!("A tag key accepts at most {MAX_TAG_KEY_CHARS} characters"),
+        },
+        PastBoundCase {
+            case: format!("a tag value of {} characters", MAX_TAG_VALUE_CHARS + 1),
+            extra: owned_tag_params(&[(
+                "PastValueBound".to_string(),
+                "v".repeat(MAX_TAG_VALUE_CHARS + 1),
+            )]),
+            code: "InvalidParameterValue",
+            message: format!(
+                "The value of tag key 'PastValueBound' accepts at most \
+                 {MAX_TAG_VALUE_CHARS} characters"
+            ),
+        },
+        PastBoundCase {
+            case: format!("a client token of {} characters", MAX_CLIENT_TOKEN_CHARS + 1),
+            extra: vec![param(
+                "ClientToken",
+                &"t".repeat(MAX_CLIENT_TOKEN_CHARS + 1),
+            )],
+            code: "InvalidParameterValue",
+            message: format!("clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"),
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case.as_str();
+        let mut params = vec![param("VpcId", &vpc_id)];
+        params.extend(row.extra.iter().cloned());
+        let (status, body) = create(&router, &params).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 one past the bound, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            row.code,
+            "case {case:?}: expected {code}, got {body}",
+            code = row.code
+        );
+        assert_eq!(
+            error_message(&body),
+            row.message,
+            "case {case:?}: expected the message {message:?}, got {actual:?}",
+            message = row.message,
+            actual = error_message(&body)
+        );
+    }
+
+    assert_eq!(
+        created_tables_held(&engine),
+        0,
+        "a create refused past a bound must store no route table at all, got {}",
+        created_tables_held(&engine)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Caller text in the XML envelope
+// ---------------------------------------------------------------------------
+
+/// A tag whose key or value carries the characters that delimit the XML this protocol answers
+/// in comes back as the caller wrote it, both from the SUCCESS envelope (the create and the
+/// describe that reads the table back) and from the MESSAGE of a refusal that quotes the
+/// caller's own tag key: the envelope escapes the text it carries rather than letting it end
+/// an element.
+#[tokio::test]
+async fn a_tag_carrying_xml_delimiters_round_trips_and_is_quoted_back_in_a_refusal() {
+    let (router, _engine) = super::ec2_query::emulator();
+    let (vpc_id, _) = default_vpc(&router).await;
+    let key = "Note<&>\"'".to_string();
+    let value = "a < b & c > d \" e ' f".to_string();
+    let tags = vec![(key.clone(), value)];
+
+    let case = "a tag key and value carrying XML delimiters";
+    let mut params = vec![param("VpcId", &vpc_id)];
+    params.extend(owned_tag_params(&tags));
+    let (status, body) = create(&router, &params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200, got {status} with body {body}"
+    );
+    let route_table_id = member(case, &body, "routeTableId");
+
+    let read_back = describe_one(case, &router, &route_table_id).await;
+    for (reported, source) in [(&body, "the create"), (&read_back, "the describe")] {
+        assert_eq!(
+            reported_tags(case, reported),
+            tags,
+            "case {case:?}: {source} must report the tag exactly as it was asked for, got \
+             {reported}"
+        );
+    }
+
+    // The same key in a refusal that quotes it: one character past the value bound, so the
+    // message is built from the caller's key and the bound rather than from a literal.
+    let refused_case = "a quoted tag key carrying XML delimiters";
+    let mut params = vec![param("VpcId", &vpc_id)];
+    params.extend(owned_tag_params(&[(
+        key.clone(),
+        "v".repeat(MAX_TAG_VALUE_CHARS + 1),
+    )]));
+    let (status, body) = create(&router, &params).await;
+    assert_eq!(
+        status, 400,
+        "case {refused_case:?}: expected HTTP 400, got {status} with body {body}"
+    );
+    assert_eq!(
+        error_message(&body),
+        format!("The value of tag key '{key}' accepts at most {MAX_TAG_VALUE_CHARS} characters"),
+        "case {refused_case:?}: the message must quote the caller's own key, got {actual:?}",
+        actual = error_message(&body)
     );
 }
