@@ -8,9 +8,12 @@
 //! `Expiration` names and the resource tags it carries, and returns the stored binding.
 //! An endpoint ARN that names ANOTHER account is `ValidationException` — a verdict on
 //! the request, reached before the store is read; an endpoint ARN of this account with
-//! no record behind it is `ResourceNotFoundException`; an `IdempotencyToken` re-sent
-//! (against the same endpoint) with the same parameters resolves to the binding it
-//! already created, and re-sent with different parameters it is refused as a conflict.
+//! no record behind it is `ResourceNotFoundException`; a `RoleArn` whose trust policy
+//! does not let this service's ACME principal assume it is `AccessDeniedException`
+//! ([`crate::service::acme_role_trust`]), reached before anything is written; an
+//! `IdempotencyToken` re-sent (against the same endpoint) with the same parameters
+//! resolves to the binding it already created, and re-sent with different parameters it
+//! is refused as a conflict.
 //!
 //! The credentials are SERVER-GENERATED and immutable: no request member proposes
 //! either, they are minted once here
@@ -239,6 +242,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
+        // Whether this service can ACT AS the role the request binds. The binding exists
+        // to let the ACME enrollment surface issue certificates by assuming that role, so
+        // a role whose trust policy does not let this service's principal assume it (with
+        // the session tags and source identity that assume carries) is refused here and
+        // nothing is stored — the role is resolved in the IAM store of the same shared
+        // engine, BEFORE this service's own store is locked
+        // ([`crate::service::acme_role_trust`]).
+        let unassumable =
+            crate::service::acme_role_trust::assume_refusal(&*self.engine, &input.role_arn);
+
         let fingerprint = request_fingerprint(&input, &tags);
         // A binding is created UNDER one endpoint, so a token names one create against
         // that endpoint: the index is keyed by the pair, and the endpoint ARN already
@@ -308,6 +321,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let acme_endpoint_arn = endpoint.arn.clone();
+
+        // The role this service would have to assume, judged before anything is written:
+        // the create is an authorization failure rather than a stored binding backed by a
+        // role nothing could assume.
+        if let Some(refusal) = unassumable {
+            return Err(
+                CreateAcmeExternalAccountBindingErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(refusal),
+                    },
+                )
+                .into(),
+            );
+        }
 
         // The cap on the WHOLE map, checked first because it is the one bound nothing in
         // the request can partition: the per-endpoint quota below is counted over a

@@ -15,9 +15,11 @@
 //!   IAM reports a trust document URL-encoded, so a document that is not JSON as it
 //!   stands is percent-decoded and parsed again ([`parse_policy`]);
 //! * a statement is ABOUT this call only when its `Principal.Service` names the principal
-//!   AND its `Action` names [`ASSUME_ROLE_ACTION`] (or a wildcard covering it). `Action`
-//!   and `Principal.Service` are each either one string or a list of them, and IAM
-//!   compares both case-insensitively;
+//!   AND its `Action` names the action asked about — [`ASSUME_ROLE_ACTION`] for a service
+//!   that only assumes the role, every action it performs on the role for a service that
+//!   also tags the session or sets a source identity ([`admits_service_principal_actions`])
+//!   — or a wildcard covering it. `Action` and `Principal.Service` are each either one
+//!   string or a list of them, and IAM compares both case-insensitively;
 //! * an explicit `Deny` among those statements WINS, whatever any `Allow` says;
 //! * otherwise the role admits the principal exactly when one of them is an `Allow`.
 //!
@@ -51,6 +53,26 @@ pub const ASSUME_ROLE_ACTION: &str = "sts:AssumeRole";
 /// when `document` is not a policy this can be read out of — see the module docs for why
 /// that case is the caller's to decide.
 pub fn admits_service_principal(document: &str, principal: &str) -> Option<bool> {
+    admits_service_principal_actions(document, principal, &[ASSUME_ROLE_ACTION])
+}
+
+/// Whether `document` lets the service principal `principal` perform EVERY action in
+/// `actions` on the role it is attached to.
+///
+/// [`admits_service_principal`] is this asked about [`ASSUME_ROLE_ACTION`] alone, which is
+/// all a service that just assumes the role needs. A service that assumes it WITH session
+/// tags or a source identity performs further STS actions on it in the same call
+/// (`sts:TagSession`, `sts:SetSourceIdentity`), and a trust policy that withholds any one
+/// of them is a role that service cannot act as — so each action it performs is asked about
+/// here, and the role admits the principal only when the document grants them all. The rule
+/// per action, and what each answer means, is [`admits_service_principal`]'s.
+///
+/// An empty `actions` asks nothing of the document, so every policy admits it.
+pub fn admits_service_principal_actions(
+    document: &str,
+    principal: &str,
+    actions: &[&str],
+) -> Option<bool> {
     let policy = parse_policy(document)?;
     let statement = &policy["Statement"];
     // A document that PARSED but carries no statement this can read is a policy that
@@ -61,22 +83,32 @@ pub fn admits_service_principal(document: &str, principal: &str) -> Option<bool>
         ::serde_json::Value::Object(_) => vec![statement],
         _ => return Some(false),
     };
+    Some(
+        actions
+            .iter()
+            .all(|action| admits_action(&statements, principal, action)),
+    )
+}
+
+/// Whether the statements of one document let `principal` perform `action` on the role:
+/// IAM's order over the statements that are ABOUT that call.
+fn admits_action(statements: &[&::serde_json::Value], principal: &str, action: &str) -> bool {
     let mut admitted = false;
     for entry in statements {
-        if !statement_covers(entry, principal) {
+        if !statement_covers(entry, principal, action) {
             continue;
         }
         let effect = entry["Effect"].as_str().unwrap_or_default();
         if effect.eq_ignore_ascii_case("Deny") {
             // An explicit deny is final: no `Allow`, before it or after it, puts the
             // grant back.
-            return Some(false);
+            return false;
         }
         if effect.eq_ignore_ascii_case("Allow") {
             admitted = true;
         }
     }
-    Some(admitted)
+    admitted
 }
 
 /// Whether `document` grants the service principal `principal` the assume of the role
@@ -145,29 +177,27 @@ pub(crate) fn parse_policy(document: &str) -> Option<::serde_json::Value> {
     ::serde_json::from_str(&decoded).ok()
 }
 
-/// Whether one statement is ABOUT `principal` assuming the role — whatever effect it then
-/// states.
-fn statement_covers(statement: &::serde_json::Value, principal: &str) -> bool {
+/// Whether one statement is ABOUT `principal` performing `action` on the role — whatever
+/// effect it then states.
+fn statement_covers(statement: &::serde_json::Value, principal: &str, action: &str) -> bool {
     let names_principal = json_strings(&statement["Principal"]["Service"])
         .iter()
         .any(|service| service.eq_ignore_ascii_case(principal));
-    let names_assume_role = json_strings(&statement["Action"])
+    let names_action = json_strings(&statement["Action"])
         .iter()
-        .any(|action| action_covers_assume_role(action));
-    names_principal && names_assume_role
+        .any(|named| action_covers(named, action));
+    names_principal && names_action
 }
 
-/// Whether one `Action` entry covers [`ASSUME_ROLE_ACTION`]: the action itself, or a
-/// wildcard IAM admits in its place (`*`, or a prefix wildcard such as `sts:*` or
-/// `sts:Assume*`).
-fn action_covers_assume_role(action: &str) -> bool {
-    if action == "*" || action.eq_ignore_ascii_case(ASSUME_ROLE_ACTION) {
+/// Whether one `Action` entry covers `action`: the action itself, or a wildcard IAM admits
+/// in its place (`*`, or a prefix wildcard such as `sts:*` or `sts:Assume*`).
+fn action_covers(named: &str, action: &str) -> bool {
+    if named == "*" || named.eq_ignore_ascii_case(action) {
         return true;
     }
-    match action.strip_suffix('*') {
+    match named.strip_suffix('*') {
         Some(prefix) => {
-            ASSUME_ROLE_ACTION.len() >= prefix.len()
-                && ASSUME_ROLE_ACTION[..prefix.len()].eq_ignore_ascii_case(prefix)
+            action.len() >= prefix.len() && action[..prefix.len()].eq_ignore_ascii_case(prefix)
         }
         None => false,
     }
@@ -279,6 +309,93 @@ mod tests {
 
         for (case, document, expected) in rows {
             let admitted = admits_service_principal(&document, "fis.amazonaws.com");
+            assert_eq!(
+                admitted, expected,
+                "case {case:?}: expected {expected:?}, got {admitted:?} for {document}"
+            );
+        }
+    }
+
+    /// RULE: a service that performs SEVERAL STS actions on the role it assumes is admitted
+    /// only by a document that grants the principal EVERY one of them; a document that
+    /// withholds any single action withholds the whole assume.
+    #[test]
+    fn every_action_a_service_performs_has_to_be_granted() {
+        // The session actions a service that assumes a role WITH session tags and a source
+        // identity performs on it, beside the assume itself.
+        let actions = [ASSUME_ROLE_ACTION, "sts:SetSourceIdentity", "sts:TagSession"];
+        // The rows differ along what the rule generalises over: how many of the actions the
+        // document names, how they are spread over statements, the wildcards IAM admits in
+        // their place, the casing, and the effect.
+        let rows: [(&str, String, Option<bool>); 8] = [
+            (
+                "every action in one statement",
+                policy(
+                    "Allow",
+                    "[\"sts:AssumeRole\",\"sts:SetSourceIdentity\",\"sts:TagSession\"]",
+                    "\"fis.amazonaws.com\"",
+                ),
+                Some(true),
+            ),
+            (
+                "every action, one per statement",
+                format!(
+                    "{{\"Statement\":[{}]}}",
+                    actions
+                        .iter()
+                        .map(|action| format!(
+                            "{{\"Effect\":\"Allow\",\
+                             \"Principal\":{{\"Service\":\"fis.amazonaws.com\"}},\
+                             \"Action\":\"{action}\"}}"
+                        ))
+                        .collect::<Vec<String>>()
+                        .join(",")
+                ),
+                Some(true),
+            ),
+            (
+                "a service wildcard covering them all",
+                policy("Allow", "\"sts:*\"", "\"fis.amazonaws.com\""),
+                Some(true),
+            ),
+            (
+                "every action, named in another casing",
+                policy(
+                    "Allow",
+                    "[\"STS:ASSUMEROLE\",\"sts:setsourceidentity\",\"Sts:TagSession\"]",
+                    "\"fis.amazonaws.com\"",
+                ),
+                Some(true),
+            ),
+            (
+                "the assume alone, without the session actions",
+                policy("Allow", "\"sts:AssumeRole\"", "\"fis.amazonaws.com\""),
+                Some(false),
+            ),
+            (
+                "all but one of them",
+                policy(
+                    "Allow",
+                    "[\"sts:AssumeRole\",\"sts:TagSession\"]",
+                    "\"fis.amazonaws.com\"",
+                ),
+                Some(false),
+            ),
+            (
+                "every action, explicitly denied",
+                policy(
+                    "Deny",
+                    "[\"sts:AssumeRole\",\"sts:SetSourceIdentity\",\"sts:TagSession\"]",
+                    "\"fis.amazonaws.com\"",
+                ),
+                Some(false),
+            ),
+            ("not a policy at all", "this is not json".to_string(), None),
+        ];
+
+        for (case, document, expected) in rows {
+            let admitted =
+                admits_service_principal_actions(&document, "fis.amazonaws.com", &actions);
             assert_eq!(
                 admitted, expected,
                 "case {case:?}: expected {expected:?}, got {admitted:?} for {document}"

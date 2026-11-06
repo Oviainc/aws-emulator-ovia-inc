@@ -83,6 +83,7 @@
 
 pub mod acme_http;
 pub mod acme_jws;
+pub mod acme_role_trust;
 pub mod authorization;
 mod enum_value_sets;
 
