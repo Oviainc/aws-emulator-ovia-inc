@@ -116,6 +116,7 @@ fn trained_model(collaboration: &str, membership: &str, region: &str, id: &str) 
         description: None,
         creator_account_id: ACCOUNT.to_string(),
         ml_model_training_payer_account_id: None,
+        tags: Default::default(),
         status: "ACTIVE".to_string(),
         pending: None,
         create_time: instant(1_760_000_000),

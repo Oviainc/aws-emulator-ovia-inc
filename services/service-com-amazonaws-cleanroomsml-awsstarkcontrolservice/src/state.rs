@@ -21,6 +21,11 @@
 //! collaboration that membership belongs to, and so is a trained model inference
 //! job — the run of one trained model over a data source, held here beside the
 //! model it ran.
+//!
+//! Tags are part of the record of the resource they are assigned to, whichever
+//! kind of resource that is: `TagResource` and `UntagResource` change that one
+//! map and `ListTagsForResource` reports it, so a resource's tags never live in
+//! a second place.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
@@ -221,6 +226,9 @@ pub struct MlInputChannel {
     pub payer_configuration: Option<PayerConfiguration>,
     /// The account of the member that created the channel.
     pub creator_account_id: String,
+    /// The tags assigned to this channel: `TagResource` writes them,
+    /// `UntagResource` removes them and `ListTagsForResource` reports them.
+    pub tags: BTreeMap<String, String>,
     /// One of `MLInputChannelStatus`'s values.
     pub status: String,
     /// The status change the clock owes this channel, if any.
@@ -292,6 +300,9 @@ pub struct TrainedModel {
     pub creator_account_id: String,
     /// The account that pays for the training, when the create named one.
     pub ml_model_training_payer_account_id: Option<String>,
+    /// The tags assigned to this model, held the same way every other taggable
+    /// record in this store holds them.
+    pub tags: BTreeMap<String, String>,
     /// One of `TrainedModelStatus`'s values.
     pub status: String,
     /// The status change the clock owes this model, if any.
@@ -377,6 +388,9 @@ pub struct TrainedModelInferenceJob {
     /// One of `LogsStatus`'s values, once the job has logs to publish.
     pub logs_status: Option<String>,
     pub logs_status_details: Option<String>,
+    /// The tags assigned to this job, held the same way every other taggable
+    /// record in this store holds them.
+    pub tags: BTreeMap<String, String>,
     /// One of `TrainedModelInferenceJobStatus`'s values.
     pub status: String,
     /// The status change the clock owes this job, if any.
@@ -637,6 +651,22 @@ pub struct ConfiguredModelAlgorithm {
     pub update_time: SystemTime,
 }
 
+/// Which kind of resource a `TaggableArn` names a record of in this store.
+///
+/// `TaggableArn` is one pattern over every resource Clean Rooms ML tags, and
+/// each kind of resource lives in its own ARN-keyed map here — so resolving the
+/// ARN to the kind that holds it is what lets the tagging operations reach one
+/// resource's tags without caring which kind it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggedResourceKind {
+    TrainingDataset,
+    AudienceModel,
+    ConfiguredModelAlgorithm,
+    MlInputChannel,
+    TrainedModel,
+    TrainedModelInferenceJob,
+}
+
 /// Per-service state for com-amazonaws-cleanroomsml-awsstarkcontrolservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCleanroomsmlAwsstarkcontrolserviceState {
@@ -721,6 +751,94 @@ impl ComAmazonawsCleanroomsmlAwsstarkcontrolserviceState {
         self.configured_model_algorithms
             .get(arn)
             .filter(|algorithm| algorithm.region == region)
+    }
+
+    /// Which kind of resource the endpoint `region`'s store holds `arn` under,
+    /// or `None` when it holds none.
+    ///
+    /// Every record is keyed by its own ARN and an ARN names exactly one
+    /// resource, so at most one of these maps can hold one ARN. The region is
+    /// checked for the same reason every other read of this service checks it:
+    /// a Clean Rooms ML endpoint serves the resources created under its own
+    /// region and nothing else.
+    pub fn tagged_resource_kind(&self, arn: &str, region: &str) -> Option<TaggedResourceKind> {
+        self.training_datasets
+            .get(arn)
+            .map(|record| (TaggedResourceKind::TrainingDataset, record.region.as_str()))
+            .or_else(|| {
+                self.audience_models
+                    .get(arn)
+                    .map(|record| (TaggedResourceKind::AudienceModel, record.region.as_str()))
+            })
+            .or_else(|| {
+                self.configured_model_algorithms.get(arn).map(|record| {
+                    (
+                        TaggedResourceKind::ConfiguredModelAlgorithm,
+                        record.region.as_str(),
+                    )
+                })
+            })
+            .or_else(|| {
+                self.ml_input_channels
+                    .get(arn)
+                    .map(|record| (TaggedResourceKind::MlInputChannel, record.region.as_str()))
+            })
+            .or_else(|| {
+                self.trained_models
+                    .get(arn)
+                    .map(|record| (TaggedResourceKind::TrainedModel, record.region.as_str()))
+            })
+            .or_else(|| {
+                self.trained_model_inference_jobs.get(arn).map(|record| {
+                    (
+                        TaggedResourceKind::TrainedModelInferenceJob,
+                        record.region.as_str(),
+                    )
+                })
+            })
+            .filter(|(_, held)| *held == region)
+            .map(|(kind, _)| kind)
+    }
+
+    /// The tags the endpoint `region`'s store holds for the resource `arn`
+    /// names, or `None` when it holds no such resource.
+    ///
+    /// A resource's tags are part of that resource's record, so this is the one
+    /// copy of them that every read reports and every write changes.
+    pub fn resource_tags(&self, arn: &str, region: &str) -> Option<&BTreeMap<String, String>> {
+        Some(match self.tagged_resource_kind(arn, region)? {
+            TaggedResourceKind::TrainingDataset => &self.training_datasets.get(arn)?.tags,
+            TaggedResourceKind::AudienceModel => &self.audience_models.get(arn)?.tags,
+            TaggedResourceKind::ConfiguredModelAlgorithm => {
+                &self.configured_model_algorithms.get(arn)?.tags
+            }
+            TaggedResourceKind::MlInputChannel => &self.ml_input_channels.get(arn)?.tags,
+            TaggedResourceKind::TrainedModel => &self.trained_models.get(arn)?.tags,
+            TaggedResourceKind::TrainedModelInferenceJob => {
+                &self.trained_model_inference_jobs.get(arn)?.tags
+            }
+        })
+    }
+
+    /// The same tag set, for the operations that change it: `TagResource` adds
+    /// to it and `UntagResource` removes from it.
+    pub fn resource_tags_mut(
+        &mut self,
+        arn: &str,
+        region: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        Some(match self.tagged_resource_kind(arn, region)? {
+            TaggedResourceKind::TrainingDataset => &mut self.training_datasets.get_mut(arn)?.tags,
+            TaggedResourceKind::AudienceModel => &mut self.audience_models.get_mut(arn)?.tags,
+            TaggedResourceKind::ConfiguredModelAlgorithm => {
+                &mut self.configured_model_algorithms.get_mut(arn)?.tags
+            }
+            TaggedResourceKind::MlInputChannel => &mut self.ml_input_channels.get_mut(arn)?.tags,
+            TaggedResourceKind::TrainedModel => &mut self.trained_models.get_mut(arn)?.tags,
+            TaggedResourceKind::TrainedModelInferenceJob => {
+                &mut self.trained_model_inference_jobs.get_mut(arn)?.tags
+            }
+        })
     }
 
     /// The audience model `arn` names, if the endpoint `region` serves it, with
@@ -939,6 +1057,21 @@ pub fn resource_not_found(arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: format!("Resource {arn} not found"),
     }
+}
+
+/// The message the TAGGING path's not-found refusal carries.
+///
+/// The three tagging operations are served by the front end in front of this service,
+/// which answers an ARN that names no resource with its own refusal — the error code
+/// `NotFoundException`, which no operation of this service models, and this one fixed
+/// string — rather than with the control plane's modelled `ResourceNotFoundException`
+/// and [`resource_not_found`]. It names no identifier, so the refusal echoes nothing
+/// the caller sent.
+pub const TAGGED_RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The tagging path's refusal for an ARN that names no persisted resource.
+pub fn tagged_resource_not_found() -> crate::scaffolded::NotFoundException {
+    crate::scaffolded::NotFoundException::new(TAGGED_RESOURCE_NOT_FOUND_MESSAGE)
 }
 
 /// The `ConflictException` payload for a resource another resource depends on.

@@ -21,6 +21,8 @@ mod collaboration_trained_models;
 mod configured_model_algorithm;
 #[path = "all/ops_name_bindings.rs"]
 mod ops_name_bindings;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

@@ -145,6 +145,7 @@ fn inference_job(
         metrics_status_details: None,
         logs_status: None,
         logs_status_details: None,
+        tags: Default::default(),
         status: "ACTIVE".to_string(),
         pending: None,
         create_time: instant(1_760_000_000),

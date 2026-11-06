@@ -108,6 +108,7 @@ fn channel(collaboration: &str, membership: &str, region: &str, id: &str) -> MlI
         description: None,
         payer_configuration: None,
         creator_account_id: ACCOUNT.to_string(),
+        tags: Default::default(),
         status: "ACTIVE".to_string(),
         pending: None,
         create_time: instant(1_750_000_000),
