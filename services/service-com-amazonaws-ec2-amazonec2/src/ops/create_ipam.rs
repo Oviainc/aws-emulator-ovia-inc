@@ -191,37 +191,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The operating Regions for the IPAM. Operating Regions are Amazon Web Services
         // Regions where the IPAM is allowed to manage IP address CIDRs"
-        // (`CreateIpamRequest$OperatingRegions`). A Region a REQUEST names is held to the
-        // catalog itself — [`crate::state::commercial_regions`], the Regions of the `aws`
-        // partition this emulator's ARNs name — the way an instance type is held to the
-        // offered catalog; the grammar alone is what the Region in a credential scope is
-        // held to. They are also a SET, and the Region the IPAM is created in belongs to it
-        // whether or not the request names it: it is the IPAM's home Region
-        // (`Ipam$IpamRegion`), and an IPAM that did not operate in its own Region could
-        // manage nothing there. So a name the set already holds adds nothing rather than
-        // being stored twice, and the model's `len 0..50` has already bounded how many may
-        // be named.
+        // (`CreateIpamRequest$OperatingRegions`). The Region names a REQUEST carries are read
+        // by the ONE reader every operation resolving an operating-Region list in this crate
+        // goes through ([`crate::state::ipam_operating_region_names`]), so a create and a
+        // modify cannot disagree about which Region names an IPAM may operate in: each is
+        // held to the catalog itself — the Regions of the `aws` partition this emulator's
+        // ARNs name — the way an instance type is held to the offered catalog, and the list
+        // is a SET, so a name given twice is kept once. The Region the IPAM is created in
+        // belongs to that set whether or not the request names it: it is the IPAM's home
+        // Region (`Ipam$IpamRegion`), and an IPAM that did not operate in its own Region
+        // could manage nothing there. The model's `len 0..50` has already bounded how many
+        // may be named.
         let region = state::request_region(ctx.parts());
         let mut operating_regions: Vec<String> = vec![region.clone()];
-        let catalog = state::commercial_regions();
-        for requested in input.operating_regions.iter().flatten() {
-            let Some(region_name) = requested
-                .region_name
-                .as_deref()
-                .filter(|name| !name.is_empty())
-            else {
-                return Err(state::missing_parameter(
-                    "An operating region must have a region name",
-                ));
-            };
-            if !catalog.contains(&region_name) {
-                return Err(state::invalid_parameter_value(format!(
-                    "Value ({region_name}) for parameter operatingRegion is invalid. \
-                     This is not a valid Region name."
-                )));
-            }
-            if !operating_regions.iter().any(|held| held == region_name) {
-                operating_regions.push(region_name.to_string());
+        for region_name in state::ipam_operating_region_names(
+            input
+                .operating_regions
+                .iter()
+                .flatten()
+                .map(|requested| requested.region_name.as_deref()),
+            "operatingRegion",
+        )? {
+            if !operating_regions.contains(&region_name) {
+                operating_regions.push(region_name);
             }
         }
 

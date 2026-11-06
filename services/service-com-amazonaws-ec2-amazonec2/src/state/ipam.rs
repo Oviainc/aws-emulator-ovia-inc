@@ -649,6 +649,49 @@ pub fn invalid_ipam_id_not_found<E>(ipam_id: &str) -> Scaffolded<E> {
     )
 }
 
+/// The Region names one operating-Region list of a request carries, validated and as a SET.
+///
+/// The ONE reader every operation of this crate resolving an `AddIpamOperatingRegionSet` or a
+/// `RemoveIpamOperatingRegionSet` goes through — `CreateIpam`'s `OperatingRegions` and
+/// `ModifyIpam`'s `AddOperatingRegions` and `RemoveOperatingRegions` — so no two of them can
+/// disagree about which Region names an IPAM may operate in, the same contract
+/// [`tags_from_specifications`] has for a tag payload. `member` is the parameter the refusal
+/// names, since that is all that differs between them.
+///
+/// "The name of the operating Region" (`AddIpamOperatingRegion$RegionName` /
+/// `RemoveIpamOperatingRegion$RegionName`) is the only member either shape has, so an entry
+/// without one names no Region at all and is refused with `MissingParameter`. A name that IS
+/// given is held to the CATALOG of Regions of the partition this emulator's ARNs name
+/// ([`commercial_regions`]) rather than to the grammar, the way an instance type is held to
+/// the offered catalog: a Region AWS does not publish can neither be given to an IPAM at
+/// creation, added to one, nor removed from one. Operating Regions are a SET
+/// (`Ipam$OperatingRegions`), so a name repeated within one list says nothing the first
+/// mention does not and is kept once, in the order the request named them.
+pub fn ipam_operating_region_names<'a, E>(
+    requested: impl IntoIterator<Item = Option<&'a str>>,
+    member: &str,
+) -> Result<Vec<String>, Scaffolded<E>> {
+    let catalog = commercial_regions();
+    let mut regions: Vec<String> = Vec::new();
+    for region_name in requested {
+        let Some(region_name) = region_name.filter(|name| !name.is_empty()) else {
+            return Err(missing_parameter(
+                "An operating region must have a region name",
+            ));
+        };
+        if !catalog.contains(&region_name) {
+            return Err(invalid_parameter_value(format!(
+                "Value ({region_name}) for parameter {member} is invalid. \
+                 This is not a valid Region name."
+            )));
+        }
+        if !regions.iter().any(|held| held == region_name) {
+            regions.push(region_name.to_string());
+        }
+    }
+    Ok(regions)
+}
+
 /// What one stored IPAM is created with, beside everything the store derives itself (every
 /// id, every ARN, the states, the scope and association counts).
 ///

@@ -175,10 +175,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resources in the Amazon Web Services Regions you select as operating Regions"
         // (`AddOperatingRegions`) and "the operating Regions to remove"
         // (`RemoveOperatingRegions`). Both lists are read HERE, before anything is looked up
-        // or written, and a Region a request names is held to the same catalog `CreateIpam`
-        // holds one to, so the two cannot disagree about which Region names an IPAM may
-        // operate in. The model's `len 0..50` has already bounded how many may be named.
-        let add_operating_regions = requested_regions(
+        // or written, by the ONE reader every operation resolving an operating-Region list in
+        // this crate goes through, which `CreateIpam` reads its own list by — so the two
+        // cannot disagree about which Region names an IPAM may operate in, and each list is
+        // resolved as the SET it is. The model's `len 0..50` has already bounded how many may
+        // be named.
+        let add_operating_regions = state::ipam_operating_region_names(
             input
                 .add_operating_regions
                 .iter()
@@ -186,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|added| added.region_name.as_deref()),
             "addOperatingRegion",
         )?;
-        let remove_operating_regions = requested_regions(
+        let remove_operating_regions = state::ipam_operating_region_names(
             input
                 .remove_operating_regions
                 .iter()
@@ -201,12 +203,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .find(|added| remove_operating_regions.contains(added))
         {
-            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
-                format!(
-                    "The operating Region {conflicting} cannot be added and removed by the \
-                     same request"
-                ),
-            ));
+            return Err(state::invalid_parameter_combination(format!(
+                "The operating Region {conflicting} cannot be added and removed by the \
+                 same request"
+            )));
         }
 
         let modification = state::IpamModification {
@@ -284,40 +284,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         Ok(ModifyIpamOutput { ipam: Some(ipam) })
     }
-}
-
-/// The Region names one operating-Region list of the request carries, as a set.
-///
-/// "The name of the operating Region" (`AddIpamOperatingRegion$RegionName` /
-/// `RemoveIpamOperatingRegion$RegionName`) is the only member either shape has, so an entry
-/// without one names no Region at all and is refused with the same `MissingParameter`
-/// `CreateIpam` answers for it. A name that IS given is held to the catalog of Regions of the
-/// partition this emulator's ARNs name ([`crate::state::commercial_regions`]), exactly as
-/// `CreateIpam` holds the operating Regions of a create — a Region AWS does not publish can
-/// neither be added to an IPAM nor removed from one. Operating Regions are a SET
-/// (`Ipam$OperatingRegions`), so a name repeated within one list says nothing the first
-/// mention does not and is kept once.
-fn requested_regions<'a>(
-    requested: impl Iterator<Item = Option<&'a str>>,
-    member: &str,
-) -> Result<Vec<String>, ModifyIpamError> {
-    let catalog = crate::state::commercial_regions();
-    let mut regions: Vec<String> = Vec::new();
-    for region_name in requested {
-        let Some(region_name) = region_name.filter(|name| !name.is_empty()) else {
-            return Err(crate::state::missing_parameter(
-                "An operating region must have a region name",
-            ));
-        };
-        if !catalog.contains(&region_name) {
-            return Err(crate::state::invalid_parameter_value(format!(
-                "Value ({region_name}) for parameter {member} is invalid. \
-                 This is not a valid Region name."
-            )));
-        }
-        if !regions.iter().any(|held| held == region_name) {
-            regions.push(region_name.to_string());
-        }
-    }
-    Ok(regions)
 }
