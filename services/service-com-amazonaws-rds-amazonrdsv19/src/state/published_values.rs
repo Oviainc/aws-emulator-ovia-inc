@@ -579,6 +579,18 @@ pub const GLOBAL_CLUSTER_STATUS_AVAILABLE: &str = "available";
 /// other delete paths of this service report.
 pub const GLOBAL_CLUSTER_STATUS_DELETING: &str = "deleting";
 
+/// The status an Aurora global database cluster reports while a change to it is being
+/// applied, the `modifying` status the other modify paths of this service report
+/// ([`DB_CLUSTER_STATUS_MODIFYING`], [`EVENT_SUBSCRIPTION_STATUS_MODIFYING`]).
+///
+/// Transient: `ModifyGlobalCluster` "modifies a setting for an Amazon Aurora global
+/// database cluster" and answers before the setting is in force, so the clock owes the
+/// global cluster [`GLOBAL_CLUSTER_STATUS_AVAILABLE`] [`STATUS_TRANSITION_DELAY`] later and
+/// a caller reading straight after the modify sees the change in progress — and the state
+/// errors that status carries, since a global cluster is not in a state another request can
+/// be taken in while one is being applied.
+pub const GLOBAL_CLUSTER_STATUS_MODIFYING: &str = "modifying";
+
 /// The status an event notification subscription reports in the answer to the delete that
 /// was accepted for it, from `EventSubscription$Status`'s published list.
 pub const EVENT_SUBSCRIPTION_STATUS_DELETING: &str = "deleting";

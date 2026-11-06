@@ -141,7 +141,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A global cluster is ACCOUNT-scoped, so the region the request was signed for
         // does not scope what it can delete. It is still read, so a malformed credential
         // scope is refused here as it is everywhere else in this service.
-        let _region =
+        let region =
             crate::state::request_region(ctx).map_err(DeleteGlobalClusterError::validation)?;
         // `CreateGlobalCluster` stores the identifier "as a lowercase string", so a
         // delete resolves the name the same way every other lookup of it does.
@@ -154,6 +154,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
         let mut store = state.lock();
+        // A global database whose modify the clock has already finished is `available`
+        // again, so the transitions due at this instant are materialised before the status
+        // precondition below reads it.
+        store.settle_due_transitions(&region);
 
         // An identifier no create stored is the modelled 404 — the same answer a second
         // delete of one global cluster gets, which is what lets a caller tell "deleted"
@@ -166,6 +170,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // A global database with an engine upgrade still running is not in a state this
+        // delete can be performed in: `InvalidGlobalClusterStateFault` is "the global
+        // cluster is in an invalid state and can't perform the requested operation", and
+        // the transient status the upgrade put it in is exactly that state. The caller waits
+        // for it to report `available` again (see `GlobalClusterRecord::begin_modifying`).
+        if !record.is_available() {
+            return Err(
+                DeleteGlobalClusterErrorModeled::InvalidGlobalClusterStateFault(
+                    InvalidGlobalClusterStateFault {
+                        message: Some(crate::state::global_cluster_not_available_message(
+                            &record.arn(),
+                            &record.status,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
         // "The global database can't be deleted when deletion protection is enabled"
         // (`CreateGlobalCluster$DeletionProtection`) — a setting of the global cluster the
         // request CONFLICTS with rather than a state it is passing through, so the refusal
@@ -186,10 +208,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteGlobalClusterErrorModeled::InvalidGlobalClusterStateFault(
                     InvalidGlobalClusterStateFault {
-                        message: Some(format!(
-                            "Global cluster {identifier} can't be deleted because it still has \
-                             {} member cluster(s): detach them first",
-                            record.member_cluster_arns.len()
+                        message: Some(crate::state::global_cluster_not_empty_message(
+                            &record.arn(),
                         )),
                     },
                 )

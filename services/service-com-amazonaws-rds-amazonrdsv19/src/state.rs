@@ -624,6 +624,19 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         for key in gone {
             self.event_subscriptions.remove(&key);
         }
+        // A global cluster is ACCOUNT-scoped, so it sits in no region's range: the whole
+        // map is walked, bounded by [`GLOBAL_CLUSTER_QUOTA_PER_ACCOUNT`], which is what
+        // makes the transition a modify owes due whichever region the next request is
+        // signed for.
+        let mut gone_globally: Vec<String> = Vec::new();
+        for (identifier, global) in self.global_clusters.iter_mut() {
+            if global.settle(now) {
+                gone_globally.push(identifier.clone());
+            }
+        }
+        for identifier in gone_globally {
+            self.global_clusters.remove(&identifier);
+        }
         // An event past the published retention window is one `DescribeEvents` does not
         // report whether or not anybody calls, so dropping it here materialises an expiry
         // the clock already owed rather than changing what a caller can see.
@@ -2003,6 +2016,28 @@ pub fn global_cluster_already_exists_message(identifier: &str) -> String {
     format!("Global cluster {identifier} already exists")
 }
 
+/// The message an `InvalidGlobalClusterStateFault` carries for a global database that still
+/// holds member clusters.
+///
+/// Amazon RDS words this family's state refusals as a sentence about the global cluster,
+/// naming it by its ARN: the fixed text is "Global Cluster " and " is not empty", and the
+/// ARN of the global database the request named is the only variable part. Its primary and
+/// secondary clusters have to be detached or deleted first.
+pub fn global_cluster_not_empty_message(arn: &str) -> String {
+    format!("Global Cluster {arn} is not empty")
+}
+
+/// The message an `InvalidGlobalClusterStateFault` carries for a global database whose
+/// current status is not one the requested operation can be performed in.
+///
+/// The same sentence shape as [`global_cluster_not_empty_message`] — the global cluster
+/// named by its ARN — carrying the status it is in, which is what the DB cluster and DB
+/// instance state faults of this service name as the reason too. Both parts come from the
+/// stored record.
+pub fn global_cluster_not_available_message(arn: &str, status: &str) -> String {
+    format!("Global Cluster {arn} isn't available for the requested operation with status {status}")
+}
+
 /// A stored Aurora global database cluster: the record `DescribeGlobalClusters` reports.
 ///
 /// Account-scoped rather than regional — see
@@ -2037,6 +2072,10 @@ pub struct GlobalClusterRecord {
     /// identifier and the `global` suffix: a server-minted token, unique per global
     /// cluster — see [`Self::endpoint`].
     pub endpoint_host: String,
+    /// The status this record owes, and when; see [`PendingStatus`]. A global cluster is
+    /// `available` from its create onwards and only a modify puts it in a transient status,
+    /// so this is `None` for a global cluster nothing has changed.
+    pub pending_status: Option<PendingStatus>,
     /// `TagList`: the tags `CreateGlobalCluster$Tags` assigned to the global cluster.
     pub tags: Vec<Tag>,
 }
@@ -2098,6 +2137,46 @@ impl GlobalClusterRecord {
         } else {
             STORAGE_ENCRYPTION_TYPE_SSE_RDS
         }
+    }
+
+    /// Accept a modify: the global cluster reports [`GLOBAL_CLUSTER_STATUS_MODIFYING`]
+    /// while the change is applied, and the clock owes it
+    /// [`GLOBAL_CLUSTER_STATUS_AVAILABLE`] [`STATUS_TRANSITION_DELAY`] later — so a caller
+    /// reading straight after the modify sees the transient status the real service
+    /// reports, and the requests that status refuses are refused.
+    pub fn begin_modifying(&mut self) {
+        self.status = GLOBAL_CLUSTER_STATUS_MODIFYING.to_string();
+        self.pending_status = Some(PendingStatus::in_a_moment(GLOBAL_CLUSTER_STATUS_AVAILABLE));
+    }
+
+    /// Whether this global cluster is in the one status another request can be taken in.
+    ///
+    /// `InvalidGlobalClusterStateFault` is "the global cluster is in an invalid state and
+    /// can't perform the requested operation": a global database with a change still being
+    /// applied is in exactly that state, which is what makes two modifies of one global
+    /// database serialise and a delete during one refused.
+    pub fn is_available(&self) -> bool {
+        self.status == GLOBAL_CLUSTER_STATUS_AVAILABLE
+    }
+
+    /// Apply a change whose due instant has passed. Returns whether the record is now
+    /// gone, exactly as [`DbInstanceRecord::settle`] does.
+    fn settle(&mut self, now: Instant) -> bool {
+        let due = self
+            .pending_status
+            .as_ref()
+            .is_some_and(|pending| now >= pending.due_at);
+        if !due {
+            return false;
+        }
+        match self.pending_status.take().map(|pending| pending.change) {
+            Some(PendingChange::Status(status)) => self.status = status,
+            Some(PendingChange::Removal) => return true,
+            // Unreachable: the change was there a line ago, under this one `&mut self`.
+            // Answered as "nothing was due" rather than with a panic in a request path.
+            None => {}
+        }
+        false
     }
 
     /// Accept a delete: the global cluster's own answer reports the `deleting` status that

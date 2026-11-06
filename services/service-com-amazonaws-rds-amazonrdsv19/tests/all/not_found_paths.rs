@@ -726,6 +726,7 @@ async fn global_clusters_are_reported_out_of_state_and_filtered_by_member_region
                         "arn:aws:rds:{member_region}:{ACCOUNT}:cluster:{identifier}-primary"
                     )],
                     endpoint_host: format!("host{identifier}"),
+                    pending_status: None,
                     tags: Vec::new(),
                 },
             );

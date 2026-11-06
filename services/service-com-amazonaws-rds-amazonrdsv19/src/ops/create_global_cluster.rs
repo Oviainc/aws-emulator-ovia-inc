@@ -435,6 +435,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|source| vec![source.arn.clone()])
                 .unwrap_or_default(),
             endpoint_host: crate::state::mint_endpoint_host(mint),
+            // Nothing is being applied to a global database this call has just created, so
+            // the clock owes it no transition; `ModifyGlobalCluster` is what puts one here.
+            pending_status: None,
             tags,
         };
         let global_cluster = record.to_wire();

@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyGlobalCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyGlobalCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Modifies one Aurora global database cluster: its identifier, its deletion protection
+//! and the engine version it runs. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyGlobalCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The change is accepted rather than applied instantly — "modifies a setting for an
+//! Amazon Aurora global database cluster" answers before the setting is in force — so the
+//! global cluster reports the transient `modifying` status and the clock owes it
+//! `available` a span later ([`crate::state::GlobalClusterRecord::begin_modifying`]).
+//! While it is in that status it is not in a state another request can be taken in, which
+//! is what `DeleteGlobalCluster` refuses with the modelled
+//! `InvalidGlobalClusterStateFault`.
+//!
+//! A rename moves the record's KEY, since the identifier is what the store is keyed by and
+//! what the ARN every tag and delete call resolves is built from; the member DB clusters
+//! are re-pointed at the new identifier under the same lock, so no stored record names a
+//! global cluster this service no longer holds.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +182,222 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyGlobalCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyGlobalClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyGlobalCluster"))
+        // A global cluster is ACCOUNT-scoped, so the region the request was signed for
+        // does not scope what it can modify. It is still read, so a malformed credential
+        // scope is refused here as it is everywhere else in this service.
+        let region =
+            crate::state::request_region(ctx).map_err(ModifyGlobalClusterError::validation)?;
+        // `GlobalClusterIdentifier`: "This parameter isn't case-sensitive", and
+        // `CreateGlobalCluster` stores the identifier "as a lowercase string", so the
+        // lookup folds the name the way every other lookup of it does.
+        let identifier = input.global_cluster_identifier.to_ascii_lowercase();
+        // `NewGlobalClusterIdentifier`: "Must contain from 1 to 63 letters, numbers, or
+        // hyphens. The first character must be a letter. Can't end with a hyphen or contain
+        // two consecutive hyphens" — a rule the model's own pattern is wider than, so it is
+        // enforced here, with the one sentence pair this service family words an identifier
+        // refusal with. "This value is stored as a lowercase string."
+        let renamed = match &input.new_global_cluster_identifier {
+            None => None,
+            Some(named) => {
+                crate::state::check_identifier(
+                    "NewGlobalClusterIdentifier",
+                    named,
+                    MAX_GLOBAL_CLUSTER_IDENTIFIER_LEN,
+                )
+                .map_err(ModifyGlobalClusterError::invalid_parameter_value)?;
+                Some(named.to_ascii_lowercase())
+            }
+        };
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated success.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A change an earlier modify owed is in force once its instant has passed, so the
+        // transitions due at this instant are materialised before the status precondition
+        // below reads it.
+        store.settle_due_transitions(&region);
+
+        // An identifier no create stored is the modelled 404, the same answer every other
+        // global-cluster lookup gives it.
+        let Some(record) = store.global_clusters.get(&identifier) else {
+            return Err(ModifyGlobalClusterErrorModeled::GlobalClusterNotFoundFault(
+                GlobalClusterNotFoundFault {
+                    message: Some(format!("Global cluster '{identifier}' not found")),
+                },
+            )
+            .into());
+        };
+        // A global database with a change still being applied is not in a state another
+        // one can be taken in: `InvalidGlobalClusterStateFault` is "the global cluster is in
+        // an invalid state and can't perform the requested operation", which is what makes
+        // two modifies of one global database serialise rather than interleave.
+        if !record.is_available() {
+            return Err(
+                ModifyGlobalClusterErrorModeled::InvalidGlobalClusterStateFault(
+                    InvalidGlobalClusterStateFault {
+                        message: Some(crate::state::global_cluster_not_available_message(
+                            &record.arn(),
+                            &record.status,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The identifier names ONE global cluster in the account, so a rename onto a name
+        // the account already holds is the modelled already-exists fault rather than a
+        // silent overwrite of the other record. A rename to the name it already has is no
+        // collision with itself.
+        if let Some(new_identifier) = &renamed {
+            if new_identifier != &identifier && store.global_clusters.contains_key(new_identifier)
+            {
+                return Err(
+                    ModifyGlobalClusterErrorModeled::GlobalClusterAlreadyExistsFault(
+                        GlobalClusterAlreadyExistsFault {
+                            message: Some(crate::state::global_cluster_already_exists_message(
+                                new_identifier,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        // `EngineVersion` is "the version number of the database engine to which you want to
+        // upgrade", resolved against the engine-version catalogue the same way
+        // `CreateGlobalCluster` resolves the version a global database is created on: a
+        // value naming a catalogue entry is reported as that entry, and a well-formed
+        // version the catalogue does not carry stands as the request named it, since the
+        // catalogue is a published SAMPLE and a global database's member clusters are
+        // upgraded by their own control plane.
+        let upgraded_version = match &input.engine_version {
+            None => None,
+            Some(named) => {
+                let engine = record.engine.clone();
+                let resolved = match &engine {
+                    Some(engine) => crate::ops::describe_db_engine_versions::resolve_version(
+                        engine,
+                        Some(named.as_str()),
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|entry| entry.engine_version.to_string()),
+                    None => None,
+                };
+                let version = match resolved {
+                    Some(resolved) => resolved,
+                    None => {
+                        crate::state::check_engine_version_form(named)
+                            .map_err(ModifyGlobalClusterError::invalid_parameter_value)?;
+                        named.clone()
+                    }
+                };
+                // `AllowMajorVersionUpgrade` "must be enabled if you specify a value for
+                // the EngineVersion parameter that's a different major version than the
+                // global cluster's current version": the two members have to agree, which
+                // is the combination the Query API refuses rather than one bad value.
+                let crossing_major = record
+                    .engine_version
+                    .as_deref()
+                    .is_some_and(|current| !same_major_version(current, &version));
+                if crossing_major && input.allow_major_version_upgrade != Some(true) {
+                    return Err(ModifyGlobalClusterError::invalid_parameter_combination(
+                        format!(
+                            "EngineVersion {version} is a different major version than the \
+                             global cluster's current version: AllowMajorVersionUpgrade must \
+                             be enabled to upgrade to it"
+                        ),
+                    ));
+                }
+                Some(version)
+            }
+        };
+
+        // Every refusal is behind us, so the change is ACCEPTED from here. The record is
+        // taken out of the store and put back under the identifier the request leaves it
+        // with, which is what makes a rename move the key the store — and so every ARN
+        // built from it — is addressed by.
+        let mut record = store
+            .global_clusters
+            .remove(&identifier)
+            .expect("the record was found above and the store is locked");
+        if let Some(new_identifier) = renamed {
+            record.identifier = new_identifier;
+        }
+        if let Some(protection) = input.deletion_protection {
+            record.deletion_protection = protection;
+        }
+        // An engine upgrade is work the service runs on the global database's member
+        // clusters, so a request that asks for one leaves the global cluster in the
+        // transient `modifying` status and the clock owes it `available` a span later. The
+        // other two settings are the global database's own metadata — its identifier and
+        // whether it may be deleted — which a modify has in force when it answers, so a
+        // request that changes only those leaves the global cluster READY, as the real
+        // service answers it: a caller may modify it again or delete it straight away.
+        if let Some(version) = upgraded_version {
+            let upgrading = record.engine_version.as_deref() != Some(version.as_str());
+            record.engine_version = Some(version);
+            if upgrading {
+                record.begin_modifying();
+            }
+        }
+        let member_arns = record.member_cluster_arns.clone();
+        let new_identifier = record.identifier.clone();
+        let global_cluster = record.to_wire();
+        store
+            .global_clusters
+            .insert(new_identifier.clone(), record);
+        // A member DB cluster carries the identifier of the global database it belongs to
+        // (`DBCluster$GlobalClusterIdentifier`), so a rename re-points every member under
+        // the same lock: no stored record may name a global cluster this service no longer
+        // holds. The members are addressed by the ARNs the global cluster itself carries, so
+        // the walk is over a map the store's own per-region quotas bound and runs only when
+        // the identifier actually moved.
+        if identifier != new_identifier {
+            let members: Vec<crate::state::RegionalKey> = store
+                .db_clusters
+                .iter()
+                .filter(|(_, cluster)| member_arns.contains(&cluster.arn()))
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in members {
+                if let Some(cluster) = store.db_clusters.get_mut(&key) {
+                    cluster.global_cluster_identifier = Some(new_identifier.clone());
+                }
+            }
+        }
+
+        Ok(ModifyGlobalClusterOutput {
+            global_cluster: Some(global_cluster),
+        })
+    }
+}
+
+/// `NewGlobalClusterIdentifier`'s own length bound: "Must contain from 1 to 63 letters,
+/// numbers, or hyphens."
+const MAX_GLOBAL_CLUSTER_IDENTIFIER_LEN: usize = 63;
+
+/// Whether two engine versions belong to the same MAJOR version, which is what decides
+/// whether `AllowMajorVersionUpgrade` has to be enabled for the upgrade.
+///
+/// A major version is the leading component of the version string for every engine a global
+/// database runs: Aurora PostgreSQL versions ARE the community PostgreSQL versions
+/// (`16.6`), and an Aurora MySQL version carries the MySQL major version it is compatible
+/// with first (`8.0.mysql_aurora.3.08.0`), whose major version is its first TWO components
+/// — so the comparison is of everything up to the Aurora build suffix, which is what
+/// `MajorEngineVersion` reports for each of them.
+fn same_major_version(current: &str, requested: &str) -> bool {
+    major_of(current) == major_of(requested)
+}
+
+/// The major version of `version`: the components before the engine's own build suffix.
+fn major_of(version: &str) -> &str {
+    match version.find(".mysql_aurora.") {
+        Some(cut) => &version[..cut],
+        None => version.split('.').next().unwrap_or(version),
     }
 }

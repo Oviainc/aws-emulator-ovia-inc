@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cluster is an account-scoped resource that spans the regions of its members. It
         // is still read, so a malformed credential scope is refused here as it is
         // everywhere else in this service.
-        let _region = crate::state::request_region(ctx)
+        let region = crate::state::request_region(ctx)
             .map_err(DescribeGlobalClustersError::validation)?;
         let page_size = crate::state::check_max_records(input.max_records)
             .map_err(DescribeGlobalClustersError::invalid_parameter_value)?;
@@ -195,7 +195,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
-        let store = state.lock();
+        let mut store = state.lock();
+        // A global database whose modify the clock has already finished is `available`
+        // again, so the transitions due at this instant are materialised before the status
+        // is reported: this report writes only what was owed even if nobody had called.
+        store.settle_due_transitions(&region);
+        let store = &*store;
 
         // `GlobalClusterIdentifier` names one global cluster, and "this parameter isn't
         // case-sensitive"; an identifier that names nothing in state is the modelled 404

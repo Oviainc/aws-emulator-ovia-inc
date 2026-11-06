@@ -65,6 +65,8 @@ mod db_instance_stop;
 mod db_instances;
 #[path = "all/db_major_engine_versions.rs"]
 mod db_major_engine_versions;
+#[path = "all/db_parameter_group_copy.rs"]
+mod db_parameter_group_copy;
 #[path = "all/db_parameter_group_deletion.rs"]
 mod db_parameter_group_deletion;
 #[path = "all/db_parameter_group_provisioning.rs"]
@@ -139,8 +141,12 @@ mod events;
 mod existence_and_parameter_guards;
 #[path = "all/export_tasks.rs"]
 mod export_tasks;
+#[path = "all/global_cluster_modification.rs"]
+mod global_cluster_modification;
 #[path = "all/global_clusters.rs"]
 mod global_clusters;
+#[path = "all/global_database_published_versions.rs"]
+mod global_database_published_versions;
 #[path = "all/guard_order_and_refusal_classes.rs"]
 mod guard_order_and_refusal_classes;
 #[path = "all/instance_configuration_guards.rs"]
