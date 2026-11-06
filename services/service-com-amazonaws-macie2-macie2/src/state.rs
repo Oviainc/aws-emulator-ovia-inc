@@ -10,7 +10,10 @@
 //! `ListCustomDataIdentifiers` project it, `DeleteCustomDataIdentifier` soft
 //! deletes it) — plus the per-region automated sensitive data discovery
 //! configuration (`UpdateAutomatedDiscoveryConfiguration` writes it,
-//! `GetAutomatedDiscoveryConfiguration` projects it). Nothing a handler answers
+//! `GetAutomatedDiscoveryConfiguration` projects it) and the per-region
+//! findings-publication configuration
+//! (`PutFindingsPublicationConfiguration` writes it,
+//! `GetFindingsPublicationConfiguration` projects it). Nothing a handler answers
 //! with is computed from the request
 //! alone: every member of every response is read back out of here.
 
@@ -79,6 +82,16 @@ pub const DEFAULT_AUTOMATED_DISCOVERY_STATUS: &str = AUTOMATED_DISCOVERY_DISABLE
 /// are: ALL (default), enable it for all existing accounts and new member
 /// accounts". An entry of [`crate::ops::types::AUTO_ENABLE_MODE_VALUES`].
 pub const DEFAULT_AUTO_ENABLE_ORGANIZATION_MEMBERS: &str = "ALL";
+
+/// Whether sensitive data (classification) findings are published to Security
+/// Hub when nothing has configured findings publication: the member's doc
+/// states "The default value is false."
+pub const DEFAULT_PUBLISH_CLASSIFICATION_FINDINGS: bool = false;
+
+/// Whether policy findings are published to Security Hub when nothing has
+/// configured findings publication: the member's doc states "The default value
+/// is true."
+pub const DEFAULT_PUBLISH_POLICY_FINDINGS: bool = true;
 
 /// How a reporting operation states that this account has no Macie session in
 /// the region the request addressed. Macie has to be enabled before any of its
@@ -217,6 +230,31 @@ pub struct AutomatedDiscoveryConfiguration {
     pub last_updated_at: SystemTime,
 }
 
+/// The settings that determine which findings one account's Macie publishes to
+/// Security Hub, in one region.
+///
+/// Both members of the modelled `SecurityHubConfiguration` are required, so a
+/// stored configuration always carries both; an account that has never written
+/// one is reported with [`DEFAULT_PUBLISH_CLASSIFICATION_FINDINGS`] and
+/// [`DEFAULT_PUBLISH_POLICY_FINDINGS`], the values the two members document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FindingsPublicationConfiguration {
+    /// Whether sensitive data findings are published to Security Hub.
+    pub publish_classification_findings: bool,
+    /// Whether policy findings are published to Security Hub.
+    pub publish_policy_findings: bool,
+}
+
+impl Default for FindingsPublicationConfiguration {
+    /// The configuration an account has until something writes one.
+    fn default() -> Self {
+        Self {
+            publish_classification_findings: DEFAULT_PUBLISH_CLASSIFICATION_FINDINGS,
+            publish_policy_findings: DEFAULT_PUBLISH_POLICY_FINDINGS,
+        }
+    }
+}
+
 /// A stored custom data identifier.
 ///
 /// Every member of `GetCustomDataIdentifierResponse` and of
@@ -302,6 +340,12 @@ pub struct ComAmazonawsMacie2Macie2State {
     /// [`Self::sessions`]: Macie has to be enabled in a region before its
     /// automated discovery can be configured there.
     pub automated_discovery: BTreeMap<String, AutomatedDiscoveryConfiguration>,
+    /// The findings-publication configuration of each region something has
+    /// written one for (`PutFindingsPublicationConfiguration`), which
+    /// `GetFindingsPublicationConfiguration` reports. A key of this map is
+    /// always a key of [`Self::sessions`], for the same reason as
+    /// [`Self::automated_discovery`].
+    pub findings_publication: BTreeMap<String, FindingsPublicationConfiguration>,
     /// Custom data identifiers keyed by id, so an id-addressed read is
     /// O(log n) and an enumeration is in a stable total order.
     pub custom_data_identifiers: BTreeMap<String, CustomDataIdentifier>,
@@ -333,6 +377,15 @@ impl ComAmazonawsMacie2Macie2State {
         region: &str,
     ) -> Option<&AutomatedDiscoveryConfiguration> {
         self.automated_discovery.get(region)
+    }
+
+    /// The findings-publication configuration of `region`, or `None` when
+    /// nothing has written one there yet.
+    pub fn findings_publication_configuration(
+        &self,
+        region: &str,
+    ) -> Option<&FindingsPublicationConfiguration> {
+        self.findings_publication.get(region)
     }
 
     /// The custom data identifier `id` of `region`, soft deleted or not.
@@ -375,6 +428,7 @@ impl ComAmazonawsMacie2Macie2State {
     pub fn forget_region(&mut self, region: &str) {
         self.sessions.remove(region);
         self.automated_discovery.remove(region);
+        self.findings_publication.remove(region);
         self.custom_data_identifiers
             .retain(|_, identifier| identifier.region != region);
         let prefix = region_key_prefix(region);

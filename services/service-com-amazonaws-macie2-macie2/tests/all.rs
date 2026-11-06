@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/automated_discovery_configuration.rs"]
 mod automated_discovery_configuration;
+#[path = "all/findings_publication_configuration.rs"]
+mod findings_publication_configuration;
 #[path = "all/macie_session_and_custom_data_identifiers.rs"]
 mod macie_session_and_custom_data_identifiers;
 #[path = "all/state_roundtrip.rs"]
