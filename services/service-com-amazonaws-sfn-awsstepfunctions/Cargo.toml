@@ -32,6 +32,16 @@ tokio = { workspace = true, features = ["sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
+# Percent-encodes the fields of the form an `awsQuery` service's request IS, over the
+# unreserved set AWS's own canonical request states.
+percent-encoding = "2"
+# Reads the restXml answer of the S3 dataset a `Map` state's `ItemReader` names: the
+# `ListObjectsV2` listing, and the error document a refused read carries. The
+# maintained XML pull parser, as the S3 service's own suites use.
+quick-xml = "0.41"
+# Reads a CSV dataset an `ItemReader` declares `"InputType": "CSV"` for: the maintained
+# RFC 4180 reader, rather than splitting the text on the delimiter here.
+csv = "1.4"
 # Signs the in-process call a `Task` state's service integration makes to the service
 # that owns the operation: the emulator verifies every request signature, and the
 # credential scope is what routes the call. The SDK's own signer, as the emulator's
@@ -65,6 +75,14 @@ hex = { workspace = true }
 # mounted beside Step Functions on the one engine the test router builds, the same shape
 # `core/router/src/lib.rs` mounts them in, so the call a task makes is served for real.
 service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
+# The service that owns the dataset a `Map` state's `ItemReader` reads, mounted the same
+# way in `tests/all/map_item_reader.rs`, so the objects the reader lists and gets are
+# really stored by S3's own handlers.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The `awsQuery` service a `Task` state's integration call is made to in
+# `tests/all/form_protocol_integration.rs`, mounted the same way, so what the task
+# reports is that service's own answer.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [lints]
 workspace = true

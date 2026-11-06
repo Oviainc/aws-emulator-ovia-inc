@@ -1797,9 +1797,6 @@ impl Interpreter<'_> {
         // in this order rather than that one.
         let entered = self.map_runs_entered;
         self.map_runs_entered = self.map_runs_entered.saturating_add(1);
-        let items = self
-            .map_items(name, state, language, &effective, context)
-            .map_err(|failure| failure.at(at))?;
         let (processor, distributed) = map_processor(name, state).map_err(|failure| failure.at(at))?;
         let (processor_states, processor_start) =
             states_of(processor, &format!("the 'ItemProcessor' of state '{name}'"))
@@ -1812,61 +1809,100 @@ impl Interpreter<'_> {
             .and_then(Value::as_str)
             .unwrap_or(name)
             .to_string();
-        let plan = MapPlan {
-            items: &items,
-            name,
-            label: &label,
-            states: processor_states,
-            start_at: processor_start,
-            selector: state.get("ItemSelector").or_else(|| state.get("Parameters")),
-            language,
-            distributed,
-            concurrency: self
-                .number_member(state, language, "MaxConcurrency", &effective, context, 0.0)
-                .map_err(|failure| failure.at(at))? as usize,
-            tolerated_count: self
-                .number_member(
-                    state,
-                    language,
-                    "ToleratedFailureCount",
-                    &effective,
-                    context,
-                    0.0,
-                )
-                .map_err(|failure| failure.at(at))? as u64,
-            tolerated_percentage: self
-                .number_member(
-                    state,
-                    language,
-                    "ToleratedFailurePercentage",
-                    &effective,
-                    context,
-                    0.0,
-                )
-                .map_err(|failure| failure.at(at))?,
-            tolerance_declared: ["ToleratedFailureCount", "ToleratedFailureCountPath",
-                "ToleratedFailurePercentage", "ToleratedFailurePercentagePath"]
-                .iter()
-                .any(|member| state.contains_key(*member)),
-        };
+        // "ItemBatcher — specifies how to batch the items": a state that declares one
+        // hands each iteration a BATCH of its items rather than one item, and the
+        // `ItemSelector` is applied to each item on the way into its batch.
+        let batcher = state.get("ItemBatcher");
+        let concurrency = self
+            .number_member(state, language, "MaxConcurrency", &effective, context, 0.0)
+            .map_err(|failure| failure.at(at))? as usize;
+        let tolerated_count = self
+            .number_member(
+                state,
+                language,
+                "ToleratedFailureCount",
+                &effective,
+                context,
+                0.0,
+            )
+            .map_err(|failure| failure.at(at))? as u64;
+        let tolerated_percentage = self
+            .number_member(
+                state,
+                language,
+                "ToleratedFailurePercentage",
+                &effective,
+                context,
+                0.0,
+            )
+            .map_err(|failure| failure.at(at))?;
+        let tolerance_declared = [
+            "ToleratedFailureCount",
+            "ToleratedFailureCountPath",
+            "ToleratedFailurePercentage",
+            "ToleratedFailurePercentagePath",
+        ]
+        .iter()
+        .any(|member| state.contains_key(*member));
 
         // The tally belongs to the LAST attempt: a retried `Map` state resets it, so
         // what is reported is what the attempt the state ended on did.
         let mut tally = MapTally::default();
+        // How many items the attempt the state ended on iterated, which is what the Map
+        // Run reports: every attempt reads the state's item source again, so the figure
+        // belongs to the attempt rather than to the state.
+        let mut total_items = 0usize;
         let (outcome, end) = self.with_retries(state, at, &mut |me, at| {
-            // Every attempt at this state iterates the items again, so every attempt
-            // writes its own `MapStateStarted` — carrying "the size of the array for
-            // Map state iterations" — and the event of the outcome those iterations
-            // reached.
+            // Every attempt at this state reads its item source again — a `Retry`
+            // re-runs the state, and reading the dataset an `ItemReader` names is part
+            // of what the state DOES — so a read that failed is this attempt's failure
+            // and the next attempt reads it afresh.
+            let read = me
+                .map_items(name, state, language, &effective, context)
+                .and_then(|items| match batcher {
+                    None => Ok(items),
+                    Some(batcher) => me.batched_items(
+                        name, state, language, batcher, items, &effective, context,
+                    ),
+                });
+            let items = match read {
+                Ok(items) => items,
+                Err(failure) => return (Err(failure), at),
+            };
+            total_items = items.len();
+            // Every attempt iterates those items, so every attempt writes its own
+            // `MapStateStarted` — carrying "the size of the array for Map state
+            // iterations" — and the event of the outcome those iterations reached.
             me.push_detailed(
                 super::super::EVENT_MAP_STATE_STARTED,
                 name,
                 at,
                 super::super::EventDetails {
-                    length: Some(i32::try_from(plan.items.len()).unwrap_or(i32::MAX)),
+                    length: Some(i32::try_from(items.len()).unwrap_or(i32::MAX)),
                     ..super::super::EventDetails::default()
                 },
             );
+            let plan = MapPlan {
+                items: &items,
+                name,
+                label: &label,
+                states: processor_states,
+                start_at: processor_start,
+                selector: match batcher {
+                    // A batched state's selector was spent on the items BEFORE they
+                    // were placed in their batches, so the batch an iteration is handed
+                    // is already the document it runs on.
+                    Some(_) => None,
+                    None => state.get("ItemSelector").or_else(|| state.get("Parameters")),
+                },
+                language,
+                distributed,
+                batched: batcher.is_some(),
+                concurrency,
+                tolerated_count,
+                tolerated_percentage,
+                tolerance_declared,
+            };
             // This attempt's own members read `$$.State.RetryCount`, so they are
             // evaluated with the context of the attempt they are on.
             let context = with_retry_count(context, me.retry_count);
@@ -1905,12 +1941,11 @@ impl Interpreter<'_> {
                     started_at: at,
                     stopped_at: end,
                     max_concurrency: super::super::reported_max_concurrency(
-                        i64::try_from(plan.concurrency).unwrap_or(i64::MAX),
+                        i64::try_from(concurrency).unwrap_or(i64::MAX),
                     ),
-                    tolerated_failure_count: i64::try_from(plan.tolerated_count)
-                        .unwrap_or(i64::MAX),
-                    tolerated_failure_percentage: plan.tolerated_percentage as f32,
-                    total_items: i64::try_from(plan.items.len()).unwrap_or(i64::MAX),
+                    tolerated_failure_count: i64::try_from(tolerated_count).unwrap_or(i64::MAX),
+                    tolerated_failure_percentage: tolerated_percentage as f32,
+                    total_items: i64::try_from(total_items).unwrap_or(i64::MAX),
                     items: finished_items,
                     // One child execution per item of the attempt the state ended
                     // on, which is what `ListExecutions` reports for this Map Run.
@@ -1965,8 +2000,9 @@ impl Interpreter<'_> {
         }
     }
 
-    /// The items a `Map` state iterates: `Items` when it declares one, else what
-    /// `ItemsPath` (default `$`) selects from the state's effective input.
+    /// The items a `Map` state iterates: what its `ItemReader`'s dataset holds when it
+    /// declares one, else `Items` when it declares that, else what `ItemsPath`
+    /// (default `$`) selects from the state's effective input.
     pub(super) fn map_items(
         &self,
         name: &str,
@@ -1975,6 +2011,11 @@ impl Interpreter<'_> {
         effective: &Value,
         context: &Value,
     ) -> Result<Vec<Value>, Failure> {
+        // "ItemReader — specifies a dataset and its location": a state that declares
+        // one iterates THAT dataset, so nothing of its own input is read for its items.
+        if let Some(reader) = state.get("ItemReader") {
+            return self.dataset_items(name, reader, language, effective, context);
+        }
         let selected = match state.get("Items") {
             // "Items — an array, or a JSONata expression that evaluates to an array":
             // the member is the array itself in either language, and in JSONata it may
@@ -2002,6 +2043,114 @@ impl Interpreter<'_> {
                  'Map' state iterates"
             ))),
         }
+    }
+
+    /// The items the DATASET a `Map` state's `ItemReader` names holds.
+    ///
+    /// The reader's own `Parameters` (or JSONata `Arguments`) is a payload template of
+    /// the state's language, so it is rendered here — against the state's effective
+    /// input, exactly as its `ItemSelector` is — and `MaxItems` is resolved from the
+    /// member or from its `MaxItemsPath` form in that same language. The dataset is
+    /// then read through the same seam a `Task` state's integration call is made over
+    /// ([`super::super::item_reader`]).
+    pub(super) fn dataset_items(
+        &self,
+        name: &str,
+        reader: &Value,
+        language: &'static str,
+        effective: &Value,
+        context: &Value,
+    ) -> Result<Vec<Value>, Failure> {
+        let parameters = match reader.get("Arguments").or_else(|| reader.get("Parameters")) {
+            Some(template) => self.render_selector(language, template, effective, context)?,
+            None => Value::Object(Map::new()),
+        };
+        // "MaxItems — limits the number of data items passed", and `MaxItemsPath` reads
+        // that figure from the state's input instead: one member of the reader's
+        // `ReaderConfig`, resolved the same way every other numeric member of a state
+        // is.
+        let empty = Map::new();
+        let config = reader
+            .get("ReaderConfig")
+            .and_then(Value::as_object)
+            .unwrap_or(&empty);
+        let max_items =
+            self.number_member(config, language, "MaxItems", effective, context, 0.0)? as usize;
+        let dataset = super::super::item_reader::read(name, reader, &parameters, max_items)
+            .map_err(reported)?;
+        dataset.items(name, self.tasks).map_err(reported)
+    }
+
+    /// `items` grouped as the state's `ItemBatcher` says, for a state that declares
+    /// one: each of the documents the state's iterations are then handed is one BATCH.
+    ///
+    /// The `ItemSelector` is applied FIRST, item by item, because it transforms each
+    /// item and the batches are built out of what it produced — so the state's own
+    /// selector is spent here and the iterations are handed the batches unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn batched_items(
+        &self,
+        name: &str,
+        state: &Map<String, Value>,
+        language: &'static str,
+        batcher: &Value,
+        items: Vec<Value>,
+        effective: &Value,
+        context: &Value,
+    ) -> Result<Vec<Value>, Failure> {
+        let Some(members) = batcher.as_object() else {
+            return Err(runtime(format!(
+                "'ItemBatcher' must be an object, not {batcher}"
+            )));
+        };
+        if let Some(member) = members
+            .keys()
+            .find(|member| !super::super::item_batcher::BATCHER_MEMBERS.contains(&member.as_str()))
+        {
+            return Err(runtime(format!(
+                "the 'ItemBatcher' carries the member '{member}', which this emulator does not \
+                 interpret, so nothing was run for it"
+            )));
+        }
+        let selected = match state.get("ItemSelector").or_else(|| state.get("Parameters")) {
+            None => items,
+            Some(template) => {
+                let mut selected = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    let map_item = serde_json::json!({ "Index": index, "Value": item });
+                    let item_context = with_map_item(context, &map_item);
+                    selected.push(
+                        self.render_selector(language, template, effective, &item_context)?,
+                    );
+                }
+                selected
+            }
+        };
+        let batching = super::super::item_batcher::Batching {
+            max_items: self.number_member(
+                members,
+                language,
+                "MaxItemsPerBatch",
+                effective,
+                context,
+                0.0,
+            )? as usize,
+            max_bytes: self.number_member(
+                members,
+                language,
+                "MaxInputBytesPerBatch",
+                effective,
+                context,
+                0.0,
+            )? as usize,
+            batch_input: match members.get("BatchInput") {
+                None => None,
+                Some(template) => {
+                    Some(self.render_selector(language, template, effective, context)?)
+                }
+            },
+        };
+        super::super::item_batcher::batches(name, selected, &batching).map_err(reported)
     }
 
     /// Run every item of a `Map` state and collect what the iterations produced.
@@ -2165,8 +2314,14 @@ impl Interpreter<'_> {
                         status,
                         started_at: batch_start,
                         finished_at: branch.end,
-                        // One item per child: see [`StartedChildExecution::item_count`].
-                        item_count: 1,
+                        // One item per child, or the batch's own count for a state
+                        // that declares an `ItemBatcher`: see
+                        // [`StartedChildExecution::item_count`].
+                        item_count: match plan.batched {
+                            true => i32::try_from(super::super::item_batcher::item_count(item))
+                                .unwrap_or(i32::MAX),
+                            false => 1,
+                        },
                     });
                 }
                 let outcome_event = match &branch.outcome {

@@ -458,6 +458,7 @@ dependencies = [
  "service-com-amazonaws-connectcontactlens-amazonconnectcontactlens",
  "service-com-amazonaws-connecthealth-connecthealth",
  "service-com-amazonaws-connectparticipant-amazonconnectparticipantservicelambda",
+ "service-com-amazonaws-continuum-continuumcontrolplane",
  "service-com-amazonaws-controlcatalog-controlcatalog",
  "service-com-amazonaws-controltower-awscontroltowerapis",
  "service-com-amazonaws-costandusagereportservice-awsorigamiservicegatewayservice",
@@ -9904,6 +9905,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "service-com-amazonaws-continuum-continuumcontrolplane"
+version = "0.1.0"
+dependencies = [
+ "aws-emulator-build-support",
+ "aws-emulator-emulator-telemetry",
+ "aws-emulator-engine",
+ "aws-emulator-server",
+ "aws-emulator-smithy-macros",
+ "aws-emulator-smithy-schema-server",
+ "aws-emulator-smithy-server-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 0.2.1",
+ "aws-smithy-types",
+ "bytes",
+ "hex",
+ "http",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "service-com-amazonaws-controlcatalog-controlcatalog"
 version = "0.1.0"
 dependencies = [
@@ -16597,13 +16621,18 @@ dependencies = [
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
  "bytes",
+ "csv",
  "hex",
  "http",
+ "percent-encoding",
+ "quick-xml",
  "serde_json",
  "serde_json_path",
  "service-com-amazonaws-dynamodb-dynamodb-20120810",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-kms-trentservice",
+ "service-com-amazonaws-s3-amazons3",
+ "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",
  "sha2 0.10.9",
  "tokio",

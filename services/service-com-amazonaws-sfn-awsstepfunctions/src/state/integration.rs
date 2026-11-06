@@ -31,7 +31,10 @@
 //! action, and nothing is written per action. A `restJson1` service spreads an
 //! operation's input over the path, the query, the headers and one payload member, so
 //! its entry carries those bindings per operation ([`Rest`]) and a call is made only
-//! for an operation whose bindings are stated.
+//! for an operation whose bindings are stated. An `awsQuery` service takes the whole
+//! request as a FORM — the action and the service's API version beside one field per
+//! member of the input ([`form_body`]) — and answers an XML document wrapping the
+//! operation's own result ([`query_result`]).
 //!
 //! The parameters of a `Task` state's integration are written in the integration's
 //! own convention, PascalCase, whatever the invoked API spells its own members in,
@@ -50,12 +53,12 @@
 //! execution in the service's own failure state with the ASL-documented
 //! [`super::asl::RUNTIME_ERROR`] and a cause saying what was not run:
 //!
-//! * a service with no entry — one whose protocol binds its request to a shape the
-//!   state's document is not (`awsQuery`'s form fields), since handing such a service
-//!   a JSON document would not be its request, and equally one whose wire facts
-//!   simply are not listed here yet;
+//! * a service with no entry — one whose wire facts are simply not listed here yet,
+//!   since each entry's facts are that service's own model's;
 //! * an operation of a REST service whose own bindings are not carried, since where
-//!   each of its members goes on the wire is that operation's own fact;
+//!   each of its members goes on the wire is that operation's own fact, and a member
+//!   of a FORM request that is a structure or a list, whose field names are the
+//!   invoked shape's own ([`form_body`]);
 //! * a run-a-job (`.sync`) pattern over an integration that is not in the
 //!   [`RUN_A_JOB`] catalogue below, because the job it starts is reported and
 //!   stopped through calls only that integration names;
@@ -107,9 +110,21 @@
 //!
 //! An ACTIVITY `Resource` is not one of these: its work belongs to a worker that
 //! polls this emulator, so the walk schedules a task and suspends at it rather than
-//! asking for a call ([`super::asl::Interpreter`] decides that before [`read`] is
-//! asked anything). [`read`] still answers for one, so it is total over every
-//! `Resource` form a definition can carry.
+//! asking for a call ([`read`] is not asked anything first by
+//! [`super::asl::Interpreter`]). [`read`] still answers for one, so it is total over
+//! every `Resource` form a definition can carry.
+//!
+//! ## The dataset a `Map` state reads
+//!
+//! One more call is made from here, and it is not a `Task` state's: a `Map` state's
+//! `ItemReader` names an S3 dataset, and the items it iterates are read out of it
+//! ([`super::item_reader`]). That read goes over this same seam — the same in-process
+//! callback, the same signature, the same Region — through [`dataset_call`], whose two
+//! bindings are S3's own. S3 is deliberately NOT one of [`APIS`]: a `Task` state's
+//! `Resource` naming an S3 operation is still work no integration call is made for,
+//! because an integration's result is the operation's own response members and this
+//! emulator does not read those out of `restXml`. What the dataset read wants is the
+//! answer's BYTES, which that protocol does carry.
 //!
 //! ## What a task may do, and what its call answers
 //!
@@ -298,15 +313,18 @@ impl Api {
             // is a blob is the bytes themselves, which is what the one REST operation
             // bound here sends.
             Wire::Rest(_) => REST_CONTENT_TYPE.to_string(),
+            // `awsQuery` carries the whole request as form fields.
+            Wire::Query { .. } => FORM_CONTENT_TYPE.to_string(),
         }
     }
 
     /// The REST binding of `operation`, for a service whose requests are bound that
-    /// way; `None` for an AWS JSON service, whose every operation takes the same
-    /// request shape, and for an operation of a REST service no binding is stated for.
+    /// way; `None` for an AWS JSON or `awsQuery` service, whose every operation takes
+    /// the same request shape, and for an operation of a REST service no binding is
+    /// stated for.
     fn rest(&self, operation: &str) -> Option<&'static Rest> {
         match self.wire {
-            Wire::Json { .. } => None,
+            Wire::Json { .. } | Wire::Query { .. } => None,
             Wire::Rest(bound) => bound.iter().find(|rest| rest.operation == operation),
         }
     }
@@ -352,7 +370,18 @@ pub enum Wire {
     /// query, headers and one payload, so a call is made only for an operation whose
     /// bindings are stated here.
     Rest(&'static [Rest]),
+    /// `awsQuery`: the request is a FORM — the operation named in an `Action` field
+    /// beside the service's API version, and the input's members as further fields —
+    /// and the answer is an XML document wrapping the operation's own result.
+    Query {
+        /// The API version its model declares (`service.version`), which every request
+        /// to such a service names beside the action.
+        version: &'static str,
+    },
 }
+
+/// The media type an `awsQuery` request body carries.
+const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 
 /// The media type a `restJson1` request and the body of its answer carry.
 const REST_CONTENT_TYPE: &str = "application/json";
@@ -615,7 +644,123 @@ pub const APIS: &[Api] = &[
         // `Invoke`'s input: `FunctionName`, `Payload`, `InvocationType`.
         member_case: MemberCase::Pascal,
     },
+    // `services/service-com-amazonaws-sts-awssecuritytokenservicev20110615/
+    // smithy-model/com-amazonaws-sts-awssecuritytokenservicev20110615.json`: awsQuery,
+    // sigv4Name `sts`, endpointPrefix `sts`, sdkId `STS`, version `2011-06-15` — a FORM
+    // protocol, so the operation's input goes on the wire as form fields beside the
+    // action it names ([`Wire::Query`]).
+    Api {
+        namespace: "sts",
+        signing_name: "sts",
+        endpoint_prefix: "sts",
+        wire: Wire::Query {
+            version: "2011-06-15",
+        },
+        sdk_id: "STS",
+        // `AssumeRole`'s input: `RoleArn`, `RoleSessionName`, `DurationSeconds`.
+        member_case: MemberCase::Pascal,
+    },
 ];
+
+/// Amazon S3, for the one call this crate makes to it: the DATASET a `Map` state's
+/// `ItemReader` names ([`super::item_reader`]).
+///
+/// Deliberately NOT one of [`APIS`]: a `Task` state's `Resource` naming an S3
+/// operation is still work no integration call is made for, because an S3 answer is a
+/// restXml document and an integration's result is the operation's own response
+/// members, which this emulator does not read out of that protocol. [`read`] reports
+/// such a `Resource` as before. What these bindings serve is the dataset read, whose
+/// answer is the object's own BYTES rather than a response document.
+///
+/// `services/service-com-amazonaws-s3-amazons3/smithy-model/
+/// com-amazonaws-s3-amazons3.json`: restXml, sigv4Name `s3`, endpointPrefix `s3`,
+/// sdkId `S3`, arnNamespace `s3`.
+static S3_API: Api = Api {
+    namespace: S3_NAMESPACE,
+    signing_name: S3_NAMESPACE,
+    endpoint_prefix: S3_NAMESPACE,
+    wire: Wire::Rest(S3_REST),
+    sdk_id: "S3",
+    // `GetObject`'s input: `Bucket`, `Key`; `ListObjectsV2`'s: `Bucket`, `Prefix`.
+    member_case: MemberCase::Pascal,
+};
+
+/// S3's ARN namespace, its signing name and its endpoint prefix, which are the same
+/// label.
+const S3_NAMESPACE: &str = "s3";
+
+/// The REST bindings of the two S3 operations a dataset read makes.
+///
+/// `smithy_query(query="operation",operation="ListObjectsV2,GetObject",
+/// model_path="services/service-com-amazonaws-s3-amazons3/smithy-model/
+/// com-amazonaws-s3-amazons3.json")`: `ListObjectsV2` is `http` GET
+/// `/{Bucket}?list-type=2` with `Bucket` an `httpLabel` and `Prefix`,
+/// `ContinuationToken` and `MaxKeys` `httpQuery` members, answering an XML document
+/// as the whole body; `GetObject` is GET `/{Bucket}/{Key+}?x-id=GetObject` with
+/// `Bucket` and the GREEDY `Key` as `httpLabel`s, and its output binds `Body` as its
+/// `httpPayload`.
+const S3_REST: &[Rest] = &[
+    Rest {
+        operation: LIST_OBJECTS_OPERATION,
+        method: "GET",
+        uri: "/{Bucket}?list-type=2",
+        payload: "",
+        headers: &[],
+        query: &[
+            ("Prefix", "prefix"),
+            ("ContinuationToken", "continuation-token"),
+            ("MaxKeys", "max-keys"),
+        ],
+        response_payload: DATASET_BODY,
+        response_status: "",
+        response_headers: &[],
+    },
+    Rest {
+        operation: GET_OBJECT_OPERATION,
+        method: "GET",
+        uri: "/{Bucket}/{Key+}?x-id=GetObject",
+        payload: "",
+        headers: &[],
+        query: &[],
+        response_payload: DATASET_BODY,
+        response_status: "",
+        response_headers: &[],
+    },
+];
+
+/// The S3 operations a dataset read makes, as that model spells them.
+pub const LIST_OBJECTS_OPERATION: &str = "ListObjectsV2";
+/// See [`LIST_OBJECTS_OPERATION`].
+pub const GET_OBJECT_OPERATION: &str = "GetObject";
+
+/// The member a dataset read reports the answer's BODY under: `GetObject`'s own
+/// `Body`, which that operation binds as its `httpPayload`, and — for the listing,
+/// whose protocol carries its document as the whole body — that document's text.
+pub const DATASET_BODY: &str = "Body";
+
+/// The dataset-read call `operation` names, for the one reader that makes them
+/// ([`super::item_reader`]); `None` for an operation these bindings do not carry.
+///
+/// A dataset read is NOT a `Task` state's integration: its result is not reported to
+/// any state, so the call carries no SDK envelope, no run-a-job pattern and no
+/// conversion — only where the request goes and how the answer's body comes back.
+#[must_use]
+pub fn dataset_call(operation: &str) -> Option<Call> {
+    let rest = S3_API.rest(operation)?;
+    Some(Call {
+        api: &S3_API,
+        operation: rest.operation.to_string(),
+        rest: Some(rest),
+        job: None,
+        callback: false,
+        parsed_output: false,
+        json_text: &[],
+        sdk_envelope: false,
+        epoch_millis: &[],
+        targets: None,
+        invokes: None,
+    })
+}
 
 /// One integration call: the service's API, and the operation of it the `Resource`'s
 /// action named.
@@ -1548,7 +1693,9 @@ pub fn read(resource: &str) -> Result<Call, String> {
     // whose bindings this emulator carries; one with none is reported as work nothing
     // was run for rather than sent as a request its protocol does not describe.
     let rest = match api.wire {
-        Wire::Json { .. } => None,
+        // An AWS JSON service's every operation takes the same request shape, and a
+        // FORM one's is built from the action and the input's own members.
+        Wire::Json { .. } | Wire::Query { .. } => None,
         Wire::Rest(_) => Some(api.rest(&operation).ok_or_else(|| {
             format!(
                 "'{shown}' names the '{operation}' operation of {}, whose request this emulator \
@@ -2132,6 +2279,17 @@ fn wired(call: &Call, request: &Value) -> Result<Wired, String> {
         // root and named in a header.
         let target = match call.api.wire {
             Wire::Json { target_prefix, .. } => format!("{target_prefix}.{}", call.operation),
+            // An `awsQuery` request is a FORM, posted to the root, with the operation
+            // named in it rather than in a header.
+            Wire::Query { version } => {
+                return Ok(Wired {
+                    method: "POST",
+                    uri: "/".to_string(),
+                    target: None,
+                    headers: Vec::new(),
+                    body: form_body(&call.operation, version, &document)?.into_bytes(),
+                })
+            }
             // A service whose protocol is a REST one reaches this only for a call
             // carrying no binding, which [`read`] does not produce.
             Wire::Rest(_) => {
@@ -2154,6 +2312,53 @@ fn wired(call: &Call, request: &Value) -> Result<Wired, String> {
     rest.wired(&document)
 }
 
+/// The `application/x-www-form-urlencoded` body an `awsQuery` request carries:
+/// `Action` naming the operation, `Version` naming the service's API version, and one
+/// field per member of the operation's input.
+///
+/// Each value is percent-encoded by the maintained encoder
+/// ([`::percent_encoding`]), over RFC 3986's unreserved set — which is the encoding
+/// AWS's own canonical request states — so a value carrying a delimiter is one field
+/// rather than several.
+///
+/// A member whose value is a STRUCTURE or a LIST is not bound: this protocol spreads
+/// such a member over one field per leaf, under names that are the invoked shape's own,
+/// and those names are not readable from this crate. The call is not made for one
+/// rather than made with a field the service does not carry.
+fn form_body(operation: &str, version: &str, document: &Value) -> Result<String, String> {
+    let mut body = format!("Action={operation}&Version={version}");
+    for (member, value) in document.as_object().into_iter().flatten() {
+        let field = match value {
+            Value::Null => continue,
+            Value::String(text) => text.clone(),
+            Value::Bool(_) | Value::Number(_) => value.to_string(),
+            Value::Array(_) | Value::Object(_) => {
+                return Err(format!(
+                    "this task's '{member}' is a {}, which this emulator does not bind to that \
+                     service's form-field protocol",
+                    match value {
+                        Value::Array(_) => "list",
+                        _ => "structure",
+                    }
+                ))
+            }
+        };
+        body.push('&');
+        body.push_str(&::percent_encoding::utf8_percent_encode(member, FORM_FIELD).to_string());
+        body.push('=');
+        body.push_str(&::percent_encoding::utf8_percent_encode(&field, FORM_FIELD).to_string());
+    }
+    Ok(body)
+}
+
+/// The characters a form field escapes: everything but RFC 3986's unreserved set,
+/// which is the encoding AWS's own canonical request states for a query component.
+const FORM_FIELD: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
 impl Rest {
     /// The request this operation's bindings put `document` on the wire as.
     fn wired(&self, document: &Value) -> Result<Wired, String> {
@@ -2167,24 +2372,35 @@ impl Rest {
             let (label, tail) = after
                 .split_once('}')
                 .ok_or_else(|| format!("the '{}' path binding is malformed", self.operation))?;
+            // A label written `{<member>+}` is a GREEDY one, which spans as many path
+            // segments as the value has: an object key is bound that way, so the
+            // separator between its segments is part of the value rather than a
+            // delimiter the value may not carry.
+            let (label, component) = match label.strip_suffix('+') {
+                Some(greedy) => (greedy, Component::GreedyLabel),
+                None => (label, Component::Label),
+            };
             let named = member_text(document, label).ok_or_else(|| {
                 format!("this task's parameters name no '{label}', which the call's path needs")
             })?;
-            uri.push_str(&one_component(&named, label, Component::Label)?);
+            uri.push_str(&one_component(&named, label, component)?);
             remaining = tail;
         }
         uri.push_str(remaining);
-        let mut query = String::new();
         for (member, parameter) in self.query {
             let Some(named) = member_text(document, member) else {
                 continue;
             };
-            query.push(if query.is_empty() { '?' } else { '&' });
-            query.push_str(parameter);
-            query.push('=');
-            query.push_str(&one_component(&named, member, Component::Query)?);
+            let value = one_component(&named, member, Component::Query)?;
+            // The operation's own `http.uri` may already carry a literal query — which
+            // is how a service names a subresource (`?list-type=2`) — so what separates
+            // this parameter from what is already there is read off the target as it
+            // stands rather than assumed to be its first.
+            uri.push(if uri.contains('?') { '&' } else { '?' });
+            uri.push_str(parameter);
+            uri.push('=');
+            uri.push_str(&value);
         }
-        uri.push_str(&query);
         let headers = self
             .headers
             .iter()
@@ -2256,6 +2472,10 @@ enum Component {
     /// A path label, which stands for one whole segment: an empty one would collapse
     /// the path it is part of, so there is no request to send for it.
     Label,
+    /// A GREEDY path label (`{Key+}`), which stands for as many segments as the value
+    /// holds: the separator between them is part of the value, so it is carried rather
+    /// than refused. An empty one still collapses the path.
+    GreedyLabel,
     /// A query parameter's value, which an operation may model as admitting the empty
     /// string (`Invoke`'s `Qualifier` does), and which a request carries as the
     /// parameter with nothing after its `=`.
@@ -2273,11 +2493,21 @@ enum Component {
 /// what would make it more than one component — and the call is not made rather than
 /// made against a target assembled out of it. Nothing is escaped here: a value that
 /// needed escaping names no resource of the invoked operation either.
+///
+/// The path SEPARATOR is the one character whose place depends on the component: a
+/// greedy label spans several segments and a prefix or a key written in a query names
+/// one, so each of those carries it, while a single-segment label does not.
 fn one_component(value: &str, member: &str, component: Component) -> Result<String, String> {
-    let carried = value.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric() || URI_COMPONENT_PUNCTUATION.contains(&byte)
-    });
-    if (value.is_empty() && component == Component::Label) || !carried {
+    let punctuation = match component {
+        Component::Label => URI_COMPONENT_PUNCTUATION,
+        Component::GreedyLabel | Component::Query => URI_PATH_PUNCTUATION,
+    };
+    let carried = value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || punctuation.contains(&byte));
+    let empty = value.is_empty()
+        && matches!(component, Component::Label | Component::GreedyLabel);
+    if empty || !carried {
         return Err(format!(
             "this task's '{member}' is not text a request-target carries as one component, so it \
              addresses nothing the call can be made against"
@@ -2290,6 +2520,11 @@ fn one_component(value: &str, member: &str, component: Component) -> Result<Stri
 /// 3986's unreserved set (`-`, `.`, `_`, `~`) and the two sub-delimiters an ARN and a
 /// version qualifier are written with (`:`, `$`).
 const URI_COMPONENT_PUNCTUATION: &[u8] = b"-._~:$";
+
+/// [`URI_COMPONENT_PUNCTUATION`] plus the path separator, for the components that span
+/// segments: a greedy label (an object's key) and a query parameter naming a path (a
+/// listing's prefix).
+const URI_PATH_PUNCTUATION: &[u8] = b"-._~:$/";
 
 /// Stop every job a walk started and then ABANDONED.
 ///
@@ -2344,13 +2579,20 @@ pub async fn call_api(
                 // its body, so the operation's own bindings are what reads it; a
                 // refusal is read the same way whichever protocol carried it.
                 Some(rest) if (200..300).contains(&answered.status) => Ok(rest.result(&answered)),
-                _ => answer_of(
-                    api,
-                    &call.operation,
-                    answered.status,
-                    answered.error_type.as_deref(),
-                    &answered.payload,
-                ),
+                _ => match api.wire {
+                    // An `awsQuery` answer is an XML document wrapping the operation's
+                    // own result, so the result is read out of that wrapper.
+                    Wire::Query { .. } if (200..300).contains(&answered.status) => {
+                        query_result(&call.operation, &answered.payload)
+                    }
+                    _ => answer_of(
+                        api,
+                        &call.operation,
+                        answered.status,
+                        answered.error_type.as_deref(),
+                        &answered.payload,
+                    ),
+                },
             };
             // The result of an OPTIMIZED integration is the literal SDK response of
             // the call, which renders each instant the response carries as whole
@@ -2520,7 +2762,13 @@ fn answer_of(
     let document: Option<Value> = if payload.is_empty() {
         None
     } else {
-        ::serde_json::from_slice(payload).ok()
+        // A refusal is read in whichever of the two protocols this crate calls carried
+        // it: an AWS JSON body is the document itself, and a REST-XML one carries its
+        // `Code` and `Message` as the document's own elements, which is read to the
+        // same object so one reading answers for both.
+        ::serde_json::from_slice(payload)
+            .ok()
+            .or_else(|| super::xml_answer::as_document(payload))
     };
     if (200..300).contains(&status) {
         return Ok(document.unwrap_or_else(|| Value::Object(Map::new())));
@@ -2561,6 +2809,36 @@ fn answer_of(
     };
     Err(Failed { error, cause })
 }
+
+/// What an `awsQuery` 2xx answered, as the operation's own output document.
+///
+/// Such an answer wraps the operation's result in a `<{Operation}Response>` element
+/// carrying a `<{Operation}Result>` element and the `<ResponseMetadata>` beside it, so
+/// the operation's own members are the children of that result element — which is what
+/// this reports ([`super::xml_answer::as_value`]). An operation whose output carries no
+/// member answers no result element, which is the empty document; a document that is
+/// not that shape is reported from the response element with its metadata left out,
+/// rather than read as members it does not carry.
+fn query_result(operation: &str, payload: &[u8]) -> Answer {
+    let root = super::xml_answer::read(payload).map_err(|why| Failed {
+        error: super::asl::RUNTIME_ERROR.to_string(),
+        cause: format!("the answer to the '{operation}' call could not be read: {why}"),
+    })?;
+    if let Some(result) = root.child(&format!("{operation}{RESULT_SUFFIX}")) {
+        return Ok(super::xml_answer::as_value(result));
+    }
+    let mut reported = root.clone();
+    reported
+        .children
+        .retain(|child| child.name != RESPONSE_METADATA_ELEMENT);
+    Ok(super::xml_answer::as_value(&reported))
+}
+
+/// The element an `awsQuery` answer wraps the operation's own members in, and the one
+/// it carries the call's own metadata in beside them.
+const RESULT_SUFFIX: &str = "Result";
+/// See [`RESULT_SUFFIX`].
+const RESPONSE_METADATA_ELEMENT: &str = "ResponseMetadata";
 
 /// The error code an AWS JSON refusal carries: the `X-Amzn-Errortype` header, else
 /// the body's `__type` discriminator, else its `code` member.
@@ -2612,8 +2890,12 @@ async fn dispatch(
     let mut builder = ::http::Request::builder()
         .method(built.method)
         .uri(&built.uri)
-        .header("host", api.host(region))
-        .header("content-type", api.content_type());
+        .header("host", api.host(region));
+    // A media type describes a BODY: a request that carries none — a REST read bound
+    // to its path and its query alone — names none either.
+    if !built.body.is_empty() {
+        builder = builder.header("content-type", api.content_type());
+    }
     if let Some(target) = &built.target {
         builder = builder.header(TARGET_HEADER, target);
     }

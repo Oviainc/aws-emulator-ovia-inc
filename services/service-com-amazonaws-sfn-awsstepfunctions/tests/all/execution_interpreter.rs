@@ -10,10 +10,12 @@
 //! the states, the data-flow members, the context object and the intrinsic functions
 //! the definition uses — and only a state or member whose semantics need something
 //! outside this process (a `Task` whose `Resource` names no integration call this
-//! emulator makes, a Distributed Map's S3 `ItemReader`, a JSONata definition) ends
+//! emulator makes, a Distributed Map's S3 `ResultWriter`, an `ItemReader` whose
+//! `InputType` this emulator does not read) ends
 //! the execution `FAILED` with ASL's `States.Runtime` and a cause that says what was
 //! not run. The integration calls that ARE made are
-//! `tests/all/task_integrations.rs`.
+//! `tests/all/task_integrations.rs`, and the datasets an `ItemReader` DOES read are
+//! `tests/all/map_item_reader.rs`.
 //!
 //! Each table below spans one class of that rule: the recorded Distributed Map that
 //! this suite's issue was filed about is ONE row of the first one.
@@ -388,8 +390,11 @@ async fn what_cannot_be_run_in_process_fails_rather_than_being_faked() {
             expected: Expected::Failure("States.Runtime"),
         },
         RunCase {
-            case: "a Distributed Map's S3 ItemReader",
-            definition: r#"{"StartAt":"M","States":{"M":{"Type":"Map","ItemReader":{"Resource":"arn:aws:states:::s3:listObjectsV2","Parameters":{"Bucket":"b"}},"ItemProcessor":{"ProcessorConfig":{"Mode":"DISTRIBUTED"},"StartAt":"P","States":{"P":{"Type":"Pass","End":true}}},"End":true}}}"#,
+            // The datasets this emulator DOES read are read from S3 for real
+            // (`tests/all/map_item_reader.rs`); an `InputType` outside those is still
+            // not read, and says so.
+            case: "a Distributed Map's ItemReader whose InputType is not read",
+            definition: r#"{"StartAt":"M","States":{"M":{"Type":"Map","ItemReader":{"Resource":"arn:aws:states:::s3:getObject","ReaderConfig":{"InputType":"PARQUET"},"Parameters":{"Bucket":"b","Key":"k"}},"ItemProcessor":{"ProcessorConfig":{"Mode":"DISTRIBUTED"},"StartAt":"P","States":{"P":{"Type":"Pass","End":true}}},"End":true}}}"#,
             input: "{}",
             expected: Expected::Failure("States.Runtime"),
         },

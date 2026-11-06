@@ -4278,6 +4278,8 @@ fn round_up_to(value: i64, increment: i64) -> i64 {
 pub mod asl;
 pub mod encryption;
 pub mod integration;
+pub mod item_batcher;
+pub mod item_reader;
 mod json_diagnostic;
 pub mod jsonata;
 mod plan;
@@ -4286,6 +4288,7 @@ pub mod run_a_job;
 pub mod store;
 pub use store::{ActivityPoll, StateMachineUpdate, StateMachineUpdateRejection, Stopped};
 pub mod task_authorization;
+pub mod xml_answer;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

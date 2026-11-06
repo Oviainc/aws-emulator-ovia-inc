@@ -24,6 +24,11 @@
 //! anywhere in a JSONPath machine — inside a `Parallel` branch or a `Map`'s
 //! processor included — is evaluated with that language's semantics.
 //!
+//! A `Map` state's items come from the DATASET its `ItemReader` names when it declares
+//! one — read out of S3 for real ([`super::item_reader`]) — else from its own input;
+//! an `ItemBatcher` then groups them into the batches its iterations are handed
+//! ([`super::item_batcher`]).
+//!
 //! A `Task` state's work is RUN too, in the one way this process can run each kind:
 //!
 //! * a `Resource` naming a service INTEGRATION is called — the call goes to the
@@ -66,8 +71,10 @@
 //!   request is not one JSON document,
 //!   a run-a-job pattern over an integration whose job cannot be reported or
 //!   stopped, a `Resource` naming no integration at all;
-//! * a Distributed Map's `ItemReader`, `ItemBatcher` and `ResultWriter`, which read
-//!   and write an S3 dataset.
+//! * a Distributed Map's `ResultWriter`, which WRITES an S3 dataset, and a dataset its
+//!   `ItemReader` names that this emulator does not read (an `InputType` outside
+//!   `CSV`/`JSON`/`JSONL`) — the datasets it DOES read are read from S3 for real
+//!   ([`super::item_reader`]).
 //!
 //! Reaching one of those ends the execution in the service's own failure state:
 //! `FAILED`, with the ASL-documented [`RUNTIME_ERROR`] name and a cause that says
@@ -603,14 +610,19 @@ fn executable_members(state_type: &str) -> &'static [&'static str] {
             "Next",
             "End",
         ],
-        // `ItemReader`, `ItemBatcher` and `ResultWriter` are deliberately absent:
-        // each one reads or writes an S3 dataset, which is outside this process.
+        // `ResultWriter` is deliberately absent: it WRITES an S3 dataset, and the
+        // manifest of result files it writes is not produced here. `ItemReader` and
+        // `ItemBatcher` are interpreted — the dataset is read from S3 for real
+        // ([`super::item_reader`]) and its items are grouped as declared
+        // ([`super::item_batcher`]).
         "Map" => &[
             "Type",
             "Comment",
             "QueryLanguage",
             "InputPath",
             "Parameters",
+            "ItemReader",
+            "ItemBatcher",
             "ItemSelector",
             "ItemsPath",
             "Items",
@@ -829,6 +841,8 @@ fn jsonata_members(state_type: &str, activity: bool) -> &'static [&'static str] 
             "Assign",
             "Output",
             "Items",
+            "ItemReader",
+            "ItemBatcher",
             "ItemSelector",
             "ItemProcessor",
             "Iterator",
@@ -966,10 +980,10 @@ pub struct StartedChildExecution {
     /// finished.
     pub started_at: Duration,
     pub finished_at: Duration,
-    /// "The total number of items processed in a child workflow execution": one,
-    /// because every child this emulator starts is handed exactly one item of the
-    /// state's array (`ItemBatcher`, which batches several into one child, is not
-    /// interpreted — see the module docs).
+    /// "The total number of items processed in a child workflow execution": one for
+    /// each item of the state's array, and the size of the BATCH for a state that
+    /// declares an `ItemBatcher`, whose children are each handed one batch
+    /// ([`super::item_batcher::item_count`]).
     pub item_count: i32,
 }
 
@@ -1338,6 +1352,19 @@ fn named(error: &str, cause: String) -> Failure {
     }
 }
 
+/// What a state REPORTS for work outside the walk that failed: the error name and the
+/// cause that work answered, which is what `Retry` and `Catch` are matched against.
+///
+/// The one conversion between the two halves of a failure — what a call or a read
+/// answered ([`super::integration::Failed`]) and what a state reports ([`Failure`]) —
+/// so neither side restates the other's shape.
+fn reported(failed: super::integration::Failed) -> Failure {
+    Failure {
+        error: Some(failed.error),
+        cause: Some(failed.cause),
+    }
+}
+
 /// A JSONata template of a state that was not evaluated, under the ASL error name
 /// for the class the refusal belongs to: the language's data-limit failure for a
 /// template that outgrew what a state may carry, and
@@ -1447,7 +1474,10 @@ struct MapPlan<'a> {
     /// The `ItemProcessor`'s (or legacy `Iterator`'s) own state list and entry point.
     states: &'a Map<String, Value>,
     start_at: &'a str,
-    /// `ItemSelector`, or the legacy `Parameters` form of it.
+    /// `ItemSelector`, or the legacy `Parameters` form of it. `None` for a state whose
+    /// items are already the documents its iterations are handed — which a BATCHED
+    /// state's are, because the selector was applied to each item before it was placed
+    /// in a batch.
     selector: Option<&'a Value>,
     /// The query language the `Map` state itself is written in, which its own members
     /// — its `ItemSelector` included — are evaluated in. A state of the processor
@@ -1455,6 +1485,10 @@ struct MapPlan<'a> {
     language: &'static str,
     /// Whether the processor declares `"Mode": "DISTRIBUTED"`.
     distributed: bool,
+    /// Whether the state declares an `ItemBatcher`, so each of `items` is a BATCH of
+    /// items rather than one item: what an iteration reports as the count it processed
+    /// is read off the batch then ([`super::item_batcher::item_count`]).
+    batched: bool,
     /// How many items run at once; `0` is `MaxConcurrency`'s documented "no limit".
     concurrency: usize,
     tolerated_count: u64,

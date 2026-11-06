@@ -81,6 +81,8 @@ mod execution_redrive;
 mod execution_role_assumption;
 #[path = "all/express_run_a_job_refusal.rs"]
 mod express_run_a_job_refusal;
+#[path = "all/form_protocol_integration.rs"]
+mod form_protocol_integration;
 #[path = "all/history_event_provenance.rs"]
 mod history_event_provenance;
 #[path = "all/integration_member_names.rs"]
@@ -91,6 +93,8 @@ mod json_parse_diagnostics;
 mod jsonata_states;
 #[path = "all/list_state_machine_aliases_pages.rs"]
 mod list_state_machine_aliases_pages;
+#[path = "all/map_item_reader.rs"]
+mod map_item_reader;
 #[path = "all/map_run_failure_budget.rs"]
 mod map_run_failure_budget;
 #[path = "all/map_run_updates.rs"]
