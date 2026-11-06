@@ -23,6 +23,11 @@ use super::execution::package::MAX_PACKAGE_ENTRIES;
 /// The number of bytes the entries of `zip_bytes` hold once expanded: the sum of the
 /// content size every entry of the archive declares.
 ///
+/// The walk stops after [`MAX_PACKAGE_ENTRIES`] entries, so an archive with more entries
+/// than that is measured as the sum of its first [`MAX_PACKAGE_ENTRIES`]: the declared
+/// sizes are the caller's, and a directory of any length cannot be allowed to make an
+/// arbitrarily long read.
+///
 /// 0 when this emulator holds no bytes for the archive, and 0 when the bytes it holds are
 /// not a readable .zip directory — the same answer the stored size takes in both cases,
 /// because neither is an expanded size this emulator measured.
@@ -112,5 +117,27 @@ mod tests {
                 "case {case:?}: expected 0 expanded bytes, got {measured}"
             );
         }
+    }
+
+    /// An archive with more entries than the walk reads is measured over the entries it
+    /// read, which is the bound this module states rather than a measurement of the whole
+    /// directory.
+    #[test]
+    fn an_archive_past_the_entry_bound_is_measured_over_the_entries_read() {
+        let names: Vec<String> = (0..MAX_PACKAGE_ENTRIES + 16)
+            .map(|index| format!("e{index}.bin"))
+            .collect();
+        let entries: Vec<(&str, &[u8])> = names
+            .iter()
+            .map(|name| (name.as_str(), b"x" as &[u8]))
+            .collect();
+        let held = archive(&entries);
+        let measured = unzipped_bytes(Some(&held));
+        let expected = i64::try_from(MAX_PACKAGE_ENTRIES).unwrap_or(i64::MAX);
+        assert_eq!(
+            measured, expected,
+            "expected the first {MAX_PACKAGE_ENTRIES} entries of one byte each to measure \
+             {expected}, got {measured}"
+        );
     }
 }

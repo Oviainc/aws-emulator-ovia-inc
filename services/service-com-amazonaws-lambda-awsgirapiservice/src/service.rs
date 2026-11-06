@@ -158,9 +158,8 @@ macro_rules! wrap_operations {
 /// The value SET is the model's and the CHECK is the framework's; only the order the
 /// sentence lists the set in is chosen here, because no model records it: AWS states a
 /// value set in neither the model's declaration order nor ascending order, so each row
-/// is RECORDED from an AWS answer rather than computed. Source for the one row below:
-/// the answer the corpus unit `lambda.put-runtime-management-config-invalid-mode-rejected`
-/// carries for an `UpdateRuntimeOn` outside its value set.
+/// is RECORDED from an AWS answer rather than computed, and each row below names the
+/// corpus units its order was recorded from.
 ///
 /// A row is matched by its value SET rather than by the member the clause names (see
 /// [`reported_enum_order`]), because the order is a property of the enum SHAPE: every
@@ -169,7 +168,9 @@ macro_rules! wrap_operations {
 /// the only order there is evidence for.
 const REPORTED_ENUM_ORDERS: &[&[&str]] = &[
     // com.amazonaws.lambda#UpdateRuntimeOn (`Auto | Manual | FunctionUpdate` in the
-    // model), reported by AWS as:
+    // model), reported by AWS as below. Source: the answer the corpus unit
+    // `lambda.put-runtime-management-config-invalid-mode-rejected` carries for an
+    // `UpdateRuntimeOn` outside its value set.
     &["FunctionUpdate", "Manual", "Auto"],
     // com.amazonaws.lambda#InvocationType (`Event | RequestResponse | DryRun` in the
     // model), reported by AWS as below. Source: the answers the corpus units
