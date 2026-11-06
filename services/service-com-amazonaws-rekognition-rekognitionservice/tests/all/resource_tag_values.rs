@@ -25,7 +25,10 @@ use std::collections::BTreeMap;
 use serde_json::json;
 
 use crate::face_collections::{call, harness};
-use crate::resource_tags::{as_json, collection_resource, project_resource, tags_of};
+use crate::resource_tags::{
+    as_json, assert_not_found_by_every_tagging_operation, collection_resource, project_resource,
+    tags_of,
+};
 
 /// The published bounds of a tag key and a tag value, from this service's model
 /// (`smithy_query(query="shape",shape="TagKey,TagValue")`: `TagKey` `length 1..128`,
@@ -33,7 +36,6 @@ use crate::resource_tags::{as_json, collection_resource, project_resource, tags_
 /// `[\p{L}\p{Z}\p{N}_.:/=+\-@]`).
 const TAG_KEY_MIN: usize = 1;
 const TAG_KEY_MAX: usize = 128;
-const TAG_VALUE_MIN: usize = 0;
 const TAG_VALUE_MAX: usize = 256;
 
 /// One row of the tag-form table: a label for failure messages, and the key and value the
@@ -42,11 +44,6 @@ struct TagForm {
     case: &'static str,
     key: String,
     value: String,
-}
-
-/// A string of `length` copies of `unit`, for the rows that sit on a published bound.
-fn repeated(unit: &str, length: usize) -> String {
-    unit.repeat(length)
 }
 
 /// Every form a tag pair takes inside the charset the model allows, one row each.
@@ -85,22 +82,24 @@ fn tag_forms() -> Vec<TagForm> {
         TagForm {
             case: "an empty value",
             key: "no-value".to_string(),
-            value: repeated("v", TAG_VALUE_MIN),
+            // The published `TagValue` minimum length is zero, so the empty string is a
+            // value a resource can carry.
+            value: String::new(),
         },
         TagForm {
             case: "the shortest key the model allows",
-            key: repeated("k", TAG_KEY_MIN),
+            key: "k".repeat(TAG_KEY_MIN),
             value: "one-character-key".to_string(),
         },
         TagForm {
             case: "the longest key the model allows",
-            key: repeated("k", TAG_KEY_MAX),
+            key: "k".repeat(TAG_KEY_MAX),
             value: "longest-key".to_string(),
         },
         TagForm {
             case: "the longest value the model allows",
             key: "longest-value".to_string(),
-            value: repeated("v", TAG_VALUE_MAX),
+            value: "v".repeat(TAG_VALUE_MAX),
         },
     ]
 }
@@ -307,6 +306,22 @@ async fn a_tag_set_belongs_to_the_live_resource_and_not_to_its_arn() {
             );
         }
 
+        // What the first life carries before it is deleted: what its create attached,
+        // plus what was tagged onto it — so each row's setup is load-bearing rather than
+        // assumed.
+        let mut first_life: BTreeMap<String, String> = row
+            .created_with
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), format!("{value}-first")))
+            .collect();
+        first_life.extend(added.clone());
+        assert_eq!(
+            tags_of(&router, case, &first.arns[0]).await,
+            as_json(&first_life),
+            "case {case:?}: the first life must carry what its create and its tagging put \
+             on it"
+        );
+
         let deleted = call(
             &router,
             "DeleteCollection",
@@ -322,22 +337,7 @@ async fn a_tag_set_belongs_to_the_live_resource_and_not_to_its_arn() {
         // The ARN now names no live resource, in either of its forms, so the tagging
         // operations do not find it — the tag set went with the record.
         for arn in &first.arns {
-            for (operation, body) in [
-                ("ListTagsForResource", json!({})),
-                ("TagResource", json!({ "Tags": { "env": "after-delete" } })),
-                ("UntagResource", json!({ "TagKeys": ["env"] })),
-            ] {
-                let mut body = body;
-                body["ResourceArn"] = json!(arn);
-                let reply = call(&router, operation, body).await;
-                assert_eq!(
-                    (reply.status, reply.error_code().as_str()),
-                    (400, "ResourceNotFoundException"),
-                    "case {case:?}: {operation} on the deleted {arn} must not be found, \
-                     got {:?}",
-                    reply.body
-                );
-            }
+            assert_not_found_by_every_tagging_operation(&router, case, arn).await;
         }
 
         // The same identity created again is a NEW resource under the same ARN: it

@@ -361,22 +361,35 @@ async fn an_arn_naming_no_live_resource_is_not_found_by_any_tagging_operation() 
         stray_project,
         stream_processor,
     ] {
-        for (operation, body) in [
-            ("ListTagsForResource", json!({})),
-            ("TagResource", json!({ "Tags": { "env": "test" } })),
-            ("UntagResource", json!({ "TagKeys": ["env"] })),
-        ] {
-            let mut body = body;
-            body["ResourceArn"] = json!(arn);
-            let reply = call(&router, operation, body).await;
-            assert_eq!(
-                (reply.status, reply.error_code().as_str()),
-                (400, "ResourceNotFoundException"),
-                "case {operation} on {arn}: an ARN naming no live resource must not be \
-                 found, got {:?}",
-                reply.body
-            );
-        }
+        assert_not_found_by_every_tagging_operation(&router, "an ARN naming no live resource", &arn)
+            .await;
+    }
+}
+
+/// Every operation that reports or changes a resource's tags answers
+/// `ResourceNotFoundException` for `arn`, because it names no live resource of this store.
+///
+/// One place for the three-operation sweep, so a suite that deletes a resource and a suite
+/// that never created one assert the same thing about its ARN.
+pub(crate) async fn assert_not_found_by_every_tagging_operation(
+    router: &MultiServiceRouter,
+    case: &str,
+    arn: &str,
+) {
+    for (operation, body) in [
+        ("ListTagsForResource", json!({})),
+        ("TagResource", json!({ "Tags": { "env": "test" } })),
+        ("UntagResource", json!({ "TagKeys": ["env"] })),
+    ] {
+        let mut body = body;
+        body["ResourceArn"] = json!(arn);
+        let reply = call(router, operation, body).await;
+        assert_eq!(
+            (reply.status, reply.error_code().as_str()),
+            (400, "ResourceNotFoundException"),
+            "case {case:?}: {operation} on {arn} must not be found, got {:?}",
+            reply.body
+        );
     }
 }
 
