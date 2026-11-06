@@ -262,6 +262,28 @@ pub fn assert_iso8601(case: &str, value: Option<&Value>) -> String {
     rendered.to_string()
 }
 
+/// The epoch-millisecond INSTANT a rendered ISO8601 `date-time` names, read back through
+/// the SDK's own parser.
+///
+/// The ONE place a suite turns a reported timestamp into something comparable, because a
+/// rendering carries its fractional seconds only when they are non-zero and with trailing
+/// zeros trimmed (`…:11Z`, `…:11.1Z`, `…:11.284Z`): two renderings therefore do NOT
+/// compare chronologically as text — `Z` sorts after every digit, and `…:11.1Z` (100 ms)
+/// sorts after `…:11.12Z` (120 ms). Which of two reported instants came first is a
+/// question about the instants, so every case that asks it reads them here.
+pub fn millis_of_iso8601(case: &str, rendered: &str) -> i64 {
+    let instant = ::aws_smithy_types::DateTime::from_str(
+        rendered,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .unwrap_or_else(|error| {
+        panic!("case {case:?}: {rendered:?} is not a date-time timestamp: {error}")
+    });
+    instant.to_millis().unwrap_or_else(|error| {
+        panic!("case {case:?}: {rendered:?} does not convert to millis: {error}")
+    })
+}
+
 /// A 12-digit account id (the modelled `AccountId`: length 12..12, `^[0-9]+$`).
 pub fn account_id(n: u64) -> String {
     let id = format!("{:012}", 100_000_000_000u64 + n);

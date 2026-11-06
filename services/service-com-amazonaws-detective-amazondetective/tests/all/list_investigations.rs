@@ -35,7 +35,7 @@ use service_com_amazonaws_detective_amazondetective::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::support::{
-    call, create_graph_ok, emulator, error_code, error_message, ACCOUNT, REGION,
+    call, create_graph_ok, emulator, error_code, error_message, millis_of_iso8601, ACCOUNT, REGION,
 };
 
 /// The URIs of the investigation operations, from
@@ -240,26 +240,6 @@ fn rank(case: &str, ladder: &[&str], value: &str) -> usize {
         .unwrap_or_else(|| panic!("case {case:?}: {value:?} is not one of {ladder:?}"))
 }
 
-/// A rendered `date-time` as a key that orders CHRONOLOGICALLY as text.
-///
-/// An RFC 3339 rendering carries its fractional seconds only when they are non-zero,
-/// and with trailing zeros trimmed (`...:11Z`, `...:11.1Z`, `...:11.284Z`), so the
-/// renderings themselves do NOT sort chronologically: `Z` sorts after every digit, so
-/// plain text order puts `...:11Z` (the whole second) after `...:11.284Z`, and
-/// `...:11.1Z` (100 ms) after `...:11.12Z` (120 ms). Padding the fraction back out to
-/// the nine digits the format admits restores the order, so a case can compare two
-/// reported instants without parsing a calendar.
-fn chronological_key(case: &str, rendered: &str) -> String {
-    let body = rendered.strip_suffix('Z').unwrap_or_else(|| {
-        panic!("case {case:?}: expected a UTC ISO8601 date-time, got {rendered:?}")
-    });
-    let (whole, fraction) = match body.split_once('.') {
-        Some((whole, fraction)) => (whole, fraction),
-        None => (body, ""),
-    };
-    format!("{whole}.{fraction:0<9}")
-}
-
 #[tokio::test]
 async fn a_listing_reports_the_investigations_of_that_graph_as_a_read_of_each_reports_them() {
     let router = emulator();
@@ -397,9 +377,10 @@ async fn each_filter_criterion_narrows_the_listing_to_the_investigations_it_name
     let latest_created = created_times
         .iter()
         // The chronologically latest instant, which is not the textually largest
-        // rendering (see `chronological_key`); the value kept is the rendering itself,
-        // since that is what the filter row below carries.
-        .max_by_key(|rendered| chronological_key(case, rendered))
+        // rendering: which reported instant came last is decided on the INSTANTS
+        // ([`millis_of_iso8601`]). The value kept is the rendering itself, since that is
+        // what the filter row below carries.
+        .max_by_key(|rendered| millis_of_iso8601(case, rendered))
         .expect("the seeded graph holds investigations")
         .clone();
     let ids_created_at_latest: Vec<String> = listed
@@ -607,19 +588,15 @@ async fn the_results_are_ordered_by_the_field_the_request_names_in_the_order_it_
                     Some("STATUS") => {
                         rank(case, &STATUS_ORDER, &member(case, entry, "Status")) as i64
                     }
-                    // `CreatedTime` is compared as the chronological key its rendering
-                    // implies (see `chronological_key`); a field-less row sorts on the
-                    // id alone.
+                    // `CreatedTime` orders by the INSTANT it names, never by its
+                    // rendering ([`millis_of_iso8601`]); a field-less row sorts on the id
+                    // alone.
+                    Some("CREATED_TIME") => {
+                        millis_of_iso8601(case, &member(case, entry, "CreatedTime"))
+                    }
                     _ => 0,
                 };
-                let secondary = match field {
-                    Some("CREATED_TIME") => format!(
-                        "{}#{}",
-                        chronological_key(case, &member(case, entry, "CreatedTime")),
-                        member(case, entry, "InvestigationId")
-                    ),
-                    _ => member(case, entry, "InvestigationId"),
-                };
+                let secondary = member(case, entry, "InvestigationId");
                 (primary, secondary)
             })
             .collect();

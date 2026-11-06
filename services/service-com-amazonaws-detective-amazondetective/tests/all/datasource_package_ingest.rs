@@ -24,8 +24,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use aws_smithy_types::date_time::Format;
-use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
 use service_com_amazonaws_detective_amazondetective::state::{
     DATASOURCE_PACKAGE_STATE_STARTED, DATASOURCE_PACKAGE_STATE_STOPPED,
@@ -34,7 +32,8 @@ use service_com_amazonaws_detective_amazondetective::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::support::{
-    assert_iso8601, call, create_graph_ok, emulator, error_code, error_message, REGION,
+    assert_iso8601, call, create_graph_ok, emulator, error_code, error_message, millis_of_iso8601,
+    REGION,
 };
 
 /// Every value the modelled `DatasourcePackage` enum accepts, from
@@ -148,12 +147,7 @@ fn state_change_millis(case: &str, detail: &Value, state: &str) -> Option<i64> {
         &format!("{case}: {state} timestamp"),
         entry.get("Timestamp"),
     );
-    let parsed = DateTime::from_str(&rendered, Format::DateTime).unwrap_or_else(|error| {
-        panic!("case {case:?}: {rendered:?} is not a date-time timestamp: {error}")
-    });
-    Some(parsed.to_millis().unwrap_or_else(|error| {
-        panic!("case {case:?}: {rendered:?} does not convert to millis: {error}")
-    }))
+    Some(millis_of_iso8601(case, &rendered))
 }
 
 /// As [`state_change_millis`], for a state the package must have been in.
