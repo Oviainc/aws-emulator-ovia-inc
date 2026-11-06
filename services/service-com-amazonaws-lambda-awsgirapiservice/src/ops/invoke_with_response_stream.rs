@@ -415,6 +415,9 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
             client_context,
             tenant_id: input.tenant_id.clone(),
             request_id: crate::state::mint_request_id(),
+            // The AWS SDK this runtime supplies the handler reaches the rest of this
+            // emulator through the callback the framework handed THIS request.
+            aws: crate::state::AwsAccess::new(ctx.callback().clone(), &region),
         };
         let kms_key_arn = resolved_config.kms_key_arn.clone();
             (invocation, function_name, resource, kms_key_arn, stopped)

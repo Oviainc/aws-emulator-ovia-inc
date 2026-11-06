@@ -64,6 +64,13 @@ pub mod node;
 /// The runtime the handler runs under, in the language the handler is written in.
 mod bootstrap;
 
+/// The AWS SDK call seam a running handler reaches the rest of this emulator through.
+pub mod aws_api;
+pub use aws_api::AwsAccess;
+
+/// The AWS SDK modules a Python handler imports, which that seam is reached through.
+mod aws_sdk_guest;
+
 /// The `posix` module a run's Python is built on: this emulator's own, with no host call
 /// in it.
 mod host_posix;
@@ -233,6 +240,9 @@ pub struct Invocation {
     pub tenant_id: Option<String>,
     /// This invocation's request id.
     pub request_id: String,
+    /// How the handler reaches the rest of this emulator through the AWS SDK this runtime
+    /// supplies it ([`aws_api`]), or `None` where there is no seam to dispatch a call on.
+    pub aws: Option<AwsAccess>,
 }
 
 /// Why an invocation ran nothing at all.
@@ -374,6 +384,7 @@ pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnabl
                     client_context: invocation.client_context.as_deref(),
                     tenant_id: invocation.tenant_id.as_deref(),
                     budget,
+                    aws: invocation.aws.as_ref(),
                 }),
                 Engine::Node => node::run(&node::Run {
                     modules: &modules,
@@ -943,6 +954,7 @@ mod tests {
             client_context: None,
             tenant_id: None,
             request_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            aws: None,
         };
         let environment = runtime_environment(&invocation, SystemTime::UNIX_EPOCH);
         let cases: &[(&str, &str)] = &[

@@ -280,8 +280,8 @@ pub use recursion::{
 /// module.
 pub mod execution;
 pub use execution::{
-    engine_for, environment_key_fault, mint_request_id, run_invocation, runs_handler, Engine,
-    EnvironmentKeyFault, Invocation, Invoked, Unrunnable,
+    engine_for, environment_key_fault, mint_request_id, run_invocation, runs_handler, AwsAccess,
+    Engine, EnvironmentKeyFault, Invocation, Invoked, Unrunnable,
 };
 
 /// How large a stored .zip archive is once EXPANDED — the second size Lambda reports for a

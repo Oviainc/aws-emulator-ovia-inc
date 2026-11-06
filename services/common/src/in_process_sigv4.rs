@@ -52,10 +52,27 @@ pub async fn sign_in_process_request(
     region: &str,
     ctx: &OperationContext<'_>,
 ) -> Result<(), String> {
+    sign_callback_request(request, signing_name, region, ctx.callback()).await
+}
+
+/// The same signature, for a caller that holds the CALLBACK rather than the operation
+/// context it came from.
+///
+/// A call made outside the handler's own stack frame — from a task an operation spawned,
+/// or from a host function a running engine calls — has the callback
+/// ([`::smithy_server_runtime::EmbeddedEmulator`], which is `Clone` and `'static`) but no
+/// borrowed [`OperationContext`]. It is the same identity and the same settings either
+/// way, so there is one implementation and [`sign_in_process_request`] is this with the
+/// context's callback handed in.
+pub async fn sign_callback_request(
+    request: &mut ::http::Request<Vec<u8>>,
+    signing_name: &str,
+    region: &str,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+) -> Result<(), String> {
     use ::aws_credential_types::provider::ProvideCredentials;
 
-    let credentials = ctx
-        .callback()
+    let credentials = callback
         .aws_credentials_provider()
         .provide_credentials()
         .await

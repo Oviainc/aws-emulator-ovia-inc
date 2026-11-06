@@ -665,6 +665,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     client_context: client_context.clone(),
                     tenant_id: input.tenant_id.clone(),
                     request_id: crate::state::mint_request_id(),
+                    // The AWS SDK this runtime supplies the handler reaches the rest of
+                    // this emulator through, built from the callback the framework handed
+                    // THIS request — the same seam a synchronous invocation's run gets.
+                    aws: crate::state::AwsAccess::new(ctx.callback().clone(), &region),
                 };
                 record.queue_async_invocation(&version, &invocation.request_id, payload, now);
                 invocation
@@ -726,6 +730,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_context: client_context.clone(),
             tenant_id: input.tenant_id.clone(),
             request_id: crate::state::mint_request_id(),
+            // The AWS SDK this runtime supplies the handler reaches the rest of this
+            // emulator through the callback the framework handed THIS request.
+            aws: crate::state::AwsAccess::new(ctx.callback().clone(), &region),
         };
             (invocation, function_name, resource, kms_key_arn)
         };

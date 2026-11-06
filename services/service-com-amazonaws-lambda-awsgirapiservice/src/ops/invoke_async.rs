@@ -389,6 +389,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 client_context: None,
                 tenant_id: None,
                 request_id: request_id.clone(),
+                // The AWS SDK this runtime supplies the handler reaches the rest of this
+                // emulator through, built from the callback the framework handed THIS
+                // request — the same seam a synchronous invocation's run gets.
+                aws: crate::state::AwsAccess::new(ctx.callback().clone(), &region),
             };
             record.queue_async_invocation(&version, &request_id, input.invoke_args, now);
             Some(invocation)

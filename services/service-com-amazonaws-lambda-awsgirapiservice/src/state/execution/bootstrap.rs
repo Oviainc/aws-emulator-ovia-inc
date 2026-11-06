@@ -20,8 +20,9 @@
 //! surface stays as small as a string in and a string out:
 //!
 //! * `__lambda_input` — a JSON document the host sets before this source runs: the
-//!   handler name, the package's modules, the event, the environment the invocation runs
-//!   with, and the deadline.
+//!   handler name, the package's modules, the modules the RUNTIME supplies beside them
+//!   (the AWS SDK), the event, the environment the invocation runs with, and the
+//!   deadline.
 //! * `__lambda_entry` — the one function this source leaves behind, which the host calls
 //!   once the bounds are in place; it answers a JSON document carrying what the handler
 //!   returned, or the error it raised.
@@ -190,6 +191,15 @@ def _bounded_sleep(seconds):
 def _run(request):
     sources = request["modules"]
     sys.meta_path.insert(0, _PackageFinder(sources, importlib.util.spec_from_loader))
+    # The modules the RUNTIME supplies — the AWS SDK a managed runtime ships — are
+    # resolved AFTER the deployment package's own entries and after the standard library,
+    # so a package shipping its own copy of one of them wins, exactly as the package
+    # directory precedes the runtime's site-packages on a real runtime's `sys.path`.
+    runtime_sources = request.get("runtimeModules") or {}
+    if runtime_sources:
+        sys.meta_path.append(
+            _PackageFinder(runtime_sources, importlib.util.spec_from_loader)
+        )
     time.sleep = _bounded_sleep
 
     handler = request["handler"]

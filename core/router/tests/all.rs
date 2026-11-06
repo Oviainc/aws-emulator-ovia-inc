@@ -853,6 +853,8 @@ mod cloudformation_refuses_mq_brokers;
 mod cloudformation_provisions_agentcore_workload_identities;
 #[path = "all/events_lambda_target_resource_policy.rs"]
 mod events_lambda_target_resource_policy;
+#[path = "all/events_lambda_target_runs_the_handler.rs"]
+mod events_lambda_target_runs_the_handler;
 #[path = "all/cloudformation_provisions_lambda_functions.rs"]
 mod cloudformation_provisions_lambda_functions;
 #[path = "all/cloudformation_updates_lambda_functions.rs"]

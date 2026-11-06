@@ -26,10 +26,12 @@
 //!   own variables held in memory, the working directory is the task root the runtime
 //!   reports, randomness comes from the host's own generator, and every call that would
 //!   reach a host file, process or descriptor raises;
-//! * the only host functions the guest can call are the three on [`HOST_MODULE`]: the
-//!   invocation log, a sleep clamped to what is left of the run, and the step hook below.
-//!   No host path, host environment variable, host credential or other function's state is
-//!   reachable from guest code.
+//! * the only host functions the guest can call are the four on [`HOST_MODULE`]: the
+//!   invocation log, a sleep clamped to what is left of the run, the step hook below, and
+//!   ONE AWS SDK call into this same emulator ([`super::aws_api`], which decides which
+//!   services are reachable, signs the request itself and bounds it by what the run has
+//!   left). No host path, host environment variable, host credential or other function's
+//!   state is reachable from guest code.
 //!
 //! # Bounds
 //!
@@ -65,6 +67,7 @@ use rustpython_vm::{AsObject, Interpreter, PyObjectRef, PyRef, PyResult, Setting
 // the shared ones ([`super::outcome`]) rather than this interpreter's own.
 pub use super::outcome::{Budget, Completion, Finished, Stop};
 
+use super::aws_api::{AwsAccess, Refusal, MAX_CALLS_PER_RUN};
 use super::outcome::{captured, Capture};
 use super::package::PackageModule;
 
@@ -193,6 +196,10 @@ pub struct Run<'a> {
     pub tenant_id: Option<&'a str>,
     /// What this run may spend.
     pub budget: Budget,
+    /// How the handler reaches the rest of this emulator through the AWS SDK this runtime
+    /// supplies it, or `None` for a run with no seam to dispatch a call on — whose
+    /// `boto3` reports every call as one that was not made.
+    pub aws: Option<&'a AwsAccess>,
 }
 
 /// Run `request`'s handler to completion.
@@ -322,7 +329,7 @@ fn prepare(
     // to be had: a guest that drops this one cannot import a second.
     modules.set_item(
         HOST_MODULE,
-        host_module(vm, capture, bounds).into(),
+        host_module(vm, capture, bounds, request.aws).into(),
         vm,
     )?;
     // A built-in module can no longer be CREATED: every one the guest can reach is the
@@ -537,6 +544,7 @@ fn runtime_input(request: &Run<'_>) -> Result<String, String> {
     let document = ::serde_json::json!({
         "handler": request.handler,
         "modules": modules,
+        "runtimeModules": runtime_modules(),
         "environment": environment,
         "event": request.event,
         "requestId": request.request_id,
@@ -546,6 +554,16 @@ fn runtime_input(request: &Run<'_>) -> Result<String, String> {
         "deadlineEpochMs": deadline_epoch_ms,
     });
     ::serde_json::to_string(&document).map_err(|error| error.to_string())
+}
+
+/// The modules this RUNTIME supplies on the handler's import path, beside the deployment
+/// package's own: the AWS SDK a managed `python3.x` runtime ships
+/// ([`super::aws_sdk_guest`]).
+fn runtime_modules() -> ::serde_json::Map<String, ::serde_json::Value> {
+    super::aws_sdk_guest::runtime_modules()
+        .into_iter()
+        .map(|module| (module.path, ::serde_json::Value::String(module.source)))
+        .collect()
 }
 
 /// Install the trace hook the step and deadline bounds are checked from, then take away
@@ -592,12 +610,14 @@ fn clamp_recursion(vm: &VirtualMachine, limit: usize) -> PyResult<()> {
     Ok(())
 }
 
-/// The module the three host functions live on: the invocation log, the bounded sleep and
-/// the step hook. Nothing else of the host is reachable from guest code.
+/// The module the four host functions live on: the invocation log, the bounded sleep, the
+/// step hook and the one AWS SDK call. Nothing else of the host is reachable from guest
+/// code.
 fn host_module(
     vm: &VirtualMachine,
     capture: &Arc<Mutex<Capture>>,
     bounds: &Arc<Bounds>,
+    aws: Option<&AwsAccess>,
 ) -> PyRef<PyModule> {
     let module = vm.new_module(HOST_MODULE, vm.ctx.new_dict(), None);
     let log_capture = Arc::clone(capture);
@@ -629,7 +649,100 @@ fn host_module(
             Some(stop) => Err(vm.new_runtime_error(stop.reason().to_owned())),
         },
     );
+    // The ONE call a handler reaches another service of this emulator by. The service
+    // table, the signature and the destination are all [`super::aws_api`]'s, so what the
+    // guest decides is only which operation of which reachable service it asks for and
+    // what it sends; the two bounds that are this run's — how many calls it may make and
+    // how long one may take — are held here, where no guest code can reach them.
+    let access = aws.cloned();
+    let call_bounds = Arc::clone(bounds);
+    let made = Arc::new(AtomicU64::new(0));
+    set_function(
+        vm,
+        &module,
+        "aws",
+        move |args: FuncArgs, vm: &VirtualMachine| {
+            let (service, operation, region, body): (String, String, String, String) =
+                args.bind(vm)?;
+            // A run whose budget is already spent makes no further call: the latched stop
+            // is its answer, so work it starts afterwards is work nothing will report.
+            if let Some(stop) = call_bounds.stopped() {
+                return Err(vm.new_runtime_error(stop.reason().to_owned()));
+            }
+            if made.fetch_add(1, Ordering::Relaxed) >= MAX_CALLS_PER_RUN as u64 {
+                return Err(vm.new_runtime_error(format!(
+                    "one invocation may make at most {MAX_CALLS_PER_RUN} AWS SDK calls"
+                )));
+            }
+            let Some(access) = access.as_ref() else {
+                return Ok(vm
+                    .ctx
+                    .new_str(refusal_answer(
+                        "not_made",
+                        "this invocation was given no AWS SDK seam, so no call was made",
+                    ))
+                    .into());
+            };
+            let remaining = call_bounds.remaining();
+            if remaining.is_zero() {
+                return Err(vm.new_runtime_error(Stop::Deadline.reason().to_owned()));
+            }
+            let answered = access.call(&service, &operation, &region, &body, remaining);
+            Ok(vm.ctx.new_str(call_answer(&answered)).into())
+        },
+    );
     module
+}
+
+/// What the guest reads back from one AWS SDK call: the service's own answer, or the
+/// reason no call was made.
+///
+/// A document rather than a Python object, for the reason the runtime's own protocol is one
+/// ([`super::bootstrap`]): the host's interpreter surface stays a string in and a string
+/// out.
+fn call_answer(answered: &Result<super::aws_api::Answer, Refusal>) -> String {
+    let document = match answered {
+        Ok(answer) => ::serde_json::json!({
+            "status": answer.status,
+            "body": answer.body,
+            "errorType": answer.error_type,
+            "requestId": answer.request_id,
+        }),
+        Err(Refusal::UnknownService) => {
+            return refusal_answer(
+                "unknown_service",
+                &super::aws_api::reachable_services().join(", "),
+            )
+        }
+        Err(Refusal::UnknownOperation) => return refusal_answer("unknown_operation", ""),
+        Err(Refusal::TimedOut) => return refusal_answer("timed_out", ""),
+        Err(Refusal::RequestTooLarge) => {
+            return refusal_answer(
+                "not_made",
+                &format!(
+                    "the request document is larger than the {} bytes one AWS SDK call may \
+                     carry",
+                    super::aws_api::MAX_REQUEST_BYTES
+                ),
+            )
+        }
+        Err(Refusal::ResponseTooLarge) => {
+            return refusal_answer(
+                "not_made",
+                &format!(
+                    "the answer is larger than the {} bytes one AWS SDK call may read back",
+                    super::aws_api::MAX_RESPONSE_BYTES
+                ),
+            )
+        }
+        Err(Refusal::NotMade(detail)) => return refusal_answer("not_made", detail),
+    };
+    document.to_string()
+}
+
+/// The answer for a call that was not made, naming which refusal it was.
+fn refusal_answer(refused: &str, detail: &str) -> String {
+    ::serde_json::json!({ "refused": refused, "detail": detail }).to_string()
 }
 
 /// The names Python's `os` looks for on the module it is built on, every one of which
@@ -925,6 +1038,9 @@ mod tests {
                     client_context: None,
                     tenant_id: None,
                     budget,
+                    // These runs are the interpreter's own containment and bounds: no
+                    // emulator is standing behind them, so there is no SDK seam either.
+                    aws: None,
                 })
             })
             .expect("a run thread")

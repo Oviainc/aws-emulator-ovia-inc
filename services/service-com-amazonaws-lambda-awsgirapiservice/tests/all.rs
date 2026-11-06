@@ -39,6 +39,8 @@ mod alias_update_not_found_sentence;
 mod alias_version_not_found_sentence;
 #[path = "all/alias_write_not_found_sentence.rs"]
 mod alias_write_not_found_sentence;
+#[path = "all/async_delivery.rs"]
+mod async_delivery;
 #[path = "all/async_invocation.rs"]
 mod async_invocation;
 #[path = "all/asynchronous_invoke_run.rs"]
@@ -183,6 +185,8 @@ mod function_version_listing;
 mod function_versions_by_capacity_provider;
 #[path = "all/functions_by_code_signing_config.rs"]
 mod functions_by_code_signing_config;
+#[path = "all/handler_aws_sdk.rs"]
+mod handler_aws_sdk;
 #[path = "all/invocation_count_series.rs"]
 mod invocation_count_series;
 #[path = "all/invocation_refusal_diagnostics.rs"]
