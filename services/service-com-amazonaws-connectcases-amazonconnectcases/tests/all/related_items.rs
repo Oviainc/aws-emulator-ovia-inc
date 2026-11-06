@@ -578,38 +578,22 @@ async fn an_association_is_accepted_at_each_modelled_bound_and_refused_past_it()
 }
 
 /// One content of every kind an association can carry, as
-/// `(RelatedItemType value, content)`. The model names the six members of
-/// `RelatedItemInputContent` after the six values of `RelatedItemType`
+/// `(RelatedItemType value, content)`, taken from the ONE association table
+/// this suite keeps ([`associations`]) so a content shape is spelled once. The
+/// model names the six members of `RelatedItemInputContent` after the six values
+/// of `RelatedItemType`
 /// (`smithy_query(query="shape",shape="RelatedItemInputContent,RelatedItemType")`),
-/// so each row is the content that one declared type agrees with and that every
-/// other one contradicts.
-fn content_of_every_kind(text_field: &str, linked_case_id: &str) -> Vec<(&'static str, Value)> {
-    vec![
-        (
-            "Comment",
-            json!({ "comment": { "body": "a note", "contentType": "Text/Plain" } }),
-        ),
-        (
-            "ConnectCase",
-            json!({ "connectCase": { "caseId": linked_case_id } }),
-        ),
-        ("Contact", json!({ "contact": { "contactArn": CONTACT_ARN } })),
-        (
-            "Custom",
-            json!({ "custom": { "fields": [
-                { "id": text_field, "value": { "stringValue": "order-4711" } },
-            ] } }),
-        ),
-        ("File", json!({ "file": { "fileArn": FILE_ARN } })),
-        (
-            "Sla",
-            json!({ "sla": { "slaInputConfiguration": {
-                "name": "resolve before the target",
-                "type": "CaseField",
-                "targetSlaMinutes": 60,
-            } } }),
-        ),
-    ]
+/// so each entry is the content that one declared type agrees with and that
+/// every other one contradicts.
+fn content_of_every_kind(
+    text_field: &str,
+    number_field: &str,
+    linked_case_id: &str,
+) -> Vec<(&'static str, Value)> {
+    associations(text_field, number_field, linked_case_id)
+        .into_iter()
+        .map(|row| (row.item_type, row.content))
+        .collect()
 }
 
 /// The refusal a mismatched pair earns: the DECLARED type upper-cased, then the
@@ -633,7 +617,7 @@ async fn every_mismatched_type_and_content_pair_is_refused_with_the_services_fix
     let linked_case_id = create_case(&emulator, &domain_id, &template_id, "the linked case").await;
     let path = related_items_path(&domain_id, &case_id);
 
-    let contents = content_of_every_kind(&text_field, &linked_case_id);
+    let contents = content_of_every_kind(&text_field, &number_field, &linked_case_id);
     // The catalog above is the whole content vocabulary, so the cross product
     // below is every ordered mismatched pair rather than the one recorded pair.
     for item_type in RELATED_ITEM_TYPE_VALUES {
@@ -710,7 +694,6 @@ async fn every_mismatched_type_and_content_pair_is_refused_with_the_services_fix
     // The control: each declared type agrees with the content of its own kind,
     // and is accepted — so the refusals above are about the contradiction and
     // not about the operation or the content.
-    let mut accepted = 0;
     for (kind, content) in &contents {
         let case = format!("{kind} declared with {kind} content");
         let created = emulator
@@ -726,12 +709,11 @@ async fn every_mismatched_type_and_content_pair_is_refused_with_the_services_fix
             is_minted_id(&related_item_id),
             "case {case:?}: an agreeing pair is stored under a minted id, got {created:?}"
         );
-        accepted += 1;
     }
     let history = audit_events(&emulator, "after the agreeing pairs", &domain_id, &case_id).await;
     assert_eq!(
         history.len(),
-        accepted + 1,
+        contents.len() + 1,
         "case \"after the agreeing pairs\": one recorded association per accepted request, \
          got {history:?}"
     );
