@@ -27,6 +27,8 @@ mod image_content_refusal;
 mod photographic_enrolment;
 #[path = "all/projects.rs"]
 mod projects;
+#[path = "all/resource_tag_values.rs"]
+mod resource_tag_values;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

@@ -40,10 +40,10 @@ const REGION: &str = "us-east-1";
 /// One taggable resource, as this suite holds it: a label for failure messages, a marker
 /// that makes its tag VALUES its own (so one resource's tags cannot pass for another's),
 /// every ARN form that names it, and the tag set it must be carrying.
-struct TaggedResource {
-    case: &'static str,
+pub(crate) struct TaggedResource {
+    pub(crate) case: &'static str,
     marker: &'static str,
-    arns: Vec<String>,
+    pub(crate) arns: Vec<String>,
     expected: BTreeMap<String, String>,
 }
 
@@ -77,7 +77,7 @@ struct Step {
 }
 
 /// A tag map as it comes back on the wire.
-fn as_json(tags: &BTreeMap<String, String>) -> Value {
+pub(crate) fn as_json(tags: &BTreeMap<String, String>) -> Value {
     Value::Object(
         tags.iter()
             .map(|(key, value)| (key.clone(), json!(value)))
@@ -86,7 +86,7 @@ fn as_json(tags: &BTreeMap<String, String>) -> Value {
 }
 
 /// The tags `ListTagsForResource` reports for the resource `arn` names.
-async fn tags_of(router: &MultiServiceRouter, case: &str, arn: &str) -> Value {
+pub(crate) async fn tags_of(router: &MultiServiceRouter, case: &str, arn: &str) -> Value {
     let reply = call(router, "ListTagsForResource", json!({ "ResourceArn": arn })).await;
     assert_eq!(
         reply.status, 200,
@@ -98,7 +98,7 @@ async fn tags_of(router: &MultiServiceRouter, case: &str, arn: &str) -> Value {
 
 /// `CreateCollection` for `collection_id` with `tags` attached, as a resource of the
 /// table: its ARN as the store holds it, and the label-less form its own answer reports.
-async fn collection_resource(
+pub(crate) async fn collection_resource(
     router: &MultiServiceRouter,
     case: &'static str,
     marker: &'static str,
@@ -134,7 +134,7 @@ async fn collection_resource(
 
 /// `CreateProject` for `project_name` with `tags` attached, as a resource of the table:
 /// the ARN the service minted for it, and the same ARN without its label.
-async fn project_resource(
+pub(crate) async fn project_resource(
     router: &MultiServiceRouter,
     case: &'static str,
     marker: &'static str,
