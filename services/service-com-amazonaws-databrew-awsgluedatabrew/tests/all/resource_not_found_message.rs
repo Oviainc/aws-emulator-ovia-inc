@@ -12,6 +12,10 @@
 //! shape="ResourceNotFoundException")`) describes the error CLASS; it is not the
 //! message a particular lookup answers with.
 //!
+//! A project's miss carries DataBrew's project sentence (`The project <Name> wasn't
+//! found.`), which `tests/all/project_not_found_wording.rs` spans over the project
+//! operations.
+//!
 //! A lookup that addresses a (recipe, VERSION) pair has DataBrew's own sentence for
 //! that pair (`The recipe <Name> for version <RecipeVersion> wasn't found.`), which
 //! `tests/all/recipe_version_resolution.rs` is where the version forms are spanned.

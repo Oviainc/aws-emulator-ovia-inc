@@ -318,7 +318,7 @@ async fn a_project_name_is_unique_and_from_the_documented_character_set() {
     );
     assert_eq!(
         error_message(&absent),
-        "Project ghost wasn't found.",
+        "The project ghost wasn't found.",
         "case \"a project nobody created\": unexpected message, got {:?}",
         absent.body
     );

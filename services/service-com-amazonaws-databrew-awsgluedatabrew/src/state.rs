@@ -39,6 +39,25 @@ fn stated_in_short_form(kind: &str) -> bool {
     SHORT_FORM_RESOURCE_KINDS.contains(&kind)
 }
 
+/// The resource kinds whose NOT-FOUND sentence DataBrew words with the definite
+/// article and the kind spelled in LOWER case (`The project orders wasn't found.`),
+/// rather than with the capitalised bare kind the sentence form otherwise takes
+/// (`Dataset orders wasn't found.`).
+///
+/// Like [`SHORT_FORM_RESOURCE_KINDS`] this wording belongs to the RESOURCE the lookup
+/// addressed rather than to the operation that addressed it, so a kind listed here
+/// reads identically from every operation that resolves it by name and an operation
+/// added on such a kind needs no case of its own. A recipe addressed together with a
+/// version is worded this way too, in the pair sentence
+/// [`recipe_version_not_found_message`] builds.
+const DEFINITE_ARTICLE_NOT_FOUND_KINDS: [&str; 1] = ["Project"];
+
+/// Whether DataBrew words `kind`'s not-found sentence with the definite article and the
+/// kind in lower case ([`DEFINITE_ARTICLE_NOT_FOUND_KINDS`]).
+fn not_found_stated_with_article(kind: &str) -> bool {
+    DEFINITE_ARTICLE_NOT_FOUND_KINDS.contains(&kind)
+}
+
 /// The message DataBrew answers a `ResourceNotFoundException` with: the kind of
 /// resource the lookup addressed, the identifier the request carried for it, and the
 /// predicate stating it was not found.
@@ -48,11 +67,16 @@ fn stated_in_short_form(kind: &str) -> bool {
 /// answers with: DataBrew builds that message from the request, so a client can tell
 /// which resource was missing, and of which kind. `kind` is the resource kind as
 /// DataBrew names it in prose, capitalised (`Dataset`, `Job`, `Recipe`, `Schedule`);
-/// `identifier` is what the request looked the resource up by. The predicate is the
-/// one DataBrew words that kind's refusals with ([`SHORT_FORM_RESOURCE_KINDS`]).
+/// `identifier` is what the request looked the resource up by. The sentence is the one
+/// DataBrew words that kind's refusals with: the short, period-less predicate for the
+/// kinds listed in [`SHORT_FORM_RESOURCE_KINDS`], the definite-article sentence for
+/// those in [`DEFINITE_ARTICLE_NOT_FOUND_KINDS`], and the capitalised bare-kind
+/// sentence for every other kind.
 pub fn not_found_message(kind: &str, identifier: &str) -> String {
     if stated_in_short_form(kind) {
         format!("{kind} {identifier} not found")
+    } else if not_found_stated_with_article(kind) {
+        format!("The {} {identifier} wasn't found.", kind.to_lowercase())
     } else {
         format!("{kind} {identifier} wasn't found.")
     }
@@ -68,6 +92,55 @@ pub fn not_found_message(kind: &str, identifier: &str) -> String {
 /// client can tell "no such recipe" from "that recipe holds no such version".
 pub fn recipe_version_not_found_message(name: &str, version: &str) -> String {
     format!("The recipe {name} for version {version} wasn't found.")
+}
+
+/// The `ErrorMessage` a PER-ITEM version failure reports for a version the recipe does
+/// not hold: the recipe name the request carried and the version identifier that item
+/// asked for.
+///
+/// A batch version delete reports each version's failure as an item of its own rather
+/// than refusing the whole request, and the item's sentence states the pair it could
+/// not resolve the same way a single lookup does — but in the per-item wording recorded
+/// for this operation, which names the version without the `for` of
+/// [`recipe_version_not_found_message`].
+pub fn recipe_version_item_not_found_message(name: &str, version: &str) -> String {
+    format!("The recipe {name} version {version} wasn't found.")
+}
+
+/// The `ErrorMessage` a per-item version failure reports for a version a PROJECT is
+/// developing: the version identifier the item asked for and the project that holds it,
+/// read from state.
+///
+/// A project develops its recipe's working version, so that version cannot be deleted
+/// while the project exists; the item names the project so a client knows what to delete
+/// first. The phrasing follows the one recorded for this refusal — the versions, then
+/// the project that holds them — with both parts read from the request and from state.
+pub fn recipe_version_used_by_project_message(version: &str, project: &str) -> String {
+    format!("Recipe versions {version} are used by project {project}")
+}
+
+/// The `ErrorMessage` a per-item version failure reports for a version a JOB runs: the
+/// version identifier the item asked for and the job whose recipe reference names it.
+///
+/// A job runs one version of one recipe (model: `Job$RecipeReference`), so a version a
+/// job references cannot be deleted out from under it. The sentence is the one
+/// [`recipe_version_used_by_project_message`] states, for a holder that is a job.
+pub fn recipe_version_used_by_job_message(version: &str, job: &str) -> String {
+    format!("Recipe versions {version} are used by job {job}")
+}
+
+/// The `ErrorMessage` a per-item version failure reports for the working version of a
+/// recipe that still holds other versions.
+///
+/// The rule is stated on the operation itself — "The LATEST_WORKING version will only be
+/// deleted if the recipe has no other versions" (model: `BatchDeleteRecipeVersion`) — and
+/// the item states exactly that rule, which has no variable part: the version this item
+/// is about is already its `RecipeVersion` member.
+pub fn working_version_not_last_message() -> String {
+    format!(
+        "The {LATEST_WORKING} version will only be deleted if the recipe has no other \
+         versions."
+    )
 }
 
 /// The message a schedule write answers its refusal with when a name in `JobNames`
@@ -765,6 +838,22 @@ impl RecipeRecord {
         self.published.push(frozen);
         self.renumber_working();
         version
+    }
+
+    /// Remove the published versions `versions` names from this recipe's history, and
+    /// renumber the working draft onto the major it now revises.
+    ///
+    /// A delete of a published version changes which versions the recipe holds, so the
+    /// draft's number — a function of that history, not a number of its own
+    /// ([`RecipeRecord::renumber_working`]) — is owed the same recomputation a publish
+    /// owes it: dropping the newest published major leaves the draft revising the
+    /// highest major that is left, and dropping every published version leaves it back
+    /// at major 0. The draft keeps its definition and its audit: a delete of another
+    /// version does not edit it.
+    pub fn delete_published_versions(&mut self, versions: &[String]) {
+        self.published
+            .retain(|held| !versions.contains(&held.version));
+        self.renumber_working();
     }
 }
 

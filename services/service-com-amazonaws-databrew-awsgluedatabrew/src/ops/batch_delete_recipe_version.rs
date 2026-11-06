@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDeleteRecipeVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDeleteRecipeVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDeleteRecipeVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes versions of one stored recipe, addressed by name, and reports the versions it
+//! could not delete ONE BY ONE rather than refusing the whole call: the request itself is
+//! rejected only for the reasons the model documents (no such recipe, an identifier this
+//! operation does not accept, a duplicate entry), and every other reason a single version
+//! survives — it names no version this recipe holds, a project develops it, a job runs it,
+//! or it is the working version of a recipe that still holds others — is an item of the
+//! response's `Errors` list, with the status of that refusal as its `ErrorCode`.
 //!
 //! ## Shape of an operation
 //!
@@ -95,10 +94,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-databrew-awsgluedatabre
 // here — hence the `BatchDeleteRecipeVersionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.databrew#BatchDeleteRecipeVersion")]
+// `InternalServerException` (HTTP 500) is widened in: the service models it, this
+// operation does not list it, and it is the only honest answer for an engine that
+// holds no state — a mounting fault, never a client error.
+#[smithy_macros::operation_error(
+    "com.amazonaws.databrew#BatchDeleteRecipeVersion",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum BatchDeleteRecipeVersionErrorModeled {
     ConflictException(ConflictException),
+    InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
 }
@@ -115,6 +121,41 @@ pub type BatchDeleteRecipeVersionError = crate::scaffolded::Scaffolded<BatchDele
 impl From<BatchDeleteRecipeVersionErrorModeled> for BatchDeleteRecipeVersionError {
     fn from(modeled: BatchDeleteRecipeVersionErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// The status a version the recipe does not hold is reported with: the status the
+/// modelled `ResourceNotFoundException` carries, since that is the refusal the item
+/// states.
+const VERSION_NOT_FOUND_STATUS: u16 = 404;
+
+/// The status a version something still holds is reported with: the status the modelled
+/// `ConflictException` carries, since a version a project develops, a job runs, or that
+/// is the working version of a recipe with others beside it is exactly the inconsistent
+/// state that error is for.
+const VERSION_CONFLICT_STATUS: u16 = 409;
+
+/// This operation's modelled 400, for a request rejected by a rule the model's own
+/// constraints cannot express.
+fn refused_as_invalid(message: String) -> BatchDeleteRecipeVersionError {
+    BatchDeleteRecipeVersionErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// One item of the response's `Errors` list: the version the item is about, the status
+/// of the refusal that kept it, and that refusal's own sentence.
+///
+/// `ErrorCode` is an HTTP status written as three digits (model:
+/// `RecipeVersionErrorDetail$ErrorCode` is `pattern ^[1-5][0-9][0-9]$`), so the code an
+/// item carries is the status the same refusal answers with when it is the whole
+/// request's.
+fn version_failure(version: &str, status: u16, message: String) -> RecipeVersionErrorDetail {
+    RecipeVersionErrorDetail {
+        error_code: Some(status.to_string()),
+        error_message: Some(message),
+        recipe_version: Some(version.to_string()),
     }
 }
 
@@ -152,20 +193,230 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDeleteRecipeVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeleteRecipeVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDeleteRecipeVersion"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchDeleteRecipeVersionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "DataBrew is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+        // Every version this request addresses belongs to ONE recipe, addressed by name,
+        // so a name this account holds no recipe under rejects the whole request — the
+        // first of the documented wholesale rejections ("The entire request will be
+        // rejected if: The recipe does not exist. There is an invalid version identifier
+        // in the list of versions. The version list is empty. The version list size
+        // exceeds 50. The version list contains duplicate entries."), which is the order
+        // they are checked in here.
+        let Some(recipe) = store.recipes.get(&input.name) else {
+            return Err(
+                BatchDeleteRecipeVersionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::not_found_message("Recipe", &input.name)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let working_version = recipe.working.version.clone();
+        let developing_project = recipe.project_name.clone();
+        let published: Vec<String> = recipe
+            .published
+            .iter()
+            .map(|held| held.version.clone())
+            .collect();
+        let latest_published = published.last().cloned();
+
+        // An empty list and one longer than 50 are the modelled `len 1..50` bounds,
+        // already refused before this handler runs; the identifier set and the duplicate
+        // rule are not modelled, so they are refused here, with nothing deleted.
+        let mut named: Vec<String> = Vec::new();
+        for requested in &input.recipe_versions {
+            // "You can specify numeric versions (X.Y) or LATEST_WORKING. LATEST_PUBLISHED
+            // is not supported" (model:
+            // `BatchDeleteRecipeVersionRequest$RecipeVersions`), so the alias every
+            // lookup accepts is an invalid identifier HERE.
+            if requested == crate::state::LATEST_PUBLISHED {
+                return Err(refused_as_invalid(format!(
+                    "RecipeVersions must name numeric versions X.Y or {}: {} is not \
+                     supported by this operation",
+                    crate::state::LATEST_WORKING,
+                    crate::state::LATEST_PUBLISHED
+                )));
+            }
+            if let Err(message) =
+                crate::state::validate_recipe_version("RecipeVersions", requested)
+            {
+                return Err(refused_as_invalid(message));
+            }
+            // A duplicate entry is one naming a version this list already names, and
+            // `LATEST_WORKING` and the working version's own number name the SAME
+            // version — so the rule is checked over the version each identifier resolves
+            // to rather than over the identifier as written.
+            let addressed = if *requested == crate::state::LATEST_WORKING {
+                working_version.clone()
+            } else {
+                requested.clone()
+            };
+            if named.contains(&addressed) {
+                return Err(refused_as_invalid(format!(
+                    "RecipeVersions must not name a version twice: {requested}"
+                )));
+            }
+            named.push(addressed);
+        }
+
+        // The jobs that run a version of THIS recipe, by the identifier each job's recipe
+        // reference addresses it with (model: `Job$RecipeReference`). The store is keyed
+        // by job name, so the job reported for a version is the first in name order, and a
+        // reference that carries no version addresses the latest published one exactly as
+        // a versionless lookup does.
+        let mut job_of_version: ::std::collections::BTreeMap<String, String> =
+            ::std::collections::BTreeMap::new();
+        for job in store.jobs.values() {
+            let Some(reference) = &job.recipe_reference else {
+                continue;
+            };
+            if reference.name != input.name {
+                continue;
+            }
+            let addressed = reference
+                .recipe_version
+                .clone()
+                .unwrap_or_else(|| crate::state::LATEST_PUBLISHED.to_string());
+            job_of_version
+                .entry(addressed)
+                .or_insert_with(|| job.name.clone());
+        }
+        // The first job, in name order, that addresses a version by any of the
+        // identifiers that resolve to it.
+        let job_running = |identifiers: &[&str]| -> Option<String> {
+            identifiers
+                .iter()
+                .filter_map(|identifier| job_of_version.get(*identifier))
+                .min()
+                .cloned()
+        };
+
+        // Each version is decided on its own: the ones that can go are deleted and the
+        // rest become items of `Errors` ("The request will complete successfully, but with
+        // partial failures, if: A version does not exist. A version is being used by a
+        // job. You specify LATEST_WORKING, but it's being used by a project. The version
+        // fails to be deleted.").
+        let mut failures: ::std::collections::BTreeMap<String, RecipeVersionErrorDetail> =
+            ::std::collections::BTreeMap::new();
+        let mut deleted: Vec<String> = Vec::new();
+        let mut working_requested: Option<String> = None;
+
+        for requested in &input.recipe_versions {
+            // `LATEST_WORKING` and the working version's own number address the same
+            // version, and it is deleted only once the others this request names are
+            // gone, so it is decided last.
+            if *requested == crate::state::LATEST_WORKING || *requested == working_version {
+                working_requested = Some(requested.clone());
+                continue;
+            }
+            if !published.contains(requested) {
+                failures.insert(
+                    requested.clone(),
+                    version_failure(
+                        requested,
+                        VERSION_NOT_FOUND_STATUS,
+                        crate::state::recipe_version_item_not_found_message(
+                            &input.name,
+                            requested,
+                        ),
+                    ),
+                );
+                continue;
+            }
+            let mut addressed_by: Vec<&str> = vec![requested.as_str()];
+            if latest_published.as_deref() == Some(requested.as_str()) {
+                addressed_by.push(crate::state::LATEST_PUBLISHED);
+            }
+            if let Some(job) = job_running(&addressed_by) {
+                failures.insert(
+                    requested.clone(),
+                    version_failure(
+                        requested,
+                        VERSION_CONFLICT_STATUS,
+                        crate::state::recipe_version_used_by_job_message(requested, &job),
+                    ),
+                );
+                continue;
+            }
+            deleted.push(requested.clone());
+        }
+
+        // Deleting the working version leaves nothing of the recipe to hold the rest, so
+        // it is the record itself that goes — and only when nothing holds that version:
+        // "The LATEST_WORKING version will only be deleted if the recipe has no other
+        // versions."
+        let mut remove_recipe = false;
+        if let Some(requested) = working_requested {
+            let others_left = published.iter().any(|held| !deleted.contains(held));
+            if let Some(project) = &developing_project {
+                failures.insert(
+                    requested.clone(),
+                    version_failure(
+                        &requested,
+                        VERSION_CONFLICT_STATUS,
+                        crate::state::recipe_version_used_by_project_message(&requested, project),
+                    ),
+                );
+            } else if others_left {
+                failures.insert(
+                    requested.clone(),
+                    version_failure(
+                        &requested,
+                        VERSION_CONFLICT_STATUS,
+                        crate::state::working_version_not_last_message(),
+                    ),
+                );
+            } else if let Some(job) =
+                job_running(&[crate::state::LATEST_WORKING, working_version.as_str()])
+            {
+                failures.insert(
+                    requested.clone(),
+                    version_failure(
+                        &requested,
+                        VERSION_CONFLICT_STATUS,
+                        crate::state::recipe_version_used_by_job_message(&requested, &job),
+                    ),
+                );
+            } else {
+                remove_recipe = true;
+            }
+        }
+
+        if remove_recipe {
+            store.recipes.remove(&input.name);
+        } else if !deleted.is_empty() {
+            if let Some(recipe) = store.recipes.get_mut(&input.name) {
+                // The draft's number is a function of the publish history, so a delete
+                // that changes which versions this recipe holds published owes it the
+                // same recomputation a publish does.
+                recipe.delete_published_versions(&deleted);
+            }
+        }
+
+        // The items are reported in the order the request named the versions, so a client
+        // reads each failure against the entry it sent.
+        let errors: Vec<RecipeVersionErrorDetail> = input
+            .recipe_versions
+            .iter()
+            .filter_map(|requested| failures.remove(requested))
+            .collect();
+
+        Ok(BatchDeleteRecipeVersionOutput {
+            name: input.name,
+            errors: crate::state::wire_list(&errors),
+        })
     }
 }

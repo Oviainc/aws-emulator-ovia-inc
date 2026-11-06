@@ -25,12 +25,16 @@ mod enum_value_set_order;
 mod project_delete;
 #[path = "all/project_lifecycle.rs"]
 mod project_lifecycle;
+#[path = "all/project_not_found_wording.rs"]
+mod project_not_found_wording;
 #[path = "all/recipe_already_attached_refusal.rs"]
 mod recipe_already_attached_refusal;
 #[path = "all/recipe_lifecycle.rs"]
 mod recipe_lifecycle;
 #[path = "all/recipe_publishing.rs"]
 mod recipe_publishing;
+#[path = "all/recipe_version_batch_delete.rs"]
+mod recipe_version_batch_delete;
 #[path = "all/recipe_version_resolution.rs"]
 mod recipe_version_resolution;
 #[path = "all/recipe_working_update.rs"]

@@ -180,7 +180,7 @@ async fn a_deleted_project_resolves_nothing_afterwards() {
         );
         assert_eq!(
             gone.error_message(),
-            format!("Project {name} wasn't found."),
+            format!("The project {name} wasn't found."),
             "case {case:?}: the miss must name the project, got {:?}",
             gone.body
         );
@@ -193,7 +193,7 @@ async fn a_deleted_project_resolves_nothing_afterwards() {
         );
         assert_eq!(
             deleted_again.error_message(),
-            format!("Project {name} wasn't found."),
+            format!("The project {name} wasn't found."),
             "case {case:?}: the second delete must name the project, got {:?}",
             deleted_again.body
         );
@@ -264,7 +264,7 @@ async fn deleting_a_project_that_does_not_exist_removes_nothing() {
         );
         assert_eq!(
             refused.error_message(),
-            format!("Project {name} wasn't found."),
+            format!("The project {name} wasn't found."),
             "case {case:?}: the miss must name the project, got {:?}",
             refused.body
         );
