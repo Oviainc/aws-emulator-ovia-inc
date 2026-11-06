@@ -22,6 +22,11 @@ mod cloudformation_fifo_resource_generated_names;
 mod cloudformation_ec2_cdk_vpc_estate;
 #[path = "all/greengrass_deployment_iot_job.rs"]
 mod greengrass_deployment_iot_job;
+// Declared here, in this same head region, for the reason the entry above records: the
+// appended tail and the sorted `c…` span (where every cloudformation suite lands) are both
+// regions concurrently landing suites add their line to.
+#[path = "all/cloudformation_sam_function_writes_its_table.rs"]
+mod cloudformation_sam_function_writes_its_table;
 // Declared here, in this same head region, for the reason the entry above records.
 // What S3's two address forms — path-style and virtual-hosted — mean to the router, which is
 // the rule every cross-service suite that stages an S3 object addresses its setup calls by.
