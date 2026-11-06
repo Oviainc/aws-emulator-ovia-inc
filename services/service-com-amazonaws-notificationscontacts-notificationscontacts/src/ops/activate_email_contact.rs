@@ -81,10 +81,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// Why the modelled 400 blames `code` when the token outstanding for this contact is
-/// not the code submitted. The code is `@sensitive`, so the refusal never echoes it.
-const WRONG_CODE: &str = "is not the activation code outstanding for this email contact";
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -249,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if !code_matches {
             return Err(ActivateEmailContactErrorModeled::ValidationException(
-                crate::state::field_validation_failure("code", WRONG_CODE),
+                crate::state::activation_token_mismatch(&input.arn),
             )
             .into());
         }

@@ -48,6 +48,17 @@ pub const CONTACT_RESOURCE_TYPE: &str = "emailcontact";
 /// answer for one request are told apart by it.
 pub const ACTIVATION_TOKEN_RESOURCE_TYPE: &str = "activation-token";
 
+/// How this service NAMES the email-contact resource in a sentence it writes about it.
+///
+/// The resource `resourceType` reports is the machine word of the modelled ARN; a
+/// message states the resource the way the service's own prose does, which is what tells
+/// a reader WHICH resource a not-found is about.
+pub const CONTACT_RESOURCE_TITLE: &str = "Email Contact";
+
+/// How this service names the ACTIVATION TOKEN resource in such a sentence, beside
+/// [`CONTACT_RESOURCE_TITLE`].
+pub const ACTIVATION_TOKEN_RESOURCE_TITLE: &str = "Activation Token";
+
 /// The ARN service namespace for this service (`arnNamespace`/sigv4 name
 /// `notifications-contacts`).
 pub const ARN_SERVICE: &str = "notifications-contacts";
@@ -161,7 +172,7 @@ pub fn satisfies_tag_key_pattern(key: &str) -> bool {
 }
 
 /// `Ok` when every KEY of a `TagMap` member in `keys` satisfies [`TAG_KEY_PATTERN`],
-/// else the modelled 400 for the offending one.
+/// else the modelled 400 blaming that member.
 ///
 /// `member` is the map member the keys arrived through (`tags`), and that member is the
 /// path the refusal blames: the centralized walk visits no map key at all, so there is
@@ -213,7 +224,8 @@ fn element_path(member: &str, position: usize) -> String {
 /// [`pattern_validation_failure`] words for the member path it carries.
 ///
 /// The ONE refusal path for a `@pattern` this service has to apply by hand, so no caller
-/// of it can word such a refusal its own way.
+/// of it can word such a refusal its own way. It carries the path and not the offending
+/// value, because the refusal states the member and the constraint and never the value.
 fn refuse_outside_pattern(
     pattern: &str,
     offender: Option<String>,
@@ -627,13 +639,24 @@ pub fn contact_id_from_arn(candidate: &str) -> Option<&str> {
         .then_some(id)
 }
 
+/// The modelled 404 for the `title` resource named by `arn`, which this store does not
+/// hold, reported under `resource_type`.
+///
+/// The ONE place this service words a not-found: every resource it cannot resolve is
+/// reported with the same sentence — the resource as this service names it, the ARN the
+/// request carried, and the fact that nothing resolves it — so a caller reads one
+/// template whichever resource went missing.
+fn resource_not_found(title: &str, arn: &str, resource_type: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("{title} with arn {arn} not found"),
+        resource_id: arn.to_string(),
+        resource_type: resource_type.to_string(),
+    }
+}
+
 /// The modelled 404 for an email contact this store does not hold.
 pub fn contact_not_found(arn: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!("no email contact exists with the arn {arn}"),
-        resource_id: arn.to_string(),
-        resource_type: CONTACT_RESOURCE_TYPE.to_string(),
-    }
+    resource_not_found(CONTACT_RESOURCE_TITLE, arn, CONTACT_RESOURCE_TYPE)
 }
 
 /// What the tag plane states for a resource it holds no record of: FIXED text, naming
@@ -673,11 +696,11 @@ pub fn tagged_resource_not_found(arn: &str) -> ResourceNotFoundException {
 /// again has no token for a code to be compared against until a new send mints one, so
 /// it is the same missing resource.
 pub fn activation_token_not_found(arn: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!("Activation Token with arn {arn} not found"),
-        resource_id: arn.to_string(),
-        resource_type: ACTIVATION_TOKEN_RESOURCE_TYPE.to_string(),
-    }
+    resource_not_found(
+        ACTIVATION_TOKEN_RESOURCE_TITLE,
+        arn,
+        ACTIVATION_TOKEN_RESOURCE_TYPE,
+    )
 }
 
 /// The modelled 409 for a contact whose current state refuses `why`.
@@ -697,6 +720,32 @@ pub fn field_validation_failure(member: &str, why: &str) -> ValidationException 
         field_list: Some(vec![ValidationExceptionField {
             name: member.to_string(),
             message: why.to_string(),
+        }]),
+    }
+}
+
+/// The input member an activation code arrives through, and the member a code that
+/// disagrees with the stored token is blamed on.
+const ACTIVATION_CODE_MEMBER: &str = "code";
+
+/// The modelled 400 for a well-formed activation code that is not the one the activation
+/// token outstanding for `arn` holds.
+///
+/// The sentence states the comparison that failed — the token the request submitted
+/// against the one this service stored for the contact — and names the contact by the ARN
+/// the request carried, so the refusal is told apart from the 404 a contact holding NO
+/// token answers ([`activation_token_not_found`]) by its words as well as its status. The
+/// submitted code is `@sensitive` and is never part of it.
+pub fn activation_token_mismatch(arn: &str) -> ValidationException {
+    let stated = format!(
+        "Input token did not match stored {ACTIVATION_TOKEN_RESOURCE_TITLE} for arn {arn}"
+    );
+    ValidationException {
+        message: stated.clone(),
+        reason: VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: ACTIVATION_CODE_MEMBER.to_string(),
+            message: stated,
         }]),
     }
 }

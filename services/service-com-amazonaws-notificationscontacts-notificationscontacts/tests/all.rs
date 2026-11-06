@@ -27,6 +27,8 @@ mod email_contact_quota_refusal;
 mod email_contact_timestamp_wire_form;
 #[path = "all/email_contacts.rs"]
 mod email_contacts;
+#[path = "all/error_message_templates.rs"]
+mod error_message_templates;
 #[path = "all/hand_applied_pattern_refusals.rs"]
 mod hand_applied_pattern_refusals;
 #[path = "all/list_email_contacts_page_token.rs"]
