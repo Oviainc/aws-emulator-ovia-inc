@@ -199,8 +199,9 @@ pub fn validate_action_type_declaration(declaration: &ActionTypeDeclaration) -> 
 }
 
 /// The property half of [`validate_action_type_declaration`], over the
-/// `ActionTypeProperty` view of an action type's configuration properties.
-pub(super) fn validate_action_type_properties(properties: &[ActionTypeProperty]) -> Result<(), String> {
+/// `ActionTypeProperty` view of an action type's configuration properties. Only that
+/// check asks, so this one stays private to the module.
+fn validate_action_type_properties(properties: &[ActionTypeProperty]) -> Result<(), String> {
     let mut seen = BTreeSet::new();
     for property in properties {
         if !seen.insert(property.name.as_str()) {

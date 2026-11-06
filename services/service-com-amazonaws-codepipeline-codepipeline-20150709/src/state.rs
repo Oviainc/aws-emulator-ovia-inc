@@ -56,7 +56,12 @@ mod clock;
 /// The action-type catalog: an action type's identity, the records this account holds
 /// for the custom ones, and the action types the service itself provides.
 mod action_types;
-pub use action_types::*;
+// Named rather than a glob, so what `crate::state` publishes stays explicit — the same
+// way the re-exports below name what they take.
+pub use action_types::{
+    validate_action_type_declaration, ActionTypeKey, ActionTypeRecord, BuiltInActionType,
+    BUILT_IN_ACTION_TYPES,
+};
 
 pub use driver::advance;
 pub use execution::{

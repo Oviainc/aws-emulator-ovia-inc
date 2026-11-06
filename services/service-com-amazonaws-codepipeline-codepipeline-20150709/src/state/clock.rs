@@ -262,7 +262,10 @@ fn set_clock(
     generation: u64,
     handle: ::tokio::task::JoinHandle<()>,
 ) {
-    if store.clock_generation != generation {
+    // A claim that is no longer the current one, or no longer held at all (the task has
+    // already run out of work and released it), installs nothing: the handle and the
+    // claim are written together, so the store never holds one without the other.
+    if store.clock_generation != generation || !store.clock_running {
         handle.abort();
         return;
     }
