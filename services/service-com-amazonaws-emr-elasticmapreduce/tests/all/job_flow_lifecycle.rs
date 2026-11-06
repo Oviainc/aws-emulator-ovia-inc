@@ -1111,7 +1111,7 @@ async fn list_clusters_paginates_on_marker() {
 /// `USER_REQUEST` state-change reason, the clock then owes it `TERMINATED` with an
 /// `EndDateTime`, and a batch naming a termination-protected cluster is refused in whole
 /// and shuts nothing down (the batch rule itself lives in
-/// `tests/all/termination_protection.rs`).
+/// `tests/all/terminate_job_flows_protection.rs`).
 #[tokio::test]
 async fn terminate_job_flows_shuts_each_named_cluster_down() {
     let emr = Emr::new();

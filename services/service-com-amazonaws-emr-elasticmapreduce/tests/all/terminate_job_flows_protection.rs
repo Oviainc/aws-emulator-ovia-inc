@@ -12,7 +12,8 @@
 //!
 //! The sibling suite `tests/all/termination_protection.rs` spans the WRITE of the lock and
 //! the unlock-then-terminate sequence on one id; this one spans the BATCH the refusal is
-//! decided over and the cluster states the lock is evaluated in.
+//! decided over, the cluster states the lock is evaluated in, and the structured record
+//! each branch of the shutdown leaves.
 //!
 //! Every case drives the real HTTP path — `POST /` with
 //! `X-Amz-Target: ElasticMapReduce.<Op>` and an `awsJson1_1` body — through the router's
@@ -25,11 +26,10 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use crate::emr_control_plane::MAX_JOB_FLOW_IDS_PER_REQUEST;
-use crate::job_flow_lifecycle::{
-    assert_refused, at, kept_alive_request, Emr, INSTANCE_PROFILE, SERVICE_ROLE,
-};
+use crate::job_flow_lifecycle::{assert_refused, at, kept_alive_request, Emr, REQUEST_TARGET};
 use crate::refusal_messages::message;
-use crate::termination_protection::PAST_TRANSITION;
+use crate::security_configurations::audit_capture;
+use crate::termination_protection::{launched_with_protection, PAST_TRANSITION};
 
 /// The sentence Amazon EMR refuses a shutdown of a locked cluster with. Recorded
 /// behaviour: it is entirely fixed text — plural and id-free, because the whole batch is
@@ -38,20 +38,17 @@ use crate::termination_protection::PAST_TRANSITION;
 const PROTECTED_SENTENCE: &str =
     "Could not shut down one or more job flows since they are termination protected.";
 
-/// A `RunJobFlow` request launching a cluster with `TerminationProtected` set to
-/// `protected`, so a row can lock a cluster at launch rather than through the API call.
-fn launched_with_protection(name: &str, protected: bool) -> Value {
-    json!({
-        "Name": name,
-        "JobFlowRole": INSTANCE_PROFILE, "ServiceRole": SERVICE_ROLE,
-        "Instances": {
-            "InstanceCount": 1,
-            "MasterInstanceType": "m5.xlarge",
-            "KeepJobFlowAliveWhenNoSteps": true,
-            "TerminationProtected": protected,
-        },
-    })
-}
+/// The access key id this suite's audit case presents, which no other suite uses, so the
+/// shared audit capture can tell its records from a sibling's.
+const AUDIT_AKID: &str = "AKIDEMRTERMINATEJOBFLOWS";
+
+/// One row of the audit table: a label, the `JobFlowIds` batch the request names, and the
+/// (resource, outcome) pairs of the records that call must leave, oldest first.
+type AuditedBatch<'a> = (&'a str, Vec<&'a String>, Vec<(&'a str, &'a str)>);
+
+/// An id no cluster is held under, for the row that asserts the record a lookup refusal
+/// leaves.
+const UNKNOWN_ID: &str = "j-NOSUCHCLUSTER";
 
 /// That a refusal is this surface's refusal of a locked shutdown: HTTP 400, the
 /// `ValidationException` channel (this operation's model declares no client error) and the
@@ -334,4 +331,109 @@ async fn clearing_the_lock_lets_the_identical_terminate_through() {
             );
         }
     }
+}
+
+/// THE RULE on the record: shutting a cluster down DESTROYS what this service holds for
+/// it, so every branch of `TerminateJobFlows` that returns leaves the structured record
+/// naming the operation, the cluster the outcome is about, the presented access key id,
+/// the request target and the outcome — one per cluster it shut down, one per refusal —
+/// while a cluster the call did not move, and a reporting call, leave none.
+#[tokio::test]
+async fn shutting_a_cluster_down_records_each_cluster_and_each_refusal() {
+    let capture = audit_capture();
+    let emr = Emr::with_akid(AUDIT_AKID);
+
+    // Harness self-test, so a failure below can never be mistaken for a missing record.
+    tracing::info!(target: "emulator::audit", access_key_id = AUDIT_AKID, "probe");
+    let probe = capture.drain_audit_records(AUDIT_AKID);
+    assert_eq!(
+        probe.len(),
+        1,
+        "the capture harness must see an audit record emitted on this thread, got {probe:?}"
+    );
+
+    let locked = emr
+        .run_job_flow(launched_with_protection("audited-locked", true))
+        .await;
+    let first = emr.run_job_flow(kept_alive_request("audited-one")).await;
+    let second = emr.run_job_flow(kept_alive_request("audited-two")).await;
+    // The launches leave records of their own, which belong to `RunJobFlow`.
+    let _ = capture.drain_audit_records(AUDIT_AKID);
+
+    let past_the_cap: Vec<&String> = (0..=MAX_JOB_FLOW_IDS_PER_REQUEST).map(|_| &first).collect();
+    let unknown = UNKNOWN_ID.to_string();
+
+    // (label, the batch, the records it must leave, oldest first).
+    let audited: Vec<AuditedBatch<'_>> = vec![
+        (
+            "a batch naming a locked cluster",
+            vec![&first, &locked],
+            vec![(locked.as_str(), "validation-refused")],
+        ),
+        (
+            "a batch naming an id no cluster carries",
+            vec![&unknown],
+            vec![(UNKNOWN_ID, "validation-refused")],
+        ),
+        (
+            // The SIZE of the batch is refused before any id in it is looked up, so the
+            // record names no cluster.
+            "a batch past the maximum",
+            past_the_cap,
+            vec![("", "validation-refused")],
+        ),
+        (
+            "two clusters shut down at once",
+            vec![&first, &second],
+            vec![
+                (first.as_str(), "cluster-termination-started"),
+                (second.as_str(), "cluster-termination-started"),
+            ],
+        ),
+        (
+            // Both are already shutting down, so this call moved nothing and has nothing
+            // to attribute.
+            "the same batch again",
+            vec![&first, &second],
+            vec![],
+        ),
+    ];
+
+    for (label, ids, expected) in audited {
+        emr.call("TerminateJobFlows", json!({ "JobFlowIds": &ids }))
+            .await;
+        let records = capture.drain_audit_records(AUDIT_AKID);
+        assert_eq!(
+            records.len(),
+            expected.len(),
+            "case {label:?}: expected {} audit record(s), captured {records:?}",
+            expected.len()
+        );
+        for (record, (resource, outcome)) in records.iter().zip(expected) {
+            for (field, value) in [
+                ("operation", "TerminateJobFlows"),
+                ("resource", resource),
+                ("outcome", outcome),
+                ("access_key_id", AUDIT_AKID),
+                ("request_target", REQUEST_TARGET),
+            ] {
+                assert_eq!(
+                    record.field(field),
+                    Some(value),
+                    "case {label:?}: expected {field}={value:?}, got {record:?}"
+                );
+            }
+        }
+    }
+
+    // Reporting calls record nothing: there is no state change to attribute.
+    let _ = emr.describe_cluster(&locked).await;
+    emr.call("DescribeCluster", json!({ "ClusterId": UNKNOWN_ID }))
+        .await;
+    let leaked = capture.drain_audit_records(AUDIT_AKID);
+    assert!(
+        leaked.is_empty(),
+        "case \"reporting calls\": a reporting operation must emit no audit record, \
+         captured {leaked:?}"
+    );
 }

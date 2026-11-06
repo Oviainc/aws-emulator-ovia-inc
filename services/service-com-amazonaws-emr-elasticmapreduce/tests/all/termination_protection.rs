@@ -36,7 +36,10 @@ const NOT_SHUTTING_DOWN: [&str; 3] = ["STARTING", "WAITING", "RUNNING"];
 
 /// A `RunJobFlow` request launching a cluster with `TerminationProtected` already set to
 /// `protected`, so a row can assert the write both as a change and as a no-op.
-fn launched_with_protection(name: &str, protected: bool) -> serde_json::Value {
+///
+/// `pub(crate)` so the sibling suite that spans the refusal launches a locked cluster
+/// through this one helper rather than its own copy.
+pub(crate) fn launched_with_protection(name: &str, protected: bool) -> serde_json::Value {
     json!({
         "Name": name,
         "JobFlowRole": crate::job_flow_lifecycle::INSTANCE_PROFILE, "ServiceRole": crate::job_flow_lifecycle::SERVICE_ROLE,

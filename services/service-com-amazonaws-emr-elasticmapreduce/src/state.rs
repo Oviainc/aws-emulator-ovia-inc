@@ -4319,6 +4319,11 @@ pub const AUDIT_TARGET: &str = "emulator::audit";
 /// configuration is logged, so a caller's own data never reaches the log. Every
 /// interpolated value is request-derived, so [`audit_field`] bounds it and strips the
 /// control characters that would otherwise let one request forge a second record.
+///
+/// This only EMITS: it reads the request's own parts, reaches no service state and takes
+/// no lock of its own, so it cannot contend with the store. Handlers nevertheless emit
+/// their records with the store guard released, which keeps the emission out of the
+/// critical section whatever a subscriber does with it.
 pub fn audit(
     operation: &str,
     resource: &str,
@@ -4367,6 +4372,9 @@ pub enum AuditOutcome {
     SecurityConfigurationDeleted,
     /// A cluster (job flow) was launched and persisted, under the id EMR minted for it.
     ClusterLaunched,
+    /// A cluster's shutdown was started: it was moved to `TERMINATING` and the clock owes
+    /// it `TERMINATED`, so what the store held for it is going away.
+    ClusterTerminationStarted,
     /// A persistent application user interface was created and persisted, under the id
     /// EMR minted for it.
     PersistentAppUICreated,
@@ -4390,6 +4398,7 @@ impl AuditOutcome {
             Self::SecurityConfigurationUnchanged => "security-configuration-unchanged",
             Self::SecurityConfigurationDeleted => "security-configuration-deleted",
             Self::ClusterLaunched => "cluster-launched",
+            Self::ClusterTerminationStarted => "cluster-termination-started",
             Self::PersistentAppUICreated => "persistent-app-ui-created",
             Self::ValidationRefused => "validation-refused",
             Self::Conflict => "conflict",

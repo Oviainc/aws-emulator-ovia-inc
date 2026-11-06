@@ -151,23 +151,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::MAX_TERMINATE_JOB_FLOW_IDS;
+        use crate::state::{AuditOutcome, MAX_TERMINATE_JOB_FLOW_IDS};
 
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
+
+        // Shutting a cluster down DESTROYS what this service holds for it, and afterwards
+        // the store shows only that the cluster is going away — so every branch that
+        // returns from this call leaves the structured record `crate::state::audit`
+        // writes: the operation, the cluster the outcome is about, the access key id the
+        // request PRESENTED, the request target and the outcome. Nothing of the cluster's
+        // own configuration is logged. One request shuts up to ten separate clusters
+        // down, so the success path records each cluster it shut down on its own, and a
+        // refusal records the one cluster it refused for.
+        //
+        // EVERY record below is emitted with the store lock RELEASED — the refusals that
+        // need a lookup collect their decision first and answer it after the guard is
+        // dropped — so no branch of this handler can hold the store across the emission.
+        let refuse = |resource: &str, message: String| -> Self::Error {
+            crate::state::audit(Self::NAME, resource, ctx, AuditOutcome::ValidationRefused);
+            crate::scaffolded::Scaffolded::validation(message)
+        };
 
         // "The maximum number of clusters allowed is 10." (TerminateJobFlows doc.) This
         // operation models no client error, so the refusal is the 400
-        // `ValidationException` channel.
+        // `ValidationException` channel. What is refused is the SIZE of the batch, before
+        // any id in it is looked up, so the record names no cluster.
         if input.job_flow_ids.len() > MAX_TERMINATE_JOB_FLOW_IDS {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "JobFlowIds carries {} ids; the maximum number of clusters allowed is \
-                 {MAX_TERMINATE_JOB_FLOW_IDS}",
-                input.job_flow_ids.len()
-            )));
+            return Err(refuse(
+                "",
+                format!(
+                    "JobFlowIds carries {} ids; the maximum number of clusters allowed is \
+                     {MAX_TERMINATE_JOB_FLOW_IDS}",
+                    input.job_flow_ids.len()
+                ),
+            ));
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(Self::NAME, "", ctx, AuditOutcome::StoreUnavailable);
             return Err(
                 TerminateJobFlowsErrorModeled::InternalServerError(InternalServerError {}).into(),
             );
@@ -177,26 +198,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Resolve every id AND decide protection BEFORE changing anything, so a request
         // naming one unknown id, or one locked cluster, terminates nothing. Both
         // sentences of this legacy job-flow surface are CONSTANT: neither names an id,
-        // and the protected one is plural because the whole batch is judged at once.
+        // and the protected one is plural because the whole batch is judged at once. The
+        // decision is only COLLECTED here (the cluster it is about, and the sentence):
+        // answering it needs no store, so it is answered once the guard is gone.
+        let mut refusal: Option<(String, String)> = None;
         for job_flow_id in &input.job_flow_ids {
             let Some(cluster) = store.cluster_mut(job_flow_id, now) else {
-                return Err(crate::scaffolded::Scaffolded::validation(
+                refusal = Some((
+                    job_flow_id.clone(),
                     crate::state::unknown_job_flow_message(),
                 ));
+                break;
             };
             if cluster.termination_protection_holds() {
-                return Err(crate::scaffolded::Scaffolded::validation(
+                refusal = Some((
+                    job_flow_id.clone(),
                     crate::state::termination_protected_message(),
                 ));
+                break;
             }
         }
+        if let Some((resource, message)) = refusal {
+            drop(store);
+            return Err(refuse(&resource, message));
+        }
 
+        let mut shut_down: Vec<&str> = Vec::new();
         for job_flow_id in &input.job_flow_ids {
             if let Some(cluster) = store.cluster_mut(job_flow_id, now) {
-                cluster.begin_termination(now);
+                if cluster.begin_termination(now) {
+                    shut_down.push(job_flow_id);
+                }
             }
         }
         drop(store);
+
+        // A cluster this call did not move — one already shutting down or already gone,
+        // which keeps the repeated request a success — changed nothing, so there is
+        // nothing to attribute for it.
+        for job_flow_id in shut_down {
+            crate::state::audit(
+                Self::NAME,
+                job_flow_id,
+                ctx,
+                AuditOutcome::ClusterTerminationStarted,
+            );
+        }
 
         Ok(TerminateJobFlowsOutput)
     }
