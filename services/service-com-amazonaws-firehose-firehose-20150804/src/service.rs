@@ -46,9 +46,10 @@
 //!
 //! This file also owns the sentences the HANDLERS state for the rules they enforce
 //! themselves (`already_exists_message` and friends), so every operation words the same
-//! refusal the same way instead of spelling its own — and the one modelled constraint the
-//! request boundary cannot enforce (`check_tag_keys` / `check_tag_key_list`), so a handler
-//! judging it refuses in the words the boundary would have used.
+//! refusal the same way instead of spelling its own — and the modelled constraints the
+//! request boundary cannot enforce (`check_tag_keys` / `check_tag_key_list` /
+//! `check_bucket_arns`), so a handler judging one refuses in the words the boundary would
+//! have used.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
@@ -312,14 +313,16 @@ fn violation_envelope(clauses: &[String]) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------------
-// A modelled constraint the request boundary cannot enforce
+// The modelled constraints the request boundary cannot enforce
 //
-// The boundary's constraint walk compiles a `@pattern` with the linear-time `regex` crate,
-// which has no look-around, and reads a pattern it cannot compile as satisfied — so a value
-// constrained by a pattern written with a look-ahead reaches a handler UNCHECKED. A handler
-// judges such a value itself, by the clause the look-ahead states and the same walk for the
-// rest of the expression, and words the refusal with the renderer above so it is the
-// sentence the boundary would have stated for the same violation.
+// The boundary's constraint walk compiles a `@pattern` with the linear-time `regex` crate
+// and reads a pattern it cannot compile as satisfied — so a value constrained by an
+// expression that engine refuses reaches a handler UNCHECKED. Two of this model's
+// expressions are such: one written with a LOOK-AHEAD (which a linear-time engine has no
+// form for) and one whose BOUNDED repetition over a character class the engine declines to
+// expand. A handler judges such a value itself, by the clause the engine cannot decide and
+// the same walk for the rest of the expression, and words the refusal with the renderer
+// above so it is the sentence the boundary would have stated for the same violation.
 // ---------------------------------------------------------------------------------
 
 /// The `@pattern` of `TagKey`, the shape every member that takes a tag key targets
@@ -506,6 +509,102 @@ fn tag_key_list_member(path: &str) -> Option<&str> {
     .then_some(member)
 }
 
+/// The `@pattern` of `BucketARN`, the shape every member that takes an Amazon S3
+/// destination bucket targets (`smithy_query(query="shape", shape="BucketARN")`). Held as
+/// the model spells it, because that expression is what a refusal reports.
+///
+/// It says a destination bucket is named by an Amazon S3 bucket ARN and by nothing else:
+/// an S3 bucket ARN carries neither Region nor account (`arn:<partition>:s3:::<name>`), so
+/// a value that is not an ARN, or an ARN of another service, satisfies it nowhere.
+const BUCKET_ARN_PATTERN: &str = r"^arn:.*:s3:::[\w\.\-]{1,255}$";
+
+/// [`BUCKET_ARN_PATTERN`] with its one bounded repetition written as an UNBOUNDED one, so
+/// the boundary's own engine can compile it, plus [`MAX_BUCKET_ARN_NAME_CHARS`] applied to
+/// that run separately. The two together admit exactly the values the model's expression
+/// does — the run's character class excludes `:`, so the run a match consumes can only be
+/// the one after the last `:s3:::`.
+const BUCKET_ARN_FORM: &str = r"^arn:.*:s3:::[\w\.\-]+$";
+
+/// The upper bound [`BUCKET_ARN_PATTERN`]'s repetition states on the bucket-name run.
+const MAX_BUCKET_ARN_NAME_CHARS: usize = 255;
+
+/// [`BUCKET_ARN_FORM`] hung on a member schema, for the same reason [`TAG_KEY_TRAITS`] is:
+/// the decision is then the framework's own constraint walk rather than a second reading
+/// of the expression.
+static BUCKET_ARN_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(PatternTrait::new(BUCKET_ARN_FORM)));
+    traits
+});
+
+/// The member schema carrying [`BUCKET_ARN_TRAITS`]. Its name never reaches a message —
+/// see [`M_TAG_KEY`].
+static M_BUCKET_ARN: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.firehose#CheckedMember$bucketARN",
+        NAMESPACE,
+        "bucketARN",
+    ),
+    ShapeType::String,
+    "bucketARN",
+    0,
+)
+.with_traits(&BUCKET_ARN_TRAITS);
+
+/// Whether [`BUCKET_ARN_PATTERN`] admits `bucket_arn`: it has the form of an Amazon S3
+/// bucket ARN and the bucket name it carries is within the bound that expression states.
+///
+/// The name is read by [`crate::state::delivery::bucket_name`], the one reading of a
+/// `BucketARN`'s resource part in this crate. Both tests have to hold, so reading the name
+/// as the part after the last colon is exact here: the form above admits no colon in the
+/// run it bounds.
+fn admits_bucket_arn(bucket_arn: &str) -> bool {
+    let Some(name) = crate::state::delivery::bucket_name(bucket_arn) else {
+        return false;
+    };
+    name.chars().count() <= MAX_BUCKET_ARN_NAME_CHARS
+        && validate(
+            &CheckedString {
+                member: &M_BUCKET_ARN,
+                value: bucket_arn,
+            },
+            &CHECKED_MEMBER_SCHEMA,
+        )
+        .is_empty()
+}
+
+/// Refuse every destination bucket ARN of a request that [`BUCKET_ARN_PATTERN`] does not
+/// admit, each named at the dotted path it was submitted at; `Ok(())` when they all
+/// satisfy it.
+///
+/// One refusal states every violating value, the way the boundary walk accumulates
+/// violations rather than reporting only the first, and in the words that walk would have
+/// used — this is a modelled constraint the request boundary could not apply, not a rule
+/// of this service's own.
+pub(crate) fn check_bucket_arns<'a, I>(bucket_arns: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = (String, &'a str)>,
+{
+    let clauses: Vec<String> = bucket_arns
+        .into_iter()
+        .filter(|(_, bucket_arn)| !admits_bucket_arn(bucket_arn))
+        .filter_map(|(path, _)| {
+            constraint_clause(&Violation {
+                path,
+                kind: ViolationKind::Pattern(BUCKET_ARN_PATTERN.to_string()),
+                // The rejected ARN is the value, and this service states no value in a
+                // constraint refusal at all — see `constraint_clause`.
+                value: None,
+                sensitive: false,
+            })
+        })
+        .collect();
+    match violation_envelope(&clauses) {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
 // ---------------------------------------------------------------------------------
 // Refusal wording for the rules the HANDLERS enforce
 //
@@ -632,6 +731,15 @@ pub fn mandatory_source_configuration_message(configuration: &str, stream_type: 
     format!("{configuration} is mandatory for {stream_type} stream type.")
 }
 
+/// A data processor that omits a parameter its type cannot run without: the parameter, and
+/// the processor type that requires it.
+///
+/// Stated as a requirement of the processor TYPE the request chose, because that is what
+/// makes a parameter the model leaves optional in general mandatory here.
+pub fn mandatory_processor_parameter_message(parameter: &str, processor_type: &str) -> String {
+    format!("{parameter} is required when {processor_type} processor is used.")
+}
+
 /// A put that resolved no stream. Same rule as [`not_found_message`] — the account, not
 /// the probed name — in the wording the data plane uses.
 pub fn put_not_found_message() -> String {
@@ -663,6 +771,18 @@ pub fn invalid_source_message(name: &str) -> String {
 /// discloses no name in this account's namespace.
 pub fn not_direct_put_message(stream_type: &str) -> String {
     format!("This operation is not permitted on {stream_type} delivery stream type.")
+}
+
+/// A batch put whose records together exceed the per-request ceiling: the ceiling, in the
+/// megabytes the sentence states it in.
+///
+/// The fault is the aggregate SIZE of the records and not any one of them — each may be
+/// legal on its own — so the sentence names neither a record nor a count, and the whole
+/// request is refused.
+pub fn records_too_large_message(limit_bytes: usize) -> String {
+    /// A megabyte, as both the limit and the modelled per-record bound count it.
+    const MEGABYTE: usize = 1024 * 1024;
+    format!("Records size exceeds {} MB limit", limit_bytes / MEGABYTE)
 }
 
 /// A put refused because the stream it named is not accepting data: the stream the

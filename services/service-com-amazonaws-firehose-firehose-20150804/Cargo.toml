@@ -56,6 +56,9 @@ flate2 = "1"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 # The `Snappy` / `HADOOP_SNAPPY` compression formats a destination can ask for.
 snap = "1"
+# The `ZSTD` compression format a destination can ask for. Pure Rust, like the other
+# codecs above: the emulator links no native compression library.
+ruzstd = "0.9"
 # The random component of a delivered object's name, which Firehose mints per object.
 uuid = { version = "1", features = ["v4"] }
 # The jq program a `MetadataExtraction` processor carries

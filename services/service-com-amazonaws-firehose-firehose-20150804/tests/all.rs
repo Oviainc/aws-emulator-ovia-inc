@@ -33,6 +33,8 @@ mod delivery_stream_tag_updates;
 mod delivery_stream_tags;
 #[path = "all/description_defaults.rs"]
 mod description_defaults;
+#[path = "all/destination_argument_rules.rs"]
+mod destination_argument_rules;
 #[path = "all/destination_arity_refusal.rs"]
 mod destination_arity_refusal;
 #[path = "all/destination_bucket_preflight.rs"]

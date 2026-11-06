@@ -86,6 +86,15 @@ pub const MAX_BUFFERED_BYTES_PER_STREAM: usize = 16 * 1024 * 1024;
 /// exhaust the process.
 pub const MAX_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
 
+/// The most record data ONE `PutRecordBatch` request carries, over every record in it.
+///
+/// Documented, not chosen: "Each record in the request can be as large as 1,000 KB (before
+/// base64 encoding), up to a limit of 4 MB for the entire request. These limits cannot be
+/// changed" (`PutRecordBatch`). The per-record bound of that sentence is the modelled
+/// `Data` length (1,024,000 bytes — 1,000 KB counted in 1,024-byte units), so the 4 MB of
+/// the same sentence is counted the same way.
+pub const MAX_PUT_RECORD_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
 /// The most records ONE stream keeps buffered, so a flood of tiny records cannot grow
 /// the buffer (and the expiry scan over it) without bound either.
 pub const MAX_BUFFERED_RECORDS_PER_STREAM: usize = 50_000;
@@ -390,6 +399,84 @@ fn fill_parameter(parameters: &mut Vec<ProcessorParameter>, name: &str, value: &
         parameter_name: name.to_string(),
         parameter_value: value.to_string(),
     });
+}
+
+/// The `ProcessorType` that de-aggregates one record into the sub-records it carries.
+pub const RECORD_DE_AGGREGATION_PROCESSOR_TYPE: &str = "RecordDeAggregation";
+
+/// The `ProcessorParameterName` naming the Lambda function a `Lambda` processor transforms
+/// records with.
+pub const LAMBDA_ARN_PARAMETER: &str = "LambdaArn";
+
+/// The `ProcessorParameterName` naming the engine a `MetadataExtraction` program is written
+/// for.
+pub const JSON_PARSING_ENGINE_PARAMETER: &str = "JsonParsingEngine";
+
+/// The `ProcessorParameterName` naming the form of the sub-records a `RecordDeAggregation`
+/// processor splits a record into.
+pub const SUB_RECORD_TYPE_PARAMETER: &str = "SubRecordType";
+
+/// The parameters a processor of each `ProcessorType` cannot run without.
+///
+/// The model expresses `Parameters` as one generic list for every processor type, so WHICH
+/// parameters a given type requires is a rule of the service rather than of the shape: a
+/// processor Firehose runs by invoking a function has to be told which function
+/// ([`LAMBDA_ARN_PARAMETER`]), one that derives partition keys has to be given the program
+/// and the engine it is written for, and one that splits a record has to be told the form
+/// of its sub-records. The types absent from this table require none: a processor whose
+/// parameters are all optional ("You don't have to put a processor parameter when you
+/// select `AppendDelimiterToRecord`" — `Processor`) and the two of the CloudWatch Logs
+/// pipeline ([`CLOUDWATCH_LOGS_PROCESSOR_TYPES`]), which Firehose parameterizes from the
+/// payload it was handed.
+pub const MANDATORY_PROCESSOR_PARAMETERS: &[(&str, &[&str])] = &[
+    (LAMBDA_PROCESSOR_TYPE, &[LAMBDA_ARN_PARAMETER]),
+    (
+        delivery::METADATA_EXTRACTION_PROCESSOR,
+        &[
+            delivery::METADATA_EXTRACTION_QUERY_PARAMETER,
+            JSON_PARSING_ENGINE_PARAMETER,
+        ],
+    ),
+    (
+        RECORD_DE_AGGREGATION_PROCESSOR_TYPE,
+        &[SUB_RECORD_TYPE_PARAMETER],
+    ),
+];
+
+/// The refusal for the first processor of `processing` that omits a parameter its type
+/// cannot run without; `None` when every processor the configuration lists carries the
+/// parameters [`MANDATORY_PROCESSOR_PARAMETERS`] names for its type (and for a destination
+/// that carries no data-processing configuration at all).
+///
+/// The question is about the configuration as SUBMITTED, so it is asked of every processor
+/// the list holds whatever `Enabled` says: a configuration is stored either way, and a
+/// processor that could never run is a bad argument now rather than at the moment data
+/// processing is turned on. Shared by the two paths that WRITE a destination configuration
+/// (`CreateDeliveryStream`, `UpdateDestination`), which both report it as the modelled
+/// `InvalidArgumentException`.
+pub fn incomplete_processor(processing: Option<&ProcessingConfiguration>) -> Option<String> {
+    for processor in processing?.processors.iter().flatten() {
+        let Some((_, mandatory)) = MANDATORY_PROCESSOR_PARAMETERS
+            .iter()
+            .find(|(processor_type, _)| *processor_type == processor.r#type)
+        else {
+            continue;
+        };
+        let absent = mandatory.iter().find(|name| {
+            !processor
+                .parameters
+                .iter()
+                .flatten()
+                .any(|parameter| parameter.parameter_name == **name)
+        });
+        if let Some(absent) = absent {
+            return Some(crate::service::mandatory_processor_parameter_message(
+                absent,
+                &processor.r#type,
+            ));
+        }
+    }
+    None
 }
 
 /// Whether `processing` turns on a processor that only a CloudWatch Logs producer can
@@ -877,6 +964,19 @@ pub fn check_encryption_configuration_input(
                 ),
             });
         }
+        // And a CMK the stream's own account does not own is one whose key policy this
+        // account cannot be granted on: encrypting a stream under a customer managed CMK
+        // is Firehose creating a KMS GRANT on that key, and only the key's own account can
+        // allow that. KMS answers such a caller AccessDeniedException rather than
+        // disclosing whether the key is there at all, so that is the exception type this
+        // refusal relays and the sentence it carries is the one about the key policy.
+        let key_account = key_arn.split(':').nth(4).unwrap_or_default();
+        if !key_account.is_empty() && key_account != ::engine::emulator_account_id() {
+            return Err(EncryptionConfigRefusal::InvalidKmsResource {
+                code: KMS_ACCESS_DENIED_EXCEPTION.to_string(),
+                message: KMS_ACCESS_DENIED.to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -930,6 +1030,19 @@ pub async fn unusable_kms_key(
             }
         }
         Err(error) => {
+            // KMS denied the call: the key policy does not let this stream's Firehose use
+            // the key, which is a grounded refusal and the one Firehose words in terms of
+            // that policy ([`KMS_ACCESS_DENIED`]).
+            let denied = error.as_service_error().is_some_and(|service_error| {
+                ::aws_smithy_types::error::metadata::ProvideErrorMetadata::code(service_error)
+                    == Some(KMS_ACCESS_DENIED_EXCEPTION)
+            });
+            if denied {
+                return Some(EncryptionConfigRefusal::InvalidKmsResource {
+                    code: KMS_ACCESS_DENIED_EXCEPTION.to_string(),
+                    message: KMS_ACCESS_DENIED.to_string(),
+                });
+            }
             // KMS says this account holds no such key: the refusal is grounded, and it
             // carries KMS's own sentence about the key where KMS stated one.
             let not_found = error.as_service_error().is_some_and(
@@ -970,6 +1083,20 @@ const KMS_KEY_DISABLED: &str = "Disabled";
 const KMS_NOT_FOUND_EXCEPTION: &str = "NotFoundException";
 const KMS_DISABLED_EXCEPTION: &str = "DisabledException";
 const KMS_INVALID_STATE_EXCEPTION: &str = "InvalidStateException";
+/// The KMS exception type for a call the CMK's key policy does not allow, which is the
+/// one Firehose relays for a key it is not permitted to use.
+const KMS_ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
+
+/// What Firehose states for a CMK KMS would not let it use.
+///
+/// Encrypting a stream under a customer managed CMK is Firehose creating a KMS grant on
+/// that key, so a key policy that does not allow the grant APIs is what a caller has to
+/// change — and that is what the sentence says. It names no key: the fault is the policy
+/// of whichever CMK the request pointed at, and the refusal is the same sentence for all
+/// of them.
+const KMS_ACCESS_DENIED: &str = "AccessDenied by KMS while using the CMK. Check the key \
+     policy to ensure that the KMS grant related apis are allowed. Try again after the key \
+     policy has the right permissions.";
 
 /// What Firehose states for a CMK it cannot use: the key the request named and the reason
 /// KMS gave for it.

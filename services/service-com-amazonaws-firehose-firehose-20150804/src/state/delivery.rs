@@ -330,7 +330,11 @@ fn abandoned_budget_spent() -> bool {
 
 /// The `ProcessorType` whose parameters carry the jq program that derives a record's
 /// partition keys.
-const METADATA_EXTRACTION_PROCESSOR: &str = "MetadataExtraction";
+///
+/// `pub(crate)` because the rule about the parameters a processor of this type cannot run
+/// without is stated beside the other processor rules in the parent module, over this one
+/// name rather than a second spelling of it.
+pub(crate) const METADATA_EXTRACTION_PROCESSOR: &str = "MetadataExtraction";
 
 /// The `ProcessorType` that asks for a delimiter between the records of a delivered
 /// object: "If you want to add a new line delimiter between records in objects that are
@@ -340,8 +344,8 @@ const METADATA_EXTRACTION_PROCESSOR: &str = "MetadataExtraction";
 const APPEND_DELIMITER_PROCESSOR: &str = "AppendDelimiterToRecord";
 
 /// The `ProcessorParameterName` carrying the jq program of a `MetadataExtraction`
-/// processor.
-const METADATA_EXTRACTION_QUERY_PARAMETER: &str = "MetadataExtractionQuery";
+/// processor. `pub(crate)` for the same reason as [`METADATA_EXTRACTION_PROCESSOR`].
+pub(crate) const METADATA_EXTRACTION_QUERY_PARAMETER: &str = "MetadataExtractionQuery";
 
 /// The delimiter `AppendDelimiterToRecord` adds between the records of one object: the
 /// new line that processor exists to add, and the one `PutRecordBatch` names as the way
@@ -2162,8 +2166,10 @@ async fn partition_keys(query: String, records: &[StoredRecord]) -> Option<Vec<G
 /// * it nests deeper than [`MAX_PROGRAM_DEPTH`], or carries more than
 ///   [`MAX_PROGRAM_TOKENS`] tokens;
 /// * it DEFINES a function (`def`), which — with no library function registered — is the
-///   one construct left that may call itself, or LOOPS (`reduce`, `foreach`), which re-apply
-///   their update expression once per element of the value they are given;
+///   one construct left that may call itself, or re-applies an expression once per element
+///   of a value: `reduce` and `foreach` re-apply their update expression that way, and a
+///   BINDING (`f as $x | g`) re-applies `g` once per output of `f`, which over an iterated
+///   path is the same unbounded chain under another spelling;
 /// * it carries `+`, `*`, `-` or a lone `/`, the operators that GROW a value out of
 ///   proportion to the one they were given (`+` concatenates and merges, `*` repeats a
 ///   string and merges deeply, `-` subtracts one array from another by comparing every pair
@@ -2195,11 +2201,11 @@ async fn partition_keys(query: String, records: &[StoredRecord]) -> Option<Vec<G
 ///   one, so nothing can be hidden behind one either.
 ///
 /// THE MEMORY BOUND those last three give. With no library function registered there is no
-/// generator and no recursion; with no definition and no loop form there is nothing that
-/// re-applies an expression, so a program is STRAIGHT-LINE: it either takes the input APART
-/// (a path, an index, a slice, a comparison, `if`, `//`, `|`, a binding) or CONSTRUCTS one
-/// container from it. A construction holding `n` copies of its input grows it `n`-fold and
-/// a chain of `k` constructions grows it `n^k`-fold — so with `k` capped at one and `n`
+/// generator and no recursion; with no definition, no loop form and no binding there is
+/// nothing that re-applies an expression, so a program is STRAIGHT-LINE: it either takes
+/// the input APART (a path, an index, a slice, a comparison, `if`, `//`, `|`) or CONSTRUCTS
+/// one container from it. A construction holding `n` copies of its input grows it `n`-fold
+/// and a chain of `k` constructions grows it `n^k`-fold — so with `k` capped at one and `n`
 /// bounded by the token count, the largest value one run can build is at most
 /// [`MAX_PROGRAM_TOKENS`] times [`MAX_EXTRACTED_RECORD_BYTES`], and at most
 /// [`MAX_RUNNING_METADATA_EXTRACTIONS`] runs hold one at a time. The steps it takes are
@@ -2401,14 +2407,17 @@ fn admissible_program(query: &str) -> Result<(), &'static str> {
 
 /// Why a jq KEYWORD makes a program inadmissible, or `None` for a word that does not.
 ///
-/// The three core forms whose evaluation is not bounded by the program's own text: a
-/// definition may call itself, and `reduce` / `foreach` re-apply their update expression
-/// once per element of the value they are given, so one construction inside either is
-/// worth an unbounded chain of them.
+/// The forms whose evaluation is not bounded by the program's own text: a definition may
+/// call itself, `reduce` / `foreach` re-apply their update expression once per element of
+/// the value they are given, and a BINDING (`f as $x | g`) re-applies `g` once per output
+/// of `f` — so over an iterated path (`.items[] as $i | …`) it re-applies it once per
+/// element exactly as a loop does, and nesting bindings multiplies that per level. One
+/// construction inside any of them is worth an unbounded chain of them, which is what the
+/// memory bound [`admissible_program`] documents rests on not happening.
 fn inadmissible_word(word: &str) -> Option<&'static str> {
     match word {
         "def" => Some("it defines a function"),
-        "reduce" | "foreach" => Some("it loops over a value"),
+        "reduce" | "foreach" | "as" => Some("it loops over a value"),
         _ => None,
     }
 }
@@ -2608,6 +2617,7 @@ fn compressed(body: Vec<u8>, target: &S3Target) -> Option<(Vec<u8>, String)> {
         // uncompressed or Snappy object without one.
         "GZIP" => (gzip(&body)?, ".gz"),
         "ZIP" => (zip(&body)?, ".zip"),
+        "ZSTD" => (zstd(&body)?, ".zst"),
         "Snappy" => (snappy(&body)?, ""),
         "HADOOP_SNAPPY" => (hadoop_snappy(&body)?, ""),
         UNCOMPRESSED => (body, ""),
@@ -2643,6 +2653,14 @@ fn zip(body: &[u8]) -> Option<Vec<u8>> {
         .ok()?;
     archive.write_all(body).ok()?;
     Some(archive.finish().ok()?.into_inner())
+}
+
+/// `body` as a Zstandard frame.
+fn zstd(body: &[u8]) -> Option<Vec<u8>> {
+    Some(::ruzstd::encoding::compress_to_vec(
+        body,
+        ::ruzstd::encoding::CompressionLevel::Fastest,
+    ))
 }
 
 /// `body` in the Snappy framing format.
@@ -3001,7 +3019,7 @@ mod tests {
     #[test]
     fn a_program_that_reads_a_partition_key_out_of_a_record_is_admitted() {
         // The forms a metadata-extraction query needs: an object construction over a path,
-        // a nested path, a binding, the alternative operator, and each comparison — none of
+        // a nested path, the alternative operator, and each comparison — none of
         // which can hand the engine more than the record it was given.
         for program in [
             "{dept:.dept}",
@@ -3009,7 +3027,6 @@ mod tests {
             "{customer:.customer.id}",
             "{dept:(.dept // \"unknown\")}",
             "{dept:(.a[0] // .b[\"k\"] // .c[1:2])}",
-            ". as $record | {dept:$record.dept}",
             "{dept:(if .a == .b then .a else .b end)}",
             "{dept:(if .a != .b then .a else .b end)}",
             "{dept:(if .a <= .b then .a else .b end)}",
@@ -3061,6 +3078,16 @@ mod tests {
             ("def f: f; f", "it defines a function"),
             (
                 "{dept:(reduce .items[] as $i ([]; $i))}",
+                "it loops over a value",
+            ),
+            // A BINDING re-applies what follows it once per output of what precedes it, so
+            // over an iterated path it is a loop under another spelling — and nesting two
+            // of them multiplies that per level, which is how a handful of tokens builds a
+            // value the straight-line accounting never charged for.
+            (". as $record | {dept:$record.dept}", "it loops over a value"),
+            (".items[] as $i | {dept:$i}", "it loops over a value"),
+            (
+                "[.items[] as $i | .items[] as $j | [$i,$j]]",
                 "it loops over a value",
             ),
         ] {

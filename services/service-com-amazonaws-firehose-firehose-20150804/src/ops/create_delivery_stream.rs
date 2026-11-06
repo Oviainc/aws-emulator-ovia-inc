@@ -267,9 +267,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(crate::scaffolded::Scaffolded::validation)?;
         }
 
+        // Every `BucketARN` the create names is judged against the modelled pattern the
+        // request boundary could not apply, at the member it was submitted at and in the
+        // words that boundary would have used (`crate::service::check_bucket_arns`): a
+        // destination's bucket is named by an Amazon S3 bucket ARN and by nothing else, so
+        // a value of another shape — or an ARN of another service — names no bucket this
+        // stream could ever deliver to.
+        crate::service::check_bucket_arns(bucket_arns(&input))
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
         // "You must specify only one of the following destination configuration
         // parameters" — the create carries exactly one destination.
         let mut destination = sole_destination(&input)?;
+        // A processor of a type Firehose parameterizes by name carries the parameters that
+        // type cannot run without, whichever destination holds the configuration.
+        let processing = destination.processing_configuration();
+        if let Some(message) = crate::state::incomplete_processor(processing) {
+            return Err(invalid_argument(message));
+        }
         // A stored destination holds its data processing as Firehose runs it, not as it
         // was submitted: the parameters Firehose fills in itself are materialised and the
         // list is put in the service's canonical order, so the describe echo and the
@@ -542,6 +557,159 @@ fn role_arns(input: &CreateDeliveryStreamInput) -> Vec<&str> {
     }
 
     crate::state::distinct_role_arns(found)
+}
+
+/// The member every destination configuration names its Amazon S3 bucket by, and the
+/// member the nested configuration a destination delivers or backs up through is carried
+/// at. Spelled as the model declares them, because [`at`] is what re-cases a path.
+const BUCKET_ARN_MEMBER: &str = "BucketARN";
+const S3_CONFIGURATION_MEMBER: &str = "S3Configuration";
+const S3_BACKUP_CONFIGURATION_MEMBER: &str = "S3BackupConfiguration";
+
+/// The dotted path a member of a nested configuration is submitted at, spelled by the
+/// framework's own path builder so a refusal this handler states names the member exactly
+/// as a refusal the request boundary states does.
+fn at(members: &[&str]) -> String {
+    let segments: Vec<String> = members.iter().map(|member| path::member(member)).collect();
+    path::join(&segments)
+}
+
+/// Every Amazon S3 bucket ARN the create names, each at the dotted path it was submitted
+/// at.
+///
+/// The same collection as [`role_arns`], over the other resource a destination
+/// configuration names: an object Firehose delivers goes to the bucket of a `BucketARN`,
+/// whichever member of whichever destination type carried it — a plain or extended Amazon
+/// S3 destination's own, the `S3Configuration` every other destination kind delivers or
+/// backs up through, and an extended or Redshift destination's `S3BackupConfiguration` —
+/// so the gate is over all of them rather than over the destination's own bucket alone.
+/// Every one is the modelled `BucketARN` shape, so one rule answers for them all.
+fn bucket_arns<'a>(input: &'a CreateDeliveryStreamInput) -> Vec<(String, &'a str)> {
+    let mut found: Vec<(String, &str)> = Vec::new();
+    let mut bucket = |members: &[&str], bucket_arn: &'a str| {
+        found.push((at(members), bucket_arn));
+    };
+
+    if let Some(config) = input.s3_destination_configuration.as_ref() {
+        bucket(
+            &["S3DestinationConfiguration", BUCKET_ARN_MEMBER],
+            &config.bucket_arn,
+        );
+    }
+    if let Some(config) = input.extended_s3_destination_configuration.as_ref() {
+        bucket(
+            &["ExtendedS3DestinationConfiguration", BUCKET_ARN_MEMBER],
+            &config.bucket_arn,
+        );
+        if let Some(backup) = config.s3_backup_configuration.as_ref() {
+            bucket(
+                &[
+                    "ExtendedS3DestinationConfiguration",
+                    S3_BACKUP_CONFIGURATION_MEMBER,
+                    BUCKET_ARN_MEMBER,
+                ],
+                &backup.bucket_arn,
+            );
+        }
+    }
+    if let Some(config) = input.redshift_destination_configuration.as_ref() {
+        bucket(
+            &[
+                "RedshiftDestinationConfiguration",
+                S3_CONFIGURATION_MEMBER,
+                BUCKET_ARN_MEMBER,
+            ],
+            &config.s3_configuration.bucket_arn,
+        );
+        if let Some(backup) = config.s3_backup_configuration.as_ref() {
+            bucket(
+                &[
+                    "RedshiftDestinationConfiguration",
+                    S3_BACKUP_CONFIGURATION_MEMBER,
+                    BUCKET_ARN_MEMBER,
+                ],
+                &backup.bucket_arn,
+            );
+        }
+    }
+    if let Some(config) = input.elasticsearch_destination_configuration.as_ref() {
+        bucket(
+            &[
+                "ElasticsearchDestinationConfiguration",
+                S3_CONFIGURATION_MEMBER,
+                BUCKET_ARN_MEMBER,
+            ],
+            &config.s3_configuration.bucket_arn,
+        );
+    }
+    if let Some(config) = input
+        .amazonopensearchservice_destination_configuration
+        .as_ref()
+    {
+        bucket(
+            &[
+                "AmazonopensearchserviceDestinationConfiguration",
+                S3_CONFIGURATION_MEMBER,
+                BUCKET_ARN_MEMBER,
+            ],
+            &config.s3_configuration.bucket_arn,
+        );
+    }
+    if let Some(config) = input.splunk_destination_configuration.as_ref() {
+        bucket(
+            &[
+                "SplunkDestinationConfiguration",
+                S3_CONFIGURATION_MEMBER,
+                BUCKET_ARN_MEMBER,
+            ],
+            &config.s3_configuration.bucket_arn,
+        );
+    }
+    if let Some(config) = input.http_endpoint_destination_configuration.as_ref() {
+        bucket(
+            &[
+                "HttpEndpointDestinationConfiguration",
+                S3_CONFIGURATION_MEMBER,
+                BUCKET_ARN_MEMBER,
+            ],
+            &config.s3_configuration.bucket_arn,
+        );
+    }
+    if let Some(config) = input
+        .amazon_open_search_serverless_destination_configuration
+        .as_ref()
+    {
+        bucket(
+            &[
+                "AmazonOpenSearchServerlessDestinationConfiguration",
+                S3_CONFIGURATION_MEMBER,
+                BUCKET_ARN_MEMBER,
+            ],
+            &config.s3_configuration.bucket_arn,
+        );
+    }
+    if let Some(config) = input.snowflake_destination_configuration.as_ref() {
+        bucket(
+            &[
+                "SnowflakeDestinationConfiguration",
+                S3_CONFIGURATION_MEMBER,
+                BUCKET_ARN_MEMBER,
+            ],
+            &config.s3_configuration.bucket_arn,
+        );
+    }
+    if let Some(config) = input.iceberg_destination_configuration.as_ref() {
+        bucket(
+            &[
+                "IcebergDestinationConfiguration",
+                S3_CONFIGURATION_MEMBER,
+                BUCKET_ARN_MEMBER,
+            ],
+            &config.s3_configuration.bucket_arn,
+        );
+    }
+
+    found
 }
 
 /// The one destination configuration the request carries, refusing both none and more

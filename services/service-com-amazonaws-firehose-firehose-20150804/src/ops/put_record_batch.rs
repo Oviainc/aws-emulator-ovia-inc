@@ -205,6 +205,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
 
+        // "Each PutRecordBatch request supports up to 500 records. Each record in the
+        // request can be as large as 1,000 KB (before base64 encoding), up to a limit of 4
+        // MB for the entire request. These limits cannot be changed." The record count and
+        // each record's own size are modelled, so the boundary has already judged them; the
+        // AGGREGATE is this operation's own rule, and it is a property of the request
+        // alone, so it is answered before the stream it names is resolved — and it refuses
+        // the WHOLE request, so no record of an oversized batch is accepted.
+        let request_bytes: usize = input
+            .records
+            .iter()
+            .map(|record| record.data.len())
+            .sum();
+        if request_bytes > crate::state::MAX_PUT_RECORD_BATCH_BYTES {
+            return Err(PutRecordBatchErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(crate::service::records_too_large_message(
+                        crate::state::MAX_PUT_RECORD_BATCH_BYTES,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // One lookup resolves the stream, refuses it if it is not accepting data, and
         // mints one id per record IN INPUT ORDER — so the response entries line up
         // positionally with the records the caller sent, and no id is handed out for a

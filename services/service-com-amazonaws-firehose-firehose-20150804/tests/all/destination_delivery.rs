@@ -417,6 +417,7 @@ enum Compression {
     Uncompressed,
     Gzip,
     Zip,
+    Zstd,
     Snappy,
     HadoopSnappy,
 }
@@ -429,6 +430,7 @@ impl Compression {
             Self::Uncompressed => None,
             Self::Gzip => Some("GZIP"),
             Self::Zip => Some("ZIP"),
+            Self::Zstd => Some("ZSTD"),
             Self::Snappy => Some("Snappy"),
             Self::HadoopSnappy => Some("HADOOP_SNAPPY"),
         }
@@ -439,6 +441,7 @@ impl Compression {
         match self {
             Self::Gzip => ".gz",
             Self::Zip => ".zip",
+            Self::Zstd => ".zst",
             Self::Uncompressed | Self::Snappy | Self::HadoopSnappy => "",
         }
     }
@@ -465,6 +468,14 @@ impl Compression {
                     .expect("a ZIP object must hold an entry")
                     .read_to_end(&mut decoded)
                     .expect("a ZIP entry must read");
+                decoded
+            }
+            Self::Zstd => {
+                let mut decoded = Vec::new();
+                ruzstd::decoding::StreamingDecoder::new(body)
+                    .expect("a ZSTD object must open as a Zstandard frame")
+                    .read_to_end(&mut decoded)
+                    .expect("a ZSTD object must decode");
                 decoded
             }
             Self::Snappy => {
@@ -578,6 +589,17 @@ fn delivery_rows() -> Vec<DeliveryRow> {
             automatic_time_prefix: true,
             file_extension: None,
             records: vec!["archive this"],
+            separator: "",
+        },
+        DeliveryRow {
+            case: "an extended destination compressing with ZSTD",
+            member: "ExtendedS3DestinationConfiguration",
+            config: s3_destination("{bucket}", Some("zstd/")),
+            compression: Compression::Zstd,
+            key_prefix: "zstd/",
+            automatic_time_prefix: true,
+            file_extension: None,
+            records: vec!["zstandard", "payload"],
             separator: "",
         },
         DeliveryRow {

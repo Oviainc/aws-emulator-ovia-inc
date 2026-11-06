@@ -142,6 +142,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The dotted member path a constraint violation is reported at, spelled by the framework's
+// own path builder — see `crate::ops::create_delivery_stream`.
+use ::aws_smithy_schema_server::constraints::path;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -226,6 +230,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exactly one type.
         let update = sole_update(&input)?;
 
+        // Every `BucketARN` the update names is judged against the modelled pattern the
+        // request boundary could not apply, in the words that boundary would have used
+        // (`crate::service::check_bucket_arns`) — the same gate the create path applies,
+        // because it is the same modelled shape whichever operation takes it.
+        let named_buckets = bucket_arns(&input);
+        crate::service::check_bucket_arns(
+            named_buckets
+                .iter()
+                .map(|(path, bucket_arn)| (path.clone(), *bucket_arn)),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // And the data processors it carries must each carry the parameters their type
+        // cannot run without, exactly as on the create path.
+        if let Some(message) = crate::state::incomplete_processor(update.processing_configuration())
+        {
+            return Err(invalid_argument(message));
+        }
+
         // And exactly as on the create path, every `RoleARN` the update names is a role
         // Firehose assumes, resolved against IAM before anything is written: an update
         // that moves a destination onto a role Firehose cannot assume is an argument
@@ -240,8 +263,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // objects to, resolved against Amazon S3 before anything is written: an update that
         // moves a destination onto a bucket that does not exist is the same argument fault,
         // and the stream keeps the destination it had.
-        if let Some(message) =
-            crate::state::absent_destination_bucket(ctx, &region, &bucket_arns(&input)).await
+        if let Some(message) = crate::state::absent_destination_bucket(
+            ctx,
+            &region,
+            &named_buckets
+                .iter()
+                .map(|(_, bucket_arn)| *bucket_arn)
+                .collect::<Vec<&str>>(),
+        )
+        .await
         {
             return Err(invalid_argument(message));
         }
@@ -411,7 +441,8 @@ fn role_arns(input: &UpdateDestinationInput) -> Vec<&str> {
     crate::state::distinct_role_arns(found)
 }
 
-/// Every Amazon S3 bucket ARN the update names.
+/// Every Amazon S3 bucket ARN the update names, each at the dotted path it was submitted
+/// at.
 ///
 /// The same collection as [`role_arns`], over the other resource a destination
 /// configuration names: an object Firehose delivers goes to the bucket of a `BucketARN`,
@@ -423,43 +454,123 @@ fn role_arns(input: &UpdateDestinationInput) -> Vec<&str> {
 /// resolved when it was written. One bucket named twice is one question for Amazon S3,
 /// which [`crate::state::absent_destination_bucket`] settles over the bucket NAMES it asks
 /// about rather than over the ARNs that spell them.
-fn bucket_arns(input: &UpdateDestinationInput) -> Vec<&str> {
-    let mut found: Vec<&str> = Vec::new();
+fn bucket_arns<'a>(input: &'a UpdateDestinationInput) -> Vec<(String, &'a str)> {
+    let mut found: Vec<(String, &str)> = Vec::new();
+    let mut bucket = |members: &[&str], bucket_arn: Option<&'a str>| {
+        if let Some(bucket_arn) = bucket_arn {
+            let segments: Vec<String> = members.iter().map(|member| path::member(member)).collect();
+            found.push((path::join(&segments), bucket_arn));
+        }
+    };
 
     if let Some(update) = input.s3_destination_update.as_ref() {
-        found.extend(update.bucket_arn.as_deref());
+        bucket(
+            &["S3DestinationUpdate", BUCKET_ARN_MEMBER],
+            update.bucket_arn.as_deref(),
+        );
     }
     if let Some(update) = input.extended_s3_destination_update.as_ref() {
-        found.extend(update.bucket_arn.as_deref());
-        found.extend(s3_update_bucket(update.s3_backup_update.as_ref()));
+        bucket(
+            &["ExtendedS3DestinationUpdate", BUCKET_ARN_MEMBER],
+            update.bucket_arn.as_deref(),
+        );
+        bucket(
+            &[
+                "ExtendedS3DestinationUpdate",
+                S3_BACKUP_UPDATE_MEMBER,
+                BUCKET_ARN_MEMBER,
+            ],
+            s3_update_bucket(update.s3_backup_update.as_ref()),
+        );
     }
     if let Some(update) = input.redshift_destination_update.as_ref() {
-        found.extend(s3_update_bucket(update.s3_update.as_ref()));
-        found.extend(s3_update_bucket(update.s3_backup_update.as_ref()));
+        bucket(
+            &[
+                "RedshiftDestinationUpdate",
+                S3_UPDATE_MEMBER,
+                BUCKET_ARN_MEMBER,
+            ],
+            s3_update_bucket(update.s3_update.as_ref()),
+        );
+        bucket(
+            &[
+                "RedshiftDestinationUpdate",
+                S3_BACKUP_UPDATE_MEMBER,
+                BUCKET_ARN_MEMBER,
+            ],
+            s3_update_bucket(update.s3_backup_update.as_ref()),
+        );
     }
     if let Some(update) = input.elasticsearch_destination_update.as_ref() {
-        found.extend(s3_update_bucket(update.s3_update.as_ref()));
+        bucket(
+            &[
+                "ElasticsearchDestinationUpdate",
+                S3_UPDATE_MEMBER,
+                BUCKET_ARN_MEMBER,
+            ],
+            s3_update_bucket(update.s3_update.as_ref()),
+        );
     }
     if let Some(update) = input.amazonopensearchservice_destination_update.as_ref() {
-        found.extend(s3_update_bucket(update.s3_update.as_ref()));
+        bucket(
+            &[
+                "AmazonopensearchserviceDestinationUpdate",
+                S3_UPDATE_MEMBER,
+                BUCKET_ARN_MEMBER,
+            ],
+            s3_update_bucket(update.s3_update.as_ref()),
+        );
     }
     if let Some(update) = input.splunk_destination_update.as_ref() {
-        found.extend(s3_update_bucket(update.s3_update.as_ref()));
+        bucket(
+            &[
+                "SplunkDestinationUpdate",
+                S3_UPDATE_MEMBER,
+                BUCKET_ARN_MEMBER,
+            ],
+            s3_update_bucket(update.s3_update.as_ref()),
+        );
     }
     if let Some(update) = input.http_endpoint_destination_update.as_ref() {
-        found.extend(s3_update_bucket(update.s3_update.as_ref()));
+        bucket(
+            &[
+                "HttpEndpointDestinationUpdate",
+                S3_UPDATE_MEMBER,
+                BUCKET_ARN_MEMBER,
+            ],
+            s3_update_bucket(update.s3_update.as_ref()),
+        );
     }
     if let Some(update) = input
         .amazon_open_search_serverless_destination_update
         .as_ref()
     {
-        found.extend(s3_update_bucket(update.s3_update.as_ref()));
+        bucket(
+            &[
+                "AmazonOpenSearchServerlessDestinationUpdate",
+                S3_UPDATE_MEMBER,
+                BUCKET_ARN_MEMBER,
+            ],
+            s3_update_bucket(update.s3_update.as_ref()),
+        );
     }
     if let Some(update) = input.snowflake_destination_update.as_ref() {
-        found.extend(s3_update_bucket(update.s3_update.as_ref()));
+        bucket(
+            &[
+                "SnowflakeDestinationUpdate",
+                S3_UPDATE_MEMBER,
+                BUCKET_ARN_MEMBER,
+            ],
+            s3_update_bucket(update.s3_update.as_ref()),
+        );
     }
     if let Some(update) = input.iceberg_destination_update.as_ref() {
-        found.extend(
+        bucket(
+            &[
+                "IcebergDestinationUpdate",
+                S3_CONFIGURATION_MEMBER,
+                BUCKET_ARN_MEMBER,
+            ],
             update
                 .s3_configuration
                 .as_ref()
@@ -469,6 +580,14 @@ fn bucket_arns(input: &UpdateDestinationInput) -> Vec<&str> {
 
     found
 }
+
+/// The members a destination update names its Amazon S3 bucket, and the nested
+/// configuration carrying it, by. Spelled as the model declares them; the path builder is
+/// what re-cases them.
+const BUCKET_ARN_MEMBER: &str = "BucketARN";
+const S3_UPDATE_MEMBER: &str = "S3Update";
+const S3_BACKUP_UPDATE_MEMBER: &str = "S3BackupUpdate";
+const S3_CONFIGURATION_MEMBER: &str = "S3Configuration";
 
 /// The bucket a nested `S3DestinationUpdate` names, when it names one.
 fn s3_update_bucket(update: Option<&S3DestinationUpdate>) -> Option<&str> {
@@ -520,6 +639,26 @@ impl DestinationUpdateKind {
             Self::Snowflake(_) => "SnowflakeDestinationUpdate",
             Self::AmazonOpenSearchServerless(_) => "AmazonOpenSearchServerlessDestinationUpdate",
             Self::Iceberg(_) => "IcebergDestinationUpdate",
+        }
+    }
+
+    /// The data-processing configuration this update carries, whatever variant it is.
+    ///
+    /// `S3DestinationUpdate` is the one update the model gives no
+    /// `ProcessingConfiguration` member, mirroring `S3DestinationConfiguration` on the
+    /// create path, so a plain Amazon S3 destination's update carries none.
+    fn processing_configuration(&self) -> Option<&ProcessingConfiguration> {
+        match self {
+            Self::S3(_) => None,
+            Self::ExtendedS3(update) => update.processing_configuration.as_ref(),
+            Self::Redshift(update) => update.processing_configuration.as_ref(),
+            Self::Elasticsearch(update) => update.processing_configuration.as_ref(),
+            Self::AmazonOpenSearchService(update) => update.processing_configuration.as_ref(),
+            Self::Splunk(update) => update.processing_configuration.as_ref(),
+            Self::HttpEndpoint(update) => update.processing_configuration.as_ref(),
+            Self::Snowflake(update) => update.processing_configuration.as_ref(),
+            Self::AmazonOpenSearchServerless(update) => update.processing_configuration.as_ref(),
+            Self::Iceberg(update) => update.processing_configuration.as_ref(),
         }
     }
 
