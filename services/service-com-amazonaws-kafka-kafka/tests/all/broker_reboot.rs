@@ -440,6 +440,7 @@ async fn a_reboot_names_exactly_one_broker_the_cluster_holds() {
         ("the id past the last", &["4"]),
         ("an id far past the last", &["99"]),
         ("a value that is no number", &["one"]),
+        ("an id padded with whitespace", &[" 1 "]),
         ("an empty id", &[""]),
     ];
 

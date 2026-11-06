@@ -250,15 +250,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // The broker named has to be one of THIS cluster's nodes: a reboot acts on
         // a node, so a value naming none of them names nothing to restart. The ids
-        // are the nodes' own (`BrokerNodeInfo$BrokerId`), 1-based and as many as
-        // the cluster holds brokers.
+        // are the nodes' own (`BrokerNodeInfo$BrokerId`), read off the stored broker
+        // records, which is also what the refusal reports.
         if !names_held_broker(broker_id, &held_broker_ids) {
             return Err(bad_request(
                 BROKER_IDS_MEMBER,
                 format!(
-                    "The cluster has no broker with the id {broker_id}; its broker ids are 1 \
-                     through {}.",
-                    held_broker_ids.len()
+                    "The cluster has no broker with the id {broker_id}; its broker ids are {}.",
+                    held_broker_ids
+                        .iter()
+                        .map(i32::to_string)
+                        .collect::<Vec<String>>()
+                        .join(", ")
                 ),
             ));
         }
@@ -295,12 +298,10 @@ const BROKER_IDS_MEMBER: &str = "BrokerIds";
 ///
 /// A broker id is a number (`BrokerNodeInfo$BrokerId`), so the comparison is on the
 /// number the value denotes rather than on its text: a value that denotes no number
-/// names no broker.
+/// — including one padded with whitespace, which is not how a broker id is spelled
+/// — names no broker.
 fn names_held_broker(broker_id: &str, held: &[i32]) -> bool {
-    broker_id
-        .trim()
-        .parse::<i32>()
-        .is_ok_and(|id| held.contains(&id))
+    broker_id.parse::<i32>().is_ok_and(|id| held.contains(&id))
 }
 
 /// Refuse the request with the modeled `BadRequestException`, naming the member at

@@ -1497,11 +1497,20 @@ impl ClusterChange {
     ///
     /// One function of the change itself, so the state a cluster operation puts its
     /// cluster into and the state its completion is materialised from
-    /// ([`Cluster::settle`]) cannot drift apart.
+    /// ([`Cluster::settle`]) cannot drift apart. Matched variant by variant rather
+    /// than through a catch-all, so a change added later has to say which state it
+    /// puts its cluster in instead of inheriting `UPDATING` silently.
     pub fn in_flight_state(&self) -> &'static str {
         match self {
             Self::BrokerReboot => CLUSTER_STATE_REBOOTING_BROKER,
-            _ => CLUSTER_STATE_UPDATING,
+            Self::Connectivity { .. }
+            | Self::Storage(_)
+            | Self::BrokerType { .. }
+            | Self::BrokerCount { .. }
+            | Self::KafkaVersion { .. }
+            | Self::Configuration { .. }
+            | Self::Security { .. }
+            | Self::Monitoring { .. } => CLUSTER_STATE_UPDATING,
         }
     }
 
@@ -1513,8 +1522,20 @@ impl ClusterChange {
     /// quotes none — its request carries no `CurrentVersion` member at all — and it
     /// changes no cluster attribute, so a rebooted cluster is still at the version
     /// it was.
+    ///
+    /// Decided the same way, variant by variant, for the same reason.
     pub fn generates_new_version(&self) -> bool {
-        !matches!(self, Self::BrokerReboot)
+        match self {
+            Self::BrokerReboot => false,
+            Self::Connectivity { .. }
+            | Self::Storage(_)
+            | Self::BrokerType { .. }
+            | Self::BrokerCount { .. }
+            | Self::KafkaVersion { .. }
+            | Self::Configuration { .. }
+            | Self::Security { .. }
+            | Self::Monitoring { .. } => true,
+        }
     }
 }
 
