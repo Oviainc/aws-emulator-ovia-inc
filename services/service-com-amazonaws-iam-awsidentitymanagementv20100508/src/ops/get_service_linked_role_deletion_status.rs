@@ -209,9 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetServiceLinkedRoleDeletionStatusErrorModeled::NoSuchEntityException(
                     NoSuchEntityException {
-                        message: Some(crate::state::deletion_task_not_found(
-                            &input.deletion_task_id,
-                        )),
+                        message: Some(crate::state::deletion_task_not_found()),
                     },
                 )
                 .into(),

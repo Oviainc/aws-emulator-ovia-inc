@@ -2100,14 +2100,15 @@ pub fn service_linked_role_deletion_status(
 }
 
 /// The message a read of a deletion task the account holds nothing under is refused
-/// with — the `NoSuchEntityException` message, whose fixed text is `The deletion task
-/// with ID ` and ` cannot be found.` around the id the request supplied.
+/// with — the `NoSuchEntityException` message, whose text is wholly FIXED: `Cannot find
+/// deletion status for given id.`
 ///
-/// ONE wording, worded as this service words every other missing entity ("The role with
-/// name … cannot be found."), so two reads cannot describe the same missing task
-/// differently.
-pub fn deletion_task_not_found(deletion_task_id: &str) -> String {
-    format!("The deletion task with ID {deletion_task_id} cannot be found.")
+/// The sentence interpolates NOTHING, which is why this helper takes no argument: the
+/// deletion-status surface reports the absence of a task without naming the id it was
+/// asked about, and the text a client matches is the same for every id. ONE wording, so
+/// two reads cannot describe the same missing task differently.
+pub fn deletion_task_not_found() -> String {
+    "Cannot find deletion status for given id.".to_string()
 }
 
 /// The `CreateDate` a service-provisioned role reports: the epoch.
@@ -3757,6 +3758,20 @@ pub fn boundary_scope_not_attachable(arn: &str) -> String {
 /// matching the message sees.
 pub fn role_cannot_be_found(role_name: &str) -> String {
     format!("The role with name {role_name} cannot be found.")
+}
+
+/// The message IAM refuses a USER permissions-boundary call addressed by a `UserName` the
+/// account holds no user under with — the `NoSuchEntityException` message, whose fixed text
+/// is `User ` and ` was not found.` around the name the request supplied.
+///
+/// A different sentence from the `The user with name … cannot be found.` IAM's classic user
+/// surface answers (the readers, the tag calls, the inline-policy calls): the
+/// permissions-boundary surface words a missing user its own way, and both sentences are
+/// part of the wire contract a client matching the message sees. ONE wording, shared by the
+/// put and the delete of a user's boundary, so the two cannot describe the same missing
+/// user differently.
+pub fn user_was_not_found(user_name: &str) -> String {
+    format!("User {user_name} was not found.")
 }
 
 /// The message IAM refuses a permissions-boundary DELETE with when the entity it names

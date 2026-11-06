@@ -204,7 +204,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The user is named (friendly name, not ARN) and IAM entity names "are not
         // distinguished by case", so the case-folded name is the identity. A name the
         // account holds no user under "referenced a resource entity that does not
-        // exist".
+        // exist", worded in the sentence the USER permissions-boundary surface words that
+        // absence with — `User ` and ` was not found.` around the name the request
+        // supplied (`crate::state::user_was_not_found`), which is a different sentence
+        // from the `The user with name … cannot be found.` IAM's classic user surface
+        // answers, and part of the wire contract a client matching the message sees. The
+        // same sentence `DeleteUserPermissionsBoundary` answers for the same absence.
         let user_key = crate::state::name_key(&input.user_name);
 
         // IAM authorizes its own API: the signing principal's identity-based policies are
@@ -229,10 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.users.contains_key(&user_key) {
             return Err(PutUserPermissionsBoundaryErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(format!(
-                        "The user with name {} cannot be found.",
-                        input.user_name
-                    )),
+                    message: Some(crate::state::user_was_not_found(&input.user_name)),
                 },
             )
             .into());
@@ -291,10 +293,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(user) = store.users.get_mut(&user_key) else {
             return Err(PutUserPermissionsBoundaryErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(format!(
-                        "The user with name {} cannot be found.",
-                        input.user_name
-                    )),
+                    message: Some(crate::state::user_was_not_found(&input.user_name)),
                 },
             )
             .into());

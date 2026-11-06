@@ -475,7 +475,10 @@ async fn a_task_id_outside_the_documented_format_is_invalid_and_an_unknown_one_i
             "case {deletion_task_id:?}: expected NoSuchEntity, got {:?}",
             error_code(&body)
         );
-        let expected = format!("The deletion task with ID {deletion_task_id} cannot be found.");
+        // IAM's deletion-status surface words a task it holds nothing under with a
+        // sentence that interpolates NOTHING, so both rows get the same text
+        // (`crate::state::deletion_task_not_found`).
+        let expected = "Cannot find deletion status for given id.";
         assert_eq!(
             element(&body, "Message"),
             expected,

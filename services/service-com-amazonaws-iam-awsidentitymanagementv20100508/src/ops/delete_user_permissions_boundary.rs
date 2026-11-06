@@ -168,8 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // IAM entity names "are not distinguished by case", so the user is found under
         // the case-folded name whatever case the request spelled it in; a name the
         // account holds no user under "referenced a resource entity that does not exist",
-        // worded in this operation's own sentence for it — `User ` and ` was not found.`
-        // around the name the request supplied, which is a different sentence from the
+        // worded in the sentence the USER permissions-boundary surface words that absence
+        // with — `User ` and ` was not found.` around the name the request supplied
+        // (`crate::state::user_was_not_found`), which is a different sentence from the
         // `The user with name … cannot be found.` IAM's classic user surface answers, and
         // part of the wire contract a client matching the message sees — an answer
         // withheld until the call has been authorized, because IAM decides a call against
@@ -199,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteUserPermissionsBoundaryErrorModeled::NoSuchEntityException(
                     NoSuchEntityException {
-                        message: Some(format!("User {} was not found.", input.user_name)),
+                        message: Some(crate::state::user_was_not_found(&input.user_name)),
                     },
                 )
                 .into(),

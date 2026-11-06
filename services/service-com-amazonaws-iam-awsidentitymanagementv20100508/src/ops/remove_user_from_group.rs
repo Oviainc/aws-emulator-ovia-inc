@@ -171,8 +171,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // IAM entity names "are not distinguished by case", so both entities are found
         // under their case-folded names; a name the account holds no group or no user
-        // under "referenced a resource entity that does not exist", the same two lookups
-        // and the same two sentences `AddUserToGroup` makes.
+        // under "referenced a resource entity that does not exist", the same two
+        // sentences `AddUserToGroup` makes.
         let group_key = crate::state::name_key(&input.group_name);
 
         // IAM authorizes its own API: the signing principal's identity-based policies are
@@ -194,17 +194,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &format!("group {}", input.group_name),
         )?;
 
-        if !store.groups.contains_key(&group_key) {
-            return Err(RemoveUserFromGroupErrorModeled::NoSuchEntityException(
-                NoSuchEntityException {
-                    message: Some(format!(
-                        "The group with name {} cannot be found.",
-                        input.group_name
-                    )),
-                },
-            )
-            .into());
-        }
+        // What the request asks to remove is the MEMBERSHIP of a user in a group, and the
+        // member of the pair IAM resolves first is the user: a request naming an absent
+        // user is refused naming THAT user, whether or not the account holds the group
+        // either, so the refusal always describes the entity that is missing nearest the
+        // front of the resolution rather than the one checked first by accident. Only once
+        // the user is held does the group's own absence become the thing to report.
         let user_key = crate::state::name_key(&input.user_name);
         if !store.users.contains_key(&user_key) {
             return Err(RemoveUserFromGroupErrorModeled::NoSuchEntityException(
@@ -212,6 +207,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(format!(
                         "The user with name {} cannot be found.",
                         input.user_name
+                    )),
+                },
+            )
+            .into());
+        }
+        if !store.groups.contains_key(&group_key) {
+            return Err(RemoveUserFromGroupErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The group with name {} cannot be found.",
+                        input.group_name
                     )),
                 },
             )
