@@ -1183,6 +1183,61 @@ pub fn check_db_instance_class(db_instance_class: &str) -> Result<(), String> {
 /// engines).
 pub const SERVERLESS_INSTANCE_CLASS: &str = "db.serverless";
 
+/// Refuse a DB instance this service offers no orderable option for.
+///
+/// A DB instance is created as ONE combination — a DB instance class, an engine, a version
+/// of that engine and a license model — and the real service creates it only where that
+/// combination is offered, which is what `DescribeOrderableDBInstanceOptions` reports
+/// ("the orderable DB instance options for a specified DB engine"). So a create resolves
+/// its combination against that report: a class whose instance generation the report
+/// publishes no option in at all
+/// ([`crate::ops::describe_orderable_db_instance_options::publishes_instance_family`]), or
+/// a `LicenseModel` the engine is offered under by none of them, is a combination that can
+/// be ordered nowhere.
+///
+/// This is NOT [`check_db_instance_class`], which decides whether the value is a DB
+/// instance class at ALL (an `InvalidParameterValue` on the member) — here the value is a
+/// class and the request is refused for the COMBINATION the four members make, which is
+/// the `InvalidParameterCombination` the real service answers, in the sentence it words it
+/// with: the four values, each named by its member, so a caller can see which part of the
+/// combination to change. The version is the one the create resolved against the
+/// engine-version catalogue (what it would provision), and the licence the one it would
+/// create the instance under when the request named none ([`default_license_model`]).
+///
+/// A licence the request LEFT OUT is not checked: the service picks it itself, so it is
+/// offered by construction, and only a value the CALLER chose can disagree with the report.
+pub fn check_orderable_db_instance(
+    engine: &str,
+    engine_version: &str,
+    db_instance_class: &str,
+    license_model: Option<&str>,
+) -> Result<(), String> {
+    let class_offered =
+        crate::ops::describe_orderable_db_instance_options::publishes_instance_family(
+            db_instance_class,
+        );
+    let license_offered = license_model.is_none_or(|named| {
+        crate::ops::describe_orderable_db_instance_options::offers_license_model(engine, named)
+    });
+    if class_offered && license_offered {
+        return Ok(());
+    }
+    let reported_license = license_model
+        .or_else(|| default_license_model(engine))
+        .or_else(|| {
+            crate::ops::describe_orderable_db_instance_options::license_models(engine)
+                .first()
+                .copied()
+        })
+        .unwrap_or_default();
+    Err(format!(
+        "RDS does not support creating a DB instance with the following combination: \
+         DBInstanceClass={db_instance_class}, Engine={engine}, \
+         EngineVersion={engine_version}, LicenseModel={reported_license}. For supported \
+         combinations of instance class and database engine version, see the documentation."
+    ))
+}
+
 /// The named instance sizes a DB instance class's size token may be, as AWS publishes
 /// them for its instance types. The remaining sizes are written `<n>xlarge`, which
 /// [`is_instance_size`] accepts on the form rather than by listing every `n`.

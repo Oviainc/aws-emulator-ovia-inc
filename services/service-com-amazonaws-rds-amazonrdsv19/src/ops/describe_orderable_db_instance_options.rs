@@ -480,12 +480,7 @@ fn vcpus(size: &str) -> Option<i32> {
 /// disagree about a class.
 pub fn instance_classes(engine: &str) -> Vec<InstanceClass> {
     let cluster = is_cluster_engine(engine);
-    let families = if cluster {
-        CLUSTER_FAMILIES
-    } else {
-        PROVISIONED_FAMILIES
-    };
-    let mut classes: Vec<InstanceClass> = families
+    let mut classes: Vec<InstanceClass> = instance_families(engine)
         .iter()
         .flat_map(|family| {
             family.sizes.iter().map(move |size| InstanceClass {
@@ -514,6 +509,54 @@ pub fn instance_classes(engine: &str) -> Vec<InstanceClass> {
     classes
 }
 
+/// The DB instance FAMILIES `engine` can be ordered in: the family rows this report is
+/// built from, which is the part of AWS's per-region, per-engine matrix this service
+/// publishes.
+fn instance_families(engine: &str) -> &'static [InstanceFamily] {
+    if is_cluster_engine(engine) {
+        CLUSTER_FAMILIES
+    } else {
+        PROVISIONED_FAMILIES
+    }
+}
+
+/// Whether this report publishes any option at all in the instance GENERATION
+/// `db_instance_class` names — the family part of `db.<family>.<size>`.
+///
+/// The published matrix is families crossed with sizes, and it is an explicitly PARTIAL
+/// subset of AWS's own, which moves with every instance-type launch, in both directions:
+/// a SIZE outside the rows is still a size AWS may offer in a family that is in them
+/// (`db.m5.24xlarge`), and which of its families each ENGINE offers is the part of the
+/// matrix this service does not hold. What the report does publish about a class is
+/// therefore its generation: the families any DB instance can be ordered in. A class whose
+/// family appears in no row of either table names a generation this service offers no
+/// option in — a previous-generation family no engine version it publishes can be created
+/// with — which is what the real service refuses a create of.
+pub fn publishes_instance_family(db_instance_class: &str) -> bool {
+    // The serverless capacity class has no family-and-size form at all; it is published as
+    // an option of its own, so the class itself is the generation.
+    if db_instance_class.eq_ignore_ascii_case(SERVERLESS_CLASS) {
+        return true;
+    }
+    let Some(family) = db_instance_class
+        .strip_prefix("db.")
+        .and_then(|rest| rest.split('.').next())
+    else {
+        return false;
+    };
+    PROVISIONED_FAMILIES
+        .iter()
+        .chain(CLUSTER_FAMILIES)
+        .any(|row| row.family.eq_ignore_ascii_case(family))
+}
+
+/// Whether this report offers `engine` under `license_model` ([`license_models`]).
+pub fn offers_license_model(engine: &str, license_model: &str) -> bool {
+    license_models(engine)
+        .iter()
+        .any(|offered| offered.eq_ignore_ascii_case(license_model))
+}
+
 /// The license models `engine` can be ordered under, as `CreateDBInstance`'s
 /// `LicenseModel` member documents them per engine ("`license-included`",
 /// "`bring-your-own-license`", "`general-public-license`", "`postgresql-license`",
@@ -522,7 +565,10 @@ pub fn instance_classes(engine: &str) -> Vec<InstanceClass> {
 /// An engine of another control plane this one front door serves is licensed by that
 /// control plane rather than by a database vendor, so its licence is the one THAT engine
 /// publishes and not a value from the list above.
-fn license_models(engine: &str) -> &'static [&'static str] {
+///
+/// `pub` for the same reason as [`instance_classes`]: a create that names a licence
+/// resolves it against the licences published here.
+pub fn license_models(engine: &str) -> &'static [&'static str] {
     match engine {
         "postgres" | "aurora-postgresql" => &["postgresql-license"],
         "mysql" | "mariadb" | "aurora-mysql" => &["general-public-license"],

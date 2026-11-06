@@ -1834,6 +1834,40 @@ pub fn db_security_group_reserved_name_message() -> String {
     format!("You cannot name a DB security group {DEFAULT_DB_SECURITY_GROUP}")
 }
 
+/// The longest `DBSecurityGroupName` this service stores, from the length the member's own
+/// documentation states ("Must be 1 to 255 letters, numbers, or hyphens").
+pub const MAX_DB_SECURITY_GROUP_NAME_LEN: usize = 255;
+
+/// Refuse a `DBSecurityGroupName` this service cannot STORE — and nothing else.
+///
+/// The member is a plain string in this model: it carries no `@pattern` and no `@length`
+/// (`smithy_query(query="operation",operation="CreateDBSecurityGroup")`), and a group whose
+/// name breaks the alphabet-and-hyphen clauses of the identifier rule is created and
+/// reported by the real service, so that rule — the one the DB instance, cluster, snapshot
+/// and parameter-group names state ([`check_identifier`]) — is NOT this member's and must
+/// not be borrowed for it. What a value entering the store is still checked for is what
+/// every stored caller-sized value is: that the required member carries a value at all
+/// ([`check_not_empty`]) and that it is no longer than the length its own documentation
+/// states ([`MAX_DB_SECURITY_GROUP_NAME_LEN`]).
+///
+/// It lives here because every operation that takes a DB security group NAME — the create,
+/// and the membership lists that name groups by it — applies the one rule.
+pub fn check_db_security_group_name(member: &str, value: &str) -> Result<(), String> {
+    check_not_empty(member, value)?;
+    check_stored_text(member, value, MAX_DB_SECURITY_GROUP_NAME_LEN)
+}
+
+/// [`check_db_security_group_name`] over a LIST of DB security group names, bounded by the
+/// same count cap as the other security group membership lists
+/// ([`MAX_OPTION_SECURITY_GROUPS`]).
+pub fn check_db_security_group_names(member: &str, values: &[String]) -> Result<(), String> {
+    check_request_list_len(member, values.len(), MAX_OPTION_SECURITY_GROUPS)?;
+    for value in values {
+        check_db_security_group_name(member, value)?;
+    }
+    Ok(())
+}
+
 /// The message the `InvalidDBSecurityGroupStateFault` carries where a DB security group
 /// cannot be deleted because a DB instance is still a member of it ("The specified DB
 /// security group must not be associated with any DB instances").
@@ -1936,10 +1970,12 @@ impl DbSecurityGroupRecord {
             owner_id: Some(emulator_server::emulator_account_id().to_string()),
             db_security_group_name: Some(self.name.clone()),
             db_security_group_description: Some(self.description.clone()),
-            // The VPC a DB security group belongs to is an EC2 fact this service does not
-            // hold, so it is reported ABSENT rather than carrying a made-up VPC id a
-            // caller that placed an instance by VPC would be misled by.
-            vpc_id: None,
+            // "Provides the VpcId of the DB security group": every DB security group of
+            // this account belongs to a VPC — "EC2-Classic was retired", which is the only
+            // network a group could have belonged to otherwise — so the group reports the
+            // VPC its region resolves into ([`region_vpc_id`]), the same VPC a DB subnet
+            // group of that region reports, rather than nothing at all.
+            vpc_id: Some(region_vpc_id(&self.region)),
             // Both rule lists are reported even when empty: a group really holds no
             // ingress rule until one is authorized, which is a different statement from
             // "this service does not know its rules".
@@ -3266,7 +3302,10 @@ pub fn check_tag_list(tags: Option<&Vec<Tag>>) -> Result<(), String> {
 }
 
 /// Refuse a security group membership list longer than [`MAX_OPTION_SECURITY_GROUPS`],
-/// and any entry that is not of the form a security group name or id takes.
+/// and any entry that is not of the form a VPC security group id takes.
+///
+/// A DB SECURITY GROUP name is not checked here: that member carries no identifier pattern
+/// at all, so a list of group names goes through [`check_db_security_group_names`].
 pub fn check_security_group_memberships(member: &str, values: &[String]) -> Result<(), String> {
     if values.len() > MAX_OPTION_SECURITY_GROUPS {
         return Err(format!(
@@ -3276,8 +3315,8 @@ pub fn check_security_group_memberships(member: &str, values: &[String]) -> Resu
         ));
     }
     for value in values {
-        // A DB security group name and a VPC security group id are both drawn from the
-        // letters/numbers/hyphens alphabet the identifier members share.
+        // A VPC security group id is drawn from the letters/numbers/hyphens alphabet the
+        // identifier members share.
         check_identifier(member, value, 255)?;
     }
     Ok(())

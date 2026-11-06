@@ -473,6 +473,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None
             }
         };
+        // The four members that together say WHICH DB instance is being ordered — the
+        // class, the engine, the version it resolved to and the license model — are
+        // resolved against the orderable options this service publishes: an instance is
+        // created only in a combination that can be ordered, so a class whose instance
+        // generation no option offers (or a licence the engine is offered under by none of
+        // them) is refused here, before any of it is stored. The check runs once the
+        // version is resolved and BEFORE the duplicate-identifier check below, so the
+        // refusal names the combination rather than a conflict with an instance this
+        // request should never have been able to create.
+        crate::state::check_orderable_db_instance(
+            &input.engine,
+            resolved_version
+                .map(|entry| entry.engine_version)
+                .or(input.engine_version.as_deref())
+                .unwrap_or_default(),
+            &input.db_instance_class,
+            input.license_model.as_deref(),
+        )
+        .map_err(CreateDBInstanceError::invalid_parameter_combination)?;
 
         // Every resource this request REFERENCES by name is resolved in the store
         // before the instance is inserted, and a name that resolves to nothing is that

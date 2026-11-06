@@ -799,7 +799,7 @@ const VERSION_CASES: &[VersionCase] = &[
         identifier: "emu-ver-aurora-mysql",
         engine: "aurora-mysql",
         requested: Some("8.0"),
-        provisioned: Some("8.0.mysql_aurora.3.08.0"),
+        provisioned: Some("8.0.mysql_aurora.3.10.3"),
     },
     VersionCase {
         case: "an engine the catalogue publishes no version for",

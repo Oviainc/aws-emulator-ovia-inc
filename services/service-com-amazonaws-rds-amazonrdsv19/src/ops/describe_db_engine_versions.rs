@@ -1377,6 +1377,22 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "8.0",
         "aurora-mysql8.0",
         STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &AURORA_MYSQL_8_PAUSE,
+    ),
+    // The current build of the Aurora MySQL 3 line. A family's rows have to reach the
+    // builds the engine is being created with TODAY: a create names the version it wants
+    // provisioned and a version this catalogue does not carry is refused, so a family
+    // whose rows stop at an older build refuses a version the engine still publishes.
+    // Being the family's last row, it is also its default: an in-family automatic minor
+    // upgrade moves onto the family's default build, so the default is the build the
+    // family has moved to.
+    row(
+        "aurora-mysql",
+        "8.0.mysql_aurora.3.10.3",
+        "8.0",
+        "aurora-mysql8.0",
+        STATUS_AVAILABLE,
         DefaultLevel::Engine,
         &AURORA_MYSQL_8_PAUSE,
     ),

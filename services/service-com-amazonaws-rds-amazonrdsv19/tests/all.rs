@@ -187,6 +187,8 @@ mod orderable_db_instance_options;
 mod parameter_group_and_snapshot_copies;
 #[path = "all/parameter_refusal_codes.rs"]
 mod parameter_refusal_codes;
+#[path = "all/published_catalog_creates.rs"]
+mod published_catalog_creates;
 #[path = "all/query_catalog_reads.rs"]
 mod query_catalog_reads;
 #[path = "all/query_error_envelope.rs"]

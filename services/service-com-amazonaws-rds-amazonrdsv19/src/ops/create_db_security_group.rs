@@ -157,10 +157,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "This value is stored as a lowercase string" — so the name is folded before it
         // is validated, stored or echoed, and every later lookup folds the same way.
         let name = input.db_security_group_name.to_ascii_lowercase();
-        // "Must be 1 to 255 letters, numbers, or hyphens. First character must be a
-        // letter. Can't end with a hyphen or contain two consecutive hyphens" — the rule
-        // the identifier members of this service share, at this member's own length bound.
-        crate::state::check_identifier("DBSecurityGroupName", &name, MAX_NAME_LEN)
+        // The name is checked for what this service has to be able to STORE it, and not
+        // for the identifier pattern the DB instance, cluster and parameter-group names
+        // state: this member is a plain string the model constrains neither by pattern nor
+        // by length, and the real service creates a group whose name breaks those clauses
+        // ([`crate::state::check_db_security_group_name`]).
+        crate::state::check_db_security_group_name("DBSecurityGroupName", &name)
             .map_err(CreateDBSecurityGroupError::invalid_parameter_value)?;
         if name == crate::state::DEFAULT_DB_SECURITY_GROUP {
             return Err(CreateDBSecurityGroupError::invalid_parameter_value(
@@ -250,6 +252,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The longest `DBSecurityGroupName` this operation accepts, as its member documents
-/// ("Must be 1 to 255 letters, numbers, or hyphens").
-const MAX_NAME_LEN: usize = 255;

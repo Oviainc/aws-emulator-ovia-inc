@@ -337,7 +337,7 @@ fn resolve_additions(
             option.version = Some(version.clone());
         }
         if let Some(memberships) = &config.db_security_group_memberships {
-            crate::state::check_security_group_memberships(
+            crate::state::check_db_security_group_names(
                 "OptionsToInclude.DBSecurityGroupMemberships",
                 memberships,
             )?;

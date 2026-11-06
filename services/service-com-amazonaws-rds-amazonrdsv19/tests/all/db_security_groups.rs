@@ -12,8 +12,9 @@
 //!
 //! * the create-then-read rule over rows differing in the name's case and length, the
 //!   description, and how many tags the create carries;
-//! * the name rule over every clause `DBSecurityGroupName` states, at the published bound
-//!   and one character past it, plus the one name it reserves;
+//! * the name rule over the class it generalises over — every clause of
+//!   `DBSecurityGroupName`'s prose the model does not constrain, at the stored bound and
+//!   one character past it, plus the one name it reserves;
 //! * the store bounds over the caller-sized values a create carries;
 //! * the regional scope over two regions and one name;
 //! * pagination at the documented page size and across the marker;
@@ -319,16 +320,24 @@ struct RuleCase {
     admitted: bool,
 }
 
-/// The longest `DBSecurityGroupName` the member admits ("Must be 1 to 255 letters,
-/// numbers, or hyphens").
+/// The longest `DBSecurityGroupName` this service stores ("Must be 1 to 255 letters,
+/// numbers, or hyphens" — the length the member's documentation states, which is the one
+/// clause of that prose the store enforces; see the test below).
 const MAX_NAME_LEN: usize = 255;
 
-/// The name rule, over every clause `DBSecurityGroupName` states ("Must be 1 to 255
-/// letters, numbers, or hyphens. First character must be a letter. Can't end with a
-/// hyphen or contain two consecutive hyphens. Must not be `Default`"), at the published
-/// bound and one character past it.
+/// The name rule this member actually carries, over the class it generalises over.
+///
+/// `CreateDBSecurityGroup$DBSecurityGroupName` is a plain string in the model — no
+/// `@pattern`, no `@length`
+/// (`smithy_query(query="operation",operation="CreateDBSecurityGroup")`) — and the real
+/// service CREATES a group whose name breaks the alphabet-and-hyphen clauses its prose
+/// states, so the identifier rule the DB instance, cluster, snapshot and parameter-group
+/// names enforce is not this member's. What refuses a name here is only what the store
+/// needs: a value at all, no longer than the documented length. The one name the member
+/// reserves ("Must not be `Default`") is still refused, in the case the member documents
+/// and in the case it is stored under.
 #[tokio::test]
-async fn the_documented_name_rule_is_refused_at_its_bounds() {
+async fn the_name_rule_admits_every_name_the_member_does_not_constrain() {
     let router = emulator();
     let longest = format!("n{}", "a".repeat(MAX_NAME_LEN - 1));
     let too_long = format!("n{}", "a".repeat(MAX_NAME_LEN));
@@ -339,7 +348,7 @@ async fn the_documented_name_rule_is_refused_at_its_bounds() {
             admitted: true,
         },
         RuleCase {
-            case: "the longest name the rule admits",
+            case: "the longest name the store keeps",
             value: longest,
             admitted: true,
         },
@@ -349,29 +358,41 @@ async fn the_documented_name_rule_is_refused_at_its_bounds() {
             admitted: false,
         },
         RuleCase {
+            case: "an empty name",
+            value: String::new(),
+            admitted: false,
+        },
+        // Every clause of the member's prose that the real service does not enforce: a
+        // name is admitted whatever character it starts with, ends with or repeats.
+        RuleCase {
             case: "a name that does not start with a letter",
             value: "9names-digit".to_string(),
-            admitted: false,
+            admitted: true,
         },
         RuleCase {
             case: "a name that starts with a hyphen",
             value: "-names-hyphen".to_string(),
-            admitted: false,
+            admitted: true,
         },
         RuleCase {
             case: "a name that ends with a hyphen",
             value: "names-trailing-".to_string(),
-            admitted: false,
+            admitted: true,
         },
         RuleCase {
             case: "a name carrying two consecutive hyphens",
             value: "names--double".to_string(),
-            admitted: false,
+            admitted: true,
         },
         RuleCase {
-            case: "a name carrying a character outside the set",
+            case: "a name that both leads with two hyphens and trails with one",
+            value: "--names-both-".to_string(),
+            admitted: true,
+        },
+        RuleCase {
+            case: "a name carrying a character outside the identifier alphabet",
             value: "names.dotted".to_string(),
-            admitted: false,
+            admitted: true,
         },
         RuleCase {
             case: "the name the member reserves",
@@ -393,8 +414,27 @@ async fn the_documented_name_rule_is_refused_at_its_bounds() {
     {
         let response = create(&router, &value, "a-group-under-test", &[]).await;
         if admitted {
-            expect_ok(case, response);
-            expect_ok(case, describe_one(&router, &value).await);
+            let created = expect_ok(case, response);
+            // The stored group carries the name as sent (folded, as the member documents),
+            // and reads back through the describe — so an admitted name is a group that
+            // exists rather than a 200 over nothing.
+            let stored = value.to_ascii_lowercase();
+            assert_eq!(
+                text(&created, "DBSecurityGroupName"),
+                stored,
+                "case {case:?}: expected the create to echo {stored:?}, got {created}"
+            );
+            let read_back = expect_ok(case, describe_one(&router, &value).await);
+            assert_eq!(
+                text(&read_back, "DBSecurityGroupName"),
+                stored,
+                "case {case:?}: expected the describe to report {stored:?}, got {read_back}"
+            );
+            assert_eq!(
+                text(&read_back, "DBSecurityGroupArn"),
+                expected_arn(REGION, &stored),
+                "case {case:?}: expected the ARN of the stored name, got {read_back}"
+            );
         } else {
             expect_error(case, response, 400, "InvalidParameterValue");
             // The refusal stored nothing.

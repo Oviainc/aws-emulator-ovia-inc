@@ -79,7 +79,7 @@ const GLOBAL_CLUSTER_CASES: &[GlobalClusterCase] = &[
         requested_version: None,
         // The engine's own default available version, which is what RDS provisions for a
         // request that names no version.
-        engine_version: "8.0.mysql_aurora.3.08.0",
+        engine_version: "8.0.mysql_aurora.3.10.3",
         database_name: None,
         engine_lifecycle_support: None,
         storage_encrypted: false,
