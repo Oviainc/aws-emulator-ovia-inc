@@ -41,6 +41,12 @@
 //!   event source and invokes the function" (`CreateEventSourceMapping`), so a mapping
 //!   whose function this store does not hold `Active` takes nothing off a shard — the same
 //!   rule [`crate::state::sqs_poller`] holds a queue mapping to.
+//! * THE SHARDS ARE READ AS THE FUNCTION'S EXECUTION ROLE. Lambda reads the source acting as
+//!   that role, so while the policies in force on it withhold one of the reads consuming the
+//!   stream takes, a pass reads nothing and no cursor moves
+//!   ([`super::event_source_authorization`]) — the records stay in the shard until the grant
+//!   is in place, which is the same question the call that WIRED the pair together was
+//!   refused for, and again the rule [`crate::state::sqs_poller`] holds a queue mapping to.
 //!
 //! Each pass reads what the shard holds and hands it over at once, so a mapping that
 //! configures a `MaximumBatchingWindowInSeconds` above the Kinesis default of 0 is not
@@ -156,13 +162,16 @@ pub fn drive_mapping<Eng: Send + Sync + 'static>(
     // The CloudWatch store this mapping's work is published to, resolved once per poller
     // because the handle does not change.
     let metrics = FunctionMetrics::new(super::metrics::cloudwatch_state(&**engine));
+    // The IAM store the function's execution role is judged against, resolved once for the
+    // same reason. An engine carrying none shows nothing about the role.
+    let iam = super::event_source_authorization::iam_state(&**engine);
     let claim = PollerClaim {
         state: ::engine::ServiceState::clone(&state),
         uuid: uuid.to_string(),
         held: true,
     };
     runtime.spawn(async move {
-        poll_mapping(&callback, claim, metrics).await;
+        poll_mapping(&callback, claim, metrics, iam).await;
     });
 }
 
@@ -265,6 +274,7 @@ async fn poll_mapping(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     mut claim: PollerClaim,
     metrics: FunctionMetrics,
+    iam: Option<::engine::ServiceState<super::event_source_authorization::IamState>>,
 ) {
     let uuid = claim.uuid.clone();
     // A handle of its own, so the store can be locked while the claim is borrowed.
@@ -294,6 +304,28 @@ async fn poll_mapping(
                 return;
             }
             Pass::Run(run) => {
+                // Lambda reads the shards ACTING AS the function's execution role, so this
+                // pass's reads are subject to the policies in force on that role AT THIS
+                // INSTANT rather than when the pair was wired: while one of them is
+                // withheld, nothing is read off a shard — no record is delivered and no
+                // cursor moves — and the mapping resumes where it left off once the grant is
+                // back (see [`super::event_source_authorization`], including the cases that
+                // show nothing about a role and withhold nothing).
+                if let Some(detail) = withheld_shard_read(iam.as_ref(), &run) {
+                    failures = failures.saturating_add(1);
+                    if failures == 1 || failures.is_multiple_of(FAILURE_LOG_INTERVAL) {
+                        ::tracing::warn!(
+                            mapping = %uuid,
+                            attempt = failures,
+                            detail = %detail,
+                            "an event source mapping may not read its stream as its \
+                             function's execution role; the records stay in the shard until \
+                             that role is granted the reads"
+                        );
+                    }
+                    ::tokio::time::sleep(retry_backoff(failures)).await;
+                    continue;
+                }
                 match move_batches(callback, &mut clients, &state, &metrics, &uuid, &run).await {
                     Outcome::Delivered => failures = 0,
                     Outcome::Idle => {
@@ -318,6 +350,25 @@ async fn poll_mapping(
             }
         }
     }
+}
+
+/// Why the reads this pass would make on `run`'s stream are WITHHELD from the execution
+/// role of the function the mapping invokes, or `None` when they are not — which includes
+/// every case that shows nothing about the role (see
+/// [`super::event_source_authorization`]).
+///
+/// Only the IAM store is locked here, and this service's is not: the decision is taken
+/// between two passes rather than inside the critical section either of them is decided in.
+fn withheld_shard_read(
+    iam: Option<&::engine::ServiceState<super::event_source_authorization::IamState>>,
+    run: &KinesisSourcedMapping,
+) -> Option<String> {
+    let role_arn = run.invoke_identity_arn.as_deref()?;
+    super::event_source_authorization::unreadable_event_source_held(
+        iam,
+        role_arn,
+        &run.stream_arn,
+    )
 }
 
 /// How long to wait after `failures` consecutive failed attempts at one batch: it grows

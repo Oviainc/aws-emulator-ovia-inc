@@ -21,7 +21,12 @@
 //!   first attempt at it may still be running (see [`invisible_for_seconds`]). A poll also
 //!   applies what the queue's own `RedrivePolicy` owes first, so a
 //!   message that has had every delivery that policy allows is moved to the dead-letter
-//!   queue the policy names instead of being handed over again.
+//!   queue the policy names instead of being handed over again. The reads of that poll are
+//!   made AS the function's execution role, so a pass whose role the policies in force on it
+//!   do not let receive from the queue takes nothing out of it at all
+//!   ([`super::event_source_authorization`]): the messages stay where they are until the
+//!   grant is in place, which is the same question the call that WIRED the pair together was
+//!   refused for.
 //! * FILTER. `FilterCriteria` is "an object that defines the filter criteria that determine
 //!   whether Lambda should process an event", so a polled message that matches none of the
 //!   mapping's patterns is not handed to the function. On a QUEUE source such a message is
@@ -76,6 +81,7 @@ use ::service_com_amazonaws_sqs_amazonsqs as sqs;
 use super::batch_item_failures::{
     processed_records, read_batch_item_failures, reports_batch_item_failures, BatchReport,
 };
+use super::event_source_authorization::IamState;
 use super::event_source_poller::Clients;
 use super::metrics::{EventCounts, FunctionMetrics};
 use super::{
@@ -146,6 +152,10 @@ struct PollTarget {
     /// function to run before stopping it" — so the LONGEST one attempt at this batch can
     /// last, which is the span the batch has to stay in flight for.
     function_timeout_seconds: i64,
+    /// The EXECUTION ROLE of the function version this mapping invokes, which is who the
+    /// poller reads the queue as; `None` when this store holds no configuration to read it
+    /// from.
+    role_arn: Option<String>,
     /// `BatchSize`: "the maximum number of records in each batch that Lambda pulls from
     /// your stream or queue".
     batch_size: usize,
@@ -271,6 +281,10 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
     let Some(queues) = sqs::state::service_state(engine) else {
         return;
     };
+    // The IAM store the execution role of each mapping's function is judged against,
+    // resolved once per pass because the handle does not change. An engine carrying none
+    // shows nothing about any role.
+    let iam = super::event_source_authorization::iam_state(engine);
     let targets = {
         let mut store = mappings.lock();
         store.materialize_all(now);
@@ -278,6 +292,17 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
     };
     let at_secs = epoch_secs(now);
     for target in targets {
+        // Lambda reads the queue ACTING AS the function's execution role, so the reads this
+        // pass would make are subject to the policies in force on that role AT THIS INSTANT
+        // rather than when the pair was wired: while one of them is withheld, the pass takes
+        // nothing out of the queue — nothing is hidden, invoked or deleted — and the mapping
+        // consumes again as soon as the grant is back (see
+        // [`super::event_source_authorization`], including the cases that show nothing about
+        // a role and withhold nothing).
+        if let Some(detail) = withheld_queue_read(iam.as_ref(), &target) {
+            note_unpollable(session, &target, &detail);
+            continue;
+        }
         let polled = take_batch(&queues, &target, now);
         if polled.is_empty() {
             // Nothing was waiting, so no processing attempt was made and there is no result
@@ -365,6 +390,47 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
             // This pass polled, so the next idle minute is one to publish a zero for.
             session.idle_minute.remove(&target.uuid);
         }
+    }
+}
+
+/// Why the reads this pass would make on `target`'s queue are WITHHELD from the execution
+/// role of the function the mapping invokes, or `None` when they are not — which includes
+/// every case that shows nothing about the role (see
+/// [`super::event_source_authorization`]).
+///
+/// Only the IAM store is locked here, and this service's is not: the decision is taken
+/// between two steps of the pass rather than inside either of them.
+fn withheld_queue_read(
+    iam: Option<&::engine::ServiceState<IamState>>,
+    target: &PollTarget,
+) -> Option<String> {
+    let role_arn = target.role_arn.as_deref()?;
+    super::event_source_authorization::unreadable_event_source_held(
+        iam,
+        role_arn,
+        &target.queue_arn,
+    )
+}
+
+/// Report that a mapping's execution role may not read its queue, at most once every
+/// [`FAILURE_LOG_INTERVAL`] passes so one such mapping cannot fill the log.
+///
+/// Nothing is recorded on the mapping: no batch was polled, so there is no processing
+/// attempt whose result to report — exactly as for a pass that found the queue empty.
+fn note_unpollable(session: &mut PollSession, target: &PollTarget, detail: &str) {
+    let passes = session
+        .failures
+        .entry(target.uuid.clone())
+        .and_modify(|passes| *passes = passes.saturating_add(1))
+        .or_insert(1);
+    if *passes == 1 || passes.is_multiple_of(FAILURE_LOG_INTERVAL) {
+        ::tracing::warn!(
+            mapping = %target.uuid,
+            attempt = *passes,
+            detail = %detail,
+            "an event source mapping may not read its queue as its function's execution \
+             role; the messages stay on the queue until that role is granted the read"
+        );
     }
 }
 
@@ -823,6 +889,17 @@ fn polling_targets(store: &ComAmazonawsLambdaAwsgirapiserviceState) -> Vec<PollT
                 queue_arn: queue_arn.to_string(),
                 region,
                 function_arn: mapping.function_arn.clone(),
+                // Who the poller reads the queue as: the execution role of the VERSION this
+                // mapping invokes, since "The ARN of the Lambda function" it carries may be
+                // qualified and an alias names the version it invokes.
+                role_arn: {
+                    let version = mapping
+                        .function_qualifier
+                        .as_deref()
+                        .and_then(|qualifier| function.resolved_version(qualifier))
+                        .unwrap_or_else(|| super::VERSION_LATEST.to_string());
+                    function.config_of(&version).map(|config| config.role.clone())
+                },
                 // How long the batch this mapping polls has to stay in flight for: one
                 // attempt at it cannot outlast the function's own `Timeout`.
                 function_timeout_seconds: i64::from(function.config.timeout),

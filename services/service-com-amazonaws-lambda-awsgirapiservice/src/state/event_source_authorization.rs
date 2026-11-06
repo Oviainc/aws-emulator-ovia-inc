@@ -13,6 +13,13 @@
 //! the role is short of a grant from the refusal, instead of from a mapping that polls
 //! nothing.
 //!
+//! The same question is asked again by every PASS of a mapping's poller
+//! ([`crate::state::sqs_poller`], [`crate::state::event_source_poller`]), because the
+//! policies in force on a role are not frozen when the pair is wired: while they withhold a
+//! read the poller makes on the named source, that pass takes nothing out of the source —
+//! nothing is delivered, invoked or deleted — and the mapping consumes again as soon as the
+//! grant is back in place.
+//!
 //! The pieces, each held in exactly one place:
 //!
 //! 1. **who** — the execution role of the function version the mapping would invoke, read
@@ -349,9 +356,24 @@ pub fn unreadable_event_source<Eng: Send + Sync + 'static>(
     role_arn: &str,
     event_source_arn: &str,
 ) -> Option<String> {
+    unreadable_event_source_held(iam_state(engine).as_ref(), role_arn, event_source_arn)
+}
+
+/// The SAME decision, for a caller holding the IAM store handle already.
+///
+/// The pollers ask this of EVERY pass rather than once: Lambda reads the source acting as
+/// the role for as long as the mapping polls, so a grant taken away after the pair was
+/// wired withholds the reads of the next pass exactly as it would have withheld the wiring
+/// ([`unreadable_event_source`]). `None` for the handle is an engine carrying no IAM store,
+/// which shows nothing about the role.
+#[must_use]
+pub(super) fn unreadable_event_source_held(
+    iam: Option<&::engine::ServiceState<IamState>>,
+    role_arn: &str,
+    event_source_arn: &str,
+) -> Option<String> {
     let access = access_of(event_source_arn)?;
-    let iam = iam_state(engine)?;
-    let withheld = access.withheld(&iam.lock(), role_arn, event_source_arn)?;
+    let withheld = access.withheld(&iam?.lock(), role_arn, event_source_arn)?;
     Some(access.message(event_source_arn, withheld))
 }
 

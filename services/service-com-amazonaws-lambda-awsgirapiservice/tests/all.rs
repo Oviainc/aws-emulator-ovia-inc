@@ -119,6 +119,12 @@ mod event_source_mapping_update_omitted_members;
 mod error_fault_class;
 #[path = "all/event_source_mappings.rs"]
 mod event_source_mappings;
+#[path = "all/event_source_poll_authorization.rs"]
+mod event_source_poll_authorization;
+// The file name is the one this suite was first written under; the layout check binds the
+// module name to it.
+#[path = "all/scratch_sqs_handler_run.rs"]
+mod scratch_sqs_handler_run;
 // Declared in this span of the sorted list rather than at the head of this file or in its
 // appended tail: both of those are where concurrently landing suites put their line, so a
 // declaration there loses a squash merge to every one of them, while these neighbouring
