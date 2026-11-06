@@ -26,8 +26,8 @@
 //!
 //! Two ceilings, for two different things:
 //!
-//! * the RUN's own budget, which the interpreter spends and the guest cannot reach
-//!   ([`python::Budget`]): the function's own `Timeout`, clamped to the range the model
+//! * the RUN's own budget, which the engine spends and the guest cannot reach
+//!   ([`Budget`]): the function's own `Timeout`, clamped to the range the model
 //!   allows for it, plus the step, memory, log and response bounds;
 //! * how long the CALLER waits, which is this module's ([`HOST_WAIT_CEILING`]) and is
 //!   never the guest's to set: a run still going when the caller's wait is spent is
@@ -36,7 +36,7 @@
 //!   invocation is refused with the modelled throttle rather than adding another thread.
 //!
 //! At most [`MAX_CONCURRENT_RUNS`] handlers run at once, so the memory and CPU the
-//! interpreters can hold is bounded however many invocations arrive; a call that waits
+//! engines can hold is bounded however many invocations arrive; a call that waits
 //! [`PERMIT_WAIT`] for a slot is answered with the modelled throttle. Every run happens on
 //! a thread of its own with no state guard of this service held, so one caller's handler
 //! cannot stall another caller's request.

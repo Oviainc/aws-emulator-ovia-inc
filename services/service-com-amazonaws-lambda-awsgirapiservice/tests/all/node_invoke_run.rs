@@ -339,6 +339,18 @@ async fn the_response_payload_is_what_a_node_handler_returned() {
             }),
         ),
         (
+            // The node runtime IGNORES what a NON-async handler returns: only an async
+            // handler's promise or the callback answers an invocation, so this one is
+            // answered when the event loop empties, with no value at all.
+            "a non-async handler whose return value the runtime ignores",
+            &[(
+                "index.js",
+                "exports.handler = function (event) { return { ignored: event.a }; };",
+            )],
+            "index.handler",
+            Value::Null,
+        ),
+        (
             "a handler using a core module this emulator supplies",
             &[(
                 "index.js",
@@ -386,6 +398,13 @@ async fn the_response_payload_is_what_a_node_handler_returned() {
             *expected,
             "case {case}: expected {expected}, got {}",
             answered.text()
+        );
+        // The payload is a DOCUMENT, never an empty body: an invocation the runtime has no
+        // value for answers the literal `null`, which `Answer::json` reads the same way an
+        // empty body would, so the body itself is checked here.
+        assert!(
+            !answered.text().is_empty(),
+            "case {case}: expected a payload document, got an empty body"
         );
         assert_eq!(
             answered.header("x-amz-function-error"),
@@ -511,6 +530,28 @@ async fn an_unhandled_node_handler_error_is_a_two_hundred_with_the_trace_documen
             "absent.handler",
             "Runtime.ImportModuleError",
             "Cannot find module 'absent'",
+        ),
+        (
+            "an error thrown from inside a timer",
+            &[(
+                "index.js",
+                "exports.handler = function (event, context, callback) { \
+                 setTimeout(function () { throw new Error('late failure'); }, 10); };",
+            )],
+            "index.handler",
+            "Error",
+            "late failure",
+        ),
+        (
+            "a value the response cannot be serialized from",
+            &[(
+                "index.js",
+                "exports.handler = async () => { const held = {}; held.self = held; \
+                 return held; };",
+            )],
+            "index.handler",
+            "TypeError",
+            "circular",
         ),
         (
             "a malformed handler name",

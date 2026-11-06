@@ -64,7 +64,7 @@ const JAVASCRIPT_SUFFIXES: &[&str] = &[".js", ".mjs", ".cjs", ".json"];
 
 /// Every Python module `zip_bytes` holds, in the archive's own order.
 ///
-/// `Ok(vec![])` is a readable archive with no importable module in it, which is a package
+/// `Ok(vec![])` is a readable archive with no importable entry in it, which is a package
 /// whose handler cannot be imported — not a failure of the read.
 pub fn python_modules(zip_bytes: Option<&[u8]>) -> Result<Vec<PackageModule>, PackageFault> {
     source_modules(zip_bytes, PYTHON_SUFFIXES)
