@@ -23,6 +23,12 @@ aws-sdk-iam = { version = "1", default-features = false, features = ["rt-tokio",
 aws-sdk-codecommit = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # The Lambda client an invoke action performs its work with, over the same callback.
 aws-sdk-lambda = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The EventBridge client this service publishes its own state-change events with, over
+# the same in-process callback: a pipeline execution, each of its stages and each of
+# their actions publish one event per state change onto the account's default event bus
+# (`state::events`). Only the generated client is needed — the emulator supplies the
+# transport.
+aws-sdk-eventbridge = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # Reader for the artifact archive an S3 deploy action with Extract=true unzips.
 # Pinned to 9.x: RUSTSEC-2026-0368 affects every earlier release.
 #
@@ -67,6 +73,12 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-codecommit-codecommit-20150413 = { workspace = true }
 service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# EventBridge and SQS are mounted beside codepipeline in the state-change event suite,
+# because the execution plane publishes its events onto the default event bus and a rule
+# on that bus delivers them to an SQS queue target: without them mounted there is
+# nothing for the publication to reach.
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [lints]

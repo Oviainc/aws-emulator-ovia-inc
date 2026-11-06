@@ -13,7 +13,9 @@
 //! See [`super::execution`] for the data model and for why a reporting operation is
 //! allowed to run this at all (every step carries the instant the CLOCK made it due),
 //! and [`super::clock`] for how the steps a client makes no further call for are
-//! materialised.
+//! materialised. Every status a step writes is handed to [`super::events`], which
+//! publishes it to EventBridge: the diff is taken once per step rather than at each
+//! transition site, so no transition can be made without its event.
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -117,13 +119,27 @@ pub(super) async fn advance_pipeline(
     let mut performed = 0;
     for _ in 0..MAX_ADVANCE_STEPS {
         let planned = {
+            // ONE reading of the clock per critical section, so a status the store
+            // records and the event that reports it carry the same instant.
+            let now = SystemTime::now();
             let mut store = state.lock();
-            plan(&mut store, pipeline_name, SystemTime::now())
+            let planned = plan(&mut store, pipeline_name, now);
+            // Every status the planning step just wrote — an execution entering a stage,
+            // a stage rolling up, a stop settling — owes an event, and it is recorded
+            // here rather than at each of those sites so none of them can forget.
+            super::events::record_state_changes(&mut store, region, now);
+            planned
         };
+        super::events::publish(state, callback, region).await;
         let Some(job) = planned else { break };
         let outcome = run_job(callback, region, &job).await;
-        let mut store = state.lock();
-        record_outcome(&mut store, &job, outcome, SystemTime::now());
+        {
+            let now = SystemTime::now();
+            let mut store = state.lock();
+            record_outcome(&mut store, &job, outcome, now);
+            super::events::record_state_changes(&mut store, region, now);
+        }
+        super::events::publish(state, callback, region).await;
         performed += 1;
     }
     performed

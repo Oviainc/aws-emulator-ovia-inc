@@ -83,6 +83,8 @@ mod stage_condition_overrides;
 mod stage_condition_rules;
 #[path = "all/stage_transitions.rs"]
 mod stage_transitions;
+#[path = "all/state_change_events.rs"]
+mod state_change_events;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stop_pipeline_execution.rs"]

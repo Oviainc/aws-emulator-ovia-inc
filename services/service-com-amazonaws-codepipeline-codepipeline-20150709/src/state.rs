@@ -18,7 +18,9 @@
 //! it enters, the actions it runs, the approval tokens and the jobs their reporters need,
 //! and the statuses it all rolls up into — is the EXECUTION plane: its data model in
 //! [`execution`], the engine that moves it in [`driver`], and the job-worker lifecycle a
-//! `Custom`-owned action waits on in [`jobs`].
+//! `Custom`-owned action waits on in [`jobs`]. Every state that plane writes is also
+//! PUBLISHED to EventBridge ([`events`]), which is how a client observes a run without
+//! calling this service again.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -53,6 +55,9 @@ pub mod rules;
 /// The in-process clock that materialises an execution's due steps with no further
 /// call from the client.
 mod clock;
+/// The EventBridge events this service publishes as an execution, its stages and their
+/// actions change state.
+pub mod events;
 /// The action-type catalog: an action type's identity, the records this account holds
 /// for the custom ones, and the action types the service itself provides.
 mod action_types;
@@ -656,6 +661,19 @@ pub struct ComAmazonawsCodepipelineCodepipeline20150709State {
     /// The running clock's task, kept so that replacing a clock aborts the one it
     /// replaces and so a claim held by a task that has ENDED can be taken over.
     clock: Option<::tokio::task::JoinHandle<()>>,
+    /// The state changes this service has recorded but not yet published to
+    /// EventBridge, oldest first.
+    ///
+    /// PRIVATE, and written only through [`events`], which is where the
+    /// [`events::MAX_PENDING_EVENTS`] bound lives: every transition appends to it, so a
+    /// second writer could grow it without end.
+    pending_events: VecDeque<events::StateChange>,
+    /// The states last PUBLISHED for each execution, keyed by `pipelineExecutionId` —
+    /// what the next diff is taken against, so one transition owes exactly one event.
+    ///
+    /// PRIVATE for the same reason, and pruned by that module to the executions this
+    /// store still holds.
+    published_event_states: BTreeMap<String, events::PublishedStates>,
 }
 
 impl ComAmazonawsCodepipelineCodepipeline20150709State {
