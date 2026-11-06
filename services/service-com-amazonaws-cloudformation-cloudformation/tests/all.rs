@@ -85,6 +85,8 @@ mod dynamic_reference_names;
 mod dynamic_references;
 #[path = "all/dynamodb_table_resources.rs"]
 mod dynamodb_table_resources;
+#[path = "all/dynamodb_table_settings.rs"]
+mod dynamodb_table_settings;
 #[path = "all/ec2_network_identifiers_feed_rds.rs"]
 mod ec2_network_identifiers_feed_rds;
 #[path = "all/ec2_network_stack_resources.rs"]

@@ -37,7 +37,8 @@ const DYNAMODB_JSON: &str = "application/x-amz-json-1.0";
 ///
 /// The ONE DynamoDB caller of this crate's suites, so no suite spells that calling
 /// convention twice: `cdk_deployed_table_estate.rs` reads a table deployed through a change
-/// set back through it.
+/// set back through it, and `dynamodb_table_settings.rs` reads the properties DynamoDB
+/// applies through a call of its own back through it.
 pub(crate) async fn dynamodb(
     router: &MultiServiceRouter,
     operation: &str,
@@ -100,7 +101,11 @@ fn output(xml: &str, key: &str) -> Option<String> {
 
 /// Every resource failure the stack recorded, as the reason each one carries: what a case
 /// whose stack did not complete needs in order to say WHY.
-async fn failure_reasons(router: &MultiServiceRouter, stack: &str) -> Vec<String> {
+///
+/// `pub(crate)` for the same reason [`dynamodb`] is: the suite over the properties DynamoDB
+/// applies through a call of its own (`dynamodb_table_settings.rs`) reports a stack that did
+/// not settle the same way, rather than spelling this read again.
+pub(crate) async fn failure_reasons(router: &MultiServiceRouter, stack: &str) -> Vec<String> {
     let (_, body) = call(router, "DescribeStackEvents", &[member("StackName", stack)]).await;
     xml_blocks(&body, "member")
         .into_iter()
@@ -421,30 +426,16 @@ async fn deleting_the_stack_deletes_the_table_from_dynamodb() {
 /// shallow success the provisioner refuses to report.
 #[tokio::test]
 async fn a_property_the_provisioner_does_not_apply_fails_the_resource() {
-    // The rows are properties `CreateTable` does not take at all: each is a DynamoDB call of
-    // its own, made on a table that already exists, which nothing here makes.
-    let cases: &[(&str, &str, Value)] = &[
-        (
-            "time to live",
-            "ddb-unapplied-ttl",
-            json!({"AttributeName": "expiresAt", "Enabled": true}),
-        ),
-        (
-            "point-in-time recovery",
-            "ddb-unapplied-pitr",
-            json!({"PointInTimeRecoveryEnabled": true}),
-        ),
-        (
-            "a Kinesis destination",
-            "ddb-unapplied-kinesis",
-            json!({"StreamArn": format!("arn:aws:kinesis:{REGION}:{ACCOUNT_ID}:stream/changes")}),
-        ),
-    ];
-    let unapplied = [
-        "TimeToLiveSpecification",
-        "PointInTimeRecoverySpecification",
-        "KinesisStreamSpecification",
-    ];
+    // The property left is an IMPORT rather than a create: an `AWS::DynamoDB::Table`
+    // carrying it asks for a table built from data in Amazon S3 (`ImportTable`), which
+    // nothing here makes. The properties that ARE calls of their own on a created table are
+    // applied (`dynamodb_table_settings.rs`), so none of them is here.
+    let cases: &[(&str, &str, Value)] = &[(
+        "an import source",
+        "ddb-unapplied-import",
+        json!({"S3BucketSource": {"S3Bucket": "exports"}, "InputFormat": "DYNAMODB_JSON"}),
+    )];
+    let unapplied = ["ImportSourceSpecification"];
     for ((case, stack, value), property) in cases.iter().zip(unapplied) {
         let router = router();
         let mut declared = properties(Some("unapplied-table"), false, true, Some("KEYS_ONLY"));

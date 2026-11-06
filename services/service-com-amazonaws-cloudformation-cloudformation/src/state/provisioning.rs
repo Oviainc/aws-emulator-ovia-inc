@@ -617,17 +617,26 @@ impl Owner {
 
     /// Whether the owning service reports the created resource ready — see
     /// [`Provisioner::readiness`](super::provisioner::Provisioner::readiness).
+    ///
+    /// `declared` is the properties the resource was declared with, where the records say
+    /// which they are, so an arm that waits for a declared SETTING of a resource asks about
+    /// the ones the declaration carries rather than about every setting of the type
+    /// ([`dynamodb_table::readiness`]). `None` means the declaration is not known here, and
+    /// an arm that reads it then holds to whatever that service reports about the resource.
     async fn readiness(
         self,
         ctx: &smithy_server_runtime::OperationContext<'_>,
         region: &str,
         physical_resource_id: &str,
+        declared: Option<&Value>,
     ) -> Result<Readiness, Refusal> {
         match self {
             Self::Builtin(provisioner) => {
                 provisioner.readiness(ctx, region, physical_resource_id).await
             }
-            Self::DynamodbTable => Ok(dynamodb_table::readiness()),
+            Self::DynamodbTable => {
+                Ok(dynamodb_table::readiness(ctx, region, physical_resource_id, declared).await)
+            }
             Self::LambdaFunction => Ok(lambda_function::readiness()),
             // The version exists, and a function may name it, the moment
             // `PublishLayerVersion` answers.
@@ -930,7 +939,7 @@ pub async fn advance_stabilisations(
     // Which resources are still waiting, read under a lock of its own: the readiness calls
     // below reach other services' handlers, which take those services' locks, so a client
     // reading THIS service must not be blocked behind them.
-    let waiting: Vec<(String, Vec<super::stabilising::StabilisationBarrier>)> = {
+    let waiting: Vec<(String, Vec<OpenWait>)> = {
         let store = state.lock();
         store
             .stacks
@@ -941,13 +950,26 @@ pub async fn advance_stabilisations(
                 if open.is_empty() {
                     None
                 } else {
-                    Some((stack.stack_id.clone(), open))
+                    // The properties each resource was DECLARED with travel with its
+                    // barrier: the deployment in flight holds them for the resources it is
+                    // acting on, and the stack's own records for the ones it already had.
+                    // An arm whose readiness depends on what the declaration asked for needs
+                    // them, and nothing else about the stack may be read once the lock is
+                    // released.
+                    let asked = open
+                        .into_iter()
+                        .map(|barrier| {
+                            let declared = declared_properties(stack, &barrier.logical_id);
+                            (barrier, declared)
+                        })
+                        .collect();
+                    Some((stack.stack_id.clone(), asked))
                 }
             })
             .collect()
     };
     for (stack_id, barriers) in waiting {
-        for barrier in barriers {
+        for (barrier, declared) in barriers {
             // A CUSTOM RESOURCE's wait is no question for an owning service: the resource is
             // backed by the PROVIDER its `ServiceToken` names, and what ends the wait is the
             // answer that provider PUT to the request's `ResponseURL`, which the plane that
@@ -977,7 +999,12 @@ pub async fn advance_stabilisations(
                         super::stabilising::Awaited::Ready
                         | super::stabilising::Awaited::Updated => {
                             provisioner
-                                .readiness(ctx, region, &barrier.physical_resource_id)
+                                .readiness(
+                                    ctx,
+                                    region,
+                                    &barrier.physical_resource_id,
+                                    declared.as_ref(),
+                                )
                                 .await
                         }
                         super::stabilising::Awaited::Gone => provisioner
@@ -1185,6 +1212,38 @@ pub async fn advance_stabilisations(
         }
     }
 }
+
+/// The properties the resource `logical_id` of `stack` was DECLARED with, or `None` where
+/// neither the deployment in flight nor the stack's own records hold a record for it.
+///
+/// The deployment in flight is asked first: its records are the declaration the operation
+/// holding the barrier is acting on, while the stack's own records are the declaration in
+/// force before it. `None` is "not known here", which is not the same as "declared nothing" —
+/// a reader of this holds to whatever the owning service reports instead.
+fn declared_properties(stack: &super::StoredStack, logical_id: &str) -> Option<Value> {
+    stack
+        .pending_deployment
+        .as_ref()
+        .and_then(|pending| {
+            pending
+                .resources
+                .iter()
+                .find(|resource| resource.logical_id == logical_id)
+        })
+        .map(|resource| resource.properties.clone())
+        .or_else(|| {
+            stack
+                .resources
+                .iter()
+                .find(|deployed| deployed.resource.logical_id == logical_id)
+                .map(|deployed| deployed.resource.properties.clone())
+        })
+}
+
+/// One resource of a stack whose wait is still open: the barrier that holds it, and the
+/// properties its resource was DECLARED with where the records say what they are
+/// ([`declared_properties`]).
+type OpenWait = (super::stabilising::StabilisationBarrier, Option<Value>);
 
 /// The resource an `Update` a provider answered REPLACED: what the cleanup `Delete` of the
 /// old physical resource is sent with.
@@ -1888,7 +1947,12 @@ pub async fn reconcile(
                 let readiness = match owner {
                     Some(provisioner) => {
                         provisioner
-                            .readiness(ctx, region, &resource.physical_resource_id)
+                            .readiness(
+                                ctx,
+                                region,
+                                &resource.physical_resource_id,
+                                Some(&resource.properties),
+                            )
                             .await
                     }
                     None => Ok(Readiness::Ready),

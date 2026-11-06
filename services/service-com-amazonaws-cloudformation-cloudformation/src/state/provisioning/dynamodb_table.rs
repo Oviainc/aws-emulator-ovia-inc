@@ -37,18 +37,26 @@
 //!   API's `ResourcePolicy` is that document as TEXT ([`resource_policy`]).
 //!
 //! Every other property of the type is a DIFFERENT DynamoDB call made on the table after it
-//! exists (`UpdateTimeToLive`, `UpdateContinuousBackups`, `UpdateContributorInsights`,
-//! `EnableKinesisStreamingDestination`) or an import rather than a create
-//! (`ImportSourceSpecification`). None of those is applied here, so a declaration carrying
-//! one is REFUSED rather than dropped ([`refuse_unapplied_properties`]): a table reported
-//! created with less than its declaration asked for is the shallow success this arm exists
-//! to avoid.
+//! exists (`UpdateTimeToLive`, `UpdateContinuousBackups`, `UpdateContributorInsights`, the
+//! Kinesis destination calls) or an import rather than a create
+//! (`ImportSourceSpecification`). The calls are MADE, by [`settings`], on the table this
+//! arm has just created, and the resource is reported created only once DynamoDB's own read
+//! reports each of those settings in force ([`readiness`]) — a table configured with less
+//! than its declaration asked for is the shallow success this arm exists to avoid, and a
+//! declaration of one of them that this service refuses fails the resource rather than
+//! leaving the property dropped. `ImportSourceSpecification` is not a property applied to a
+//! created table at all but a different create, so a declaration carrying THAT is still
+//! refused ([`refuse_unapplied_properties`]).
 //!
 //! `CreateTable` answers a table whose `TableStatus` is `CREATING` — "You can perform read
 //! and write operations only on an ACTIVE table" — but the table EXISTS from that moment, so
 //! the resource's creation is not held open on it ([`readiness`]): that span is DynamoDB's
 //! own transition, exactly as the `Pending` an `AWS::Lambda::Function` is reported created
 //! during is AWS Lambda's and the `creating` of an `AWS::RDS::DBInstance` is Amazon RDS's.
+//! What DOES hold the resource open is a declared SETTING that service has not put into
+//! force yet: the declaration is not applied while it is still being applied, so a client
+//! that reads the setting back the instant the stack completes is answered what the template
+//! declared.
 
 use std::collections::BTreeMap;
 
@@ -57,6 +65,10 @@ use serde_json::{Map, Value};
 use super::{call_json_rpc, Created, Readiness, Refusal, Removal, AWS_JSON_1_0};
 use crate::state::provisioner::tags_of;
 use crate::state::StoredResource;
+
+/// The properties DynamoDB applies through a call of its own on the table that already
+/// exists, and reports through a read of its own.
+mod settings;
 
 /// The resource type this module provisions.
 pub(super) const DYNAMODB_TABLE: &str = "AWS::DynamoDB::Table";
@@ -200,6 +212,11 @@ pub(super) async fn create(
     if !tags.is_empty() {
         request.insert(TAGS_PROPERTY.to_string(), tag_list(&tags));
     }
+    // Nothing is in force on a table that does not exist yet, so every declared setting is
+    // applied from off — which is the state `CreateTable` leaves each of them in, since that
+    // call carries none of them. No such change has to be reported as having no in-place
+    // path, so the answer here is the calls themselves ([`settings::calls`]).
+    let setting_calls = settings::calls(None, &resource.properties).unwrap_or_default();
     let answered = call_json_rpc(
         ctx,
         DYNAMODB_SIGNING_NAME,
@@ -209,6 +226,22 @@ pub(super) async fn create(
         &Value::Object(request),
     )
     .await?;
+    if !setting_calls.is_empty() {
+        // Each of these calls changes the CONFIGURATION of the table, which DynamoDB refuses
+        // while the table is still being created, so they are made once that service reports
+        // it settled ([`await_settled`]) — exactly as a change to the table itself is.
+        await_settled(ctx, region, &resource.physical_resource_id).await;
+        if let Err(refusal) =
+            settings::apply(ctx, region, &resource.physical_resource_id, &setting_calls).await
+        {
+            // A table configured with less than its declaration asked for is not a resource
+            // the stack may report as created, so the table is removed again before the
+            // refusal is reported — exactly as a function whose own configuration calls were
+            // refused is ([`super::lambda_function::create`]).
+            let _ = delete_table(ctx, region, &resource.physical_resource_id).await;
+            return Err(refusal);
+        }
+    }
     Ok(Created::attributes(published_attributes(
         answered.get(TABLE_DESCRIPTION_MEMBER),
     )))
@@ -216,15 +249,32 @@ pub(super) async fn create(
 
 /// Whether DynamoDB reports the table this create made ready.
 ///
-/// Nothing is asked, and nothing waits: the table EXISTS from the moment `CreateTable`
-/// answers — `DescribeTable` resolves it, `ListTables` reports it, and the stream its
-/// specification enabled is already registered under the ARN the create answered — and the
-/// `CREATING` window its own `TableStatus` reports ("You can perform read and write
-/// operations only on an ACTIVE table") is DynamoDB's own transition, not a resource that
-/// has yet to come into being. It is the case [`super::lambda_function::readiness`] states
-/// for a function and an `AWS::RDS::DBInstance` for a database.
-pub(super) fn readiness() -> Readiness {
-    Readiness::Ready
+/// The table itself is not waited for: it EXISTS from the moment `CreateTable` answers —
+/// `DescribeTable` resolves it, `ListTables` reports it, and the stream its specification
+/// enabled is already registered under the ARN the create answered — and the `CREATING`
+/// window its own `TableStatus` reports ("You can perform read and write operations only on
+/// an ACTIVE table") is DynamoDB's own transition, not a resource that has yet to come into
+/// being. It is the case [`super::lambda_function::readiness`] states for a function and an
+/// `AWS::RDS::DBInstance` for a database.
+///
+/// What IS waited for is a SETTING the DECLARATION asked for that this arm applied through a
+/// call of its own ([`settings`]): until that service's own read reports the setting in
+/// force, the configuration the declaration asked for is not the configuration the table
+/// has, and a resource reported created is one whose whole declared configuration a client
+/// reads back. A declaration that asked for none of those settings is nothing to wait for,
+/// and nothing is asked about them. `declared` is `None` where the records do not say what
+/// the resource was declared with, and every setting of the type is then asked about, since
+/// nothing says which of them this resource's creation owes.
+pub(super) async fn readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+    declared: Option<&Value>,
+) -> Readiness {
+    match settings::settling(ctx, region, physical_resource_id, declared).await {
+        Some(status) => Readiness::Pending(status),
+        None => Readiness::Ready,
+    }
 }
 
 /// Apply a CHANGED declaration to the table the stack already has, through DynamoDB's own
@@ -249,6 +299,13 @@ pub(super) async fn update(
     declared: &Value,
 ) -> Result<Option<Created>, Refusal> {
     refuse_unapplied_properties(declared, &resource.resource_type)?;
+    // The settings that are calls of their own: what takes each from what the table has to
+    // what this declaration asks for, or `None` where one of those changes has no call of
+    // this service to express it — which is reported as not applied, exactly as a change to a
+    // property `UpdateTable` does not take is.
+    let Some(setting_calls) = settings::calls(Some(&resource.properties), declared) else {
+        return Ok(None);
+    };
     let mut request = Map::new();
     for member in UPDATE_MEMBERS {
         let asked = declared_in(declared, member);
@@ -266,18 +323,26 @@ pub(super) async fn update(
     if changed_outside_update_members(&resource.properties, declared) {
         return Ok(None);
     }
+    if request.is_empty() && setting_calls.is_empty() {
+        // Nothing `UpdateTable` takes changed, no setting of its own changed, and nothing
+        // outside either did, so the table already has the declared configuration.
+        return Ok(Some(Created::default()));
+    }
+    // Every change below is made once DynamoDB reports the table out of the window it
+    // refuses one in ([`await_settled`]), exactly as the delete is.
+    await_settled(ctx, region, &resource.physical_resource_id).await;
+    // The settings first: each of their calls leaves the TABLE itself untouched, while
+    // `UpdateTable` leaves it in the window this service refuses a further change in.
+    settings::apply(ctx, region, &resource.physical_resource_id, &setting_calls).await?;
     if request.is_empty() {
-        // Nothing `UpdateTable` takes changed and nothing outside it did either, so the
-        // table already has the declared configuration.
+        // Only settings changed, and they are applied: the table itself keeps the
+        // configuration in force.
         return Ok(Some(Created::default()));
     }
     request.insert(
         TABLE_NAME_PROPERTY.to_string(),
         Value::String(resource.physical_resource_id.clone()),
     );
-    // The change is made once DynamoDB reports the table out of the window it refuses one
-    // in ([`await_settled`]), exactly as the delete is.
-    await_settled(ctx, region, &resource.physical_resource_id).await;
     let answered = call_json_rpc(
         ctx,
         DYNAMODB_SIGNING_NAME,
@@ -306,8 +371,18 @@ pub(super) async fn delete(
     region: &str,
     resource: &StoredResource,
 ) -> Result<(), Refusal> {
-    await_settled(ctx, region, &resource.physical_resource_id).await;
-    let request = addressed(&resource.physical_resource_id);
+    delete_table(ctx, region, &resource.physical_resource_id).await
+}
+
+/// Delete the table `table_name`: what the stack's own deletion owes, and what a create
+/// whose declared settings this service refused undoes before it reports that refusal.
+async fn delete_table(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    table_name: &str,
+) -> Result<(), Refusal> {
+    await_settled(ctx, region, table_name).await;
+    let request = addressed(table_name);
     match call_json_rpc(
         ctx,
         DYNAMODB_SIGNING_NAME,
@@ -540,6 +615,9 @@ fn changed_outside_update_members(in_force: &Value, declared: &Value) -> bool {
         // The tags of a resource already created are reconciled by `retag`, not by an
         // update, so a change to them alone is not a configuration change with no path.
         .filter(|property| *property != TAGS_PROPERTY)
+        // A setting DynamoDB applies through a call of its own has an in-place path of its
+        // own ([`settings`]), so a change to one is not a change `UpdateTable` had to carry.
+        .filter(|property| !settings::is_a_setting(property))
         .any(|property| declared_in(declared, property) != declared_in(in_force, property))
 }
 
@@ -547,13 +625,12 @@ fn changed_outside_update_members(in_force: &Value, declared: &Value) -> bool {
 /// was: refusing is what keeps a table from being reported created with less than its
 /// declaration asked for.
 ///
-/// Every property NOT applied here is a DynamoDB call of its own made on a table that
-/// already exists (`UpdateTimeToLive` for `TimeToLiveSpecification`,
-/// `UpdateContinuousBackups` for `PointInTimeRecoverySpecification`,
-/// `UpdateContributorInsights` for `ContributorInsightsSpecification`,
-/// `EnableKinesisStreamingDestination` for `KinesisStreamSpecification`) or an import rather
-/// than a create (`ImportSourceSpecification`) — so each is its own gap, filed as one,
-/// rather than a member silently dropped from a create that answered success.
+/// What is left is `ImportSourceSpecification`: it is not a property applied to a table this
+/// arm created but a different create — `ImportTable` rather than `CreateTable` — so a
+/// declaration carrying it asks for a table nothing here makes, filed as its own gap rather
+/// than dropped from a create that answered success. Every other property of the type is
+/// either a member of the create or a call of this service's own on the table that exists,
+/// which [`settings`] makes.
 fn refuse_unapplied_properties(properties: &Value, resource_type: &str) -> Result<(), Refusal> {
     let Value::Object(members) = properties else {
         return Ok(());
@@ -573,10 +650,11 @@ fn refuse_unapplied_properties(properties: &Value, resource_type: &str) -> Resul
 }
 
 /// Whether this arm applies the property `name`: a body member of the create, the one that
-/// addresses it, the tag set, or one of the two whose spelling differs between the two
-/// sides.
+/// addresses it, the tag set, one of the two whose spelling differs between the two sides, or
+/// one of the settings DynamoDB applies through a call of its own ([`settings`]).
 fn applies(name: &str) -> bool {
     CREATE_MEMBERS.contains(&name)
+        || settings::is_a_setting(name)
         || [
             TABLE_NAME_PROPERTY,
             TAGS_PROPERTY,
@@ -686,13 +764,9 @@ mod tests {
     /// it does apply is admitted.
     #[test]
     fn an_unapplied_property_is_refused() {
-        let refused: &[&str] = &[
-            "TimeToLiveSpecification",
-            "PointInTimeRecoverySpecification",
-            "ContributorInsightsSpecification",
-            "KinesisStreamSpecification",
-            "ImportSourceSpecification",
-        ];
+        // An import is not a property applied to a table this arm created but a different
+        // create, so a declaration carrying it is refused.
+        let refused: &[&str] = &["ImportSourceSpecification"];
         for property in refused {
             let mut properties = Map::new();
             properties.insert(
@@ -716,6 +790,11 @@ mod tests {
             "BillingMode": "PAY_PER_REQUEST",
             "StreamSpecification": { "StreamEnabled": true,
                                      "StreamViewType": "NEW_AND_OLD_IMAGES" },
+            "TimeToLiveSpecification": { "AttributeName": "expiresAt", "Enabled": true },
+            "PointInTimeRecoverySpecification": { "PointInTimeRecoveryEnabled": true },
+            "ContributorInsightsSpecification": { "Enabled": true },
+            "KinesisStreamSpecification": {
+                "StreamArn": "arn:aws:kinesis:us-east-1:000000000000:stream/changes" },
             "Tags": [{ "Key": "Tier", "Value": "gold" }],
         }));
         let answer = refuse_unapplied_properties(&applied.properties, &applied.resource_type);
