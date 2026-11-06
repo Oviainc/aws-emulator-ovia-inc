@@ -8,8 +8,9 @@
 //! per offending value, and a clause stating a `@pattern` requirement names the MEMBER PATH
 //! and the modelled expression WITHOUT its `^` / `$` anchors, and no value at all — the
 //! requirement is the expression every value of that member must match rather than the one
-//! value that missed it. Every other constraint class keeps the clause the framework writes,
-//! value and all.
+//! value that missed it. An enumerated member's value SET is stated the same way, listing
+//! the values the model declares and no submitted value. Every other constraint class keeps
+//! the clause the framework writes, value and all.
 //!
 //! The table varies what that rule generalises over rather than the one recorded request:
 //! which operation refuses, where the member is bound (a body member, a URI label, a
@@ -63,8 +64,8 @@ struct Case {
     method: &'static str,
     path: String,
     body: Option<Value>,
-    /// The value the request submitted at the member whose `@pattern` refused it, where the
-    /// row has one: no clause may echo it.
+    /// The value the request submitted at the member whose requirement states none, where
+    /// the row has one: no clause may echo it.
     withheld: Option<String>,
     clauses: Vec<String>,
 }
@@ -263,15 +264,16 @@ fn cases() -> Vec<Case> {
             )],
         },
         // An enumerated member: the requirement is the value set the model declares, and
-        // the clause stays the framework's.
+        // the clause names no submitted value — the same half of the rule a `@pattern`
+        // clause follows, because the set, like the expression, is what every value of the
+        // member must satisfy rather than the one value that did not.
         Case {
             label: "a body member outside its enum value set",
             method: "POST",
             path: "/workflow-definitions".to_string(),
             body: Some(json!({ "sortOrder": "Sideways" })),
-            withheld: None,
-            clauses: vec![value_clause(
-                "Sideways",
+            withheld: Some("Sideways".to_string()),
+            clauses: vec![clause(
                 "sortOrder",
                 &format!(
                     "Member must satisfy enum value set: [{}]",
@@ -356,13 +358,13 @@ async fn a_pattern_requirement_is_stated_over_the_expression_alone() {
         );
 
         // The two deviations the rule forbids, asserted on their own so a regression says
-        // which half broke: no submitted value in a pattern clause, and no anchors on the
-        // expression it quotes.
+        // which half broke: no submitted value in a clause that states none, and no anchors
+        // on the expression it quotes.
         if let Some(withheld) = &case.withheld {
             assert!(
                 !message.contains(withheld.as_str()),
-                "case {label:?}: a pattern clause must not echo the submitted value \
-                 {withheld:?}, got {message:?}"
+                "case {label:?}: a clause stating a requirement over every value must not \
+                 echo the submitted value {withheld:?}, got {message:?}"
             );
         }
         assert!(

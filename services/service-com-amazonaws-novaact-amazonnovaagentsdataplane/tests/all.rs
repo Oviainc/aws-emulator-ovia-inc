@@ -13,6 +13,10 @@
 // points it into `tests/all/`.
 #[path = "all/act_listing.rs"]
 mod act_listing;
+#[path = "all/act_status_enum_refusal.rs"]
+mod act_status_enum_refusal;
+#[path = "all/act_status_update.rs"]
+mod act_status_update;
 #[path = "all/model_catalog.rs"]
 mod model_catalog;
 #[path = "all/not_found_resource_identifier.rs"]

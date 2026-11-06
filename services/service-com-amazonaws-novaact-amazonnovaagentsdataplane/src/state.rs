@@ -282,6 +282,20 @@ pub enum ActStatus {
 }
 
 impl ActStatus {
+    /// Every status the model declares, in the ORDER it declares them
+    /// (`smithy_query(query="shape",shape="ActStatus")`). It is the one list
+    /// [`Self::from_wire`] reads and the order a refusal lists the set in; the integration
+    /// suites check its length against the value list generated from the model, so a model
+    /// that grows a value does not leave it behind.
+    pub const ALL: [Self; 6] = [
+        Self::Running,
+        Self::PendingClientAction,
+        Self::PendingHumanAction,
+        Self::Succeeded,
+        Self::Failed,
+        Self::TimedOut,
+    ];
+
     /// The value as the model spells it on the wire.
     pub fn as_wire(self) -> &'static str {
         match self {
@@ -292,6 +306,22 @@ impl ActStatus {
             Self::Failed => "FAILED",
             Self::TimedOut => "TIMED_OUT",
         }
+    }
+
+    /// The status a request named, or `None` for a value the model's enum does not
+    /// declare. Read off [`Self::ALL`] through [`Self::as_wire`], so no second spelling of
+    /// any value exists to drift from the wire form.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|status| status.as_wire() == value)
+    }
+
+    /// Whether the act has FINISHED: it ran to the end, it failed, or it ran out of time.
+    /// Only an act in one of those statuses has an `endedAt`, and it is the last status
+    /// the act takes.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::TimedOut)
     }
 }
 
@@ -394,13 +424,31 @@ pub struct Act {
     pub created_at: SystemTime,
     /// The instant the act finished, which only an act in a terminal status has: it is
     /// what `ActSummary`'s `endedAt` reports, and `None` while the act is still running or
-    /// waiting on an action. The operations that end an act are still scaffolds, so
-    /// nothing sets it yet and no act is reported as ended.
+    /// waiting on an action. The status transition that ends an act is what sets it
+    /// ([`Act::move_to`]).
     pub ended_at: Option<SystemTime>,
     /// Where this act's trace is stored, as `ActSummary`'s `traceLocation` reports it.
     /// `None` until something records a trace for the act.
     pub trace_location: Option<TraceLocation>,
     pub insertion_seq: u64,
+}
+
+impl Act {
+    /// Move the act to `status` as of `now`, keeping the instant the status implies in
+    /// step: an act that has just reached a terminal status ended at `now`, and one moved
+    /// back to a status that leaves it under way has not ended.
+    ///
+    /// The ONE place an act's status is written, so `endedAt` cannot drift from the status
+    /// it belongs to. A move to the status the act already holds is no move at all: it
+    /// leaves the instant the act finished where it was, which is what a repeat of an
+    /// `@idempotent` update must observe.
+    pub fn move_to(&mut self, status: ActStatus, now: SystemTime) {
+        if self.status == status {
+            return;
+        }
+        self.status = status;
+        self.ended_at = if status.is_terminal() { Some(now) } else { None };
+    }
 }
 
 /// What an `@idempotencyToken` already created, so repeating the call replays it.
@@ -645,6 +693,27 @@ impl ComAmazonawsNovaactAmazonnovaagentsdataplaneState {
         Ok(())
     }
 
+    /// The act those four identifiers name, mutably: every parent in the chain is resolved
+    /// first, so an act reached through here is never one under a parent this store does
+    /// not hold, and whichever link is missing is what the refusal reports.
+    pub fn act_mut(
+        &mut self,
+        definition_name: &str,
+        run_id: &str,
+        session_id: &str,
+        act_id: &str,
+    ) -> Result<&mut Act, MissingResource> {
+        let path = act_path(definition_name, run_id, session_id, act_id);
+        let session = self
+            .definition_mut(definition_name)?
+            .run_mut(run_id)?
+            .session_mut(session_id)?;
+        session
+            .acts
+            .get_mut(act_id)
+            .ok_or_else(|| MissingResource::new("act", path))
+    }
+
     /// The definition `name` names.
     pub fn definition(&self, name: &str) -> Result<&WorkflowDefinition, MissingResource> {
         self.workflow_definitions.get(name).ok_or_else(|| {
@@ -778,6 +847,18 @@ pub fn session_path(definition_name: &str, run_id: &str, session_id: &str) -> St
     format!(
         "{}/session/{session_id}",
         workflow_run_path(definition_name, run_id)
+    )
+}
+
+/// The resource part of an act's ARN.
+///
+/// The model declares no `ActArn` shape, so this extends the session's path with the act's
+/// own segment exactly as [`session_path`] extends the run's: it is what names an act in
+/// this service's resource chain, which is what an error reporting a missing act needs.
+pub fn act_path(definition_name: &str, run_id: &str, session_id: &str, act_id: &str) -> String {
+    format!(
+        "{}/act/{act_id}",
+        session_path(definition_name, run_id, session_id)
     )
 }
 

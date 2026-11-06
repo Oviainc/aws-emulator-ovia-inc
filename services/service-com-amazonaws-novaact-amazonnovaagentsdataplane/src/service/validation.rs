@@ -15,6 +15,10 @@
 //!   rather than the one value that missed it. So the sentence is the same whatever a caller
 //!   submitted, and the refusal is stable across requests. It holds for whichever member of
 //!   whichever operation broke it: a body member, a URI label and a query parameter alike.
+//! * an enumerated type's value SET is stated the same way: the clause lists the values the
+//!   type admits, in the order the model declares them, and names no submitted value,
+//!   because the set is the requirement every value of that member must be in rather than
+//!   the one value that was not. So this refusal too reads the same whatever a caller sent.
 //!
 //! Both of those renderings, the counted envelope, the clause, the member path and every
 //! other constraint class's requirement belong to [`service_common::validation_message`] —
@@ -22,10 +26,10 @@
 //! spelled here, so this service cannot word a constraint differently from the services that
 //! state the same sentence.
 //!
-//! A refusal carrying no pattern violation is left to the framework entirely, so every other
-//! class — a `@length` or `@range` bound, an enum value set, an absent `@required` member —
-//! keeps the clause the framework wrote for it, value and all. The pattern class is the one
-//! this service has a recording of, and the one it restates.
+//! A refusal carrying neither of those classes is left to the framework entirely, so every
+//! other class — a `@length` or `@range` bound, an absent `@required` member — keeps the
+//! clause the framework wrote for it, value and all. Those two are the classes this service
+//! has recordings of, and the ones it restates.
 
 use smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
 
@@ -33,24 +37,28 @@ use smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
 ///
 /// `None` for anything that is not an input-constraint refusal (an authentication refusal is
 /// a different failure, with its own code and status, and nothing about it is this service's
-/// to word) and for a constraint refusal that states no `@pattern` requirement.
+/// to word) and for a constraint refusal that states neither a `@pattern` requirement nor an
+/// enumerated type's value set.
 pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
     };
-    if !violations.iter().any(breaks_a_pattern) {
+    if !violations.iter().any(states_no_value) {
         return None;
     }
     service_common::validation_message::aws_validation_refusal_withholding_violations(
         refusal,
-        breaks_a_pattern,
+        states_no_value,
     )
 }
 
-/// Whether `violation` is a value outside its member's `@pattern` — the one class this
-/// service states without a value.
-fn breaks_a_pattern(violation: &Violation) -> bool {
-    matches!(violation.kind, ViolationKind::Pattern(_))
+/// Whether `violation` is one of the classes this service states without a value: a value
+/// outside its member's `@pattern`, and a value outside an enumerated type's value set.
+fn states_no_value(violation: &Violation) -> bool {
+    matches!(
+        violation.kind,
+        ViolationKind::Pattern(_) | ViolationKind::EnumValue(_)
+    )
 }
 
 #[cfg(test)]
@@ -71,7 +79,7 @@ mod tests {
     /// `tests/all/validation_message_wording.rs` cannot see it: a refusal this service does
     /// not restate is declined whole, so the framework words it.
     #[test]
-    fn a_refusal_stating_no_pattern_requirement_is_declined() {
+    fn a_refusal_stating_neither_restated_class_is_declined() {
         for (label, refusal) in [
             (
                 "a length bound alone",
@@ -101,5 +109,32 @@ mod tests {
                 "case {label:?}: expected the framework's own wording, got {stated:?}"
             );
         }
+    }
+
+    /// An enumerated type's value set is stated without the value the request sent, listing
+    /// the values the model declares in the order it declares them.
+    #[test]
+    fn an_enum_value_set_is_stated_without_the_submitted_value() {
+        let refusal = Refusal::Invalid(vec![violation(
+            "status",
+            ViolationKind::EnumValue(vec![
+                "RUNNING".to_owned(),
+                "PENDING_CLIENT_ACTION".to_owned(),
+                "SUCCEEDED".to_owned(),
+            ]),
+        )]);
+        let stated = refused(&refusal).expect("an enum value set is this service's to state");
+        assert!(
+            stated
+                .message
+                .contains("[RUNNING, PENDING_CLIENT_ACTION, SUCCEEDED]"),
+            "expected the value set listed as the model declares it, got {:?}",
+            stated.message
+        );
+        assert!(
+            !stated.message.contains("submitted"),
+            "expected no submitted value in the clause, got {:?}",
+            stated.message
+        );
     }
 }

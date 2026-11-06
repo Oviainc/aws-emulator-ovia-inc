@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAct
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAct`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Moves one stored act to the status the request names and records the error information
+//! it carries, then answers 200 with the modelled empty body. The act is reached by
+//! resolving every parent in the chain first, so an unknown definition name, run id,
+//! session id or act id answers `ResourceNotFoundException` (404) naming whichever link
+//! was missing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAct::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A status that FINISHES an act (`SUCCEEDED`, `FAILED`, `TIMED_OUT`) is the last one it
+//! takes: a request that would move a finished act to a different status names a status the
+//! act's current one does not admit, which is a `ValidationException` (400) with reason
+//! `InvalidStatus`. Re-sending the status the act already holds changes nothing and
+//! succeeds, which is what this `@idempotent` operation promises a retry.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +87,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How this service states a status an act's current status does not admit: the act is in a
+/// state this update did not expect. Fixed text with nothing interpolated, so the refusal
+/// reads the same whichever act and whichever status a caller named.
+pub const ACT_IN_UNEXPECTED_STATE: &str = "Act in unexpected state";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,18 +165,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAct` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateActErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAct"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateActErrorModeled::InternalServerException(InternalServerException {
+                message: "the com-amazonaws-novaact-amazonnovaagentsdataplane store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+                reason: None,
+            })
+        })?;
+        // The region is read for the identifier a refusal reports: the missing resource's
+        // ARN in the requesting credential scope's region.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let not_found = |missing: crate::state::MissingResource| -> Self::Error {
+            UpdateActErrorModeled::ResourceNotFoundException(missing.not_found(&region)).into()
+        };
+
+        // The status to move the act to. The model constrains the member to its enum, so
+        // the boundary walk refuses a value outside it before this handler runs; reading it
+        // here means a status an act can hold, and anything else is refused rather than
+        // stored as a status no read could report. The requirement is stated through the
+        // workspace's shared sentence for a value outside an enumerated type's set, over
+        // the values in the order the model declares them and without echoing what the
+        // caller sent — the same choice `crate::service::validation` makes for the clause
+        // the boundary walk states.
+        let requested = crate::state::ActStatus::from_wire(&input.status).ok_or_else(|| {
+            let declared: Vec<String> = crate::state::ActStatus::ALL
+                .iter()
+                .map(|status| status.as_wire().to_string())
+                .collect();
+            UpdateActErrorModeled::ValidationException(
+                crate::state::paging::field_validation_failed(
+                    "status",
+                    ::service_common::validation_message::must_be_one_of("status", &declared),
+                ),
+            )
+        })?;
+
+        let mut state = state.lock();
+        // A deletion the clock has already made due is completed first, as every handler of
+        // this service does: an act under a definition whose removal was owed at this
+        // instant is gone, so this update cannot resurrect one.
+        state.complete_due_deletions(now);
+
+        let act = state
+            .act_mut(
+                &input.workflow_definition_name,
+                &input.workflow_run_id,
+                &input.session_id,
+                &input.act_id,
+            )
+            .map_err(not_found)?;
+
+        // A finished act has no execution left for a further status to describe, so the
+        // status asked for is not one it can take. Re-sending the status it already holds
+        // is the retry an `@idempotent` operation must answer, and changes nothing.
+        if act.status.is_terminal() && act.status != requested {
+            return Err(UpdateActErrorModeled::ValidationException(ValidationException {
+                message: ACT_IN_UNEXPECTED_STATE.to_string(),
+                // `ValidationExceptionReason` declares `InvalidStatus` for exactly this:
+                // the request is well formed, but the status it names is not one the
+                // resource's current status admits.
+                reason: "InvalidStatus".to_string(),
+                field_list: None,
+            })
+            .into());
+        }
+
+        act.move_to(requested, now);
+        // `error` is the error information to associate with the act "if applicable", so a
+        // request carrying one records it and one carrying none leaves what the act already
+        // holds: the member is absent, not emptied.
+        if let Some(error) = input.error {
+            act.error = Some(error);
+        }
+
+        Ok(UpdateActOutput {})
     }
 }
