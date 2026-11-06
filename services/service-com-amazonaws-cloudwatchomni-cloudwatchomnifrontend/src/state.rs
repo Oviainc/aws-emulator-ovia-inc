@@ -17,8 +17,10 @@
 use std::collections::HashMap;
 
 use crate::ops::types::{
-    AccessGrant, AccessProfile, Domain, EncryptionConfiguration, IdentityProviderConfiguration,
-    OmniDashboard, OmniDashboardSummary, Space, SpaceSummary,
+    AccessGrant, AccessProfile, Alert, AlertStateInfo, Domain, EncryptionConfiguration,
+    IdentityProviderConfiguration, NotificationRule, OmniDashboard, OmniDashboardSummary, Rule,
+    Space, SpaceSummary, ALERT_STATE_VALUES, COMPARATOR_VALUES, NOTIFICATION_TARGET_TYPE_VALUES,
+    QUERY_LANGUAGE_VALUES, THRESHOLD_MODE_VALUES,
 };
 
 /// The region a resource is recorded in when the request carries no SigV4
@@ -160,6 +162,36 @@ pub const OMNI_DASHBOARD_ARN_RESOURCE_TYPE: &str = "omni-dashboard";
 /// [`omni_dashboard_named`]: ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::omni_dashboard_named
 pub const OMNI_DASHBOARD_QUOTA: usize = 10_000;
 
+/// The resource type an alert's ARN carries, as the model's own `CreateAlert` examples
+/// document it (`arn:aws:cloudwatch:<region>:<account>:alert/<alertId>`).
+pub const ALERT_ARN_RESOURCE_TYPE: &str = "alert";
+
+/// `NotificationStatus`'s value for an alert whose notifications (actions) are on.
+pub const NOTIFICATION_STATUS_ENABLED: &str = "ENABLED";
+
+/// `NotificationStatus`'s value for an alert whose notifications (actions) are off.
+pub const NOTIFICATION_STATUS_DISABLED: &str = "DISABLED";
+
+/// `AlertState`'s value for an evaluation that produced no data, which `NoData`'s model
+/// doc names as the default resulting state: "`treatAs` carries the resulting state;
+/// defaults to `NODATA` when omitted".
+pub const ALERT_STATE_NODATA: &str = "NODATA";
+
+/// The evaluation cadences an alert's rule may ask for.
+///
+/// `AlertEvaluation`'s model doc: "`intervalSeconds` must be one of {30, 60, 120, 300,
+/// 600, 900, 1800, 3600}".
+pub const ALERT_EVALUATION_INTERVALS: &[i32] = &[30, 60, 120, 300, 600, 900, 1800, 3600];
+
+/// How many alerts the store holds before `CreateAlert` refuses with the modelled
+/// `ServiceQuotaExceededException`.
+///
+/// The emulator's OWN bound, for the same reason as [`DOMAIN_QUOTA`]. It bounds
+/// [`ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::alerts`] and, with it,
+/// `create_alert_tokens` (one entry per live alert, forgotten by `DeleteAlert`), so
+/// neither can grow without end.
+pub const ALERT_QUOTA: usize = 10_000;
+
 /// A dashboard as persisted. The wire `OmniDashboard` shape carries no parent id, so
 /// the space the dashboard lives in is kept beside it: a dashboard is addressed by its
 /// space AND its id.
@@ -229,6 +261,21 @@ pub struct StoredAccessGrant {
     pub tags: HashMap<String, String>,
 }
 
+/// An alert as persisted. The wire `Alert` shape carries its own `spaceId` and
+/// `profileId`, so the record needs no separate parent field.
+///
+/// `state` is left unset here: it carries LIVE evaluation state rather than a property
+/// of the record, so it is computed when the alert is reported ([`alert_view`]).
+#[derive(Debug, Clone)]
+pub struct StoredAlert {
+    /// Creation order, so `ListAlerts`-style enumeration is stable.
+    pub seq: u64,
+    /// The alert as persisted, `state` apart.
+    pub alert: Alert,
+    /// The request's `tags`; no modelled operation reads them back yet.
+    pub tags: HashMap<String, String>,
+}
+
 /// Per-service state for com-amazonaws-cloudwatchomni-cloudwatchomnifrontend. A handler reaches it through [`service_state`].
 ///
 /// Every map here is BOUNDED: `domains` (and the two maps keyed one-to-one to a live
@@ -236,7 +283,8 @@ pub struct StoredAccessGrant {
 /// [`SPACE_QUOTA`], `access_profiles` (and the token map keyed to a live profile) by
 /// [`ACCESS_PROFILE_QUOTA`], `access_grants` (and the token map keyed to a live grant)
 /// by [`ACCESS_GRANT_QUOTA`], `omni_dashboards` (and the token map keyed to a live
-/// dashboard) by [`OMNI_DASHBOARD_QUOTA`]. The creates refuse with the modelled
+/// dashboard) by [`OMNI_DASHBOARD_QUOTA`], `alerts` (and the token map keyed to a live
+/// alert) by [`ALERT_QUOTA`]. The creates refuse with the modelled
 /// `ServiceQuotaExceededException` once the bound is reached, and the deletes release
 /// records and their tokens together, so nothing in the store grows without end.
 #[derive(Debug, Default)]
@@ -263,8 +311,12 @@ pub struct ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
     pub omni_dashboards: HashMap<String, StoredOmniDashboard>,
     /// `CreateOmniDashboard` `clientToken` -> the `dashboardId` that token created.
     pub create_omni_dashboard_tokens: HashMap<String, String>,
+    /// Every persisted alert, keyed by its `alertId`.
+    pub alerts: HashMap<String, StoredAlert>,
+    /// `CreateAlert` `clientToken` -> the `alertId` that token created.
+    pub create_alert_tokens: HashMap<String, String>,
     /// Hands out [`StoredDomain::seq`] / [`StoredSpace::seq`] / [`StoredAccessProfile::seq`]
-    /// / [`StoredAccessGrant::seq`] / [`StoredOmniDashboard::seq`].
+    /// / [`StoredAccessGrant::seq`] / [`StoredOmniDashboard::seq`] / [`StoredAlert::seq`].
     next_seq: u64,
 }
 
@@ -505,6 +557,15 @@ pub fn mint_grant_id() -> String {
     fresh_uuid()
 }
 
+/// A fresh `alertId`.
+///
+/// `AlertId`'s model doc: "a 32-character lowercase hex uuid, minted by the backend on
+/// create and immutable across updates" — a canonical v4 UUID with its hyphens removed
+/// is exactly that, so that is what this mints.
+pub fn mint_alert_id() -> String {
+    fresh_uuid().chars().filter(|c| *c != '-').collect()
+}
+
 /// The ARN of a domain, in this service's ARN namespace.
 pub fn domain_arn(region: &str, domain_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("domain/{domain_id}"))
@@ -552,6 +613,20 @@ pub fn omni_dashboard_arn(region: &str, dashboard_id: &str) -> String {
         ARN_NAMESPACE,
         region,
         &format!("{OMNI_DASHBOARD_ARN_RESOURCE_TYPE}/{dashboard_id}"),
+    )
+}
+
+/// The ARN of an alert, in this service's ARN namespace.
+///
+/// The form the model's own `CreateAlert` examples document for `Alert.alertArn`: the
+/// `alert` resource type and the alert's id, in the account and the region the alert
+/// lives in. Like a dashboard's, an alert's ARN therefore does not repeat its parent
+/// space — the alert id alone addresses it.
+pub fn alert_arn(region: &str, alert_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{ALERT_ARN_RESOURCE_TYPE}/{alert_id}"),
     )
 }
 
@@ -677,6 +752,195 @@ pub fn access_profile_view(stored: &StoredAccessProfile) -> AccessProfile {
         assume_status: Some(assume_status.to_string()),
         ..stored.profile.clone()
     }
+}
+
+/// The state an alert reports when its last evaluation produced no data.
+///
+/// `NoData`'s model doc: it "Configures how the alert reacts when an evaluation produces
+/// no data. `treatAs` carries the resulting state; defaults to `NODATA` when omitted" —
+/// so the rule's own `treatAs` decides, and a rule that configures none reports
+/// [`ALERT_STATE_NODATA`].
+pub fn alert_no_data_state(rule: &Rule) -> String {
+    let Rule::telemetryRule(telemetry) = rule;
+    telemetry
+        .no_data
+        .as_ref()
+        .map(|no_data| no_data.treat_as.clone())
+        .unwrap_or_else(|| ALERT_STATE_NODATA.to_string())
+}
+
+/// Project a stored alert into the `Alert` a reporting operation returns.
+///
+/// Every member but `state` is the persisted record verbatim. `state` is "Live
+/// evaluation state (read-only, system-managed)", so it is NOT persisted: it is
+/// computed when the alert is reported. This store holds no telemetry for a rule's
+/// query to read, so every evaluation of an alert produces no data, and the state that
+/// yields is the rule's own ([`alert_no_data_state`]). The alert entered it when the
+/// rule it is evaluating last changed, which is the record's `updatedAt`.
+///
+/// `contributorSummary` stays absent — its model doc: "absent until the first
+/// contributor breaches a WARNING or CRITICAL threshold" — and so does `data`, which
+/// carries the threshold a breach crossed.
+pub fn alert_view(stored: &StoredAlert) -> Alert {
+    Alert {
+        state: Some(AlertStateInfo {
+            value: alert_no_data_state(&stored.alert.rule),
+            transitioned_at: Some(stored.alert.updated_at),
+            contributor_summary: None,
+            data: None,
+        }),
+        ..stored.alert.clone()
+    }
+}
+
+/// Why `rule` is not a complete alert rule, or `None` when it is one.
+///
+/// `Rule`'s model doc: "`telemetryRule` members are optional at the Smithy level to
+/// support PATCH semantics on UpdateAlert (send only the sub-blocks you want to
+/// change). On CreateAlert, presence is enforced by the service-side validator" — so a
+/// rule that defines an alert carries the query to run, the condition that fires it and
+/// the cadence it runs at, and this is that validator. `noData` stays optional: its
+/// model doc gives it a default.
+///
+/// The returned text names the member and what was wrong with it, which is all a caller
+/// has to fix the request from.
+pub fn alert_rule_rejection(rule: &Rule) -> Option<String> {
+    let Rule::telemetryRule(telemetry) = rule;
+
+    let Some(query) = telemetry.query.as_ref() else {
+        return Some("rule.telemetryRule.query is required.".to_string());
+    };
+    if !QUERY_LANGUAGE_VALUES.contains(&query.language.as_str()) {
+        return Some(format!(
+            "rule.telemetryRule.query.language: '{}' is not a valid QueryLanguage; \
+             expected one of [{}]",
+            query.language,
+            QUERY_LANGUAGE_VALUES.join(", ")
+        ));
+    }
+
+    let Some(condition) = telemetry.condition.as_ref() else {
+        return Some("rule.telemetryRule.condition is required.".to_string());
+    };
+    // `AlertCondition`'s model doc: "A condition must keep at least one tier", the tiers
+    // being its warning and critical thresholds — a condition with neither says nothing
+    // about when the alert fires.
+    if condition.warning_threshold.is_none() && condition.critical_threshold.is_none() {
+        return Some(
+            "rule.telemetryRule.condition must set warningThreshold, criticalThreshold, or both."
+                .to_string(),
+        );
+    }
+    // The same doc: `thresholdMode` and `comparator` "are optional at the Smithy level
+    // (so a single-tier condition is expressible) but are required whenever a threshold
+    // is present" — a threshold with neither cannot be compared against anything.
+    let Some(threshold_mode) = condition.threshold_mode.as_deref() else {
+        return Some(
+            "rule.telemetryRule.condition.thresholdMode is required when a threshold is present."
+                .to_string(),
+        );
+    };
+    if !THRESHOLD_MODE_VALUES.contains(&threshold_mode) {
+        return Some(format!(
+            "rule.telemetryRule.condition.thresholdMode: '{threshold_mode}' is not a valid \
+             ThresholdMode; expected one of [{}]",
+            THRESHOLD_MODE_VALUES.join(", ")
+        ));
+    }
+    let Some(comparator) = condition.comparator.as_deref() else {
+        return Some(
+            "rule.telemetryRule.condition.comparator is required when a threshold is present."
+                .to_string(),
+        );
+    };
+    if !COMPARATOR_VALUES.contains(&comparator) {
+        return Some(format!(
+            "rule.telemetryRule.condition.comparator: '{comparator}' is not a valid Comparator; \
+             expected one of [{}]",
+            COMPARATOR_VALUES.join(", ")
+        ));
+    }
+
+    let Some(evaluation) = telemetry.evaluation.as_ref() else {
+        return Some("rule.telemetryRule.evaluation is required.".to_string());
+    };
+    // `AlertEvaluation`'s model doc: "`intervalSeconds` must be one of {30, 60, 120,
+    // 300, 600, 900, 1800, 3600}; `pendingDurationSeconds` and
+    // `recoveryDurationSeconds` must be multiples of `intervalSeconds`. A duration of 0
+    // means fire/clear immediately with no delay."
+    let interval = evaluation.interval_seconds;
+    if !ALERT_EVALUATION_INTERVALS.contains(&interval) {
+        return Some(format!(
+            "rule.telemetryRule.evaluation.intervalSeconds: {interval} is not a supported \
+             evaluation interval; expected one of [{}]",
+            ALERT_EVALUATION_INTERVALS
+                .iter()
+                .map(i32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    for (member, duration) in [
+        (
+            "pendingDurationSeconds",
+            evaluation.pending_duration_seconds,
+        ),
+        (
+            "recoveryDurationSeconds",
+            evaluation.recovery_duration_seconds,
+        ),
+    ] {
+        if let Some(duration) = duration {
+            if duration < 0 || duration % interval != 0 {
+                return Some(format!(
+                    "rule.telemetryRule.evaluation.{member}: {duration} must be a non-negative \
+                     multiple of intervalSeconds {interval}"
+                ));
+            }
+        }
+    }
+
+    if let Some(no_data) = telemetry.no_data.as_ref() {
+        if !ALERT_STATE_VALUES.contains(&no_data.treat_as.as_str()) {
+            return Some(format!(
+                "rule.telemetryRule.noData.treatAs: '{}' is not a valid AlertState; \
+                 expected one of [{}]",
+                no_data.treat_as,
+                ALERT_STATE_VALUES.join(", ")
+            ));
+        }
+    }
+
+    None
+}
+
+/// Why `rules` are not notification rules this service can act on, or `None` when they
+/// are.
+///
+/// An enum member arrives as text, so the values the model admits for a rule's target
+/// type and for the states that trigger it are checked here rather than at the
+/// boundary.
+pub fn notification_rules_rejection(rules: &[NotificationRule]) -> Option<String> {
+    for (index, rule) in rules.iter().enumerate() {
+        let target_type = rule.target.r#type.as_str();
+        if !NOTIFICATION_TARGET_TYPE_VALUES.contains(&target_type) {
+            return Some(format!(
+                "notificationRules[{index}].target.type: '{target_type}' is not a valid \
+                 NotificationTargetType; expected one of [{}]",
+                NOTIFICATION_TARGET_TYPE_VALUES.join(", ")
+            ));
+        }
+        for state in rule.trigger.state_values.iter().flatten() {
+            if !ALERT_STATE_VALUES.contains(&state.as_str()) {
+                return Some(format!(
+                    "notificationRules[{index}].trigger.stateValues: '{state}' is not a valid \
+                     AlertState; expected one of [{}]",
+                    ALERT_STATE_VALUES.join(", ")
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// The dashboard-body schema a `body` is validated against, and the refusal text a
