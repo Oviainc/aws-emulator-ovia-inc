@@ -17,8 +17,8 @@
 use std::collections::HashMap;
 
 use crate::ops::types::{
-    AccessProfile, Domain, EncryptionConfiguration, IdentityProviderConfiguration, OmniDashboard,
-    Space, SpaceSummary,
+    AccessGrant, AccessProfile, Domain, EncryptionConfiguration, IdentityProviderConfiguration,
+    OmniDashboard, Space, SpaceSummary,
 };
 
 /// The region a resource is recorded in when the request carries no SigV4
@@ -106,6 +106,43 @@ pub const SPACE_QUOTA: usize = 10_000;
 /// [`access_profile_named`]: ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::access_profile_named
 pub const ACCESS_PROFILE_QUOTA: usize = 10_000;
 
+/// `AccessGrantType`'s value for a grant a customer created, which is what every grant
+/// created through this API is: the model doc for the value reads "Created and owned by
+/// a customer", against SERVICE_MANAGED's "Provisioned and owned by the service. Cannot
+/// be deleted by customers."
+pub const ACCESS_GRANT_TYPE_CUSTOMER_MANAGED: &str = "CUSTOMER_MANAGED";
+
+/// `AccessGrantPermission`'s value whose model doc reads "Access limited to an explicit
+/// list of actions, specified in scopedActions" — the one permission that cannot stand
+/// without those actions.
+pub const ACCESS_GRANT_PERMISSION_CUSTOM: &str = "CUSTOM";
+
+/// `AccessGrantPrincipalType`'s value for an Identity Center user — the only principal
+/// type `AccessGrantPrincipal.principalAttributes` supports ("Supported only for
+/// IDC_USER principals").
+pub const ACCESS_GRANT_PRINCIPAL_TYPE_IDC_USER: &str = "IDC_USER";
+
+/// The resource type name that names an access profile in a `ResourceScope`.
+///
+/// `ResourceScope.resourceType`'s model doc is "Resource type name (e.g., \"DataSet\",
+/// \"OmniDashboard\")" — the modelled shape's own name, so an access profile is named by
+/// `AccessProfile`. It is also the `resourceType` this service's `ResourceNotFound`
+/// refusals report for a profile.
+pub const ACCESS_PROFILE_RESOURCE_TYPE: &str = "AccessProfile";
+
+/// How many access grants the store holds before `CreateAccessGrant` refuses with the
+/// modelled `ServiceQuotaExceededException`.
+///
+/// The emulator's OWN bound, for the same reason as [`DOMAIN_QUOTA`]. It bounds
+/// [`ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::access_grants`] and, with
+/// it, `create_access_grant_tokens` (one entry per live grant) — and therefore the
+/// per-request work [`access_grant_named`] and [`access_profiles_scoped_by`] do under
+/// the store lock, which is linear in the number of stored grants and profiles.
+///
+/// [`access_grant_named`]: ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::access_grant_named
+/// [`access_profiles_scoped_by`]: ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::access_profiles_scoped_by
+pub const ACCESS_GRANT_QUOTA: usize = 10_000;
+
 /// The resource type an `OmniDashboard`'s ARN carries, as the model's own
 /// `CreateOmniDashboard` example documents it
 /// (`arn:aws:cloudwatch:<region>:<account>:omni-dashboard/<dashboardId>`).
@@ -180,12 +217,25 @@ pub struct StoredAccessProfile {
     pub tags: HashMap<String, String>,
 }
 
+/// An access grant as persisted. The wire `AccessGrant` shape carries its own
+/// `domainId` and `spaceId`, so the record needs no separate parent field.
+#[derive(Debug, Clone)]
+pub struct StoredAccessGrant {
+    /// Creation order, so `ListAccessGrants`-style enumeration is stable.
+    pub seq: u64,
+    /// Exactly what `GetAccessGrant` returns.
+    pub grant: AccessGrant,
+    /// The request's `tags`; no modelled operation reads them back yet.
+    pub tags: HashMap<String, String>,
+}
+
 /// Per-service state for com-amazonaws-cloudwatchomni-cloudwatchomnifrontend. A handler reaches it through [`service_state`].
 ///
 /// Every map here is BOUNDED: `domains` (and the two maps keyed one-to-one to a live
 /// domain) by [`DOMAIN_QUOTA`], `spaces` (and the token map keyed to a live space) by
 /// [`SPACE_QUOTA`], `access_profiles` (and the token map keyed to a live profile) by
-/// [`ACCESS_PROFILE_QUOTA`], `omni_dashboards` (and the token map keyed to a live
+/// [`ACCESS_PROFILE_QUOTA`], `access_grants` (and the token map keyed to a live grant)
+/// by [`ACCESS_GRANT_QUOTA`], `omni_dashboards` (and the token map keyed to a live
 /// dashboard) by [`OMNI_DASHBOARD_QUOTA`]. The creates refuse with the modelled
 /// `ServiceQuotaExceededException` once the bound is reached, and the deletes release
 /// records and their tokens together, so nothing in the store grows without end.
@@ -205,12 +255,16 @@ pub struct ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
     pub access_profiles: HashMap<String, StoredAccessProfile>,
     /// `CreateAccessProfile` `clientToken` -> the `profileId` that token created.
     pub create_access_profile_tokens: HashMap<String, String>,
+    /// Every persisted access grant, keyed by its `grantId`.
+    pub access_grants: HashMap<String, StoredAccessGrant>,
+    /// `CreateAccessGrant` `clientToken` -> the `grantId` that token created.
+    pub create_access_grant_tokens: HashMap<String, String>,
     /// Every persisted dashboard, keyed by its `dashboardId`.
     pub omni_dashboards: HashMap<String, StoredOmniDashboard>,
     /// `CreateOmniDashboard` `clientToken` -> the `dashboardId` that token created.
     pub create_omni_dashboard_tokens: HashMap<String, String>,
     /// Hands out [`StoredDomain::seq`] / [`StoredSpace::seq`] / [`StoredAccessProfile::seq`]
-    /// / [`StoredOmniDashboard::seq`].
+    /// / [`StoredAccessGrant::seq`] / [`StoredOmniDashboard::seq`].
     next_seq: u64,
 }
 
@@ -244,6 +298,66 @@ impl ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
         self.access_profiles
             .values()
             .find(|stored| stored.profile.space_id == space_id && stored.profile.name == name)
+    }
+
+    /// The access grant `space_id` holds under `name`, if the store holds one.
+    ///
+    /// Linear in the number of stored grants, which [`ACCESS_GRANT_QUOTA`] bounds.
+    pub fn access_grant_named(&self, space_id: &str, name: &str) -> Option<&StoredAccessGrant> {
+        self.access_grants.values().find(|stored| {
+            stored.grant.space_id == space_id && stored.grant.name.as_deref() == Some(name)
+        })
+    }
+
+    /// The ids of the access profiles `grant`'s scoped actions apply to.
+    ///
+    /// A `ScopedActions` group limits a grant to the resources its `ResourceScope`s
+    /// name: `resourceArns` holds "specific resource ARNs" and, per its model doc,
+    /// "when absent, defaults to `*`" — every resource of that `resourceType`. So a
+    /// grant applies to an access profile when one of its resource scopes names that
+    /// profile's ARN, or scopes the `AccessProfile` type without narrowing it to ARNs.
+    /// Only profiles of the grant's own space are reached: a grant applies to one space.
+    ///
+    /// This is what records a grant against a profile, which is what
+    /// [`access_profile_view`] reads `assumeStatus` from — a profile no grant applies to
+    /// cannot be assumed by anyone.
+    ///
+    /// Linear in the number of stored profiles, which [`ACCESS_PROFILE_QUOTA`] bounds,
+    /// times the grant's resource scopes, which the model bounds at 20 groups of 10.
+    pub fn access_profiles_scoped_by(&self, grant: &AccessGrant) -> Vec<String> {
+        let scopes = || {
+            grant
+                .scoped_actions
+                .iter()
+                .flatten()
+                .filter_map(|group| group.resources.as_ref())
+                .flatten()
+        };
+        let whole_profile_type = scopes().any(|scope| {
+            scope.resource_type == ACCESS_PROFILE_RESOURCE_TYPE
+                && scope
+                    .resource_arns
+                    .as_ref()
+                    .is_none_or(|arns| arns.is_empty())
+        });
+        let mut named: Vec<String> = self
+            .access_profiles
+            .values()
+            .filter(|stored| stored.profile.space_id == grant.space_id)
+            .filter(|stored| {
+                whole_profile_type
+                    || scopes().any(|scope| {
+                        scope
+                            .resource_arns
+                            .iter()
+                            .flatten()
+                            .any(|arn| *arn == stored.profile.arn)
+                    })
+            })
+            .map(|stored| stored.profile.profile_id.clone())
+            .collect();
+        named.sort();
+        named
     }
 
     /// The dashboard `space_id` holds under `name`, if the store holds one.
@@ -361,6 +475,12 @@ pub fn mint_dashboard_id() -> String {
     fresh_uuid()
 }
 
+/// A fresh `grantId`. `GrantId`'s model doc: "a v4 UUID assigned when the grant is
+/// created".
+pub fn mint_grant_id() -> String {
+    fresh_uuid()
+}
+
 /// The ARN of a domain, in this service's ARN namespace.
 pub fn domain_arn(region: &str, domain_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("domain/{domain_id}"))
@@ -381,6 +501,19 @@ pub fn access_profile_arn(region: &str, space_id: &str, profile_id: &str) -> Str
         ARN_NAMESPACE,
         region,
         &format!("space/{space_id}/access-profile/{profile_id}"),
+    )
+}
+
+/// The ARN of an access grant, in this service's ARN namespace.
+///
+/// A grant is scoped to one space (`AccessGrant.spaceId`: "The space this grant applies
+/// to"), so, like an access profile's, its ARN is the parent space's resource path with
+/// the grant appended — the ARN of a child resource names its parent.
+pub fn access_grant_arn(region: &str, space_id: &str, grant_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("space/{space_id}/access-grant/{grant_id}"),
     )
 }
 
