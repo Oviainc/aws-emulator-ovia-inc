@@ -15,7 +15,10 @@
 //! the attribute and at which level of the document it sits (patient, study, one series),
 //! whether the member holds text or a number, and which side of a bound the value sits on
 //! — each member's extreme LEGAL value is written and read back, and the value one step
-//! past it is refused.
+//! past it is refused. A last table pins the rule's SCOPE from the other side: a document
+//! that names an attribute without writing a value into a constrained member — a removal,
+//! an attribute the model does not declare, an attribute of a series the modelled members
+//! do not describe — carries none of those constraints and is admitted.
 //!
 //! Every bound and pattern below is the model's own, read off
 //! `smithy_query(query="shape",shape="DICOMTags")`.
@@ -557,5 +560,131 @@ async fn a_search_reports_every_modelled_member_at_the_bound_of_its_constraints(
             member.member,
             member.combined
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Where a modelled member's constraints do NOT reach
+// ---------------------------------------------------------------------------
+
+/// A Series Instance UID a seeded image set does NOT hold. The model declares the
+/// attributes of ONE series per image set — the one its `dicomSeriesInstanceUID` identifies
+/// — so the attributes of any other series are not held in a modelled member.
+const OTHER_SERIES: &str = "1.2.840.113619.2.1.2.44";
+
+/// One row of the scope table: a document that carries a value no modelled member takes,
+/// and is therefore admitted.
+struct ScopeCase {
+    case: &'static str,
+    updatable: Option<Value>,
+    removable: Option<Value>,
+    /// Document paths the served document must hold these values at afterwards.
+    expected: Vec<(Vec<&'static str>, Value)>,
+    /// Document paths the served document must hold NOTHING at afterwards.
+    absent: Vec<Vec<&'static str>>,
+}
+
+/// The rows span the three ways a document names an attribute without writing a value into
+/// a member the model constrains: it REMOVES the attribute, it names an attribute the model
+/// does not declare, or it names an attribute of a series the modelled members do not
+/// describe. Each value is one no modelled member would take, so a row that is admitted
+/// says the constraint reached exactly the member it belongs to.
+fn scope_cases() -> Vec<ScopeCase> {
+    vec![
+        ScopeCase {
+            case: "a removal naming a modelled attribute, whatever the document holds for it",
+            updatable: None,
+            // A removal takes the attribute away, so the document holds no value for the
+            // member to carry — `PatientSex` takes 16 characters and this is 17.
+            removable: Some(json!({
+                "SchemaVersion": "1.1",
+                "Patient": { "DICOM": { "PatientSex": filled(17, "A") } },
+            })),
+            expected: vec![(vec!["Patient", "DICOM", "PatientID"], json!("PID-1"))],
+            absent: vec![vec!["Patient", "DICOM", "PatientSex"]],
+        },
+        ScopeCase {
+            case: "an attribute the model does not name, longer than any modelled member takes",
+            updatable: Some(json!({
+                "SchemaVersion": "1.1",
+                "Patient": { "DICOM": { "PatientAge": filled(1000, "A") } },
+            })),
+            removable: None,
+            expected: vec![(
+                vec!["Patient", "DICOM", "PatientAge"],
+                json!(filled(1000, "A")),
+            )],
+            absent: Vec::new(),
+        },
+        ScopeCase {
+            case: "an attribute of a series the modelled members do not describe",
+            updatable: Some(json!({
+                "SchemaVersion": "1.1",
+                "Study": {
+                    "Series": { OTHER_SERIES: { "DICOM": { "Modality": filled(64, "A") } } },
+                },
+            })),
+            removable: None,
+            expected: vec![
+                (
+                    vec!["Study", "Series", OTHER_SERIES, "DICOM", "Modality"],
+                    json!(filled(64, "A")),
+                ),
+                // The modality the modelled member holds, for the series the image set
+                // does hold, is untouched by it.
+                (
+                    vec!["Study", "Series", SERIES_UID, "DICOM", "Modality"],
+                    json!("CT"),
+                ),
+            ],
+            absent: Vec::new(),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_members_constraints_reach_only_the_values_that_member_carries() {
+    let emulator = Emulator::new();
+    let datastore_id = emulator
+        .active_datastore("attribute.scope", "token-attribute-scope")
+        .await;
+
+    for case in scope_cases() {
+        let image_set_id = seed_image_set(&emulator, &datastore_id, seeded_tags(STUDY_UID));
+        let written = update_metadata(
+            &emulator,
+            &datastore_id,
+            &image_set_id,
+            "1",
+            dicom_updates(case.updatable.as_ref(), case.removable.as_ref()),
+            &[],
+        )
+        .await;
+        assert_eq!(
+            (written.status, written.string(&["latestVersionId"]).as_str()),
+            (200, "2"),
+            "case {:?}: expected HTTP 200 minting version 2, got {written:?}",
+            case.case
+        );
+
+        let served = read_document(&emulator, &datastore_id, &image_set_id, case.case).await;
+        for (path, value) in &case.expected {
+            assert_eq!(
+                &at(&served, path),
+                value,
+                "case {:?}: expected the served document to hold {value:?} at {path:?}, got \
+                 {served}",
+                case.case
+            );
+        }
+        for path in &case.absent {
+            assert_eq!(
+                at(&served, path),
+                Value::Null,
+                "case {:?}: expected the served document to hold nothing at {path:?}, got \
+                 {served}",
+                case.case
+            );
+        }
     }
 }
