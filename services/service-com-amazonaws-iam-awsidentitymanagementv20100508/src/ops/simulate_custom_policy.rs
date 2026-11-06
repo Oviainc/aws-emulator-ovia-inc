@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SimulateCustomPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SimulateCustomPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SimulateCustomPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -181,6 +172,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The simulation itself — what the documents in force decide, the report it is answered
+// as and the bounds one request is admitted within — which `SimulatePrincipalPolicy`
+// runs too, so both operations decide alike and this file holds only what is this
+// operation's own: the policies come from the request alone.
+use crate::state::simulated_decisions as simulation;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -250,18 +247,216 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SimulateCustomPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SimulateCustomPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SimulateCustomPolicy"))
+        // `ctx` is read for the signing principal the CALL is authorized against: a
+        // simulation reports what the supplied policies WOULD decide, which is not about
+        // the caller's own identity — but asking for that report is itself an IAM call,
+        // and IAM authorizes its own API.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The operation models no `ServiceFailureException`; its own server-side
+            // failure is `PolicyEvaluationException`, "the request failed because a
+            // provided policy could not be successfully evaluated".
+            return Err(SimulateCustomPolicyErrorModeled::PolicyEvaluationException(
+                PolicyEvaluationException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "An ordered list of service control policies (SCPs) to include in the
+        // simulation. Each element represents one level of an Organizations hierarchy,
+        // from the organization root to the account": one level's SCPs per entry, in the
+        // order the request named them.
+        let organization_levels: Vec<Vec<String>> = input
+            .ordered_organization_policy_input_list
+            .unwrap_or_default()
+            .into_iter()
+            .map(|level| level.service_control_policy_input_list.unwrap_or_default())
+            .collect();
+        // "A list of policy documents to include in the simulation. Each document is
+        // specified as a string containing the complete, valid JSON text of an IAM
+        // policy": the identity-based policies in force in THIS simulation are exactly
+        // the ones the request supplies — "if you want to simulate existing policies that
+        // are attached to an IAM user, group, or role, use SimulatePrincipalPolicy
+        // instead".
+        let supplied = input.policy_input_list;
+        let boundary = input.permissions_boundary_policy_input_list.unwrap_or_default();
+        // What every simulation request is admitted by, whichever of the two operations
+        // runs it: each document it supplies IS a policy document, the ceiling it
+        // simulates is a single one, each action it names carries its service, the
+        // scenario it declares carries the resources that scenario needs, and no axis of
+        // the work it asks for is past its bound
+        // (`crate::state::simulated_decisions::request_defect`).
+        if let Some(defect) = simulation::request_defect(&simulation::SimulationInput {
+            documents: &supplied,
+            boundary: &boundary,
+            organization_levels: &organization_levels,
+            resource_policy: input.resource_policy.as_deref(),
+            resource_arns: input.resource_arns.as_deref().unwrap_or_default(),
+            context_entries: input.context_entries.as_deref(),
+            action_names: &input.action_names,
+            resource_handling_option: input.resource_handling_option.as_deref(),
+        }) {
+            return Err(invalid_input(defect));
+        }
+        // "CallerArn is required if you include a ResourcePolicy so that the policy's
+        // Principal element has a value to use in evaluating the policy": a resource-based
+        // statement is about WHO is asking, so without a simulated caller there is nothing
+        // to decide its `Principal` element against.
+        if input.resource_policy.is_some() && input.caller_arn.is_none() {
+            return Err(invalid_input(
+                "Invalid value for CallerArn: a CallerArn is required when a \
+                 ResourcePolicy is simulated, so the policy's Principal element has a \
+                 value to be evaluated against"
+                    .to_string(),
+            ));
+        }
+        // "The ARN of the IAM user, group, or role that you want to use as the simulated
+        // caller of the API operations … You cannot specify the ARN of an assumed role,
+        // federated user, or a service principal": an ARN naming none of the three names
+        // no principal the simulation could be of, which is an invalid input — the same
+        // refusal `SimulatePrincipalPolicy` answers for the principal it is handed.
+        if let Some(caller_arn) = input
+            .caller_arn
+            .as_deref()
+            .filter(|caller_arn| crate::state::parse_entity_arn(caller_arn).is_none())
+        {
+            return Err(invalid_input(format!(
+                "ARN {caller_arn} is not valid: CallerArn must be the ARN of an IAM user, \
+                 group or role"
+            )));
+        }
+        // The page resumes strictly after the POSITION the marker names, exactly as this
+        // crate's list operations do, so a token this service's encoding cannot have
+        // produced is refused rather than read as the start of the results.
+        let Some(resume_at) = simulation::resume_position(input.marker.as_deref()) else {
+            return Err(invalid_input(crate::state::INVALID_MARKER.to_string()));
+        };
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any document is read. This call names no entity of the account
+        // and the Service Authorization Reference lists no resource type for the action,
+        // so a statement permits it only by covering every resource. The guard is a
+        // TEMPORARY, so the store lock is held for the decision alone — the simulation
+        // itself reads nothing from the store, since the request carries every document
+        // it decides from.
+        crate::state::authorization::authorize(
+            &state.lock(),
+            ctx,
+            crate::state::authorization::SIMULATE_CUSTOM_POLICY,
+            crate::state::authorization::ACCOUNT_WIDE_RESOURCE,
+        )?;
+
+        // "Whenever a context key is evaluated in one of the simulated IAM permissions
+        // policies, the corresponding value is supplied": the entries the request carries
+        // are the condition values the decision knows — and they are the WHOLE context of
+        // the simulated request, since nothing else can put a value in it.
+        let context = simulation::supplied_context(input.context_entries.as_deref());
+
+        // "If this parameter is not provided, then the value defaults to * (all
+        // resources). Each API in the ActionNames parameter is evaluated for each resource
+        // in this list."
+        let named_resources = input.resource_arns.unwrap_or_default();
+        let reports_each_resource = !named_resources.is_empty();
+        let resources: Vec<String> = if named_resources.is_empty() {
+            vec![simulation::ANY_RESOURCE.to_string()]
+        } else {
+            named_resources
+        };
+        // How many actions this page decides: the request's `MaxItems`, narrowed so the
+        // page's (action, resource) pairs stay within the bound both simulation operations
+        // answer within (`crate::state::simulated_decisions::page_size`).
+        let page_size = simulation::page_size(input.max_items, resources.len());
+
+        // How the response names each supplied document: the member it arrived in and its
+        // position in that member, counted from one, so a decision reached from a document
+        // can be attributed to the document the request passed.
+        let sources: Vec<String> = (1..=supplied.len())
+            .map(|at| format!("{}.{at}", simulation::SUPPLIED_POLICY_ID))
+            .collect();
+        let prepared = ::service_common::iam_authorization::prepare_documents(&supplied);
+        let prepared_boundary = ::service_common::iam_authorization::prepare_documents(&boundary);
+        let prepared_levels: Vec<Vec<::service_common::iam_authorization::PreparedDocument>> =
+            organization_levels
+                .iter()
+                .map(|level| ::service_common::iam_authorization::prepare_documents(level))
+                .collect();
+        // "A resource-based policy to include in the simulation provided as a string. Each
+        // resource in the simulation is treated as if it had this policy attached": ONE
+        // document, read once here rather than per (action, resource) pair.
+        let prepared_resource_policy = input
+            .resource_policy
+            .as_deref()
+            .map(::service_common::iam_authorization::PreparedDocument::read);
+        // The identity a resource-based statement's `Principal` element is matched
+        // against. A request that supplies no resource-based policy names no caller
+        // either, and then nothing in the simulation is about a principal: an
+        // identity-based statement names none.
+        let caller_arn = input.caller_arn.unwrap_or_default();
+        let granting_principals = [caller_arn.clone()];
+        // The caller's own spelling PLUS the ones naming its account
+        // ([`service_common::iam_authorization::account_principals`]): a statement that
+        // denies the account denies each of its principals, so a DENY is decided under
+        // these, while a statement that allows the account root hands the decision to that
+        // account's identity-based policies rather than granting by itself, so a GRANT is
+        // decided under the caller's own spelling alone.
+        let mut denying_principals = vec![caller_arn.clone()];
+        denying_principals.extend(::service_common::iam_authorization::account_principals(
+            &caller_arn,
+        ));
+        let simulated = simulation::Simulated {
+            documents: &prepared,
+            sources: &sources,
+            boundary: &prepared_boundary,
+            organization_levels: &prepared_levels,
+            resource_policy: prepared_resource_policy.as_ref(),
+            granting_principals: &granting_principals,
+            denying_principals: &denying_principals,
+            context: &context,
+            // "An ARN representing the Amazon Web Services account ID that specifies the
+            // owner of any simulated resource that does not identify its owner in the
+            // resource ARN … This parameter is required only if you specify a
+            // resource-based policy and account that owns the resource is different from
+            // the account that owns the simulated calling user CallerArn": a simulation
+            // whose resources another account owns needs both sides to allow.
+            cross_account: simulation::cross_account(input.resource_owner.as_deref(), &caller_arn),
+        };
+        // One result per action, and the page is taken BEFORE anything is decided, so a
+        // request asking about many actions does the work of the page it asked for rather
+        // than of the whole list.
+        let total = input.action_names.len();
+        let page: Vec<String> = input
+            .action_names
+            .iter()
+            .skip(resume_at)
+            .take(page_size)
+            .cloned()
+            .collect();
+        let results =
+            simulation::evaluate_page(&simulated, &page, &resources, reports_each_resource)
+                .await
+                .map_err(invalid_input)?;
+
+        let next = resume_at.saturating_add(results.len());
+        let is_truncated = next < total;
+        Ok(SimulateCustomPolicyOutput {
+            evaluation_results: Some(results),
+            is_truncated,
+            marker: is_truncated.then(|| {
+                crate::state::encode_marker(
+                    crate::state::MARKER_SCOPE_SIMULATION_RESULTS,
+                    &next.to_string(),
+                )
+            }),
+        })
     }
 }
+
+/// The modelled 400 refusal for a request this operation cannot decide from.
+fn invalid_input(message: String) -> SimulateCustomPolicyError {
+    SimulateCustomPolicyErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+    })
+    .into()
+}
+

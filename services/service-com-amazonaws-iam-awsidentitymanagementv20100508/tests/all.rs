@@ -61,6 +61,8 @@ mod credential_report_generation;
 mod credential_report_reads;
 #[path = "all/custom_policy_context_keys.rs"]
 mod custom_policy_context_keys;
+#[path = "all/custom_policy_simulation.rs"]
+mod custom_policy_simulation;
 #[path = "all/delegation_request_acceptance.rs"]
 mod delegation_request_acceptance;
 #[path = "all/delegation_request_association.rs"]

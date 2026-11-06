@@ -27,6 +27,7 @@ pub mod input_formats;
 pub mod member_forms;
 pub mod reported_services;
 pub mod role_templates;
+pub mod simulated_decisions;
 pub mod virtual_mfa_devices;
 mod managed_policy_catalog;
 pub use managed_policy_catalog::*;

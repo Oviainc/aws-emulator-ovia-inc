@@ -472,6 +472,9 @@ pub const GET_CONTEXT_KEYS_FOR_CUSTOM_POLICY: &str = "iam:GetContextKeysForCusto
 /// `iam:GetContextKeysForPrincipalPolicy`.
 pub const GET_CONTEXT_KEYS_FOR_PRINCIPAL_POLICY: &str = "iam:GetContextKeysForPrincipalPolicy";
 
+/// `iam:SimulateCustomPolicy`.
+pub const SIMULATE_CUSTOM_POLICY: &str = "iam:SimulateCustomPolicy";
+
 /// `iam:SimulatePrincipalPolicy`.
 pub const SIMULATE_PRINCIPAL_POLICY: &str = "iam:SimulatePrincipalPolicy";
 

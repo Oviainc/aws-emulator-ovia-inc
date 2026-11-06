@@ -197,6 +197,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The simulation itself — what the documents in force decide, the report it is answered
+// as and the bounds one request is admitted within — which `SimulateCustomPolicy` runs
+// too, so both operations decide alike and this file holds only what is this
+// operation's own: the principal whose policies are simulated.
+use crate::state::simulated_decisions as simulation;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -304,69 +310,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // Every supplied document has to be a policy document before anything is
-        // decided from it: the rule, and the fixed sentence each way of breaking it is
-        // refused with, are the shared ones every operation taking a policy document
-        // applies (`crate::state::policy_document_defect`), so the refusal carries
-        // neither the member that supplied the document nor anything read out of it.
+        // What every simulation request is admitted by, whichever of the two operations
+        // runs it: each document it supplies IS a policy document, the ceiling it
+        // simulates is a single one, each action it names carries its service, the
+        // scenario it declares carries the resources that scenario needs, and no axis of
+        // the work it asks for is past its bound
+        // (`crate::state::simulated_decisions::request_defect`).
         let supplied = input.policy_input_list.unwrap_or_default();
         let boundary = input.permissions_boundary_policy_input_list.unwrap_or_default();
-        let mut documents = supplied
-            .iter()
-            .chain(boundary.iter())
-            .chain(input.resource_policy.iter());
-        if let Some(defect) = documents.find_map(|document| {
-            crate::state::policy_document_defect(document)
+        if let Some(defect) = simulation::request_defect(&simulation::SimulationInput {
+            documents: &supplied,
+            boundary: &boundary,
+            // This operation models no SCP hierarchy: `OrderedOrganizationPolicyInputList`
+            // is `SimulateCustomPolicy`'s member alone.
+            organization_levels: &[],
+            resource_policy: input.resource_policy.as_deref(),
+            resource_arns: input.resource_arns.as_deref().unwrap_or_default(),
+            context_entries: input.context_entries.as_deref(),
+            action_names: &input.action_names,
+            resource_handling_option: input.resource_handling_option.as_deref(),
         }) {
-            return Err(invalid_input(defect.message().to_string()));
-        }
-        // "An IAM entity can only have one permissions boundary in effect at a time.
-        // You can input only one permissions boundary when you pass a policy to this
-        // operation."
-        if boundary.len() > 1 {
-            return Err(invalid_input(format!(
-                "Invalid value for PermissionsBoundaryPolicyInputList: only one \
-                 permissions boundary may be simulated, got {}",
-                boundary.len()
-            )));
-        }
-        // How much one request may ask to be decided is bounded, because the work is
-        // the PRODUCT of the actions, the resources and the documents it names: past
-        // either cap the request is refused rather than served, so a single call cannot
-        // make this handler do unbounded work.
-        for (member, named, cap) in [
-            ("PolicyInputList", supplied.len(), MAX_SIMULATED_DOCUMENTS),
-            (
-                "ResourceArns",
-                input.resource_arns.as_ref().map_or(0, Vec::len),
-                MAX_SIMULATED_RESOURCES,
-            ),
-            (
-                "ContextEntries",
-                supplied_context_values(input.context_entries.as_deref()),
-                MAX_SIMULATED_CONTEXT_VALUES,
-            ),
-        ] {
-            if named > cap {
-                return Err(invalid_input(format!(
-                    "Invalid value for {member}: at most {cap} may be simulated in one \
-                     request, got {named}"
-                )));
-            }
-        }
-
-        // "Each operation must include the service identifier, such as
-        // iam:CreateUser": an action name with no service prefix names no action, so
-        // nothing can be decided about it.
-        if let Some(action) = input
-            .action_names
-            .iter()
-            .find(|action| !names_a_service_action(action))
-        {
-            return Err(invalid_input(format!(
-                "Invalid Action name: {action} must name a service and an action, as in \
-                 iam:CreateUser"
-            )));
+            return Err(invalid_input(defect));
         }
 
         // An ARN that is not a user's, a group's or a role's names no principal whose
@@ -407,29 +371,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The page resumes strictly after the POSITION the marker names, exactly as
         // this crate's list operations do, so a token this service's encoding cannot
         // have produced is refused rather than read as the start of the results.
-        let resume_at = match &input.marker {
-            Some(marker) => {
-                match crate::state::decode_marker(
-                    crate::state::MARKER_SCOPE_SIMULATION_RESULTS,
-                    marker,
-                )
-                .and_then(|key| key.parse::<usize>().ok())
-                {
-                    Some(position) => position,
-                    None => {
-                        return Err(invalid_input(crate::state::INVALID_MARKER.to_string()))
-                    }
-                }
-            }
-            None => 0,
+        let Some(resume_at) = simulation::resume_position(input.marker.as_deref()) else {
+            return Err(invalid_input(crate::state::INVALID_MARKER.to_string()));
         };
-        // `maxItemsType` is range 1..1000 and the boundary validator has already
-        // refused anything outside it, so the only choice left here is the default for
-        // an absent `MaxItems`. `.max(1)` is what makes the cast lossless.
-        let page_size = input
-            .max_items
-            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
-            .max(1) as usize;
 
         // A read: the simulation reports what the stored policies decide and writes
         // nothing — simulating a call neither performs it nor records it. The lock is
@@ -499,7 +443,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     document.map(|document| (document, source_policy_id(&source)))
                 })
                 .chain(supplied.into_iter().enumerate().map(|(at, document)| {
-                    (document, format!("{SUPPLIED_POLICY_ID}.{}", at + 1))
+                    (
+                        document,
+                        format!("{}.{}", simulation::SUPPLIED_POLICY_ID, at + 1),
+                    )
                 }))
                 .unzip();
             (documents, sources, attached_boundary)
@@ -525,7 +472,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // That is what lets IAM's absent-key rule be applied to every key a document
         // tests, rather than only to the ones a real signed call would carry (see
         // `decide`).
-        let context = supplied_context(input.context_entries.as_deref());
+        let context = simulation::supplied_context(input.context_entries.as_deref());
 
         // "If this parameter is not provided, then the value defaults to * (all
         // resources). Each API in the ActionNames parameter is evaluated for each
@@ -533,19 +480,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let named_resources = input.resource_arns.unwrap_or_default();
         let reports_each_resource = !named_resources.is_empty();
         let resources: Vec<String> = if named_resources.is_empty() {
-            vec![ANY_RESOURCE.to_string()]
+            vec![simulation::ANY_RESOURCE.to_string()]
         } else {
             named_resources
         };
         // How many actions this page decides: the request's `MaxItems`, narrowed so the
-        // page's (action, resource) pairs stay within [`MAX_EVALUATIONS_PER_PAGE`].
-        // Answering fewer results than asked for is what the model provides for — "IAM
-        // might return fewer than the MaxItems number of results even when there are
-        // more results available. In that case, the IsTruncated response element
-        // returns true, and Marker contains a value to include in the subsequent call"
-        // — so the rest of the actions are reported on the next page rather than
-        // dropped, and neither the work nor the response grows with the product.
-        let page_size = page_size.min((MAX_EVALUATIONS_PER_PAGE / resources.len()).max(1));
+        // page's (action, resource) pairs stay within the bound both simulation
+        // operations answer within (`crate::state::simulated_decisions::page_size`).
+        let page_size = simulation::page_size(input.max_items, resources.len());
 
         let prepared = ::service_common::iam_authorization::prepare_documents(&documents);
         let prepared_boundary = ::service_common::iam_authorization::prepare_documents(&boundary);
@@ -579,99 +521,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         denying_principals.extend(::service_common::iam_authorization::account_principals(
             &caller_arn,
         ));
-        let simulated = Simulated {
+        let simulated = simulation::Simulated {
             documents: &prepared,
             sources: &sources,
             boundary: &prepared_boundary,
-            no_boundary: boundary.is_empty(),
+            // This operation takes no SCP hierarchy, so no service control policy takes
+            // part in the decision and nothing about an organization is reported.
+            organization_levels: &[],
             resource_policy: prepared_resource_policy.as_ref(),
             granting_principals: &granting_principals,
             denying_principals: &denying_principals,
             context: &context,
+            // "An ARN representing the Amazon Web Services account ID that specifies the
+            // owner of any simulated resource that does not identify its owner in the
+            // resource ARN" (`ResourceOwner`): a simulation whose resources another
+            // account owns needs both sides to allow.
+            cross_account: simulation::cross_account(input.resource_owner.as_deref(), &caller_arn),
         };
         // One result per action, and the page is taken BEFORE anything is decided, so a
         // request asking about many actions does the work of the page it asked for
         // rather than of the whole list.
         let total = input.action_names.len();
-        let paged = input
+        let page: Vec<String> = input
             .action_names
             .iter()
             .skip(resume_at)
-            .take(page_size);
-        let mut results: Vec<EvaluationResult> = Vec::new();
-        let mut decided_pairs = 0usize;
-        for action in paged {
-            let mut per_resource: Vec<ResourceSpecificResult> = Vec::new();
-            for resource in &resources {
-                per_resource.push(decide(&simulated, action, resource));
-                decided_pairs += 1;
-                // The evaluation is synchronous work inside an async handler, so it
-                // hands the executor back periodically: one simulation never holds a
-                // worker for its whole run, whatever this page was asked to decide.
-                if decided_pairs.is_multiple_of(EVALUATIONS_PER_YIELD) {
-                    ::tokio::task::yield_now().await;
-                }
-            }
-            // "A list of context keys that are required by the included input policies
-            // but that were not provided by one of the input parameters": the keys the
-            // DECISION needed a value for and the request carried none, which each
-            // resource's own result already reports for its own pair ([`decide`]) — a
-            // pair reaches the statements its action and resource match, so two pairs can
-            // need different keys. The action's own result reports the union of its
-            // resources', the way it reports the union of their matched statements; the
-            // per-resource lists are reported only where the response carries the
-            // per-resource results at all. "This list is used when the resource in a
-            // simulation is '*' … if you include a list of resources, then any missing
-            // context values are instead included under the ResourceSpecificResults
-            // section."
-            let missing = folded_keys(
-                per_resource
-                    .iter()
-                    .flat_map(|result| result.missing_context_values.iter().flatten().cloned()),
-            );
-            if !reports_each_resource {
-                for result in &mut per_resource {
-                    result.missing_context_values = None;
-                }
-            }
-            // The list is reported on every result the page carries, so its length is a
-            // factor of the response's size: past the bound the request is refused rather
-            // than answered with a report nothing bounds. Truncating the list instead
-            // would be worse — a short list would read as "these are the only keys
-            // missing".
-            if missing.len() > MAX_SIMULATED_CONTEXT_KEYS {
-                return Err(invalid_input(format!(
-                    "Invalid value for PolicyInputList: the policies in force test more \
-                     than {MAX_SIMULATED_CONTEXT_KEYS} context keys the request supplied \
-                     no value for, and at most that many may be reported in one simulation"
-                )));
-            }
-            let first = per_resource.first().cloned().unwrap_or_default();
-            // "In the top-level result, this field contains the union of matched
-            // statements across all requested resources" — so the statements the
-            // action's own result reports are every resource's, each named once.
-            let mut matched: Vec<Statement> = Vec::new();
-            for result in &per_resource {
-                for entry in result.matched_statements.iter().flatten() {
-                    report_once(&mut matched, entry.clone());
-                }
-            }
-            results.push(EvaluationResult {
-                eval_action_name: action.clone(),
-                eval_resource_name: Some(first.eval_resource_name.clone()),
-                eval_decision: most_restrictive(&per_resource),
-                missing_context_values: (!missing.is_empty()).then_some(missing),
-                permissions_boundary_decision_detail: boundary_detail(&per_resource),
-                resource_specific_results: reports_each_resource.then_some(per_resource),
-                matched_statements: Some(matched),
-                // This emulator models no organization, so nothing about one is
-                // reported, and `EvalDecisionDetails` is for a decision taken from
-                // several sources (an organization policy, a boundary), none of which
-                // applies here.
-                organizations_decision_detail: None,
-                eval_decision_details: None,
-            });
-        }
+            .take(page_size)
+            .cloned()
+            .collect();
+        let results =
+            simulation::evaluate_page(&simulated, &page, &resources, reports_each_resource)
+                .await
+                .map_err(invalid_input)?;
 
         let next = resume_at.saturating_add(results.len());
         let is_truncated = next < total;
@@ -688,66 +569,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The resource a simulation is about when the request names none: "if this parameter
-/// is not provided, then the value defaults to * (all resources)"
-/// (`SimulatePrincipalPolicy$ResourceArns`).
-const ANY_RESOURCE: &str = "*";
-
-/// How many resources one request may ask to have decided.
-///
-/// The model bounds the number of RESULTS a page carries (`maxItemsType`, range
-/// 1..1000) but puts no bound on `ResourceArns`, and the work this operation does is
-/// the PRODUCT of the actions, the resources and the documents named — so the same
-/// ceiling is applied to the resource axis, and a request past it is refused rather
-/// than served. Nothing is silently dropped: the refusal says what the bound is.
-const MAX_SIMULATED_RESOURCES: usize = 1_000;
-
-/// How many extra policy documents one request may supply in `PolicyInputList`, for
-/// the same reason [`MAX_SIMULATED_RESOURCES`] exists: the documents are the third
-/// factor of that product, each may be 131,072 characters, and every one of them is
-/// walked for every pair the page decides.
-const MAX_SIMULATED_DOCUMENTS: usize = 10;
-
-/// How many (action, resource) pairs one PAGE may decide. The page's action count is
-/// narrowed so this holds, which bounds both the work the request does and the size of
-/// the response it gets back; the actions that do not fit are reported on the next
-/// page.
-const MAX_EVALUATIONS_PER_PAGE: usize = 1_000;
-
-/// How many pairs are decided between two yields back to the async executor, so a
-/// simulation cannot hold a worker thread for its whole run.
-const EVALUATIONS_PER_YIELD: usize = 64;
-
-/// How many context keys one simulation may report as missing a value.
-///
-/// The list is reported on every result the page carries, so its length multiplies the
-/// response's size; the keys come from the conditions the deciding documents carry, which
-/// the request itself can supply. Past this bound the request is refused rather than
-/// answered.
-const MAX_SIMULATED_CONTEXT_KEYS: usize = 100;
-
-/// How many condition values one request may supply in `ContextEntries` — counted over
-/// every value of every entry, since each is one value the decision may test against.
-/// Bounded for the same reason the other axes are: the keys the documents test are
-/// looked up among them.
-const MAX_SIMULATED_CONTEXT_VALUES: usize = 1_000;
-
 /// The modelled 400 refusal for a request this operation cannot decide from.
 fn invalid_input(message: String) -> SimulatePrincipalPolicyError {
     SimulatePrincipalPolicyErrorModeled::InvalidInputException(InvalidInputException {
         message: Some(message),
     })
     .into()
-}
-
-/// Whether `action` names a service and an action within it, the form
-/// `ActionNames` requires ("each operation must include the service identifier, such
-/// as iam:CreateUser").
-fn names_a_service_action(action: &str) -> bool {
-    match action.split_once(':') {
-        Some((service, operation)) => !service.is_empty() && !operation.is_empty(),
-        None => false,
-    }
 }
 
 /// Whether a `PolicyExclusionList` entry names the policy `source` came from.
@@ -786,217 +613,6 @@ fn excluded(source: &crate::state::PolicySource, exclusions: &[PolicyIdentifier]
     })
 }
 
-/// The condition values a request supplies, as the shared evaluator takes them: one
-/// `(key, value)` pair per value, since a key tested against any of its values holds.
-fn supplied_context(entries: Option<&[ContextEntry]>) -> Vec<(String, String)> {
-    let mut context = Vec::new();
-    for entry in entries.unwrap_or_default() {
-        let Some(key) = entry.context_key_name.as_deref() else {
-            continue;
-        };
-        for value in entry.context_key_values.iter().flatten() {
-            context.push((key.to_string(), value.clone()));
-        }
-    }
-    context
-}
-
-/// How many condition values `entries` carries in all — the measure
-/// [`MAX_SIMULATED_CONTEXT_VALUES`] is taken against, counted from the request's own
-/// lists before anything is built from them.
-fn supplied_context_values(entries: Option<&[ContextEntry]>) -> usize {
-    entries
-        .unwrap_or_default()
-        .iter()
-        .map(|entry| entry.context_key_values.as_ref().map_or(0, Vec::len))
-        .sum()
-}
-
-/// Everything one simulation decides every `(action, resource)` pair from: the documents
-/// in force, the identity the simulation is of, and the condition values the request
-/// carries. Read once per request rather than per pair.
-struct Simulated<'a> {
-    /// The identity-based documents in force: the simulated principal's own, then the
-    /// ones the request supplied.
-    documents: &'a [::service_common::iam_authorization::PreparedDocument],
-    /// How the response names each of those documents, one per entry of
-    /// [`Self::documents`] ([`source_policy_id`]).
-    sources: &'a [String],
-    /// The simulated permissions boundary's documents: the one the request supplied, or
-    /// the one in force on the simulated entity when it supplied none.
-    boundary: &'a [::service_common::iam_authorization::PreparedDocument],
-    /// Whether no permissions boundary took part in the simulation at all.
-    no_boundary: bool,
-    /// The resource-based policy the request supplied, when it supplied one.
-    resource_policy: Option<&'a ::service_common::iam_authorization::PreparedDocument>,
-    /// The spelling of the simulated caller a resource-based statement GRANTS to.
-    granting_principals: &'a [String],
-    /// The spellings a resource-based statement DENIES: the caller's own and its
-    /// account's (see the handler).
-    denying_principals: &'a [String],
-    /// The condition values the request supplied.
-    context: &'a [(String, String)],
-}
-
-/// What the documents in force decide about one `(action, resource)` pair, and which
-/// statements decided it.
-///
-/// The decision is the shared evaluation's ([`service_common::iam_authorization`]):
-/// the identity-based documents and, when the request supplies one, the resource-based
-/// policy — evaluated against the simulated caller, so a statement whose `Principal`
-/// element names that identity is one the simulation can match. A simulated permissions
-/// boundary bounds the result the way IAM's does — a request the boundary does not allow
-/// is denied, and the boundary can only take permission away, never grant it.
-///
-/// The request is declared to carry its WHOLE condition context, because a simulation's
-/// context is exactly the entries its caller supplied: nothing else can put a value in it.
-/// So IAM's absent-key rule decides a clause over a key the request left out — a positive
-/// comparison does not hold, while a negated one, an `IfExists` spelling and
-/// `Null: {key: true}` do — rather than leaving the statement undecided, and
-/// `MissingContextValues` is what the evaluation says it needed a value for and did not
-/// get.
-fn decide(simulated: &Simulated<'_>, action: &str, resource: &str) -> ResourceSpecificResult {
-    use ::service_common::iam_authorization as iam;
-
-    let granting = iam::Request::new(action, resource, simulated.granting_principals)
-        .with_context(simulated.context)
-        .with_complete_context();
-    let identity = iam::identity_outcome_prepared(simulated.documents, &granting);
-    let from_resource = match simulated.resource_policy {
-        Some(document) => {
-            let denying = iam::Request::new(action, resource, simulated.denying_principals)
-                .with_context(simulated.context)
-                .with_complete_context();
-            let denied = iam::resource_outcome_prepared(document, &denying);
-            if denied.decision == iam::Decision::Denied {
-                denied
-            } else {
-                iam::resource_outcome_prepared(document, &granting)
-            }
-        }
-        None => iam::Outcome::default(),
-    };
-    let decision =
-        crate::state::authorization::decision_name(identity.decision, from_resource.decision);
-
-    // "The permissions boundary sets the maximum permissions that the entity can
-    // have": a request outside it is denied even where the identity policies allow it.
-    let from_boundary = iam::identity_outcome_prepared(simulated.boundary, &granting);
-    let allowed_by_boundary = simulated.no_boundary
-        || iam::is_allowed(from_boundary.decision, iam::Decision::NotStated);
-    let decision = if allowed_by_boundary
-        || decision == crate::state::authorization::DECISION_EXPLICIT_DENY
-    {
-        decision
-    } else {
-        crate::state::authorization::DECISION_IMPLICIT_DENY
-    };
-
-    // "A list of the statements in the input policies that determine the result for this
-    // part of the simulation ... Only statements that contributed to the reported
-    // decision are included": the statements that DENIED when the reported decision is
-    // the explicit deny, the ones that GRANTED when it is the allow, and none at all for
-    // an implicit deny — nothing stated it, including one a permissions boundary caused,
-    // where the grant the boundary took away no longer determines the result.
-    let contributing = if decision == crate::state::authorization::DECISION_EXPLICIT_DENY {
-        Some(iam::Decision::Denied)
-    } else if decision == crate::state::authorization::DECISION_ALLOWED {
-        Some(iam::Decision::Allowed)
-    } else {
-        None
-    };
-    let mut matched: Vec<Statement> = Vec::new();
-    if let Some(contributing) = contributing {
-        if identity.decision == contributing {
-            for entry in &identity.matched {
-                report_once(
-                    &mut matched,
-                    statement_entry(
-                        simulated.sources.get(entry.document).cloned(),
-                        IDENTITY_POLICY_SOURCE,
-                    ),
-                );
-            }
-        }
-        if from_resource.decision == contributing && !from_resource.matched.is_empty() {
-            report_once(
-                &mut matched,
-                statement_entry(Some(RESOURCE_POLICY_ID.to_string()), RESOURCE_POLICY_SOURCE),
-            );
-        }
-    }
-
-    ResourceSpecificResult {
-        eval_resource_name: resource.to_string(),
-        eval_resource_decision: decision.to_string(),
-        // The keys THIS pair's decision needed a value for and the request supplied
-        // none: every document that took part in it is asked, since a condition in any
-        // of them is one the simulation needed the value for. Each of the three answers
-        // is already bounded by the evaluation
-        // (`service_common::iam_authorization::MAX_REQUIRED_CONTEXT_KEYS`), and the list
-        // kept per pair stops one key past the bound this operation reports under, so
-        // the page's retention is its pairs times that bound rather than times what the
-        // documents carry; the handler refuses past it.
-        missing_context_values: {
-            let missing = folded_keys(
-                identity
-                    .required_context_keys
-                    .iter()
-                    .chain(&from_resource.required_context_keys)
-                    .chain(&from_boundary.required_context_keys)
-                    .take(MAX_SIMULATED_CONTEXT_KEYS + 1)
-                    .cloned(),
-            );
-            (!missing.is_empty()).then_some(missing)
-        },
-        matched_statements: Some(matched),
-        eval_decision_details: None,
-        permissions_boundary_decision_detail: (!simulated.no_boundary).then_some(
-            PermissionsBoundaryDecisionDetail {
-                allowed_by_permissions_boundary: allowed_by_boundary,
-            },
-        ),
-    }
-}
-
-/// `keys` folded to one entry per context key and ordered, the way every report of a set
-/// of context keys this service answers with is ordered
-/// ([`crate::state::context_keys_in_policies`]): names are not distinguished by case, so
-/// the folded name is the identity and the first spelling seen is the one reported.
-fn folded_keys<I: IntoIterator<Item = String>>(keys: I) -> Vec<String> {
-    let mut folded: ::std::collections::BTreeMap<String, String> =
-        ::std::collections::BTreeMap::new();
-    for key in keys {
-        folded
-            .entry(key.to_ascii_lowercase())
-            .or_insert_with(|| key.clone());
-    }
-    folded.into_values().collect()
-}
-
-/// How a `MatchedStatements` entry names an identity-based policy in force on the
-/// simulated principal (`Statement$SourcePolicyType`, "the type of the policy").
-///
-/// The two kinds of document a simulation decides from are the ones the operation takes:
-/// the identity-based policies (the principal's own and the ones supplied in
-/// `PolicyInputList`) and the single resource-based policy supplied in `ResourcePolicy` —
-/// which is the discriminator the member exists to give, "which policy type is
-/// responsible for an allow or deny decision".
-const IDENTITY_POLICY_SOURCE: &str = "IAM Policy";
-
-/// How a `MatchedStatements` entry names the resource-based policy the request supplied.
-/// See [`IDENTITY_POLICY_SOURCE`].
-const RESOURCE_POLICY_SOURCE: &str = "Resource Policy";
-
-/// How a `MatchedStatements` entry identifies the resource-based policy the request
-/// supplied (`Statement$SourcePolicyId`, "the identifier of the policy that was provided
-/// as an input"): the input member it arrived in, of which there is exactly one.
-const RESOURCE_POLICY_ID: &str = "ResourcePolicy";
-
-/// How a `MatchedStatements` entry identifies a document the request supplied in
-/// `PolicyInputList`: that member and the document's position in it, counted from one.
-const SUPPLIED_POLICY_ID: &str = "PolicyInputList";
-
 /// How a `MatchedStatements` entry identifies one identity-based policy in force on the
 /// simulated principal: an inline policy by its own name, a managed policy by its
 /// friendly name — the names those policies were put and created under, so a caller
@@ -1012,94 +628,3 @@ fn source_policy_id(source: &crate::state::PolicySource) -> String {
     }
 }
 
-/// The decision the ACTION's own result reports, from the decisions its resources were
-/// each decided.
-///
-/// "The top-level `EvalDecision` reflects the most restrictive decision across all
-/// resources (for example, if any resource produces `explicitDeny`, the top-level
-/// decision is `explicitDeny`)" (`EvaluationResult`), so the member agrees with the
-/// statements the same result reports as having determined it — the union across those
-/// resources — rather than describing whichever resource the request happened to name
-/// first. A request that named no resource is decided about one resource, `*`, so the
-/// aggregate is that one decision.
-///
-/// The order is IAM's own: an explicit deny is the most restrictive outcome, then the
-/// implicit deny, then the allow ([`restrictiveness`]).
-fn most_restrictive(per_resource: &[ResourceSpecificResult]) -> String {
-    per_resource
-        .iter()
-        .map(|result| result.eval_resource_decision.as_str())
-        .max_by_key(|decision| restrictiveness(decision))
-        // Nothing to aggregate is nothing stated about the request, which is the
-        // implicit deny; the handler always decides at least one resource, so this is
-        // the value of a decision no resource was asked for rather than a fallback the
-        // response is built from.
-        .unwrap_or(crate::state::authorization::DECISION_IMPLICIT_DENY)
-        .to_string()
-}
-
-/// How restrictive one `PolicyEvaluationDecisionType` value is, for [`most_restrictive`]
-/// to take the maximum of: the explicit deny withholds the most, the allow the least.
-fn restrictiveness(decision: &str) -> u8 {
-    if decision == crate::state::authorization::DECISION_EXPLICIT_DENY {
-        2
-    } else if decision == crate::state::authorization::DECISION_ALLOWED {
-        0
-    } else {
-        1
-    }
-}
-
-/// The permissions-boundary detail the ACTION's own result reports, from the details its
-/// resources were each decided with.
-///
-/// Aggregated the way the decision beside it is: the boundary allowed the action only
-/// where it allowed it on EVERY resource the request asked about, since one resource the
-/// boundary withheld is a resource the entity may not act on. Absent when no permissions
-/// boundary took part in the simulation at all, which is when no resource carries the
-/// detail either.
-fn boundary_detail(
-    per_resource: &[ResourceSpecificResult],
-) -> Option<PermissionsBoundaryDecisionDetail> {
-    per_resource
-        .iter()
-        .filter_map(|result| result.permissions_boundary_decision_detail.as_ref())
-        .map(|detail| detail.allowed_by_permissions_boundary)
-        .reduce(|allowed_everywhere, allowed| allowed_everywhere && allowed)
-        .map(
-            |allowed_by_permissions_boundary| PermissionsBoundaryDecisionDetail {
-                allowed_by_permissions_boundary,
-            },
-        )
-}
-
-/// One `MatchedStatements` entry: which policy a contributing statement is in, and of
-/// which kind.
-///
-/// `StartPosition`/`EndPosition` are "the row and column of the beginning/end of the
-/// Statement in an IAM policy", which nothing here measures — reporting a position that
-/// was not measured would be worse than reporting none, so they stay absent, and the
-/// source identification they are reported beside does not depend on them.
-fn statement_entry(source_policy_id: Option<String>, source_policy_type: &str) -> Statement {
-    Statement {
-        source_policy_id,
-        source_policy_type: Some(source_policy_type.to_string()),
-        start_position: None,
-        end_position: None,
-    }
-}
-
-/// Append `entry` to `into` unless the same policy is already named there.
-///
-/// Without the statement positions, two contributing statements of ONE policy are the
-/// same entry — the policy they are in and its kind — and the member is a list of what
-/// determined the result, so naming that policy twice would report a distinction the
-/// response does not carry.
-fn report_once(into: &mut Vec<Statement>, entry: Statement) {
-    if !into.iter().any(|held| {
-        held.source_policy_id == entry.source_policy_id
-            && held.source_policy_type == entry.source_policy_type
-    }) {
-        into.push(entry);
-    }
-}
