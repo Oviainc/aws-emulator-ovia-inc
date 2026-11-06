@@ -787,9 +787,11 @@ impl RecipeRecord {
     /// of sits at `0.1` ([`INITIAL_RECIPE_VERSION`]) — major 0, nothing published — and
     /// a recipe whose newest published version is major X carries its draft at `X.1`.
     /// So an operation that changes which versions this recipe holds published ends by
-    /// calling this — `publish` does, and a delete of a published version owes the same
-    /// — and the draft keeps its definition and its audit across the renumber: it is
-    /// the same draft, named for the major it now revises.
+    /// calling this. [`RecipeRecord::publish`] is the one that does today; the rule binds
+    /// any later handler that removes a published version too, since the draft's number
+    /// is read off the history rather than stored independently of it. The draft keeps
+    /// its definition and its audit across the renumber: it is the same draft, named for
+    /// the major it now revises.
     fn renumber_working(&mut self) {
         // The HIGHEST published major, which is the same derivation
         // [`RecipeRecord::next_published_version`] reads the history with, so the two

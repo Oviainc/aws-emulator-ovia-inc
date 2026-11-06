@@ -464,6 +464,106 @@ async fn an_update_leaves_every_published_version_alone() {
     }
 }
 
+/// Over a history of alternating updates and publishes, the draft always carries the
+/// first minor revision on top of the highest published major version, and each frozen
+/// version holds the definition the update before its publish wrote.
+///
+/// The rows differ along how many (update, publish) rounds the recipe has been through —
+/// the axis the numbering rule generalises over, which the cases above exercise only at
+/// one and two publishes.
+#[tokio::test]
+async fn the_draft_revises_the_highest_published_major_however_long_the_history() {
+    let emulator = Emulator::new();
+    for rounds in [1usize, 2, 3, 5] {
+        let case = format!("{rounds} update-then-publish rounds");
+        let name = format!("long-history-{rounds}");
+        assert_eq!(
+            create_recipe(
+                &emulator,
+                &name,
+                Some("as created"),
+                &json!([{"Action": {"Operation": "DELETE"}}]),
+                None,
+            )
+            .await
+            .status,
+            200,
+            "case {case:?}: the recipe under test must be created"
+        );
+        assert_eq!(
+            describe_recipe(&emulator, &name, Some(LATEST_WORKING))
+                .await
+                .text("RecipeVersion"),
+            WORKING_VERSION,
+            "case {case:?}: a recipe nothing is published of carries its draft at major 0"
+        );
+
+        for round in 1..=rounds {
+            // Each round writes a definition of its own onto the draft, so the version
+            // the publish after it freezes is distinguishable from every other.
+            let steps =
+                json!([{"Action": {"Operation": "UPPER_CASE", "Parameters": {"sourceColumn": format!("c{round}")}}}]);
+            let body = format!("the draft of round {round}");
+            let updated = update_recipe(&emulator, &name, Some(&body), Some(&steps)).await;
+            assert_eq!(
+                updated.status, 200,
+                "case {case:?}: round {round}'s update must answer 200, got {} {:?}",
+                updated.status, updated.body
+            );
+            assert_eq!(
+                publish_recipe(&emulator, &name, None).await.status,
+                200,
+                "case {case:?}: round {round}'s publish must answer 200"
+            );
+
+            // The publish freezes the round's definition at the next whole major, and
+            // leaves the draft as that major's first minor revision.
+            let frozen_version = format!("{round}.0");
+            let frozen = describe_recipe(&emulator, &name, Some(&frozen_version)).await;
+            assert_eq!(
+                frozen.member("Steps"),
+                steps,
+                "case {case:?}: version {frozen_version} must hold round {round}'s definition, \
+                 got {:?}",
+                frozen.body["Steps"]
+            );
+            let draft = describe_recipe(&emulator, &name, Some(LATEST_WORKING)).await;
+            assert_eq!(
+                draft.text("RecipeVersion"),
+                format!("{round}.1"),
+                "case {case:?}: after round {round}'s publish the draft revises major {round}, \
+                 got {:?}",
+                draft.body["RecipeVersion"]
+            );
+            assert_eq!(
+                draft.member("Steps"),
+                steps,
+                "case {case:?}: the draft keeps round {round}'s definition across the publish, \
+                 got {:?}",
+                draft.body["Steps"]
+            );
+        }
+
+        // Every version the history froze is still addressable afterwards, each with the
+        // definition of the round that wrote it: the publishes added beside one another.
+        for round in 1..=rounds {
+            let version = format!("{round}.0");
+            let held = describe_recipe(&emulator, &name, Some(&version)).await;
+            assert_eq!(
+                held.status, 200,
+                "case {case:?}: version {version} must still resolve, got {} {:?}",
+                held.status, held.body
+            );
+            assert_eq!(
+                held.text("Description"),
+                format!("the draft of round {round}"),
+                "case {case:?}: version {version} must keep round {round}'s body, got {:?}",
+                held.body["Description"]
+            );
+        }
+    }
+}
+
 /// An update of a recipe this account holds none of is 404 `ResourceNotFoundException`
 /// naming the recipe that was looked up, and writes nothing.
 #[tokio::test]
