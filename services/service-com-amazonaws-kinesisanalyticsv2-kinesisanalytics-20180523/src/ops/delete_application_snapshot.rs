@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteApplicationSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteApplicationSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: removes the stored snapshot the caller names from the application it
+//! belongs to, so the snapshot readers no longer report it. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteApplicationSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request that identifies no stored snapshot removes nothing: an application this
+//! service holds no record of is the parameter violation the snapshot operations give
+//! that miss, a snapshot name the application holds no record of is the modelled
+//! `ResourceNotFoundException`, and a `SnapshotCreationTimestamp` that is not the stored
+//! one is refused in the wording this crate gives the same identity check on
+//! `DeleteApplication` — the crate's convention for that rule, since no recorded response
+//! of this operation words it.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +153,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteApplicationSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteApplicationSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ApplicationName`'s and `SnapshotName`'s length and pattern are refused at the
+        // boundary with HTTP 400 before this handler runs, and a
+        // `SnapshotCreationTimestamp` of any JSON class other than the number this
+        // protocol carries a timestamp as is refused by the deserializer.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteApplicationSnapshotErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            "this service is not mounted on a stateful engine, so no \
+                             snapshot can be deleted"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // Materialising the status changes the clock already owed this application and its
+        // snapshots is the only write made before the delete itself, so a snapshot whose
+        // READY was due is deleted as the READY snapshot a reader would have reported.
+        store.settle_named(&input.application_name);
+
+        // An application the service holds no record of is not a valid argument to delete a
+        // snapshot of — the refusal the snapshot operations give an application miss,
+        // stated over the account the name was resolved in — while a snapshot miss is
+        // about the snapshot itself, below.
+        let Some(application) = store.applications.get_mut(&input.application_name) else {
+            return Err(
+                DeleteApplicationSnapshotErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(crate::state::missing_application_in_account_message(
+                            &input.application_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A snapshot the application holds no record of cannot be deleted — the same
+        // miss, in the same sentence, as the reader of one snapshot by name reports.
+        let Some(snapshot) = application.snapshots.get(&input.snapshot_name) else {
+            return Err(
+                DeleteApplicationSnapshotErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_snapshot_message(
+                            &input.snapshot_name,
+                            &input.application_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `SnapshotCreationTimestamp` is the caller's proof that it is deleting the
+        // snapshot it last read — the model documents it as the creation timestamp of the
+        // snapshot to delete, retrieved from one of the snapshot readers — so a value that
+        // does not identify the stored snapshot is refused rather than ignored, the same
+        // rule `DeleteApplication` applies to `CreateTimestamp`. Timestamps are stored and
+        // reported at whole-second resolution, so the comparison is on the unit the wire
+        // carries.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteApplicationSnapshot"))
+        // The sentence states the value submitted and the snapshot and application it was
+        // checked against, all read from the request and the store. Its fixed text follows
+        // the wording this crate already gives the same refusal on `DeleteApplication`, as
+        // no recorded response of this operation words it: one convention for one rule,
+        // pending evidence of AWS's own sentence for this operation.
+        if snapshot.creation_timestamp.secs() != input.snapshot_creation_timestamp.secs() {
+            return Err(
+                DeleteApplicationSnapshotErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(format!(
+                            "SnapshotCreationTimestamp {} does not match the creation \
+                             timestamp of snapshot {} for application {}",
+                            input.snapshot_creation_timestamp.secs(),
+                            input.snapshot_name,
+                            input.application_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        application.snapshots.remove(&input.snapshot_name);
+        Ok(DeleteApplicationSnapshotOutput {})
     }
 }

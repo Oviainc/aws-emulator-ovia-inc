@@ -159,11 +159,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the clock already owed this application and its snapshots.
         store.settle_named(&input.application_name);
 
+        // This operation does not report an absent application the way the application
+        // readers do: the application named is not a valid argument to describe a snapshot
+        // of, and the sentence states the account the name was resolved in.
         let Some(application) = store.applications.get(&input.application_name) else {
             return Err(
-                DescribeApplicationSnapshotErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::missing_application_message(
+                DescribeApplicationSnapshotErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(crate::state::missing_application_in_account_message(
                             &input.application_name,
                         )),
                     },

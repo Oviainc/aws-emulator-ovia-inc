@@ -172,14 +172,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_named(&input.application_name);
 
         // This operation models no `ResourceNotFoundException`, so a name it holds no
-        // application for is reported the way the other snapshot operation without that
-        // error reports it: the application named is not a valid argument to list the
-        // snapshots of.
+        // application for is reported the way the other snapshot operations report it: the
+        // application named is not a valid argument to list the snapshots of, stated over
+        // the account the name was resolved in.
         let Some(application) = store.applications.get(&input.application_name) else {
             return Err(
                 ListApplicationSnapshotsErrorModeled::InvalidArgumentException(
                     InvalidArgumentException {
-                        message: Some(crate::state::missing_application_message(
+                        message: Some(crate::state::missing_application_in_account_message(
                             &input.application_name,
                         )),
                     },

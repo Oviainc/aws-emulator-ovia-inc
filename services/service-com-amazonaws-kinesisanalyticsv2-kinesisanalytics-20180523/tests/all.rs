@@ -29,6 +29,8 @@ mod modeled_client_errors;
 mod ops_name_bindings;
 #[path = "all/scratch.rs"]
 mod scratch;
+#[path = "all/snapshot_deletion.rs"]
+mod snapshot_deletion;
 #[path = "all/sql_input_and_configuration_defaults.rs"]
 mod sql_input_and_configuration_defaults;
 #[path = "all/state_roundtrip.rs"]

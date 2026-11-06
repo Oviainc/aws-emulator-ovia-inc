@@ -7,7 +7,8 @@
 //! `ListApplications`, `StartApplication`, `StopApplication`, `UpdateApplication` and
 //! `DeleteApplication` all read or mutate THIS struct — nothing is echoed from a request
 //! or canned. `CreateApplicationSnapshot` writes a [`Snapshot`] onto the application it
-//! names and `DescribeApplicationSnapshot` reads it back from there.
+//! names, `DescribeApplicationSnapshot` and `ListApplicationSnapshots` read it back from
+//! there and `DeleteApplicationSnapshot` removes it.
 //!
 //! Beside the records themselves this module owns the two projections every reader
 //! needs ([`Application::detail`], [`Application::summary`]), the per-version records a
@@ -646,17 +647,19 @@ impl Application {
                     });
                 }
                 // The in-app stream names are one per unit of input parallelism, named
-                // after the prefix, so they follow both wherever either moves.
-                described.in_app_stream_names = described.name_prefix.as_deref().and_then(|prefix| {
-                    in_app_stream_names(
-                        prefix,
-                        described
-                            .input_parallelism
-                            .as_ref()
-                            .and_then(|parallelism| parallelism.count)
-                            .unwrap_or(1),
-                    )
-                });
+                // after the prefix, so they follow both wherever either moves. The count
+                // reaches here from the request, so it is bounded to the range the model
+                // admits BEFORE it sizes the list it is about to derive.
+                let stream_count = bounded_input_parallelism(
+                    described
+                        .input_parallelism
+                        .as_ref()
+                        .and_then(|parallelism| parallelism.count),
+                );
+                described.in_app_stream_names = described
+                    .name_prefix
+                    .as_deref()
+                    .and_then(|prefix| in_app_stream_names(prefix, stream_count));
                 if let Some(processing) = input.input_processing_configuration_update.as_ref() {
                     described.input_processing_configuration_description =
                         Some(InputProcessingConfigurationDescription {
@@ -1172,13 +1175,13 @@ impl ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State {
         InputDescription {
             input_id: Some(self.mint_id("Input")),
             name_prefix: Some(input.name_prefix.clone()),
+            // The count comes from the request, so it is bounded to the modelled range
+            // before it sizes the name list derived from it.
             in_app_stream_names: in_app_stream_names(
                 &input.name_prefix,
-                input
-                    .input_parallelism
-                    .as_ref()
-                    .and_then(|p| p.count)
-                    .unwrap_or(1),
+                bounded_input_parallelism(
+                    input.input_parallelism.as_ref().and_then(|p| p.count),
+                ),
             ),
             input_processing_configuration_description: input
                 .input_processing_configuration
@@ -1783,6 +1786,22 @@ pub fn missing_application_message(name: &str) -> String {
     format!("Application '{name}' does not exist.")
 }
 
+/// How the SNAPSHOT operations word the same lookup miss: the name the caller asked for and
+/// the account the lookup was made in, which is the emulator's own.
+///
+/// These operations do not report an application miss the way the application readers do —
+/// they refuse it as a parameter that is not a valid argument, and state the account the
+/// name was resolved in, because a snapshot request is resolved against the snapshots of
+/// one application in one account. One wording for every snapshot operation that looks an
+/// application up by name, so two of them cannot report the same absent application
+/// differently.
+pub fn missing_application_in_account_message(name: &str) -> String {
+    format!(
+        "Application '{name}' does not exist under account '{}'.",
+        ::engine::emulator_account_id()
+    )
+}
+
 /// How this service words a create refused because an application of that name is already
 /// stored: the SAME sentence shape a lookup miss uses
 /// ([`missing_application_message`]) — the resource the request named, quoted, then what
@@ -2060,16 +2079,17 @@ fn vpc_id_for(subnet_ids: &[String]) -> String {
 /// The in-app stream names an SQL input is exposed under: one per unit of input
 /// parallelism, named `<NamePrefix>_NNN`.
 ///
-/// `count` reaches here from the request's `InputParallelism$Count`, so it SIZES A LOOP:
-/// it is clamped to [`MAX_INPUT_PARALLELISM`] before anything is allocated, so no
-/// request-supplied integer can drive an unbounded allocation loop even if the boundary
-/// range check that refuses it ever stops running.
+/// `count` reaches here already bounded by [`bounded_input_parallelism`], and SIZES A
+/// LOOP, so it is clamped again to [`MAX_INPUT_PARALLELISM`] before anything is
+/// allocated: no request-supplied integer can drive an unbounded allocation loop even if
+/// the boundary range check that refuses it, or a caller of this function, ever stops
+/// bounding it.
 ///
 /// `InAppStreamName` is bounded at 32 characters (`smithy_query(query="shape",
 /// shape="InAppStreamName")`), so a prefix long enough to overflow that bound yields no
 /// names at all rather than a value the model would reject.
 fn in_app_stream_names(name_prefix: &str, count: i32) -> Option<Vec<String>> {
-    let count = count.clamp(1, MAX_INPUT_PARALLELISM) as usize;
+    let count = count.clamp(MIN_INPUT_PARALLELISM, MAX_INPUT_PARALLELISM) as usize;
     let mut names: Vec<String> = Vec::with_capacity(count);
     names.extend(
         (1..=count)
@@ -2084,6 +2104,24 @@ fn in_app_stream_names(name_prefix: &str, count: i32) -> Option<Vec<String>> {
 /// already refuses a request outside that range; this is the defence-in-depth bound on
 /// the loop the value sizes.
 const MAX_INPUT_PARALLELISM: i32 = 64;
+
+/// The smallest `InputParallelism$Count` the model admits, from the same `@range` of
+/// 1..64, and the count an input described without one carries: one in-application stream
+/// for the streaming source.
+const MIN_INPUT_PARALLELISM: i32 = 1;
+
+/// The `InputParallelism$Count` a request asked for, bounded to the range the model admits
+/// before anything is sized from it.
+///
+/// Every derivation that counts in-application streams reads the value through here, so a
+/// request-supplied integer is bounded where it is READ and not only inside the loop it
+/// sizes. The boundary validator already refuses a count outside the modelled range, so
+/// this changes no response a caller can obtain.
+fn bounded_input_parallelism(count: Option<i32>) -> i32 {
+    count
+        .unwrap_or(MIN_INPUT_PARALLELISM)
+        .clamp(MIN_INPUT_PARALLELISM, MAX_INPUT_PARALLELISM)
+}
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

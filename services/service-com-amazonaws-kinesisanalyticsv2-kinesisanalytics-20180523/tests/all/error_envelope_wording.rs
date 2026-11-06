@@ -31,7 +31,7 @@ use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::ops::typ
 
 use super::harness::{
     call, create_body, create_startable, describe, error_code, error_message, router,
-    with_code_content, SETTLE_WAIT,
+    with_code_content, ACCOUNT, SETTLE_WAIT,
 };
 use super::stated_enum_value_set::NAMED_RUNTIME_ENVIRONMENT_VALUES;
 
@@ -277,8 +277,9 @@ async fn a_snapshot_outside_running_is_refused_as_an_invalid_request() {
 /// `DescribeApplicationSnapshot` reports a snapshot the application holds no record of
 /// with HTTP 400 `ResourceNotFoundException`, quoting the snapshot the request named and
 /// naming the application plainly — the scope the snapshot was looked up in — while a
-/// request naming an application that is not stored at all is answered with the sentence
-/// about the APPLICATION instead.
+/// request naming an application that is not stored at all is answered about the
+/// APPLICATION instead: the parameter violation the snapshot operations give an
+/// application miss, stated over the account the name was resolved in.
 ///
 /// The rows span the `SnapshotName` space (len 1..256, `^[a-zA-Z0-9_.-]+$`) and the
 /// `ApplicationName` space, and one stored snapshot of each application is read back
@@ -342,14 +343,15 @@ async fn a_snapshot_nothing_stored_is_stated_over_its_application() {
     }
 
     // A name no application is stored under is reported about the APPLICATION, whichever
-    // snapshot was asked for.
+    // snapshot was asked for: the snapshot operations refuse it as a parameter that names
+    // no application in this account.
     for (case, name) in absent_snapshots {
         let (status, refused) = described_snapshot(&router, "no-such-app", name).await;
-        let expected = "Application 'no-such-app' does not exist.";
+        let expected = format!("Application 'no-such-app' does not exist under account '{ACCOUNT}'.");
         let actual = error_message(&refused);
         assert_eq!(
             (status, error_code(&refused).as_str(), actual.as_str()),
-            (400, "ResourceNotFoundException", expected),
+            (400, "InvalidArgumentException", expected.as_str()),
             "case {case:?}: expected {expected:?}, got {status} {refused}"
         );
     }

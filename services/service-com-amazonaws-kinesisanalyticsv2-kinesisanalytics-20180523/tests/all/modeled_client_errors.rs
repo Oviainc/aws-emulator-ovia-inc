@@ -536,22 +536,26 @@ async fn a_snapshot_of_a_running_application_is_stored_and_read_back() {
         "case settled: the clock owed READY, got {described}"
     );
 
-    // A snapshot name nothing stored, and a snapshot of another application's name.
-    for (case, body) in [
+    // A snapshot name nothing stored, and a snapshot of another application's name: the
+    // snapshot miss is about the SNAPSHOT, while a name no application is stored under is
+    // the parameter violation the snapshot operations give an application miss.
+    for (case, body, expected_code) in [
         (
             "unknown snapshot",
             json!({"ApplicationName": name, "SnapshotName": "no-such-snapshot"}),
+            "ResourceNotFoundException",
         ),
         (
             "unknown application",
             json!({"ApplicationName": "no-such-app", "SnapshotName": "snap-1"}),
+            "InvalidArgumentException",
         ),
     ] {
         let (status, response) = call(&router, "DescribeApplicationSnapshot", &body).await;
         assert_eq!(
             (status, error_code(&response).as_str()),
-            (400, "ResourceNotFoundException"),
-            "case {case}: expected ResourceNotFoundException, got {status} {response}"
+            (400, expected_code),
+            "case {case}: expected {expected_code}, got {status} {response}"
         );
         assert!(
             !error_message(&response).is_empty(),
