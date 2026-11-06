@@ -39,7 +39,7 @@ use crate::resource_policy::attach_policy;
 /// The action group every row removes: the one value the modelled `ActionGroup` enum
 /// declares (`smithy_query(query="shape",shape="ActionGroup")`), which is also the only
 /// one a policy write over HTTP admits.
-const REMOVED_ACTION_GROUP: &str = ACTION_GROUP_AGENT_PERMISSIONS;
+pub(crate) const REMOVED_ACTION_GROUP: &str = ACTION_GROUP_AGENT_PERMISSIONS;
 
 /// Action groups a seeded policy carries BESIDE the removed one, so a row can hold more
 /// than one statement. These are not modelled enum values — they cannot be written over
@@ -75,26 +75,30 @@ fn principal(index: usize) -> String {
         .unwrap_or_else(|| format!("arn:aws:iam::{ACCOUNT}:role/cgp-last-bulk-{index}"))
 }
 
-fn principals(count: usize) -> Vec<String> {
+pub(crate) fn principals(count: usize) -> Vec<String> {
     (0..count).map(principal).collect()
 }
 
 /// One row: the group the policy sits on, the statements the policy holds when the
 /// removal arrives (the removed action group first), and the revision it is seeded at.
+///
+/// The table below is this policy-removal CLASS's one description, shared with
+/// [`crate::removal_of_the_last_statement_reports_no_policy`], which asserts the other
+/// half of the same rule over the same rows rather than forking a second table.
 #[derive(Debug)]
-struct Case {
-    group: GroupCase,
+pub(crate) struct Case {
+    pub(crate) group: GroupCase,
     /// `actionGroup` -> the principals it grants to. The first entry is the statement
     /// the row removes; the rest are the statements that must survive it.
-    held: Vec<(String, Vec<String>)>,
+    pub(crate) held: Vec<(String, Vec<String>)>,
     /// The revision the seeded policy carries, in the modelled `RevisionId` form.
-    revision_id: String,
+    pub(crate) revision_id: String,
 }
 
 impl Case {
     /// How many statements the removal leaves behind — and so whether the policy itself
     /// survives it.
-    fn statements_left(&self) -> usize {
+    pub(crate) fn statements_left(&self) -> usize {
         self.held.len() - 1
     }
 }
@@ -102,7 +106,7 @@ impl Case {
 /// The table: every row of the shared group table, crossed with a statement count (1, 2
 /// and 3, so the removal leaves 0, 1 and 2 behind) and a principal count spanning the
 /// modelled `Principals` bounds (1 and 50) and a count between.
-fn cases() -> Vec<Case> {
+pub(crate) fn cases() -> Vec<Case> {
     // (statements the policy holds, principals the removed statement grants to, the
     // revision the policy is seeded at).
     let shapes: [(usize, usize, &str); 5] = [
@@ -148,7 +152,7 @@ fn cases() -> Vec<Case> {
 /// Create every row's group and seed its policy, so every row is stored at once: a row
 /// that answered from another row's state fails here rather than being hidden by a fresh
 /// store.
-async fn seeded(harness: &Harness) -> Vec<Case> {
+pub(crate) async fn seeded(harness: &Harness) -> Vec<Case> {
     let cases = cases();
     for (index, case) in cases.iter().enumerate() {
         let created = harness
@@ -167,7 +171,7 @@ async fn seeded(harness: &Harness) -> Vec<Case> {
 }
 
 /// The number of statements `answer`'s `policy` member carries.
-fn statement_count(label: &str, answer: &Answer) -> usize {
+pub(crate) fn statement_count(label: &str, answer: &Answer) -> usize {
     let document = string_member(answer, "policy");
     let parsed: serde_json::Value = serde_json::from_str(&document)
         .unwrap_or_else(|error| panic!("case {label}: policy is not JSON ({error}): {document}"));
