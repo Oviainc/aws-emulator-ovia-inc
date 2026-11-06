@@ -547,11 +547,13 @@ async fn every_mutating_operation_answers_the_status_the_service_answers() {
 ///
 /// The `202 Accepted` teardown carries no body and STATES `content-length: 0`, so a client
 /// that closes the message out on an explicit zero length reads the same message end the
-/// origin wrote. The `204` answers carry the status and no body; the `content-length: 0`
-/// this service states for them does not reach the client, because the HTTP/1.1 writer this
-/// emulator is served by removes `content-length` from a `204` (RFC 9110 §15.3.5 forbids a
-/// body there) — that writer is below anything this crate decides, so this case pins what
-/// the socket really delivers and `empty_answer_framing.rs` pins what the service states.
+/// origin wrote; and an answer that DOES carry a document states that document's own length,
+/// never the empty answer's zero. The `204` answers carry the status and no body; the
+/// `content-length: 0` this service states for them does not reach the client, because the
+/// HTTP/1.1 writer this emulator is served by removes `content-length` from a `204`
+/// (RFC 9110 §15.3.5 forbids a body there) — that writer is below anything this crate
+/// decides, so this case pins what the socket really delivers and `empty_answer_framing.rs`
+/// pins what the service states.
 #[tokio::test(flavor = "multi_thread")]
 async fn on_the_wire_a_teardown_states_its_status_and_its_length() {
     let emulator = emulator();
@@ -564,25 +566,44 @@ async fn on_the_wire_a_teardown_states_its_status_and_its_length() {
         .and_then(|port| port.parse().ok())
         .unwrap_or_else(|| panic!("an endpoint with a port, got {endpoint:?}"));
 
-    for (case, path, expected_status, states_length) in [
+    /// What a row requires of the `content-length` the answer states.
+    enum Framing {
+        /// No body at all, and the length of that nothing stated.
+        EmptyAndStated,
+        /// No body at all, and nothing required of the header: the writer removes it from a
+        /// `204`, which is a transport decision this crate does not own.
+        EmptyAndUnstated,
+        /// A document, whose own byte length the stated header must equal.
+        TheDocumentsOwnLength,
+    }
+
+    for (case, method, path, expected_status, framing) in [
         (
             "DeleteRoute, answered 204",
+            "DELETE",
             format!("/v2/apis/{}/routes/{}", fixture.api, fixture.route),
             "HTTP/1.1 204",
-            // The `content-length: 0` this service states for a `204` does not reach the
-            // client: the writer removes it, as the doc comment above records. Asserting its
-            // absence would pin a transport decision this crate does not own, so the case
-            // asserts only what the socket is guaranteed to deliver.
-            false,
+            Framing::EmptyAndUnstated,
         ),
         (
             "DeleteDomainName, answered 202",
+            "DELETE",
             format!("/v2/domainnames/{}", fixture.domain),
             "HTTP/1.1 202",
-            true,
+            Framing::EmptyAndStated,
+        ),
+        (
+            // The other side of the framing rule, measured where the bytes are visible: an
+            // answer that carries a document states that document's length, so the empty
+            // answers' zero above is a length and not a constant.
+            "GetApi, answered 200 with the api",
+            "GET",
+            format!("/v2/apis/{}", fixture.api),
+            "HTTP/1.1 200",
+            Framing::TheDocumentsOwnLength,
         ),
     ] {
-        let answer = tokio::task::spawn_blocking(move || raw_delete(port, &path))
+        let answer = tokio::task::spawn_blocking(move || raw_request(port, method, &path))
             .await
             .expect("the socket exchange runs to completion");
         assert!(
@@ -592,38 +613,54 @@ async fn on_the_wire_a_teardown_states_its_status_and_its_length() {
         let (head, body) = answer
             .split_once("\r\n\r\n")
             .unwrap_or_else(|| panic!("case {case:?}: a response head and body, got {answer:?}"));
-        assert!(
-            body.is_empty(),
-            "case {case:?}: this answer carries no body, got {body:?}"
-        );
         let head = head.to_ascii_lowercase();
-        assert!(
-            !head.contains("transfer-encoding"),
-            "case {case:?}: an answer with no body is not chunked, got {head:?}"
-        );
-        if states_length {
-            assert!(
-                head.contains(&format!("content-length: {NO_CONTENT_LENGTH}")),
-                "case {case:?}: expected the answer to state content-length \
-                 {NO_CONTENT_LENGTH}, got {head:?}"
-            );
+        match framing {
+            Framing::EmptyAndStated | Framing::EmptyAndUnstated => {
+                assert!(
+                    body.is_empty(),
+                    "case {case:?}: this answer carries no body, got {body:?}"
+                );
+                assert!(
+                    !head.contains("transfer-encoding"),
+                    "case {case:?}: an answer with no body is not chunked, got {head:?}"
+                );
+                if matches!(framing, Framing::EmptyAndStated) {
+                    assert!(
+                        head.contains(&format!("content-length: {NO_CONTENT_LENGTH}")),
+                        "case {case:?}: expected the answer to state content-length \
+                         {NO_CONTENT_LENGTH}, got {head:?}"
+                    );
+                }
+            }
+            Framing::TheDocumentsOwnLength => {
+                assert!(
+                    !body.is_empty(),
+                    "case {case:?}: this answer carries a document, got none"
+                );
+                assert!(
+                    head.contains(&format!("content-length: {}", body.len())),
+                    "case {case:?}: expected the answer to state the document's own length \
+                     {}, got {head:?}",
+                    body.len()
+                );
+            }
         }
     }
 }
 
-/// One DELETE written straight onto a socket, with everything the server answered read back
-/// as text. The credential scope is what routes the request to this service, so it carries
-/// one even though the test router verifies no signature.
+/// One bodiless request written straight onto a socket, with everything the server answered
+/// read back as text. The credential scope is what routes the request to this service, so it
+/// carries one even though the test router verifies no signature.
 ///
 /// `connection: close` so the server closes the socket after answering and the read below
 /// terminates on EOF rather than on a parse of the framing these cases are about.
-fn raw_delete(port: u16, path: &str) -> String {
+fn raw_request(port: u16, method: &str, path: &str) -> String {
     use std::io::{Read, Write};
 
     let mut stream =
         std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect to the served port");
     let request = format!(
-        "DELETE {path} HTTP/1.1\r\n\
+        "{method} {path} HTTP/1.1\r\n\
          host: localhost\r\n\
          authorization: AWS4-HMAC-SHA256 \
          Credential=AKIDTESTAPIGWV2/20261021/{REGION}/apigateway/aws4_request, \
