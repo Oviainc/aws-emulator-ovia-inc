@@ -2,8 +2,9 @@
 
 //! @op AssociateApi
 //! Maps an API onto the custom domain the path addresses, and reports the
-//! `ApiAssociation` the mapping left behind. The domain side of the rule, which
-//! `DisassociateApi` follows too, lives in
+//! `ApiAssociation` the mapping left behind. The API the body names is resolved
+//! before the domain, so a request that names no API is refused on that input. The
+//! domain side of the rule, which `DisassociateApi` follows too, lives in
 //! [`crate::state::domain_for_association_change`].
 //!
 //! ## Shape of an operation
@@ -162,7 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // still being deployed is what decides the refusal below.
         guard.settle_api_associations(now);
 
-        // The API the request names, read before the domain is taken for the write.
+        // The API the request names is resolved FIRST: it is the input this operation
+        // validates, and a request that names no API at all is refused on that input
+        // rather than on the domain the path addresses.
         // An `apiId` is ONE identifier space over both API resource families — a
         // `GraphqlApi` and an `Api` are created by operations of their own — and either
         // is mapped onto a custom domain through this same path, so the id is resolved
@@ -173,9 +176,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|api| api.visibility.clone());
         let api_exists = visibility.is_some() || guard.event_apis.contains_key(&input.api_id);
 
-        // The custom domain is the resource the path addresses, so it is resolved
-        // first: nothing about the API the body names is reported for a domain this
-        // account does not hold.
+        // An `apiId` that resolves to no API is not a missing resource on this
+        // operation: the mapping asks for an API this account does not hold, which is
+        // the malformed request `BadRequestException` states, naming the value that was
+        // refused. This operation's `NotFoundException` is the custom domain's.
+        if !api_exists {
+            return Err(AssociateApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                ..Default::default()
+            })
+            .into());
+        }
+        // "Private APIs can not be associated with custom domains"
+        // (`AssociateApiRequest$apiId`): an API reachable only from inside a VPC is not
+        // served through a custom domain, so the mapping is refused rather than stored.
+        if visibility.as_deref() == Some(crate::state::PRIVATE_VISIBILITY) {
+            return Err(AssociateApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::PRIVATE_API_NOT_ASSOCIABLE_MESSAGE.to_string()),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // The custom domain is the resource the mapping is stored ON, so it is resolved
+        // once the API the body names has been: a domain this account does not hold
+        // carries no association to change.
         let domain = match crate::state::domain_for_association_change(&mut guard, &input.domain_name)
         {
             Ok(domain) => domain,
@@ -196,32 +221,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
         };
-
-        // An `apiId` that is not an API id at all is a malformed request, not a missing
-        // resource (see `crate::state::is_api_id`).
-        if !crate::state::is_api_id(&input.api_id) {
-            return Err(AssociateApiErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
-                ..Default::default()
-            })
-            .into());
-        }
-        if !api_exists {
-            return Err(AssociateApiErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
-            })
-            .into());
-        }
-        // "Private APIs can not be associated with custom domains"
-        // (`AssociateApiRequest$apiId`): an API reachable only from inside a VPC is not
-        // served through a custom domain, so the mapping is refused rather than stored.
-        if visibility.as_deref() == Some(crate::state::PRIVATE_VISIBILITY) {
-            return Err(AssociateApiErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::PRIVATE_API_NOT_ASSOCIABLE_MESSAGE.to_string()),
-                ..Default::default()
-            })
-            .into());
-        }
 
         // Every ground for refusing the mapping has been read, so nothing below writes
         // over a request that should have been refused. The mapping REPLACES whatever

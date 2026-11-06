@@ -25,8 +25,9 @@
 //!    itself untouched), so the read that follows is a not-found and repeating the call
 //!    changes nothing;
 //! 5. an API that cannot be mapped is refused and nothing is stored: an `apiId` that
-//!    names no API is a 404, one too long to be an API id a 400, and a PRIVATE API a
-//!    400 — "Private APIs can not be associated with custom domains".
+//!    names no API — whether or not it could have named one — is a 400 naming the
+//!    value it refused, and a PRIVATE API a 400 — "Private APIs can not be associated
+//!    with custom domains".
 //!
 //! Every assertion goes through the router the production emulator mounts, so these
 //! exercise routing, restJson1 (de)serialization, the handlers and the shared engine
@@ -58,10 +59,6 @@ const DOMAIN_NOT_FOUND_ON_READ: &str = "Domain name not found";
 
 /// AppSync's text for a domain that exists and carries no API association.
 const ASSOCIATION_NOT_FOUND: &str = "API association not found.";
-
-/// AppSync's text for an API that is absent, which this service's other `apiId`
-/// readers carry too.
-const API_NOT_FOUND: &str = "API not found.";
 
 /// The suffix of every `appsyncDomainName`: a custom domain is served through a
 /// CloudFront distribution domain.
@@ -182,7 +179,7 @@ fn domain_rows() -> Vec<DomainRow> {
         DomainRow {
             label: "a prefixed wildcard domain",
             domain: "*dev.events.example.com".to_string(),
-            certificate_arn: "arn:aws:acm:eu-west-1:000000000000:certificate/prefixed",
+            certificate_arn: "arn:aws:acm:us-east-1:000000000000:certificate/prefixed",
             description: Some("the per-stage wildcard"),
             tags: None,
             family: Family::Graphql,
@@ -645,10 +642,12 @@ async fn an_api_the_domain_cannot_carry_is_refused_and_stores_nothing() {
     let rows: Vec<(&str, String, u16, &str, String)> = vec![
         (
             "an apiId that names no API",
-            unknown_api,
-            404,
-            "NotFoundException",
-            API_NOT_FOUND.to_string(),
+            unknown_api.clone(),
+            400,
+            "BadRequestException",
+            // This operation's refusal for an `apiId` it cannot resolve: the value it
+            // refused. The `NotFoundException` it models is the custom domain's.
+            format!("Invalid API ID {unknown_api}"),
         ),
         (
             "an apiId longer than an AppSync API id",

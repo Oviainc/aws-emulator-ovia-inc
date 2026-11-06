@@ -3,7 +3,8 @@
 //! @op CreateDomainName
 //! Creates one custom domain name and reports the `DomainNameConfig` it stored: the
 //! endpoint AppSync serves the domain through, minted from this service's own state,
-//! plus the certificate and description the request named.
+//! plus the certificate and description the request named. The certificate side of the
+//! rule lives in [`crate::state::certificate_region_refusal`].
 //!
 //! ## Shape of an operation
 //!
@@ -155,6 +156,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let mut guard = state.lock();
+
+        // The certificate the domain is served with is read before any resource is
+        // resolved: a certificate the distribution serving this domain could never
+        // read cannot be attached to it, whatever name the create asks for.
+        if let Some(message) = crate::state::certificate_region_refusal(&input.certificate_arn) {
+            return Err(CreateDomainNameErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
 
         // A custom domain is addressed by its domain name, so a create under a name
         // this account already holds conflicts with the domain holding it rather than

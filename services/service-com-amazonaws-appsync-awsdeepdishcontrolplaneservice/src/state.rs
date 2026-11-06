@@ -1191,6 +1191,40 @@ pub fn domain_name_resource(domain_name: &str) -> String {
     format!("domainnames/{domain_name}")
 }
 
+/// The one Region a certificate an AppSync custom domain is served with is read from.
+///
+/// A custom domain is served by a CloudFront distribution (which is what
+/// [`CLOUDFRONT_HOSTED_ZONE_ID`] and [`appsync_domain_name`] report), and a
+/// distribution reads the certificate it presents from this Region alone, so a
+/// certificate held in another one cannot be attached to the domain.
+pub const CERTIFICATE_REGION: &str = "us-east-1";
+
+/// The Region field of `arn` — the fourth colon-separated field — or `None` when the
+/// value is not an ARN at all.
+///
+/// A GLOBAL service leaves that field EMPTY (an IAM server certificate is
+/// `arn:aws:iam::<account>:server-certificate/<name>`), so an empty field is reported
+/// as the empty string rather than as a Region.
+pub fn arn_region(arn: &str) -> Option<&str> {
+    arn.strip_prefix(ARN_PREFIX)?.split(':').nth(2)
+}
+
+/// Why the certificate `certificate_arn` names cannot serve a custom domain, as the
+/// text a `BadRequestException` (HTTP 400) states it with, or `None` when it can.
+///
+/// The rule the create follows: the certificate has to be reachable from the Region a
+/// custom domain's distribution reads certificates from ([`CERTIFICATE_REGION`]), so a
+/// certificate ARN that names any other Region is refused. A certificate of a global
+/// service names no Region ([`arn_region`]) and is reachable from every one, so it is
+/// not refused on this ground.
+pub fn certificate_region_refusal(certificate_arn: &str) -> Option<String> {
+    let region = arn_region(certificate_arn)?;
+    if region.is_empty() || region == CERTIFICATE_REGION {
+        return None;
+    }
+    Some(format!("Certificate must be in {CERTIFICATE_REGION}."))
+}
+
 /// Why a call that modifies a custom domain's API association was refused.
 ///
 /// Each operation answers it with the error ITS model declares and with that error's
