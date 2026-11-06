@@ -602,6 +602,20 @@ pub fn invalid_input(subject: &str, rule: &str) -> ValidationException {
     }
 }
 
+/// A `ValidationException` (HTTP 400) for a `clusterName` outside the form this
+/// service documents for that member.
+///
+/// The service does NOT state this one in the `Invalid Input - '<subject>'. <rule>`
+/// form [`invalid_input`] builds: it words a rejected cluster name as its own
+/// sentence, the fixed text `Invalid cluster name - ` followed by the name exactly as
+/// the request spelled it and a period, and carries that in `message` and nothing
+/// else. The name is the only variable part.
+pub fn invalid_cluster_name(value: &str) -> ValidationException {
+    ValidationException {
+        message: format!("Invalid cluster name - {value}."),
+    }
+}
+
 /// The member name as this service spells it inside a refusal sentence: the modelled
 /// member name with an initial capital (`shardCapacity` -> `ShardCapacity`, the
 /// spelling the recorded refusal of that member uses).
@@ -636,7 +650,7 @@ pub fn validate_shard_count(member: &str, value: i32) -> Result<(), ValidationEx
     Err(invalid_input(
         &value.to_string(),
         &format!(
-            "{} must be within [1, {SHARD_COUNT_MAX}].",
+            "{} should be between 1 and {SHARD_COUNT_MAX}.",
             member_label(member)
         ),
     ))
@@ -682,31 +696,26 @@ pub fn validate_admin_user_password(
 }
 
 /// Refuse a `clusterName` outside the documented form.
-pub fn validate_cluster_name(member: &str, value: &str) -> Result<(), ValidationException> {
+///
+/// Source: `CreateClusterInput$clusterName` doc — "Must contain from 1 to 63 letters,
+/// numbers, or hyphens. The first character must be a letter. Cannot end with a
+/// hyphen or contain two consecutive hyphens".
+///
+/// That is ONE form, so every way of breaking it — the length bound, the character
+/// set, the first character, a trailing or a doubled hyphen — is the same refusal,
+/// and the service states it in the sentence [`invalid_cluster_name`] builds rather
+/// than in the per-member rule sentence the other members' refusals carry.
+pub fn validate_cluster_name(value: &str) -> Result<(), ValidationException> {
     let (min, max) = NAME_LEN;
-    let label = member_label(member);
-    if !(min..=max).contains(&value.chars().count()) {
-        return Err(invalid_input(
-            member,
-            &format!(
-                "{label} must contain from {min} to {max} letters, numbers or hyphens."
-            ),
-        ));
-    }
-    let well_formed = value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    let well_formed = (min..=max).contains(&value.chars().count())
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         && value.starts_with(|c: char| c.is_ascii_alphabetic())
         && !value.ends_with('-')
         && !value.contains("--");
     if well_formed {
         Ok(())
     } else {
-        Err(invalid_input(
-            value,
-            &format!(
-                "{label} must begin with a letter, contain only letters, numbers or hyphens, \
-                 and must not end with a hyphen or contain two consecutive hyphens."
-            ),
-        ))
+        Err(invalid_cluster_name(value))
     }
 }
 
@@ -1056,16 +1065,21 @@ pub fn validate_kms_key_id(member: &str, value: &str) -> Result<(), ValidationEx
 }
 
 /// Refuse a `preferredMaintenanceWindow` outside the documented
-/// `ddd:hh24:mi-ddd:hh24:mi` form.
+/// `ddd:hh24:mi-ddd:hh24:mi` form, and answer the form the service STORES: the
+/// day-of-week abbreviation is matched without regard to case and normalised to the
+/// one capitalisation the service reports it in.
 ///
 /// Source: `CreateClusterInput$preferredMaintenanceWindow` doc — "Format:
-/// ddd:hh24:mi-ddd:hh24:mi … Valid days: Mon, Tue, Wed, Thu, Fri, Sat, Sun".
-pub fn validate_maintenance_window(member: &str, value: &str) -> Result<(), ValidationException> {
-    let well_formed = value
-        .split_once('-')
-        .is_some_and(|(start, end)| is_day_time(start) && is_day_time(end));
-    if well_formed {
-        Ok(())
+/// ddd:hh24:mi-ddd:hh24:mi … Valid days: Mon, Tue, Wed, Thu, Fri, Sat, Sun". The doc
+/// names the days in one capitalisation but the member carries no `@pattern`, so the
+/// day is a case-insensitive abbreviation on the way in and is echoed in the
+/// documented spelling on the way out.
+pub fn validate_maintenance_window(
+    member: &str,
+    value: &str,
+) -> Result<String, ValidationException> {
+    if let Some(normalized) = normalized_maintenance_window(value) {
+        Ok(normalized)
     } else {
         Err(invalid_input(
             value,
@@ -1100,12 +1114,25 @@ pub fn validate_backup_window(member: &str, value: &str) -> Result<(), Validatio
     }
 }
 
-/// `ddd:hh24:mi` — a valid day name followed by a wall-clock time.
-fn is_day_time(value: &str) -> bool {
-    match value.split_once(':') {
-        Some((day, time)) => MAINTENANCE_DAYS.contains(&day) && is_time_of_day(time),
-        None => false,
-    }
+/// The `ddd:hh24:mi-ddd:hh24:mi` window `value` names with each day abbreviation in
+/// the spelling [`MAINTENANCE_DAYS`] holds, or `None` when it is not of that form.
+fn normalized_maintenance_window(value: &str) -> Option<String> {
+    let (start, end) = value.split_once('-')?;
+    Some(format!(
+        "{}-{}",
+        normalized_day_time(start)?,
+        normalized_day_time(end)?
+    ))
+}
+
+/// `ddd:hh24:mi` — a valid day name, whatever case it was written in, followed by a
+/// wall-clock time; answered with the day in its documented spelling.
+fn normalized_day_time(value: &str) -> Option<String> {
+    let (day, time) = value.split_once(':')?;
+    let day = MAINTENANCE_DAYS
+        .iter()
+        .find(|known| known.eq_ignore_ascii_case(day))?;
+    is_time_of_day(time).then(|| format!("{day}:{time}"))
 }
 
 /// `hh24:mi` — two digits of hour below 24 and two of minute below 60.

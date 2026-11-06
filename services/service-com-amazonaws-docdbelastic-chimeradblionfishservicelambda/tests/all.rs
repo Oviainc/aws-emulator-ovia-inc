@@ -19,6 +19,8 @@ mod cluster_snapshot_copy;
 mod cluster_snapshot_listing;
 #[path = "all/concurrent_cluster_modification.rs"]
 mod concurrent_cluster_modification;
+#[path = "all/create_cluster_service_rules.rs"]
+mod create_cluster_service_rules;
 #[path = "all/error_resource_identity.rs"]
 mod error_resource_identity;
 #[path = "all/maintenance_and_restore.rs"]

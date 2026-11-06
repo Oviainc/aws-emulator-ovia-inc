@@ -234,7 +234,6 @@ async fn every_refused_value_is_stated_in_the_services_own_wording() {
     let cluster_arn = create_arn(&router, "wording").await;
     let cluster_path = format!("/cluster/{}", label(&cluster_arn));
     let oversized_tag_key = "k".repeat(129);
-    let long_name = "c".repeat(64);
 
     let cases: Vec<(&str, &str, String, Option<Value>)> = vec![
         (
@@ -255,18 +254,9 @@ async fn every_refused_value_is_stated_in_the_services_own_wording() {
             "/cluster".to_string(),
             Some(json!({"shardInstanceCount": 0})),
         ),
-        (
-            "CreateCluster clusterName with an illegal character",
-            "POST",
-            "/cluster".to_string(),
-            Some(json!({"clusterName": "under_score"})),
-        ),
-        (
-            "CreateCluster clusterName longer than the bound",
-            "POST",
-            "/cluster".to_string(),
-            Some(json!({"clusterName": long_name})),
-        ),
+        // `clusterName` is NOT a row here: the service words a rejected cluster name
+        // in its own sentence rather than in the `Invalid Input - …` form this table
+        // asserts, and that sentence is pinned in `create_cluster_service_rules`.
         (
             "CreateCluster adminUserName starting with a digit",
             "POST",

@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The restored cluster is a NEW cluster, so every value the request may carry
         // for it is held to the same rule `CreateCluster` holds it to, and refused
         // before anything is minted.
-        state::validate_cluster_name("clusterName", &input.cluster_name)
+        state::validate_cluster_name(&input.cluster_name)
             .map_err(RestoreClusterFromSnapshotErrorModeled::ValidationException)?;
         if let Some(capacity) = input.shard_capacity {
             state::validate_shard_capacity("shardCapacity", capacity)

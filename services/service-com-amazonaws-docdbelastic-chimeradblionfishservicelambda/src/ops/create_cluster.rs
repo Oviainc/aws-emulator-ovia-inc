@@ -198,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Constraints the docs state but the model does not express. Refused BEFORE
         // anything is minted, so a rejected create leaves no record behind.
-        state::validate_cluster_name("clusterName", &input.cluster_name)
+        state::validate_cluster_name(&input.cluster_name)
             .map_err(CreateClusterErrorModeled::ValidationException)?;
         state::validate_admin_user_name("adminUserName", &input.admin_user_name)
             .map_err(CreateClusterErrorModeled::ValidationException)?;
@@ -230,10 +230,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state::validate_kms_key_id("kmsKeyId", key)
                 .map_err(CreateClusterErrorModeled::ValidationException)?;
         }
-        if let Some(window) = input.preferred_maintenance_window.as_deref() {
-            state::validate_maintenance_window("preferredMaintenanceWindow", window)
-                .map_err(CreateClusterErrorModeled::ValidationException)?;
-        }
+        // The window is stored in the form the service echoes it in, which is what the
+        // validator answers: the day abbreviation the request wrote in any case comes
+        // back in the documented spelling.
+        let preferred_maintenance_window = match input.preferred_maintenance_window.as_deref() {
+            Some(window) => Some(
+                state::validate_maintenance_window("preferredMaintenanceWindow", window)
+                    .map_err(CreateClusterErrorModeled::ValidationException)?,
+            ),
+            None => None,
+        };
         if let Some(window) = input.preferred_backup_window.as_deref() {
             state::validate_backup_window("preferredBackupWindow", window)
                 .map_err(CreateClusterErrorModeled::ValidationException)?;
@@ -276,8 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             shard_instance_count: input.shard_instance_count,
             vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
             subnet_ids: input.subnet_ids.unwrap_or_default(),
-            preferred_maintenance_window: input
-                .preferred_maintenance_window
+            preferred_maintenance_window: preferred_maintenance_window
                 .unwrap_or_else(|| state::default_maintenance_window(&cluster_name)),
             preferred_backup_window: input.preferred_backup_window,
             backup_retention_period: input.backup_retention_period,

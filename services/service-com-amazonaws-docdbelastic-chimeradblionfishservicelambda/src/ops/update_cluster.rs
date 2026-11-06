@@ -216,10 +216,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state::validate_id_list("subnetIds", ids)
                 .map_err(UpdateClusterErrorModeled::ValidationException)?;
         }
-        if let Some(window) = input.preferred_maintenance_window.as_deref() {
-            state::validate_maintenance_window("preferredMaintenanceWindow", window)
-                .map_err(UpdateClusterErrorModeled::ValidationException)?;
-        }
+        // Stored in the form the service echoes it in; see `CreateCluster`.
+        let preferred_maintenance_window = match input.preferred_maintenance_window.as_deref() {
+            Some(window) => Some(
+                state::validate_maintenance_window("preferredMaintenanceWindow", window)
+                    .map_err(UpdateClusterErrorModeled::ValidationException)?,
+            ),
+            None => None,
+        };
         if let Some(window) = input.preferred_backup_window.as_deref() {
             state::validate_backup_window("preferredBackupWindow", window)
                 .map_err(UpdateClusterErrorModeled::ValidationException)?;
@@ -262,7 +266,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.subnet_ids = ids;
             applied = true;
         }
-        if let Some(window) = input.preferred_maintenance_window {
+        if let Some(window) = preferred_maintenance_window {
             record.preferred_maintenance_window = window;
             applied = true;
         }
