@@ -133,7 +133,33 @@ pub struct StoredChangeDetail {
     /// this change… If the `ChangeSource` value is `DirectModification`, no value is given
     /// for `CausingEntity`."
     pub causing_entity: Option<String>,
+    /// The two values of a DRIFT-AWARE comparison, for a change computed against the
+    /// resource's ACTUAL state ([`DriftedValues`]). `None` for every change computed from
+    /// the templates alone, where the members are "only present for drift-aware change
+    /// sets".
+    pub drifted: Option<DriftedValues>,
 }
+
+/// The before and after values a DRIFT-AWARE change reports for one property, and where
+/// each of them comes from.
+///
+/// `ResourceTargetDefinition$BeforeValueFrom` is `ACTUAL_STATE` — "the before value
+/// represents current actual state" — because that is what such a change set compares
+/// against, and `$AfterValueFrom` is `TEMPLATE`, "the after value comes from the new
+/// template": reverting drift puts the template's value back over the live one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriftedValues {
+    /// `ResourceTargetDefinition$BeforeValue`: the value the resource really carries.
+    pub before_value: String,
+    /// `ResourceTargetDefinition$AfterValue`: the value the template declares.
+    pub after_value: String,
+}
+
+/// `ResourceTargetDefinition$BeforeValueFrom` for a drift-aware change: the live resource.
+pub const BEFORE_VALUE_FROM_ACTUAL_STATE: &str = "ACTUAL_STATE";
+
+/// `ResourceTargetDefinition$AfterValueFrom` for a drift-aware change: the new template.
+pub const AFTER_VALUE_FROM_TEMPLATE: &str = "TEMPLATE";
 
 /// One resource-level change a change set would make, computed once when the change set
 /// is created by comparing the submitted revision with the stack's current one.
@@ -164,6 +190,10 @@ pub struct StoredResourceChange {
     /// one that is already there, which is what its `UpdateReplacePolicy` says. `None` for a
     /// change that leaves the physical resource where it is.
     pub policy_action: Option<String>,
+    /// `ResourceChange$ResourceDriftStatus`: the drift status of the resource, "only present
+    /// for drift-aware change sets" — so `None` for every change computed from the templates
+    /// alone.
+    pub resource_drift_status: Option<String>,
 }
 
 /// The revision of a stack a change set is computed AGAINST: the template in force on it,
@@ -525,6 +555,7 @@ fn propagate_recreations(
             evaluation: evaluation::STATIC.to_string(),
             change_source: source.to_string(),
             causing_entity: Some(causing_entity),
+            drifted: None,
         });
     }
     details.extend(propagated);
@@ -632,6 +663,7 @@ fn change_details(
                 evaluation: evaluation::STATIC.to_string(),
                 change_source: change_source::DIRECT_MODIFICATION.to_string(),
                 causing_entity: None,
+                drifted: None,
             });
         }
     }
@@ -711,6 +743,7 @@ fn property_details(
                 evaluation: evaluation.to_string(),
                 change_source: source.to_string(),
                 causing_entity,
+                drifted: None,
             }
         };
         // What the change is attributed to is the ENTITY the property's new value is built
@@ -857,6 +890,7 @@ fn addition(resource: &template::DeclaredResource) -> StoredResourceChange {
         replacement: None,
         details: Vec::new(),
         policy_action: None,
+        resource_drift_status: None,
     }
 }
 
@@ -874,6 +908,7 @@ fn removal(
         replacement: None,
         details: Vec::new(),
         policy_action: None,
+        resource_drift_status: None,
     }
 }
 
@@ -898,6 +933,59 @@ fn modification(
         // `UpdateReplacePolicy`.
         policy_action: (replaces != replacement::FALSE)
             .then(|| replace_action(resource).to_string()),
+        resource_drift_status: None,
+    }
+}
+
+/// The `Modify` of one resource the stack's template declares and the service that owns it
+/// reports DIFFERENTLY — a drift-aware change, as a change set whose `DeploymentMode`
+/// compares the template against the resource's actual state reports it.
+///
+/// Such a change puts the TEMPLATE's value back over the live one, so its before value is
+/// the live one and its after value the template's
+/// ([`DriftedValues`]) — one detail per property the two disagree about, in the order the
+/// comparison found them. It changes no property the template states differently from the
+/// previous template, so it never recreates the resource: `Replacement` is `False`.
+pub fn drift_change(drifted: &super::drift::DriftedResource) -> StoredResourceChange {
+    let details: Vec<StoredChangeDetail> = drifted
+        .differences
+        .iter()
+        .map(|difference| StoredChangeDetail {
+            attribute: PROPERTIES_ATTRIBUTE.to_string(),
+            // "If the `Attribute` value is `Properties`, the name of the property": the
+            // DECLARED property the difference is inside, which is the first segment of the
+            // fully-qualified path the comparison reports it under.
+            name: difference
+                .property_path
+                .trim_start_matches('/')
+                .split('/')
+                .next()
+                .map(ToString::to_string),
+            requires_recreation: requires_recreation::NEVER.to_string(),
+            // Both values are READ: the live one from the owning service, the other from the
+            // template — so the change and its value are determined, which is what `Static`
+            // reports.
+            evaluation: evaluation::STATIC.to_string(),
+            change_source: change_source::DIRECT_MODIFICATION.to_string(),
+            causing_entity: None,
+            drifted: Some(DriftedValues {
+                before_value: difference.actual_value.clone(),
+                after_value: difference.expected_value.clone(),
+            }),
+        })
+        .collect();
+    StoredResourceChange {
+        action: change_action::MODIFY.to_string(),
+        logical_resource_id: drifted.logical_id.clone(),
+        resource_type: drifted.resource_type.clone(),
+        physical_resource_id: Some(drifted.physical_resource_id.clone()),
+        scope: scope_of(&details),
+        replacement: Some(replacement::FALSE.to_string()),
+        details,
+        policy_action: None,
+        // The resource's properties were modified outside CloudFormation, which is what
+        // `MODIFIED` states.
+        resource_drift_status: Some(super::resource_drift_status::MODIFIED.to_string()),
     }
 }
 

@@ -322,6 +322,74 @@ pub fn differs(expected: &Value, actual: &Value) -> bool {
     !differences(expected, actual).is_empty()
 }
 
+/// `CreateChangeSet$DeploymentMode`'s only value: "REVERT_DRIFT — Creates a drift-aware
+/// change set that brings actual resource states in line with template definitions."
+pub const DEPLOYMENT_MODE_REVERT_DRIFT: &str = "REVERT_DRIFT";
+
+/// Whether a change set's `DeploymentMode` asks for the resources' ACTUAL state to be
+/// compared against the template — and, when it is executed, brought back to it.
+pub fn reverts_drift(deployment_mode: Option<&str>) -> bool {
+    deployment_mode == Some(DEPLOYMENT_MODE_REVERT_DRIFT)
+}
+
+/// One resource the service that owns it reports in a configuration the stack did NOT
+/// record for it — what makes the resource, and so its stack, drifted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriftedResource {
+    pub logical_id: String,
+    pub resource_type: String,
+    pub physical_resource_id: String,
+    /// The configuration that service reports the resource in, as it reported it.
+    pub actual: Value,
+    /// Every property it disagrees with the recorded configuration about
+    /// ([`differences`]), each carrying both values.
+    pub differences: Vec<PropertyDiff>,
+}
+
+/// Those of `resources` whose owning service reports a configuration the stack did not
+/// record, in the order the stack holds them.
+///
+/// The same question [`detect`] asks, for the callers that need the ACTUAL configuration
+/// itself rather than a drift report to store: a change set whose `DeploymentMode` compares
+/// the template against the resource's actual state, and the execution of such a change set,
+/// which has to put the recorded configuration back where that state differs.
+///
+/// The calls are made with no store lock held (the caller is what releases it), one resource
+/// at a time, so this costs one read per resource and no more. A resource no service here
+/// owns, one nothing was created for, and a read a service does not serve establish nothing:
+/// such a resource is not reported as drifted.
+pub async fn drifted(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resources: &[StoredResource],
+) -> Vec<DriftedResource> {
+    let mut drifted = Vec::new();
+    for resource in resources {
+        let Some(provisioner) = owner_for(&resource.resource_type) else {
+            continue;
+        };
+        if !resource.materialised {
+            continue;
+        }
+        let Ok(Some(actual)) = provisioner.actual_configuration(ctx, region, resource).await
+        else {
+            continue;
+        };
+        let differences = differences(&resource.properties, &actual);
+        if differences.is_empty() {
+            continue;
+        }
+        drifted.push(DriftedResource {
+            logical_id: resource.logical_id.clone(),
+            resource_type: resource.resource_type.clone(),
+            physical_resource_id: resource.physical_resource_id.clone(),
+            actual,
+            differences,
+        });
+    }
+    drifted
+}
+
 /// Every property the ACTUAL configuration disagrees with the EXPECTED one about, over the
 /// properties the template declared.
 ///

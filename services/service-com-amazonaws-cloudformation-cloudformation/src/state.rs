@@ -343,6 +343,14 @@ pub mod change_set_hooks;
 /// did not pass it carries.
 pub mod early_validation;
 
+/// Which stack already manages a physical resource name, and the refusal a create under a
+/// name that is taken earns.
+pub mod physical_name;
+
+/// Bringing resources that ALREADY EXIST under a stack's management: what an IMPORT change
+/// set plans and what `ImportExistingResources` adopts.
+pub mod resource_import;
+
 /// The progress a resource handler reports for one handler invocation, which
 /// `RecordHandlerProgress` records against the bearer token that invocation was issued.
 pub mod handler_progress;
@@ -910,6 +918,8 @@ pub mod status {
     /// or resources. The stack will be in the REVIEW_IN_PROGRESS state until you execute
     /// the change set").
     pub const REVIEW_IN_PROGRESS: &str = "REVIEW_IN_PROGRESS";
+    /// The status a stack takes while an IMPORT change set's resources are being adopted.
+    pub const IMPORT_IN_PROGRESS: &str = "IMPORT_IN_PROGRESS";
     /// The terminal status of a completed resource import. Nothing in this service puts a
     /// stack into it yet; it is named because it is one of the statuses a stack is STABLE
     /// in ([`super::is_stable_status`]).
@@ -971,6 +981,9 @@ pub mod resource_status {
     /// ([`provisioning::OnRefusal::Abandon`](super::provisioning::OnRefusal)). The resource
     /// is still there, which is what distinguishes this from [`DELETE_COMPLETE`].
     pub const DELETE_SKIPPED: &str = "DELETE_SKIPPED";
+    /// The status of a resource an IMPORT brought under the stack's management: it was
+    /// neither created nor changed, it is now the stack's ([`resource_import`]).
+    pub const IMPORT_COMPLETE: &str = "IMPORT_COMPLETE";
 }
 
 /// The `DeletionPolicy` values the resource attribute takes: "With the `DeletionPolicy`
@@ -1061,6 +1074,9 @@ pub mod change_action {
     pub const ADD: &str = "Add";
     pub const MODIFY: &str = "Modify";
     pub const REMOVE: &str = "Remove";
+    /// The action on a resource a change set ADOPTS rather than creates
+    /// ([`super::resource_import`]).
+    pub const IMPORT: &str = "Import";
 }
 
 /// `OperationType` values this service records for a stack operation (all from the
@@ -1647,6 +1663,8 @@ pub struct StoredRequestToken {
 /// One stack, as this emulator persists it: the record, the status transitions it lives
 /// through, and the helpers those transitions use.
 pub mod stack;
+mod failure_summary;
+pub use failure_summary::*;
 
 pub use stack::StoredStack;
 
@@ -3511,11 +3529,11 @@ pub fn parameters_in_force(
 
 /// Record, on each stored parameter, whether `template_body` declares it `NoEcho`.
 ///
-/// For the callers that resolve a parameter set WITHOUT the template's declared defaults
-/// (`CreateChangeSet`, which carries the parameters its update would apply): the masking
-/// rule is a property of the declaration, so every stored set that a template body governs
-/// goes through this or through [`parameters_in_force`]. A body this service cannot read
-/// declares nothing, which leaves every parameter unmasked rather than guessing.
+/// For a caller that resolves a parameter set WITHOUT the template's declared defaults: the
+/// masking rule is a property of the declaration, so every stored set that a template body
+/// governs goes through this or through [`parameters_in_force`] (which is the path every
+/// deploying operation and `CreateChangeSet` take). A body this service cannot read declares
+/// nothing, which leaves every parameter unmasked rather than guessing.
 pub fn record_no_echo(template_body: &str, parameters: &mut [StoredParameter]) {
     let template = template::parse(template_body).unwrap_or_default();
     mark_no_echo(&template, parameters);
@@ -3739,6 +3757,7 @@ pub fn status_takes_an_update(status: &str) -> bool {
             | status::UPDATE_ROLLBACK_COMPLETE
             | status::CREATE_FAILED
             | status::UPDATE_FAILED
+            | status::IMPORT_COMPLETE
     )
 }
 
@@ -3841,33 +3860,9 @@ pub mod failed_action {
     pub const UPDATE: &str = "update";
     /// A delete — the resources a `DeleteStack` (or a rollback) could not remove.
     pub const DELETE: &str = "delete";
-}
-
-/// The `StackStatusReason` a stack operation reports when its RESOURCES are what failed it.
-///
-/// The field is a free-form string, and what CloudFormation puts in it for this class of
-/// failure is one SUMMARY sentence: the fixed text around the comma-separated
-/// `LogicalResourceId`s of the resources the operation could not carry through, and nothing
-/// else. The sentence ends with its separating space, which is where CloudFormation's own
-/// follow-on clause about the stack would go — never the failing resource's diagnosis.
-///
-/// That diagnosis is a per-RESOURCE field: `StackEvent$ResourceStatusReason` is the
-/// "success/failure message associated with the resource", so the owning service's refusal
-/// (its error code, its message) is carried there, on the event for the resource that
-/// failed, and is read through `DescribeStackEvents` and `DescribeStackResource`. Folding it
-/// into the stack-level summary would make the one field a client parses to recover the set
-/// of failed logical ids depend on provider error text instead.
-///
-/// `action` is what the operation was doing ([`failed_action`]).
-pub fn resource_failure_summary<'a>(
-    action: &str,
-    logical_ids: impl IntoIterator<Item = &'a str>,
-) -> String {
-    let named: Vec<&str> = logical_ids.into_iter().collect();
-    format!(
-        "The following resource(s) failed to {action}: [{}]. ",
-        named.join(", ")
-    )
+    /// A create the EXPRESS deployment mode carried out, which CloudFormation names in the
+    /// summary of the resources it could not create ([`super::create_action`]).
+    pub const CREATE_VIA_EXPRESS_MODE: &str = "create via Express Mode";
 }
 
 /// The message CloudFormation answers when a request READS a stack that is not addressable:
@@ -4437,12 +4432,12 @@ pub fn deployment_config_in_force(
         mode: config
             .and_then(|config| config.mode.clone())
             .or_else(|| Some(DEPLOYMENT_CONFIG_MODE_STANDARD.to_string())),
-        // `DeploymentConfig$DisableRollback`: "Specifies whether to disable rollback of
-        // the stack if the stack operation fails. Default: false." The operation ran with
-        // that default when the request named no value.
+        // `DeploymentConfig$DisableRollback`: a request that stated the flag is reported as
+        // having stated it; one that did not is reported with the value the MODE it runs in
+        // puts in force ([`mode_disables_rollback`]).
         disable_rollback: config
             .and_then(|config| config.disable_rollback)
-            .or(Some(false)),
+            .or_else(|| Some(mode_disables_rollback(stored_deployment_mode(config)))),
     })
 }
 

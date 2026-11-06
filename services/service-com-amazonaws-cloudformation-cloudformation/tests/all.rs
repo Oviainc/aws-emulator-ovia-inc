@@ -39,6 +39,8 @@ mod cdk_metadata_resource_type;
 mod change_set_early_validation;
 #[path = "all/change_set_hooks.rs"]
 mod change_set_hooks;
+#[path = "all/change_set_import_and_drift.rs"]
+mod change_set_import_and_drift;
 #[path = "all/change_set_lifecycle.rs"]
 mod change_set_lifecycle;
 #[path = "all/change_set_preview.rs"]

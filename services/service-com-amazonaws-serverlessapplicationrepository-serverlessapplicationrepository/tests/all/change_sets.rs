@@ -1101,14 +1101,25 @@ async fn the_change_set_carries_what_the_deployment_asked_for() {
 
     // (case, the request's extra members, expected change set name, expected
     // description, expected (key, value) parameters, expected (key, value) tags)
+    //
+    // A request that overrides no parameter still deploys with the one the template
+    // declares, at the `Default` it declares for it: that is the value in force, which is
+    // what the change set CloudFormation creates reports for it.
     let cases: Vec<PassThroughCase> = vec![
-        ("nothing but the stack", json!({}), None, "", vec![], vec![]),
+        (
+            "nothing but the stack",
+            json!({}),
+            None,
+            "",
+            vec![("QueueName", "passthrough")],
+            vec![],
+        ),
         (
             "a named change set with a description",
             json!({ "changeSetName": "my-change-set", "description": "deploy the queue" }),
             Some("my-change-set"),
             "deploy the queue",
-            vec![],
+            vec![("QueueName", "passthrough")],
             vec![],
         ),
         (

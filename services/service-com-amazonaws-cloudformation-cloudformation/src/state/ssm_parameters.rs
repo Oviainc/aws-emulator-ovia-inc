@@ -21,9 +21,11 @@
 //! function that reads it, exactly as a parameter declared with that type directly would be
 //! ([`parameter_types_in_force`] is what every evaluation scope takes its types from).
 //!
-//! A name the store does not answer for leaves the name itself the value in force: one
-//! unanswered read is no evidence about the parameter, and nothing here invents a value
-//! for it.
+//! A name the store does not answer for leaves the name itself the value in force once a
+//! deployment is under way: one unanswered read is no evidence about the parameter, and
+//! nothing here invents a value for it. A call that resolves its parameters BEFORE it writes
+//! anything is answered differently — it is REFUSED ([`resolve_in_force`]), because nothing
+//! has been committed to that a missing value could be deployed around.
 //!
 //! The store is read through the SAME in-process, signed call a resource's own create and a
 //! `{{resolve:ssm:…}}` dynamic reference ride on ([`super::provisioner::call_ssm`]), so a
@@ -127,12 +129,85 @@ pub async fn resolve(
             held.insert(name.to_string(), value);
         }
     }
+    record_resolved(&declared_types, parameters, &held);
+}
+
+/// CloudFormation's refusal for a request whose SSM-typed parameters address names Parameter
+/// Store does not answer for.
+///
+/// The fixed text is CloudFormation's own; the variable part is the list of parameter-store
+/// names it could not read, in the order the request addressed them.
+pub fn unable_to_fetch(names: &[String]) -> String {
+    format!(
+        "Unable to fetch parameters [{}] from parameter store for this account.",
+        names.join(", ")
+    )
+}
+
+/// The value Parameter Store holds under each name the SSM-typed parameters of
+/// `template_body` address, given the `values` in force for those parameters.
+///
+/// `Err` is [`unable_to_fetch`]: a name the store does not answer for leaves the request with
+/// no value for that parameter, so a call that resolves its parameters BEFORE it writes
+/// anything — which is what `CreateChangeSet` does when it plans — is refused rather than
+/// planned around a value nobody read.
+///
+/// One read per DISTINCT name, exactly as [`resolve`] costs.
+pub async fn resolve_in_force(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    template_body: &str,
+    values: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let declared = super::template::parse(template_body).unwrap_or_default();
+    let declared_types = declared.parameter_types();
+    let mut addressed: Vec<&str> = Vec::new();
+    for (key, value) in values {
+        if is_ssm_typed(&declared_types, key) && !addressed.contains(&value.as_str()) {
+            addressed.push(value.as_str());
+        }
+    }
+    let mut held: BTreeMap<String, String> = BTreeMap::new();
+    let mut unanswered: Vec<String> = Vec::new();
+    for name in addressed {
+        match value_of(ctx, region, name).await {
+            Some(value) => {
+                held.insert(name.to_string(), value);
+            }
+            None => unanswered.push(name.to_string()),
+        }
+    }
+    if !unanswered.is_empty() {
+        return Err(unable_to_fetch(&unanswered));
+    }
+    Ok(held)
+}
+
+/// Record, on each SSM-typed parameter of `declared_types`, the value `held` carries for the
+/// name that parameter addresses — its [`StoredParameter::resolved_value`], so the parameter
+/// reports the NAME it addressed and the VALUE in force.
+pub fn record_resolved(
+    declared_types: &BTreeMap<String, String>,
+    parameters: &mut [StoredParameter],
+    held: &BTreeMap<String, String>,
+) {
     for parameter in parameters {
-        if !is_ssm_typed(&declared_types, &parameter.key) {
+        if !is_ssm_typed(declared_types, &parameter.key) {
             continue;
         }
         parameter.resolved_value = held.get(&parameter.value).cloned();
     }
+}
+
+/// [`record_resolved`] for a caller that holds the template BODY rather than its declared
+/// parameter types.
+pub fn record_resolved_for(
+    template_body: &str,
+    parameters: &mut [StoredParameter],
+    held: &BTreeMap<String, String>,
+) {
+    let declared = super::template::parse(template_body).unwrap_or_default();
+    record_resolved(&declared.parameter_types(), parameters, held);
 }
 
 /// Whether the template declares `key` with an SSM-typed `Type`, so the value in force for

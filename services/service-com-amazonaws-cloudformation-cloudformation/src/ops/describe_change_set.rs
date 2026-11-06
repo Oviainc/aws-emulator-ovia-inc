@@ -173,7 +173,7 @@ fn change_view(stored: &StoredResourceChange) -> Change {
             resource_type: Some(stored.resource_type.clone()),
             replacement: stored.replacement.clone(),
             scope: Some(stored.scope.clone()),
-            resource_drift_status: None,
+            resource_drift_status: stored.resource_drift_status.clone(),
             resource_drift_ignored_attributes: None,
             details: Some(stored.details.iter().map(detail_view).collect()),
             change_set_id: None,
@@ -187,10 +187,13 @@ fn change_view(stored: &StoredResourceChange) -> Change {
 
 /// One stored property-level change as the modelled `ResourceChangeDetail` shape.
 ///
-/// The drift-aware members (`BeforeValue`/`AfterValue` and their sources, `Drift`) and
-/// `Path` are left absent: they are reported for a drift-aware change set, which needs the
-/// resource's ACTUAL state read back from the owning service, and an invented before value
-/// is worse than an absent one.
+/// The drift-aware members are reported for a change computed against the resource's ACTUAL
+/// state and absent for every other change, which is what "only present for drift-aware
+/// change sets" states: the before value is the one the owning service reported and the
+/// after value the one the template declares, each beside where it came from
+/// ([`crate::state::change_plan::DriftedValues`]). `Path` and `Drift` are left absent: the
+/// detail reports the DECLARED property, and the per-property drift timestamps are not
+/// something this comparison read.
 fn detail_view(stored: &StoredChangeDetail) -> ResourceChangeDetail {
     ResourceChangeDetail {
         target: Some(ResourceTargetDefinition {
@@ -198,10 +201,21 @@ fn detail_view(stored: &StoredChangeDetail) -> ResourceChangeDetail {
             name: stored.name.clone(),
             requires_recreation: Some(stored.requires_recreation.clone()),
             path: None,
-            before_value: None,
-            after_value: None,
-            before_value_from: None,
-            after_value_from: None,
+            before_value: stored
+                .drifted
+                .as_ref()
+                .map(|drifted| drifted.before_value.clone()),
+            after_value: stored
+                .drifted
+                .as_ref()
+                .map(|drifted| drifted.after_value.clone()),
+            before_value_from: stored.drifted.as_ref().map(|_| {
+                crate::state::change_plan::BEFORE_VALUE_FROM_ACTUAL_STATE.to_string()
+            }),
+            after_value_from: stored
+                .drifted
+                .as_ref()
+                .map(|_| crate::state::change_plan::AFTER_VALUE_FROM_TEMPLATE.to_string()),
             drift: None,
             attribute_change_type: None,
         }),

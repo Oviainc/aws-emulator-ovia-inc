@@ -473,9 +473,9 @@ async fn a_name_parameter_store_does_not_hold_leaves_the_name_in_force() {
 }
 
 /// RULE (the third deploying path): a change set is a PLAN, so an SSM-typed parameter it
-/// carries is resolved by the call that EXECUTES it — `ExecuteChangeSet` deploys the
-/// template, so the value in force is the one Parameter Store holds then, and a name the
-/// store holds nothing under is refused there with nothing deployed.
+/// carries is resolved AGAIN by the call that EXECUTES it — `ExecuteChangeSet` deploys the
+/// template, so the value in force is the one Parameter Store holds then rather than the one
+/// the plan was written against.
 #[tokio::test]
 async fn executing_a_change_set_deploys_the_value_the_store_holds() {
     let router = router();
@@ -546,9 +546,9 @@ Outputs:
         "the stack must report the name it addresses and the value in force, got {reported:?}"
     );
 
-    // The complement on the same path: a plan whose SSM-typed parameter addresses a name
-    // the store does not answer for is executed with the NAME in force, reporting no
-    // resolved value for it.
+    // The complement on the same path: a plan whose SSM-typed parameter addresses a name the
+    // store does not answer for is refused where it is PLANNED — CloudFormation resolves such
+    // a parameter while it computes the change set — and no stack is created for it.
     let absent = r#"Parameters:
   Version:
     Type: AWS::SSM::Parameter::Value<String>
@@ -568,32 +568,21 @@ Outputs:
     )
     .await;
     assert_eq!(
-        status_code, 200,
-        "CreateChangeSet must accept the plan, got {status_code}: {body}"
+        status_code, 400,
+        "CreateChangeSet must refuse a name the store does not answer for, got \
+         {status_code}: {body}"
     );
-    wait_for_the_transition().await;
-    let (status_code, body) =
-        execute_change_set(&router, "ssm-plan-absent", Some("ssm-typed-plan-absent")).await;
-    assert_eq!(
-        status_code, 200,
-        "ExecuteChangeSet must be accepted, got {status_code}: {body}"
+    assert!(
+        body.contains(
+            "Unable to fetch parameters [/probe/planned-absent] from parameter store for \
+             this account."
+        ),
+        "the refusal must name the parameter-store name it could not read, got {body}"
     );
-    wait_for_the_transition().await;
-    let (_, body) = describe_stack(&router, "ssm-typed-plan-absent").await;
-    let outputs = wire_outputs(&body);
+    let (status_code, body) = describe_stack(&router, "ssm-typed-plan-absent").await;
     assert_eq!(
-        output_for(&outputs, "Resolved").and_then(|output| output.value.as_deref()),
-        Some("/probe/planned-absent"),
-        "an unanswered read leaves the name the value in force, got {outputs:?}"
-    );
-    let reported = wire_parameters(&body);
-    assert_eq!(
-        reported
-            .iter()
-            .map(|parameter| parameter.resolved_value.as_deref())
-            .collect::<Vec<_>>(),
-        vec![None],
-        "the stack must report no resolved value for it, got {reported:?}"
+        status_code, 400,
+        "the refused plan must have created no stack, got {status_code}: {body}"
     );
 }
 

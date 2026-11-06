@@ -298,11 +298,21 @@ async fn a_create_change_set_materialises_its_stack_and_execute_completes_it() {
         }
 
         // "CloudFormation creates a stack with a unique stack ID, but no template or
-        // resources": the template is the CHANGE SET's until it is executed.
+        // resources": the template the stack would be deployed from is the CHANGE SET's
+        // until it is executed — and a read of the stack's template serves that very
+        // document, which is what makes a prepared change set reviewable and executable
+        // through the stack it created.
         let (code, body) = get_template(&router, case.stack_name, None).await;
         assert_eq!(
-            code, 400,
-            "case {:?}: a stack in review has no template yet, got {code} {body}",
+            code, 200,
+            "case {:?}: a stack in review serves its change set's template, got {code} {body}",
+            case.case
+        );
+        assert_eq!(
+            xml_text(&body, "TemplateBody").as_deref(),
+            Some(case.template.as_str()),
+            "case {:?}: GetTemplate(StackName) answers the body the change set submitted, \
+             got {body}",
             case.case
         );
         let (code, body) = call(
@@ -978,11 +988,9 @@ async fn create_change_set_refuses_what_it_cannot_plan() {
             status: 400,
             error_code: "ValidationError",
         },
-        // What this slice cannot plan is answered 501 — "nobody has written it yet" —
-        // rather than guessed at: resources to import (this emulator creates no stack
-        // resources). A `TemplateURL`, by contrast, is RESOLVED: the object it addresses is
-        // read out of this emulator's own Amazon S3, so a URL naming a bucket nothing
-        // created is the request's own bad reference.
+        // A `TemplateURL` is RESOLVED: the object it addresses is read out of this
+        // emulator's own Amazon S3, so a URL naming a bucket nothing created is the
+        // request's own bad reference.
         RefusalCase {
             case: "a template URL naming no object this account can read",
             members: vec![
@@ -995,7 +1003,7 @@ async fn create_change_set_refuses_what_it_cannot_plan() {
             error_code: "ValidationError",
         },
         RefusalCase {
-            case: "importing resources that already exist",
+            case: "an IMPORT that names no resource to import",
             members: vec![
                 member("StackName", "import"),
                 member("ChangeSetName", "cs"),
@@ -1005,8 +1013,8 @@ async fn create_change_set_refuses_what_it_cannot_plan() {
                     r#"{"Resources":{"A":{"Type":"AWS::SNS::Topic"}}}"#,
                 ),
             ],
-            status: 501,
-            error_code: "NotImplemented",
+            status: 400,
+            error_code: "ValidationError",
         },
         RefusalCase {
             case: "a template body that is neither JSON nor YAML",

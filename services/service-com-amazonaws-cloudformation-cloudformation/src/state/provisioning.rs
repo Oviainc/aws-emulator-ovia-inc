@@ -291,6 +291,11 @@ pub struct StackProvenance {
     pub stack_id: String,
     /// The stack-level `Tags` in force, in the order the stack records them.
     pub tags: Vec<(String, String)>,
+    /// Whether the deployment in force on the stack runs in the EXPRESS deployment mode,
+    /// which is part of how a failure of these resources is REPORTED: the mode names itself
+    /// in the summary of what could not be created
+    /// ([`super::create_action`]).
+    pub express: bool,
 }
 
 impl StackProvenance {
@@ -1851,6 +1856,39 @@ pub async fn reconcile(
         outcome
             .transitions
             .push(ResourceTransition::creating(&resource));
+        // A physical name identifies ONE resource, and CLOUDFORMATION itself holds the
+        // record of which of this stack's resources holds which name: a declaration that
+        // resolved to a name another resource of this stack already holds — the one the
+        // stack had before this deployment, or one this very walk has just created — cannot
+        // be created, so nothing is asked of the owning service and the failure is reported
+        // in CloudFormation's own words rather than as a handler's refusal
+        // ([`super::physical_name`]).
+        let collision = super::physical_name::taken_in_the_stack(
+            &resource,
+            outcome
+                .resources
+                .iter()
+                .chain(previous.iter().filter(|existing| already_deployed(existing))),
+        )
+        .map(|existing| {
+            super::physical_name::already_exists_in_stack(
+                &existing.physical_resource_id,
+                &stack.stack_id,
+            )
+        });
+        if let Some(reason) = collision {
+            outcome.failure = Some(super::resource_failure_summary(
+                super::create_action(stack.express),
+                [resource.logical_id.as_str()],
+            ));
+            outcome.transitions.push(ResourceTransition::failed(
+                &resource,
+                super::resource_status::CREATE_FAILED,
+                reason,
+            ));
+            outcome.resources.push(resource);
+            break;
+        }
         // A CUSTOM RESOURCE is backed by no API of this emulator's: it is backed by the
         // PROVIDER its own `ServiceToken` names. CloudFormation SENDS that provider a
         // request and holds the resource until the provider answers at the request's
@@ -1906,7 +1944,7 @@ pub async fn reconcile(
                 // does on a refused create.
                 Err(refusal) => {
                     outcome.failure = Some(super::resource_failure_summary(
-                        super::failed_action::CREATE,
+                        super::create_action(stack.express),
                         [resource.logical_id.as_str()],
                     ));
                     outcome.transitions.push(ResourceTransition::failed(
@@ -2071,7 +2109,7 @@ pub async fn reconcile(
                     // rollback still deletes what the create made.
                     Ok(Readiness::Failed(reason)) => {
                         outcome.failure = Some(super::resource_failure_summary(
-                            super::failed_action::CREATE,
+                            super::create_action(stack.express),
                             [resource.logical_id.as_str()],
                         ));
                         outcome.transitions.push(ResourceTransition::finished(
@@ -2084,7 +2122,7 @@ pub async fn reconcile(
                     }
                     Err(refusal) => {
                         outcome.failure = Some(super::resource_failure_summary(
-                            super::failed_action::CREATE,
+                            super::create_action(stack.express),
                             [resource.logical_id.as_str()],
                         ));
                         outcome.transitions.push(ResourceTransition::finished(
@@ -2099,7 +2137,7 @@ pub async fn reconcile(
             }
             Err(refusal) => {
                 outcome.failure = Some(super::resource_failure_summary(
-                    super::failed_action::CREATE,
+                    super::create_action(stack.express),
                     [resource.logical_id.as_str()],
                 ));
                 outcome.transitions.push(ResourceTransition::failed(

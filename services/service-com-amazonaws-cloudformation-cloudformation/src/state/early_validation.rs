@@ -77,6 +77,26 @@ pub fn already_exists(resource_type: &str, identifier: &str) -> String {
     format!("Resource of type '{resource_type}' with identifier '{identifier}' already exists.")
 }
 
+/// The converse sentence, for a resource that is NOT there: what a resource handler reports
+/// for an identifier the service that owns the type does not hold, whose variable parts are
+/// the declared type and the identifier that was looked for.
+///
+/// Read by the IMPORT change sets `CreateChangeSet` plans
+/// ([`super::resource_import`]): a resource to import that the owning service does not hold
+/// is no resource to adopt, so the plan cannot be carried out.
+pub fn not_found(resource_type: &str, identifier: &str) -> String {
+    format!("Resource of type '{resource_type}' with identifier '{identifier}' was not found.")
+}
+
+/// Whether a resource of `resource_type` can be READ BACK from the service that owns it at
+/// all — the question [`taken_names`] puts, answered without putting it.
+///
+/// A type with no owning provisioner here is one nothing can be established about: it is
+/// neither reported as taken nor as missing, because no read was served either way.
+pub fn read_back(resource_type: &str) -> bool {
+    owner_for(resource_type).is_some()
+}
+
 /// The `StatusReason` a change set early validation failed carries: which validations failed,
 /// and where the detail of the failure is reported.
 ///
@@ -309,6 +329,7 @@ mod tests {
             replacement: None,
             details: Vec::new(),
             policy_action: None,
+            resource_drift_status: None,
         };
         let rows: &[(&str, Vec<StoredResourceChange>, Option<&str>)] = &[
             (

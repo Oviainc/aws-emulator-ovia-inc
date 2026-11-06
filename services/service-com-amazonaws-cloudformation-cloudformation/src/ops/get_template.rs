@@ -276,19 +276,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 name_or_id,
             ))
         })?;
-        // A stack a `CREATE` change set created carries no template until that change set
-        // is executed, and "if the template doesn't exist, a ValidationError is returned".
-        let template_body = stack.template_body.clone().ok_or_else(|| {
-            crate::scaffolded::Scaffolded::validation_error(
-                crate::state::template_does_not_exist(name_or_id, &stack.status),
-            )
-        })?;
+        let stack_status = stack.status.clone();
+        // A stack a `CREATE` change set created carries no template of its own until that
+        // change set is executed ("CloudFormation creates a stack with a unique stack ID,
+        // but no template or resources") — but it does carry the change set that created it
+        // (`Stack$ChangeSetId`), and that change set's template IS the document the stack
+        // would be deployed from, which is what a read of its template serves while it is in
+        // review. Only a stack with no such change set either has no template at all, and
+        // "if the template doesn't exist, a ValidationError is returned".
+        let stack_template = stack
+            .template_body
+            .is_some()
+            .then(|| (stack.processed_stage_body().map(str::to_string), None))
+            .or_else(|| {
+                let change_set = store.resolve_change_set(
+                    &region,
+                    stack.change_set_id.as_deref()?,
+                    None,
+                )?;
+                Some((
+                    change_set.processed_template_body().map(str::to_string),
+                    Some(change_set.template_body.clone()),
+                ))
+            });
+        let Some((serveable_processed, change_set_body)) = stack_template else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::template_does_not_exist(name_or_id, &stack_status),
+            ));
+        };
+        let template_body = match change_set_body {
+            Some(body) => body,
+            None => stack.template_body.clone().unwrap_or_default(),
+        };
 
-        // The one processed stage this read has: bound ONCE, so the stage advertised and
-        // the stage served are the same value rather than two independent lookups. It is
-        // the whole pipeline's stage — the declared transforms applied to the body the
-        // deploying operation spliced the `AWS::Include` snippets into.
-        let serveable_processed = stack.processed_stage_body().map(str::to_string);
         // "For stacks, the Original and Processed templates are always available" — except
         // for a template whose transform this emulator cannot apply, whose Processed stage
         // is answered 501 below: a stage the read cannot serve is not advertised as

@@ -132,6 +132,11 @@ use crate::state::{change_set_type, execution_status, status, PendingChangeSetSt
 /// DisableRollback parameter").
 const ON_STACK_FAILURE_DO_NOTHING: &str = "DO_NOTHING";
 
+/// The `OnStackFailure` value that takes the STACK away when the execution of a change set
+/// that creates it fails ("DELETE - if the stack creation fails, delete the stack"), which
+/// `CreateStack` spells `OnFailure=DELETE`.
+const ON_STACK_FAILURE_DELETE: &str = "DELETE";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -240,14 +245,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         change_set.change_set_id.clone(),
                         change_set.template_body.clone(),
                         change_set.parameters.clone(),
+                        // What a DRIFT-AWARE execution has to put back is read below, off
+                        // the resources the stack has right now.
+                        if crate::state::drift::reverts_drift(
+                            change_set.deployment_mode.as_deref(),
+                        ) {
+                            store
+                                .resolve(&request_region, &change_set.stack_id)
+                                .map(|stack| stack.current_resources())
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        },
                     )
                 })
+        };
+        // A `REVERT_DRIFT` change set brings the resources back to what the template
+        // declares, so what its execution has to change is what they REALLY are now: the
+        // configuration each drifted resource is in is read from the service that owns it
+        // here, with the store unlocked, and handed to the deployment below as the state it
+        // reconciles against — which is what makes the execution re-apply the declared
+        // configuration to a resource whose template did not change at all.
+        let drifted = match &planned {
+            Some((_, _, _, deployed)) if !deployed.is_empty() => {
+                crate::state::drift::drifted(ctx, &request_region, deployed).await
+            }
+            _ => Vec::new(),
         };
         // `None` for a request that addresses no change set this Region holds, which the
         // block below refuses with the modelled `ChangeSetNotFoundException`: there is
         // nothing to resolve for a plan that does not exist.
         let resolved_parameters = match planned {
-            Some((change_set_id, template_body, parameters)) => {
+            Some((change_set_id, template_body, parameters, _)) => {
                 // The values in force for that plan: the ones it carries, plus the
                 // template's own `Default` for a declared parameter it states none for —
                 // the same resolution a create or an update makes before it deploys, and
@@ -276,6 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             provenance,
             refused_deployment,
             role_in_force,
+            deletes_the_stack_on_failure,
         ) = {
             let mut store = state.lock();
             store.settle(now);
@@ -345,6 +375,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let change_set_id = change_set.change_set_id.clone();
             let stack_id = change_set.stack_id.clone();
             let creates_the_stack = change_set.change_set_type == change_set_type::CREATE;
+            // An IMPORT change set brings resources that already exist under the stack's
+            // management: the stack moves through the IMPORT statuses, and the resources it
+            // adopts are recorded rather than created
+            // ([`crate::state::resource_import`]).
+            let imports_resources = change_set.change_set_type == change_set_type::IMPORT;
             let template_body = change_set.template_body.clone();
             // The parameters this execution deploys: the change set's own values in force,
             // with every SSM-typed one carrying the value Parameter Store held when this
@@ -386,6 +421,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // computed and stored when it was created: what the STACK POLICY in force is
             // decided against below.
             let planned_changes = change_set.changes.clone();
+            // "DELETE - if the stack creation fails, delete the stack": what the FAILED
+            // execution of a change set that creates its stack does with that stack, read
+            // off the change set here with everything else it carries.
+            let deletes_the_stack_on_failure =
+                change_set.on_stack_failure.as_deref() == Some(ON_STACK_FAILURE_DELETE);
             // "DO_NOTHING - if the stack creation fails, do nothing. This is equivalent to
             // specifying true for the DisableRollback parameter." The deployment
             // configuration the change set was created with states the same thing through
@@ -514,7 +554,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // What the stack's resources are BEFORE this deployment: what executing the
             // change set has to keep, replace or delete in the services that own them.
-            let previous_resources = stack.current_resources().to_vec();
+            let mut previous_resources = stack.current_resources().to_vec();
             // The change set's configuration becomes the stack's: this is the call that
             // applies it, which is why the template only now reaches the stack. The
             // PROCESSED stage it carries is the one the change set computed and stored
@@ -574,7 +614,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // stack": a CREATE change set creates the stack it had left in
             // REVIEW_IN_PROGRESS, an UPDATE change set updates one that already exists —
             // which is the operation `Stack$LastOperations` reports from here on.
-            if creates_the_stack {
+            if imports_resources {
+                // "IMPORT_IN_PROGRESS … IMPORT_COMPLETE": adopting resources is neither a
+                // create nor an update of what the stack has, and the stack reports it as
+                // the import it is.
+                stack.begin_transition(
+                    now,
+                    status::IMPORT_IN_PROGRESS,
+                    status::IMPORT_COMPLETE,
+                    Some(operation_id),
+                    Some(client_request_token),
+                );
+            } else if creates_the_stack {
                 stack.begin_transition(
                     now,
                     status::CREATE_IN_PROGRESS,
@@ -616,6 +667,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let refused_deployment = stack.unresolved_import_failure();
             let region = stack.region.clone();
             let declared = stack.current_resources().to_vec();
+            // A resource the plan ADOPTS already exists in the service that owns it, and
+            // executing the change set is what puts it under the stack's management: its
+            // record is installed HERE, as a resource the stack HAS
+            // ([`crate::state::resource_import::adopted_resources`]). So the deployment
+            // reconciles against it instead of creating it — nothing is asked of that
+            // service about the resource, which importing does not modify — and the stack
+            // reports it as a resource this operation brought under management rather than
+            // one it created.
+            let adopted = crate::state::resource_import::adopted_resources(
+                &planned_changes,
+                &declared,
+            );
+            // An IMPORT change set's resources are IMPORTED, which is the resource status
+            // that names what happened to them; a CREATE or UPDATE change set that adopts a
+            // resource instead of creating it updates the stack's record of it, which is
+            // what the recorded auto-import deploy reports for one.
+            let adopted_status = if imports_resources {
+                crate::state::resource_status::IMPORT_COMPLETE
+            } else {
+                crate::state::resource_status::UPDATE_COMPLETE
+            };
+            for record in &adopted {
+                stack.resources.push(crate::state::DeployedResource::new(
+                    record.clone(),
+                    adopted_status,
+                    now,
+                ));
+            }
+            previous_resources.extend(adopted);
+            // The configuration a DRIFTED resource is REALLY in, read above: the deployment
+            // reconciles against the live state rather than against the configuration the
+            // stack recorded, so the declared one is applied again through the owning
+            // service's own update — which is what reverting drift is.
+            for drifted in &drifted {
+                if let Some(previous) = previous_resources
+                    .iter_mut()
+                    .find(|previous| previous.logical_id == drifted.logical_id)
+                {
+                    previous.properties = drifted.actual.clone();
+                }
+            }
             let provenance = stack.provenance();
 
             // "When you execute a change set, CloudFormation deletes all other change sets
@@ -644,6 +736,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 provenance,
                 refused_deployment,
                 role_in_force,
+                deletes_the_stack_on_failure,
             )
         };
 
@@ -753,7 +846,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 if stack.disable_rollback {
                                     None
                                 } else {
-                                    stack.begin_rollback(failed_at, failure);
+                                    // What the caller asked for decides what becomes of the
+                                    // stack a failed create leaves behind: `DELETE` takes
+                                    // the stack itself away once the resources it made are
+                                    // removed — the same unwind, settling into
+                                    // `DELETE_COMPLETE` rather than `ROLLBACK_COMPLETE`, so
+                                    // the name the failed create occupied is free again —
+                                    // and `ROLLBACK` leaves the stack reporting that it was
+                                    // rolled back.
+                                    if deletes_the_stack_on_failure {
+                                        stack.begin_transition(
+                                            failed_at,
+                                            status::DELETE_IN_PROGRESS,
+                                            status::DELETE_COMPLETE,
+                                            Some(crate::state::new_operation_id()),
+                                            input.client_request_token.clone(),
+                                        );
+                                    } else {
+                                        stack.begin_rollback(failed_at, failure);
+                                    }
                                     // With the records the stack HOLDS, which is the set
                                     // the removal reports a deletion of, and what it does
                                     // with the `DeletionPolicy` of a resource this

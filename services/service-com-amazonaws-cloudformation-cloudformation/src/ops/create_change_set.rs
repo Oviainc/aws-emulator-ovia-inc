@@ -50,8 +50,19 @@
 //! unchanged ([`crate::state::template_url`]); a URL naming no readable object is the
 //! `ValidationError` the request's own reference earns.
 //!
-//! Answered 501 rather than guessed at: `ChangeSetType=IMPORT` (importing resources that
-//! already exist, which this emulator does not create).
+//! A resource the plan would create that ALREADY EXISTS is adopted rather than created
+//! where the request asks for it — `ChangeSetType=IMPORT` names the resources to adopt and
+//! `ImportExistingResources` asks for every name the template states that is already there
+//! — and the change set reports each of them with the `Import` action and the identifier it
+//! already carries ([`crate::state::resource_import`]). A name another stack already MANAGES
+//! is not adoptable: the change set fails naming the stack that holds it
+//! ([`crate::state::physical_name`]), since adopting it would take over a resource
+//! CloudFormation manages elsewhere.
+//!
+//! The parameters whose value lives in AWS Systems Manager Parameter Store are resolved
+//! while the plan is computed ([`crate::state::ssm_parameters`]), so the plan is computed
+//! from the values an execution would deploy — and a name Parameter Store does not answer
+//! for is the `ValidationError` the request earns, with no stack and no change set created.
 //!
 //! ## Shape of an operation
 //!
@@ -359,22 +370,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .change_set_type
             .as_deref()
             .unwrap_or(change_set_type::UPDATE);
-        // An IMPORT change set brings resources that already exist under a stack's
-        // management. This emulator creates no stack resources, so it has none to import
-        // and answers 501 rather than a change set over resources nobody read.
-        if requested_type == change_set_type::IMPORT {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "CreateChangeSet with ChangeSetType IMPORT (importing existing resources)",
-            ));
-        }
-        // "The resources to import into your stack" — only an IMPORT change set imports.
-        if input
-            .resources_to_import
-            .as_deref()
-            .is_some_and(|resources| !resources.is_empty())
-        {
+        // An IMPORT change set brings resources that ALREADY EXIST under a stack's
+        // management: it creates nothing, so the resources it names are adopted rather
+        // than provisioned ([`crate::state::resource_import`]).
+        let imports_resources = requested_type == change_set_type::IMPORT;
+        let resources_to_import = input.resources_to_import.clone().unwrap_or_default();
+        // "The resources to import into your stack" — only an IMPORT change set imports,
+        // and an IMPORT names the resources it imports.
+        if !imports_resources && !resources_to_import.is_empty() {
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 "ResourcesToImport can only be specified when ChangeSetType is IMPORT",
+            ));
+        }
+        if imports_resources && resources_to_import.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::resource_import::RESOURCES_TO_IMPORT_REQUIRED,
             ));
         }
         // The rollback configuration this change set would put on the stack is held to the
@@ -457,44 +467,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::refuse_unassumable_role(&*self.engine, input.role_arn.as_deref())?;
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
-        // The PRE-DEPLOYMENT validation stage: a resource the change set would CREATE under
-        // an identifier the service that owns it ALREADY holds cannot be created, so the plan
-        // is not one that could be executed — and CloudFormation establishes that while
-        // creating the change set rather than at execution time
-        // (`crate::state::early_validation`). The names come off the submitted template and
-        // are asked about HERE, before the store lock below, because each question reaches
-        // the service that owns the type; which of those resources the plan would really
-        // create is decided from the plan itself, under the lock. `DisableValidation` turns
-        // the stage off, and a change set created with it carries the plan unvalidated.
+        // The submitted template as the plan below reads it, with the parameter values this
+        // change set would deploy with: the ONE reading both stages beneath this need — the
+        // parameter-store resolution, and the names the existence check asks about. A change
+        // set reusing the stack's own template submits no body and so declares nothing new.
+        let declared_submitted = submitted_processed
+            .as_ref()
+            .and_then(|processed| processed.body(input.template_body.as_deref()?))
+            .and_then(crate::state::declared_template);
+        let values_in_force = declared_submitted.as_ref().map(|declared| {
+            let mut values = declared.parameter_defaults();
+            values.extend(supplied.clone());
+            values
+        });
+        // The PARAMETER RESOLUTION stage: a template parameter whose type puts its value in
+        // AWS Systems Manager Parameter Store carries the NAME of a parameter there, and
+        // CloudFormation resolves it while it computes the plan — so the plan is computed
+        // from the values an execution would deploy. A name Parameter Store does not answer
+        // for leaves the request with no value for that parameter, and since nothing has
+        // been created yet the request itself is refused
+        // ([`crate::state::ssm_parameters::resolve_in_force`]): no stack, no change set.
+        //
+        // What is resolved is every parameter this change set would DEPLOY with, not only
+        // the ones the request restated: the template in force decides which of them address
+        // a parameter-store name (the submitted body, or the stack's own where the request
+        // reuses it), and the values in force are that template's declared defaults, the
+        // values the stack already carries for a parameter the request does not restate, and
+        // the ones the request supplies — in that order of precedence, which is the set
+        // `merged_parameters` and `parameters_in_force` resolve to under the lock below. The
+        // stack's half is read under a lock of its own, released before the reads.
+        let (stack_template, stack_parameters) = {
+            let store = state.lock();
+            match store
+                .resolve(&region, &input.stack_name)
+                .filter(|stack| stack.is_live())
+            {
+                Some(stack) => (stack.template_body.clone(), stack.parameters.clone()),
+                None => (None, Vec::new()),
+            }
+        };
+        let resolution_body = input.template_body.clone().or(stack_template);
+        let addressed_values = resolution_body.as_deref().map(|body| {
+            let mut values = crate::state::declared_template(body)
+                .map(|declared| declared.parameter_defaults())
+                .unwrap_or_default();
+            for parameter in &stack_parameters {
+                values.insert(parameter.key.clone(), parameter.value.clone());
+            }
+            values.extend(supplied.clone());
+            values
+        });
+        let resolved_parameters = match (resolution_body.as_deref(), &addressed_values) {
+            (Some(body), Some(values)) => {
+                crate::state::ssm_parameters::resolve_in_force(ctx, &region, body, values)
+                    .await
+                    .map_err(crate::scaffolded::Scaffolded::validation_error)?
+            }
+            _ => ::std::collections::BTreeMap::new(),
+        };
+        // An IMPORT change set adopts resources that already exist, so the template has to
+        // state what becomes of each of them when the stack it joins stops managing it:
+        // "each resource to import must have a DeletionPolicy attribute in your template"
+        // ([`crate::state::resource_import`]). Held BEFORE anything is written, so a refused
+        // import leaves no stack behind.
+        if imports_resources {
+            // An IMPORT states its resources in a template, so one submitted by neither
+            // value nor reference has nothing to import them into: this service's own
+            // wording for that request, as `crate::state::resource_import`'s other input
+            // refusals are.
+            let declared = declared_submitted.as_ref().ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation_error(
+                    "An IMPORT change set must submit the template the resources are \
+                     imported into",
+                )
+            })?;
+            crate::state::resource_import::validate_deletion_policies(
+                declared,
+                &resources_to_import,
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        }
+        // The resources the submitted template NAMES, each with the identifier its owning
+        // service would know it by ([`early_validation::named_resources`]): what the
+        // existence check asks about, and what an adopted resource is reported under.
         //
         // The scope a stated name is evaluated in is what the REQUEST carries: the Region,
         // the stack's name and the parameter values this change set would deploy with. The
         // stack's ID exists only once the stack does, so a name built from it resolves to
         // nothing here and that resource is simply not asked about — a name no service holds
-        // is never reported as taken. A change set reusing the stack's own template submits
-        // no body and so names nothing new to check.
-        let taken_names = match (
-            input.disable_validation == Some(true),
-            submitted_processed
-                .as_ref()
-                .and_then(|processed| processed.body(input.template_body.as_deref()?))
-                .and_then(crate::state::declared_template),
-        ) {
-            (false, Some(declared)) => {
-                let mut values = declared.parameter_defaults();
-                values.extend(supplied.clone());
-                let named = early_validation::named_resources(
-                    &declared,
-                    crate::state::template::StackScope {
-                        region: &region,
-                        stack_name: &input.stack_name,
-                        stack_id: "",
-                    },
-                    &values,
-                );
-                early_validation::taken_names(ctx, &region, &named).await
-            }
+        // is never reported as taken.
+        let named_resources = match (&declared_submitted, &values_in_force) {
+            (Some(declared), Some(values)) => early_validation::named_resources(
+                declared,
+                crate::state::template::StackScope {
+                    region: &region,
+                    stack_name: &input.stack_name,
+                    stack_id: "",
+                },
+                values,
+            ),
             _ => Vec::new(),
+        };
+        // The PRE-DEPLOYMENT validation stage: a resource the change set would CREATE under
+        // an identifier the service that owns it ALREADY holds cannot be created, so the plan
+        // is not one that could be executed — and CloudFormation establishes that while
+        // creating the change set rather than at execution time
+        // (`crate::state::early_validation`). The questions are asked HERE, before the store
+        // lock below, because each one reaches the service that owns the type; which of those
+        // resources the plan would really create is decided from the plan itself, under the
+        // lock. `DisableValidation` turns the stage off, and a change set created with it
+        // carries the plan unvalidated.
+        //
+        // An IMPORT creates nothing, so it has no addition for that check to be about: what
+        // the reads establish for it is whether the resources it ADOPTS are really there,
+        // which is the same question put about the identifiers the request named
+        // (`import_candidates`). One read per named resource either way.
+        let validating = input.disable_validation != Some(true);
+        let import_plan = if imports_resources {
+            crate::state::resource_import::import_changes(&resources_to_import, &named_resources)
+        } else {
+            Vec::new()
+        };
+        let import_candidates = crate::state::resource_import::import_candidates(&import_plan);
+        let taken_names = if validating && !imports_resources {
+            early_validation::taken_names(ctx, &region, &named_resources).await
+        } else {
+            Vec::new()
+        };
+        // `None` where the reads were not made at all — a request that turned the stage off
+        // establishes nothing about any identifier, so nothing is reported as missing.
+        let held_imports = if validating && imports_resources {
+            Some(early_validation::taken_names(ctx, &region, &import_candidates).await)
+        } else {
+            None
+        };
+        // A DRIFT-AWARE change set compares the template against what the stack's resources
+        // REALLY are rather than against the template alone: "REVERT_DRIFT — creates a
+        // drift-aware change set that brings actual resource states in line with template
+        // definitions". So the resources the stack has deployed are read back from the
+        // services that own them HERE, with the store unlocked, exactly as the existence
+        // check above is asked — and under a lock of its own, released before the reads.
+        let reverts_drift = crate::state::drift::reverts_drift(input.deployment_mode.as_deref());
+        let drifted = if reverts_drift {
+            let deployed = {
+                let store = state.lock();
+                store
+                    .resolve(&region, &input.stack_name)
+                    .filter(|stack| stack.is_live())
+                    .map(|stack| stack.current_resources())
+                    .unwrap_or_default()
+            };
+            crate::state::drift::drifted(ctx, &region, &deployed).await
+        } else {
+            Vec::new()
         };
         let mut store = state.lock();
         store.settle(now);
@@ -512,8 +637,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some_and(|(_, status)| *status == status::REVIEW_IN_PROGRESS);
 
         // "You can't use the UPDATE type to create a change set for a new stack or the
-        // CREATE type to create a change set for an existing stack."
-        let creates_the_stack = requested_type == change_set_type::CREATE;
+        // CREATE type to create a change set for an existing stack." An IMPORT brings
+        // resources into a stack that may or may not be there yet ("to create a change set
+        // for an import operation, specify IMPORT"), and where it is not, that change set
+        // creates it — in review, exactly as a CREATE change set does.
+        let creates_the_stack = requested_type == change_set_type::CREATE
+            || (imports_resources && existing.is_none());
         if creates_the_stack {
             if existing.is_some() && !in_review {
                 // The request names a stack that is already there with the type that
@@ -663,13 +792,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // when creating change sets has no effect" — reviewing a macro's expansion in a
         // change set is the very thing the acknowledgement stands in for.
 
-        let mut parameters =
+        let parameters =
             crate::state::merged_parameters(&previous_parameters, input.parameters.as_deref())
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?;
-        // The template this change set would put on the stack is what says which of its
-        // parameters are masked, so the declaration is recorded on the set the change set
-        // stores — and `ExecuteChangeSet` carries it onto the stack with the values.
-        crate::state::record_no_echo(&template_body, &mut parameters);
+        // The parameters this change set would DEPLOY with, which is what it reports: the
+        // resolved set above, plus the template's own `Default` for every parameter the
+        // template declares and nothing supplied a value for — the same set `CreateStack`
+        // and `UpdateStack` record ([`crate::state::parameters_in_force`]), since the plan
+        // reports the values its execution would use. The template this change set would put
+        // on the stack is also what says which of its parameters are masked, which that
+        // resolution records, and `ExecuteChangeSet` carries onto the stack with the values.
+        let mut parameters = crate::state::parameters_in_force(&template_body, parameters);
+        // The VALUE in force for an SSM-typed parameter is the one Parameter Store held when
+        // this call resolved it above, recorded beside the name that addressed it: the change
+        // set reports the name as its `ParameterValue` and that value as its `ResolvedValue`,
+        // and the plan below is computed from it.
+        crate::state::ssm_parameters::record_resolved_for(
+            &template_body,
+            &mut parameters,
+            &resolved_parameters,
+        );
         let parameters = parameters;
 
         // The change list is what a change set IS: "Creates a list of changes that will be
@@ -718,8 +860,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stack holds (which is what comparing against an empty declaration set would
         // read as), because nothing was computed from any document — the change set
         // settles to `FAILED` with the reason instead.
-        let changes = if unprocessable.is_some() {
+        let mut changes = if unprocessable.is_some() {
             Vec::new()
+        } else if imports_resources {
+            // An IMPORT change set does not compare templates at all: it adopts exactly the
+            // resources the request names, each under the identifier it already exists with
+            // ([`crate::state::resource_import`]), which is the plan computed above.
+            import_plan.clone()
         } else {
             crate::state::changes_against(
                 stack_identity.as_ref().map(|(region, stack_name, stack_id)| {
@@ -738,6 +885,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &parameters,
             )
         };
+        // What a DRIFT-AWARE change set adds to that plan: one `Modify` per resource the
+        // service that owns it reports DIFFERENTLY from the configuration the stack recorded,
+        // putting the template's value back over the live one
+        // ([`crate::state::change_plan::drift_change`]). A resource the template comparison
+        // already reports a change for keeps that report: the template states the change
+        // itself, which the execution would apply anyway.
+        for drifted in &drifted {
+            let already_reported = changes
+                .iter()
+                .any(|change| change.logical_resource_id == drifted.logical_id);
+            if !already_reported {
+                changes.push(crate::state::change_plan::drift_change(drifted));
+            }
+        }
 
         // The configuration the change set would carry, resolved once: it is what the
         // comparison below holds a re-created name to AND what the record stores.
@@ -749,7 +910,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::stored_rollback_configuration(input.rollback_configuration.as_ref());
         let deployment_config =
             crate::state::stored_deployment_config(input.deployment_config.as_ref());
-        let stored_change_set_type = if creates_the_stack {
+        let stored_change_set_type = if imports_resources {
+            change_set_type::IMPORT
+        } else if creates_the_stack {
             change_set_type::CREATE
         } else {
             change_set_type::UPDATE
@@ -860,10 +1023,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Validated and within quota: from here the call allocates.
+        // A resource the plan would ADOPT — one it names as already existing, or one it
+        // would CREATE under a name that is already taken — is adoptable only while NO stack
+        // manages that name: a resource another stack owns is that stack's, so adopting it
+        // would take over a resource CloudFormation manages elsewhere. Such a plan fails
+        // naming the stack that holds the resource, and the stack this plan is for keeps the
+        // status it had, in review with nothing provisioned.
+        //
+        // `ImportExistingResources` is what asks for an ADDITION to be adopted instead
+        // ("CloudFormation imports it into the stack instead of creating it"); an IMPORT
+        // change set already reports what it adopts.
+        let adopting = input.import_existing_resources == Some(true);
+        let adoptable: Vec<(&str, &str)> = changes
+            .iter()
+            .filter(|change| {
+                change.action == crate::state::change_action::IMPORT
+                    || (adopting && change.action == crate::state::change_action::ADD)
+            })
+            .filter_map(|change| {
+                let physical = if change.action == crate::state::change_action::IMPORT {
+                    change.physical_resource_id.as_deref()
+                } else {
+                    // An addition has no identifier of its own yet: the one it would be
+                    // created under is what the existence check asked about.
+                    taken_names
+                        .iter()
+                        .find(|taken| taken.logical_id == change.logical_resource_id)
+                        .map(|taken| taken.physical_resource_id.as_str())
+                }?;
+                Some((change.resource_type.as_str(), physical))
+            })
+            .collect();
+        let managed_elsewhere = adoptable.iter().find_map(|(resource_type, physical)| {
+            crate::state::physical_name::managing(
+                store.stacks.iter(),
+                &region,
+                resource_type,
+                physical,
+            )
+            .map(|owner| {
+                crate::state::physical_name::already_exists_in_stack(physical, &owner.stack_id)
+            })
+        });
+        // ...and a resource an IMPORT adopts has to BE there: the plan reports the stack as
+        // managing a resource that already exists, so one the service that owns the type does
+        // not hold — asked above, by reading the identifier the request named — is no resource
+        // to import at all, and the change set fails rather than offering a plan whose
+        // execution would record a resource nobody has. A type nothing here owns is not read
+        // and so establishes neither, and a request that turned the reads off reports nothing
+        // missing: an unanswered read is not evidence of absence.
+        let missing_import = held_imports.as_ref().and_then(|held| {
+            import_candidates
+                .iter()
+                .filter(|candidate| early_validation::read_back(&candidate.resource_type))
+                .find(|candidate| {
+                    !held
+                        .iter()
+                        .any(|read_back| read_back.logical_id == candidate.logical_id)
+                })
+                .map(|candidate| {
+                    early_validation::not_found(
+                        &candidate.resource_type,
+                        &candidate.physical_resource_id,
+                    )
+                })
+        });
+        if adopting && managed_elsewhere.is_none() {
+            crate::state::resource_import::adopt_existing(&mut changes, &taken_names);
+        }
         // What the PRE-DEPLOYMENT validation above makes of this plan: a resource it would
         // CREATE under an identifier an owning service already holds fails the change set,
-        // which is then not offered for execution at all.
-        let conflicting = early_validation::failing_addition(&changes, &taken_names).cloned();
+        // which is then not offered for execution at all. A resource the plan ADOPTS is no
+        // longer one it would create, so nothing of it is left for that check to fail — and
+        // a plan stopped by an owner above failed on that, not on this check.
+        let conflicting = managed_elsewhere
+            .is_none()
+            .then(|| early_validation::failing_addition(&changes, &taken_names).cloned())
+            .flatten();
         let change_set_id = crate::state::new_change_set_id(&region, &input.change_set_name);
         // The id of the operation creating this change set is: every event the creation
         // records carries it, so the events of one change-set creation are reportable as
@@ -955,6 +1191,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(format!(
                     "The template's transforms could not be applied: {reason}"
                 )),
+            ),
+            // A name this plan would ADOPT that another stack already manages is not this
+            // plan's to take: the change set fails naming the stack that holds the resource,
+            // and that stack keeps it.
+            None if managed_elsewhere.is_some() => (
+                change_set_status::FAILED,
+                execution_status::UNAVAILABLE,
+                managed_elsewhere.clone(),
+            ),
+            // ...and a resource to import that the owning service does not hold is no
+            // resource to adopt at all.
+            None if missing_import.is_some() => (
+                change_set_status::FAILED,
+                execution_status::UNAVAILABLE,
+                missing_import.clone(),
             ),
             // A plan the pre-deployment validation did not pass is not offered for
             // execution: the change set fails with the validation's own reason, and the
