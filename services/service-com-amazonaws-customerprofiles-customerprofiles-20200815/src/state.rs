@@ -1370,6 +1370,144 @@ pub fn profile_object_unique_key(object_type_name: &str, identity: &str) -> Stri
     ::hex::encode(digest.finalize())
 }
 
+/// The refusal for an `Object` that is not what the member must hold. Fixed text for the
+/// class: it interpolates nothing out of the request, whose `Object` is sensitive.
+const NOT_AN_OBJECT: &str = "Object must be a string serialized from a JSON object";
+
+/// Why the ingest of ONE object was refused.
+///
+/// Every class here is a bad request about that one object, so ingesting a single object
+/// reports it as `BadRequestException` while ingesting a batch reports it as that item's
+/// own entry — the same classes, read off the same ingest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestRefusal {
+    /// `Object` is not a string serialized from a JSON object.
+    NotAnObject,
+    /// The domain already holds as many profiles as this emulator keeps for one
+    /// ([`MAX_PROFILES_PER_DOMAIN`]), so no profile can be inferred for the object.
+    ProfileCapReached,
+    /// The domain already holds as many profile objects as this emulator keeps for one
+    /// ([`MAX_PROFILE_OBJECTS_PER_DOMAIN`]).
+    ObjectCapReached,
+}
+
+impl IngestRefusal {
+    /// The HTTP status this refusal is answered with: every class is a bad request about
+    /// the object, which is the status `BadRequestException` ("The input you provided is
+    /// invalid") is bound to, and which a batch item's `Code` ("The HTTP status code for
+    /// the error") carries.
+    pub const fn status(self) -> i32 {
+        400
+    }
+
+    /// The sentence the refusal is reported with: fixed text per class, whose only
+    /// variable parts are the domain the request named and the cap it reached.
+    pub fn message(self, domain_name: &str) -> String {
+        match self {
+            Self::NotAnObject => NOT_AN_OBJECT.to_string(),
+            Self::ProfileCapReached => format!(
+                "The maximum number of profiles for domain {domain_name} has been reached: {MAX_PROFILES_PER_DOMAIN}"
+            ),
+            Self::ObjectCapReached => format!(
+                "The maximum number of profile objects for domain {domain_name} has been reached: {MAX_PROFILE_OBJECTS_PER_DOMAIN}"
+            ),
+        }
+    }
+}
+
+/// Ingest ONE object into `domain` under `object_type`, answering the
+/// `ProfileObjectUniqueKey` the service derived for it.
+///
+/// The one ingest path, shared by every operation that takes an object in, so an object
+/// lands in the same place and earns the same key however it arrived: the object is read
+/// through its type's definition, stored under the unique key derived from its own
+/// identity, and tied to the profile that type's keys identify — or, when the type allows
+/// profile creation and no profile matches, to a profile inferred from the data the type
+/// maps onto one. Re-ingesting an object of the same identity replaces it, so it keeps the
+/// instant it first arrived.
+///
+/// `now` is the instant of the call. The caller holds the store, looked the domain and the
+/// object type up in it, and has already materialised the expiry the clock made due
+/// ([`Domain::expire_profile_objects`]).
+pub fn ingest_profile_object(
+    domain: &mut Domain,
+    object_type_name: &str,
+    object_type: &StoredObjectType,
+    object_text: &str,
+    now: SystemTime,
+) -> Result<String, IngestRefusal> {
+    // `Object` is "a string that is serialized from a JSON object", and its modelled
+    // length is already enforced at the boundary. Parsing it here, before the store is
+    // written, is what keeps an object carrying anything else from landing.
+    let object: ::serde_json::Value =
+        ::serde_json::from_str(object_text).map_err(|_| IngestRefusal::NotAnObject)?;
+    if !object.is_object() {
+        return Err(IngestRefusal::NotAnObject);
+    }
+
+    // Read the object through that definition: the key values it carries, the value that
+    // identifies it, the profiles it could belong to, and the standard profile its data
+    // maps into.
+    let ingest = read_profile_object(object_type, &object);
+    let unique_key = profile_object_unique_key(
+        object_type_name,
+        &profile_object_identity(ingest.unique_value.as_deref(), &object),
+    );
+
+    // The service "tries to fetch a standard profile and associate this object with the
+    // profile"; failing that, and only when the type allows profile creation, "an
+    // inferred profile can get created" out of the data the object maps onto a profile —
+    // which is what makes the next object carrying the same key values map onto that same
+    // profile. An object whose type maps none of it onto a profile gives nothing to infer
+    // one from.
+    let profile_id = match domain.match_profile(&ingest.probes) {
+        Some(profile_id) => profile_id,
+        None if object_type.allow_profile_creation && ingest.maps_profile_data => {
+            if domain.profiles.len() >= MAX_PROFILES_PER_DOMAIN {
+                return Err(IngestRefusal::ProfileCapReached);
+            }
+            let profile_id = new_profile_id();
+            let mut profile = ingest.mapped_profile;
+            profile.profile_id = Some(profile_id.clone());
+            domain.put_profile(StoredProfile {
+                profile,
+                created_at: now,
+                last_updated_at: now,
+            });
+            profile_id
+        }
+        // A type that does not allow profile creation leaves an object no profile claims
+        // unmapped: it is held, and no profile reports it.
+        None => String::new(),
+    };
+
+    // At most this many objects per domain: however many requests arrive, and however
+    // many objects one of them carries, the store cannot grow past the cap. Re-ingesting
+    // an object the domain already holds replaces it, so it keeps the instant it first
+    // arrived and is not growth.
+    let created_at = domain
+        .profile_objects_of(object_type_name, &profile_id)
+        .find(|stored| stored.unique_key == unique_key)
+        .map(|stored| stored.created_at);
+    if created_at.is_none() && domain.profile_objects.len() >= MAX_PROFILE_OBJECTS_PER_DOMAIN {
+        return Err(IngestRefusal::ObjectCapReached);
+    }
+
+    domain.put_profile_object(StoredProfileObject {
+        object_type_name: object_type_name.to_string(),
+        unique_key: unique_key.clone(),
+        // Stored as the request carried it, so a listing reports the object that was
+        // ingested rather than a re-rendering of it.
+        object: object_text.to_string(),
+        profile_id,
+        index_values: ingest.index_values,
+        created_at: created_at.unwrap_or(now),
+        last_updated_at: now,
+    });
+
+    Ok(unique_key)
+}
+
 /// Take one page out of `items`, already in ascending cursor order.
 ///
 /// `next_token` is the cursor a previous page handed back: the page resumes at the first

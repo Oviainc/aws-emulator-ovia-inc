@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchPutProfileObject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchPutProfileObject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchPutProfileObject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Ingests up to ten objects into a domain under the profile object type that describes
+//! them, in one call: every item is ingested exactly as `PutProfileObject` ingests one,
+//! and the response reports one entry per item — the item's `Id` with the unique key the
+//! service derived for its object under `Successful`, or that `Id` with the HTTP status
+//! and sentence of the refusal that object would earn on its own under `Failed`. A domain
+//! or object type the store does not hold refuses the whole call with
+//! `ResourceNotFoundException` (404), because neither is a property of one item.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +158,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchPutProfileObject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchPutProfileObjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchPutProfileObject"))
+        // `ctx` carries request metadata only; the engine is reachable from `&self`.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let domain = store
+            .domains
+            .get_mut(&input.domain_name)
+            .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
+        domain.expire_profile_objects(now);
+
+        // "BatchPutProfileObject needs an ObjectType, which can be created using
+        // PutProfileObjectType": the definition is what says where each object's data
+        // belongs, and it is named once for the whole batch, so a type the domain does
+        // not hold leaves no item anything to ingest through.
+        let object_type = domain
+            .object_types
+            .get(&input.object_type_name)
+            .cloned()
+            .ok_or_else(|| {
+                not_found(crate::state::object_type_not_found(&input.object_type_name))
+            })?;
+
+        // Every item is ingested on its own, in the order the request listed them, so one
+        // item's refusal neither stops the batch nor undoes what an earlier item stored:
+        // that is what makes the call partially successful. The `Id` an item carries is
+        // "used to correlate items in the response", so each answer carries the id of the
+        // item it is about, and nothing else identifies it.
+        let mut successful = Vec::new();
+        let mut failed = Vec::new();
+        for item in &input.items {
+            match crate::state::ingest_profile_object(
+                domain,
+                &input.object_type_name,
+                &object_type,
+                &item.object,
+                now,
+            ) {
+                Ok(unique_key) => successful.push(BatchPutProfileObjectResponseItem {
+                    id: item.id.clone(),
+                    profile_object_unique_key: unique_key,
+                }),
+                Err(refusal) => failed.push(BatchPutProfileObjectErrorItem {
+                    id: item.id.clone(),
+                    code: refusal.status(),
+                    message: Some(refusal.message(&input.domain_name)),
+                }),
+            }
+        }
+
+        // Both lists are always reported, so a caller reads "nothing failed" and "nothing
+        // landed" off an empty list rather than off an absent member.
+        Ok(BatchPutProfileObjectOutput {
+            successful: Some(successful),
+            failed: Some(failed),
+        })
     }
+}
+
+/// A domain or object type the request names is not stored.
+fn not_found(message: String) -> BatchPutProfileObjectError {
+    BatchPutProfileObjectErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> BatchPutProfileObjectError {
+    BatchPutProfileObjectErrorModeled::InternalServerException(crate::state::store_unavailable())
+        .into()
 }

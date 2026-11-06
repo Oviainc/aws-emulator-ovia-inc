@@ -102,7 +102,7 @@ async fn put_object_type(emulator: &Emulator, domain: &str, name: &str, definiti
 
 /// The contact-record object type: every field and key above, allowed to infer a profile
 /// only when `allow_profile_creation` says so.
-async fn put_contact_type(
+pub(crate) async fn put_contact_type(
     emulator: &Emulator,
     domain: &str,
     name: &str,
@@ -142,7 +142,12 @@ async fn put_object(
 }
 
 /// `PutProfileObject`, asserting it succeeded, and answering the unique key it derived.
-async fn ingest(emulator: &Emulator, domain: &str, object_type: &str, object: &Value) -> String {
+pub(crate) async fn ingest(
+    emulator: &Emulator,
+    domain: &str,
+    object_type: &str,
+    object: &Value,
+) -> String {
     let (status, body) = put_object(emulator, domain, object_type, object).await;
     assert_eq!(
         status, 200,
@@ -177,7 +182,7 @@ async fn list(
 }
 
 /// The `Items` of a listing, asserting it succeeded.
-async fn listed(
+pub(crate) async fn listed(
     emulator: &Emulator,
     domain: &str,
     object_type: &str,
@@ -195,7 +200,7 @@ async fn listed(
 }
 
 /// The unique keys a listing reports, in the order it reported them.
-fn listed_keys(items: &[Value]) -> Vec<String> {
+pub(crate) fn listed_keys(items: &[Value]) -> Vec<String> {
     items
         .iter()
         .map(|item| {
@@ -246,7 +251,7 @@ async fn search(emulator: &Emulator, domain: &str, key_name: &str, value: &str) 
 
 /// A contact-record object: the shape the fields above read, with the members a row
 /// chooses.
-fn contact(contact_id: &str, customer: Value, extra: Value) -> Value {
+pub(crate) fn contact(contact_id: &str, customer: Value, extra: Value) -> Value {
     let mut object = json!({ "contactId": contact_id, "customer": customer });
     for (member, value) in extra.as_object().expect("an object") {
         object[member] = value.clone();

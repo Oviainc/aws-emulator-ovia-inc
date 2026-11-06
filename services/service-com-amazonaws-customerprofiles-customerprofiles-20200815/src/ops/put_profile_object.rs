@@ -157,16 +157,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
 
-        // `Object` is "a string that is serialized from a JSON object", and its modelled
-        // 1..256000 characters are already enforced at the boundary. Parsing it here,
-        // before the store is reached, is what keeps a request carrying anything else
-        // from writing.
-        let object: ::serde_json::Value =
-            ::serde_json::from_str(&input.object).map_err(|_| bad_request(NOT_AN_OBJECT))?;
-        if !object.is_object() {
-            return Err(bad_request(NOT_AN_OBJECT));
-        }
-
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let domain = store
@@ -187,75 +177,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 not_found(crate::state::object_type_not_found(&input.object_type_name))
             })?;
 
-        // Read the object through that definition: the key values it carries, the value
-        // that identifies it, the profiles it could belong to, and the standard profile
-        // its data maps into.
-        let ingest = crate::state::read_profile_object(&object_type, &object);
-        let unique_key = crate::state::profile_object_unique_key(
+        // One object per request, through the one ingest path every operation that takes
+        // an object in shares.
+        let unique_key = crate::state::ingest_profile_object(
+            domain,
             &input.object_type_name,
-            &crate::state::profile_object_identity(ingest.unique_value.as_deref(), &object),
-        );
-
-        // The service "tries to fetch a standard profile and associate this object with
-        // the profile"; failing that, and only when the type allows profile creation,
-        // "an inferred profile can get created" out of the data the object maps onto a
-        // profile — which is what makes the next object carrying the same key values map
-        // onto that same profile. An object whose type maps none of it onto a profile
-        // gives nothing to infer one from.
-        let profile_id = match domain.match_profile(&ingest.probes) {
-            Some(profile_id) => profile_id,
-            None if object_type.allow_profile_creation && ingest.maps_profile_data => {
-                if domain.profiles.len() >= crate::state::MAX_PROFILES_PER_DOMAIN {
-                    return Err(bad_request_owned(format!(
-                        "The maximum number of profiles for domain {} has been reached: {}",
-                        input.domain_name,
-                        crate::state::MAX_PROFILES_PER_DOMAIN
-                    )));
-                }
-                let profile_id = crate::state::new_profile_id();
-                let mut profile = ingest.mapped_profile;
-                profile.profile_id = Some(profile_id.clone());
-                domain.put_profile(crate::state::StoredProfile {
-                    profile,
-                    created_at: now,
-                    last_updated_at: now,
-                });
-                profile_id
-            }
-            // A type that does not allow profile creation leaves an object no profile
-            // claims unmapped: it is held, and no profile reports it.
-            None => String::new(),
-        };
-
-        // One object per request, and at most this many per domain: however many
-        // requests arrive, the store cannot grow past the cap. Re-ingesting an object the
-        // domain already holds replaces it, so it keeps the instant it first arrived and
-        // is not growth.
-        let created_at = domain
-            .profile_objects_of(&input.object_type_name, &profile_id)
-            .find(|stored| stored.unique_key == unique_key)
-            .map(|stored| stored.created_at);
-        if created_at.is_none()
-            && domain.profile_objects.len() >= crate::state::MAX_PROFILE_OBJECTS_PER_DOMAIN
-        {
-            return Err(bad_request_owned(format!(
-                "The maximum number of profile objects for domain {} has been reached: {}",
-                input.domain_name,
-                crate::state::MAX_PROFILE_OBJECTS_PER_DOMAIN
-            )));
-        }
-
-        domain.put_profile_object(crate::state::StoredProfileObject {
-            object_type_name: input.object_type_name,
-            unique_key: unique_key.clone(),
-            // Stored as the request carried it, so a listing reports the object that was
-            // ingested rather than a re-rendering of it.
-            object: input.object,
-            profile_id,
-            index_values: ingest.index_values,
-            created_at: created_at.unwrap_or(now),
-            last_updated_at: now,
-        });
+            &object_type,
+            &input.object,
+            now,
+        )
+        .map_err(|refusal| bad_request(refusal.message(&input.domain_name)))?;
 
         Ok(PutProfileObjectOutput {
             profile_object_unique_key: Some(unique_key),
@@ -263,17 +194,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The refusal for an `Object` that is not what the member must hold. Fixed text for the
-/// class: it interpolates nothing out of the request, whose `Object` is sensitive.
-const NOT_AN_OBJECT: &str = "Object must be a string serialized from a JSON object";
-
 /// The request is invalid — HTTP 400, the error code a client branches on.
-fn bad_request(message: &str) -> PutProfileObjectError {
-    bad_request_owned(message.to_string())
-}
-
-/// [`bad_request`] for a sentence built from the request and the store.
-fn bad_request_owned(message: String) -> PutProfileObjectError {
+fn bad_request(message: String) -> PutProfileObjectError {
     PutProfileObjectErrorModeled::BadRequestException(BadRequestException {
         message: Some(message),
     })

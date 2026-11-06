@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/batch_get_profile.rs"]
 mod batch_get_profile;
+#[path = "all/batch_put_profile_object.rs"]
+mod batch_put_profile_object;
 #[path = "all/calculated_attribute_definitions.rs"]
 mod calculated_attribute_definitions;
 #[path = "all/delete_calculated_attribute_definition.rs"]
