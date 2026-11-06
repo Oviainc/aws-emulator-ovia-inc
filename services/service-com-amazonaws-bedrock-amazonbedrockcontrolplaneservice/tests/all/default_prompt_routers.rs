@@ -32,7 +32,9 @@
 
 use serde_json::Value;
 
-use crate::support::{date_time_seconds, emulator, label, Emulator, Reply, ACCOUNT, REGION};
+use crate::support::{
+    date_time_seconds, emulator, label, profile_model_id, Emulator, Reply, ACCOUNT, REGION,
+};
 
 /// `PromptRouterStatus` carries exactly one value
 /// (`smithy_query(query="shape",shape="PromptRouterStatus")`).
@@ -47,17 +49,17 @@ const SYSTEM_DEFINED: &str = "SYSTEM_DEFINED";
 
 /// The resource half of the `promptRouterArn` of every router this emulator's Amazon
 /// Bedrock publishes, with the brand each one is published under and the published model
-/// FAMILY it routes within: `(router id, brand, family)`.
+/// FAMILY it routes a prompt up to: `(router id, brand, family)`.
 ///
 /// One row per model family AWS publishes a default router for in "Intelligent prompt
 /// routing"; the ids are the `<provider>.<family>:<n>` form `PromptRouterArn`'s pattern
 /// admits after `default-prompt-router/`. The families are the `modelFamily`
-/// `ListFoundationModels` reports for the models each router routes between, which this
+/// `ListFoundationModels` reports for the model each router falls back to, which this
 /// suite checks rather than assumes. Includes the Amazon Nova router, which no earlier row
 /// of this suite cited.
 const PUBLISHED_ROUTERS: &[(&str, &str, &str)] = &[
     ("amazon.nova:1", "Nova", "Nova"),
-    ("anthropic.claude:1", "Anthropic", "Claude 3"),
+    ("anthropic.claude:1", "Anthropic", "Claude 3.5"),
     ("meta.llama:1", "Meta", "Llama 3.1"),
 ];
 
@@ -113,16 +115,6 @@ fn text(row: &Value, member: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
-}
-
-/// The base `modelId` a published `inference-profile` ARN routes to: the profile id behind
-/// its geography prefix.
-fn profile_model_id(profile_arn: &str) -> String {
-    profile_arn
-        .rsplit_once("inference-profile/")
-        .and_then(|(_, id)| id.split_once('.'))
-        .map(|(_, model_id)| model_id.to_string())
-        .unwrap_or_default()
 }
 
 /// `(modelId, modelFamily)` for every model `ListFoundationModels` reports in `region` —
@@ -318,19 +310,27 @@ async fn every_router_target_is_a_published_inference_profile_of_the_region() {
                      {:?}",
                     read.body
                 );
-                // And the model behind that profile belongs to the line the router's own
-                // description names: two sizes of ONE published family.
+                // And the model behind that profile is one this control plane publishes.
                 let model_id = profile_model_id(target);
-                assert_eq!(
-                    families
-                        .iter()
-                        .find(|(id, _)| *id == model_id)
-                        .map(|(_, listed_family)| listed_family.as_str()),
-                    Some(*family),
+                assert!(
+                    families.iter().any(|(id, _)| *id == model_id),
                     "case {case:?}: the routed model {model_id:?} must be one \
-                     ListFoundationModels reports in the {family:?} family"
+                     ListFoundationModels reports"
                 );
             }
+
+            // The line the router's own description names is the published family of the
+            // model it routes a prompt UP to: the fallback.
+            let fallback_model = profile_model_id(&fallback[0]);
+            assert_eq!(
+                families
+                    .iter()
+                    .find(|(id, _)| *id == fallback_model)
+                    .map(|(_, listed_family)| listed_family.as_str()),
+                Some(*family),
+                "case {case:?} / {router:?}: the fallback model {fallback_model:?} must be \
+                 the one ListFoundationModels reports in the {family:?} family"
+            );
         }
     }
 }

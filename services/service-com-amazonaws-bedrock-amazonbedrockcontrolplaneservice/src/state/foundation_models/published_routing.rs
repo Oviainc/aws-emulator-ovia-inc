@@ -40,11 +40,12 @@ pub struct DefaultPromptRouter {
     pub label: &'static str,
     /// The `modelId`s the router routes between, in the order the summary reports them —
     /// the smaller model first, because the criteria are what sends a prompt UP to the
-    /// larger one. Two sizes of ONE published line ([`FoundationModel::model_family`]):
-    /// routing a prompt between two GENERATIONS of a provider's models is not what the
-    /// feature does, and the line is what the router's description names. Every id is a row
-    /// of [`FOUNDATION_MODELS`] that also carries a cross-region profile
-    /// ([`CROSS_REGION_MODELS`]), because that profile is what a target is reported as.
+    /// larger one. The set AWS publishes for the router, which is a line's smaller model
+    /// and the stronger model a prompt is routed up to; the stronger one is the fallback,
+    /// and its published family ([`FoundationModel::model_family`]) is the line the
+    /// router's description names. Every id is a row of [`FOUNDATION_MODELS`] that also
+    /// carries a cross-region profile ([`CROSS_REGION_MODELS`]), because that profile is
+    /// what a target is reported as.
     pub models: &'static [&'static str],
     /// The `modelId` of the model the router falls back to when the criteria are not met;
     /// one of [`DefaultPromptRouter::models`].
@@ -55,10 +56,10 @@ pub struct DefaultPromptRouter {
 /// their ARNs sort in, which is the order a listing pages through.
 ///
 /// The ids, brands and model sets are the ones AWS publishes in "Intelligent prompt
-/// routing": one router per model family, routing between two models of that family and
-/// falling back to the larger one. The model ids are the rows [`FOUNDATION_MODELS`]
-/// carries for those families, so the two catalogs agree about which models exist, and two
-/// models of ONE published line are what a router routes between.
+/// routing": one router per model family, routing between a smaller model of that family
+/// and the stronger model it falls back to. The model ids are the rows
+/// [`FOUNDATION_MODELS`] carries for those families, so the two catalogs agree about which
+/// models exist.
 pub const DEFAULT_PROMPT_ROUTERS: &[DefaultPromptRouter] = &[
     DefaultPromptRouter {
         id: "amazon.nova:1",
@@ -71,9 +72,9 @@ pub const DEFAULT_PROMPT_ROUTERS: &[DefaultPromptRouter] = &[
         label: "Anthropic",
         models: &[
             "anthropic.claude-3-haiku-20240307-v1:0",
-            "anthropic.claude-3-sonnet-20240229-v1:0",
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
         ],
-        fallback_model: "anthropic.claude-3-sonnet-20240229-v1:0",
+        fallback_model: "anthropic.claude-3-5-sonnet-20241022-v2:0",
     },
     DefaultPromptRouter {
         id: "meta.llama:1",
@@ -102,10 +103,9 @@ pub fn default_prompt_router_name(router: &DefaultPromptRouter) -> String {
 ///
 /// `PromptRouterDescription` is modelled (len 1..200, `^([0-9a-zA-Z:.][ _-]?)+$`) and a
 /// published router carries one, so it is stated for every row by ONE rule rather than
-/// written out per router: what a default router IS, is the published family of the models
-/// it routes between ([`FoundationModel::model_family`]). Read off the model it falls back
-/// to, which is one of them — the models of a router are two sizes of ONE line, so that
-/// row's family is the family of all of them.
+/// written out per router: what a default router IS, is the published family of the model
+/// it routes a prompt UP to ([`FoundationModel::model_family`]) — the stronger model it
+/// falls back to, which is the line a caller is choosing when it picks the router.
 ///
 /// `None` for a router whose fallback model the catalogue offers no row for, because the
 /// family of a model nothing publishes is not something to invent; such a router publishes
@@ -293,6 +293,13 @@ pub const CROSS_REGION_MODELS: &[&str] = &[
 /// by its provider name. Both halves are the row's own published members
 /// ([`FoundationModel::provider_name`], [`FoundationModel::model_name`]), so a profile
 /// names a model exactly as the model catalogue does.
+///
+/// A brand is reported AS PUBLISHED, version separator included, so a name may carry a `.`
+/// that `InferenceProfileName`'s pattern (`^([0-9a-zA-Z][ _-]?)+$`) does not admit. That
+/// pattern constrains the name a CALLER may give a profile of its own — the validating walk
+/// runs on operation inputs — while this is the name AWS itself publishes for a profile no
+/// caller created, and re-spelling a branded name to fit an input constraint would report a
+/// name no client could look the model up by.
 #[must_use]
 pub fn cross_region_model_brand(model: &FoundationModel) -> String {
     if model.provider_name == AWS_MODEL_PROVIDER {

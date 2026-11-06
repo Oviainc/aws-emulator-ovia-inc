@@ -31,7 +31,7 @@
 
 use serde_json::{json, Value};
 
-use crate::support::{emulator, label, Emulator, Reply, ACCOUNT, REGION};
+use crate::support::{emulator, label, profile_model_id, Emulator, Reply, ACCOUNT, REGION};
 
 /// The most tags one resource of this service may carry, as `TooManyTagsException`
 /// documents it ("50 tags per resource").
@@ -163,15 +163,9 @@ async fn published_profile_arns(emu: &Emulator, region: &str) -> Vec<String> {
         .collect()
 }
 
-/// The base `modelId` a published `inference-profile` ARN routes to: the profile id behind
-/// its geography prefix.
-fn profile_model_id(profile_arn: &str) -> String {
-    profile_arn
-        .rsplit_once("inference-profile/")
-        .and_then(|(_, id)| id.split_once('.'))
-        .map(|(_, model_id)| model_id.to_string())
-        .unwrap_or_default()
-}
+// The base `modelId` a published `inference-profile` ARN routes to lives in
+// `crate::support` (`profile_model_id`), so both published-catalogue suites read a profile
+// ARN the same way.
 
 /// The summaries a listing reported.
 fn rows(reply: &Reply, member: &str) -> Vec<Value> {

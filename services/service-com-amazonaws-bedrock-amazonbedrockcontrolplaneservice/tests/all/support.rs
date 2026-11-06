@@ -130,6 +130,19 @@ pub fn foundation_model_arn(region: &str, model_id: &str) -> String {
     format!("arn:aws:bedrock:{region}::foundation-model/{model_id}")
 }
 
+/// The base `modelId` a published `inference-profile` ARN routes to: the
+/// `inferenceProfileId` behind its geography prefix (`us.<modelId>`).
+///
+/// Here rather than in one suite because both the published-catalogue suites read a
+/// profile ARN this way, and how a published profile names its model must be ONE reading.
+pub fn profile_model_id(profile_arn: &str) -> String {
+    profile_arn
+        .rsplit_once("inference-profile/")
+        .and_then(|(_, id)| id.split_once('.'))
+        .map(|(_, model_id)| model_id.to_string())
+        .unwrap_or_default()
+}
+
 /// The WHOLE projection of the published catalog row `model` that a listing
 /// (`ListFoundationModels`) and a read (`GetFoundationModel`) must both report for it in
 /// `region`: the ten members `FoundationModelSummary`/`FoundationModelDetails` declare
