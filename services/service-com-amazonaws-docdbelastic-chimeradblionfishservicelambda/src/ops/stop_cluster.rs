@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops a running elastic cluster: the cluster the request names moves to `STOPPING`
+//! and the clock owes it `STOPPED` a short span later, and the response is computed
+//! from the record this call wrote. A cluster that is not in its settled available
+//! status is refused and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +140,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopCluster"))
+        use crate::state;
+
+        let _ = ctx;
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(StopClusterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: state::STORE_UNREACHABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut guard = store.lock();
+        let Some(record) = guard.clusters.get_mut(&input.cluster_arn) else {
+            return Err(StopClusterErrorModeled::ResourceNotFoundException(
+                state::not_found(state::ResourceKind::Cluster, &input.cluster_arn),
+            )
+            .into());
+        };
+        // The transition the clock has already made due is completed first, so a cluster
+        // whose create or update became due is judged — and stopped — by the status it is
+        // owed rather than the one it was left in.
+        record.settle_due();
+        // A cluster is stopped only from its settled available status: one the service is
+        // still building or changing, and one that is already stopping or stopped, is
+        // refused and nothing is written.
+        state::ensure_available(record, "stopped")
+            .map_err(StopClusterErrorModeled::ValidationException)?;
+
+        // The stop is in flight when this call answers: the cluster reports STOPPING, and
+        // the clock owes it STOPPED a short span later. Nothing sleeps for that — the due
+        // instant is stored on the record and materialised by whoever next reads it.
+        record.begin_transition(state::STATUS_STOPPING);
+        let cluster = record.as_cluster();
+        drop(guard);
+
+        Ok(StopClusterOutput { cluster })
     }
 }

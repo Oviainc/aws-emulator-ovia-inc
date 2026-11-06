@@ -220,7 +220,8 @@ impl ::std::fmt::Debug for ClusterRecord {
 }
 
 impl ClusterRecord {
-    /// Start a status transition the clock owes: `status` now, `ACTIVE` once
+    /// Start a status transition the clock owes: the transient `status` now, and the
+    /// settled status that transient one leads to ([`settled_status`]) once
     /// [`SETTLE_AFTER`] has elapsed.
     pub fn begin_transition(&mut self, status: &str) {
         self.status = status.to_string();
@@ -233,14 +234,31 @@ impl ClusterRecord {
     /// Materialise the transition the clock has already made due. Reporting
     /// operations call this: it only completes work that was owed at this instant
     /// whether or not anybody called.
+    ///
+    /// Which settled status is owed follows from the transient one the cluster is in
+    /// ([`settled_status`]), so a cluster that is being stopped settles stopped and one
+    /// that is being built, changed or restarted settles available.
     pub fn settle_due(&mut self) {
         if self.settles_at.is_some_and(|due| Instant::now() >= due) {
+            let settled = settled_status(&self.status);
             self.settles_at = None;
-            self.status = STATUS_ACTIVE.to_string();
+            self.status = settled.to_string();
             for shard in &mut self.shards {
-                shard.status = STATUS_ACTIVE.to_string();
+                shard.status = settled.to_string();
             }
         }
+    }
+
+    /// Whether this cluster is in its settled available status, so a call that acts
+    /// only from that status may act on it.
+    ///
+    /// The one predicate both status refusals ask ([`ensure_modifiable`] and
+    /// [`ensure_available`]), so the two cannot disagree about which cluster is settled
+    /// while answering the refusal each of their operations models. Ask it after
+    /// [`settle_due`](Self::settle_due), so the answer is about the status the clock owes
+    /// the cluster rather than the one it was left in.
+    pub fn is_settled_available(&self) -> bool {
+        self.status == STATUS_ACTIVE
     }
 
     /// The modelled `Cluster` for this record. Every `@required` member is populated.
@@ -361,9 +379,28 @@ pub const STATUS_CREATING: &str = "CREATING";
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 pub const STATUS_UPDATING: &str = "UPDATING";
 pub const STATUS_DELETING: &str = "DELETING";
+pub const STATUS_STOPPING: &str = "STOPPING";
+pub const STATUS_STOPPED: &str = "STOPPED";
+
 /// The status a snapshot being copied from another snapshot carries until the clock
 /// owes it `ACTIVE`; `CopyClusterSnapshot` is the only operation that starts it.
 pub const STATUS_COPYING: &str = "COPYING";
+
+/// The settled status the clock owes a cluster that is now in the transient status
+/// `transient`.
+///
+/// A transient status names work the service is carrying out, and the work decides
+/// where it ends: stopping a cluster ends with it stopped, a cluster being deleted is
+/// going away and so is owed no other status, and every other transient status this
+/// emulator starts — building, changing or restarting a cluster — ends with it
+/// available. All of them are modelled `Status` values (`ops::types::STATUS_VALUES`).
+pub fn settled_status(transient: &str) -> &'static str {
+    match transient {
+        STATUS_STOPPING => STATUS_STOPPED,
+        STATUS_DELETING => STATUS_DELETING,
+        _ => STATUS_ACTIVE,
+    }
+}
 
 /// The `OptInType` values the maintenance-action opt-in path names.
 ///
@@ -904,7 +941,7 @@ pub fn conflict(kind: ResourceKind, arn: &str, message: String) -> ConflictExcep
 /// has already made due is judged by the status it is owed and not by the one it was
 /// left in.
 pub fn ensure_modifiable(record: &ClusterRecord) -> Result<(), ConflictException> {
-    if record.status == STATUS_ACTIVE {
+    if record.is_settled_available() {
         return Ok(());
     }
     Err(conflict(
@@ -913,6 +950,35 @@ pub fn ensure_modifiable(record: &ClusterRecord) -> Result<(), ConflictException
         format!(
             "The elastic cluster {} is in {} status and cannot be modified until it is {}",
             record.cluster_name, record.status, STATUS_ACTIVE
+        ),
+    ))
+}
+
+/// Refuse a lifecycle action on a cluster that is not in its available status.
+///
+/// A cluster acts on a stop (and, once it is written, a start) only from its settled
+/// available status: `StopCluster` documents that "the elastic cluster must be in the
+/// available state", so a cluster the service is still building or changing, or one
+/// that is already stopping or stopped, is refused instead of taking the action. The
+/// refusal is `ValidationException` (HTTP 400) because that is the client refusal those
+/// operations model for a request they will not act on — they model no
+/// `ConflictException` (`smithy_query(query="operation", operation="StopCluster")`).
+///
+/// `action` is the past participle of the action being refused, so the sentence names
+/// what the caller asked for; the status the cluster is actually in is reported too, so
+/// a caller can tell "not settled yet" from "already stopped". Call
+/// [`ClusterRecord::settle_due`] first, so the judgement is on the status the clock
+/// owes the cluster rather than the one it was left in.
+pub fn ensure_available(record: &ClusterRecord, action: &str) -> Result<(), ValidationException> {
+    if record.is_settled_available() {
+        return Ok(());
+    }
+    Err(invalid_input(
+        &record.cluster_arn,
+        &format!(
+            "The elastic cluster must be in {STATUS_ACTIVE} status to be {action}, but {} is in \
+             {} status.",
+            record.cluster_name, record.status
         ),
     ))
 }

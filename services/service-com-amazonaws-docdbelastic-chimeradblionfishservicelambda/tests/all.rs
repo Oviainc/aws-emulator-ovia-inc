@@ -17,6 +17,8 @@ mod cluster_lifecycle;
 mod cluster_snapshot_copy;
 #[path = "all/cluster_snapshot_listing.rs"]
 mod cluster_snapshot_listing;
+#[path = "all/cluster_stop.rs"]
+mod cluster_stop;
 #[path = "all/concurrent_cluster_modification.rs"]
 mod concurrent_cluster_modification;
 #[path = "all/create_cluster_service_rules.rs"]
