@@ -320,6 +320,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             thing_arn: None,
             fuota_task_id: None,
             multicast_group_id: None,
+            // No event topic is enabled until `UpdateResourceEventConfiguration` says
+            // so, so a created device publishes to none.
+            event_configuration: crate::state::ResourceEventConfiguration::default(),
             tags: input.tags.clone().unwrap_or_default(),
             created_at: ::std::time::SystemTime::now(),
             last_uplink_received_at: None,

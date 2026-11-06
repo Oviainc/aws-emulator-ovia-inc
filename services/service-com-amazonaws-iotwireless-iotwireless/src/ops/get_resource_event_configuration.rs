@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourceEventConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourceEventConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the event configuration `UpdateResourceEventConfiguration` persisted for the
+//! addressed resource. Implemented here — this is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourceEventConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A resource's event configuration belongs to the resource, so the identifier is
+//! resolved against the store (a wireless device by `WirelessDeviceId`/`DevEui`, a
+//! wireless gateway by `WirelessGatewayId`/`GatewayEui`) and the statuses reported are
+//! the ones held on that record. Every event topic the resolved resource publishes
+//! carries a status — `Disabled` until an update enables it — and a topic belonging to
+//! another kind of resource carries none unless an update set one for it, in which case
+//! the status that update stored is reported: this reads the record back and never
+//! invents a status, nor drops one a caller asked for.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +159,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourceEventConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourceEventConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourceEventConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetResourceEventConfigurationError::from(
+                GetResourceEventConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the iotwireless store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        // A pure read: the store is only looked at, so a later caller sees exactly what
+        // this one did. `IdentifierType` is a modelled enum, so a value outside it is
+        // already refused before this handler runs. `PartnerType` only qualifies a
+        // `PartnerAccountId` identifier, and nothing associates a partner account yet
+        // (`AssociateAwsAccountWithPartnerAccount` is still scaffolded), so every such
+        // identifier resolves to no stored resource whatever partner type it names.
+        let store = state.lock();
+        let (resource, stored) = store
+            .find_event_configuration(&input.identifier_type, &input.identifier)
+            .ok_or_else(|| {
+                GetResourceEventConfigurationError::from(
+                    GetResourceEventConfigurationErrorModeled::ResourceNotFoundException(
+                        crate::state::event_configuration_not_found(
+                            &input.identifier_type,
+                            &input.identifier,
+                        ),
+                    ),
+                )
+            })?;
+
+        // Every topic the resolved resource publishes reports a status: the one the
+        // stored record holds, and `Disabled` for a topic no update has named yet.
+        let mut reported = resource.disabled_event_configuration();
+        reported.overlay(stored);
+
+        Ok(GetResourceEventConfigurationOutput {
+            device_registration_state: reported.device_registration_state,
+            proximity: reported.proximity,
+            join: reported.join,
+            connection_status: reported.connection_status,
+            message_delivery_status: reported.message_delivery_status,
+        })
     }
 }

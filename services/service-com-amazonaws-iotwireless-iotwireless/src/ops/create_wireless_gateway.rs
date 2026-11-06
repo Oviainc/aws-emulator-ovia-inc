@@ -266,6 +266,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             lorawan: input.lo_ra_wan.clone(),
             thing_name: None,
             thing_arn: None,
+            // No event topic is enabled until `UpdateResourceEventConfiguration` says
+            // so, so a created gateway publishes to none.
+            event_configuration: crate::state::ResourceEventConfiguration::default(),
             tags: input.tags.clone().unwrap_or_default(),
         };
         let output = CreateWirelessGatewayOutput {

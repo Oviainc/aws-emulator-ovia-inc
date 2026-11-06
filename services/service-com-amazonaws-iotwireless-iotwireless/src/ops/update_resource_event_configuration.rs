@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateResourceEventConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateResourceEventConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Persists the event configuration `GetResourceEventConfiguration` reports for the
+//! addressed resource. Implemented here — this is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateResourceEventConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The configuration belongs to the resource the identifier resolves to, and every
+//! event-topic status the request carries is taken into that resource's record while a
+//! topic the request does not name keeps the status it had, so enabling one topic never
+//! resets another.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +155,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateResourceEventConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateResourceEventConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateResourceEventConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateResourceEventConfigurationError::from(
+                UpdateResourceEventConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the iotwireless store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        // The statuses this request asks for, as one record, so the merge the reader's
+        // defaults go through is the merge the store is written with.
+        let requested = crate::state::ResourceEventConfiguration {
+            device_registration_state: input.device_registration_state.clone(),
+            proximity: input.proximity.clone(),
+            join: input.join.clone(),
+            connection_status: input.connection_status.clone(),
+            message_delivery_status: input.message_delivery_status.clone(),
+        };
+
+        let mut store = state.lock();
+        // `Identifier` is this operation's `@httpLabel`, so it ADDRESSES the resource
+        // whose configuration is updated; an identifier the account holds no resource for
+        // is the modelled 404, worded by the one helper the reader refuses through.
+        // `PartnerType` only qualifies a `PartnerAccountId` identifier, which the store
+        // holds no resource for while partner-account association is still scaffolded.
+        let (_, stored) = store
+            .find_event_configuration_mut(&input.identifier_type, &input.identifier)
+            .ok_or_else(|| {
+                UpdateResourceEventConfigurationError::from(
+                    UpdateResourceEventConfigurationErrorModeled::ResourceNotFoundException(
+                        crate::state::event_configuration_not_found(
+                            &input.identifier_type,
+                            &input.identifier,
+                        ),
+                    ),
+                )
+            })?;
+
+        // Every status the request carries replaces the stored one; a topic it leaves out
+        // keeps the status it had. `EventNotificationTopicStatus` is a modelled enum, so
+        // nothing outside it reaches the store.
+        stored.overlay(&requested);
+
+        // The operation models no output members: `GetResourceEventConfiguration` is what
+        // reports the configuration back.
+        Ok(UpdateResourceEventConfigurationOutput {})
     }
 }

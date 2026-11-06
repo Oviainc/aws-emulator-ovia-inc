@@ -9,8 +9,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    ConflictException, LoRaWANDevice, LoRaWANDeviceProfile, LoRaWANFuotaTask, LoRaWANGateway,
-    LoRaWANMulticast, LoRaWANServiceProfile, ResourceNotFoundException, SidewalkDevice, Tag,
+    ConflictException, ConnectionStatusEventConfiguration,
+    DeviceRegistrationStateEventConfiguration, JoinEventConfiguration, LoRaWANDevice,
+    LoRaWANDeviceProfile, LoRaWANFuotaTask, LoRaWANGateway,
+    LoRaWANConnectionStatusEventNotificationConfigurations,
+    LoRaWANJoinEventNotificationConfigurations, LoRaWANMulticast, LoRaWANServiceProfile,
+    MessageDeliveryStatusEventConfiguration, ProximityEventConfiguration,
+    ResourceNotFoundException, SidewalkDevice, SidewalkEventNotificationConfigurations, Tag,
     UpdateWirelessGatewayTaskCreate, ValidationException,
 };
 
@@ -334,6 +339,235 @@ pub fn service_profile_settings(requested: &LoRaWANServiceProfile) -> LoRaWANSer
     }
 }
 
+/// The `EventNotificationTopicStatus` an event topic carries until an update enables it.
+///
+/// One of the modelled values [`crate::ops::types::EVENT_NOTIFICATION_TOPIC_STATUS_VALUES`]
+/// lists: a resource publishes to no event topic nobody asked for, so every topic the
+/// addressed resource publishes reports this status until
+/// `UpdateResourceEventConfiguration` sets it.
+pub const EVENT_TOPIC_DISABLED: &str = "Disabled";
+
+/// One resource's event configuration: which of its event topics are enabled, held as
+/// the modelled sections `UpdateResourceEventConfiguration` writes and
+/// `GetResourceEventConfiguration` reports.
+///
+/// A section stays `None` until an update names it, and [`Self::overlay`] is the one
+/// merge both sides go through — the writer takes the request's statuses into the stored
+/// record, the reader takes the stored record onto
+/// [`EventConfigurationResource::disabled_event_configuration`] — so a reader reports
+/// exactly the statuses the writes left and a default for nothing else.
+#[derive(Debug, Clone, Default)]
+pub struct ResourceEventConfiguration {
+    pub device_registration_state: Option<DeviceRegistrationStateEventConfiguration>,
+    pub proximity: Option<ProximityEventConfiguration>,
+    pub join: Option<JoinEventConfiguration>,
+    pub connection_status: Option<ConnectionStatusEventConfiguration>,
+    pub message_delivery_status: Option<MessageDeliveryStatusEventConfiguration>,
+}
+
+/// Take `requested`'s status for one event topic, leaving the stored one as it was when
+/// the request named none.
+fn merge_topic(stored: &mut Option<String>, requested: &Option<String>) {
+    if let Some(status) = requested {
+        *stored = Some(status.clone());
+    }
+}
+
+/// Member-wise merge for the `Sidewalk` member the Sidewalk event sections carry.
+fn merge_sidewalk_topics(
+    stored: &mut Option<SidewalkEventNotificationConfigurations>,
+    requested: &Option<SidewalkEventNotificationConfigurations>,
+) {
+    if let Some(requested) = requested {
+        let target = stored.get_or_insert_with(SidewalkEventNotificationConfigurations::default);
+        merge_topic(&mut target.amazon_id_event_topic, &requested.amazon_id_event_topic);
+    }
+}
+
+/// Member-wise merge for each event section whose shape is `{ Sidewalk: {
+/// AmazonIdEventTopic }, WirelessDeviceIdEventTopic }` — `DeviceRegistrationState`,
+/// `Proximity` and `MessageDeliveryStatus`, which are three distinct modelled structures
+/// with the same members, so one merge rule serves all three.
+macro_rules! merge_sidewalk_section {
+    ($name:ident, $section:ty) => {
+        fn $name(stored: &mut Option<$section>, requested: &Option<$section>) {
+            if let Some(requested) = requested {
+                let target = stored.get_or_insert_with(<$section>::default);
+                merge_sidewalk_topics(&mut target.sidewalk, &requested.sidewalk);
+                merge_topic(
+                    &mut target.wireless_device_id_event_topic,
+                    &requested.wireless_device_id_event_topic,
+                );
+            }
+        }
+    };
+}
+
+merge_sidewalk_section!(
+    merge_device_registration_state,
+    DeviceRegistrationStateEventConfiguration
+);
+merge_sidewalk_section!(merge_proximity, ProximityEventConfiguration);
+merge_sidewalk_section!(
+    merge_message_delivery_status,
+    MessageDeliveryStatusEventConfiguration
+);
+
+/// Member-wise merge for the `Join` section, whose technology member is LoRaWAN's
+/// `DevEuiEventTopic`.
+fn merge_join(stored: &mut Option<JoinEventConfiguration>, requested: &Option<JoinEventConfiguration>) {
+    if let Some(requested) = requested {
+        let target = stored.get_or_insert_with(JoinEventConfiguration::default);
+        if let Some(requested_lorawan) = &requested.lo_ra_wan {
+            let lorawan = target
+                .lo_ra_wan
+                .get_or_insert_with(LoRaWANJoinEventNotificationConfigurations::default);
+            merge_topic(
+                &mut lorawan.dev_eui_event_topic,
+                &requested_lorawan.dev_eui_event_topic,
+            );
+        }
+        merge_topic(
+            &mut target.wireless_device_id_event_topic,
+            &requested.wireless_device_id_event_topic,
+        );
+    }
+}
+
+/// Member-wise merge for the `ConnectionStatus` section, whose technology member is
+/// LoRaWAN's `GatewayEuiEventTopic`.
+fn merge_connection_status(
+    stored: &mut Option<ConnectionStatusEventConfiguration>,
+    requested: &Option<ConnectionStatusEventConfiguration>,
+) {
+    if let Some(requested) = requested {
+        let target = stored.get_or_insert_with(ConnectionStatusEventConfiguration::default);
+        if let Some(requested_lorawan) = &requested.lo_ra_wan {
+            let lorawan = target
+                .lo_ra_wan
+                .get_or_insert_with(LoRaWANConnectionStatusEventNotificationConfigurations::default);
+            merge_topic(
+                &mut lorawan.gateway_eui_event_topic,
+                &requested_lorawan.gateway_eui_event_topic,
+            );
+        }
+        merge_topic(
+            &mut target.wireless_gateway_id_event_topic,
+            &requested.wireless_gateway_id_event_topic,
+        );
+    }
+}
+
+impl ResourceEventConfiguration {
+    /// Take every event-topic status `requested` carries into this record, leaving a
+    /// topic it does not name with the status it already had.
+    ///
+    /// An update names the topics it changes, so merging member by member is what lets a
+    /// caller enable one topic without resetting the rest.
+    pub fn overlay(&mut self, requested: &ResourceEventConfiguration) {
+        merge_device_registration_state(
+            &mut self.device_registration_state,
+            &requested.device_registration_state,
+        );
+        merge_proximity(&mut self.proximity, &requested.proximity);
+        merge_join(&mut self.join, &requested.join);
+        merge_connection_status(&mut self.connection_status, &requested.connection_status);
+        merge_message_delivery_status(
+            &mut self.message_delivery_status,
+            &requested.message_delivery_status,
+        );
+    }
+}
+
+/// What an event-configuration `IdentifierType`/`Identifier` pair addresses once it is
+/// resolved against the store, and therefore which event topics that resource publishes.
+///
+/// Each modelled section names the kind of resource it belongs to through its own
+/// resource-id topic member: `DeviceRegistrationState`, `Proximity`, `Join` and
+/// `MessageDeliveryStatus` carry a `WirelessDeviceIdEventTopic`, `ConnectionStatus` a
+/// `WirelessGatewayIdEventTopic`. So the sections a resource reports follow from what
+/// the resource IS, not from which of its identifiers the request used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventConfigurationResource {
+    /// A wireless device: the device-registration-state, proximity, join and
+    /// message-delivery-status event topics.
+    WirelessDevice,
+    /// A wireless gateway: the connection-status event topics.
+    WirelessGateway,
+}
+
+impl EventConfigurationResource {
+    /// This resource's event configuration before any update has touched it: every event
+    /// topic it publishes at [`EVENT_TOPIC_DISABLED`], and no section at all for a topic
+    /// it does not publish.
+    pub fn disabled_event_configuration(self) -> ResourceEventConfiguration {
+        let disabled = || Some(EVENT_TOPIC_DISABLED.to_string());
+        let sidewalk = || {
+            Some(SidewalkEventNotificationConfigurations {
+                amazon_id_event_topic: disabled(),
+            })
+        };
+        match self {
+            Self::WirelessDevice => ResourceEventConfiguration {
+                device_registration_state: Some(DeviceRegistrationStateEventConfiguration {
+                    sidewalk: sidewalk(),
+                    wireless_device_id_event_topic: disabled(),
+                }),
+                proximity: Some(ProximityEventConfiguration {
+                    sidewalk: sidewalk(),
+                    wireless_device_id_event_topic: disabled(),
+                }),
+                join: Some(JoinEventConfiguration {
+                    lo_ra_wan: Some(LoRaWANJoinEventNotificationConfigurations {
+                        dev_eui_event_topic: disabled(),
+                    }),
+                    wireless_device_id_event_topic: disabled(),
+                }),
+                message_delivery_status: Some(MessageDeliveryStatusEventConfiguration {
+                    sidewalk: sidewalk(),
+                    wireless_device_id_event_topic: disabled(),
+                }),
+                connection_status: None,
+            },
+            Self::WirelessGateway => ResourceEventConfiguration {
+                connection_status: Some(ConnectionStatusEventConfiguration {
+                    lo_ra_wan: Some(LoRaWANConnectionStatusEventNotificationConfigurations {
+                        gateway_eui_event_topic: disabled(),
+                    }),
+                    wireless_gateway_id_event_topic: disabled(),
+                }),
+                ..ResourceEventConfiguration::default()
+            },
+        }
+    }
+}
+
+/// The `ResourceNotFoundException` body for an event-configuration identifier the account
+/// holds no resource for, worded like the refusal the addressed resource's own reader
+/// gives that identifier.
+///
+/// `PartnerAccountId` resolves to a partner account, and nothing associates one yet
+/// (`AssociateAwsAccountWithPartnerAccount` is still scaffolded), so the store holds
+/// none and every partner-account identifier is refused here.
+pub fn event_configuration_not_found(
+    identifier_type: &str,
+    identifier: &str,
+) -> ResourceNotFoundException {
+    let (resource_type, noun) = match identifier_type {
+        "WirelessDeviceId" | "DevEui" => ("WirelessDevice", "wireless device"),
+        "WirelessGatewayId" | "GatewayEui" => ("WirelessGateway", "wireless gateway"),
+        "PartnerAccountId" => ("PartnerAccount", "partner account"),
+        // An identifier kind a later model adds: refused by that kind's own name,
+        // rather than claimed to have addressed one of the kinds above.
+        other => (other, "resource"),
+    };
+    ResourceNotFoundException {
+        message: Some(format!("No {noun} with {identifier_type} {identifier}")),
+        resource_id: Some(identifier.to_string()),
+        resource_type: Some(resource_type.to_string()),
+    }
+}
+
 /// A wireless device registered against a destination.
 #[derive(Debug, Clone)]
 pub struct WirelessDevice {
@@ -363,6 +597,11 @@ pub struct WirelessDevice {
     /// `ListWirelessDevices?multicastGroupId=` selects on it, and
     /// `GetMulticastGroup` counts the devices that name a group.
     pub multicast_group_id: Option<String>,
+    /// Which of this device's event topics are enabled, written by
+    /// `UpdateResourceEventConfiguration` and reported by
+    /// `GetResourceEventConfiguration`. A created device has configured none, so every
+    /// section is unset until an update names it.
+    pub event_configuration: ResourceEventConfiguration,
     pub tags: Vec<Tag>,
     /// When the device was registered. Reported by `GetWirelessDeviceStatistics` and
     /// the import-task operations, which are still scaffolded, so no implemented
@@ -388,6 +627,10 @@ pub struct WirelessGateway {
     /// gateway created today carries none.
     pub thing_name: Option<String>,
     pub thing_arn: Option<String>,
+    /// Which of this gateway's event topics are enabled, written by
+    /// `UpdateResourceEventConfiguration` and reported by
+    /// `GetResourceEventConfiguration`, like a device's.
+    pub event_configuration: ResourceEventConfiguration,
     pub tags: Vec<Tag>,
 }
 
@@ -1180,6 +1423,64 @@ impl ComAmazonawsIotwirelessIotwirelessState {
                 .wireless_gateways
                 .values()
                 .find(|gateway| gateway.thing_name.as_deref() == Some(identifier)),
+            _ => None,
+        }
+    }
+
+    /// The resource an event-configuration identifier addresses and the event
+    /// configuration that resource holds, or `None` when the account holds no such
+    /// resource.
+    ///
+    /// The configuration belongs to the RESOURCE, not to the identifier the request used
+    /// to address it, so a device configured by its `DevEui` reports the same statuses
+    /// when it is read by its `WirelessDeviceId`.
+    pub fn find_event_configuration(
+        &self,
+        identifier_type: &str,
+        identifier: &str,
+    ) -> Option<(EventConfigurationResource, &ResourceEventConfiguration)> {
+        match identifier_type {
+            "WirelessDeviceId" | "DevEui" => {
+                let device = self.find_device(identifier_type, identifier)?;
+                Some((
+                    EventConfigurationResource::WirelessDevice,
+                    &device.event_configuration,
+                ))
+            }
+            "WirelessGatewayId" | "GatewayEui" => {
+                let gateway = self.find_gateway(identifier_type, identifier)?;
+                Some((
+                    EventConfigurationResource::WirelessGateway,
+                    &gateway.event_configuration,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// The same lookup as [`Self::find_event_configuration`], for the writer.
+    pub fn find_event_configuration_mut(
+        &mut self,
+        identifier_type: &str,
+        identifier: &str,
+    ) -> Option<(EventConfigurationResource, &mut ResourceEventConfiguration)> {
+        match identifier_type {
+            "WirelessDeviceId" | "DevEui" => {
+                let id = self.find_device(identifier_type, identifier)?.id.clone();
+                let device = self.wireless_devices.get_mut(&id)?;
+                Some((
+                    EventConfigurationResource::WirelessDevice,
+                    &mut device.event_configuration,
+                ))
+            }
+            "WirelessGatewayId" | "GatewayEui" => {
+                let id = self.find_gateway(identifier_type, identifier)?.id.clone();
+                let gateway = self.wireless_gateways.get_mut(&id)?;
+                Some((
+                    EventConfigurationResource::WirelessGateway,
+                    &mut gateway.event_configuration,
+                ))
+            }
             _ => None,
         }
     }

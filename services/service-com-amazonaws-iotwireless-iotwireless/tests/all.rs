@@ -29,6 +29,8 @@ mod multicast_group_device_association;
 mod multicast_group_device_disassociation;
 #[path = "all/multicast_group_lifecycle.rs"]
 mod multicast_group_lifecycle;
+#[path = "all/resource_event_configuration.rs"]
+mod resource_event_configuration;
 #[path = "all/service_profile_lifecycle.rs"]
 mod service_profile_lifecycle;
 #[path = "all/state_roundtrip.rs"]
