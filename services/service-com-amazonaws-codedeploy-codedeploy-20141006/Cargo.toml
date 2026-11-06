@@ -25,6 +25,10 @@ tracing = { workspace = true }
 # per-process seed, rendered as hex.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# A deployment's `alarmConfiguration` is polled against the alarms' own state,
+# which lives in the CloudWatch emulator's alarm store: it is reached through the
+# shared engine and needs the owning service's state TYPE.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

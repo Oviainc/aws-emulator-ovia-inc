@@ -27,6 +27,21 @@ pub(crate) struct Emulator {
 
 impl Emulator {
     pub(crate) fn new() -> Self {
+        Self::mounted(false)
+    }
+
+    /// One emulator with CloudWatch mounted beside CodeDeploy on the SAME engine.
+    ///
+    /// The alarms a deployment is gated on belong to CloudWatch, so a suite about
+    /// them drives both services through this one front door — the way the router
+    /// mounts them — rather than reaching into either store.
+    pub(crate) fn with_cloudwatch() -> Self {
+        Self::mounted(true)
+    }
+
+    /// The one constructor behind both: CodeDeploy, and CloudWatch when
+    /// `cloudwatch` asks for it, on one shared engine.
+    fn mounted(cloudwatch: bool) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing; routing is by `X-Amz-Target`.
@@ -36,6 +51,13 @@ impl Emulator {
                 &engine,
             )),
         );
+        if cloudwatch {
+            router.register_service(
+                service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
+                    Arc::clone(&engine),
+                ),
+            );
+        }
         Self { router, engine }
     }
 
@@ -88,6 +110,42 @@ impl Emulator {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(status, 200, "{operation} must succeed, got {parsed:?}");
         parsed
+    }
+
+    /// Call one CLOUDWATCH `operation` through the same front door and require
+    /// success, answering the response body.
+    ///
+    /// CloudWatch's model declares `awsJson1_0`
+    /// (`smithy_query(query="service_info")`), so the envelope and the target
+    /// prefix are that service's own, not CodeDeploy's. Only meaningful on an
+    /// [`Emulator::with_cloudwatch`].
+    pub(crate) async fn cloudwatch_ok(&self, operation: &str, body: Value) -> Value {
+        let request = ::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "monitoring.us-east-1.amazonaws.com")
+            .header(
+                "x-amz-target",
+                format!("GraniteServiceVersion20100801.{operation}"),
+            )
+            .header("content-type", "application/x-amz-json-1.0")
+            // The SigV4 credential scope is what routes the request to the
+            // `monitoring` signing name; the suite verifies no signature.
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/monitoring/\
+                 aws4_request, SignedHeaders=host, Signature=0000",
+            )
+            .body(bytes::Bytes::from(body.to_string()))
+            .expect("the request is well formed");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let answered = String::from_utf8_lossy(response.body()).to_string();
+        assert_eq!(
+            status, 200,
+            "cloudwatch {operation} must succeed, got {status} with body {answered}"
+        );
+        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
     }
 }
 

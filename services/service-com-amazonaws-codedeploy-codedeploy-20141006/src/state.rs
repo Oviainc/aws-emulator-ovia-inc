@@ -16,6 +16,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
+/// The CloudWatch alarm gate a deployment in flight runs under: the one place a
+/// stored `alarmConfiguration` is evaluated.
+pub mod alarm_gate;
+
+/// The rollback deployment a stopped deployment is given, and the `RollbackInfo`
+/// linking the two records.
+pub mod rollback;
+
 use crate::ops::types::{
     AlarmConfiguration, AutoRollbackConfiguration, BlueGreenDeploymentConfiguration,
     DeploymentStyle, EC2DeploymentOptions, EC2TagFilter, EC2TagSet, ECSService, LoadBalancerInfo,
@@ -3789,16 +3797,22 @@ fn content_digest(content: &str) -> String {
 }
 
 /// Run `body` against this service's store, with the built-ins seeded and every
-/// clock-owed deployment completion already applied.
+/// clock-owed deployment transition already applied.
 ///
-/// EVERY handler goes through here, so no handler can observe an unseeded store
-/// or a deployment that should already have completed. `None` means the engine
-/// is not the shared in-memory one — answer it with a modelled server error.
+/// EVERY handler goes through here, so no handler can observe an unseeded store,
+/// a deployment that should already have completed, or one the alarms its group
+/// polls have already stopped. `None` means the engine is not the shared
+/// in-memory one — answer it with a modelled server error.
 pub fn with_state<Eng: Send + Sync + 'static, R>(
     engine: &Eng,
     body: impl FnOnce(&mut ComAmazonawsCodedeployCodedeploy20141006State) -> R,
 ) -> Option<R> {
     let state = service_state(engine)?;
+    // The alarm gate reads CloudWatch's own alarm store, so it runs with THIS
+    // store unlocked — the two are never held at once — and BEFORE the clock
+    // settles anything: a deployment the alarms had already stopped must not
+    // reach a successful outcome at the instant its stop was owed.
+    alarm_gate::poll_alarms(engine);
     let mut guard = state.lock();
     let now = now_ms();
     guard.ensure_seeded(now);

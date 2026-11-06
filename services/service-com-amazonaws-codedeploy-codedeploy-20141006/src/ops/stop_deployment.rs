@@ -220,123 +220,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
 
-            // What a rollback of this deployment would redeploy, and what the
-            // rollback deployment inherits from it: a rollback goes to the same
-            // deployment group with the same configuration, so those come from the
-            // stored record rather than from the request.
-            let rollback_revision = deployment.previous_revision.clone();
-            let stopped_revision = deployment.revision.clone();
-            let application_name = deployment.application_name.clone();
-            let deployment_group_name = deployment.deployment_group_name.clone();
-            let deployment_config_name = deployment.deployment_config_name.clone();
-            let compute_platform = deployment.compute_platform.clone();
-            let deployment_style = deployment.deployment_style.clone();
-            let auto_rollback_configuration = deployment.auto_rollback_configuration.clone();
-            // A rollback goes to the SAME deployment group, so it resolves the
-            // same deployment targets as the deployment it rolls back, and its
-            // terminal status follows from them the same way.
-            let targets = deployment.targets.clone();
-
-            // The id of the rollback deployment, minted only when the caller asked
-            // for a rollback AND this deployment group has a revision to go back
-            // to. A group whose first deployment is being stopped has none, which
-            // is what the rollback message then reports.
-            let rollback_deployment_id = (auto_rollback_enabled && rollback_revision.is_some())
-                .then(|| state.mint_deployment_id());
-            let rollback_info = match (auto_rollback_enabled, &rollback_deployment_id) {
-                (false, _) => None,
-                (true, Some(rollback_id)) => Some(RollbackInfo {
-                    rollback_deployment_id: Some(rollback_id.clone()),
-                    rollback_triggering_deployment_id: Some(deployment_id.clone()),
-                    rollback_message: Some(format!(
-                        "Deployment {rollback_id} was created to roll deployment \
-                         {deployment_id} back to the previously deployed revision"
-                    )),
-                }),
-                (true, None) => Some(RollbackInfo {
-                    rollback_deployment_id: None,
-                    rollback_triggering_deployment_id: Some(deployment_id.clone()),
-                    rollback_message: Some(format!(
-                        "Deployment {deployment_id} cannot be rolled back: no revision was \
-                         deployed to this deployment group before it"
-                    )),
-                }),
-            };
-
             let stopped_at_ms = crate::state::now_ms();
+            // The rollback the caller asked for, from the one place a stopped
+            // deployment's rollback is recorded: the rollback deployment, and the
+            // `RollbackInfo` both records then carry. It reads what the rollback
+            // inherits off the stored record, so it must run before the stop
+            // itself is written.
+            let rollback_info = auto_rollback_enabled
+                .then(|| {
+                    crate::state::rollback::record_rollback(
+                        state,
+                        &deployment_id,
+                        stopped_at_ms,
+                    )
+                })
+                .flatten();
             if let Some(deployment) = state.deployments.get_mut(&deployment_id) {
                 // The stop takes effect at this instant, so the deployment is
                 // terminal from here on and the clock owes it nothing further.
                 deployment.status = crate::state::DEPLOYMENT_STATUS_STOPPED.to_string();
                 deployment.complete_time_ms = Some(stopped_at_ms);
-                deployment.rollback_info = rollback_info.clone();
-            }
-
-            // The rollback is a DEPLOYMENT of its own, created by the service
-            // rather than by a client, which the clock then runs like any other.
-            if let (Some(rollback_id), Some(revision)) =
-                (rollback_deployment_id.clone(), rollback_revision)
-            {
-                // A rollback is a deployment to the SAME deployment group, so it
-                // owes the original environment whatever that group configured,
-                // exactly as a client's own deployment to it does.
-                let (terminates_original_instances, termination_wait_millis) =
-                    deployment_group_name
-                        .as_deref()
-                        .and_then(|group_name| {
-                            state
-                                .applications
-                                .get(&application_name)
-                                .and_then(|application| {
-                                    application.deployment_groups.get(group_name)
-                                })
-                        })
-                        .map_or((false, 0), crate::state::termination_wait);
-                state.record_deployment(crate::state::Deployment {
-                    deployment_id: rollback_id,
-                    application_name,
-                    deployment_group_name,
-                    deployment_config_name,
-                    // The revision's identity, computed once here so no later
-                    // request re-derives it from the revision's content.
-                    revision_key: crate::state::revision_key(&revision),
-                    revision: Some(revision),
-                    // The revision this group was on when the rollback started:
-                    // the one the stopped deployment was deploying.
-                    previous_revision: stopped_revision,
-                    status: crate::state::DEPLOYMENT_STATUS_CREATED.to_string(),
-                    creator: crate::state::DEPLOYMENT_CREATOR_ROLLBACK.to_string(),
-                    description: None,
-                    ignore_application_stop_failures: false,
-                    update_outdated_instances_only: false,
-                    file_exists_behavior: None,
-                    deployment_mode: None,
-                    auto_rollback_configuration,
-                    // Nothing a client sent to the stopped deployment carries over:
-                    // a rollback targets the group's own instances with the group's
-                    // own settings.
-                    target_instances: None,
-                    override_alarm_configuration: None,
-                    ec2_deployment_options: None,
-                    deployment_style,
-                    compute_platform,
-                    external_id: None,
-                    rollback_info: rollback_info.clone(),
-                    create_time_ms: stopped_at_ms,
-                    start_time_ms: None,
-                    complete_time_ms: None,
-                    starts_at_ms: crate::state::deployment_start_due(stopped_at_ms),
-                    completes_at_ms: crate::state::deployment_completion_due(stopped_at_ms)
-                        + termination_wait_millis,
-                    // Nothing has failed, and no lifecycle event hook has reported
-                    // against the rollback yet.
-                    error_information: None,
-                    lifecycle_hook_executions: Vec::new(),
-                    targets,
-                    terminates_original_instances,
-                    termination_wait_millis,
-                    instance_termination_wait_time_started: false,
-                });
             }
 
             Ok(rollback_info)
