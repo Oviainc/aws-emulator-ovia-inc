@@ -3,8 +3,8 @@
 //! @op TerminateJobFlows
 //! Starts the shutdown of each named cluster in the shared engine: the cluster moves to
 //! `TERMINATING` with a `USER_REQUEST` state-change reason, and the clock owes it
-//! `TERMINATED` with an `EndDateTime`. A termination-protected cluster is left as it is,
-//! and an id no cluster carries is refused.
+//! `TERMINATED` with an `EndDateTime`. A request naming a termination-protected cluster,
+//! or an id no cluster carries, is refused in whole and shuts nothing down.
 //!
 //! ## Shape of an operation
 //!
@@ -174,13 +174,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        // Resolve every id BEFORE changing anything, so a request naming one unknown id
-        // terminates nothing. The legacy job-flow surface's sentence is CONSTANT: it
-        // names no id.
+        // Resolve every id AND decide protection BEFORE changing anything, so a request
+        // naming one unknown id, or one locked cluster, terminates nothing. Both
+        // sentences of this legacy job-flow surface are CONSTANT: neither names an id,
+        // and the protected one is plural because the whole batch is judged at once.
         for job_flow_id in &input.job_flow_ids {
-            if !store.clusters.contains_key(job_flow_id) {
+            let Some(cluster) = store.cluster_mut(job_flow_id, now) else {
                 return Err(crate::scaffolded::Scaffolded::validation(
                     crate::state::unknown_job_flow_message(),
+                ));
+            };
+            if cluster.termination_protection_holds() {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::termination_protected_message(),
                 ));
             }
         }

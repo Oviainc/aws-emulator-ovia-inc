@@ -2,9 +2,9 @@
 
 //! @op SetTerminationProtection
 //! Sets `TerminationProtected` on every cluster the request names, so a later
-//! `DescribeCluster` reports the new value and `TerminateJobFlows` leaves a locked
-//! cluster alone until a later call unlocks it. Every id is resolved before anything is
-//! changed, so a request naming an unknown cluster changes nothing and is refused.
+//! `DescribeCluster` reports the new value and `TerminateJobFlows` refuses to shut a
+//! locked cluster down until a later call unlocks it. Every id is resolved before anything
+//! is changed, so a request naming an unknown cluster changes nothing and is refused.
 //!
 //! ## Shape of an operation
 //!

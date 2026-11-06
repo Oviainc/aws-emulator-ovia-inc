@@ -77,6 +77,8 @@ mod studio_session_mapping_listing;
 mod supported_instance_types;
 #[path = "all/tag_character_class.rs"]
 mod tag_character_class;
+#[path = "all/terminate_job_flows_protection.rs"]
+mod terminate_job_flows_protection;
 #[path = "all/termination_protection.rs"]
 mod termination_protection;
 #[path = "all/validation_refusal_identity.rs"]

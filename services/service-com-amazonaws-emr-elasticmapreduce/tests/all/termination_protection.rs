@@ -6,7 +6,8 @@
 //! `JobFlowIds` batch against the service's own clusters, refuses the whole batch when
 //! one id names no cluster, and otherwise writes the requested `TerminationProtected`
 //! value on each named cluster — so a later `DescribeCluster` reports exactly that value
-//! and `TerminateJobFlows` leaves a locked cluster alone until a later call unlocks it.
+//! and `TerminateJobFlows` refuses to shut a locked cluster down until a later call
+//! unlocks it.
 //!
 //! Every case drives the real HTTP path — `POST /` with
 //! `X-Amz-Target: ElasticMapReduce.<Op>` and an `awsJson1_1` body — through the router's
@@ -134,11 +135,11 @@ async fn set_termination_protection_writes_what_describe_cluster_reports() {
     }
 }
 
-/// THE RULE's consequence: a locked cluster survives `TerminateJobFlows`, and "to
-/// terminate a cluster that has been locked by setting SetTerminationProtection to true,
-/// you must first unlock the job flow by a subsequent call to SetTerminationProtection in
-/// which you set the value to false" (`SetTerminationProtection` doc) — after which the
-/// same call shuts it down.
+/// THE RULE's consequence: a locked cluster cannot be shut down by `TerminateJobFlows`,
+/// and "to terminate a cluster that has been locked by setting SetTerminationProtection to
+/// true, you must first unlock the job flow by a subsequent call to
+/// SetTerminationProtection in which you set the value to false"
+/// (`SetTerminationProtection` doc) — after which the same call shuts it down.
 #[tokio::test]
 async fn termination_protection_blocks_terminate_job_flows_until_it_is_unlocked() {
     let emr = Emr::new();
@@ -158,8 +159,10 @@ async fn termination_protection_blocks_terminate_job_flows_until_it_is_unlocked(
             .await;
         }
 
-        emr.ok("TerminateJobFlows", json!({ "JobFlowIds": [&cluster_id] }))
+        let (status, payload) = emr
+            .call("TerminateJobFlows", json!({ "JobFlowIds": [&cluster_id] }))
             .await;
+        assert_refused(label, status, &payload, "ValidationException");
         tokio::time::sleep(PAST_TRANSITION).await;
         let locked = emr.describe_cluster(&cluster_id).await;
         let state = at(&locked, &["Status", "State"]).as_str().unwrap_or_default();

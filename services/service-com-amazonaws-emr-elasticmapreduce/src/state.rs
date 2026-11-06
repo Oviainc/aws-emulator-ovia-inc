@@ -553,6 +553,21 @@ pub fn unknown_job_flow() -> InvalidRequestException {
     }
 }
 
+/// How a shutdown request is refused when a cluster it names is locked against
+/// termination: the lock "prevent[s] the Amazon EC2 instances from being terminated by an
+/// API call or user intervention" (`Cluster$TerminationProtected` doc), and "to terminate
+/// a cluster that has been locked ... you must first unlock the job flow by a subsequent
+/// call to SetTerminationProtection in which you set the value to false"
+/// (`SetTerminationProtection` doc).
+///
+/// Recorded behavior: the sentence is CONSTANT — plural and id-free, because the whole
+/// batch is decided before any cluster is shut down, so nothing of the request or of the
+/// state is interpolated into it.
+pub fn termination_protected_message() -> String {
+    "Could not shut down one or more job flows since they are termination protected."
+        .to_string()
+}
+
 /// How `GetClusterSessionCredentials` refuses a cluster id it holds no cluster for: the
 /// same statement as [`unknown_cluster_message`] with no id in it.
 pub fn unknown_cluster_without_id_message() -> String {
@@ -2851,15 +2866,26 @@ impl ClusterRecord {
         }
     }
 
+    /// Whether this cluster's termination protection has a shutdown to refuse: the lock
+    /// "prevent[s] the Amazon EC2 instances from being terminated by an API call or user
+    /// intervention" (`Cluster$TerminationProtected` doc), so it holds only while the
+    /// cluster still has instances to lose — a cluster that is already shutting down or
+    /// gone has nothing left for the lock to protect, which is why a repeated shutdown of
+    /// one stays a no-op rather than becoming a refusal.
+    pub fn termination_protection_holds(&self) -> bool {
+        self.instances.termination_protected
+            && !self.is_terminal()
+            && self.status.state != cluster_state::TERMINATING
+    }
+
     /// Start the `TERMINATING` -> `TERMINATED` span, recording why.
     ///
-    /// Answers `false` without touching the cluster when it is termination protected
-    /// ("Indicates whether Amazon EMR will lock the cluster to prevent the Amazon EC2
-    /// instances from being terminated by an API call or user intervention" —
-    /// `Cluster$TerminationProtected` doc), and when it is already shutting down or
-    /// gone, which makes a repeated `TerminateJobFlows` idempotent.
+    /// Answers `false` without touching the cluster when its termination protection holds
+    /// ([`Self::termination_protection_holds`]) — a shutdown request is refused for that
+    /// before it reaches here — and when the cluster is already shutting down or gone,
+    /// which makes a repeated `TerminateJobFlows` idempotent.
     pub fn begin_termination(&mut self, now: SystemTime) -> bool {
-        if self.instances.termination_protected || self.is_terminal() {
+        if self.termination_protection_holds() || self.is_terminal() {
             return false;
         }
         if self.status.state == cluster_state::TERMINATING {

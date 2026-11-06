@@ -1109,7 +1109,9 @@ async fn list_clusters_paginates_on_marker() {
 
 /// THE RULE: `TerminateJobFlows` moves each named cluster to `TERMINATING` with a
 /// `USER_REQUEST` state-change reason, the clock then owes it `TERMINATED` with an
-/// `EndDateTime`, and a termination-protected cluster is left alone.
+/// `EndDateTime`, and a batch naming a termination-protected cluster is refused in whole
+/// and shuts nothing down (the batch rule itself lives in
+/// `tests/all/termination_protection.rs`).
 #[tokio::test]
 async fn terminate_job_flows_shuts_each_named_cluster_down() {
     let emr = Emr::new();
@@ -1128,7 +1130,37 @@ async fn terminate_job_flows_shuts_each_named_cluster_down() {
         }))
         .await;
 
-    emr.ok("TerminateJobFlows", json!({ "JobFlowIds": [&doomed, &protected] }))
+    // "Indicates whether Amazon EMR will lock the cluster to prevent the Amazon EC2
+    // instances from being terminated by an API call" (Cluster$TerminationProtected): the
+    // batch that names the locked cluster is refused, and the cluster beside it in the
+    // same batch is not shut down either.
+    let (status, payload) = emr
+        .call("TerminateJobFlows", json!({ "JobFlowIds": [&doomed, &protected] }))
+        .await;
+    assert_refused(
+        "a batch naming a protected cluster",
+        status,
+        &payload,
+        "ValidationException",
+    );
+    let locked = emr.describe_cluster(&protected).await;
+    assert_eq!(
+        at(&locked, &["Status", "State"]).as_str(),
+        Some("STARTING"),
+        "case \"protected cluster\": an API call must not terminate it, got {locked}"
+    );
+    assert!(
+        at(&locked, &["Status", "StateChangeReason"]).is_null(),
+        "case \"protected cluster\": nothing changed its state, got {locked}"
+    );
+    let spared = emr.describe_cluster(&doomed).await;
+    assert!(
+        at(&spared, &["Status", "StateChangeReason"]).is_null(),
+        "case \"a batch naming a protected cluster\": the cluster beside it must not be \
+         shut down, got {spared}"
+    );
+
+    emr.ok("TerminateJobFlows", json!({ "JobFlowIds": [&doomed] }))
         .await;
 
     let cluster = emr.describe_cluster(&doomed).await;
@@ -1145,19 +1177,6 @@ async fn terminate_job_flows_shuts_each_named_cluster_down() {
     assert!(
         at(&cluster, &["Status", "Timeline", "EndDateTime"]).is_null(),
         "case \"terminated cluster\": it has not ended yet, got {cluster}"
-    );
-
-    // "Indicates whether Amazon EMR will lock the cluster to prevent the Amazon EC2
-    // instances from being terminated by an API call" (Cluster$TerminationProtected).
-    let locked = emr.describe_cluster(&protected).await;
-    assert_eq!(
-        at(&locked, &["Status", "State"]).as_str(),
-        Some("STARTING"),
-        "case \"protected cluster\": an API call must not terminate it, got {locked}"
-    );
-    assert!(
-        at(&locked, &["Status", "StateChangeReason"]).is_null(),
-        "case \"protected cluster\": nothing changed its state, got {locked}"
     );
 
     tokio::time::sleep(PAST_TRANSITION).await;
