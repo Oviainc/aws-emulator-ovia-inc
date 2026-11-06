@@ -31,7 +31,8 @@ use tracing::{Event, Metadata, Subscriber};
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::AUDIT_TARGET;
 
 use crate::documentation_parts::{
-    content_map, get_part, import_body, import_parts, listed_entities, listed_ids, BAD_REQUEST,
+    content_map, get_part, import_body, import_parts, imported_content_map, listed_entities,
+    listed_ids, BAD_REQUEST,
 };
 use crate::rest_api_lifecycle::{assert_failure, create_api, string_member, Answer, Gateway};
 
@@ -154,7 +155,7 @@ async fn an_import_stores_one_part_per_entity_whatever_the_bodys_entry_count() {
             );
             assert_eq!(
                 string_member(&read.body, "properties", &case),
-                entries[index].1.to_string(),
+                imported_content_map(&format!("entity {index}")),
                 "case {case}: expected the content map of entry {index}, got {:?}",
                 read.body["properties"]
             );
@@ -410,7 +411,7 @@ async fn an_import_is_accepted_at_the_per_api_quota_and_refused_one_entity_past_
     );
     assert_eq!(
         string_member(&read.body, "properties", case),
-        again[0].1.to_string(),
+        imported_content_map("the same entity, documented again"),
         "case {case}: expected the re-imported content map, got {:?}",
         read.body["properties"]
     );

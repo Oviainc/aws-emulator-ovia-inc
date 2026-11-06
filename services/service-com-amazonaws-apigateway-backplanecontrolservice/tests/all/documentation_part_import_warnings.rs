@@ -251,6 +251,10 @@ async fn a_model_reference_the_document_does_not_resolve_is_what_fail_on_warning
         document: Value,
         /// The warnings it earns, in order; empty for a document that earns none.
         warnings: &'static [&'static str],
+        /// The entities the DOCUMENT itself documents, beside the extension's entry: a
+        /// response object describes itself, and that description documents the API's
+        /// `RESPONSE` entity at that status code.
+        documents: Vec<(Value, Value)>,
     }
     let rows = vec![
         Row {
@@ -266,6 +270,10 @@ async fn a_model_reference_the_document_does_not_resolve_is_what_fail_on_warning
                 } } } } },
             }),
             warnings: &["Reference to model 'DoesNotExist' not found. Ignoring."],
+            documents: vec![entry(
+                json!({ "type": "RESPONSE", "path": "/", "method": "GET", "statusCode": "200" }),
+                "ok",
+            )],
         },
         Row {
             case: "an OpenAPI 3 request body of another media type and another verb",
@@ -280,6 +288,10 @@ async fn a_model_reference_the_document_does_not_resolve_is_what_fail_on_warning
                 } } },
             }),
             warnings: &["Reference to model 'Absent' not found. Ignoring."],
+            documents: vec![entry(
+                json!({ "type": "RESPONSE", "path": "/orders", "method": "POST", "statusCode": "201" }),
+                "created",
+            )],
         },
         Row {
             case: "a Swagger 2.0 response schema, whose media type the document produces",
@@ -293,6 +305,10 @@ async fn a_model_reference_the_document_does_not_resolve_is_what_fail_on_warning
                 } } } } },
             }),
             warnings: &["Reference to model 'Gone' not found. Ignoring."],
+            documents: vec![entry(
+                json!({ "type": "RESPONSE", "path": "/", "method": "GET", "statusCode": "200" }),
+                "ok",
+            )],
         },
         Row {
             case: "a reference into another document, which an import has no access to",
@@ -305,6 +321,10 @@ async fn a_model_reference_the_document_does_not_resolve_is_what_fail_on_warning
                 } } } } },
             }),
             warnings: &["Reference to model 'Thing' not found. Ignoring."],
+            documents: vec![entry(
+                json!({ "type": "RESPONSE", "path": "/", "method": "GET", "statusCode": "200" }),
+                "ok",
+            )],
         },
         Row {
             case: "a reference the document does declare",
@@ -320,6 +340,10 @@ async fn a_model_reference_the_document_does_not_resolve_is_what_fail_on_warning
                 } } } } },
             }),
             warnings: &[],
+            documents: vec![entry(
+                json!({ "type": "RESPONSE", "path": "/", "method": "GET", "statusCode": "200" }),
+                "ok",
+            )],
         },
     ];
 
@@ -407,10 +431,14 @@ async fn a_model_reference_the_document_does_not_resolve_is_what_fail_on_warning
                     reported, expected,
                     "case {case}: expected the warnings {expected:?}, got {reported:?}"
                 );
-                let after = listed_entities(&gateway, &api, &case).await;
+                // What the import left documented: the seeded part, the extension's entry
+                // and the entities the document's own fields document.
+                let mut expected = vec![documented.clone(), imported.clone()];
+                expected.extend(row.documents.iter().cloned());
+                let after = by_entity(listed_entities(&gateway, &api, &case).await);
                 assert_eq!(
                     after,
-                    vec![documented.clone(), imported.clone()],
+                    by_entity(expected),
                     "case {case}: expected the import to be carried out, got {after:?}"
                 );
             }
@@ -420,7 +448,7 @@ async fn a_model_reference_the_document_does_not_resolve_is_what_fail_on_warning
 
 /// `document` carrying `entries` as its documentation set, as the body of an import: the
 /// same extension [`import_body`] writes, over a document whose own members the row chose.
-fn document_with(document: &Value, entries: &[(Value, Value)]) -> String {
+pub(crate) fn document_with(document: &Value, entries: &[(Value, Value)]) -> String {
     let parts: Vec<Value> = entries
         .iter()
         .map(|(location, properties)| json!({ "location": location, "properties": properties }))

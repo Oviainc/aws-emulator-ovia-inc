@@ -3,8 +3,14 @@
 //! @op ImportDocumentationParts
 //! IMPLEMENTED: reads the documentation parts an OpenAPI body declares under its
 //! `x-amazon-apigateway-documentation` extension and writes one `DocumentationPart` per
-//! documented ENTITY, `merge` landing an entry on the part that already documents that
-//! entity and `overwrite` replacing the API's documentation set.
+//! documented ENTITY, each entry landing on the part that already documents its entity —
+//! which keeps that part's identifier — and `overwrite` additionally dropping the parts
+//! the body does not document, where `merge` keeps them.
+//!
+//! A content map an entry declares as a JSON OBJECT is stored as the service's own
+//! serialisation of that object ([`rendered_content_map`]) rather than as the bytes the
+//! body wrote it with; one an entry already carries as a JSON string is stored as given,
+//! exactly as a `properties` string a request supplies is.
 //!
 //! The import is ALL-OR-NOTHING: an entry this service cannot store refuses the whole
 //! body with the modelled 400 and leaves the API's documentation set exactly as it was.
@@ -91,13 +97,18 @@
 use super::types::*;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::io;
 
-use ::serde_json::Value;
+use ::serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
+use ::serde::{Deserialize, Serialize, Serializer};
 
 use crate::state::DocumentationPartEntry;
 
 use super::create_documentation_part::{location_key, validated_location, validated_properties};
-use super::put_rest_api::{model_reference_warnings, put_mode, warnings_refusal, Node, PutModeKind};
+use super::put_rest_api::{
+    model_reference_warnings, put_mode, warnings_refusal, Node, PutModeKind, OPERATION_KEYS,
+};
 
 /// The OpenAPI extension API Gateway carries a documentation set in, and the member of
 /// it that holds the parts.
@@ -137,6 +148,246 @@ const MAX_IMPORT_BYTES: usize = 1024 * 1024;
 /// entries fit in [`MAX_IMPORT_BYTES`].
 const MAX_IMPORT_ENTRIES: usize = 4 * crate::state::MAX_DOCUMENTATION_PARTS_PER_API;
 
+/// One node of an import body: the shapes a JSON document carries, with every object's
+/// members in the DOCUMENT's own order and every scalar's JSON type kept.
+///
+/// `serde_json::Value` is not this reader's tree, because the content map an entry carries
+/// as an OBJECT is written back out for storage ([`rendered_content_map`]): a `Value`'s
+/// object is keyed in sort order, which would re-order the members of the map the document
+/// declared. The sibling definition reader's [`Node`] is not it either — that one keeps
+/// every scalar as its text, which cannot be written back out as the JSON value it was.
+/// `serde_json` still does the reading: this is the tree its visits build.
+#[derive(Debug, Clone, Default)]
+enum BodyNode {
+    /// A JSON null.
+    #[default]
+    Null,
+    /// A JSON boolean.
+    Flag(bool),
+    /// A JSON number, as read.
+    Number(::serde_json::Number),
+    /// A JSON string.
+    Text(String),
+    /// A JSON array, in order.
+    List(Vec<BodyNode>),
+    /// A JSON object, members in document order. A document that repeats a name keeps
+    /// both members and [`BodyNode::member`] takes the FIRST, so what the import reads
+    /// does not depend on how far the reader got.
+    Object(Vec<(String, BodyNode)>),
+}
+
+impl BodyNode {
+    /// A member of this object by name; `None` for any other node.
+    fn member(&self, name: &str) -> Option<&BodyNode> {
+        match self {
+            BodyNode::Object(members) => members
+                .iter()
+                .find(|(declared, _)| declared == name)
+                .map(|(_, value)| value),
+            _ => None,
+        }
+    }
+
+    /// This node's items, when it is an array.
+    fn list(&self) -> Option<&[BodyNode]> {
+        match self {
+            BodyNode::List(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    /// Whether this node is an object.
+    fn is_object(&self) -> bool {
+        matches!(self, BodyNode::Object(_))
+    }
+}
+
+impl<'de> Deserialize<'de> for BodyNode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(BodyNodeVisitor)
+    }
+}
+
+/// Builds a [`BodyNode`] from `serde_json`'s visits, so the body is read by the
+/// maintained reader — under its own recursion limit — rather than by anything here.
+struct BodyNodeVisitor;
+
+impl<'de> Visitor<'de> for BodyNodeVisitor {
+    type Value = BodyNode;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_unit<E: ::serde::de::Error>(self) -> Result<BodyNode, E> {
+        Ok(BodyNode::Null)
+    }
+
+    fn visit_bool<E: ::serde::de::Error>(self, value: bool) -> Result<BodyNode, E> {
+        Ok(BodyNode::Flag(value))
+    }
+
+    fn visit_i64<E: ::serde::de::Error>(self, value: i64) -> Result<BodyNode, E> {
+        Ok(BodyNode::Number(value.into()))
+    }
+
+    fn visit_u64<E: ::serde::de::Error>(self, value: u64) -> Result<BodyNode, E> {
+        Ok(BodyNode::Number(value.into()))
+    }
+
+    fn visit_f64<E: ::serde::de::Error>(self, value: f64) -> Result<BodyNode, E> {
+        // A JSON document carries no infinity and no NaN, so the reader hands this one
+        // only finite numbers; one that somehow is not a number is read as the null it
+        // can be written back out as.
+        Ok(::serde_json::Number::from_f64(value).map_or(BodyNode::Null, BodyNode::Number))
+    }
+
+    fn visit_str<E: ::serde::de::Error>(self, value: &str) -> Result<BodyNode, E> {
+        Ok(BodyNode::Text(value.to_owned()))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<BodyNode, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = sequence.next_element()? {
+            items.push(item);
+        }
+        Ok(BodyNode::List(items))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut object: A) -> Result<BodyNode, A::Error> {
+        let mut members = Vec::new();
+        while let Some((name, value)) = object.next_entry::<String, BodyNode>()? {
+            members.push((name, value));
+        }
+        Ok(BodyNode::Object(members))
+    }
+}
+
+impl Serialize for BodyNode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            BodyNode::Null => serializer.serialize_unit(),
+            BodyNode::Flag(value) => serializer.serialize_bool(*value),
+            BodyNode::Number(value) => value.serialize(serializer),
+            BodyNode::Text(value) => serializer.serialize_str(value),
+            BodyNode::List(items) => serializer.collect_seq(items),
+            BodyNode::Object(members) => {
+                serializer.collect_map(members.iter().map(|(name, value)| (name, value)))
+            }
+        }
+    }
+}
+
+/// One level of indentation of a written content map.
+const CONTENT_MAP_INDENT: &[u8] = b"  ";
+
+/// What a written content map carries between a member's name and its value.
+const CONTENT_MAP_SEPARATOR: &[u8] = b" : ";
+
+/// How the service LAYS OUT a content map it serialises: each member of an object on its
+/// own line, indented by [`CONTENT_MAP_INDENT`] per level of nesting, with
+/// [`CONTENT_MAP_SEPARATOR`] between a member's name and its value; an array's items on
+/// one line, spaced inside its brackets; and a space inside the brackets of an empty
+/// object or array.
+///
+/// The layout is `serde_json`'s to write — this only says where the breaks and the spaces
+/// go, through the serializer's own formatter seam.
+#[derive(Debug, Default)]
+struct ContentMapLayout {
+    /// How deeply nested the value being written is, which is how far a member of it is
+    /// indented.
+    depth: usize,
+    /// One flag per object still open, set once that object has had a member written:
+    /// what decides whether its closing brace follows a line break or a space.
+    objects: Vec<bool>,
+}
+
+impl ContentMapLayout {
+    /// A line break followed by the indentation of the current depth.
+    fn line<W: ?Sized + io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        writer.write_all(b"\n")?;
+        for _ in 0..self.depth {
+            writer.write_all(CONTENT_MAP_INDENT)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::serde_json::ser::Formatter for ContentMapLayout {
+    fn begin_object<W: ?Sized + io::Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.depth += 1;
+        self.objects.push(false);
+        writer.write_all(b"{")
+    }
+
+    fn end_object<W: ?Sized + io::Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        let written = self.objects.pop().unwrap_or(false);
+        self.depth = self.depth.saturating_sub(1);
+        if written {
+            self.line(writer)?;
+        } else {
+            writer.write_all(b" ")?;
+        }
+        writer.write_all(b"}")
+    }
+
+    fn begin_object_key<W: ?Sized + io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> io::Result<()> {
+        if let Some(written) = self.objects.last_mut() {
+            *written = true;
+        }
+        if !first {
+            writer.write_all(b",")?;
+        }
+        self.line(writer)
+    }
+
+    fn begin_object_value<W: ?Sized + io::Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        writer.write_all(CONTENT_MAP_SEPARATOR)
+    }
+
+    fn begin_array<W: ?Sized + io::Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.depth += 1;
+        writer.write_all(b"[")
+    }
+
+    fn end_array<W: ?Sized + io::Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.depth = self.depth.saturating_sub(1);
+        writer.write_all(b" ]")
+    }
+
+    fn begin_array_value<W: ?Sized + io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> io::Result<()> {
+        writer.write_all(if first { b" " } else { b", " })
+    }
+}
+
+/// The content map an entry carries as a JSON OBJECT, as the text it is STORED and
+/// reported as: the service's own serialisation of that object ([`ContentMapLayout`]),
+/// not the bytes the body happened to write it with.
+///
+/// `DocumentationPart$properties` is "a content map of API-specific key-value pairs ...
+/// encoded as a JSON string", so an entry that declares the map as an object has it
+/// written out as that string here — one member per line, indented, with a space either
+/// side of the separator — while an entry that already carries the string is stored as
+/// given, exactly as a `properties` a request supplies is.
+///
+/// `None` only for a map the serializer could not write, which is answered as the entry's
+/// own problem rather than reported as a content map that was not stored.
+fn rendered_content_map(map: &BodyNode) -> Option<String> {
+    let mut written = Vec::new();
+    let mut serializer =
+        ::serde_json::Serializer::with_formatter(&mut written, ContentMapLayout::default());
+    map.serialize(&mut serializer).ok()?;
+    String::from_utf8(written).ok()
+}
+
 /// One entry of an import: the entity it documents, and the content map to store for it.
 #[derive(Debug, Clone)]
 struct ImportedPart {
@@ -144,10 +395,11 @@ struct ImportedPart {
     properties: String,
 }
 
-/// What an import reads out of a body: the entries it can store, in document order.
+/// What an import reads out of a body: the parts it will store, one per documented
+/// ENTITY, in the order the body documents them.
 ///
 /// There is no "partially readable" body: an entry this service cannot store refuses the
-/// whole import (see [`parse_import`]), so every entry here is one the import applies.
+/// whole import (see [`parse_import`]), so every part here is one the import applies.
 #[derive(Debug, Clone, Default)]
 struct ImportedParts {
     parts: Vec<ImportedPart>,
@@ -157,22 +409,25 @@ struct ImportedParts {
 ///
 /// The entry's `location` goes through the same rules as a `CreateDocumentationPart`
 /// location, and its `properties` object becomes the JSON text the `properties` member
-/// documents ("The map must be encoded as a JSON string"); an entry that already writes
+/// documents ("The map must be encoded as a JSON string") — the service's own
+/// serialisation of that object ([`rendered_content_map`]); an entry that already writes
 /// the map as a JSON string is taken as given.
 ///
 /// `Err` carries what is wrong with this one entry, which refuses the whole import.
-fn imported_part(entry: &Value) -> Result<ImportedPart, String> {
-    let entry = entry
-        .as_object()
-        .ok_or_else(|| "an entry of the documentation set must be a JSON object".to_string())?;
+fn imported_part(entry: &BodyNode) -> Result<ImportedPart, String> {
+    if !entry.is_object() {
+        return Err("an entry of the documentation set must be a JSON object".to_string());
+    }
     let location = entry
-        .get("location")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "location must be a JSON object naming the targeted API entity".to_string())?;
+        .member("location")
+        .filter(|node| node.is_object())
+        .ok_or_else(|| {
+            "location must be a JSON object naming the targeted API entity".to_string()
+        })?;
     let member = |name: &str| -> Result<Option<String>, String> {
-        match location.get(name) {
-            None | Some(Value::Null) => Ok(None),
-            Some(Value::String(text)) => Ok(Some(text.clone())),
+        match location.member(name) {
+            None | Some(BodyNode::Null) => Ok(None),
+            Some(BodyNode::Text(text)) => Ok(Some(text.clone())),
             Some(_) => Err(format!("location.{name} must be a string")),
         }
     };
@@ -184,13 +439,13 @@ fn imported_part(entry: &Value) -> Result<ImportedPart, String> {
         status_code: member("statusCode")?,
         name: member("name")?,
     };
-    let properties = match entry.get("properties") {
+    let properties = match entry.member("properties") {
         // An entry that declares no content map documents nothing yet: it is stored as
         // the empty content map, which is what `locationStatus=UNDOCUMENTED` reports.
-        None | Some(Value::Null) => "{}".to_string(),
-        Some(value @ Value::Object(_)) => ::serde_json::to_string(value)
-            .map_err(|_| "properties could not be read as a content map".to_string())?,
-        Some(Value::String(text)) => text.clone(),
+        None | Some(BodyNode::Null) => "{}".to_string(),
+        Some(map @ BodyNode::Object(_)) => rendered_content_map(map)
+            .ok_or_else(|| "properties could not be read as a content map".to_string())?,
+        Some(BodyNode::Text(text)) => text.clone(),
         Some(_) => {
             return Err("properties must be a content map of key-value pairs".to_string());
         }
@@ -233,27 +488,58 @@ fn parse_import(body: &[u8]) -> Result<ImportedParts, String> {
             body.len()
         ));
     }
-    let document: Value = ::serde_json::from_slice(body).map_err(|_| UNREADABLE_IMPORT.to_string())?;
-    let object = document.as_object().ok_or_else(|| UNREADABLE_IMPORT.to_string())?;
-    let declared = object
-        .get(DOCUMENTATION_EXTENSION)
-        .and_then(|extension| extension.get(DOCUMENTATION_PARTS_MEMBER))
-        .or_else(|| object.get(DOCUMENTATION_PARTS_MEMBER))
+    let document: BodyNode =
+        ::serde_json::from_slice(body).map_err(|_| UNREADABLE_IMPORT.to_string())?;
+    let declared = document
+        .member(DOCUMENTATION_EXTENSION)
+        .and_then(|extension| extension.member(DOCUMENTATION_PARTS_MEMBER))
+        .or_else(|| document.member(DOCUMENTATION_PARTS_MEMBER))
         .ok_or_else(|| UNREADABLE_IMPORT.to_string())?;
     let declared = declared
-        .as_array()
+        .list()
         .ok_or_else(|| UNREADABLE_IMPORT.to_string())?;
-    // The reader's own entry bound, so the work one request causes is bounded by a
-    // constant and not by how many entries fit in the body's bytes. It is NOT the AWS
-    // quota: that one counts the documentation parts an API HOLDS — one per documented
-    // entity — so it is enforced on the entities the import would leave behind, in
-    // `handle`, as the modelled `LimitExceededException`.
+    // The documentation the DOCUMENT itself carries, first: an OpenAPI document documents
+    // the API's entities in its own documentation-related fields, and
+    // `DocumentationPart$properties` states that those fields are what an exported
+    // definition publishes a part's content map as ("Only OpenAPI-compliant
+    // documentation-related fields from the properties map are exported and, hence,
+    // published as part of the API entity definitions"), so a document read back in
+    // documents the same entities through them.
+    let documented = documented_entities(&document);
+    // The reader's own entry bound, over everything the body documents — the entries its
+    // extension declares and the entities its own nodes document — so the work one request
+    // causes is bounded by a constant and not by how many of either fit in the body's
+    // bytes. It is NOT the AWS quota: that one counts the documentation parts an API HOLDS
+    // — one per documented entity — so it is enforced on the entities the import would
+    // leave behind, in `handle`, as the modelled `LimitExceededException`.
     crate::state::bound_entries(
         DOCUMENTATION_PARTS_MEMBER,
-        declared.len(),
+        declared.len().saturating_add(documented.len()),
         MAX_IMPORT_ENTRIES,
     )?;
-    let mut read = ImportedParts::default();
+    // The set this read builds, one part per documented ENTITY, with where each entity
+    // sits in it: a part for an entity the set already documents REPLACES that one — the
+    // later entry documents the entity — and the lookup is what keeps the work one body
+    // causes linear in what it documents rather than quadratic.
+    let mut parts: Vec<ImportedPart> = Vec::with_capacity(declared.len() + documented.len());
+    let mut at: BTreeMap<[String; 5], usize> = BTreeMap::new();
+    let mut place = |part: ImportedPart, parts: &mut Vec<ImportedPart>| {
+        let key = location_key(&part.location);
+        match at.get(&key) {
+            Some(&index) => {
+                if let Some(slot) = parts.get_mut(index) {
+                    *slot = part;
+                }
+            }
+            None => {
+                at.insert(key, parts.len());
+                parts.push(part);
+            }
+        }
+    };
+    for part in documented {
+        place(part, &mut parts);
+    }
     for (index, entry) in declared.iter().enumerate() {
         // The FIRST entry the import cannot store ends the read: it names the entry and
         // its problem, which is what the caller has to fix, and the entries after it are
@@ -261,10 +547,234 @@ fn parse_import(body: &[u8]) -> Result<ImportedParts, String> {
         let part = imported_part(entry).map_err(|message| {
             import_errors(&format!("{DOCUMENTATION_PARTS_MEMBER}[{index}]: {message}"))
         })?;
-        read.parts.push(part);
+        // The extension's own entry for an entity is that entity's documentation set
+        // entry, so it replaces what the document's own fields documented it with.
+        place(part, &mut parts);
     }
-    Ok(read)
+    Ok(ImportedParts { parts })
 }
+
+/// The OpenAPI fields that carry an API entity's DOCUMENTATION, in the order a content
+/// map written from them names them.
+///
+/// `summary` and `description` are the fields an OpenAPI node describes itself with — the
+/// documentation-related fields `DocumentationPart$properties` states an exported
+/// definition publishes a part's content map as — so they are what a document read back in
+/// documents its entities with. A node's other fields describe its SHAPE (a schema, a
+/// parameter's type, a response's headers) rather than the entity, and a documentation
+/// part carries none of them.
+const DOCUMENTATION_FIELDS: &[&str] = &["summary", "description"];
+
+/// The [`DOCUMENTATION_FIELDS`] a node carries, in the order the catalog names them;
+/// `None` for a node that carries none, which documents nothing.
+fn documentation_fields(node: &BodyNode) -> Option<Vec<(String, BodyNode)>> {
+    let fields: Vec<(String, BodyNode)> = DOCUMENTATION_FIELDS
+        .iter()
+        .filter_map(|field| match node.member(field) {
+            Some(BodyNode::Text(text)) if !text.trim().is_empty() => {
+                Some(((*field).to_string(), BodyNode::Text(text.clone())))
+            }
+            _ => None,
+        })
+        .collect();
+    (!fields.is_empty()).then_some(fields)
+}
+
+/// The content map a documented node's own fields make, as the text a part stores: the
+/// [`DOCUMENTATION_FIELDS`] the node carries, each under its own name.
+///
+/// `None` for a node that documents nothing — which is no documented entity at all, not an
+/// entity documented with the empty content map.
+fn documented_content_map(content: &BodyNode) -> Option<String> {
+    let rendered = rendered_content_map(content)?;
+    validated_properties(&rendered).ok()
+}
+
+/// One documented entity of the document: the part to store for it, when its location is
+/// one this service stores and the content map is one it holds.
+fn documented_entity(
+    location: DocumentationPartLocation,
+    content: &BodyNode,
+) -> Option<ImportedPart> {
+    Some(ImportedPart {
+        location: validated_location(&location).ok()?,
+        properties: documented_content_map(content)?,
+    })
+}
+
+/// The part a node documents the entity at `location` with: its own
+/// [`DOCUMENTATION_FIELDS`] as the entity's content map, and nothing when it carries none.
+fn documented_node(
+    location: &DocumentationPartLocation,
+    node: &BodyNode,
+) -> Option<ImportedPart> {
+    let fields = documentation_fields(node)?;
+    documented_entity(location.clone(), &BodyNode::Object(fields))
+}
+
+/// The API entities the DOCUMENT itself documents, as the documentation parts they are:
+/// one per entity whose node carries documentation, in document order.
+///
+/// An OpenAPI document documents its API's entities in its own nodes: the document's
+/// `info` documents the `API` entity, a path item documents that path's `RESOURCE`, an
+/// operation of it the `METHOD`, a parameter of that operation the entity its `in` names,
+/// each response the `RESPONSE` at its status code and each header of a response the
+/// `RESPONSE_HEADER` of it, and a declared schema the `MODEL` of that name. The
+/// documentation itself is the node's own [`DOCUMENTATION_FIELDS`], so a node that carries
+/// none documents no entity.
+fn documented_entities(document: &BodyNode) -> Vec<ImportedPart> {
+    let mut documented = Vec::new();
+    // The API itself, documented by the document's own `info` — which is where an
+    // exported definition publishes the API entity's documentation, so an API part's
+    // content map carries those fields under that same member.
+    if let Some(info) = document.member("info") {
+        if let Some(fields) = documentation_fields(info) {
+            let content = BodyNode::Object(vec![("info".to_string(), BodyNode::Object(fields))]);
+            documented.extend(documented_entity(
+                DocumentationPartLocation {
+                    r#type: "API".to_string(),
+                    path: None,
+                    method: None,
+                    status_code: None,
+                    name: None,
+                },
+                &content,
+            ));
+        }
+    }
+    if let Some(BodyNode::Object(paths)) = document.member("paths") {
+        for (path, item) in paths {
+            documented.extend(documented_node(
+                &DocumentationPartLocation {
+                    r#type: "RESOURCE".to_string(),
+                    path: Some(path.clone()),
+                    method: None,
+                    status_code: None,
+                    name: None,
+                },
+                item,
+            ));
+            for (written, verb) in OPERATION_KEYS {
+                let Some(operation) = item.member(written) else {
+                    continue;
+                };
+                let at = |r#type: &str, status_code: Option<&str>, name: Option<&str>| {
+                    DocumentationPartLocation {
+                        r#type: r#type.to_string(),
+                        path: Some(path.clone()),
+                        method: Some((*verb).to_string()),
+                        status_code: status_code.map(str::to_string),
+                        name: name.map(str::to_string),
+                    }
+                };
+                documented.extend(documented_node(&at("METHOD", None, None), operation));
+                // The operation's parameters: each one documents the entity its `in`
+                // names, under its own name. OpenAPI 3 moved the request body out of the
+                // parameter list into `requestBody`, which documents the same entity.
+                if let Some(BodyNode::List(parameters)) = operation.member("parameters") {
+                    for parameter in parameters {
+                        let Some(BodyNode::Text(place)) = parameter.member("in") else {
+                            continue;
+                        };
+                        let Some(r#type) = PARAMETER_ENTITY_TYPES
+                            .iter()
+                            .find(|(declared, _)| declared == place)
+                            .map(|(_, r#type)| *r#type)
+                        else {
+                            continue;
+                        };
+                        let name = match parameter.member("name") {
+                            Some(BodyNode::Text(name)) => Some(name.clone()),
+                            _ => None,
+                        };
+                        documented.extend(documented_node(
+                            &at(r#type, None, name.as_deref()),
+                            parameter,
+                        ));
+                    }
+                }
+                if let Some(body) = operation.member("requestBody") {
+                    documented.extend(documented_node(&at("REQUEST_BODY", None, None), body));
+                }
+                let Some(BodyNode::Object(responses)) = operation.member("responses") else {
+                    continue;
+                };
+                for (status_code, response) in responses {
+                    documented.extend(documented_node(
+                        &at("RESPONSE", Some(status_code), None),
+                        response,
+                    ));
+                    if let Some(BodyNode::Object(headers)) = response.member("headers") {
+                        for (header, declared) in headers {
+                            documented.extend(documented_node(
+                                &at("RESPONSE_HEADER", Some(status_code), Some(header)),
+                                declared,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // The models the document declares: `definitions` is Swagger 2.0's spelling of the
+    // set, replaced by `components.schemas` from OpenAPI 3 on.
+    let schemas = document.member("definitions").or_else(|| {
+        document
+            .member("components")
+            .and_then(|components| components.member("schemas"))
+    });
+    if let Some(BodyNode::Object(schemas)) = schemas {
+        for (name, schema) in schemas {
+            documented.extend(documented_node(
+                &DocumentationPartLocation {
+                    r#type: "MODEL".to_string(),
+                    path: None,
+                    method: None,
+                    status_code: None,
+                    name: Some(name.clone()),
+                },
+                schema,
+            ));
+        }
+    }
+    // And the authorizers it declares, under Swagger 2.0's `securityDefinitions` or
+    // OpenAPI 3's `components.securitySchemes` — the same two spellings the definition
+    // importer reads a security scheme under.
+    let schemes = document.member("securityDefinitions").or_else(|| {
+        document
+            .member("components")
+            .and_then(|components| components.member("securitySchemes"))
+    });
+    if let Some(BodyNode::Object(schemes)) = schemes {
+        for (name, scheme) in schemes {
+            documented.extend(documented_node(
+                &DocumentationPartLocation {
+                    r#type: "AUTHORIZER".to_string(),
+                    path: None,
+                    method: None,
+                    status_code: None,
+                    name: Some(name.clone()),
+                },
+                scheme,
+            ));
+        }
+    }
+    documented
+}
+
+/// The entity type a parameter of an operation documents, by the `in` its OpenAPI
+/// declaration names.
+///
+/// From `DocumentationPartLocation$name`, the entity types a parameter's documentation
+/// part targets are `PATH_PARAMETER`, `QUERY_PARAMETER`, `REQUEST_HEADER` and
+/// `REQUEST_BODY` — which are OpenAPI's `path`, `query`, `header` and (Swagger 2.0) `body`
+/// parameter locations.
+const PARAMETER_ENTITY_TYPES: &[(&str, &str)] = &[
+    ("path", "PATH_PARAMETER"),
+    ("query", "QUERY_PARAMETER"),
+    ("header", "REQUEST_HEADER"),
+    ("body", "REQUEST_BODY"),
+];
 
 /// The `BadRequestException` message for an import this service refuses for what one of
 /// its entries declares: the sentence API Gateway states for a documentation import it
@@ -408,33 +918,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // How many identifiers this import has to mint: one per entity the body
-        // documents that the surviving documentation set does not already document.
-        // Entities are counted, not entries, so two entries for one entity count once,
-        // exactly as they will be stored — and that count is what the per-API quota
-        // applies to, because it is what the API will HOLD.
+        // The entities the body documents: what an `overwrite` import leaves documented,
+        // however many entries name each of them.
+        let imported_entities: BTreeSet<[String; 5]> =
+            parts.iter().map(|part| location_key(&part.location)).collect();
+
+        // How many documentation parts this import CREATES: one per entry whose entity the
+        // API does not already document. An entry for an entity it DOES document lands on
+        // that part, keeping its identifier, whichever mode the import runs in.
         let minted_count = {
             let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
                 ImportDocumentationPartsErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
                 })
             })?;
-            // What survives the import: nothing in `overwrite` mode, which replaces "any
-            // existing DocumentationParts definition".
-            let surviving: BTreeSet<[String; 5]> = match mode {
-                PutModeKind::Overwrite => BTreeSet::new(),
-                PutModeKind::Merge => api
-                    .documentation_parts
-                    .values()
-                    .map(|part| location_key(&part.location))
-                    .collect(),
-            };
-            let minted: BTreeSet<[String; 5]> = parts
-                .iter()
+            // The parts that survive this import: all of them in `merge`, and in
+            // `overwrite` — which replaces "any existing DocumentationParts definition" —
+            // only those documenting an entity the body documents.
+            let kept: Vec<[String; 5]> = api
+                .documentation_parts
+                .values()
                 .map(|part| location_key(&part.location))
-                .filter(|key| !surviving.contains(key))
+                .filter(|key| mode == PutModeKind::Merge || imported_entities.contains(key))
                 .collect();
-            if surviving.len() + minted.len() > crate::state::MAX_DOCUMENTATION_PARTS_PER_API {
+            let landed: BTreeSet<&[String; 5]> = kept.iter().collect();
+            let minted = parts
+                .iter()
+                .filter(|part| !landed.contains(&location_key(&part.location)))
+                .count();
+            if kept.len() + minted > crate::state::MAX_DOCUMENTATION_PARTS_PER_API {
                 return Err(ImportDocumentationPartsErrorModeled::LimitExceededException(
                     LimitExceededException {
                         retry_after_seconds: None,
@@ -446,11 +958,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            minted.len()
+            minted
         };
-        // One id and one creation rank per entity this import CREATES: an entry that
-        // lands on the part already documenting its entity keeps that part's id and
-        // rank instead.
+        // One id and one creation rank per part this import CREATES: an entry that lands
+        // on the part already documenting its entity keeps that part's id and rank
+        // instead.
         let ids = store.reserve_ids(minted_count);
         let sequences: Vec<u64> = (0..minted_count).map(|_| store.next_sequence()).collect();
 
@@ -461,16 +973,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         if mode == PutModeKind::Overwrite {
             // `overwrite` replaces "any existing DocumentationParts definition": the
-            // imported set becomes the API's documentation, so what the previous one
-            // documented is gone.
-            api.documentation_parts.clear();
+            // imported set becomes the API's documentation, so an entity the body does
+            // not document is no longer documented. An entity it DOES document keeps the
+            // part documenting it — the entry lands on that record, under its identifier,
+            // rather than on a second part for one entity — so a client holding that id
+            // still reads, patches and deletes the entity's documentation after the
+            // import.
+            api.documentation_parts
+                .retain(|_, part| imported_entities.contains(&location_key(&part.location)));
         }
 
         // The entity-to-part index this import writes through, built ONCE from the
-        // documentation set that survives it: an entry lands on the part documenting its
-        // entity with a lookup, so the work under the lock is one lookup per entry rather
-        // than a scan of the API's whole documentation set.
-        let mut documented: BTreeMap<[String; 5], (String, u64)> = api
+        // documentation set the import LANDS ON — the one that was already there: an entry
+        // lands on the part documenting its entity with a lookup, so the work under the
+        // lock is one lookup per entry rather than a scan of the API's whole documentation
+        // set.
+        let documented: BTreeMap<[String; 5], (String, u64)> = api
             .documentation_parts
             .values()
             .map(|part| {
@@ -482,10 +1000,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         let mut minted = 0usize;
-        // No capacity hint: this collects one id per entity the body documents, which is
-        // the minted ones plus however many landed on a surviving part.
-        let mut imported: Vec<String> = Vec::new();
-        let mut reported: BTreeSet<String> = BTreeSet::new();
+        // One identifier per ENTITY the body documents, in the order it documents them:
+        // the read already landed every entry on the entity it documents
+        // ([`parse_import`]), so an entity several entries name is one part here.
+        let mut imported: Vec<String> = Vec::with_capacity(parts.len());
         for part in parts {
             // `merge` merges "the new definition into the existing one": an entry for an
             // entity the API already documents replaces that part's content map under its
@@ -503,7 +1021,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .copied()
                         .ok_or_else(crate::state::state_unavailable)?;
                     minted += 1;
-                    documented.insert(key, (id.clone(), sequence));
                     (id, sequence)
                 }
             };
@@ -516,12 +1033,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     sequence,
                 },
             );
-            // "A list of the returned documentation part identifiers": one per part the
-            // import left behind, in the order the body first documented its entity, so
-            // an entity several entries document is named once.
-            if reported.insert(id.clone()) {
-                imported.push(id);
-            }
+            imported.push(id);
         }
 
         // Everything below is owned, so the store lock is released before the response is

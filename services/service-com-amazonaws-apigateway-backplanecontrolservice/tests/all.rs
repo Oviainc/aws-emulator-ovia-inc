@@ -51,6 +51,8 @@ mod delete_method_response;
 mod delete_stage;
 #[path = "all/documentation_part_import_bulk.rs"]
 mod documentation_part_import_bulk;
+#[path = "all/documentation_part_import_document.rs"]
+mod documentation_part_import_document;
 #[path = "all/documentation_parts.rs"]
 mod documentation_parts;
 #[path = "all/documentation_version_collection.rs"]

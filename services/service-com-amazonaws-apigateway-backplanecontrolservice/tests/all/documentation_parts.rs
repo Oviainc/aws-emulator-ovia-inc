@@ -82,6 +82,19 @@ pub(crate) fn content_map(description: &str) -> String {
     json!({ "description": description }).to_string()
 }
 
+/// The text a content map an import body declared as a JSON OBJECT is stored and reported
+/// as.
+///
+/// An entry's content map is a JSON object in the document, and `properties` is "a content
+/// map ... encoded as a JSON string": the service writes that object out itself — one
+/// member per line, indented by two spaces, with a space either side of the name/value
+/// separator — so a read reports the service's own rendering rather than the bytes the body
+/// carried. Spelled out here as the expected text, for the one-member `description` map
+/// these cases import, rather than computed the way the service computes it.
+pub(crate) fn imported_content_map(description: &str) -> String {
+    format!("{{\n  \"description\" : {}\n}}", json!(description))
+}
+
 /// The location a request that sets only `type` must be STORED and reported with: every
 /// member the type makes valid, at its documented default.
 fn defaulted_location(entity_type: &str, valid: &[&str]) -> Value {
@@ -772,26 +785,39 @@ async fn an_import_writes_one_part_per_entity_and_the_mode_decides_what_survives
             !*overwrites
         );
 
-        // `merge` lands an entry on the part that already documents its entity, so that
-        // part keeps its identifier; `overwrite` replaced the set, so the old id is gone.
+        // An entry lands on the part that already documents its entity, so that part keeps
+        // its identifier whichever mode the import ran in: a client holding the id still
+        // reads the entity's documentation, now carrying the re-imported content map.
         let first_method_id = created[1]
             .as_str()
             .unwrap_or_else(|| panic!("case {case}: expected a string id, got {:?}", created[1]))
             .to_string();
         let read = get_part(&gateway, &api, &first_method_id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case}: expected the re-imported part to keep its id, got {} with {:?}",
+            read.status, read.body
+        );
+        assert_eq!(
+            read.body["properties"].as_str(),
+            Some(imported_content_map("list every pet").as_str()),
+            "case {case}: expected the re-imported content map, got {:?}",
+            read.body["properties"]
+        );
+        // The part whose entity the second body does NOT document: `overwrite` drops it,
+        // so its id names nothing; `merge` keeps it, under its own id.
+        let query_parameter_id = created[2]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: expected a string id, got {:?}", created[2]))
+            .to_string();
+        let read = get_part(&gateway, &api, &query_parameter_id).await;
         if *overwrites {
             assert_failure(&read, 404, NOT_FOUND, case);
         } else {
             assert_eq!(
                 read.status, 200,
-                "case {case}: expected the merged part to keep its id, got {} with {:?}",
+                "case {case}: expected the part the body left alone to be kept, got {} with {:?}",
                 read.status, read.body
-            );
-            assert_eq!(
-                read.body["properties"].as_str(),
-                Some(json!({ "description": "list every pet" }).to_string().as_str()),
-                "case {case}: expected the merged content map, got {:?}",
-                read.body["properties"]
             );
         }
     }
