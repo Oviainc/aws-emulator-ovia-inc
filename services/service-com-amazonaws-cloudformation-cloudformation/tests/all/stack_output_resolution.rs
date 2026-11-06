@@ -296,7 +296,10 @@ Outputs:
             stack_name: "catalogued",
             template: r#"{"Resources":{
                    "T":{"Type":"AWS::SNS::Topic","Properties":{"TopicName":"probe-topic"}},
-                   "D":{"Type":"AWS::DynamoDB::Table","Properties":{"TableName":"probe-table"}}},
+                   "D":{"Type":"AWS::DynamoDB::Table","Properties":{
+                     "TableName":"probe-table","BillingMode":"PAY_PER_REQUEST",
+                     "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+                     "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}]}}},
                  "Outputs":{
                    "TopicPublished":{"Value":{"Fn::GetAtt":["T","TopicArn"]}},
                    "TopicConventional":{"Value":{"Fn::GetAtt":["T","Arn"]}},

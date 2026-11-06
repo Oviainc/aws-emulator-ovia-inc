@@ -198,6 +198,7 @@ use serde_json::Value;
 use super::provisioner::{provisioner_for, Provisioner};
 use super::StoredResource;
 
+mod dynamodb_table;
 mod ec2_vpc_network;
 mod lambda_function;
 mod lambda_layer_version;
@@ -532,6 +533,8 @@ pub(super) enum Owner {
     /// A type whose create, update and delete arms are entries of
     /// [`provisioner_for`](super::provisioner::provisioner_for)'s catalogue.
     Builtin(Provisioner),
+    /// `AWS::DynamoDB::Table`, whose arms are [`dynamodb_table`]'s.
+    DynamodbTable,
     /// `AWS::Lambda::Function`, whose arms are [`lambda_function`]'s.
     LambdaFunction,
     /// `AWS::Lambda::LayerVersion`, whose arms are [`lambda_layer_version`]'s.
@@ -548,6 +551,9 @@ pub(super) enum Owner {
 /// The owner of a template resource type, or `None` for a type this emulator leaves
 /// declared-only.
 pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
+    if resource_type == dynamodb_table::DYNAMODB_TABLE {
+        return Some(Owner::DynamodbTable);
+    }
     if resource_type == lambda_function::LAMBDA_FUNCTION {
         return Some(Owner::LambdaFunction);
     }
@@ -576,6 +582,9 @@ impl Owner {
         match self {
             Self::Builtin(provisioner) => {
                 provisioner.create(ctx, region, resource, propagated).await
+            }
+            Self::DynamodbTable => {
+                dynamodb_table::create(ctx, region, resource, propagated).await
             }
             Self::LambdaFunction => {
                 lambda_function::create(ctx, region, resource, propagated).await
@@ -606,6 +615,7 @@ impl Owner {
             Self::Builtin(provisioner) => {
                 provisioner.readiness(ctx, region, physical_resource_id).await
             }
+            Self::DynamodbTable => Ok(dynamodb_table::readiness()),
             Self::LambdaFunction => Ok(lambda_function::readiness()),
             // The version exists, and a function may name it, the moment
             // `PublishLayerVersion` answers.
@@ -643,6 +653,9 @@ impl Owner {
             Self::LambdaFunction | Self::LambdaLayerVersion | Self::LambdaPermission => {
                 Ok(BTreeMap::new())
             }
+            // A table's `Arn` and `StreamArn` are the ones its own `CreateTable` answered
+            // with, so there is nothing left to read once the resource is up.
+            Self::DynamodbTable => Ok(BTreeMap::new()),
             // Each of these types publishes its own identifier and nothing else, and the
             // create answered it, so there is nothing to read once the resource is up.
             Self::Ec2VpcNetwork(_) => Ok(BTreeMap::new()),
@@ -661,6 +674,7 @@ impl Owner {
             Self::Builtin(provisioner) => {
                 provisioner.removal(ctx, region, physical_resource_id).await
             }
+            Self::DynamodbTable => Ok(dynamodb_table::removal()),
             Self::LambdaFunction => {
                 lambda_function::removal(ctx, region, physical_resource_id).await
             }
@@ -687,6 +701,9 @@ impl Owner {
         match self {
             Self::Builtin(provisioner) => {
                 provisioner.update(ctx, region, resource, declared).await
+            }
+            Self::DynamodbTable => {
+                dynamodb_table::update(ctx, region, resource, declared).await
             }
             Self::LambdaFunction => lambda_function::update(ctx, region, resource, declared)
                 .await
@@ -728,6 +745,10 @@ impl Owner {
             Self::LambdaFunction => {
                 lambda_function::retag(ctx, region, resource, declared, propagated).await
             }
+            // The tags of a table that already exists are reconciled by no arm here yet —
+            // as for every type whose arm states no `retag` ([`Provisioner::retag`]'s own
+            // default) — so nothing is asked about them.
+            Self::DynamodbTable => Ok(()),
             // Neither a layer version nor a policy statement is taggable, so nothing is
             // asked about their tags.
             Self::LambdaLayerVersion | Self::LambdaPermission => Ok(()),
@@ -753,6 +774,11 @@ impl Owner {
                     .delete(ctx, region, resource, final_snapshot)
                     .await
             }
+            // DynamoDB's `DeleteTable` takes no snapshot of a table on the way out: there
+            // is no such call (a backup is `CreateBackup`, a call of its own), so a
+            // `Snapshot` deletion policy on this type deletes the table with no snapshot
+            // invented for it.
+            Self::DynamodbTable => dynamodb_table::delete(ctx, region, resource).await,
             // Lambda's `DeleteFunction` takes no snapshot of a function on the way out:
             // there is no such call, so a `Snapshot` deletion policy on this type deletes
             // the function with no snapshot invented for it.
@@ -784,6 +810,10 @@ impl Owner {
             Self::Builtin(provisioner) => {
                 provisioner.actual_configuration(ctx, region, resource).await
             }
+            // A table reports no configuration of its own to compare yet: this arm reads
+            // nothing back for drift detection, so nothing of it is reported as drifted
+            // rather than guessed at.
+            Self::DynamodbTable => Ok(None),
             Self::LambdaFunction => {
                 lambda_function::actual_configuration(
                     ctx,
@@ -814,6 +844,8 @@ impl Owner {
             Self::LambdaFunction | Self::LambdaLayerVersion | Self::LambdaPermission => {
                 message.to_string()
             }
+            // Amazon DynamoDB's does the same.
+            Self::DynamodbTable => message.to_string(),
             // Amazon EC2's does the same.
             Self::Ec2VpcNetwork(_) => message.to_string(),
         }

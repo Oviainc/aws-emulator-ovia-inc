@@ -102,6 +102,10 @@ service-com-amazonaws-ssm-amazonssm = { workspace = true }
 # Amazon EC2, for the `AWS::EC2::VPC` and `AWS::EC2::Subnet` a stack really creates there:
 # the suites that deploy a network read the VPC and its subnets back through EC2's own wire.
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# Amazon DynamoDB, for the `AWS::DynamoDB::Table` a stack really creates there — including
+# the one an `AWS::Serverless::SimpleTable` becomes — so a suite that deploys one reads the
+# table, and the stream its specification enabled, back through DynamoDB's own wire.
+service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 
 [lints]
 workspace = true

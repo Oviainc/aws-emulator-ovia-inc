@@ -38,14 +38,25 @@ use crate::stack_lifecycle::{call, call_in, deploy, list_members, ACCOUNT_ID};
 /// A second Region, for the case that holds the read to the Region it was signed for.
 const OTHER_REGION: &str = "us-west-2";
 
+/// The members a declared `AWS::DynamoDB::Table` must carry for DynamoDB to create it: a
+/// key schema with the attribute it names defined, and a capacity mode — a table declared
+/// without `ProvisionedThroughput` has to name the on-demand mode.
+const TABLE_KEY: &str = r#""KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+    "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+    "BillingMode":"PAY_PER_REQUEST""#;
+
 /// A stack of three resources whose primary identifiers span the forms a type publishes: an
 /// ARN (`AWS::SNS::Topic`'s `Ref` "returns the topic ARN"), a name the template declared
 /// (`AWS::S3::Bucket`) and a name CloudFormation generated (`AWS::DynamoDB::Table`).
-const THREE_RESOURCES: &str = r#"{"Resources":{
-    "Alpha":{"Type":"AWS::SNS::Topic","Properties":{"TopicName":"alpha-topic"}},
-    "Beta":{"Type":"AWS::S3::Bucket","Properties":{"BucketName":"beta-bucket"}},
-    "Gamma":{"Type":"AWS::DynamoDB::Table"}
-}}"#;
+fn three_resources() -> String {
+    format!(
+        r#"{{"Resources":{{
+    "Alpha":{{"Type":"AWS::SNS::Topic","Properties":{{"TopicName":"alpha-topic"}}}},
+    "Beta":{{"Type":"AWS::S3::Bucket","Properties":{{"BucketName":"beta-bucket"}}}},
+    "Gamma":{{"Type":"AWS::DynamoDB::Table","Properties":{{{TABLE_KEY}}}}}
+}}}}"#
+    )
+}
 
 /// A second stack: its resources are related to each other and to nothing the first one holds.
 const TWO_RESOURCES: &str = r#"{"Resources":{
@@ -57,14 +68,25 @@ const TWO_RESOURCES: &str = r#"{"Resources":{
 const ONE_RESOURCE: &str = r#"{"Resources":{"Solo":{"Type":"AWS::SNS::Topic"}}}"#;
 
 /// A stack of six resources, so a page boundary falls inside one stack's related resources.
-const SIX_RESOURCES: &str = r#"{"Resources":{
-    "One":{"Type":"AWS::DynamoDB::Table","Properties":{"TableName":"paged-one"}},
-    "Two":{"Type":"AWS::DynamoDB::Table","Properties":{"TableName":"paged-two"}},
-    "Three":{"Type":"AWS::DynamoDB::Table","Properties":{"TableName":"paged-three"}},
-    "Four":{"Type":"AWS::DynamoDB::Table","Properties":{"TableName":"paged-four"}},
-    "Five":{"Type":"AWS::DynamoDB::Table","Properties":{"TableName":"paged-five"}},
-    "Six":{"Type":"AWS::DynamoDB::Table","Properties":{"TableName":"paged-six"}}
-}}"#;
+fn six_resources() -> String {
+    let tables: Vec<String> = [
+        ("One", "paged-one"),
+        ("Two", "paged-two"),
+        ("Three", "paged-three"),
+        ("Four", "paged-four"),
+        ("Five", "paged-five"),
+        ("Six", "paged-six"),
+    ]
+    .iter()
+    .map(|(logical_id, name)| {
+        format!(
+            r#""{logical_id}":{{"Type":"AWS::DynamoDB::Table",
+            "Properties":{{"TableName":"{name}",{TABLE_KEY}}}}}"#
+        )
+    })
+    .collect();
+    format!("{{\"Resources\":{{{}}}}}", tables.join(","))
+}
 
 /// The property name a resource of `resource_type` carries its primary identifier under.
 ///
@@ -308,8 +330,9 @@ async fn list_related(
 /// under.
 #[tokio::test]
 async fn related_resources_are_the_other_resources_the_same_stack_manages() {
+    let three = three_resources();
     let (router, resource_scan_id, catalogue) = scanned_account(&[
-        ("related-three", THREE_RESOURCES),
+        ("related-three", &three),
         ("related-two", TWO_RESOURCES),
         ("related-one", ONE_RESOURCE),
     ])
@@ -450,7 +473,7 @@ async fn related_resources_are_the_other_resources_the_same_stack_manages() {
 #[tokio::test]
 async fn one_response_carries_at_most_the_requested_page_of_related_resources() {
     let (router, resource_scan_id, catalogue) =
-        scanned_account(&[("related-paged", SIX_RESOURCES)]).await;
+        scanned_account(&[("related-paged", &six_resources())]).await;
     let addressed = vec![addressing(&catalogue, "One")];
     let related = ["Two", "Three", "Four", "Five", "Six"];
 
@@ -555,7 +578,7 @@ async fn one_response_carries_at_most_the_requested_page_of_related_resources() 
 #[tokio::test]
 async fn the_refusals_around_listing_related_resources() {
     let (router, resource_scan_id, catalogue) = scanned_account(&[
-        ("refused-three", THREE_RESOURCES),
+        ("refused-three", &three_resources()),
     ])
     .await;
     let addressed = vec![addressing(&catalogue, "Alpha")];

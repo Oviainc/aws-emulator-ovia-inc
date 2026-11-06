@@ -146,14 +146,14 @@ const OWNED: &[Owned] = &[
 
 /// The properties the declaration of `resource_type` carries.
 ///
-/// Only the two types this emulator really CREATES in their owning service need any, and
-/// each needs exactly what that service's create requires of a caller: an
-/// `AWS::IAM::Role`'s `AssumeRolePolicyDocument` is required on the type and on IAM's own
-/// `CreateRole` (the policy here is the issue's own — a role the AWS Config recorder
-/// assumes), and an `AWS::RDS::DBInstance` is created through `CreateDBInstance`, whose
-/// `Engine` and `DBInstanceClass` are required members. The other types here are recorded
-/// by CloudFormation rather than created in their owning service, and the naming rule reads
-/// no property of theirs — a declaration that names the resource nowhere is exactly the case
+/// Only the types this emulator really CREATES in their owning service need any, and each
+/// needs exactly what that service's create requires of a caller: an `AWS::IAM::Role`'s
+/// `AssumeRolePolicyDocument` is required on the type and on IAM's own `CreateRole` (the
+/// policy here is the issue's own — a role the AWS Config recorder assumes), and an
+/// `AWS::RDS::DBInstance` is created through `CreateDBInstance`, whose `Engine` and
+/// `DBInstanceClass` are required members. The other types here are recorded by
+/// CloudFormation rather than created in their owning service, and the naming rule reads no
+/// property of theirs — a declaration that names the resource nowhere is exactly the case
 /// under test.
 fn properties(resource_type: &str) -> Value {
     if resource_type == "AWS::IAM::Role" {
@@ -181,6 +181,17 @@ fn properties(resource_type: &str) -> Value {
             "Handler": "index.handler",
             "Role": {"Fn::GetAtt": [EXEC_ROLE_LOGICAL_ID, "Arn"]},
             "Code": {"ZipFile": "def handler(event, context):\n    return {}\n"}
+        });
+    }
+    // An `AWS::DynamoDB::Table` is created through `CreateTable`, whose `KeySchema` and the
+    // `AttributeDefinitions` of the attributes it names are required of a caller, and whose
+    // capacity mode has to be the on-demand one for a declaration carrying no
+    // `ProvisionedThroughput`.
+    if resource_type == "AWS::DynamoDB::Table" {
+        return json!({
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
         });
     }
     json!({})
@@ -517,20 +528,20 @@ async fn a_name_the_template_declares_is_not_fitted() {
     // case and length; the type is one this emulator records rather than provisions, so
     // what is read back is the name CloudFormation kept.
     let router = router();
-    let past_the_bound = format!("declared-table-{}", "x".repeat(300));
+    let past_the_bound = format!("declared-alarm-{}", "x".repeat(300));
     let cases: &[(&str, &str, &str)] = &[
-        ("a short declared table name", "Declared", "declared-config-table"),
+        ("a short declared alarm name", "Declared", "declared-config-alarm"),
         (
             // Upper case, which the generated-name rule lowercases for a type whose owning
             // service admits none: a DECLARED name keeps its case either way.
-            "a declared table name carrying upper case",
+            "a declared alarm name carrying upper case",
             "DeclaredMixed",
-            "Declared-Config-Table",
+            "Declared-Config-Alarm",
         ),
         (
-            // Past Amazon DynamoDB's 255 characters (`TableName`, `@length(max: 255)`):
-            // still the caller's name.
-            "a declared table name past the bound",
+            // Past Amazon CloudWatch's 255 characters (`PutMetricAlarm.AlarmName`,
+            // `@length(max: 255)`): still the caller's name.
+            "a declared alarm name past the bound",
             "DeclaredLong",
             &past_the_bound,
         ),
@@ -539,7 +550,7 @@ async fn a_name_the_template_declares_is_not_fitted() {
     for (_, logical_id, declared) in cases {
         resources.insert(
             (*logical_id).to_string(),
-            json!({"Type": "AWS::DynamoDB::Table", "Properties": {"TableName": declared}}),
+            json!({"Type": "AWS::CloudWatch::Alarm", "Properties": {"AlarmName": declared}}),
         );
     }
     let template = json!({"Resources": resources}).to_string();

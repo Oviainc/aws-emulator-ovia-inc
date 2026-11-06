@@ -8852,6 +8852,7 @@ dependencies = [
  "quick-xml",
  "serde_json",
  "service-com-amazonaws-codepipeline-codepipeline-20150709",
+ "service-com-amazonaws-dynamodb-dynamodb-20120810",
  "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-lambda-awsgirapiservice",

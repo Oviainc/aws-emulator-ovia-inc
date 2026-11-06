@@ -45,18 +45,30 @@ use crate::stack_lifecycle::{call, call_in, deploy, list_members, ACCOUNT_ID};
 /// A second Region, for the case that holds the read to the Region it was signed for.
 const OTHER_REGION: &str = "us-west-2";
 
+/// The members a declared `AWS::DynamoDB::Table` must carry for DynamoDB to create it: a
+/// key schema with the attribute it names defined, and a capacity mode — a table declared
+/// without `ProvisionedThroughput` has to name the on-demand mode.
+const TABLE_KEY: &str = r#""KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+    "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+    "BillingMode":"PAY_PER_REQUEST""#;
+
 /// A stack whose resources span the forms a primary identifier takes — an ARN
 /// (`AWS::SNS::Topic`'s `Ref` "returns the topic ARN"), a name the template declared
 /// (`AWS::S3::Bucket`, `AWS::Logs::LogGroup`) and a name CloudFormation generated
 /// (`AWS::DynamoDB::Table`) — and whose declarations span a resource that asks for tags of its
 /// own and one that asks for none.
-const TAGGED_STACK: &str = r#"{"Resources":{
-    "Alpha":{"Type":"AWS::SNS::Topic","Properties":{"TopicName":"scanned-alpha-topic"}},
-    "Beta":{"Type":"AWS::S3::Bucket","Properties":{"BucketName":"scanned-beta-bucket"}},
-    "Gamma":{"Type":"AWS::DynamoDB::Table","Properties":{"Tags":[{"Key":"Tier","Value":"gold"}]}},
-    "Delta":{"Type":"AWS::Logs::LogGroup","Properties":{
-        "LogGroupName":"scanned-delta-group","Tags":[{"Key":"Tier","Value":"silver"}]}}
-}}"#;
+fn tagged_stack() -> String {
+    format!(
+        r#"{{"Resources":{{
+    "Alpha":{{"Type":"AWS::SNS::Topic","Properties":{{"TopicName":"scanned-alpha-topic"}}}},
+    "Beta":{{"Type":"AWS::S3::Bucket","Properties":{{"BucketName":"scanned-beta-bucket"}}}},
+    "Gamma":{{"Type":"AWS::DynamoDB::Table",
+        "Properties":{{"Tags":[{{"Key":"Tier","Value":"gold"}}],{TABLE_KEY}}}}},
+    "Delta":{{"Type":"AWS::Logs::LogGroup","Properties":{{
+        "LogGroupName":"scanned-delta-group","Tags":[{{"Key":"Tier","Value":"silver"}}]}}}}
+}}}}"#
+    )
+}
 
 /// A second stack, carrying no stack-level tags at all: its resource is in the same scan and
 /// outside every tag filter the first stack's tags answer.
@@ -65,14 +77,25 @@ const PLAIN_STACK: &str = r#"{"Resources":{
 }}"#;
 
 /// A stack of six resources, so a page boundary falls inside one scan's resources.
-const SIX_RESOURCES: &str = r#"{"Resources":{
-    "One":{"Type":"AWS::DynamoDB::Table","Properties":{"TableName":"scanned-one"}},
-    "Two":{"Type":"AWS::DynamoDB::Table","Properties":{"TableName":"scanned-two"}},
-    "Three":{"Type":"AWS::DynamoDB::Table","Properties":{"TableName":"scanned-three"}},
-    "Four":{"Type":"AWS::DynamoDB::Table","Properties":{"TableName":"scanned-four"}},
-    "Five":{"Type":"AWS::DynamoDB::Table","Properties":{"TableName":"scanned-five"}},
-    "Six":{"Type":"AWS::DynamoDB::Table","Properties":{"TableName":"scanned-six"}}
-}}"#;
+fn six_resources() -> String {
+    let tables: Vec<String> = [
+        ("One", "scanned-one"),
+        ("Two", "scanned-two"),
+        ("Three", "scanned-three"),
+        ("Four", "scanned-four"),
+        ("Five", "scanned-five"),
+        ("Six", "scanned-six"),
+    ]
+    .iter()
+    .map(|(logical_id, name)| {
+        format!(
+            r#""{logical_id}":{{"Type":"AWS::DynamoDB::Table",
+            "Properties":{{"TableName":"{name}",{TABLE_KEY}}}}}"#
+        )
+    })
+    .collect();
+    format!("{{\"Resources\":{{{}}}}}", tables.join(","))
+}
 
 /// The stack-level tags the tagged stack is deployed with, which CloudFormation propagates to
 /// the resources it creates in that stack.
@@ -120,7 +143,7 @@ async fn deploy_tagged(router: &MultiServiceRouter, name: &str, template: &str) 
 /// one, and the scan that found all five.
 async fn scanned_account() -> (MultiServiceRouter, String, BTreeMap<String, Scanned>) {
     let router = router();
-    deploy_tagged(&router, TAGGED_STACK_NAME, TAGGED_STACK).await;
+    deploy_tagged(&router, TAGGED_STACK_NAME, &tagged_stack()).await;
     deploy(&router, "scanned-plain", PLAIN_STACK).await;
     let mut catalogue = stack_catalogue(&router, TAGGED_STACK_NAME).await;
     catalogue.extend(stack_catalogue(&router, "scanned-plain").await);
@@ -464,7 +487,7 @@ async fn the_filters_narrow_the_resources_the_scan_found() {
 #[tokio::test]
 async fn one_response_carries_at_most_the_requested_page_of_resources() {
     let router = router();
-    deploy(&router, "scanned-paged", SIX_RESOURCES).await;
+    deploy(&router, "scanned-paged", &six_resources()).await;
     let catalogue = stack_catalogue(&router, "scanned-paged").await;
     let resource_scan_id = completed_scan(&router).await;
     let found = ["One", "Two", "Three", "Four", "Five", "Six"];

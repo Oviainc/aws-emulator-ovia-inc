@@ -444,7 +444,10 @@ fn output_cases() -> Vec<OutputCase> {
             stack_name: "storage",
             template: r#"{"Resources":{"B":{"Type":"AWS::S3::Bucket",
                    "Properties":{"BucketName":"probe-bucket"}},
-                   "D":{"Type":"AWS::DynamoDB::Table","Properties":{"TableName":"probe-table"}}},
+                   "D":{"Type":"AWS::DynamoDB::Table","Properties":{
+                     "TableName":"probe-table","BillingMode":"PAY_PER_REQUEST",
+                     "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+                     "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}]}}},
                  "Outputs":{"BucketName":{"Value":{"Ref":"B"}},
                    "BucketArn":{"Value":{"Fn::GetAtt":["B","Arn"]}},
                    "TableName":{"Value":{"Ref":"D"}},

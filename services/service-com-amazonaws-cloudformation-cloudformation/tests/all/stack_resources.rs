@@ -264,7 +264,10 @@ fn resource_cases() -> Vec<ResourceCase> {
             case: "two named resources whose ids are their names",
             stack_name: "catalogued",
             template: r#"{"Resources":{
-                 "Table":{"Type":"AWS::DynamoDB::Table","Properties":{"TableName":"probe-table"}},
+                 "Table":{"Type":"AWS::DynamoDB::Table","Properties":{
+                   "TableName":"probe-table","BillingMode":"PAY_PER_REQUEST",
+                   "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+                   "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}]}},
                  "Group":{"Type":"AWS::Logs::LogGroup","Properties":{"LogGroupName":"probe-logs"}}}}"#
                 .to_string(),
             expected: vec![

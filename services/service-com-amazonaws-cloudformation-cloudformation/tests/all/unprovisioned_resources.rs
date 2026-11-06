@@ -105,13 +105,13 @@ async fn a_resource_whose_owning_service_does_not_answer_fails_the_stack() {
 #[tokio::test]
 async fn resource_types_with_no_provisioner_are_declared_only_and_the_stack_completes() {
     let router = crate::stack_lifecycle::router();
-    let case = "a table and a log group, neither of which this emulator provisions";
+    let case = "an alarm and a log group, neither of which this emulator provisions";
     let stack_name = "declared-only-stack";
     let template = json!({
         "Resources": {
-            "Table": {
-                "Type": "AWS::DynamoDB::Table",
-                "Properties": { "TableName": "declared-only-table" }
+            "Alarm": {
+                "Type": "AWS::CloudWatch::Alarm",
+                "Properties": { "AlarmName": "declared-only-alarm" }
             },
             "Group": {
                 "Type": "AWS::Logs::LogGroup",
@@ -119,8 +119,8 @@ async fn resource_types_with_no_provisioner_are_declared_only_and_the_stack_comp
             }
         },
         "Outputs": {
-            "GroupArn": { "Value": { "Fn::GetAtt": ["Group", "Arn"] } },
-            "TableName": { "Value": { "Ref": "Table" } }
+            "AlarmName": { "Value": { "Ref": "Alarm" } },
+            "GroupArn": { "Value": { "Fn::GetAtt": ["Group", "Arn"] } }
         }
     })
     .to_string();
@@ -141,8 +141,8 @@ async fn resource_types_with_no_provisioner_are_declared_only_and_the_stack_comp
     assert_eq!(
         values,
         vec![
+            "declared-only-alarm".to_string(),
             "arn:aws:logs:us-east-1:000000000000:log-group:declared-only-group:*".to_string(),
-            "declared-only-table".to_string(),
         ],
         "case {case:?}: expected the documented Ref and Fn::GetAtt values, got {values:?}"
     );

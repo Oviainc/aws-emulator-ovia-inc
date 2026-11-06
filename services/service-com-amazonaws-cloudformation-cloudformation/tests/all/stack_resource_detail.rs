@@ -215,8 +215,6 @@ fn detail_cases() -> Vec<DetailCase> {
         DetailCase {
             // Three types, declared out of logical-id order, one of them a type the
             // return-value catalogue does not carry; two carry Metadata and one does not.
-            // Every type here is one this emulator does not provision in an owning
-            // service, so nothing outside CloudFormation is called for the stack.
             case: "a yaml template declaring three resources of three types",
             stack_name: "detail-mixed",
             template: concat!(
@@ -225,6 +223,13 @@ fn detail_cases() -> Vec<DetailCase> {
                 "    Type: AWS::DynamoDB::Table\n",
                 "    Properties:\n",
                 "      TableName: detail-table\n",
+                "      BillingMode: PAY_PER_REQUEST\n",
+                "      KeySchema:\n",
+                "        - AttributeName: pk\n",
+                "          KeyType: HASH\n",
+                "      AttributeDefinitions:\n",
+                "        - AttributeName: pk\n",
+                "          AttributeType: S\n",
                 "    Metadata:\n",
                 "      Purpose: ingest\n",
                 "  Bucket:\n",
