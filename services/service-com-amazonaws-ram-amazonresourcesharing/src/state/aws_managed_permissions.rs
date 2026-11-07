@@ -366,3 +366,22 @@ pub fn catalog_records(now: i64) -> BTreeMap<String, PermissionRecord> {
         .map(|entry| (entry.arn(), entry.record(now)))
         .collect()
 }
+
+/// The AWS managed permission RAM attaches to a share that shares a resource of
+/// `resource_type` and names no permission for that type: the catalog entry that is
+/// "the default managed permission for all resources of this resource type"
+/// ([`AwsManagedPermission::is_resource_type_default`]), or `None` when the catalog
+/// publishes no permission for the type at all.
+///
+/// The type is matched the way [`super::resource_type_matches`] matches one, so the
+/// spelling read off a shared resource's ARN finds the entry the catalog publishes
+/// under the display spelling of the same type.
+pub fn default_aws_managed_permission(
+    resource_type: &str,
+) -> Option<&'static AwsManagedPermission> {
+    AWS_MANAGED_PERMISSIONS.iter().find(|entry| {
+        entry.is_resource_type_default
+            && super::resource_type_matches(entry.resource_type, resource_type)
+    })
+}
+

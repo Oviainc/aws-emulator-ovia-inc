@@ -33,6 +33,8 @@ mod resource_policies;
 mod resource_shares;
 #[path = "all/response_payload_fidelity.rs"]
 mod response_payload_fidelity;
+#[path = "all/share_permissions.rs"]
+mod share_permissions;
 #[path = "all/share_tags_and_configuration.rs"]
 mod share_tags_and_configuration;
 #[path = "all/state_roundtrip.rs"]

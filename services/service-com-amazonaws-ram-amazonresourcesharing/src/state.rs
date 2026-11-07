@@ -953,6 +953,68 @@ impl ComAmazonawsRamAmazonresourcesharingState {
             .insert(permission.arn.clone(), permission);
     }
 
+    /// Every managed permission attached to the share `arn` names, in permission ARN
+    /// order — the order a paginated read of them pages in — and each of them once.
+    /// Empty for a share this store does not hold.
+    ///
+    /// A share's permissions are the ones the share was created with, plus the DEFAULT
+    /// managed permission of every resource type it shares that none of those applies
+    /// to: a managed permission flagged `isResourceTypeDefault` is "the default managed
+    /// permission for all resources of this resource type"
+    /// (`ResourceSharePermissionSummary$isResourceTypeDefault`), the one RAM attaches
+    /// when the share names none for the type, so a share created with a resource and no
+    /// permission at all is still governed by one. A permission ARN no permission in this
+    /// store answers to names nothing to report.
+    pub fn share_permissions(&self, arn: &str) -> Vec<&PermissionRecord> {
+        let Some(share) = self.share(arn) else {
+            return Vec::new();
+        };
+        let mut attached: Vec<&PermissionRecord> = share
+            .permission_arns
+            .iter()
+            .filter_map(|permission_arn| self.permissions.get(permission_arn))
+            .collect();
+        for resource_type in self.shared_resource_types(arn) {
+            if attached
+                .iter()
+                .any(|permission| resource_type_matches(&permission.resource_type, &resource_type))
+            {
+                continue;
+            }
+            if let Some(default) = default_aws_managed_permission(&resource_type)
+                .and_then(|entry| self.permissions.get(&entry.arn()))
+            {
+                attached.push(default);
+            }
+        }
+        attached.sort_unstable_by(|left, right| left.arn.cmp(&right.arn));
+        attached.dedup_by(|left, right| left.arn == right.arn);
+        attached
+    }
+
+    /// Every resource type the share `arn` names shares, each of them once.
+    ///
+    /// A resource association SURVIVES being torn down, in a terminal status, and the
+    /// managed permission RAM attaches when a resource type is first shared stays
+    /// attached to the share until the permission itself is disassociated from it — so
+    /// what counts here is that the share has an association of that type at all, not
+    /// where that association has got to. A resource whose ARN names no type
+    /// ([`resource_type_of_arn`]) contributes none.
+    pub fn shared_resource_types(&self, arn: &str) -> Vec<String> {
+        let mut types: Vec<String> = self
+            .associations
+            .values()
+            .filter(|record| {
+                record.resource_share_arn == arn
+                    && record.association_type == ASSOCIATION_TYPE_RESOURCE
+            })
+            .filter_map(|record| resource_type_of_arn(&record.associated_entity))
+            .collect();
+        types.sort_unstable();
+        types.dedup();
+        types
+    }
+
     /// How many managed permissions this account has CREATED, which is what the
     /// create cap counts: the AWS managed catalog the store is seeded with was created
     /// by Amazon Web Services, not by a caller, so it does not count against what a
@@ -1503,6 +1565,30 @@ pub fn resource_type_of_arn(arn: &str) -> Option<String> {
     let resource = arn.splitn(6, ':').nth(5)?;
     let (code, _) = resource.split_once(['/', ':'])?;
     (!code.is_empty() && !service.is_empty()).then(|| format!("{service}:{code}"))
+}
+
+/// Whether two resource-type names name the same resource type.
+///
+/// `Resource$type` is read off a shared resource's own ARN, where the resource code is
+/// spelled the way the owning service spells it there (`prefix-list`), while a managed
+/// permission's `resourceType` carries the spelling RAM publishes for the same type
+/// (`ec2:PrefixList`). Those two spellings differ only in case and in the separators
+/// inside the resource code, and the member's own documentation says the name "is not
+/// case sensitive" (`ListPermissions$resourceType`), so the comparison is on the
+/// letters and digits of each half alone.
+pub fn resource_type_matches(left: &str, right: &str) -> bool {
+    resource_type_key(left) == resource_type_key(right)
+}
+
+/// `resource_type` reduced to what [`resource_type_matches`] compares: its letters and
+/// digits, lowercased, with the colon that separates the service code from the
+/// resource code kept so the two halves cannot run together.
+fn resource_type_key(resource_type: &str) -> String {
+    resource_type
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == ':')
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 /// The `ResourceRegionScope` of the resource `arn` names.
@@ -2328,6 +2414,12 @@ pub fn decode_resource_cursor(token: &str) -> Option<String> {
 /// service issued — the `InvalidNextTokenException` case.
 pub fn decode_invitation_cursor(token: &str) -> Option<String> {
     decode_cursor(token).filter(|arn| is_invitation_arn(arn))
+}
+
+/// The managed-permission ARN a `nextToken` names, or `None` when the token is not one
+/// this service issued — the `InvalidNextTokenException` case.
+pub fn decode_permission_cursor(token: &str) -> Option<String> {
+    decode_cursor(token).filter(|arn| is_permission_arn(arn))
 }
 
 fn decode_cursor(token: &str) -> Option<String> {

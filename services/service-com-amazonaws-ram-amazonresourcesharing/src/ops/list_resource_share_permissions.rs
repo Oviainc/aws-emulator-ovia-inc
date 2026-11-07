@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourceSharePermissions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourceSharePermissions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the managed permissions [`crate::state`] holds as attached to one resource
+//! share, one `@paginated` page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourceSharePermissions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A share's permissions are the ones it was created with plus the default managed
+//! permission of every resource type it shares that none of those applies to
+//! ([`crate::state::ComAmazonawsRamAmazonresourcesharingState::share_permissions`]).
+//!
+//! A pure read: it reports what the store holds and writes nothing at all.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +176,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourceSharePermissions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourceSharePermissionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourceSharePermissions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListResourceSharePermissionsErrorModeled::ServerInternalException(
+                ServerInternalException {
+                    message: "the resource share store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // The model constrains the member not at all, so the rule is applied here,
+        // rendered as the modelled error RAM words that refusal with.
+        if let Some(why) =
+            crate::state::share_arn_rejection("resourceShareArn", &input.resource_share_arn)
+        {
+            return Err(
+                ListResourceSharePermissionsErrorModeled::MalformedArnException(
+                    MalformedArnException { message: why },
+                )
+                .into(),
+            );
+        }
+
+        let page_size = crate::state::page_size(input.max_results);
+        let start = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_permission_cursor(token).ok_or_else(
+                || {
+                    ListResourceSharePermissionsErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: "nextToken is not a pagination token issued by \
+                                      ListResourceSharePermissions"
+                                .to_string(),
+                        },
+                    )
+                },
+            )?),
+        };
+
+        let store = state.lock();
+
+        // A share `DeleteResourceShare` has removed shares nothing, so it has no
+        // permissions to report either.
+        if store.live_share(&input.resource_share_arn).is_none() {
+            return Err(
+                ListResourceSharePermissionsErrorModeled::UnknownResourceException(
+                    UnknownResourceException {
+                        message: crate::state::unknown_share_message(&input.resource_share_arn),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let attached = store.share_permissions(&input.resource_share_arn);
+        let mut permissions = Vec::with_capacity(page_size.min(attached.len()));
+        let mut next_token = None;
+        // The attached permissions are in ARN order, so a token naming an ARN starts
+        // this page at the first permission at or after it.
+        for permission in attached.into_iter().skip_while(|permission| {
+            start
+                .as_deref()
+                .is_some_and(|from| permission.arn.as_str() < from)
+        }) {
+            // The first permission that does not fit becomes the next page's start,
+            // and only then is a `nextToken` emitted — the last page carries none.
+            if permissions.len() == page_size {
+                next_token = Some(crate::state::encode_arn_cursor(&permission.arn));
+                break;
+            }
+            // A read that names no version reports the permission's default version,
+            // which every stored permission carries.
+            if let Some(version) = permission.version(None) {
+                permissions.push(permission.summary(version));
+            }
+        }
+
+        Ok(ListResourceSharePermissionsOutput {
+            permissions: Some(permissions),
+            next_token,
+        })
     }
 }
