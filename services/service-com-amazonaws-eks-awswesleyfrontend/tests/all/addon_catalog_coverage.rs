@@ -46,7 +46,7 @@ use crate::wire::{call, emulator, encode_label};
 
 /// The one `AddonInfo` the catalog publishes for `addon_name`, optionally for one
 /// Kubernetes version — the lookup a client makes to resolve a version.
-async fn published_addon(
+pub(crate) async fn published_addon(
     router: &MultiServiceRouter,
     addon_name: &str,
     kubernetes_version: Option<&str>,
@@ -72,7 +72,7 @@ async fn published_addon(
 }
 
 /// The Kubernetes versions one reported add-on's builds support, deduplicated.
-fn supported_cluster_versions(addon: &serde_json::Value) -> BTreeSet<String> {
+pub(crate) fn supported_cluster_versions(addon: &serde_json::Value) -> BTreeSet<String> {
     versions_of(addon)
         .iter()
         .flat_map(|build| {

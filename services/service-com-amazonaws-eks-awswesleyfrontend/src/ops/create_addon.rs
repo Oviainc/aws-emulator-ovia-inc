@@ -684,6 +684,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let settles_at =
             guard.addon_install_settles_at(&region, &input.cluster_name, &input.addon_name, now);
 
+        // What the catalog publishes about this add-on itself, read once: its
+        // publisher, its owner and the AWS Marketplace listing it is subscribed
+        // through, if it is listed on Marketplace at all.
+        let catalog_metadata = guard.published_addon(&input.addon_name, now).map(|published| {
+            (
+                published.publisher.clone(),
+                published.owner.clone(),
+                published.marketplace_information.clone(),
+            )
+        });
+
         let record = AddonRecord {
             arn: addon_arn,
             // The caller's version if it named one, else the default version for the
@@ -705,8 +716,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // request asked for them.
             pod_identity_association_arns: association_arns,
             namespace,
-            publisher: ADDON_PUBLISHER_EKS.to_string(),
-            owner: ADDON_OWNER_AWS.to_string(),
+            // The add-on's own catalog metadata: an add-on's publisher, owner
+            // and Marketplace listing are properties of the ADD-ON
+            // (`AddonInfo$publisher` / `$owner` / `$marketplaceInformation`), so
+            // an installed add-on reports what `DescribeAddonVersions` publishes
+            // for that name rather than one value for every add-on. Every add-on
+            // this far into the handler is one the catalog publishes (see LAYER 4
+            // above); the Amazon EKS-managed pair stands in only for a catalog
+            // entry that somehow publishes none of its own.
+            publisher: catalog_metadata
+                .as_ref()
+                .map(|(publisher, _, _)| publisher.clone())
+                .unwrap_or_else(|| ADDON_PUBLISHER_EKS.to_string()),
+            owner: catalog_metadata
+                .as_ref()
+                .map(|(_, owner, _)| owner.clone())
+                .unwrap_or_else(|| ADDON_OWNER_AWS.to_string()),
+            marketplace_information: catalog_metadata
+                .and_then(|(_, _, listing)| listing),
             client_request_token: input.client_request_token.clone(),
             cluster_name: input.cluster_name.clone(),
             addon_name: input.addon_name.clone(),

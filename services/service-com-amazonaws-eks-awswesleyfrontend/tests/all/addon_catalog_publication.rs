@@ -169,7 +169,7 @@ async fn newest_build(
 }
 
 /// The `configurationSchema` served for one published build, parsed.
-async fn configuration_schema(
+pub(crate) async fn configuration_schema(
     router: &MultiServiceRouter,
     addon_name: &str,
     addon_version: &str,

@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
     self, addon_schema_not_found_message, ADDON_ANY_PLATFORM_VERSION, ADDON_OWNER_AWS,
-    ADDON_OWNER_MARKETPLACE, ADDON_PUBLISHER_EKS, CLUSTER_ACTIVATION_DELAY,
+    ADDON_OWNER_COMMUNITY, ADDON_OWNER_MARKETPLACE, ADDON_PUBLISHER_EKS, CLUSTER_ACTIVATION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -105,7 +105,7 @@ pub(crate) fn compatibilities_of(version: &serde_json::Value) -> Vec<serde_json:
 /// builds are ordered numerically rather than lexically.
 ///
 /// The form is the `vX.Y.Z-eksbuild.N` one every Amazon EKS add-on version takes.
-fn version_key(version: &str) -> (u32, u32, u32, u32) {
+pub(crate) fn version_key(version: &str) -> (u32, u32, u32, u32) {
     let (semantic, build) = version
         .strip_prefix('v')
         .and_then(|rest| rest.split_once("-eksbuild."))
@@ -234,10 +234,15 @@ async fn the_published_catalog_is_reported_from_state() {
             addon["type"]
         );
         assert!(
-            addon["owner"].as_str() == Some(ADDON_OWNER_AWS)
-                || addon["owner"].as_str() == Some(ADDON_OWNER_MARKETPLACE),
-            "case {case:?}: an add-on is owned by {ADDON_OWNER_AWS:?} or \
-             {ADDON_OWNER_MARKETPLACE:?}, got {:?}",
+            [
+                ADDON_OWNER_AWS,
+                ADDON_OWNER_COMMUNITY,
+                ADDON_OWNER_MARKETPLACE
+            ]
+            .iter()
+            .any(|owner| addon["owner"].as_str() == Some(*owner)),
+            "case {case:?}: an add-on is owned by {ADDON_OWNER_AWS:?}, \
+             {ADDON_OWNER_COMMUNITY:?} or {ADDON_OWNER_MARKETPLACE:?}, got {:?}",
             addon["owner"]
         );
         assert!(
@@ -248,20 +253,7 @@ async fn the_published_catalog_is_reported_from_state() {
         let listing = addon
             .get("marketplaceInformation")
             .filter(|listing| !listing.is_null());
-        if addon["owner"].as_str() == Some(ADDON_OWNER_AWS) {
-            assert_eq!(
-                addon["publisher"].as_str(),
-                Some(ADDON_PUBLISHER_EKS),
-                "case {case:?}: an Amazon EKS-managed add-on is published by \
-                 {ADDON_PUBLISHER_EKS:?}, got {:?}",
-                addon["publisher"]
-            );
-            assert!(
-                listing.is_none(),
-                "case {case:?}: an Amazon EKS-managed add-on has no Marketplace listing, got \
-                 {listing:?}"
-            );
-        } else {
+        if addon["owner"].as_str() == Some(ADDON_OWNER_MARKETPLACE) {
             let listing = listing.unwrap_or_else(|| {
                 panic!("case {case:?}: a Marketplace add-on reports its listing, got {addon:?}")
             });
@@ -273,6 +265,22 @@ async fn the_published_catalog_is_reported_from_state() {
                 string_member(listing, "productUrl")
                     .starts_with("https://aws.amazon.com/marketplace/pp/"),
                 "case {case:?}: expected the listing's Marketplace URL, got {listing:?}"
+            );
+        } else {
+            // Amazon EKS builds and publishes the add-ons it manages and the
+            // community ones it curates alike, and neither is sold through AWS
+            // Marketplace.
+            assert_eq!(
+                addon["publisher"].as_str(),
+                Some(ADDON_PUBLISHER_EKS),
+                "case {case:?}: an add-on Amazon EKS publishes is published by \
+                 {ADDON_PUBLISHER_EKS:?}, got {:?}",
+                addon["publisher"]
+            );
+            assert!(
+                listing.is_none(),
+                "case {case:?}: an add-on Amazon EKS publishes has no Marketplace listing, got \
+                 {listing:?}"
             );
         }
         assert!(
@@ -420,14 +428,15 @@ async fn filters_narrow_the_listing() {
             .collect()
     };
     let aws_owned = named_by("owner", ADDON_OWNER_AWS);
+    let community_owned = named_by("owner", ADDON_OWNER_COMMUNITY);
     let marketplace_owned = named_by("owner", ADDON_OWNER_MARKETPLACE);
     let published_by_eks = named_by("publisher", ADDON_PUBLISHER_EKS);
     // The owner of an add-on is a property of the add-on, so the catalog carries
-    // both kinds and the owner filter is a real narrowing rather than a no-op.
+    // each kind and the owner filter is a real narrowing rather than a no-op.
     assert!(
-        !aws_owned.is_empty() && !marketplace_owned.is_empty(),
-        "the catalog must publish both Amazon EKS-managed and Marketplace add-ons, got \
-         {aws_owned:?} and {marketplace_owned:?}"
+        !aws_owned.is_empty() && !community_owned.is_empty() && !marketplace_owned.is_empty(),
+        "the catalog must publish Amazon EKS-managed, community and Marketplace add-ons, got \
+         {aws_owned:?}, {community_owned:?} and {marketplace_owned:?}"
     );
     let a_vendor = string_member(
         catalog
@@ -475,6 +484,11 @@ async fn filters_narrow_the_listing() {
             marketplace_owned.clone(),
         ),
         (
+            "owners naming the community owner",
+            format!("owners={ADDON_OWNER_COMMUNITY}"),
+            community_owned.clone(),
+        ),
+        (
             "owners naming an owner nothing is published by",
             "owners=not-an-owner".to_string(),
             Vec::new(),
@@ -497,6 +511,18 @@ async fn filters_narrow_the_listing() {
         (
             "two values in one member widen it",
             format!("owners={ADDON_OWNER_AWS}&owners={ADDON_OWNER_MARKETPLACE}"),
+            every_name
+                .iter()
+                .filter(|name| !community_owned.contains(name))
+                .cloned()
+                .collect(),
+        ),
+        (
+            "every owner the catalog publishes widens to the whole catalog",
+            format!(
+                "owners={ADDON_OWNER_AWS}&owners={ADDON_OWNER_COMMUNITY}&\
+                 owners={ADDON_OWNER_MARKETPLACE}"
+            ),
             every_name.clone(),
         ),
         (

@@ -70,6 +70,15 @@ const EXPECTED: &[Expected] = &[
         )],
     },
     Expected {
+        // An operator that calls AWS for the work it runs, so it carries the
+        // managed policy Amazon Web Services publishes for it.
+        addon: "amazon-sagemaker-hyperpod-training-operator",
+        pod_identity: &[(
+            "hp-training-controller-manager",
+            &["arn:aws:iam::aws:policy/AmazonSageMakerHyperPodTrainingOperatorAccess"],
+        )],
+    },
+    Expected {
         // The EBS driver calls AWS from its controller only, so one entry.
         addon: "aws-ebs-csi-driver",
         pod_identity: &[(

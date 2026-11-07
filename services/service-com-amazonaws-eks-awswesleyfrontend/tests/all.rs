@@ -23,6 +23,8 @@ mod access_policy_catalog;
 mod access_policy_revocation;
 #[path = "all/addon_catalog_coverage.rs"]
 mod addon_catalog_coverage;
+#[path = "all/addon_catalog_metadata.rs"]
+mod addon_catalog_metadata;
 #[path = "all/addon_catalog_publication.rs"]
 mod addon_catalog_publication;
 #[path = "all/addon_deletion.rs"]

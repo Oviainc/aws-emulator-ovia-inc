@@ -2674,12 +2674,14 @@ pub const UPDATE_PARAM_POD_IDENTITY_ASSOCIATIONS: &str = "PodIdentityAssociation
 /// instant is stored on the record; nothing sleeps for it.
 pub const ADDON_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 
-/// The `owner` a created add-on reports.
+/// The `owner` of an add-on Amazon EKS builds itself.
 ///
-/// This emulator installs only Amazon EKS-managed add-ons — it holds no
-/// Marketplace subscription and mints no `marketplaceInformation` — and an
-/// EKS-managed add-on is owned by `aws` and published by `eks`, which is what
-/// `DescribeAddonVersions` reports for them.
+/// An Amazon EKS-managed add-on is owned by `aws` and published by `eks`, which
+/// is what `DescribeAddonVersions` reports for them. It is one of the owner
+/// tokens the catalog publishes, beside [`ADDON_OWNER_COMMUNITY`] and
+/// [`ADDON_OWNER_MARKETPLACE`]: the owner is the add-on's own, so a caller can
+/// separate the add-ons Amazon Web Services builds from the ones it curates or
+/// a vendor sells.
 pub const ADDON_OWNER_AWS: &str = "aws";
 /// See [`ADDON_OWNER_AWS`].
 pub const ADDON_PUBLISHER_EKS: &str = "eks";
@@ -2692,6 +2694,16 @@ pub const ADDON_PUBLISHER_EKS: &str = "eks";
 /// `aws-marketplace`, published by its VENDOR rather than by `eks`, and carries
 /// the `marketplaceInformation` of the listing it is subscribed through.
 pub const ADDON_OWNER_MARKETPLACE: &str = "aws-marketplace";
+
+/// The `owner` of an add-on Amazon EKS curates but does not own: the upstream
+/// open-source project's own add-on, built and offered through Amazon EKS.
+///
+/// `AddonInfo$owner` is "The owner of the add-on", and an add-on's owner is a
+/// property of the ADD-ON rather than of the service publishing it — which is
+/// what makes `DescribeAddonVersions$owners` a filter that separates the add-ons
+/// Amazon Web Services builds from the ones it only curates, so a client can
+/// tell which of the add-ons on its cluster are vendor-supplied.
+pub const ADDON_OWNER_COMMUNITY: &str = "community";
 
 /// The Kubernetes namespace an add-on is installed into when the request names
 /// none.
@@ -2827,8 +2839,16 @@ pub struct AddonRecord {
     /// The Kubernetes namespace this add-on is installed into: the one the
     /// request's `namespaceConfig` named, or [`ADDON_DEFAULT_NAMESPACE`].
     pub namespace: String,
+    /// Who publishes and who owns the add-on this record installs: the
+    /// catalog's own `publisher` and `owner` for that add-on name
+    /// ([`AddonCatalogRecord`]), so the metadata an installed add-on reports is
+    /// the metadata `DescribeAddonVersions` publishes for it.
     pub publisher: String,
     pub owner: String,
+    /// The AWS Marketplace listing the add-on is subscribed through, for an
+    /// add-on the catalog publishes one for; `None` for every add-on that is
+    /// not listed on Marketplace at all.
+    pub marketplace_information: Option<MarketplaceInformation>,
     pub client_request_token: Option<String>,
     /// The change the asynchronous update this add-on is taking puts on it when
     /// the clock completes that update; `None` when the add-on is taking none.
@@ -2996,10 +3016,11 @@ impl AddonRecord {
             namespace_config: Some(AddonNamespaceConfigResponse {
                 namespace: Some(self.namespace.clone()),
             }),
-            // Left unset: `marketplaceInformation` describes an add-on bought
-            // through the Amazon Web Services Marketplace, and this emulator
-            // installs only EKS-managed add-ons ([`ADDON_OWNER_AWS`]).
-            marketplace_information: None,
+            // "Information about an Amazon EKS add-on from the Amazon Web
+            // Services Marketplace": the listing is a property of the add-on,
+            // so it is the one the catalog publishes for this add-on name —
+            // nothing for an add-on that is not listed on Marketplace.
+            marketplace_information: self.marketplace_information.clone(),
         }
     }
 }
@@ -4063,14 +4084,20 @@ const ADDON_ARCHITECTURES: &[&str] = &["amd64", "arm64"];
 /// subset of them.
 pub const ADDON_ANY_PLATFORM_VERSION: &str = "*";
 
-/// The JSON Schema dialect `DescribeAddonConfiguration` publishes its
-/// configuration schema in.
+/// The JSON Schema dialect most of the published add-on configuration documents
+/// are written in.
 ///
 /// `DescribeAddonConfigurationResponse$configurationSchema` is "A JSON schema
 /// that's used to validate the configuration values you provide when an add-on
 /// is created or updated", so the document names the dialect it is written in,
-/// as every JSON Schema does.
-const ADDON_CONFIGURATION_SCHEMA_DIALECT: &str = "http://json-schema.org/draft-06/schema#";
+/// as every JSON Schema does. The dialect belongs to the DOCUMENT, so it is a
+/// property of each add-on's own schema ([`AddonCatalogSeed::schema_dialect`])
+/// rather than of this service.
+pub const ADDON_SCHEMA_DIALECT_DRAFT_06: &str = "http://json-schema.org/draft-06/schema#";
+
+/// The JSON Schema dialect the newer published add-on configuration documents
+/// are written in; see [`ADDON_SCHEMA_DIALECT_DRAFT_06`].
+pub const ADDON_SCHEMA_DIALECT_DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
 
 /// One top-level property an add-on's configuration schema declares: the key a
 /// `configurationValues` document may set, and the JSON Schema type that key

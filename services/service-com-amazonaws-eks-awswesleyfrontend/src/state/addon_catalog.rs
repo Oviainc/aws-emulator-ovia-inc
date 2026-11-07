@@ -81,10 +81,48 @@ pub(super) struct AddonCatalogSeed {
     /// IAM policies"). Empty for an add-on that runs as no service account of
     /// its own.
     pub(super) pod_identity: &'static [(&'static str, &'static [&'static str])],
-    /// `(major, minor, patch)` of the build published for the OLDEST Kubernetes
-    /// version in [`VERSION_CALENDAR`]. An add-on's version tracks the ADD-ON,
-    /// not the control plane, so each add-on carries its own line.
-    pub(super) oldest_build: (u32, u32, u32),
+    /// The JSON Schema dialect THIS add-on's published configuration document
+    /// is written in ([`ADDON_SCHEMA_DIALECT_DRAFT_06`] or
+    /// [`ADDON_SCHEMA_DIALECT_DRAFT_07`]).
+    ///
+    /// Source: the `$schema` keyword of the document `aws eks
+    /// describe-addon-configuration --addon-name <name> --addon-version
+    /// <build>` reports. The dialect belongs to the DOCUMENT, so it is the
+    /// add-on's own: the charts Amazon EKS has published schemas for the longest
+    /// declare draft-06, while the newer generation — the upstream projects it
+    /// curates and the operators it has added since — declare draft-07, and a
+    /// client that loads the document into a validator honours the keywords of
+    /// the dialect that add-on published.
+    pub(super) schema_dialect: &'static str,
+    /// The OLDEST Kubernetes version in [`VERSION_CALENDAR`] this add-on has a
+    /// published build for: the calendar row Amazon EKS first offered it on, or
+    /// the oldest cluster version it still supports. `None` for an add-on
+    /// published for every row the calendar carries.
+    ///
+    /// An add-on offered later than a calendar row has NO build for that row,
+    /// which is what makes `AddonVersionInfo$compatibilities` the add-on's own
+    /// set rather than the service's version list: a cluster on a version older
+    /// than this one cannot install the add-on, and the add-on drops out of a
+    /// listing filtered to that version.
+    ///
+    /// Source: the Kubernetes versions the Amazon EKS User Guide's add-on
+    /// compatibility tables list for the add-on.
+    pub(super) first_cluster_version: Option<&'static str>,
+    /// The add-on's OWN published build line, oldest release first: one release
+    /// per Kubernetes minor version it has been published for since
+    /// [`Self::first_cluster_version`], as `(major, minor, patch)`.
+    ///
+    /// An add-on's version tracks the ADD-ON, not the control plane, so each
+    /// add-on carries its own line — and a line crosses a MAJOR version
+    /// wherever the project released one, so the published history of such an
+    /// add-on spans several majors rather than one. A line shorter than the
+    /// rows it covers continues from its last release by one minor version per
+    /// further row, so a calendar that grows a row still publishes a build for
+    /// it.
+    ///
+    /// Source: the releases the add-on's project published, as the
+    /// `DescribeAddonVersions` catalog lists them.
+    pub(super) releases: &'static [(u32, u32, u32)],
 }
 
 /// The add-ons this service publishes.
@@ -96,8 +134,15 @@ pub(super) struct AddonCatalogSeed {
 /// workloads run in, whether it needs IAM permissions of its own, EVERY service
 /// account it runs as — a driver whose controller and node components both call
 /// AWS carries one per component — with the managed policies the guide
-/// recommends for each, and the keys its own configuration schema declares. They
-/// are owned by [`ADDON_OWNER_AWS`] and published by [`ADDON_PUBLISHER_EKS`].
+/// recommends for each, and the keys its own configuration schema declares.
+///
+/// Each row carries the add-on's OWN owner: the ones Amazon Web Services builds
+/// are owned by [`ADDON_OWNER_AWS`], the upstream projects Amazon EKS only
+/// curates by [`ADDON_OWNER_COMMUNITY`], and the ones a caller subscribes to by
+/// [`ADDON_OWNER_MARKETPLACE`] — which is what makes
+/// `DescribeAddonVersions$owners` narrow the catalog. Amazon EKS builds and
+/// publishes the EKS-managed and the community rows alike, so both are published
+/// by [`ADDON_PUBLISHER_EKS`].
 ///
 /// This table is what the catalog PUBLISHES, so an add-on missing from it cannot
 /// be discovered or installed at all: a row here is the only way a caller reads
@@ -137,7 +182,10 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("manager", "object"),
             ("tolerations", "array"),
         ],
-        oldest_build: (0, 102, 1),
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
+        first_cluster_version: None,
+        // The operator's line stays inside its 0.x series.
+        releases: &[(0, 102, 1)],
     },
     AddonCatalogSeed {
         addon_name: "amazon-cloudwatch-observability",
@@ -164,7 +212,20 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("manager", "object"),
             ("tolerations", "array"),
         ],
-        oldest_build: (1, 5, 0),
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
+        first_cluster_version: None,
+        // The agent and its operator crossed three major versions over these
+        // Kubernetes releases, so the published history spans all of them.
+        releases: &[
+            (1, 5, 0),
+            (2, 1, 0),
+            (2, 5, 0),
+            (3, 2, 0),
+            (3, 6, 0),
+            (4, 0, 0),
+            (4, 2, 0),
+            (4, 4, 0),
+        ],
     },
     AddonCatalogSeed {
         // Amazon SageMaker HyperPod's task governance, which schedules the
@@ -188,7 +249,13 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("kueue", "object"),
             ("replicaCount", "integer"),
         ],
-        oldest_build: (1, 0, 0),
+        // Its schema is one of the newer documents, written in the newer
+        // dialect.
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_07,
+        // Amazon EKS began offering task governance after the oldest Kubernetes
+        // versions the calendar carries, so it has no build for them.
+        first_cluster_version: Some("1.31"),
+        releases: &[(1, 0, 0)],
     },
     AddonCatalogSeed {
         addon_name: "amazon-sagemaker-hyperpod-training-operator",
@@ -199,9 +266,17 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "machine-learning",
         default_namespace: "aws-hyperpod",
-        requires_iam_permissions: false,
+        // The operator calls Amazon SageMaker for the training jobs it runs, so
+        // it needs IAM permissions of its own.
+        requires_iam_permissions: true,
         required_configuration: &[],
-        pod_identity: &[],
+        // It runs as the controller manager its own schema names
+        // (`hpTrainingControllerManager`), with the managed policy Amazon Web
+        // Services publishes for the operator.
+        pod_identity: &[(
+            "hp-training-controller-manager",
+            &["arn:aws:iam::aws:policy/AmazonSageMakerHyperPodTrainingOperatorAccess"],
+        )],
         configuration_properties: &[
             ("hpTrainingControllerManager", "object"),
             ("nodeSelector", "object"),
@@ -209,7 +284,12 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("resources", "object"),
             ("tolerations", "array"),
         ],
-        oldest_build: (1, 0, 0),
+        // Its published schema is written in the newer dialect.
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_07,
+        // The newest add-on in the catalog: Amazon EKS offers it only from this
+        // Kubernetes version on.
+        first_cluster_version: Some("1.34"),
+        releases: &[(1, 0, 0)],
     },
     AddonCatalogSeed {
         addon_name: "aws-ebs-csi-driver",
@@ -237,7 +317,9 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("sidecars", "object"),
             ("storageClasses", "array"),
         ],
-        oldest_build: (1, 31, 0),
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
+        first_cluster_version: None,
+        releases: &[(1, 31, 0)],
     },
     AddonCatalogSeed {
         // The Elastic Fabric Adapter device plugin, which advertises the EFA
@@ -257,7 +339,9 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         // no settings of its own beyond the placement values every add-on's
         // schema carries.
         configuration_properties: &[],
-        oldest_build: (0, 5, 3),
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
+        first_cluster_version: None,
+        releases: &[(0, 5, 3)],
     },
     AddonCatalogSeed {
         addon_name: "aws-efs-csi-driver",
@@ -295,7 +379,22 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             // declares the options that add-on itself takes.
             ("useFIPS", "boolean"),
         ],
-        oldest_build: (2, 0, 7),
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
+        first_cluster_version: None,
+        // The driver released two new major versions over these Kubernetes
+        // releases, so its published history spans majors 1, 2 and 3: a caller
+        // pinning, upgrading or rolling back to a build of any of them finds it
+        // in the catalog.
+        releases: &[
+            (1, 7, 6),
+            (2, 0, 7),
+            (2, 1, 4),
+            (2, 1, 9),
+            (3, 0, 3),
+            (3, 1, 0),
+            (3, 1, 2),
+            (3, 2, 0),
+        ],
     },
     AddonCatalogSeed {
         addon_name: "aws-guardduty-agent",
@@ -315,7 +414,9 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("resources", "object"),
             ("tolerations", "array"),
         ],
-        oldest_build: (1, 6, 1),
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
+        first_cluster_version: None,
+        releases: &[(1, 6, 1)],
     },
     AddonCatalogSeed {
         addon_name: "aws-mountpoint-s3-csi-driver",
@@ -334,7 +435,20 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("node", "object"),
             ("tolerations", "array"),
         ],
-        oldest_build: (1, 7, 0),
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
+        first_cluster_version: None,
+        // The driver's second major version replaced its mount architecture, so
+        // the published history carries both majors.
+        releases: &[
+            (1, 7, 0),
+            (1, 9, 0),
+            (1, 11, 0),
+            (1, 14, 1),
+            (2, 0, 0),
+            (2, 1, 0),
+            (2, 2, 0),
+            (2, 3, 0),
+        ],
     },
     AddonCatalogSeed {
         // The agent that reports the cluster's network flows to Amazon
@@ -358,7 +472,11 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         // operator sets on it are the placement values every add-on's schema
         // carries.
         configuration_properties: &[("agent", "object")],
-        oldest_build: (1, 0, 1),
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
+        // The agent was published alongside Amazon CloudWatch Network Flow
+        // Monitor, after the oldest Kubernetes version the calendar carries.
+        first_cluster_version: Some("1.31"),
+        releases: &[(1, 0, 1)],
     },
     AddonCatalogSeed {
         addon_name: "cert-manager",
@@ -368,7 +486,9 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         workload: AddonWorkload::Replicated,
         required_addons: &[],
         admission_webhook: true,
-        owner: ADDON_OWNER_AWS,
+        // An upstream project Amazon EKS curates rather than builds, so the
+        // add-on is the community's, not Amazon Web Services'.
+        owner: ADDON_OWNER_COMMUNITY,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "security",
         default_namespace: "cert-manager",
@@ -384,7 +504,21 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("tolerations", "array"),
             ("webhook", "object"),
         ],
-        oldest_build: (1, 16, 2),
+        // The community charts' schemas are published in the newer dialect.
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_07,
+        first_cluster_version: None,
+        // The project's own 1.x line, one release per Kubernetes version it has
+        // been published for.
+        releases: &[
+            (1, 14, 2),
+            (1, 15, 3),
+            (1, 16, 2),
+            (1, 17, 1),
+            (1, 18, 2),
+            (1, 19, 0),
+            (1, 20, 1),
+            (1, 21, 2),
+        ],
     },
     AddonCatalogSeed {
         addon_name: "coredns",
@@ -404,7 +538,9 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("corefile", "string"),
             ("replicaCount", "integer"),
         ],
-        oldest_build: (1, 11, 1),
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
+        first_cluster_version: None,
+        releases: &[(1, 11, 1)],
     },
     AddonCatalogSeed {
         addon_name: "datadog_operator",
@@ -425,7 +561,9 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("resources", "object"),
             ("site", "string"),
         ],
-        oldest_build: (1, 8, 0),
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
+        first_cluster_version: None,
+        releases: &[(1, 8, 0)],
     },
     AddonCatalogSeed {
         addon_name: "dynatrace_dynatrace-operator",
@@ -442,7 +580,9 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         required_configuration: &["apiUrl", "apiToken"],
         pod_identity: &[],
         configuration_properties: &[("resources", "object"), ("tolerations", "array")],
-        oldest_build: (1, 3, 0),
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
+        first_cluster_version: None,
+        releases: &[(1, 3, 0)],
     },
     AddonCatalogSeed {
         addon_name: "eks-node-monitoring-agent",
@@ -462,7 +602,11 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("resources", "object"),
             ("tolerations", "array"),
         ],
-        oldest_build: (1, 0, 0),
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
+        // The agent was published alongside node auto repair, after the oldest
+        // Kubernetes version the calendar carries.
+        first_cluster_version: Some("1.31"),
+        releases: &[(1, 0, 0)],
     },
     AddonCatalogSeed {
         addon_name: "eks-pod-identity-agent",
@@ -482,14 +626,17 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("nodeSelector", "object"),
             ("tolerations", "array"),
         ],
-        oldest_build: (1, 2, 0),
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
+        first_cluster_version: None,
+        releases: &[(1, 2, 0)],
     },
     AddonCatalogSeed {
         addon_name: "external-dns",
         workload: AddonWorkload::Replicated,
         required_addons: &[],
         admission_webhook: false,
-        owner: ADDON_OWNER_AWS,
+        // An upstream project Amazon EKS curates rather than builds.
+        owner: ADDON_OWNER_COMMUNITY,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "networking",
         default_namespace: "external-dns",
@@ -507,7 +654,10 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("sources", "array"),
             ("txtOwnerId", "string"),
         ],
-        oldest_build: (0, 15, 0),
+        // The community charts' schemas are published in the newer dialect.
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_07,
+        first_cluster_version: None,
+        releases: &[(0, 15, 0)],
     },
     AddonCatalogSeed {
         addon_name: "kube-proxy",
@@ -521,22 +671,26 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         requires_iam_permissions: false,
         required_configuration: &[],
         pod_identity: &[],
-        // kube-proxy is the one add-on whose version IS the Kubernetes version
-        // it runs with, so its line starts at the oldest calendar row's version.
         configuration_properties: &[
             ("affinity", "object"),
             ("nodeSelector", "object"),
             ("resources", "object"),
             ("tolerations", "array"),
         ],
-        oldest_build: (1, 30, 0),
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
+        first_cluster_version: None,
+        // kube-proxy is the one add-on whose version IS the Kubernetes version
+        // it runs with, so its line starts at the oldest calendar row's version
+        // and steps with the calendar.
+        releases: &[(1, 30, 0)],
     },
     AddonCatalogSeed {
         addon_name: "kube-state-metrics",
         workload: AddonWorkload::Replicated,
         required_addons: &[],
         admission_webhook: false,
-        owner: ADDON_OWNER_AWS,
+        // An upstream project Amazon EKS curates rather than builds.
+        owner: ADDON_OWNER_COMMUNITY,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "observability",
         default_namespace: ADDON_DEFAULT_NAMESPACE,
@@ -549,7 +703,10 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("resources", "object"),
             ("tolerations", "array"),
         ],
-        oldest_build: (2, 13, 0),
+        // The community charts' schemas are published in the newer dialect.
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_07,
+        first_cluster_version: None,
+        releases: &[(2, 13, 0)],
     },
     AddonCatalogSeed {
         addon_name: "kubecost_kubecost",
@@ -572,14 +729,17 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("persistentVolume", "object"),
             ("prometheus", "object"),
         ],
-        oldest_build: (2, 3, 0),
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
+        first_cluster_version: None,
+        releases: &[(2, 3, 0)],
     },
     AddonCatalogSeed {
         addon_name: "metrics-server",
         workload: AddonWorkload::Replicated,
         required_addons: &[],
         admission_webhook: false,
-        owner: ADDON_OWNER_AWS,
+        // An upstream project Amazon EKS curates rather than builds.
+        owner: ADDON_OWNER_COMMUNITY,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "observability",
         default_namespace: ADDON_DEFAULT_NAMESPACE,
@@ -593,14 +753,18 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("resources", "object"),
             ("tolerations", "array"),
         ],
-        oldest_build: (0, 7, 0),
+        // The community charts' schemas are published in the newer dialect.
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_07,
+        first_cluster_version: None,
+        releases: &[(0, 7, 0)],
     },
     AddonCatalogSeed {
         addon_name: "prometheus-node-exporter",
         workload: AddonWorkload::PerNode,
         required_addons: &[],
         admission_webhook: false,
-        owner: ADDON_OWNER_AWS,
+        // An upstream project Amazon EKS curates rather than builds.
+        owner: ADDON_OWNER_COMMUNITY,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "observability",
         default_namespace: "prometheus-node-exporter",
@@ -613,7 +777,10 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("service", "object"),
             ("tolerations", "array"),
         ],
-        oldest_build: (1, 8, 2),
+        // The community charts' schemas are published in the newer dialect.
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_07,
+        first_cluster_version: None,
+        releases: &[(1, 8, 2)],
     },
     AddonCatalogSeed {
         addon_name: "snapshot-controller",
@@ -633,7 +800,9 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("tolerations", "array"),
             ("volumeSnapshotClasses", "array"),
         ],
-        oldest_build: (8, 1, 0),
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
+        first_cluster_version: None,
+        releases: &[(8, 1, 0)],
     },
     AddonCatalogSeed {
         addon_name: "vpc-cni",
@@ -659,7 +828,9 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("init", "object"),
             ("nodeAgent", "object"),
         ],
-        oldest_build: (1, 18, 0),
+        schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
+        first_cluster_version: None,
+        releases: &[(1, 18, 0)],
     },
 ];
 
@@ -797,6 +968,9 @@ pub struct AddonCatalogRecord {
     /// ([`ADDON_COMMON_CONFIGURATION_PROPERTIES`]), in the schema's own
     /// alphabetical order.
     pub configuration_properties: Vec<(String, String)>,
+    /// The JSON Schema dialect this add-on's own published configuration
+    /// document is written in; see [`AddonCatalogSeed::schema_dialect`].
+    pub schema_dialect: String,
     /// Every build of this add-on, NEWEST FIRST — the order the catalog
     /// publishes versions in, so a caller reading it to pick a version sees the
     /// newest build at the head of the list.
@@ -859,6 +1033,12 @@ impl AddonCatalogRecord {
     /// makes [`AddonCatalogVersionRecord::requires_configuration`] true: a build
     /// that requires configuration publishes a schema that requires it, and one
     /// that does not publishes a schema with nothing required.
+    ///
+    /// The document is the ADD-ON's own, so the dialect it declares is the
+    /// add-on's own too ([`AddonCatalogSeed::schema_dialect`]): a client that
+    /// loads the schema into a validator reads the dialect that add-on published
+    /// rather than one fixed for the whole service, which is what decides which
+    /// keywords that validator honours.
     pub fn configuration_schema(&self, version: &AddonCatalogVersionRecord) -> String {
         self.configuration_schema_value(version).to_string()
     }
@@ -925,7 +1105,7 @@ impl AddonCatalogRecord {
             );
         }
         ::serde_json::json!({
-            "$schema": ADDON_CONFIGURATION_SCHEMA_DIALECT,
+            "$schema": self.schema_dialect,
             "type": "object",
             "properties": ::serde_json::Value::Object(properties),
             "required": version.required_configuration,
@@ -1081,17 +1261,74 @@ pub(super) fn marketplace_listing(addon_name: &str) -> MarketplaceInformation {
     }
 }
 
+/// The index of the [`VERSION_CALENDAR`] row an add-on's published history
+/// starts at: the row [`AddonCatalogSeed::first_cluster_version`] names, or the
+/// OLDEST row for an add-on published for every version the calendar carries.
+///
+/// A name no calendar row carries is a typo in the seed, which is why it panics
+/// here — at seed time, with the add-on named — rather than quietly publishing
+/// the add-on for every row.
+fn first_published_row(seed: &AddonCatalogSeed) -> usize {
+    let Some(first) = seed.first_cluster_version else {
+        return 0;
+    };
+    VERSION_CALENDAR
+        .iter()
+        .position(|(cluster_version, _, _, _)| *cluster_version == first)
+        .unwrap_or_else(|| {
+            panic!(
+                "the add-on catalog publishes {} from Kubernetes {first}, which the version \
+                 calendar does not carry",
+                seed.addon_name
+            )
+        })
+}
+
+/// The version of the build an add-on published for the `step`-th Kubernetes
+/// version it has been offered for, in the `vX.Y.Z-eksbuild.N` form every Amazon
+/// EKS add-on version takes.
+///
+/// It is the add-on's OWN release at that step
+/// ([`AddonCatalogSeed::releases`]) — which is how a published history crosses
+/// the major versions the project released — and past the end of that line it
+/// continues from the last release by one minor version per further step, so a
+/// calendar row the recorded history does not reach still has a build.
+fn addon_build_version(seed: &AddonCatalogSeed, step: usize) -> String {
+    let (major, minor, patch) = seed
+        .releases
+        .get(step)
+        .copied()
+        .or_else(|| {
+            let (major, minor, patch) = *seed.releases.last()?;
+            Some((major, minor + (step + 1 - seed.releases.len()) as u32, patch))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the add-on catalog publishes {} with no release line at all",
+                seed.addon_name
+            )
+        });
+    format!("v{major}.{minor}.{patch}-eksbuild.1")
+}
+
 /// Build the add-on catalog this service publishes from [`ADDON_CATALOG`].
 ///
-/// An add-on publishes one build per Kubernetes minor version the calendar
-/// carries, along its own version line: the build published alongside a
-/// Kubernetes version supports that version and the one before it — an add-on
-/// build keeps working on the cluster version it was released on — and it is the
-/// DEFAULT version for the Kubernetes version it was published for. So for any
-/// Kubernetes version the catalog names exactly ONE default build per add-on,
-/// while the newer build that still supports that version is offered as a
-/// non-default choice, which is what `CreateAddon` resolves an absent
-/// `addonVersion` through ([`ComAmazonawsEksAwswesleyfrontendState::default_addon_version`]).
+/// An add-on publishes one build per Kubernetes minor version it has been
+/// OFFERED for, along its own version line ([`addon_build_version`]): the build
+/// published alongside a Kubernetes version supports that version and the one
+/// before it — an add-on build keeps working on the cluster version it was
+/// released on — and it is the DEFAULT version for the Kubernetes version it was
+/// published for. So for any Kubernetes version the catalog names exactly ONE
+/// default build per add-on, while the newer build that still supports that
+/// version is offered as a non-default choice, which is what `CreateAddon`
+/// resolves an absent `addonVersion` through
+/// ([`ComAmazonawsEksAwswesleyfrontendState::default_addon_version`]).
+///
+/// The versions an add-on is offered for start at its OWN first calendar row
+/// ([`first_published_row`]), so the compatible cluster-version set an add-on
+/// reports is the add-on's own: an add-on Amazon EKS began offering later has no
+/// build for the older rows, and the oldest build it does publish names no
+/// cluster version older than the one it was introduced on.
 ///
 /// Each add-on's builds come out NEWEST FIRST, the order the catalog publishes
 /// them in; the add-ons themselves keep [`ADDON_CATALOG`]'s name order.
@@ -1099,13 +1336,17 @@ pub(super) fn seed_addon_catalog() -> Vec<AddonCatalogRecord> {
     ADDON_CATALOG
         .iter()
         .map(|seed| {
-            let (major, minor, patch) = seed.oldest_build;
+            let first = first_published_row(seed);
             let mut versions: Vec<AddonCatalogVersionRecord> = VERSION_CALENDAR
                 .iter()
                 .enumerate()
+                .skip(first)
                 .map(|(index, (cluster_version, release, _, _))| {
                     let mut compatibilities = Vec::with_capacity(2);
-                    if let Some((previous, _, _, _)) = index.checked_sub(1).and_then(|earlier| VERSION_CALENDAR.get(earlier))
+                    if let Some((previous, _, _, _)) = index
+                        .checked_sub(1)
+                        .filter(|earlier| *earlier >= first)
+                        .and_then(|earlier| VERSION_CALENDAR.get(earlier))
                     {
                         compatibilities.push(AddonCompatibilityRecord {
                             cluster_version: (*previous).to_string(),
@@ -1119,10 +1360,7 @@ pub(super) fn seed_addon_catalog() -> Vec<AddonCatalogRecord> {
                         default_version: true,
                     });
                     AddonCatalogVersionRecord {
-                        addon_version: format!(
-                            "v{major}.{}.{patch}-eksbuild.1",
-                            minor + index as u32
-                        ),
+                        addon_version: addon_build_version(seed, index - first),
                         published_at: calendar_instant(release),
                         architecture: ADDON_ARCHITECTURES
                             .iter()
@@ -1176,6 +1414,7 @@ pub(super) fn seed_addon_catalog() -> Vec<AddonCatalogRecord> {
                     .collect::<BTreeMap<String, String>>()
                     .into_iter()
                     .collect(),
+                schema_dialect: seed.schema_dialect.to_string(),
                 versions,
             }
         })
