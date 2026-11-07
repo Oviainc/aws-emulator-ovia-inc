@@ -21,22 +21,16 @@ mod documentation_part_creation;
 // Declared here, at the head, for the reason the entry above records.
 #[path = "all/stage_lambda_proxy_integration.rs"]
 mod stage_lambda_proxy_integration;
-// Declared here, at the head, for the reason the entry above records.
 #[path = "all/stage_custom_authorizer.rs"]
 mod stage_custom_authorizer;
-// Declared here, at the head, for the reason the entry above records.
 #[path = "all/passed_through_integration.rs"]
 mod passed_through_integration;
-// Declared here, at the head, for the reason the entry above records.
 #[path = "all/stage_cors_preflight.rs"]
 mod stage_cors_preflight;
-// Declared here, at the head, for the reason the entry above records.
 #[path = "all/proxy_binary_media_types.rs"]
 mod proxy_binary_media_types;
-// Declared here, at the head, for the reason the entry above records.
 #[path = "all/http_proxy_function_url.rs"]
 mod http_proxy_function_url;
-// Declared here, at the head, for the reason the entry above records.
 #[path = "all/proxy_event_repeated_names.rs"]
 mod proxy_event_repeated_names;
 // Declared here, at the head, for the reason the entry above records.
@@ -437,6 +431,14 @@ mod minted_identifier_widths;
 // Lambda and DynamoDB on one engine.
 #[path = "all/lambda_proxy_integration.rs"]
 mod lambda_proxy_integration;
+// Appended for the reason the note above gives: the identifier form an access association's
+// `accessAssociationSource` must carry for the one source type the model declares.
+#[path = "all/domain_name_access_association_source.rs"]
+mod domain_name_access_association_source;
+// Appended for the reason the note above gives: which method of one resource serves a
+// request when the resource carries both an explicit verb and the `ANY` catch-all.
+#[path = "all/stage_verb_precedence.rs"]
+mod stage_verb_precedence;
 // Appended for the reason the note above gives: an `AWS_PROXY` integration whose `uri`
 // carries a QUALIFIER — an alias or a published version — and the code that qualifier
 // resolves to.

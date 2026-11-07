@@ -161,9 +161,9 @@ async fn a_created_access_association_is_persisted_and_read_back_member_for_memb
             json!({ "cost:center": "team/platform", "empty-value": "" }),
         ),
         (
-            "another domain name, a short source id",
+            "another domain name, the shorter of the two source id widths",
             third.as_str(),
-            "vpce-abc",
+            "vpce-0a1b2c3d",
             json!({ "Name": "orders" }),
         ),
     ];
@@ -482,8 +482,11 @@ async fn an_access_association_names_a_stored_private_custom_domain_name() {
         ("an edge-optimized domain name", edge),
     ];
     for (case, domain_name_arn) in &rows {
-        let answer =
-            create_association(&gateway, association_body(domain_name_arn, "vpce-0abc")).await;
+        let answer = create_association(
+            &gateway,
+            association_body(domain_name_arn, "vpce-0123456789abcdef0"),
+        )
+        .await;
         assert_failure(&answer, 400, BAD_REQUEST, case);
     }
 
@@ -497,7 +500,7 @@ async fn an_access_association_names_a_stored_private_custom_domain_name() {
             json!({
                 "domainNameArn": private,
                 "accessAssociationSourceType": source_type,
-                "accessAssociationSource": "vpce-0abc",
+                "accessAssociationSource": "vpce-0123456789abcdef0",
             }),
         )
         .await;

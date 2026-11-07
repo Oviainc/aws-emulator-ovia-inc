@@ -92,13 +92,16 @@
 //! request, and this service's is its control plane's (`apigateway`). An invoke of a
 //! deployed stage is signed under the data plane's own signing name instead — the
 //! `execute-api` service AWS publishes the invoke endpoint and the `execute-api:Invoke`
-//! action under — so a correctly signed invoke never matches that name and is refused
-//! before the stage is reached, whatever the api's records say. The emulator's own
-//! signature verification cannot be pointed at a second signing name from here, so the
-//! choice is between refusing every correctly signed invoke and serving it: AWS serves it,
-//! so the operation above declares none. What a method's `authorizationType` requires of the
-//! request is unchanged — `AWS_IAM` still admits only a request that CARRIES a SigV4
-//! credential ([`invoke::carries_sigv4_credential`]), and refuses one that carries none.
+//! action under — so a correctly signed invoke never matches that name and would be refused
+//! before the stage is reached, whatever the api's records say. The front door cannot be
+//! pointed at a second signing name from here, so the invoke reaches the stage unchecked and
+//! the stage asks the emulator's OWN verifier about the data plane's signing name instead
+//! ([`invoke::sigv4_authentication`]) — one reading of SigV4 in this process, asked by
+//! whichever plane the request addressed. What a method's `authorizationType` requires of the
+//! request is unchanged — `AWS_IAM` admits only a request that CARRIES a SigV4 credential
+//! ([`invoke::carries_sigv4_credential`]) and whose credential AUTHENTICATES: an access key
+//! id this emulator holds no credential for, and one signed with the wrong secret, are both
+//! refused `403` with no integration performed.
 //! WHAT that credential may then do is a second question, answered from the account's own
 //! records ([`invoke::execute_api_authorization`]): a verified credential is not a pass, so
 //! such a method is served only where the identity-based policies in force on the principal
@@ -387,8 +390,11 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for StageDataPlane<Eng> {
     /// MODELLED operation first, and every control-plane request resolves one.
     ///
     /// What a method's `authorizationType` requires of the request is unchanged — `AWS_IAM`
-    /// still admits only a request that CARRIES a SigV4 credential
-    /// ([`invoke::carries_sigv4_credential`]), and refuses one that carries none.
+    /// admits only a request that CARRIES a SigV4 credential
+    /// ([`invoke::carries_sigv4_credential`]) and whose credential the emulator's own
+    /// verifier authenticates against the data plane's signing name
+    /// ([`invoke::sigv4_authentication`]), so declaring no scheme here moves that check to
+    /// the stage rather than dropping it.
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
         Some(&[])
     }

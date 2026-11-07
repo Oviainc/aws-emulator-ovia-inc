@@ -17,6 +17,11 @@
 // else appends to.
 #[path = "all/cloudformation_fifo_resource_generated_names.rs"]
 mod cloudformation_fifo_resource_generated_names;
+// Declared here, in this same head region, for the reason the entry above records: what a
+// deployed `AWS_IAM` method makes of the credential its request presents, on a router that
+// verifies request signatures.
+#[path = "all/apigateway_iam_authenticated_invoke.rs"]
+mod apigateway_iam_authenticated_invoke;
 // Declared here, in this same head region, for the reason the entry above records.
 #[path = "all/cloudformation_rollback_triggers_revert_the_operation.rs"]
 mod cloudformation_rollback_triggers_revert_the_operation;

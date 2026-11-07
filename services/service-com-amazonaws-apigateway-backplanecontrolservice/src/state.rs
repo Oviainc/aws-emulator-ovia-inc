@@ -3651,6 +3651,45 @@ pub const ACCESS_ASSOCIATION_ALREADY_EXISTS: &str =
     "The domain name access association between this VPC endpoint and domain name already \
      exists.";
 
+/// The prefix every VPC endpoint id carries, which is also what tells it apart from the
+/// OTHER ids EC2 mints under a longer prefix of its own (an endpoint SERVICE's
+/// `vpce-svc-…`, an endpoint connection's `vpce-conn-…`): those carry a second hyphen
+/// where an endpoint id carries only hexadecimal digits.
+pub const VPC_ENDPOINT_ID_PREFIX: &str = "vpce-";
+
+/// The widths of the hexadecimal part of a VPC endpoint id, from EC2's own id pattern
+/// (`^vpce-([0-9a-f]{8}|[0-9a-f]{17})$`): the two EC2 mints.
+pub const VPC_ENDPOINT_ID_HEX_WIDTHS: &[usize] = &[8, 17];
+
+/// Whether `value` is the id of a VPC endpoint: [`VPC_ENDPOINT_ID_PREFIX`] and one of the
+/// hexadecimal widths EC2 mints ([`VPC_ENDPOINT_ID_HEX_WIDTHS`]), in lower case.
+///
+/// The ONE reading of that form in this crate, so a member that names a VPC endpoint reads
+/// it the same way wherever it is read: the `accessAssociationSource` of a `VPCE` access
+/// association ("For a VPCE, the value is the VPC endpoint ID",
+/// `CreateDomainNameAccessAssociation$accessAssociationSource`) and the first label of an
+/// interface endpoint's own `execute-api` DNS name, which the data plane resolves a private
+/// api's source endpoint from ([`crate::service::invoke`]).
+#[must_use]
+pub fn is_vpc_endpoint_id(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix(VPC_ENDPOINT_ID_PREFIX) else {
+        return false;
+    };
+    VPC_ENDPOINT_ID_HEX_WIDTHS.contains(&hex.len())
+        && hex
+            .chars()
+            .all(|glyph| glyph.is_ascii_hexdigit() && !glyph.is_ascii_uppercase())
+}
+
+/// The `BadRequestException` message for an `accessAssociationSource` that is not the id of
+/// a VPC endpoint, which is what a `VPCE` access association's source must be ("For a VPCE,
+/// the value is the VPC endpoint ID").
+///
+/// VERBATIM from the recorded refusal of a malformed source, which asserts this sentence
+/// exactly: entirely fixed text for the class, naming the kind of identifier the request got
+/// wrong and echoing none of the value it sent.
+pub const INVALID_ACCESS_ASSOCIATION_SOURCE: &str = "Invalid VPC endpoint ID specified.";
+
 /// The `ConflictException` message for a custom domain name a stored
 /// `DomainNameAccessAssociation` still depends on, which is what `DeleteDomainName`
 /// refuses while the dependency stands (see

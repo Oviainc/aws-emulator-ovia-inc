@@ -15,6 +15,16 @@
 //! correctly signed invoke before the stage was reached — and a client could not tell a
 //! refused backend from an endpoint that answers nothing.
 //!
+//! Where the method's `authorizationType` is `AWS_IAM` the stage AUTHENTICATES the credential
+//! before anything else: the access key id must name a credential this emulator holds and the
+//! signature must be the one that credential's secret produces, so the credential this
+//! harness fabricates — an access key id the emulator issued nothing for — is refused `403`
+//! BY THE STAGE, through the api's own gateway response and naming the request it answered,
+//! in every credential form. That the refusal is the STAGE's and not the front door's is what
+//! each row's request-id assertion observes; what a credential that DOES authenticate earns
+//! is pinned in `core/router/tests/all/apigateway_iam_authenticated_invoke.rs`, where the
+//! requests are really signed with the keys the emulator published.
+//!
 //! The rows span what the rule generalises over: WHICH credential form the request carries
 //! (an `Authorization` header, a session credential with its security token, a presigned
 //! URL's query credential, a scope naming another Region, no credential at all), WHICH
@@ -69,6 +79,11 @@ const CONFIGURATION_ERROR: &str = "Internal server error";
 /// The sentence a request the deployment places no method for, and an `AWS_IAM` method
 /// reached with no credential at all, are answered with.
 const MISSING_TOKEN: &str = "Missing Authentication Token";
+
+/// The sentence an `AWS_IAM` method's caller is refused with when the access key id it
+/// presented names no credential this emulator holds — which is what every credential this
+/// harness fabricates is, since the emulator issued none of them.
+const INVALID_TOKEN: &str = "The security token included in the request is invalid.";
 
 /// The body the `MOCK` route open to everyone answers.
 const OPEN_BODY: &str = r#"{"served":"open"}"#;
@@ -322,7 +337,7 @@ async fn every_signed_invoke_of_a_deployed_stage_is_answered_by_the_stage() {
                 session: false,
             },
             addressing: Addressing::OwnHost,
-            answer: Answer::Gateway(500, CONFIGURATION_ERROR),
+            answer: Answer::Gateway(403, INVALID_TOKEN),
         },
         Row {
             case: "the same, signed with a temporary credential and its session token",
@@ -333,9 +348,13 @@ async fn every_signed_invoke_of_a_deployed_stage_is_answered_by_the_stage() {
                 session: true,
             },
             addressing: Addressing::OwnHost,
-            answer: Answer::Gateway(500, CONFIGURATION_ERROR),
+            answer: Answer::Gateway(403, INVALID_TOKEN),
         },
         Row {
+            // The emulator's own verifier does not tell a scope naming another REGION from a
+            // credential it holds no secret for — both reach this plane as one refusal — so
+            // this row asserts the sentence that refusal states rather than a
+            // region-specific one of AWS's.
             case: "the same, with a credential scope naming another Region",
             verb: "GET",
             path: "/beta/backend",
@@ -344,7 +363,7 @@ async fn every_signed_invoke_of_a_deployed_stage_is_answered_by_the_stage() {
                 session: false,
             },
             addressing: Addressing::OwnHost,
-            answer: Answer::Gateway(500, CONFIGURATION_ERROR),
+            answer: Answer::Gateway(403, INVALID_TOKEN),
         },
         Row {
             case: "the same, reached as a presigned URL carrying its credential in the query",
@@ -352,7 +371,7 @@ async fn every_signed_invoke_of_a_deployed_stage_is_answered_by_the_stage() {
             path: "/beta/backend",
             credential: Credential::PresignedQuery { region: REGION },
             addressing: Addressing::OwnHost,
-            answer: Answer::Gateway(500, CONFIGURATION_ERROR),
+            answer: Answer::Gateway(403, INVALID_TOKEN),
         },
         Row {
             case: "the same, addressed through the data-plane path prefix",
@@ -363,7 +382,7 @@ async fn every_signed_invoke_of_a_deployed_stage_is_answered_by_the_stage() {
                 session: false,
             },
             addressing: Addressing::EmulatorPath,
-            answer: Answer::Gateway(500, CONFIGURATION_ERROR),
+            answer: Answer::Gateway(403, INVALID_TOKEN),
         },
         Row {
             case: "a Lambda proxy method open to everyone, signed anyway",
@@ -385,7 +404,7 @@ async fn every_signed_invoke_of_a_deployed_stage_is_answered_by_the_stage() {
                 session: false,
             },
             addressing: Addressing::OwnHost,
-            answer: Answer::Served(200, IAM_BODY),
+            answer: Answer::Gateway(403, INVALID_TOKEN),
         },
         Row {
             case: "an IAM-authorized MOCK method, reached as a presigned URL",
@@ -393,7 +412,7 @@ async fn every_signed_invoke_of_a_deployed_stage_is_answered_by_the_stage() {
             path: "/beta/signed",
             credential: Credential::PresignedQuery { region: REGION },
             addressing: Addressing::OwnHost,
-            answer: Answer::Served(200, IAM_BODY),
+            answer: Answer::Gateway(403, INVALID_TOKEN),
         },
         Row {
             case: "an IAM-authorized MOCK method, addressed through the data-plane path prefix",
@@ -404,7 +423,7 @@ async fn every_signed_invoke_of_a_deployed_stage_is_answered_by_the_stage() {
                 session: true,
             },
             addressing: Addressing::EmulatorPath,
-            answer: Answer::Served(200, IAM_BODY),
+            answer: Answer::Gateway(403, INVALID_TOKEN),
         },
         Row {
             case: "a method open to everyone, signed anyway",
@@ -516,6 +535,12 @@ async fn a_signed_invoke_reads_the_api_record_the_control_plane_wrote() {
     // The round trip: what a signed invoke is answered with follows the records, so a
     // change the control plane makes to the deployed method is what the next signed invoke
     // reads — the same credential, two answers.
+    //
+    // The method is open (`authorizationType` `NONE`), because what this test observes is
+    // the GATEWAY RESPONSE the api holds for an integration that could not be performed: an
+    // `AWS_IAM` method would refuse this harness's fabricated credential before reaching the
+    // integration at all (the rows above pin that refusal), and then neither answer would be
+    // the record's.
     let mut gateway = Gateway::new();
     let (api, root) = create_api(&gateway, "signed-invoke-records").await;
     let resource = resource_under(&gateway, &api, &root, "items").await;
@@ -524,7 +549,7 @@ async fn a_signed_invoke_reads_the_api_record_the_control_plane_wrote() {
         &api,
         &resource,
         "GET",
-        json!({ "authorizationType": "AWS_IAM" }),
+        json!({ "authorizationType": "NONE" }),
     )
     .await;
     put_integration(

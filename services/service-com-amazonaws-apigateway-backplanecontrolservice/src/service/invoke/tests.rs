@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The two pure rules this module owns that a wire test cannot vary cheaply: which
-//! host is an `execute-api` endpoint, and how specifically a deployed resource path
-//! matches a request path. The served behaviour is pinned end to end in
-//! `tests/all/execute_api_data_plane.rs`.
+//! The pure rules this module owns that a wire test cannot vary cheaply: which
+//! host is an `execute-api` endpoint, how specifically a deployed resource path
+//! matches a request path, and how an integration's `uri` is addressed. The served
+//! behaviour is pinned end to end in `tests/all/execute_api_data_plane.rs`.
 
 use super::*;
 
@@ -205,4 +205,61 @@ fn a_literal_segment_beats_a_parameter_which_beats_a_greedy_parameter() {
         "case specificity: expected literal > parameter > greedy, got \
              {literal:?} > {parameter:?} > {greedy:?}"
     );
+}
+
+/// RULE: an integration `uri`'s `{name}` placeholders are filled in ONE pass over the `uri`
+/// itself, so a value substituted for one name is never scanned for another name's
+/// placeholder — the values are the caller's, so rescanning them would make the address the
+/// product of their sizes rather than their sum.
+#[test]
+fn a_substituted_path_parameter_is_never_scanned_for_another_placeholder() {
+    let mapped = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect()
+    };
+    /// One row: the integration's `uri`, the values mapped onto its path parameters, and the
+    /// address the rule owes it.
+    struct Addressing<'a> {
+        uri: &'a str,
+        mapped: &'a [(&'a str, &'a str)],
+        expected: &'a str,
+    }
+    let case = |uri, mapped, expected| Addressing {
+        uri,
+        mapped,
+        expected,
+    };
+    // Rows differ along what the mapped values carry and which placeholders the `uri` has:
+    // a plain value, a value that spells another name's placeholder (twice, and in the name
+    // that sorts FIRST so a per-name rewrite would rescan it), a placeholder no mapping
+    // names, repeated placeholders of one name, and braces that are text rather than a
+    // placeholder.
+    let cases = [
+        case("/orders/{id}", &[("id", "42")], "/orders/42"),
+        case(
+            "/a/{alpha}/b/{beta}",
+            &[("alpha", "{beta}{beta}"), ("beta", "B")],
+            "/a/{beta}{beta}/b/B",
+        ),
+        case(
+            "/a/{alpha}/b/{beta}",
+            &[("beta", "{alpha}"), ("alpha", "A")],
+            "/a/A/b/{alpha}",
+        ),
+        case("/{proxy}", &[], "/{proxy}"),
+        case("/{id}/{id}", &[("id", "7")], "/7/7"),
+        case("/not-a-placeholder", &[("id", "7")], "/not-a-placeholder"),
+        case("/open{id", &[("id", "7")], "/open{id"),
+        case("/{}/x", &[("id", "7")], "/{}/x"),
+    ];
+    for row in &cases {
+        let addressed = expanded_uri(row.uri, &mapped(row.mapped));
+        assert_eq!(
+            addressed, row.expected,
+            "case {:?} with {:?}: expected {:?}, got {addressed:?}",
+            row.uri, row.mapped, row.expected
+        );
+    }
 }

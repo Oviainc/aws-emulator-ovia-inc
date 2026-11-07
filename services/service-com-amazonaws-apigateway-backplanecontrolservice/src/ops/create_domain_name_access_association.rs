@@ -93,6 +93,11 @@ use crate::state::{
     MAX_DOMAIN_NAME_ACCESS_ASSOCIATIONS, MAX_STRING_CHARS, MAX_TAGS, PRIVATE_ENDPOINT_TYPE,
 };
 
+/// The one `accessAssociationSourceType` the model declares, whose source is a VPC endpoint
+/// id: "The type of the domain name access association source"
+/// (`smithy_query(query="shape", shape="AccessAssociationSourceType")` lists `VPCE` alone).
+const VPCE_SOURCE_TYPE: &str = "VPCE";
+
 /// Read `domainNameArn` as the key the domain name it names is stored under
 /// (`smithy_query(query="operation", operation="GetDomainName")`:
 /// `/domainnames/{domainName}` is that ARN's resource portion).
@@ -242,9 +247,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Nothing caller-sized reaches the store unchecked, and the ARN is read as an ARN,
         // before the store lock is taken at all. `accessAssociationSourceType` is NOT
-        // checked here: it is a modelled enum, so a value outside it is refused before
-        // this handler runs.
+        // checked for membership of its value set here: it is a modelled enum, so a value
+        // outside it is refused before this handler runs.
         bound_input(&input).map_err(bad_request)?;
+        // The SOURCE is read as the identifier its type says it is: with
+        // `accessAssociationSourceType` `VPCE`, "the value is the VPC endpoint ID"
+        // (`accessAssociationSource`), so a value that is not one names no endpoint this
+        // association could ever be resolved through and is refused BEFORE anything is
+        // written — the identifier refusal this service answers an unreadable identifier
+        // with.
+        if input.access_association_source_type == VPCE_SOURCE_TYPE
+            && !crate::state::is_vpc_endpoint_id(&input.access_association_source)
+        {
+            return Err(bad_request(
+                crate::state::INVALID_ACCESS_ASSOCIATION_SOURCE.to_string(),
+            ));
+        }
         let domain_name_key = domain_name_key_of(&input.domain_name_arn)
             .ok_or_else(|| bad_request(crate::state::INVALID_DOMAIN_NAME_ARN.to_string()))?;
 

@@ -53,11 +53,13 @@
 //!    `{parameter}`, which beats a greedy `{proxy+}`;
 //! 4. the request's verb names a method of that resource in the deployment, or the
 //!    `ANY` catch-all;
-//! 5. the method's deployed `authorizationType` is enforced — including a `CUSTOM`
-//!    authorizer, whose decision is the RETURN VALUE of the Lambda function its
-//!    `authorizerUri` names ([`custom_authorizer`]), obtained by invoking that function and
-//!    then HELD on the stage for the authorizer's own `authorizerResultTtlInSeconds` — and
-//!    then the API's own
+//! 5. the method's deployed `authorizationType` is enforced — for `AWS_IAM` that is the
+//!    SigV4 credential being AUTHENTICATED against this emulator's own credentials
+//!    ([`sigv4_authentication`]) and then AUTHORIZED for the principal it speaks for
+//!    ([`execute_api_authorization`]), and for a `CUSTOM` authorizer it is the RETURN VALUE
+//!    of the Lambda function its `authorizerUri` names ([`custom_authorizer`]), obtained by
+//!    invoking that function and then HELD on the stage for the authorizer's own
+//!    `authorizerResultTtlInSeconds` — and then the API's own
 //!    RESOURCE POLICY is applied ([`super::resource_policy`]): `RestApi$policy` "applies to
 //!    this RestApi regardless of the caller and Method configuration", so a document the
 //!    developer attached decides every request this endpoint answers — a private API pinned
@@ -245,6 +247,7 @@ mod custom_authorizer;
 pub mod execute_api_authorization;
 pub mod lambda_proxy;
 mod onward_endpoint;
+pub mod sigv4_authentication;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -298,18 +301,15 @@ const EMULATOR_PATH_NAMESPACE: &str = "_aws";
 /// make two services claim one request, which the router rejects as `AmbiguousService`.
 const CONNECTIONS_SEGMENT: &str = "@connections";
 
-/// The prefix of every VPC endpoint id, which is also the first label of the
-/// endpoint-specific DNS names an interface endpoint answers on.
-///
-/// An interface endpoint to the Region's `execute-api` service is given endpoint-specific
-/// names of the form `{vpc-endpoint-id}.execute-api.{region}.vpce.amazonaws.com` (and one
-/// `{vpc-endpoint-id}-{zone}.…` per Availability Zone), which is how a client addresses a
-/// PRIVATE api through one endpoint rather than another — see [`endpoint_of_host`].
-const VPC_ENDPOINT_ID_PREFIX: &str = "vpce-";
-
-/// The lengths of the hexadecimal part of a VPC endpoint id, from EC2's own id pattern
-/// (`^vpce-([0-9a-f]{8}|[0-9a-f]{17})$`): the two widths AWS mints.
-const VPC_ENDPOINT_ID_HEX_LENGTHS: &[usize] = &[8, 17];
+// The prefix of every VPC endpoint id, which is also the first label of the
+// endpoint-specific DNS names an interface endpoint answers on.
+//
+// An interface endpoint to the Region's `execute-api` service is given endpoint-specific
+// names of the form `{vpc-endpoint-id}.execute-api.{region}.vpce.amazonaws.com` (and one
+// `{vpc-endpoint-id}-{zone}.…` per Availability Zone), which is how a client addresses a
+// PRIVATE api through one endpoint rather than another — see `endpoint_of_host`. The id's
+// whole form is `crate::state::is_vpc_endpoint_id`, this crate's one reading of it.
+use crate::state::VPC_ENDPOINT_ID_PREFIX;
 
 /// The header a client names the api in when it addresses a PRIVATE api by its VPC
 /// endpoint's own DNS name, which names the endpoint rather than the api: AWS documents
@@ -780,6 +780,26 @@ fn access_denied(message: String) -> GatewayRefusal {
     }
 }
 
+/// The SigV4 credential an `AWS_IAM` method's caller presented does not authenticate: the
+/// access key id names no credential this emulator holds, or the signature is not the one
+/// that credential's secret produces over this request
+/// ([`sigv4_authentication::Unauthenticated`]).
+///
+/// Answered through `INVALID_SIGNATURE` — the gateway response type a request whose
+/// signature does not conform is customized under, whose own documented status is `403`
+/// ([`crate::state::default_gateway_status_code`]) — carrying the sentence AWS words that
+/// class with and the exception class the endpoint reports it in, so a client tells a
+/// credential it must replace from a signature it must recompute.
+fn invalid_signature(class: sigv4_authentication::Unauthenticated) -> GatewayRefusal {
+    GatewayRefusal {
+        response_type: "INVALID_SIGNATURE",
+        message: class.message(),
+        error_type: Some(class.error_type()),
+        validation_detail: Cow::Borrowed(""),
+        message_member: MESSAGE_MEMBER,
+    }
+}
+
 /// The request was refused by the WAFv2 web ACL in front of the stage: `403` through
 /// `WAF_FILTERED`, the gateway response type API Gateway answers a request its web ACL
 /// blocked with ([`crate::state::default_gateway_status_code`] gives that type's own
@@ -1129,7 +1149,7 @@ fn endpoint_labels(host: &str) -> Option<(&str, &str)> {
 /// `{vpc-endpoint-id}-{zone}.…` per Availability Zone its interfaces sit in — so the id is
 /// the first label up to the zone suffix, and the zonal and regional names resolve to the
 /// SAME endpoint. The id is [`VPC_ENDPOINT_ID_PREFIX`] and one of the hexadecimal widths
-/// EC2's id pattern admits ([`VPC_ENDPOINT_ID_HEX_LENGTHS`]), which is also what tells an
+/// EC2's id pattern admits ([`crate::state::is_vpc_endpoint_id`]), which is also what tells an
 /// endpoint's own name apart from an api id that merely begins with those characters.
 fn endpoint_of_host(host: &str) -> Option<&str> {
     let (first, _region) = endpoint_labels(host)?;
@@ -1137,16 +1157,11 @@ fn endpoint_of_host(host: &str) -> Option<&str> {
         .strip_prefix(VPC_ENDPOINT_ID_PREFIX)?
         .split('-')
         .next()?;
-    if !VPC_ENDPOINT_ID_HEX_LENGTHS.contains(&hex.len())
-        || !hex
-            .chars()
-            .all(|glyph| glyph.is_ascii_hexdigit() && !glyph.is_ascii_uppercase())
-    {
-        return None;
-    }
     // By `get`, never by a byte-index slice: the label is read off the wire, and the id's
     // own width is all that has been established about it.
-    first.get(..VPC_ENDPOINT_ID_PREFIX.len() + hex.len())
+    first
+        .get(..VPC_ENDPOINT_ID_PREFIX.len() + hex.len())
+        .filter(|id| crate::state::is_vpc_endpoint_id(id))
 }
 
 /// Whether `path` addresses the `@connections` space of ApiGatewayManagementApi, in either
@@ -1328,6 +1343,32 @@ async fn serving<Eng: Send + Sync + 'static>(
                 .find(|resource| resource.path == matched_path);
             let deployed_method =
                 deployed_resource.and_then(|resource| resource.methods.get(verb));
+
+            // An `AWS_IAM` method is authorized by IAM, and that is a decision about the
+            // principal a credential speaks for — so a credential the request DOES carry is
+            // AUTHENTICATED first: the access key id must name one this emulator holds and
+            // the signature must be the one that credential's secret produces. A made-up key
+            // id, and a real one signed with the wrong secret, are refused here, with the
+            // api's own document unread and the integration never performed
+            // ([`sigv4_authentication`]). A request carrying NO credential is not this
+            // refusal: it is the missing-token one the method's own authorization states
+            // below ([`authorization_refusal`]).
+            if authorization_type == AUTHORIZATION_AWS_IAM && carries_sigv4_credential(req) {
+                if let Some(unauthenticated) = sigv4_authentication::refusal(req, ctx) {
+                    tracing::warn!(
+                        api_id = %api.id,
+                        stage = %stage.stage_name,
+                        path = %matched_path,
+                        verb = %verb,
+                        class = ?unauthenticated,
+                        "the credential this invoke presented does not authenticate"
+                    );
+                    break 'planned Planned::answered(refusal_response(
+                        Some(api),
+                        invalid_signature(unauthenticated),
+                    ));
+                }
+            }
 
             // Who the request speaks for is the METHOD's authorization, not what the request
             // carries: API Gateway authenticates nobody for a method whose
@@ -2443,10 +2484,12 @@ fn warned(mut response: RtResponse, warn: bool) -> RtResponse {
 /// What the method's `authorizationType` makes of this request: the claims the authorizer
 /// publishes to the integration, or the refusal the request earns.
 ///
-/// `NONE` admits every request and publishes nothing. `AWS_IAM` needs a SigV4 credential,
-/// whose SIGNATURE the emulator itself verifies (a service never checks signatures), so only
-/// its presence is read here — WHETHER that credential may invoke the method is the decision
-/// [`execute_api_authorization`] takes, applied by [`serving`] once the method ARN is known.
+/// `NONE` admits every request and publishes nothing. `AWS_IAM` needs a SigV4 credential, so
+/// only its PRESENCE is read here; whether that credential AUTHENTICATES — the access key id
+/// naming a credential this emulator holds and the signature matching its secret — is
+/// [`sigv4_authentication`]'s decision, and WHETHER the principal it speaks for may invoke
+/// the method is [`execute_api_authorization`]'s, both applied by [`serving`] once the method
+/// is known.
 ///
 /// An `Authorizer`-backed type is read in two steps. The part settled before the authorizer
 /// is called at all is the identity source: a source the request does not carry is `401`
@@ -3616,11 +3659,33 @@ fn integration_request_parameter(key: &str) -> Option<(ParameterIn, &str)> {
 /// integration addresses the path the caller asked for — the greedy `{proxy}` of a catch-all
 /// resource among them. A placeholder no mapping names is left in place, so the caller can
 /// tell an address it cannot resolve from one it can.
+///
+/// ONE left-to-right pass over the `uri` itself, so a value that has been substituted is
+/// never scanned again: the values come from the request (a header, a query parameter, a
+/// bound path segment), so rewriting the whole string once per name would let one request's
+/// value carry another name's placeholder and make the result the PRODUCT of the values'
+/// sizes rather than their sum. It is the same no-rescan contract
+/// [`resolved_references`] states for a stage variable, for the same reason.
 fn expanded_uri(uri: &str, path: &BTreeMap<String, String>) -> String {
-    let mut expanded = uri.to_string();
-    for (name, value) in path {
-        expanded = expanded.replace(&format!("{{{name}}}"), value);
+    let mut expanded = String::with_capacity(uri.len());
+    let mut rest = uri;
+    while let Some(open) = rest.find('{') {
+        let (before, from_open) = rest.split_at(open);
+        expanded.push_str(before);
+        // A `{` that closes nowhere is text of the address, not a placeholder.
+        let Some(close) = from_open.find('}') else {
+            expanded.push_str(from_open);
+            return expanded;
+        };
+        let name = from_open.get(1..close).unwrap_or_default();
+        match path.get(name) {
+            Some(value) => expanded.push_str(value),
+            // A placeholder no mapping names travels on as written.
+            None => expanded.push_str(from_open.get(..=close).unwrap_or_default()),
+        }
+        rest = from_open.get(close + 1..).unwrap_or_default();
     }
+    expanded.push_str(rest);
     expanded
 }
 
@@ -4650,13 +4715,14 @@ pub(crate) fn stored_pattern(expression: &str) -> Option<::regex::Regex> {
 /// credential in the query string, so reading only the header would refuse a presigned
 /// invoke of an `AWS_IAM` method that AWS admits.
 ///
-/// Whether the SIGNATURE over that credential is correct is the emulator's own check, never
-/// a service's — and it is one the emulator cannot make for this plane: it verifies a
-/// request against the signing name of the service that claimed it, which for this service
-/// is its control plane's, while an invoke is signed under the data plane's own
-/// (`crate::service`'s module docs state the whole rule). WHICH principal the credential
-/// speaks for, and whether that principal may invoke the method, is
-/// [`execute_api_authorization`]'s decision.
+/// Whether the SIGNATURE over that credential is correct is a second question, and it is
+/// taken with the emulator's OWN verifier rather than with a reading of SigV4 written here:
+/// the front door verifies a named operation's credential against the signing name of the
+/// service that claimed the request, which for this service is its control plane's, while an
+/// invoke is signed under the data plane's own — so this plane asks that same verifier about
+/// ITS signing name ([`sigv4_authentication`]) once a method's `AWS_IAM` authorization makes
+/// the credential matter. WHICH principal the credential speaks for, and whether that
+/// principal may invoke the method, is [`execute_api_authorization`]'s decision.
 pub fn carries_sigv4_credential(req: &RtRequest) -> bool {
     sigv4_access_key_id(req).is_some()
 }
@@ -4668,22 +4734,46 @@ pub fn carries_sigv4_credential(req: &RtRequest) -> bool {
 /// One reader for the presence and the value, so a request that is admitted as signed is
 /// also one whose principal can be resolved.
 fn sigv4_access_key_id(req: &RtRequest) -> Option<String> {
-    let key_id_of = |credential: &str| {
-        let key_id = credential.split('/').next().unwrap_or(credential).trim();
-        (!key_id.is_empty()).then(|| key_id.to_string())
-    };
-    if let Some(credential) = req
+    sigv4_credential_elements(req)?
+        .into_iter()
+        .next()
+        .filter(|key_id| !key_id.is_empty())
+}
+
+/// The SIGNING NAME the request's credential scope names — the fourth element of
+/// `<akid>/<date>/<region>/<service>/aws4_request` — or `None` when the request carries no
+/// credential or a scope with no such element.
+///
+/// Read beside the access key id by [`sigv4_credential_elements`], because the two are two
+/// fields of one value: [`sigv4_authentication`] states a credential scoped to another
+/// service differently from one this emulator holds no secret for, and AWS words those two
+/// refusals differently.
+pub(super) fn sigv4_credential_scope_service(req: &RtRequest) -> Option<String> {
+    sigv4_credential_elements(req)?
+        .into_iter()
+        .nth(3)
+        .filter(|service| !service.is_empty())
+}
+
+/// The elements of the credential scope the request presents, in the order SigV4 writes
+/// them: `<akid>/<date>/<region>/<service>/aws4_request`.
+///
+/// Both carriages are read here, and the presigned one through the framework's own query
+/// reader ([`sent_query_parameters`]) — so its `%2F`-escaped separators are the separators
+/// they encode rather than part of a field, which is what lets the SAME field be read out of
+/// a presigned URL and out of an `Authorization` header.
+fn sigv4_credential_elements(req: &RtRequest) -> Option<Vec<String>> {
+    let credential = match req
         .headers()
         .get("authorization")
         .and_then(|value| value.split("Credential=").nth(1))
         .and_then(|credential| credential.split([',', ' ']).next())
     {
-        return key_id_of(credential);
-    }
-    query_of(req.uri())
-        .split('&')
-        .find_map(|pair| pair.strip_prefix("X-Amz-Credential="))
-        .and_then(key_id_of)
+        Some(credential) => credential.trim().to_string(),
+        None => sent_query_parameters(query_of(req.uri())).remove("X-Amz-Credential")?,
+    };
+    let elements: Vec<String> = credential.split('/').map(str::to_string).collect();
+    (!elements.is_empty()).then_some(elements)
 }
 
 /// One gateway-response refusal, rendered as the API serves it on the wire.

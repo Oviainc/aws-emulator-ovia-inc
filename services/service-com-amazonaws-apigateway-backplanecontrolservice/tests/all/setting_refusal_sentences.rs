@@ -320,7 +320,7 @@ async fn a_domain_name_arn_this_service_cannot_read_earns_one_fixed_sentence() {
         apigateway_arn("/restapis/abcde12345"),
         apigateway_arn("/"),
         apigateway_arn(
-            "/domainnameaccessassociations/domainname/absent.example.com+abcd12/vpcesource/vpce-0abc",
+            "/domainnameaccessassociations/domainname/absent.example.com+abcd12/vpcesource/vpce-0123456789abcdef0",
         ),
         String::new(),
     ];
@@ -345,7 +345,8 @@ async fn a_domain_name_arn_this_service_cannot_read_earns_one_fixed_sentence() {
             INVALID_DOMAIN_NAME_ARN,
             &format!("RejectDomainNameAccessAssociation(domainNameArn={value:?})"),
         );
-        let on_create = create_association(&gateway, association_body(value, "vpce-0abc")).await;
+        let on_create =
+            create_association(&gateway, association_body(value, "vpce-0123456789abcdef0")).await;
         assert_refusal(
             &on_create,
             BAD_REQUEST,
@@ -367,7 +368,8 @@ async fn a_domain_name_arn_this_service_cannot_read_earns_one_fixed_sentence() {
     // And a readable `domainNameArn` of a STORED private custom domain name is served, so
     // the refusals above are about the values and not about the calls.
     let stored = private_domain(&gateway, "readable.example.com").await;
-    let created = create_association(&gateway, association_body(&stored, "vpce-0abc")).await;
+    let created =
+        create_association(&gateway, association_body(&stored, "vpce-0123456789abcdef0")).await;
     assert_eq!(
         created.status, 201,
         "case CreateDomainNameAccessAssociation(a stored private domain name): expected 201, \

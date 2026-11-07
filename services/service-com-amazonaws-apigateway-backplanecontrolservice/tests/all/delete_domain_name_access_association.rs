@@ -166,9 +166,9 @@ async fn deleting_an_association_removes_that_record_alone_and_a_second_delete_i
             json!({ "cost:center": "team/platform", "empty-value": "" }),
         ),
         (
-            "an association of another domain name, a short source id",
+            "an association of another domain name, the shorter source id width",
             third.as_str(),
-            "vpce-abc",
+            "vpce-0a1b2c3d",
             json!({ "Name": "orders" }),
         ),
     ];

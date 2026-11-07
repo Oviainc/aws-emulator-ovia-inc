@@ -336,7 +336,7 @@ async fn the_same_account_sentence_carries_nothing_from_the_request_or_the_store
     // name, the access association source, and so the minted association id — and the
     // sentence must be byte-for-byte the same in each.
     let rows: Vec<(&str, &str, &str)> = vec![
-        ("a short name", "a.example.com", "vpce-0abc"),
+        ("a short name", "a.example.com", "vpce-0a1b2c3d"),
         (
             "a long name and a long source",
             "deeply.nested.private.api.example.co.uk",
