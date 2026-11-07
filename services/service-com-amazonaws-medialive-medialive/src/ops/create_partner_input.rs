@@ -188,6 +188,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(&message));
         };
 
+        // A partner input exists only to be the second feed of an AWS CDI input
+        // pair, so the `InputType` of the input the path names is a
+        // PRECONDITION of this operation: an input of any other type — and one
+        // created without a type at all — cannot take a partner, and the
+        // request is refused with this operation's modelled
+        // `BadRequestException` before anything is minted, rather than leaving
+        // the account holding a pairing the service cannot produce. The
+        // sentence is fixed text: nothing about it varies with the request.
+        //
+        // Checked BEFORE the idempotency replay below for the same reason the
+        // liveness lookup above is: a `RequestId` does not turn a request this
+        // operation refuses into one it serves.
+        if primary.input_type.as_deref() != Some(AWS_CDI_INPUT_TYPE) {
+            return Err(bad_request(PARTNER_REQUIRES_AWS_CDI_MESSAGE));
+        }
+
         // A retried create (same `@idempotencyToken` `RequestId`) must return the
         // partner input the first one created, not a second one. The token map is
         // the input store's, shared with `CreateInput`, so a replay counts only
@@ -254,6 +270,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The `InputType` an input must be for a partner to be created for it: the
+/// AWS CDI type, as the `InputType` enum spells it
+/// (`smithy_query(query="shape", shape="InputType")`, whose values this crate
+/// also lists as `super::types::INPUT_TYPE_VALUES`).
+///
+/// A partner input is the second feed of an AWS-CDI pair, so every other
+/// `InputType` — and an input created without one — is outside what this
+/// operation serves.
+const AWS_CDI_INPUT_TYPE: &str = "AWS_CDI";
+
+/// The message the refusal of a partner create for an input that is not an AWS
+/// CDI input carries.
+///
+/// FIXED text: the refusal is about the input's TYPE, and the type is already
+/// what the caller named the input by, so nothing of the request or of this
+/// emulator's state is interpolated into it.
+const PARTNER_REQUIRES_AWS_CDI_MESSAGE: &str =
+    "Creating a partner is only supported for AWS CDI inputs.";
 
 /// A request this operation refuses, as its own modelled client error.
 fn bad_request(message: &str) -> CreatePartnerInputError {

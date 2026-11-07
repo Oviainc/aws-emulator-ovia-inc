@@ -737,12 +737,13 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// create and delete rather than being recorded at create time. The
     /// association the store knows is the one a channel's own request carries:
     /// `AnywhereSettings$ClusterId`, "The ID of the cluster" the channel runs
-    /// on. A channel that has reached the terminal `DELETED` state is no longer
-    /// associated with anything, so it is not reported.
+    /// on. A channel whose delete this service has ACCEPTED is no longer
+    /// associated with anything, so it is not reported — the one cut point every
+    /// derived "currently using" list of this store applies.
     pub fn channels_in_cluster(&self, cluster_id: &str) -> Vec<String> {
         self.channels
             .values()
-            .filter(|channel| !channel.is_deleted())
+            .filter(|channel| !channel.is_delete_accepted())
             .filter(|channel| {
                 channel
                     .anywhere_settings

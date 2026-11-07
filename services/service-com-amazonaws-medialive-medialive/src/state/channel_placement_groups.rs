@@ -687,8 +687,8 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// store, so it tracks every later create and delete rather than being
     /// recorded on the group.
     ///
-    /// A channel that has reached the terminal `DELETED` state is no longer
-    /// placed anywhere, so it is not reported — the same rule
+    /// A channel whose delete this service has ACCEPTED is no longer placed
+    /// anywhere, so it is not reported — the same rule
     /// [`ComAmazonawsMedialiveMedialiveState::channels_using_security_group`]
     /// follows.
     ///
@@ -705,7 +705,7 @@ impl ComAmazonawsMedialiveMedialiveState {
     ) -> Vec<String> {
         self.channels
             .values()
-            .filter(|channel| !channel.is_deleted())
+            .filter(|channel| !channel.is_delete_accepted())
             .filter(|channel| {
                 let Some(settings) = channel.anywhere_settings.as_ref() else {
                     return false;

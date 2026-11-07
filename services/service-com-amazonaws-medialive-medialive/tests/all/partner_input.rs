@@ -9,10 +9,18 @@
 //! The suites are TABLES: one input family is one row, never the whole rule.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_medialive_medialive::ops::types::INPUT_TYPE_VALUES;
 use service_com_amazonaws_medialive_medialive::state::MAX_INPUTS;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{call, call_in_region, error_code, medialive, ACCOUNT};
+use crate::wire::{call, call_in_region, error_code, error_message, medialive, ACCOUNT};
+
+/// The one `InputType` a partner input may be created for: a partner is the
+/// second feed of an AWS-CDI pair. Spelled as the `InputType` enum spells it
+/// (`smithy_query(query="shape", shape="InputType")`, whose values the crate
+/// also lists as `INPUT_TYPE_VALUES`), and asserted to BE one of them by
+/// [`a_partner_is_only_created_for_an_aws_cdi_input`].
+const AWS_CDI: &str = "AWS_CDI";
 
 /// The ids an input configuration names are resolved first, so every create in
 /// this suite is one the service can ingest through (`crate::support`).
@@ -62,73 +70,73 @@ fn destination_ips(input: &Value) -> Vec<Value> {
         .collect()
 }
 
-/// The `InputType` families the table below spans, each created the way its own
-/// family ingests. Source for the type names and the per-family member each
-/// row fills: the `CreateInput` input signature and the `InputType` enum
+/// The AWS-CDI input configurations the mirror table below spans.
+///
+/// Every row is an input of the ONE `InputType` a partner may be created for
+/// ([`AWS_CDI`]), varied along what a partner inherits from it: how many
+/// destination slots it holds, whether a slot carries the caller's own ON-PREM
+/// ingest address, whether it is admitted by an input security group, whether
+/// it delegates through a role, and whether it is named at all. Source for the
+/// member names: the `CreateInput` input signature
 /// (`smithy_query(query="operation", operation="CreateInput")`).
 fn primary_input_table() -> Vec<(&'static str, Value)> {
     vec![
         (
-            "url pull with one source",
-            json!({
-                "name": "pull-primary",
-                "type": "URL_PULL",
-                "sources": [source("https://example.com/a.m3u8")],
-                "inputSecurityGroups": ["3456789"],
-            }),
+            "aws cdi with no destination",
+            json!({ "name": "cdi-bare", "type": AWS_CDI }),
         ),
         (
-            "rtp push with one destination",
-            json!({
-                "name": "rtp-primary",
-                "type": "RTP_PUSH",
-                "destinations": [{ "streamName": "live/a" }],
-            }),
-        ),
-        (
-            "rtmp push with two destinations",
-            json!({
-                "name": "rtmp-primary",
-                "type": "RTMP_PUSH",
-                "destinations": [{ "streamName": "live/a" }, { "streamName": "live/b" }],
-            }),
-        ),
-        (
-            "mediaconnect with one flow",
-            json!({
-                "name": "mediaconnect-primary",
-                "type": "MEDIACONNECT",
-                "mediaConnectFlows": [
-                    { "flowArn": "arn:aws:mediaconnect:us-west-2:111122223333:flow:1:a" },
-                ],
-                "roleArn": "arn:aws:iam::111122223333:role/MediaLiveAccessRole",
-            }),
-        ),
-        (
-            // The family partner inputs exist for in the first place, and one
-            // the input-lifecycle suite does not cover.
             "aws cdi with one destination",
             json!({
                 "name": "cdi-primary",
-                "type": "AWS_CDI",
+                "type": AWS_CDI,
                 "destinations": [{ "streamName": "cdi-a" }],
             }),
         ),
         (
-            "sdi on premises",
+            "aws cdi with two destinations",
             json!({
-                "name": "sdi-primary",
-                "type": "SDI",
-                "sdiSources": ["sdi-a"],
-                "inputNetworkLocation": "ON_PREMISES",
+                "name": "cdi-redundant",
+                "type": AWS_CDI,
+                "destinations": [{ "streamName": "cdi-a" }, { "streamName": "cdi-b" }],
             }),
         ),
         (
-            "one input device",
+            "aws cdi admitted by an input security group",
             json!({
-                "name": "device-primary",
-                "type": "INPUT_DEVICE",
-                "inputDevices": [{ "id": "hd-0000000" }],
+                "name": "cdi-grouped",
+                "type": AWS_CDI,
+                "destinations": [{ "streamName": "cdi-a" }],
+                "inputSecurityGroups": ["3456789"],
+            }),
+        ),
+        (
+            "aws cdi delegating through a role, with tags of its own",
+            json!({
+                "name": "cdi-role",
+                "type": AWS_CDI,
+                "destinations": [{ "streamName": "cdi-a" }],
+                "roleArn": "arn:aws:iam::111122223333:role/MediaLiveAccessRole",
+                "tags": { "owner": "primary" },
+            }),
+        ),
+        (
+            // `InputDestinationRequest$StaticIpAddress` is the CALLER's address
+            // for the slot on its own network, so both inputs of the pair keep
+            // reporting it.
+            "aws cdi on premises with the caller's own ingest address",
+            json!({
+                "name": "cdi-on-prem",
+                "type": AWS_CDI,
+                "inputNetworkLocation": "ON_PREMISES",
+                "destinations": [{ "streamName": "cdi-a", "staticIpAddress": "192.0.2.10" }],
+            }),
+        ),
+        (
+            "aws cdi with no name",
+            json!({
+                "type": AWS_CDI,
+                "destinations": [{ "streamName": "cdi-a" }],
             }),
         ),
     ]
@@ -234,10 +242,12 @@ async fn a_partner_input_mirrors_the_input_it_partners_and_the_pair_names_each_o
             partner["attachedChannels"]
         );
 
-        // A destination slot per slot of the input it partners, each with an
-        // ingest endpoint of the partner's OWN: `InputDestination$Ip` "remains
-        // fixed for the lifetime of the input", so the partner cannot share the
-        // one the partnered input holds.
+        // A destination slot per slot of the input it partners, each reporting
+        // the address that slot has: the CALLER's own ON-PREM
+        // `InputDestinationRequest$StaticIpAddress` where the request named one
+        // — that address is the caller's value for the slot, so both inputs of
+        // the pair report it — and none at all where the service allocates no
+        // push endpoint for the input's type.
         let primary_ips = destination_ips(&primary);
         let partner_ips = destination_ips(&partner);
         assert_eq!(
@@ -246,26 +256,21 @@ async fn a_partner_input_mirrors_the_input_it_partners_and_the_pair_names_each_o
             "case {case:?}: expected one destination per partnered destination, got {partner_ips:?}"
         );
         for (slot, (primary_ip, partner_ip)) in primary_ips.iter().zip(&partner_ips).enumerate() {
-            if primary_ip.is_string() {
-                // A type with a push ingest protocol: both hold an address, and
-                // the partner's is not the partnered input's.
-                assert!(
-                    partner_ip.is_string(),
-                    "case {case:?}: destination slot {slot}: expected the partner's own ingest \
-                     address, got {partner_ip:?}"
-                );
-                assert_ne!(
-                    partner_ip, primary_ip,
-                    "case {case:?}: destination slot {slot}: expected an address of the \
-                     partner's own, got the partnered input's {primary_ip:?}"
+            let requested = request["destinations"][slot]["staticIpAddress"].clone();
+            if requested.is_string() {
+                assert_eq!(
+                    (primary_ip, partner_ip),
+                    (&requested, &requested),
+                    "case {case:?}: destination slot {slot}: expected both inputs to report the \
+                     caller's own address {requested:?}, got {primary_ip:?} and {partner_ip:?}"
                 );
             } else {
-                // A type the service allocates no push endpoint for reports
-                // none for either input.
                 assert_eq!(
-                    partner_ip, primary_ip,
+                    (primary_ip, partner_ip),
+                    (&Value::Null, &Value::Null),
                     "case {case:?}: destination slot {slot}: expected no ingest address on a \
-                     type that has no push endpoint, got {partner_ip:?}"
+                     type this service allocates no push endpoint for, got {primary_ip:?} and \
+                     {partner_ip:?}"
                 );
             }
         }
@@ -312,8 +317,8 @@ async fn a_partner_input_carries_the_tags_its_own_request_supplied() {
             &router,
             json!({
                 "name": "tagged-primary",
-                "type": "URL_PULL",
-                "sources": [source("https://example.com/a.m3u8")],
+                "type": AWS_CDI,
+                "destinations": [{ "streamName": "cdi-a" }],
                 "tags": { "owner": "primary" },
             }),
         )
@@ -360,7 +365,7 @@ async fn a_repeated_request_id_creates_one_partner_input() {
             &router,
             json!({
                 "name": "idempotent-primary",
-                "type": "AWS_CDI",
+                "type": AWS_CDI,
                 "destinations": [{ "streamName": "cdi-a" }],
             }),
         )
@@ -425,7 +430,7 @@ async fn a_request_id_spent_on_another_create_is_not_a_partner_replay() {
         let router = medialive();
         let body = json!({
             "name": "token-primary",
-            "type": "AWS_CDI",
+            "type": AWS_CDI,
             "destinations": [{ "streamName": "cdi-a" }],
         });
         let primary = create_input(&router, body.clone()).await;
@@ -498,7 +503,7 @@ async fn the_partner_arn_names_the_signed_region() {
             region,
             "POST",
             "/prod/inputs",
-            Some(json!({ "name": "region-primary", "type": "AWS_CDI",
+            Some(json!({ "name": "region-primary", "type": AWS_CDI,
                          "destinations": [{ "streamName": "cdi-a" }] })),
         )
         .await;
@@ -558,8 +563,8 @@ async fn a_partner_of_an_unusable_input_is_refused() {
             &router,
             json!({
                 "name": "refusal-primary",
-                "type": "URL_PULL",
-                "sources": [source("https://example.com/a.m3u8")],
+                "type": AWS_CDI,
+                "destinations": [{ "streamName": "cdi-a" }],
             }),
         )
         .await;
@@ -619,8 +624,8 @@ async fn the_partner_create_respects_the_input_store_bound() {
     let router = medialive();
     let primary = create_input(
         &router,
-        json!({ "name": "bound-primary", "type": "URL_PULL",
-                "sources": [source("https://example.com/a.m3u8")] }),
+        json!({ "name": "bound-primary", "type": AWS_CDI,
+                "destinations": [{ "streamName": "cdi-a" }] }),
     )
     .await;
     let primary_id = primary["id"].as_str().unwrap_or_default().to_string();
@@ -644,4 +649,109 @@ async fn the_partner_create_respects_the_input_store_bound() {
         "TooManyRequestsException",
         "case {MAX_INPUTS} stored: expected TooManyRequestsException, got {body}"
     );
+}
+
+/// The sentence AWS refuses a partner create for an input that is not an AWS
+/// CDI input with. Wholly fixed text: the refusal is about the input's `Type`,
+/// so nothing of the request or of the account is interpolated into it.
+const NOT_AN_AWS_CDI_INPUT_MESSAGE: &str = "Creating a partner is only supported for AWS CDI inputs.";
+
+/// Rule: a partner input exists only as the second feed of an AWS-CDI input
+/// pair, so the `Type` of the input the path names is a PRECONDITION of
+/// `CreatePartnerInput`: an input of any other `InputType` — and one created
+/// with no type at all — is refused with the operation's modelled
+/// `BadRequestException` (400, the only client refusal
+/// `smithy_query(query="operation", operation="CreatePartnerInput")` declares
+/// besides the authorization and throttling ones) carrying
+/// [`NOT_AN_AWS_CDI_INPUT_MESSAGE`], and nothing is created.
+///
+/// The table spans the WHOLE modelled `InputType` catalog — `INPUT_TYPE_VALUES`
+/// is the generated list of that enum's values, so a type added to the model
+/// joins this table by itself — plus the input that names no type at all. Every
+/// row but the AWS-CDI one is a refusal.
+#[tokio::test]
+async fn a_partner_is_only_created_for_an_aws_cdi_input() {
+    assert!(
+        INPUT_TYPE_VALUES.contains(&AWS_CDI),
+        "case catalog: expected {AWS_CDI:?} among the modelled input types, got \
+         {INPUT_TYPE_VALUES:?}"
+    );
+
+    let rows: Vec<(String, Option<&str>)> = INPUT_TYPE_VALUES
+        .iter()
+        .map(|input_type| (format!("an input of type {input_type}"), Some(*input_type)))
+        .chain(std::iter::once((
+            "an input with no type at all".to_string(),
+            None,
+        )))
+        .collect();
+
+    for (case, input_type) in rows {
+        let router = medialive();
+        let mut body = json!({ "name": "precondition-primary" });
+        if let Some(input_type) = input_type {
+            body["type"] = json!(input_type);
+        }
+        let primary = create_input(&router, body).await;
+        let primary_id = primary["id"].as_str().unwrap_or_default().to_string();
+
+        let (status, response) = create_partner(&router, &primary_id, None).await;
+
+        if input_type == Some(AWS_CDI) {
+            assert_eq!(
+                status, 201,
+                "case {case:?}: the one type a partner is created for: got {status}: {response}"
+            );
+            assert_eq!(
+                response["input"]["inputPartnerIds"],
+                json!([primary_id.clone()]),
+                "case {case:?}: expected the partner to name the input it partners, got {:?}",
+                response["input"]["inputPartnerIds"]
+            );
+            continue;
+        }
+
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the partner create to be refused, got {status}: {response}"
+        );
+        assert_eq!(
+            error_code(status, &response),
+            "BadRequestException",
+            "case {case:?}: expected the operation's own BadRequestException, got {response}"
+        );
+        assert_eq!(
+            error_message(&response),
+            NOT_AN_AWS_CDI_INPUT_MESSAGE,
+            "case {case:?}: expected the refusal to carry {NOT_AN_AWS_CDI_INPUT_MESSAGE:?}, got {:?}",
+            error_message(&response)
+        );
+
+        // The refusal created NOTHING: the input it was aimed at gained no
+        // partner, and the next input minted is the one that would have been
+        // minted had the refused call never been made.
+        let (status, described) = describe_input(&router, &primary_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeInput on the refused input: got {status}: {described}"
+        );
+        assert_eq!(
+            described["inputPartnerIds"],
+            json!([]),
+            "case {case:?}: a refused partner create must not have partnered anything, got {:?}",
+            described["inputPartnerIds"]
+        );
+        let next = create_input(
+            &router,
+            json!({ "name": "after-refusal", "type": AWS_CDI,
+                    "destinations": [{ "streamName": "cdi-a" }] }),
+        )
+        .await;
+        assert_eq!(
+            next["id"],
+            json!("1000001"),
+            "case {case:?}: a refused partner create must not have minted an input, got {:?}",
+            next["id"]
+        );
+    }
 }

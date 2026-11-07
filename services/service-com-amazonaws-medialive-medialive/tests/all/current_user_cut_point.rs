@@ -3,12 +3,11 @@
 //! The ONE cut point this service's derived "currently using" lists apply, end
 //! to end over the restJson1 wire.
 //!
-//! A resource whose delete has been accepted is still a resource this account
-//! HOLDS until the clock settles it into its terminal deleted state, so it goes
-//! on being reported as a current user of what it references — in the derived
-//! member itself, and in the `State`, the output type and the in-use refusal
-//! derived from that member — and it leaves those lists only once it has
-//! reached that terminal state.
+//! ACCEPTING a resource's delete is what releases everything it held, so from
+//! that instant it stops being reported as a current user of what it referenced
+//! — in the derived member itself, and in the `State`, the output type and the
+//! in-use refusal derived from that member — and it stays out once the clock has
+//! settled it into its terminal deleted state.
 //!
 //! Every test drives the service the way a client does — through
 //! `MultiServiceRouter::dispatch` with real HTTP requests — so what is asserted
@@ -57,12 +56,13 @@ struct Scenario {
     wrapper: Option<&'static str>,
     /// The derived member under test.
     member: &'static str,
-    /// What that member reports while the user is one this account holds.
+    /// What that member reports while the user is one this account holds and may
+    /// still use.
     entry: Value,
-    /// What it reports once no user is left.
+    /// What it reports once no such user is left.
     empty: Value,
-    /// The member derived FROM that list: its name, its value while a user is
-    /// left and its value once none is.
+    /// The member derived FROM that list: its name, its value while such a user
+    /// is left and its value once none is.
     derived: (&'static str, Value, Value),
     /// The id of the resource that uses it, as the refusal naming it spells it.
     user_id: String,
@@ -271,11 +271,11 @@ async fn batch_delete(
     )
 }
 
-/// Rule: a resource is a CURRENT user of what it references for as long as this
-/// account holds it, so it leaves the derived list of users — and the member
-/// derived from that list — only once its delete has come due and it has
-/// reached its terminal deleted state, not while it is still in the transient
-/// `DELETING` step the clock owes.
+/// Rule: a resource is a CURRENT user of what it references only while its
+/// delete has not been accepted, so it leaves the derived list of users — and
+/// the member derived from that list — the instant the delete is accepted, in
+/// the transient `DELETING` step as much as in the terminal state the clock
+/// settles it into.
 ///
 /// The rows span what the rule generalises over: the kind of resource that does
 /// the using (an input, a channel) and the kind of resource whose derived list
@@ -284,7 +284,7 @@ async fn batch_delete(
 /// — while the user is live, inside the `DELETING` window and once the clock has
 /// settled it — because the rule is about WHERE between them the cut falls.
 #[tokio::test]
-async fn a_user_leaves_a_derived_list_only_in_its_terminal_state() {
+async fn a_user_leaves_a_derived_list_once_its_delete_is_accepted() {
     // (case, the resource whose derived list is read, the resource using it)
     let table: [(&str, Referenced, User); 4] = [
         (
@@ -334,17 +334,18 @@ async fn a_user_leaves_a_derived_list_only_in_its_terminal_state() {
             "case {case:?}: expected the accepted delete to open the transient step, got {deleting:?}"
         );
 
-        // The account still holds the user, so nothing about the resource it
-        // references has changed yet.
+        // The delete has been accepted, so the user has already released what it
+        // referenced: the derived list drops it inside the `DELETING` window.
         let during = referenced_resource(&router, case, &scenario).await;
         assert_eq!(
-            during[scenario.member], scenario.entry,
-            "case {case:?}: expected {} to keep a user that is only DELETING, got {:?}",
+            during[scenario.member], scenario.empty,
+            "case {case:?}: expected {} to drop a user whose delete was accepted, got {:?}",
             scenario.member, during[scenario.member]
         );
         assert_eq!(
-            during[derived], in_use,
-            "case {case:?}: expected {derived} to hold while the user is only DELETING, got {:?}",
+            during[derived], unused,
+            "case {case:?}: expected {derived} to report no user once the delete was accepted, \
+             got {:?}",
             during[derived]
         );
 
@@ -357,7 +358,7 @@ async fn a_user_leaves_a_derived_list_only_in_its_terminal_state() {
         let after = referenced_resource(&router, case, &scenario).await;
         assert_eq!(
             after[scenario.member], scenario.empty,
-            "case {case:?}: expected {} to drop a user in its terminal state, got {:?}",
+            "case {case:?}: expected {} to keep a settled user out, got {:?}",
             scenario.member, after[scenario.member]
         );
         assert_eq!(
@@ -376,17 +377,18 @@ async fn a_user_leaves_a_derived_list_only_in_its_terminal_state() {
 }
 
 /// Rule: `BatchDelete`'s per-group delete is judged on the same pair of derived
-/// lists `DescribeInputSecurityGroup` reports, so a group whose last user is
-/// still in the transient `DELETING` step is refused with the operation's
-/// per-resource `BadRequestException` naming that user, and the delete is
-/// accepted once the clock has settled the user into its terminal state.
+/// lists `DescribeInputSecurityGroup` reports, so a group a LIVE resource holds
+/// is refused with the operation's per-resource `BadRequestException` naming
+/// that user, and the delete is accepted as soon as that user's own delete has
+/// been accepted — inside the transient `DELETING` window, without waiting for
+/// the clock.
 ///
 /// The rows span the two kinds of user a group has — an input, through
 /// `InputSecurityGroup$Inputs`, and a channel, through `$Channels` — because
 /// one situation cannot have two answers depending on which kind the last user
 /// is.
 #[tokio::test]
-async fn a_group_whose_last_user_is_still_deleting_is_refused_for_either_kind() {
+async fn a_group_is_refused_while_a_live_user_holds_it_for_either_kind() {
     // (case, the kind of resource using the group)
     let table: [(&str, User); 2] = [
         ("an input using the group", User::Input),
@@ -398,13 +400,6 @@ async fn a_group_whose_last_user_is_still_deleting_is_refused_for_either_kind() 
         let scenario = scenario(&router, case, Referenced::SecurityGroup, user).await;
         let group_id = scenario.id.clone();
 
-        let (status, deleted) = call(&router, "DELETE", &scenario.user_uri, None).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: DELETE {}: expected 200, got {status}: {deleted}",
-            scenario.user_uri
-        );
-
         let (successful, failed) = batch_delete(
             &router,
             case,
@@ -413,7 +408,7 @@ async fn a_group_whose_last_user_is_still_deleting_is_refused_for_either_kind() 
         .await;
         assert!(
             successful.is_empty(),
-            "case {case:?}: expected no accepted delete while a user is still DELETING, got {successful:?}"
+            "case {case:?}: expected no accepted delete while a live user holds the group, got {successful:?}"
         );
         assert_eq!(
             failed.len(),
@@ -441,9 +436,20 @@ async fn a_group_whose_last_user_is_still_deleting_is_refused_for_either_kind() 
             "case {case:?}: expected the refused delete to leave the group in use, got {kept:?}"
         );
 
-        // Once the user has reached its terminal state the group is used by
-        // nothing, so the same request is accepted.
-        wait_for_the_clock();
+        // Accepting the user's delete releases the group, so the same request is
+        // accepted while that user is still only `DELETING`.
+        let (status, deleted) = call(&router, "DELETE", &scenario.user_uri, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DELETE {}: expected 200, got {status}: {deleted}",
+            scenario.user_uri
+        );
+        let deleting = resource_state(&router, case, &scenario.user_uri).await;
+        assert_eq!(
+            deleting, "DELETING",
+            "case {case:?}: expected the accepted delete to open the transient step, got {deleting:?}"
+        );
+
         let (successful, failed) = batch_delete(
             &router,
             case,
@@ -452,7 +458,7 @@ async fn a_group_whose_last_user_is_still_deleting_is_refused_for_either_kind() 
         .await;
         assert!(
             failed.is_empty(),
-            "case {case:?}: expected no refusal once the user has settled, got {failed:?}"
+            "case {case:?}: expected no refusal once the user's delete was accepted, got {failed:?}"
         );
         assert_eq!(
             successful.len(),
@@ -464,6 +470,64 @@ async fn a_group_whose_last_user_is_still_deleting_is_refused_for_either_kind() 
             json!("DELETED"),
             "case {case:?}: expected the accepted delete to report DELETED, got {:?}",
             successful[0]
+        );
+    }
+}
+
+/// Rule: `DeleteInputSecurityGroup` answers with the group's USAGE state — the
+/// one derived from the same pair of lists `DescribeInputSecurityGroup` reports
+/// — so a group whose last user's delete has already been accepted is deleted as
+/// an unused group: the response names no user at all and reports `IDLE`, from
+/// the instant that user's delete was accepted rather than one transient span
+/// later. This is the teardown order a client cleaning up runs: delete what used
+/// the group, then delete the group.
+///
+/// The rows span the two kinds of user a group has (an input, through
+/// `InputSecurityGroup$Inputs`; a channel, through `$Channels`) and both phases
+/// of the user's accepted delete, because the answer cannot depend on either.
+#[tokio::test]
+async fn deleting_a_group_right_after_its_last_user_reports_no_user_and_idle() {
+    // (case, the kind of resource using the group, whether the clock settles the
+    //  user's delete before the group is deleted)
+    let table: [(&str, User, bool); 4] = [
+        ("an input, inside the DELETING window", User::Input, false),
+        ("an input, once the delete settled", User::Input, true),
+        ("a channel, inside the DELETING window", User::Channel, false),
+        ("a channel, once the delete settled", User::Channel, true),
+    ];
+
+    for (case, user, settle) in table {
+        let router = medialive();
+        let scenario = scenario(&router, case, Referenced::SecurityGroup, user).await;
+
+        let (status, deleted_user) = call(&router, "DELETE", &scenario.user_uri, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DELETE {}: expected 200, got {status}: {deleted_user}",
+            scenario.user_uri
+        );
+        if settle {
+            wait_for_the_clock();
+        }
+
+        let (status, deleted) = crate::input_security_group::delete_group(&router, &scenario.id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DeleteInputSecurityGroup: expected 200, got {status}: {deleted}"
+        );
+        for member in ["inputs", "channels"] {
+            assert_eq!(
+                deleted[member],
+                json!([]),
+                "case {case:?}: expected the deleted group to name no {member}, got {:?}",
+                deleted[member]
+            );
+        }
+        assert_eq!(
+            deleted["state"],
+            json!("IDLE"),
+            "case {case:?}: expected the group to be deleted as an unused group, got {:?}",
+            deleted["state"]
         );
     }
 }

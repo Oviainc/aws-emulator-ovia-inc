@@ -778,15 +778,15 @@ async fn a_deleted_cluster_takes_no_write_and_releases_its_name() {
     }
 }
 
-/// Rule: a cluster in the terminal `DELETED` state is no longer *using* anything,
-/// so it leaves the `AssociatedClusterIds` a network reports and stops blocking
-/// that network's own delete — while a cluster whose deletion the clock has not
-/// made due yet is still attached.
+/// Rule: a cluster whose delete this service has ACCEPTED is no longer *using*
+/// anything, so it leaves the `AssociatedClusterIds` a network reports and stops
+/// blocking that network's own delete — in the transient `DELETING` step the
+/// clock owes as much as in the terminal `DELETED` state.
 ///
 /// The rows differ along the PHASE the cluster's accepted delete is in, because
-/// that is what the rule turns on.
+/// the rule has to hold the same way in both.
 #[tokio::test]
-async fn a_cluster_leaves_a_network_once_its_deletion_comes_due() {
+async fn a_cluster_leaves_a_network_once_its_delete_is_accepted() {
     for (case, settle_after_delete) in [
         ("inside the DELETING window", false),
         ("after the terminal DELETED", true),
@@ -830,11 +830,6 @@ async fn a_cluster_leaves_a_network_once_its_deletion_comes_due() {
             wait_for_the_clock();
         }
 
-        let expected: Value = if settle_after_delete {
-            json!([])
-        } else {
-            json!([cluster_id.clone()])
-        };
         let (status, described) = crate::networks::describe(&router, &network_id).await;
         assert_eq!(
             status, 200,
@@ -842,8 +837,8 @@ async fn a_cluster_leaves_a_network_once_its_deletion_comes_due() {
         );
         assert_eq!(
             crate::networks::list_member(&described, "associatedClusterIds"),
-            expected,
-            "case {case:?}: expected {expected}, got {:?}",
+            json!([]),
+            "case {case:?}: expected the cluster whose delete was accepted to be gone, got {:?}",
             described["associatedClusterIds"]
         );
 
@@ -855,10 +850,9 @@ async fn a_cluster_leaves_a_network_once_its_deletion_comes_due() {
             None,
         )
         .await;
-        let wanted = if settle_after_delete { 202 } else { 409 };
         assert_eq!(
-            status, wanted,
-            "case {case:?}: expected DeleteNetwork to answer {wanted}, got {status}: {body}"
+            status, 202,
+            "case {case:?}: expected DeleteNetwork to answer 202, got {status}: {body}"
         );
     }
 }
