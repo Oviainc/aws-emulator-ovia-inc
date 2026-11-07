@@ -25,6 +25,10 @@
 
 use std::collections::BTreeMap;
 
+/// The per-category tier of the seeded catalog, which is what makes a search over the whole
+/// catalog and a facet-refined one alike continuable.
+mod taxonomy_rows;
+
 use crate::ops::types::{
     AmazonMachineImageEbsVolume, AmazonMachineImageFulfillmentOption,
     AmazonMachineImageOperatingSystem, AmazonMachineImageRecommendation,
@@ -3246,6 +3250,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
     );
 
     seed_breadth(&mut state, now);
+    taxonomy_rows::seed_taxonomy_rows(&mut state, now);
 
     state
 }
@@ -3614,24 +3619,91 @@ fn fulfillment_option_for_type(
 /// can collide with the hand-written records above, and the whole block is derived from the
 /// row rather than written out: what each row varies is what the catalog needs to span.
 fn seed_breadth(state: &mut ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState, now: i64) {
+    // A telephone number per row in the `555-01xx` range reserved for fictional use, clear
+    // of the numbers the hand-written records above take, so the `PHONE_NUMBER` resource of
+    // two rows is never the same number.
+    let phones: Vec<String> = (0..BREADTH_ROWS.len())
+        .map(|index| format!("+1-206-555-{:04}", 110 + index))
+        .collect();
+    let rows: Vec<CatalogRow<'_>> = BREADTH_ROWS
+        .iter()
+        .enumerate()
+        .map(|(index, row)| CatalogRow {
+            // Ids in the `0101..` block, clear of the hand-written records above.
+            sequence: 101 + index,
+            slug: row.slug,
+            name: row.name,
+            short_description: row.short_description,
+            categories: row.categories,
+            fulfillment: row.fulfillment,
+            seller: BREADTH_SELLERS[index % BREADTH_SELLERS.len()],
+            pricing_model: PRICING_MODEL_DISPLAY_NAMES[index % PRICING_MODEL_DISPLAY_NAMES.len()],
+            pricing_unit: PRICING_UNIT_DISPLAY_NAMES[index % PRICING_UNIT_DISPLAY_NAMES.len()],
+            reviews: BREADTH_REVIEWS[index % BREADTH_REVIEWS.len()],
+            support_phone: &phones[index],
+            // Every third row's offer belongs to an offer set, so `OFFERSET` purchase
+            // options are reachable for products across the catalog and not only for the
+            // one hand-written set above.
+            offer_set: index % 3 == 2,
+        })
+        .collect();
+    seed_rows(state, now, &rows);
+}
+
+/// One row the seeder derives a whole record block from: a single-product listing with its
+/// product, offer, offer terms and — when `offer_set` says so — its offer set.
+///
+/// Every tier of the seeded catalog ([`BREADTH_ROWS`] and the per-category tier in
+/// [`taxonomy_rows`]) describes its rows this way, so one seeding path builds them all and
+/// no tier can drift into records shaped differently from another's.
+pub(crate) struct CatalogRow<'a> {
+    /// The numeric block this row's ids are built in; unique across the whole catalog.
+    pub sequence: usize,
+    /// The slug every id of this row's records carries after its sequence number.
+    pub slug: &'a str,
+    pub name: &'a str,
+    pub short_description: &'a str,
+    /// The taxonomy categories the listing is classified under; each one's ancestors come
+    /// with it through [`classified_under`].
+    pub categories: &'a [&'a str],
+    /// The `FulfillmentOptionType` its single product is fulfilled through.
+    pub fulfillment: &'a str,
+    /// The seller it is published by, as `(sellerProfileId, displayName)`.
+    pub seller: (&'a str, &'a str),
+    /// Its pricing model, as `(PricingModelType, displayName)`.
+    pub pricing_model: (&'a str, &'a str),
+    /// Its pricing unit, as `(PricingUnitType, displayName)`.
+    pub pricing_unit: (&'a str, &'a str),
+    /// Its review summary, as `(averageRating, totalReviews)`.
+    pub reviews: (&'a str, i64),
+    /// Its fictional support telephone number.
+    pub support_phone: &'a str,
+    /// Whether its offer belongs to an offer set.
+    pub offer_set: bool,
+}
+
+/// Seed one listing, product, offer, set of offer terms and optional offer set per row.
+fn seed_rows(
+    state: &mut ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState,
+    now: i64,
+    rows: &[CatalogRow<'_>],
+) {
     let month_ago = now - 30 * DAY;
     let next_year = now + 365 * DAY;
 
-    for (index, row) in BREADTH_ROWS.iter().enumerate() {
-        let sequence = 101 + index;
+    for row in rows {
+        let sequence = row.sequence;
         let slug = row.slug;
         let listing_id = format!("l-{sequence:04}-{slug}");
         let product_id = format!("p-{sequence:04}-{slug}");
         let offer_id = format!("o-{sequence:04}-{slug}");
         let option_id = format!("fo-{sequence:04}-{slug}");
 
-        let (seller_profile_id, seller_name) = BREADTH_SELLERS[index % BREADTH_SELLERS.len()];
+        let (seller_profile_id, seller_name) = row.seller;
         let publisher = seller(seller_profile_id, seller_name);
-        let (model_type, model_name) =
-            PRICING_MODEL_DISPLAY_NAMES[index % PRICING_MODEL_DISPLAY_NAMES.len()];
-        let (unit_type, unit_name) =
-            PRICING_UNIT_DISPLAY_NAMES[index % PRICING_UNIT_DISPLAY_NAMES.len()];
-        let (rating, total_reviews) = BREADTH_REVIEWS[index % BREADTH_REVIEWS.len()];
+        let (model_type, model_name) = row.pricing_model;
+        let (unit_type, unit_name) = row.pricing_unit;
+        let (rating, total_reviews) = row.reviews;
 
         let categories = classified_under(row.categories);
         // The row's own deepest category, which is the one its prose names: the expanded
@@ -3653,11 +3725,9 @@ fn seed_breadth(state: &mut ComAmazonawsMarketplacediscoveryAwsmarketplacediscov
         let logo = format!("https://example.com/logos/{slug}.png");
         let docs = format!("https://example.com/docs/{slug}");
         let support_email = format!("support@{slug}.example.com");
-        // A telephone number in the `555-01xx` range reserved for fictional use, one per
-        // row and clear of the numbers the records above take, so the `PHONE_NUMBER`
-        // resource of two rows is never the same number. BREADTH_ROWS is far shorter than
-        // the 90 numbers left in the range.
-        let support_phone = format!("+1-206-555-{:04}", 110 + index);
+        // The row's own number in the `555-01xx` range reserved for fictional use, so the
+        // `PHONE_NUMBER` resource of two rows is never the same number.
+        let support_phone = row.support_phone;
         let contact = format!("https://example.com/{slug}/contact");
 
         // A badge is not seeded: `listing_badges` derives each one from the records it
@@ -3685,7 +3755,7 @@ fn seed_breadth(state: &mut ComAmazonawsMarketplacediscoveryAwsmarketplacediscov
                     &format!("https://example.com/media/{slug}/overview.png"),
                     row.short_description,
                 )],
-                resources: support_resources(&support_email, &support_phone, &docs),
+                resources: support_resources(&support_email, support_phone, &docs),
                 seller_engagements: engagements(&contact),
                 use_cases: vec![use_case(
                     slug,
@@ -3710,7 +3780,7 @@ fn seed_breadth(state: &mut ComAmazonawsMarketplacediscoveryAwsmarketplacediscov
                 categories,
                 highlights: vec![format!("Fulfilled as {fulfillment_name}")],
                 promotional_media: Vec::new(),
-                resources: support_resources(&support_email, &support_phone, &docs),
+                resources: support_resources(&support_email, support_phone, &docs),
                 seller_engagements: engagements(&contact),
                 fulfillment_options: vec![fulfillment_option_for_type(
                     row.fulfillment,
@@ -3722,10 +3792,10 @@ fn seed_breadth(state: &mut ComAmazonawsMarketplacediscoveryAwsmarketplacediscov
             },
         );
 
-        // Every third row's offer belongs to an offer set, so `OFFERSET` purchase options
-        // are reachable for products across the catalog and not only for the one
+        // The row says whether its offer belongs to an offer set, so `OFFERSET` purchase
+        // options are reachable for products across the catalog and not only for the one
         // hand-written set above.
-        let offer_set_id = (index % 3 == 2).then(|| format!("os-{sequence:04}-{slug}"));
+        let offer_set_id = row.offer_set.then(|| format!("os-{sequence:04}-{slug}"));
         state.offers.insert(
             offer_id.clone(),
             Offer {
