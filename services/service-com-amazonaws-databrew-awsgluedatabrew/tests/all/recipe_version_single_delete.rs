@@ -578,6 +578,7 @@ async fn a_version_something_holds_cannot_be_deleted() {
                         "Name": job,
                         "RoleArn": ROLE_ARN,
                         "RecipeReference": reference,
+                        "Outputs": [{"Location": {"Bucket": "brew-bucket", "Key": "out/"}}],
                     })),
                 )
                 .await
@@ -630,6 +631,7 @@ async fn a_version_something_holds_cannot_be_deleted() {
                     "Name": "run-draft",
                     "RoleArn": ROLE_ARN,
                     "RecipeReference": {"Name": recipe, "RecipeVersion": LATEST_WORKING},
+                    "Outputs": [{"Location": {"Bucket": "brew-bucket", "Key": "out/"}}],
                 })),
             )
             .await

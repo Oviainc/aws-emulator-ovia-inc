@@ -305,6 +305,7 @@ async fn the_last_modified_pair_is_absent_until_a_mutation_runs() {
                     "Name": "fresh-job",
                     "RoleArn": "arn:aws:iam::000000000000:role/brew",
                     "DatasetName": name,
+                    "Outputs": [{"Location": {"Bucket": "brew-bucket", "Key": "out/"}}],
                 })),
             )
             .await

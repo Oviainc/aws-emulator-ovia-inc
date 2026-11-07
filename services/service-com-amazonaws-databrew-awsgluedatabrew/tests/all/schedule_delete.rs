@@ -15,7 +15,7 @@
 
 use serde_json::{json, Value};
 
-use crate::databrew_harness::{label, Emulator, Reply, ROLE_ARN};
+use crate::databrew_harness::{job_outputs, label, Emulator, Reply, ROLE_ARN};
 
 /// `CreateSchedule`: `POST /schedules` (model: `smithy_query(query="operation",
 /// operation="CreateSchedule")`).
@@ -49,14 +49,18 @@ async fn delete_schedule(emulator: &Emulator, name: &str) -> Reply {
         .await
 }
 
-/// `CreateRecipeJob`: the job a schedule names. `RoleArn` is the only other member the
-/// create requires.
+/// `CreateRecipeJob`: the job a schedule names. `RoleArn` and one selected output are
+/// the only other members the create requires.
 async fn create_job(emulator: &Emulator, name: &str) -> Reply {
     emulator
         .call(
             "POST",
             "/recipeJobs",
-            Some(json!({"Name": name, "RoleArn": ROLE_ARN})),
+            Some(json!({
+                "Name": name,
+                "RoleArn": ROLE_ARN,
+                "Outputs": job_outputs("out/"),
+            })),
         )
         .await
 }

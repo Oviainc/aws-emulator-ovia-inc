@@ -3,8 +3,9 @@
 //! @op CreateRecipeJob
 //!
 //! Inserts a job record of `Type` `RECIPE` into [`crate::state`], keyed by `Name`,
-//! after resolving the `DatasetName` it names against the stored datasets. The ARN
-//! and the `*By`/`*Date` members are derived here, at create time.
+//! after resolving the `DatasetName` it names against the stored datasets and the
+//! `RoleArn` it runs as against the account's IAM records. The ARN and the `*By`/`*Date`
+//! members are derived here, at create time.
 //!
 //! ## Shape of an operation
 //!
@@ -161,10 +162,25 @@ impl<Eng> CreateRecipeJob<Eng> {
     }
 }
 
+/// Whether this create selects NOWHERE to write: each of the three modelled output lists
+/// is absent or carries no entry.
+///
+/// An empty list selects no output exactly as an absent one does (and the modelled lists
+/// are `len 1..`), so the two are refused alike rather than one of them being stored as a
+/// job whose run has nothing to write.
+fn selects_no_output(input: &CreateRecipeJobInput) -> bool {
+    [
+        input.outputs.as_ref().map(Vec::len),
+        input.data_catalog_outputs.as_ref().map(Vec::len),
+        input.database_outputs.as_ref().map(Vec::len),
+    ]
+    .iter()
+    .all(|selected| selected.unwrap_or(0) == 0)
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateRecipeJob<Eng>
-{
-    type Input = CreateRecipeJobInput;
+{    type Input = CreateRecipeJobInput;
     type Output = CreateRecipeJobOutput;
     type Error = CreateRecipeJobError;
 
@@ -191,6 +207,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A job WRITES what its run transforms, so a create that selects no output at
+        // all is refused: every modelled output list is absent or empty, and a job with
+        // nowhere to write is one no run could produce anything for.
+        if selects_no_output(&input) {
+            return Err(CreateRecipeJobErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::NO_OUTPUTS_SELECTED_MESSAGE.to_string()),
+            })
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        // The job RUNS AS the role it names (model: `RoleArn` — "the IAM role to be
+        // assumed when DataBrew runs the job"), so the role is resolved against this
+        // account's IAM, and the trust policy it carries, BEFORE anything is stored: a
+        // role this service cannot assume backs no run, and a job created on one would
+        // look healthy and transform nothing. Only what IAM ANSWERED refuses the create
+        // (see `crate::state::role_is_unassumable`), and it is awaited with no store
+        // guard held.
+        if crate::state::role_is_unassumable(ctx, &region, &input.role_arn).await {
+            return Err(CreateRecipeJobErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::untrusted_role_message(&input.role_arn)),
+            })
+            .into());
+        }
+
         let now = ::std::time::SystemTime::now();
         let principal = crate::state::request_principal();
         let record = crate::state::JobRecord {
@@ -202,19 +243,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             project_name: input.project_name.clone(),
             recipe_reference: input.recipe_reference.clone(),
             outputs: input.outputs.clone().unwrap_or_default(),
+            data_catalog_outputs: input.data_catalog_outputs.clone().unwrap_or_default(),
+            database_outputs: input.database_outputs.clone().unwrap_or_default(),
             role_arn: input.role_arn.clone(),
-            max_capacity: input.max_capacity,
+            // A job runs on nodes, so a create that asked for no capacity carries the
+            // service's own default rather than none.
+            max_capacity: crate::state::effective_max_capacity(input.max_capacity),
             max_retries: input.max_retries,
             timeout: input.timeout,
             encryption_mode: input.encryption_mode.clone(),
             encryption_key_arn: input.encryption_key_arn.clone(),
             log_subscription: input.log_subscription.clone(),
             tags: crate::state::stored_tags(input.tags.as_ref()),
-            resource_arn: crate::state::resource_arn(
-                &crate::state::request_region(ctx),
-                "job",
-                &input.name,
-            ),
+            resource_arn: crate::state::resource_arn(&region, "job", &input.name),
             // A job that has only been created has no modification to report, so the
             // audit's last-modified pair stays unset until an update runs.
             audit: crate::state::Audit::created(now, principal),

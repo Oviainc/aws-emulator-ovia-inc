@@ -222,6 +222,7 @@ async fn seed(row: &HeldCase) -> Emulator {
                         "Name": name,
                         "RoleArn": ROLE_ARN,
                         "RecipeReference": recipe_reference,
+                        "Outputs": [{"Location": {"Bucket": "brew-bucket", "Key": "out/"}}],
                     })),
                 )
                 .await;

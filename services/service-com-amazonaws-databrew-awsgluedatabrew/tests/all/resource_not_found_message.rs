@@ -110,6 +110,7 @@ fn not_found_cases() -> Vec<NotFoundCase> {
                         "Name": PENDING_JOB,
                         "RoleArn": ROLE_ARN,
                         "DatasetName": name,
+                        "Outputs": [{"Location": {"Bucket": "brew-bucket", "Key": "out/"}}],
                     })),
                 )
             },
@@ -275,7 +276,11 @@ async fn a_compound_identifier_names_the_half_that_is_missing() {
             .call(
                 "POST",
                 "/recipeJobs",
-                Some(json!({"Name": job, "RoleArn": ROLE_ARN})),
+                Some(json!({
+                    "Name": job,
+                    "RoleArn": ROLE_ARN,
+                    "Outputs": [{"Location": {"Bucket": "brew-bucket", "Key": "out/"}}],
+                })),
             )
             .await
             .status,

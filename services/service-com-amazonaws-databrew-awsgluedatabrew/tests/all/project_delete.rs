@@ -436,6 +436,7 @@ async fn a_job_that_names_a_project_does_not_hold_it() {
                 "Name": "project-job",
                 "ProjectName": "job-project",
                 "RoleArn": ROLE_ARN,
+                "Outputs": [{"Location": {"Bucket": "brew-bucket", "Key": "out/"}}],
             })),
         )
         .await;

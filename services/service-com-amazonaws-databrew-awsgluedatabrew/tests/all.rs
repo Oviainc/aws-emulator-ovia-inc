@@ -29,6 +29,8 @@ mod project_lifecycle;
 mod project_not_found_wording;
 #[path = "all/recipe_already_attached_refusal.rs"]
 mod recipe_already_attached_refusal;
+#[path = "all/recipe_job_execution.rs"]
+mod recipe_job_execution;
 #[path = "all/recipe_job_schema_evaluation.rs"]
 mod recipe_job_schema_evaluation;
 #[path = "all/recipe_lifecycle.rs"]

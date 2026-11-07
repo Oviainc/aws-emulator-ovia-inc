@@ -655,6 +655,7 @@ async fn a_dataset_a_project_acts_upon_cannot_be_deleted() {
                     "Name": "reader-job",
                     "DatasetName": job_dataset,
                     "RoleArn": ROLE_ARN,
+                    "Outputs": [{"Location": {"Bucket": "brew-bucket", "Key": "out/"}}],
                 })),
             )
             .await

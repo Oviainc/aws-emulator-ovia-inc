@@ -2,9 +2,18 @@
 
 //! @op StartJobRun
 //!
-//! Mints a run id, persists a run of the named job under it with the job's dataset,
-//! outputs and recipe reference copied in, and returns that same id — so the
-//! `DescribeJobRun`/`ListJobRuns` that follow resolve it.
+//! Performs the run — reads the dataset's object, applies the referenced recipe
+//! version's steps and writes the result to each of the job's outputs — then mints a run
+//! id, persists a run under it carrying what the work answered, and returns that same id,
+//! so the `DescribeJobRun`/`ListJobRuns` that follow resolve it.
+//!
+//! The work is awaited BEFORE the id is answered, which is what lets the run's terminal
+//! state be the one its work reached (a `SUCCEEDED` run's objects are written, a `FAILED`
+//! run's are not) rather than one the clock assumed. Two consequences, both deliberate:
+//! this call's latency is the dataset's, and the written objects are observable while the
+//! run still reports the non-terminal state the clock owes it — the terminal state is
+//! revealed when its span falls due ([`crate::state::JobRunRecord::advance_to`]), and
+//! nothing sleeps on the request path.
 //!
 //! The run's WORK is decided here too: the referenced recipe version's steps are applied
 //! to the columns of the job's dataset, so a run whose recipe names a column its dataset
@@ -159,10 +168,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let started_by = crate::state::request_principal();
         let started_on = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
 
-        // What the run will EXECUTE, read off the store under one lock: the job, the
-        // dataset it reads and the steps of the exact recipe version it references.
-        let (job, dataset, steps) = {
+        // What the run needs is copied out of the store under its lock, and the lock is
+        // released before Amazon S3 is called: nothing is awaited while the store is
+        // held, and the run reads the job as it stood when the run started.
+        let (job, plan) = {
             let store = state.lock();
             let Some(job) = store.jobs.get(&input.name).cloned() else {
                 return Err(StartJobRunErrorModeled::ResourceNotFoundException(
@@ -172,36 +183,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
-            let dataset = job
-                .dataset_name
-                .as_deref()
-                .and_then(|name| store.datasets.get(name))
-                .cloned();
-            let steps = job.recipe_reference.as_ref().and_then(|reference| {
-                store
-                    .recipes
-                    .get(&reference.name)
-                    .and_then(|recipe| recipe.resolve_version(reference.recipe_version.as_deref()))
-                    .map(|version| version.steps.clone())
-            });
-            (job, dataset, steps)
+            let plan = crate::state::job_execution::plan(&store, &job);
+            (job, plan)
         };
 
-        // The run's work: the referenced recipe version's steps against the dataset's own
-        // columns, which is what lets a recipe that does not fit its dataset be diagnosed
-        // at all. Reading the dataset object is an await, so it happens with NO lock
-        // held. A dataset whose columns this emulator cannot establish, or a job
-        // referencing no recipe version, leaves the run owed the outcome it is owed with
-        // no step to judge.
-        let outcome = match (dataset, steps) {
-            (Some(dataset), Some(steps)) => {
-                match crate::state::dataset_columns(ctx, &dataset).await {
-                    Some(columns) => crate::state::apply_steps(&steps, &columns),
-                    None => crate::state::RunOutcome::Succeeded,
-                }
-            }
-            _ => crate::state::RunOutcome::Succeeded,
-        };
+        // The run is PERFORMED here, before the record exists: the outcome is what the
+        // reading, the recipe and the writing answered, so the state the clock later
+        // reveals is backed by the objects this wrote. The store holds no lock across
+        // these calls.
+        let outcome = crate::state::job_execution::perform(ctx, &region, &plan).await;
 
         let mut store = state.lock();
         // The job is re-read under the lock the run is recorded under: a delete that
@@ -214,7 +204,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-
         // The id is minted from the stored counter and the run is stored under it, so
         // the id handed back is the one a later describe resolves.
         let run_id = store.mint_run_id();
@@ -223,7 +212,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             job_name: job.name.clone(),
             dataset_name: job.dataset_name.clone(),
             // A DataBrew run starts non-terminal and reaches a terminal state on its
-            // own; the transition is owed to the clock, not to another call.
+            // own; WHEN that transition happens is owed to the clock, while WHICH state
+            // it reaches is the outcome recorded below.
             state: "STARTING".to_string(),
             attempt: 0,
             execution_time: 0,
@@ -232,6 +222,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             completed_on: None,
             error_message: None,
             outputs: job.outputs.clone(),
+            data_catalog_outputs: job.data_catalog_outputs.clone(),
+            database_outputs: job.database_outputs.clone(),
             recipe_reference: job.recipe_reference.clone(),
             log_subscription: job.log_subscription.clone(),
             log_group_name: job
@@ -239,9 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_deref()
                 .filter(|subscription| *subscription == "ENABLE")
                 .map(|_| crate::state::log_group_name(&job.name)),
-            // The terminal state the run's own execution is owed, materialised by the
-            // clock rather than by whoever polls it.
-            outcome,
+            terminal_outcome: Some(outcome),
         };
         // Stored through `record_run`, which evicts the oldest runs past the retained
         // ceiling, so repeated starts grow the store to a fixed bound and no further.

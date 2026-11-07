@@ -24,16 +24,11 @@
 //! columns it has, and whether the named column is absent, present, or written by an
 //! earlier step.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The Region both services are addressed in: the one a request carrying no credential
-/// scope is served in, and the one Amazon S3 places a bucket created with no
-/// `LocationConstraint` in.
-const REGION: &str = "us-east-1";
+use crate::databrew_harness::Emulator;
 
 /// The bucket every dataset object and output prefix below lives in.
 const BUCKET: &str = "brew-data";
@@ -52,124 +47,44 @@ const TERMINAL_STATES: [&str; 4] = ["SUCCEEDED", "FAILED", "STOPPED", "TIMEOUT"]
 /// The role a recipe job assumes, as `CreateRecipeJobRequest$RoleArn` takes it.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/brew";
 
-/// One emulator: databrew and Amazon S3 on a single shared engine behind the production
-/// router — what the assembled emulator runs, narrowed to the two services under test.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // The signature itself is not what these cases are about; the credential scope still
-    // routes each request to the service that serves it.
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_databrew_awsgluedatabrew::EmulatedService::new(Arc::clone(&engine)),
-    );
-    router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
-        engine,
-    ));
-    router
-}
-
-/// A SigV4 credential scope naming `service`, which is what claims a request.
-fn authorization(service: &str) -> String {
-    format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{service}/aws4_request, \
-         SignedHeaders=host, Signature=0000"
-    )
+/// One emulator: databrew with the emulator's own Amazon S3 (and IAM) on a single shared
+/// engine behind the production router — what the assembled emulator runs. The router,
+/// the wire envelope and the Amazon S3 front door are the shared harness's
+/// (`crate::databrew_harness`), so this suite holds no second copy of them.
+fn emulator() -> Emulator {
+    Emulator::with_object_store_and_iam()
 }
 
 /// One databrew call in this service's own wire envelope (restJson1: the modelled method
 /// and URI), answering the status and the decoded body.
 async fn brew(
-    router: &MultiServiceRouter,
+    router: &Emulator,
     method: &str,
     uri: &str,
     body: Option<Value>,
 ) -> (u16, Value) {
-    let payload = body
-        .map(|body| serde_json::to_vec(&body).expect("the test body serializes"))
-        .unwrap_or_default();
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!("https://databrew.{REGION}.amazonaws.com{uri}"))
-        .header("authorization", authorization("databrew"))
-        .header("content-type", "application/json")
-        .body(bytes::Bytes::from(payload))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    (status, parsed)
-}
-
-/// One path-style request to the emulator's Amazon S3 front door: the bucket and the key
-/// live in the URI and the body is the object's own bytes, so this is a raw request rather
-/// than a modelled call.
-async fn s3(router: &MultiServiceRouter, method: &str, path: &str, body: &[u8]) -> (u16, String) {
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!("https://s3.{REGION}.amazonaws.com{path}"))
-        .header("host", format!("s3.{REGION}.amazonaws.com"))
-        .header("authorization", authorization("s3"))
-        .body(bytes::Bytes::copy_from_slice(body))
-        .expect("the request builds");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let text = String::from_utf8_lossy(response.body()).to_string();
-    (status, text)
+    let reply = router.call(method, uri, body).await;
+    (reply.status, reply.body)
 }
 
 /// `PUT /<bucket>` — `CreateBucket` — so the staged dataset objects have a bucket.
-async fn given_bucket(router: &MultiServiceRouter) {
-    let (status, body) = s3(router, "PUT", &format!("/{BUCKET}"), &[]).await;
-    assert_eq!(
-        status, 200,
-        "the dataset bucket must be created first, got {status}: {body}"
-    );
+async fn given_bucket(router: &Emulator) {
+    router.given_bucket(BUCKET).await;
 }
 
 /// `PUT /<bucket>/<key>` — `PutObject` — storing `contents` as the object's own body.
-async fn given_object(router: &MultiServiceRouter, case: &str, key: &str, contents: &str) {
-    let (status, body) = s3(
-        router,
-        "PUT",
-        &format!("/{BUCKET}/{key}"),
-        contents.as_bytes(),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: the dataset object {key:?} must be stored, got {status}: {body}"
-    );
+async fn given_object(router: &Emulator, key: &str, contents: &str) {
+    router.given_object(BUCKET, key, contents).await;
 }
 
-/// The keys `ListObjectsV2` reports under `prefix`, read out of the XML listing the store
-/// answers with.
-async fn keys_under(router: &MultiServiceRouter, prefix: &str) -> Vec<String> {
-    let (status, body) = s3(
-        router,
-        "GET",
-        &format!("/{BUCKET}?list-type=2&prefix={prefix}"),
-        &[],
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "the output prefix {prefix:?} must be listable, got {status}: {body}"
-    );
-    body.split("<Key>")
-        .skip(1)
-        .filter_map(|tail| tail.split_once("</Key>"))
-        .map(|(key, _)| key.to_string())
-        .collect()
+/// The keys `ListObjectsV2` reports under `prefix`.
+async fn keys_under(router: &Emulator, prefix: &str) -> Vec<String> {
+    router.keys_under(BUCKET, prefix).await
 }
 
 /// Read the run until it reaches a terminal state, or until the budget runs out.
 async fn await_terminal(
-    router: &MultiServiceRouter,
+    router: &Emulator,
     case: &str,
     job: &str,
     run_id: &str,
@@ -374,7 +289,7 @@ async fn a_recipe_job_run_is_judged_against_its_datasets_own_columns() {
         let job = format!("job-{suffix}");
         let prefix = format!("out-{suffix}/");
 
-        given_object(&router, name, &key, case.object).await;
+        given_object(&router, &key, case.object).await;
 
         let mut format_options = json!({"Csv": {"HeaderRow": true}});
         if let Some(delimiter) = case.delimiter {
@@ -575,12 +490,11 @@ async fn one_recipe_is_judged_against_each_dataset_it_is_run_over() {
     let case = "one recipe over two datasets";
     given_object(
         &router,
-        case,
         "in/people.csv",
         "id,employee_name,dept,salary\n7,ada,sales,10\n",
     )
     .await;
-    given_object(&router, case, "in/parts.csv", "sku,qty\nA-1,4\n").await;
+    given_object(&router, "in/parts.csv", "sku,qty\nA-1,4\n").await;
 
     for (dataset, key) in [("ds-ok", "in/people.csv"), ("ds-bad", "in/parts.csv")] {
         let (status, body) = brew(

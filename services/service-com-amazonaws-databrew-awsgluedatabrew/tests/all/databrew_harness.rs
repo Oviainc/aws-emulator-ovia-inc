@@ -96,6 +96,31 @@ impl Emulator {
         Self { router, engine }
     }
 
+    /// This service with the emulator's own Amazon S3 and IAM mounted BESIDE it on the
+    /// same engine — what `core/router` assembles, narrowed to the services under test.
+    ///
+    /// A case needs them wherever DataBrew resolves a resource another service owns: the
+    /// object a job run reads and writes, and the role a job is created with.
+    pub fn with_object_store_and_iam() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(
+            service_com_amazonaws_databrew_awsgluedatabrew::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
+        );
+        router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
+        router.register_service(
+            service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
+        Self { router, engine }
+    }
+
     /// The SINGLE shared engine this service is mounted on, so a case can read or seed
     /// the very store the handlers serve from (`engine.state::<State>()`) rather than a
     /// private copy.
@@ -146,6 +171,126 @@ impl Emulator {
             body,
         }
     }
+
+    /// One path-style request to the emulator's own Amazon S3 front door: the bucket and
+    /// the key live in the URI and the body is the object's own bytes, so this is a raw
+    /// request rather than a modelled call. The credential scope names `s3`, which is
+    /// what claims it.
+    pub async fn s3(&self, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+        let request = ::http::Request::builder()
+            .method(method)
+            .uri(format!("https://s3.us-east-1.amazonaws.com{path}"))
+            .header("host", "s3.us-east-1.amazonaws.com")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIDEXAMPLE/20260101/us-east-1/s3/aws4_request, \
+                 SignedHeaders=host, Signature=0000",
+            )
+            .body(::bytes::Bytes::copy_from_slice(body))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        (
+            response.status().as_u16(),
+            response.body().as_ref().to_vec(),
+        )
+    }
+
+    /// `PUT /<bucket>` — `CreateBucket` — so the objects a case stages have a bucket to
+    /// live in.
+    pub async fn given_bucket(&self, bucket: &str) {
+        let (status, body) = self.s3("PUT", &format!("/{bucket}"), &[]).await;
+        assert_eq!(
+            status,
+            200,
+            "the bucket {bucket} must be created first, got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// `PUT /<bucket>/<key>` — `PutObject` — storing `body` as the object's own bytes.
+    pub async fn given_object(&self, bucket: &str, key: &str, body: &str) {
+        let (status, answered) = self
+            .s3("PUT", &format!("/{bucket}/{key}"), body.as_bytes())
+            .await;
+        assert_eq!(
+            status,
+            200,
+            "case {key:?}: the object must be stored, got {status} {}",
+            String::from_utf8_lossy(&answered)
+        );
+    }
+
+    /// `GET /<bucket>/<key>` — `GetObject` — as the text it holds, or `None` when the
+    /// store does not hold it.
+    pub async fn object_text(&self, bucket: &str, key: &str) -> Option<String> {
+        let (status, body) = self.s3("GET", &format!("/{bucket}/{key}"), &[]).await;
+        if status == 200 {
+            Some(String::from_utf8_lossy(&body).to_string())
+        } else {
+            None
+        }
+    }
+
+    /// The keys Amazon S3 holds under `prefix`, in the order `ListObjectsV2` reports
+    /// them. The listing is XML, and the keys are read out of the `<Key>` elements the
+    /// store answered with.
+    pub async fn keys_under(&self, bucket: &str, prefix: &str) -> Vec<String> {
+        let (status, body) = self
+            .s3(
+                "GET",
+                &format!("/{bucket}?list-type=2&prefix={prefix}"),
+                &[],
+            )
+            .await;
+        let xml = String::from_utf8_lossy(&body).to_string();
+        assert_eq!(
+            status, 200,
+            "the output prefix {prefix:?} must be listable, got {status} {xml}"
+        );
+        xml.split("<Key>")
+            .skip(1)
+            .filter_map(|tail| tail.split_once("</Key>"))
+            .map(|(key, _)| key.to_string())
+            .collect()
+    }
+
+    /// Create one role through IAM's own `CreateRole` (a query-protocol request), and
+    /// answer the ARN IAM persisted for it.
+    pub async fn given_role(&self, name: &str, trust: &Value) -> String {
+        let body = format!(
+            "Action=CreateRole&Version=2010-05-08&RoleName={}&AssumeRolePolicyDocument={}",
+            form_encode(name),
+            form_encode(&trust.to_string()),
+        );
+        let request = ::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "iam.amazonaws.com")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(::bytes::Bytes::from(body))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let xml = String::from_utf8_lossy(response.body()).to_string();
+        assert_eq!(
+            status, 200,
+            "the role {name} must be created in IAM first, got {status} {xml}"
+        );
+        let arn = xml
+            .split_once("<Arn>")
+            .and_then(|(_, tail)| tail.split_once("</Arn>"))
+            .map(|(arn, _)| arn.to_string());
+        arn.unwrap_or_else(|| panic!("CreateRole must answer the role's ARN, got {xml}"))
+    }
+}
+
+/// One value as an `application/x-www-form-urlencoded` field, percent-encoded by the
+/// `percent-encoding` crate, which is how IAM's query protocol carries a policy
+/// document. Everything but the unreserved set is encoded (`NON_ALPHANUMERIC` keeps
+/// `-._~` out of the encoding by being applied to the ASCII-alphanumeric complement).
+fn form_encode(value: &str) -> String {
+    ::percent_encoding::utf8_percent_encode(value, ::percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
 impl Default for Emulator {
@@ -178,6 +323,15 @@ pub async fn create_dataset(emulator: &Emulator, name: &str, input: Value) -> Re
 /// The role a project assumes, as `CreateProjectRequest$RoleArn` takes it (modelled
 /// `len 20..2048`).
 pub const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/brew";
+
+/// The `Outputs` a recipe job writes to: one Amazon S3 location under `key`.
+///
+/// `CreateRecipeJob` refuses a job that selects NO output at all — a job with nowhere to
+/// write is one no run can produce anything for — so every job created in these suites
+/// carries one.
+pub fn job_outputs(key: &str) -> Value {
+    json!([{ "Location": { "Bucket": "brew-bucket", "Key": key } }])
+}
 
 /// `CreateProject`: `POST /projects` (model: `smithy_query(query="operation",
 /// operation="CreateProject")`).

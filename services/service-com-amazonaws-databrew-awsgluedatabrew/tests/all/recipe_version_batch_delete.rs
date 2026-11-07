@@ -480,6 +480,7 @@ async fn a_version_something_still_holds_survives_the_delete() {
                     "Name": "job-on-1-0",
                     "RoleArn": ROLE_ARN,
                     "RecipeReference": {"Name": recipe, "RecipeVersion": "1.0"},
+                    "Outputs": [{"Location": {"Bucket": "brew-bucket", "Key": "out/"}}],
                 })),
             )
             .await

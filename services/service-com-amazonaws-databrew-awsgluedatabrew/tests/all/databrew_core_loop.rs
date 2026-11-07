@@ -614,6 +614,7 @@ async fn the_stores_a_caller_can_grow_are_bounded() {
                     "Name": "demo-job",
                     "RoleArn": "arn:aws:iam::000000000000:role/brew",
                     "DatasetName": "demo-ds",
+                    "Outputs": [{"Location": {"Bucket": "brew-bucket", "Key": "out/"}}],
                 })),
             )
             .await
@@ -714,6 +715,7 @@ async fn the_stores_a_caller_can_grow_are_bounded() {
                 Some(json!({
                     "Name": format!("job-{n:06}"),
                     "RoleArn": "arn:aws:iam::000000000000:role/brew",
+                    "Outputs": [{"Location": {"Bucket": "brew-bucket", "Key": "out/"}}],
                 })),
             )
             .await;
@@ -730,6 +732,7 @@ async fn the_stores_a_caller_can_grow_are_bounded() {
             Some(json!({
                 "Name": "one-too-many",
                 "RoleArn": "arn:aws:iam::000000000000:role/brew",
+                "Outputs": [{"Location": {"Bucket": "brew-bucket", "Key": "out/"}}],
             })),
         )
         .await;
@@ -750,9 +753,17 @@ async fn the_stores_a_caller_can_grow_are_bounded() {
 /// transition is owed to the clock, so a caller that describes the run immediately
 /// still sees `STARTING`, and one that waits sees the terminal `SUCCEEDED` with the
 /// `CompletedOn`/`ExecutionTime` that go with it. Once terminal it stays put.
+///
+/// The `SUCCEEDED` it reaches is backed by the object the run wrote, so the emulator is
+/// assembled with its own Amazon S3 beside it and the dataset's object is staged there;
+/// what the run writes is the subject of `crate::recipe_job_execution`.
 #[tokio::test]
 async fn a_job_run_progresses_to_a_terminal_state_on_its_own() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_object_store_and_iam();
+    emulator.given_bucket("brew-bucket").await;
+    emulator
+        .given_object("brew-bucket", "in/data.csv", "name,size\nhalyard,2\n")
+        .await;
     assert_eq!(
         create_dataset(&emulator, "demo-ds", s3_input("in/data.csv"))
             .await
@@ -844,5 +855,12 @@ async fn a_job_run_progresses_to_a_terminal_state_on_its_own() {
         json!("SUCCEEDED"),
         "ListJobRuns must report the same state as DescribeJobRun, got {:?}",
         listed.body["JobRuns"]
+    );
+
+    // The success is backed: the run wrote its output under the output location's key.
+    assert_eq!(
+        emulator.keys_under("brew-bucket", "out/").await,
+        vec!["out/demo-job_part00000.csv".to_string()],
+        "case \"terminal run\": a SUCCEEDED run must have written its output object"
     );
 }

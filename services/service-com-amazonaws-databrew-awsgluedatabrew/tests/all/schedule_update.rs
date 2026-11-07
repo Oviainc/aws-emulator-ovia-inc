@@ -14,7 +14,7 @@
 
 use serde_json::{json, Value};
 
-use crate::databrew_harness::{label, Emulator, Reply, CALLER_PRINCIPAL};
+use crate::databrew_harness::{job_outputs, label, Emulator, Reply, CALLER_PRINCIPAL};
 
 /// The one sentence DataBrew answers every invalid schedule cron expression with
 /// (`INVALID_CRON_EXPRESSION_MESSAGE` in `src/state.rs`).
@@ -25,8 +25,8 @@ const INVALID_CRON_MESSAGE: &str =
 /// expression from the one its update wrote.
 const CREATED_CRON: &str = "cron(0 12 * * ? *)";
 
-/// `CreateRecipeJob`: the job a schedule can name. `RoleArn` is the only other member
-/// it requires.
+/// `CreateRecipeJob`: the job a schedule can name. `RoleArn` and one selected output are
+/// the only other members it requires.
 async fn create_job(emulator: &Emulator, name: &str) -> Reply {
     emulator
         .call(
@@ -35,6 +35,7 @@ async fn create_job(emulator: &Emulator, name: &str) -> Reply {
             Some(json!({
                 "Name": name,
                 "RoleArn": "arn:aws:iam::000000000000:role/brew",
+                "Outputs": job_outputs("out/"),
             })),
         )
         .await

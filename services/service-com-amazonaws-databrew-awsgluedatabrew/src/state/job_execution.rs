@@ -1,354 +1,497 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a recipe-job RUN does: read the columns of the dataset the job names, apply the
-//! steps of the recipe version it references to them, and decide the terminal state that
-//! pair is owed.
+//! What a recipe job RUN does: read the dataset's object out of Amazon S3, apply the
+//! steps of the recipe version the job references, and write the result to each of the
+//! job's outputs.
 //!
-//! A DataBrew job run is admitted first and executes afterwards — `StartJobRun` answers
-//! `RunId` and the run reaches a terminal state on its own — so a recipe that does not fit
-//! its dataset is never a refusal at the door: the run is admitted, runs, and ends
-//! `FAILED` carrying the diagnosis of the step that could not be applied. That diagnosis
-//! is only possible if something really reads the data, so the dataset's columns come from
-//! the OBJECT Amazon S3 holds at the dataset's own `S3InputDefinition`, read through the
-//! operation callback ([`smithy_server_runtime::OperationContext::callback`]), which routes
-//! IN PROCESS: no socket, no outbound request, no host resolution. A header a caller
-//! staged with `PutObject` is therefore the header the run is judged against.
+//! `StartJobRun` "runs a DataBrew job" (model: `StartJobRun`), and a recipe job's purpose
+//! is the objects it writes: once a run reports `SUCCEEDED`, the transformed dataset is in
+//! the output's Amazon S3 location. A run is admitted FIRST and executes afterwards —
+//! `StartJobRun` answers a `RunId` and the run reaches a terminal state on its own — so a
+//! recipe that does not fit its dataset is never a refusal at the door: the run is
+//! admitted, runs, and ends `FAILED` carrying the diagnosis of the step that could not be
+//! applied. The clock decides WHEN the terminal state is reported
+//! ([`super::JobRunRecord::advance_to`]); this module decides WHICH state it is, by doing
+//! the work and answering the [`super::RunOutcome`] that was reached. A run whose dataset
+//! could not be read, whose recipe could not be applied, or whose output could not be
+//! written reports `FAILED` with the reason as its modelled `ErrorMessage`: there is no
+//! success to report for work that produced no object.
 //!
-//! ## What is established, and what is not
+//! Amazon S3 is reached the way the framework documents a handler reaching another
+//! emulated service ([`smithy_server_runtime::OperationContext::callback`]): an AWS SDK
+//! client over the emulator's OWN in-process callback, so nothing here opens a socket,
+//! resolves a host or reads a host credential. The object a client staged with
+//! `PutObject` is therefore the object a run reads and is judged against, and the object a
+//! run writes is the one `ListObjectsV2` then lists. The one caller-supplied value that
+//! reaches the client's authority is the signing Region, and it is narrowed to a Region
+//! label before it gets there, so no request can re-point this client at an address of its
+//! own choosing.
 //!
-//! A step is reported as unapplicable ONLY against a column list this emulator really
-//! read. When the dataset names no S3 object, the object is not there, the format is not
-//! one whose column names live in the data, or the read answers nothing at all, the column
-//! list is UNESTABLISHED ([`dataset_columns`] answers `None`) and no step is judged: the
-//! run is owed the state it was owed before, because a missing column is a claim about
-//! data this emulator did not see.
-//!
-//! HOW MUCH IS READ IS BOUNDED: the read asks Amazon S3 for the first
-//! [`MAX_HEADER_BYTES`] of the object and nothing more, so the bytes taken into this
-//! process do not scale with the dataset, and a header naming more than
-//! [`MAX_COLUMNS`] columns is left unestablished rather than held.
+//! Every bound on how much is read, held and written lives in [`super::tabular_data`],
+//! and each is applied before the allocation it caps.
 
-use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+use super::tabular_data::{self, Table, MAX_INPUT_BYTES};
+use super::{ComAmazonawsDatabrewAwsgluedatabrewState, JobRecord, RunOutcome};
+use crate::ops::types::{Output, RecipeStep, S3Location};
 
-use crate::ops::types::RecipeStep;
+/// The dataset format a run reads when the dataset names none and its object's name says
+/// nothing either (model: `Dataset$Format` is optional). CSV is the comma-separated
+/// reading, and the one a dataset created from a `.csv` object carries.
+const DEFAULT_INPUT_FORMAT: &str = "CSV";
 
-use super::DatasetRecord;
+/// The object-name extensions the format of a dataset that names none follows from: the
+/// `Format` member is optional (model: `CreateDatasetRequest$Format`), so such a dataset
+/// is read as the format its object's name states.
+const FORMAT_EXTENSIONS: [(&str, &str); 2] = [(".csv", "CSV"), (".json", "JSON")];
 
-/// The most bytes of a dataset object this emulator reads to find its column names. A
-/// header is the FIRST record of the object, so the read asks Amazon S3 for a prefix of
-/// it rather than for the whole dataset, and the bytes that enter this process are
-/// bounded before any of them do.
-pub const MAX_HEADER_BYTES: usize = 64 * 1024;
+/// The output format a run writes when the output names none (model: `Output$Format` is
+/// optional and documents no default). CSV is the format a recipe job's output carries
+/// unless the job asks for another.
+const DEFAULT_OUTPUT_FORMAT: &str = "CSV";
 
-/// The most columns this emulator holds for one dataset, so neither the column list nor
-/// the diagnosis built from it is sized by what a caller staged. A header naming more is
-/// left unestablished rather than truncated: a truncated list would report a column that
-/// IS present as missing.
-pub const MAX_COLUMNS: usize = 1_000;
+/// The number of output files a run writes when the output names none (model:
+/// `Output$MaxOutputFiles` is optional, range 1..999, and is "the maximum number of files
+/// to be generated by the job"). One file is what a single-part output is.
+const DEFAULT_MAX_OUTPUT_FILES: i32 = 1;
 
-/// The dataset format whose column names are carried by the data itself, in its first
-/// record (model: `CsvOptions$HeaderRow` — "A variable that specifies whether the first row
-/// in the file is parsed as the header"). The other formats DataBrew reads
-/// (model: `InputFormat`) carry their column names in a schema this emulator does not
-/// hold, so a dataset in one of them establishes no column list here.
-const CSV_FORMAT: &str = "CSV";
+/// The most part files one output is written as: the modelled maximum of
+/// `Output$MaxOutputFiles` (range 1..999). The value a request carries is CLAMPED to this
+/// range before it sizes the part split or the write loop, so neither is sized by a raw
+/// request field.
+const MAX_OUTPUT_FILES: i32 = 999;
 
-/// The file extension a dataset whose `Format` the create left out is read as CSV by:
-/// `Format` is optional (model: `CreateDatasetRequest$Format`), and the format of such a
-/// dataset follows from its object's name.
-const CSV_EXTENSION: &str = ".csv";
+/// The most outputs one run writes. `OutputList` carries a minimum of 1 and no maximum
+/// (model: `CreateRecipeJobRequest$Outputs`), and each output is a write loop of its own,
+/// so the number of them is capped here. CHOSEN for this emulator.
+const MAX_OUTPUTS: usize = 16;
 
-/// The delimiter a CSV dataset is read with when its `FormatOptions` name none (model:
-/// `CsvOptions$Delimiter` — "A single character that specifies the delimiter being used in
-/// the CSV file"; a comma-separated value file is separated by a comma).
-const DEFAULT_CSV_DELIMITER: u8 = b',';
-
-/// The byte order mark a UTF-8 encoded text file may open with, which is not part of the
-/// first column's name.
-const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
-
-/// The recipe-action parameters that name a column the data must ALREADY have: the column
-/// the transformation reads (model: `RecipeAction$Parameters` — "Contextual parameters for
-/// the transformation" — whose names are the recipe structure
-/// `ConditionExpression$Condition` points at). A parameter naming the column a step WRITES
-/// is not one of them ([`TARGET_COLUMN_PARAMETER`]).
-const SOURCE_COLUMN_PARAMETERS: [&str; 3] = ["sourceColumn", "sourceColumn1", "sourceColumn2"];
-
-/// The recipe-action parameter naming SEVERAL such columns at once, as a JSON array of
-/// names.
-const SOURCE_COLUMNS_PARAMETER: &str = "sourceColumns";
-
-/// The recipe-action parameter naming the column a step WRITES. It is not required to
-/// exist beforehand — a step that renames or derives a column names the result here — so
-/// after that step the name IS one of the data's columns.
-const TARGET_COLUMN_PARAMETER: &str = "targetColumn";
-
-/// The Amazon S3 error codes in which the store ANSWERS that it does not serve the object
-/// a dataset names. Every other answer is this emulator failing to ask its own object
-/// store, which establishes nothing either; the two are kept apart only so the second is
-/// logged as the assembly fault it is.
-const UNREADABLE_OBJECT_CODES: &[&str] = &[
-    "NoSuchBucket",
-    "NoSuchKey",
-    "NoSuchVersion",
-    "NotFound",
-    "AccessDenied",
-    "AllAccessDisabled",
-];
-
-/// The terminal state a run is owed once it has executed, decided from the dataset and the
-/// recipe version the run was admitted with.
-///
-/// The decision is made when the run is ADMITTED, against the data and the recipe version
-/// as they were then, and materialised by the clock
-/// ([`super::JobRunRecord::advance_to`]): a run reports the outcome of what it ran with,
-/// not of what the dataset or the recipe became afterwards.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum RunOutcome {
-    /// The recipe applies to the data: the run ends in the terminal `SUCCEEDED` state and
-    /// reports no `ErrorMessage`.
-    #[default]
-    Succeeded,
-    /// The recipe cannot be applied: the run ends in the terminal `FAILED` state and
-    /// reports this `ErrorMessage`, and the work it would have written is not written.
-    Failed(String),
+/// What a run needs in order to be performed, copied out of the store under its lock so
+/// nothing is read from the store while Amazon S3 is being called.
+#[derive(Debug, Clone)]
+pub enum RunPlan {
+    /// Everything the run reads and writes.
+    Ready(Box<ReadyRun>),
+    /// The run cannot be performed and the reason is already settled, without reading
+    /// anything: the job names no dataset this emulator can read, or no recipe version
+    /// the store holds.
+    Unperformable(String),
 }
 
-/// The `ErrorMessage` a run that could not apply one of its recipe's steps reports.
-///
-/// `step` is the 1-based index of the step that could not be applied, `column` the column
-/// that step names and the data does not have, and `columns` the columns the data really
-/// has, in the order the data carries them — the three facts an operator needs to repair
-/// either the recipe or the dataset.
-pub fn recipe_step_error_message(step: usize, column: &str, columns: &[String]) -> String {
-    format!(
-        "RecipeStepError: Failed at step {step}: Column '{column}' does not exist. \
-         The dataset's columns are: {}",
-        columns.join(", ")
-    )
+/// A run that can be attempted: where its input is, what steps to apply, and where the
+/// result goes.
+#[derive(Debug, Clone)]
+pub struct ReadyRun {
+    /// The job's name, which is part of every output part file's name.
+    pub job_name: String,
+    /// The object the dataset reads from.
+    pub input: S3Location,
+    /// The dataset's `Format`, as the modelled `InputFormat`.
+    pub input_format: String,
+    /// The delimiter a comma-separated dataset is read with.
+    pub delimiter: u8,
+    /// Whether the dataset's first record is its header.
+    pub header_row: bool,
+    /// The steps of the recipe version the job references; empty when it references none.
+    pub steps: Vec<RecipeStep>,
+    /// The job's Amazon S3 outputs, each written in full.
+    pub outputs: Vec<Output>,
 }
 
-/// The terminal state the recipe `steps` are owed against the data columns `columns`.
+/// What `job` would run with, read out of `store`.
 ///
-/// The steps are applied IN ORDER against the columns the data has at that point in the
-/// recipe: the first step that names a column which is not among them is the step that
-/// cannot be applied, and the run is owed `FAILED` carrying its diagnosis. A step that
-/// writes a column adds that name for the steps after it
-/// ([`TARGET_COLUMN_PARAMETER`]), so a recipe that derives a column and then transforms it
-/// applies.
-///
-/// Membership is decided through a set, so the walk costs no more than the size of the
-/// recipe the create already stored however many columns or steps either side has.
-pub fn apply_steps(steps: &[RecipeStep], columns: &[String]) -> RunOutcome {
-    let mut present: ::std::collections::BTreeSet<String> = columns.iter().cloned().collect();
-    for (index, step) in steps.iter().enumerate() {
-        for referenced in referenced_columns(step) {
-            if !present.contains(&referenced) {
-                return RunOutcome::Failed(recipe_step_error_message(
-                    index + 1,
-                    &referenced,
-                    columns,
-                ));
-            }
-        }
-        if let Some(written) = step
-            .action
-            .parameters
-            .as_ref()
-            .and_then(|parameters| parameters.get(TARGET_COLUMN_PARAMETER))
-            .filter(|written| !written.trim().is_empty())
-        {
-            present.insert(written.clone());
-        }
+/// The dataset is the job's own (`Job$DatasetName`), or the one the project it was created
+/// against acts upon — "either the name of an existing project, or a combination of a
+/// recipe and a dataset" (model: `CreateRecipeJobRequest$ProjectName`) — so a job built
+/// either way resolves the same way. The steps are the referenced recipe VERSION's, which
+/// is what makes a run reproduce what that version held rather than what the recipe has
+/// since become.
+pub fn plan(store: &ComAmazonawsDatabrewAwsgluedatabrewState, job: &JobRecord) -> RunPlan {
+    // What the job writes is what the run has to produce: an output kind this emulator
+    // does not write is stated as the reason the run could not be performed, never passed
+    // over on the way to a success nothing backs.
+    if !job.data_catalog_outputs.is_empty() || !job.database_outputs.is_empty() {
+        return RunPlan::Unperformable(format!(
+            "The job selects {} output(s) this emulator does not write; it writes an Amazon S3 \
+             output.",
+            unwritten_output_kinds(job).join(" and ")
+        ));
     }
-    RunOutcome::Succeeded
-}
-
-/// The columns one recipe step names and the data must already have, in a stable order:
-/// the action's own source parameters, then the names its `sourceColumns` array carries,
-/// then the column each of its conditions applies to (model:
-/// `ConditionExpression$TargetColumn` — "A column to apply this condition to").
-///
-/// The order is fixed so the step's diagnosis names the same column on every run of the
-/// same recipe.
-fn referenced_columns(step: &RecipeStep) -> Vec<String> {
-    let mut referenced = Vec::new();
-    if let Some(parameters) = step.action.parameters.as_ref() {
-        for name in SOURCE_COLUMN_PARAMETERS {
-            if let Some(column) = parameters.get(name).filter(|value| !value.is_empty()) {
-                referenced.push(column.clone());
-            }
-        }
-        if let Some(list) = parameters.get(SOURCE_COLUMNS_PARAMETER) {
-            referenced.extend(column_name_list(list));
-        }
+    if job.outputs.is_empty() {
+        return RunPlan::Unperformable(
+            "The job selects no output, so the run has nowhere to write.".to_string(),
+        );
     }
-    for condition in step.condition_expressions.iter().flatten() {
-        referenced.push(condition.target_column.clone());
+    if job.outputs.len() > MAX_OUTPUTS {
+        return RunPlan::Unperformable(format!(
+            "The job selects {} outputs, more than the {MAX_OUTPUTS} this emulator writes in one \
+             job run.",
+            job.outputs.len()
+        ));
     }
-    referenced
-}
+    let project = job
+        .project_name
+        .as_ref()
+        .and_then(|name| store.projects.get(name));
+    let dataset_name = job
+        .dataset_name
+        .clone()
+        .or_else(|| project.map(|project| project.dataset_name.clone()));
+    let Some(dataset_name) = dataset_name else {
+        return RunPlan::Unperformable(
+            "The job names no dataset, so the run has no input to read.".to_string(),
+        );
+    };
+    let Some(dataset) = store.datasets.get(&dataset_name) else {
+        return RunPlan::Unperformable(super::not_found_message("Dataset", &dataset_name));
+    };
+    let Some(input) = dataset.input.s3_input_definition.clone() else {
+        return RunPlan::Unperformable(format!(
+            "The dataset {dataset_name} reads from {}, which this emulator does not read; it \
+             reads an Amazon S3 input.",
+            super::source_of(&dataset.input).unwrap_or("no input definition")
+        ));
+    };
 
-/// The column names a `sourceColumns` parameter carries. The value is a parameter string
-/// (model: `ParameterMap`'s value is a string), and a recipe states several columns in it
-/// as a JSON array of names; a value that is not such an array names no column list and is
-/// read as naming nothing.
-fn column_name_list(value: &str) -> Vec<String> {
-    ::serde_json::from_str::<Vec<String>>(value).unwrap_or_default()
-}
-
-/// The columns the dataset `dataset` has, or `None` when this emulator established none of
-/// them (see the module docs).
-pub async fn dataset_columns(
-    ctx: &::smithy_server_runtime::OperationContext<'_>,
-    dataset: &DatasetRecord,
-) -> Option<Vec<String>> {
-    let object = dataset.input.s3_input_definition.as_ref()?;
-    let key = object.key.as_deref().filter(|key| !key.is_empty())?;
-    if !reads_as_csv(dataset, key) {
-        return None;
+    // The recipe the job references, at the version it references. A job that references
+    // none performs no step, which is the identity transformation: the output is the
+    // dataset.
+    let mut steps: Vec<RecipeStep> = Vec::new();
+    if let Some(reference) = &job.recipe_reference {
+        let Some(recipe) = store.recipes.get(&reference.name) else {
+            return RunPlan::Unperformable(super::not_found_message("Recipe", &reference.name));
+        };
+        let Some(version) = recipe.resolve_version(reference.recipe_version.as_deref()) else {
+            return RunPlan::Unperformable(super::recipe_version_not_found_message(
+                &reference.name,
+                super::requested_recipe_version(reference.recipe_version.as_deref()),
+            ));
+        };
+        steps = version.steps.clone();
     }
-    // "If this value is false, column names are auto-generated" (model:
-    // `CsvOptions$HeaderRow`) — a generated name is not one the data carries, so such a
-    // dataset establishes no column list here.
+
     let csv = dataset
         .format_options
         .as_ref()
         .and_then(|options| options.csv.as_ref());
-    if csv.and_then(|csv| csv.header_row) == Some(false) {
-        return None;
-    }
-    let delimiter = csv
-        .and_then(|csv| csv.delimiter.as_deref())
-        .and_then(|delimiter| delimiter.bytes().next())
-        .unwrap_or(DEFAULT_CSV_DELIMITER);
-
-    let region = super::request_region(ctx);
-    let head = object_prefix(&s3_client(ctx, &region), &object.bucket, key).await?;
-    header_columns(&head, delimiter)
+    RunPlan::Ready(Box::new(ReadyRun {
+        job_name: job.name.clone(),
+        input_format: input_format_of(dataset.format.as_deref(), input.key.as_deref()),
+        input,
+        delimiter: csv
+            .and_then(|csv| csv.delimiter.as_deref())
+            .and_then(single_byte)
+            .unwrap_or(tabular_data::DEFAULT_DELIMITER),
+        // "A variable that specifies whether the first row in the file is parsed as the
+        // header" (model: `CsvOptions$HeaderRow`); a dataset that says nothing is read
+        // with a header, which is what a CSV export carries.
+        header_row: csv.and_then(|csv| csv.header_row).unwrap_or(true),
+        steps,
+        outputs: job.outputs.clone(),
+    }))
 }
 
-/// Whether `dataset` is read as a CSV file: either its `Format` says so, or it names no
-/// format and its object's name does.
-fn reads_as_csv(dataset: &DatasetRecord, key: &str) -> bool {
-    match dataset.format.as_deref() {
-        Some(format) => format.eq_ignore_ascii_case(CSV_FORMAT),
-        None => key.to_ascii_lowercase().ends_with(CSV_EXTENSION),
+/// The kinds of output `job` selects that this emulator does not write, as the reason a
+/// run names them: a Glue Data Catalog output is written to a catalog and a database
+/// output through a JDBC connection, neither of which this emulator serves.
+fn unwritten_output_kinds(job: &JobRecord) -> Vec<&'static str> {
+    let mut kinds = Vec::new();
+    if !job.data_catalog_outputs.is_empty() {
+        kinds.push("Glue Data Catalog");
     }
+    if !job.database_outputs.is_empty() {
+        kinds.push("JDBC database");
+    }
+    kinds
 }
 
-/// The column names the first record of `head` carries, read with `delimiter`, or `None`
-/// when it carries none this emulator can hold.
-///
-/// `head` is a PREFIX of the object ([`MAX_HEADER_BYTES`]), so a header record longer than
-/// that prefix was not seen to its end — the prefix would yield a clipped last column name,
-/// which would then be reported as a column the data does not have. Such a header
-/// establishes nothing: it is recognised by a prefix that fills the cap and carries no
-/// record terminator at all.
-fn header_columns(head: &[u8], delimiter: u8) -> Option<Vec<String>> {
-    if head.len() >= MAX_HEADER_BYTES && !head.contains(&b'\n') {
-        return None;
+/// The format a dataset is read as: the `Format` it names, else the one its object's name
+/// states ([`FORMAT_EXTENSIONS`]), else [`DEFAULT_INPUT_FORMAT`].
+fn input_format_of(format: Option<&str>, key: Option<&str>) -> String {
+    if let Some(format) = format.filter(|format| !format.is_empty()) {
+        return format.to_string();
     }
-    let head = head.strip_prefix(&UTF8_BOM).unwrap_or(head);
-    let mut reader = ::csv::ReaderBuilder::new()
-        .delimiter(delimiter)
-        .flexible(true)
-        .has_headers(true)
-        .from_reader(head);
-    let columns: Vec<String> = reader
-        .headers()
-        .ok()?
+    let key = key.unwrap_or_default().to_ascii_lowercase();
+    FORMAT_EXTENSIONS
         .iter()
-        .map(|column| column.trim().to_string())
-        .collect();
-    if columns.is_empty() || columns.iter().all(String::is_empty) || columns.len() > MAX_COLUMNS {
-        return None;
-    }
-    Some(columns)
+        .find(|(extension, _)| key.ends_with(extension))
+        .map_or_else(|| DEFAULT_INPUT_FORMAT.to_string(), |(_, format)| {
+            (*format).to_string()
+        })
 }
 
-/// The first [`MAX_HEADER_BYTES`] of the object `bucket`/`key`, or `None` when the store
-/// did not serve them.
-async fn object_prefix(
+/// Perform `plan`: read the input, apply the steps, write every output — and answer the
+/// terminal state that reached.
+///
+/// Awaited with NO store guard held: the reads and writes go through the in-process
+/// callback, and the outcome is recorded against the run afterwards.
+pub async fn perform(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    plan: &RunPlan,
+) -> RunOutcome {
+    let run = match plan {
+        RunPlan::Ready(run) => run,
+        RunPlan::Unperformable(reason) => return RunOutcome::failed(reason.clone()),
+    };
+    let client = s3_client(ctx, region);
+
+    let bytes = match read_object(&client, &run.input).await {
+        Ok(bytes) => bytes,
+        Err(reason) => return RunOutcome::failed(reason),
+    };
+    let table = match read_table(&bytes, run) {
+        Ok(table) => table,
+        Err(reason) => return RunOutcome::failed(reason),
+    };
+    let table = match super::recipe_steps::apply_steps(table, &run.steps).await {
+        Ok(table) => table,
+        Err(reason) => return RunOutcome::failed(reason),
+    };
+
+    // How much one run writes in total, across every part of every output: the product
+    // neither the part count nor the part size caps on its own.
+    let mut written = 0usize;
+    for output in &run.outputs {
+        match write_output(&client, run, &table, output, &mut written).await {
+            Ok(()) => {}
+            Err(reason) => return RunOutcome::failed(reason),
+        }
+    }
+    RunOutcome::succeeded()
+}
+
+/// The bytes of the object `location` names, or the reason the run could not read it.
+///
+/// The published ceiling is checked against the length Amazon S3's own answer DECLARES
+/// before a byte of the body is taken into this process, and against the bytes that
+/// arrive, so an answer that declared no length is bounded too.
+async fn read_object(
     client: &::aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
-) -> Option<::bytes::Bytes> {
-    // The read asks for a prefix of the object rather than the object, so the bytes taken
-    // into this process are bounded before any of them are.
+    location: &S3Location,
+) -> Result<Vec<u8>, String> {
+    let key = location.key.clone().unwrap_or_default();
     let read = client
         .get_object()
-        .bucket(bucket)
-        .key(key)
-        .range(format!("bytes=0-{}", MAX_HEADER_BYTES - 1))
+        .bucket(&location.bucket)
+        .key(&key)
+        // The read asks for at most the ceiling, plus the one byte that shows the object
+        // is past it, so the bound is enforced by the REQUEST: nothing larger is
+        // allocated even when the answer declares no length.
+        .range(format!("bytes=0-{MAX_INPUT_BYTES}"))
         .send()
-        .await;
-    let read = match read {
-        Ok(read) => read,
-        Err(error) => {
-            let code = error.code().unwrap_or_default();
-            if !UNREADABLE_OBJECT_CODES.contains(&code) {
-                // Not the store reporting that it holds no such object, but this emulator
-                // failing to ask its own object store — worth a warning, because a
-                // deployment with no Amazon S3 mounted to ask is one where no dataset's
-                // columns are ever established. The caller's own values are rendered in
-                // their escaped `Debug` form, so a bucket or key carrying a newline
-                // cannot forge a log line.
-                ::tracing::warn!(
-                    bucket = ?bucket,
-                    key = ?key,
-                    code = ?error.code(),
-                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                    "a DataBrew dataset could not be read from the emulator's Amazon S3"
-                );
-            }
-            return None;
-        }
-    };
-    match read.body.collect().await {
-        Ok(body) => {
-            // The `Range` above is what bounds the read; the slice bounds what is HELD,
-            // so an answer that ignored the range cannot grow the column list either.
-            let bytes = body.into_bytes();
-            let held = bytes.len().min(MAX_HEADER_BYTES);
-            Some(bytes.slice(..held))
-        }
-        Err(error) => {
-            ::tracing::warn!(
-                bucket = ?bucket,
+        .await
+        .map_err(|error| {
+            // The caller's own values are rendered in their escaped `Debug` form, so a
+            // bucket or key carrying a newline cannot forge a log line.
+            ::tracing::debug!(
+                bucket = ?location.bucket,
                 key = ?key,
-                error = %error,
-                "a DataBrew dataset's bytes did not arrive from the emulator's Amazon S3"
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "a DataBrew job run could not read its dataset object"
             );
-            None
+            format!(
+                "The dataset's object s3://{}/{key} could not be read.",
+                location.bucket
+            )
+        })?;
+    if let Some(declared) = read
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+    {
+        if declared > MAX_INPUT_BYTES {
+            return Err(input_too_large(declared));
         }
+    }
+    let body = read
+        .body
+        .collect()
+        .await
+        .map_err(|error| format!("The dataset's object could not be read in full: {error}"))?
+        .into_bytes();
+    if body.len() > MAX_INPUT_BYTES {
+        return Err(input_too_large(body.len()));
+    }
+    Ok(body.to_vec())
+}
+
+/// The table `bytes` holds, read as the dataset's own format.
+fn read_table(bytes: &[u8], run: &ReadyRun) -> Result<Table, String> {
+    match run.input_format.to_ascii_uppercase().as_str() {
+        "CSV" => tabular_data::read_csv(bytes, run.delimiter, run.header_row),
+        "JSON" => tabular_data::read_json(bytes),
+        other => Err(format!(
+            "The dataset's {other} format is not one this emulator reads; it reads CSV and JSON."
+        )),
     }
 }
 
-/// The Amazon S3 client a dataset object is read with, addressed to `region`.
+/// Write `table` to `output`: one part file per group of rows, named the way DataBrew
+/// names a job's output parts. `written` carries how many bytes this RUN has written so
+/// far, across every output, and is held to [`tabular_data::MAX_RUN_OUTPUT_BYTES`].
+async fn write_output(
+    client: &::aws_sdk_s3::Client,
+    run: &ReadyRun,
+    table: &Table,
+    output: &Output,
+    written: &mut usize,
+) -> Result<(), String> {
+    // A compressed output would have to carry the bytes of the algorithm the job asked
+    // for; this emulator writes the output as it encoded it, so a job asking for one is
+    // not a job it performed.
+    if let Some(compression) = &output.compression_format {
+        return Err(format!(
+            "The output's {compression} compression is not one this emulator writes; it writes \
+             uncompressed output."
+        ));
+    }
+    let format = output
+        .format
+        .clone()
+        .unwrap_or_else(|| DEFAULT_OUTPUT_FORMAT.to_string())
+        .to_ascii_uppercase();
+    let extension = match format.as_str() {
+        "CSV" => "csv",
+        "JSON" => "json",
+        other => {
+            return Err(format!(
+                "The output's {other} format is not one this emulator writes; it writes CSV and \
+                 JSON."
+            ))
+        }
+    };
+    let delimiter = output
+        .format_options
+        .as_ref()
+        .and_then(|options| options.csv.as_ref())
+        .and_then(|csv| csv.delimiter.as_deref())
+        .and_then(single_byte)
+        .unwrap_or(tabular_data::DEFAULT_DELIMITER);
+
+    // The part count is CLAMPED to the modelled range before it sizes the split or this
+    // loop, so neither is sized by a raw request field.
+    let files = output
+        .max_output_files
+        .unwrap_or(DEFAULT_MAX_OUTPUT_FILES)
+        .clamp(1, MAX_OUTPUT_FILES);
+    let files = usize::try_from(files).unwrap_or(1);
+    for (index, rows) in table.parts(files).iter().enumerate() {
+        let body = match format.as_str() {
+            "JSON" => tabular_data::write_json(table, rows)?,
+            _ => tabular_data::write_csv(table, rows, delimiter)?,
+        };
+        *written = written.saturating_add(body.len());
+        if *written > tabular_data::MAX_RUN_OUTPUT_BYTES {
+            return Err(format!(
+                "The job's outputs are larger than the {} bytes this emulator writes in one job \
+                 run.",
+                tabular_data::MAX_RUN_OUTPUT_BYTES
+            ));
+        }
+        let key = part_key(&output.location, &run.job_name, index, extension);
+        // "A value that, if true, means that any data in the location specified for
+        // output is overwritten with new output" (model: `Output$Overwrite`) — so an
+        // output that did NOT ask for it does not replace an object the location already
+        // holds: the run fails instead, leaving what was there.
+        if !output.overwrite && object_exists(client, &output.location.bucket, &key).await {
+            return Err(format!(
+                "The output location already holds s3://{}/{key} and the output does not \
+                 overwrite.",
+                output.location.bucket
+            ));
+        }
+        client
+            .put_object()
+            .bucket(&output.location.bucket)
+            .key(&key)
+            .body(::aws_sdk_s3::primitives::ByteStream::from(body))
+            .send()
+            .await
+            .map_err(|error| {
+                ::tracing::debug!(
+                    bucket = ?output.location.bucket,
+                    key = ?key,
+                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                    "a DataBrew job run could not write its output object"
+                );
+                format!(
+                    "The job's output could not be written to s3://{}/{key}.",
+                    output.location.bucket
+                )
+            })?;
+    }
+    Ok(())
+}
+
+/// Whether Amazon S3 ANSWERED that it holds an object at `bucket`/`key`.
+///
+/// `false` for every answer that is not the store reporting the object: an emulator with
+/// no object store to ask establishes nothing, and a run is not failed on a guess.
+async fn object_exists(client: &::aws_sdk_s3::Client, bucket: &str, key: &str) -> bool {
+    client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .is_ok()
+}
+
+/// The key one output part file is written under: the output location's own key, then the
+/// JOB's name, the zero-padded part number and the format's extension
+/// (`<prefix><job name>_part00000.csv`).
+///
+/// The location's `Key` is "the location in Amazon S3 where the job writes its output"
+/// (model: `Output$Location`), so it is a prefix the part names hang off rather than an
+/// object name of its own: the run writes one object per part under it.
+fn part_key(location: &S3Location, job_name: &str, index: usize, extension: &str) -> String {
+    format!(
+        "{}{job_name}_part{index:05}.{extension}",
+        location.key.clone().unwrap_or_default()
+    )
+}
+
+/// A modelled single-character delimiter as the byte the reader and writer take (model:
+/// `CsvOptions$Delimiter` is `len 1..1`). `None` for a value that is not one byte, which
+/// leaves the default delimiter in place rather than failing the run.
+fn single_byte(value: &str) -> Option<u8> {
+    let bytes = value.as_bytes();
+    match bytes {
+        [only] => Some(*only),
+        _ => None,
+    }
+}
+
+/// The reason a run fails for an object larger than [`MAX_INPUT_BYTES`].
+fn input_too_large(declared: usize) -> String {
+    format!(
+        "The dataset's object is {declared} bytes, larger than the {MAX_INPUT_BYTES} bytes this \
+         emulator reads in one job run."
+    )
+}
+
+/// The Amazon S3 client a run reads its dataset and writes its output with, addressed to
+/// `region`.
 ///
 /// The transport is the emulator's own in-process callback, so the `endpoint_url` below is
 /// an ADDRESS the in-process router reads rather than a host any resolver looks up: this
 /// client reaches the emulator's own Amazon S3 and nothing else, whatever bucket or key a
-/// dataset names. The one caller-supplied value that reaches its authority is the signing
-/// region, and [`super::request_region`] takes that from the request's own SigV4 credential
-/// scope and otherwise answers the default Region.
+/// caller names. The Region is narrowed to a Region label before it reaches the authority.
 ///
 /// There is nothing to retry, time out or watch for a stalled stream, each of which would
 /// need a sleep implementation this client is not given. The same goes for caching the
 /// identity: the credentials the callback hands over are used directly, and they only sign
 /// this operation's in-process calls.
 fn s3_client(
-    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> ::aws_sdk_s3::Client {
+    let region = ::service_common::arn::region_label(region).unwrap_or(super::DEFAULT_REGION);
     let config = ::aws_sdk_s3::Config::builder()
         .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
         .region(::aws_sdk_s3::config::Region::new(region.to_string()))
         .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
-        // The in-process transport routes on the request's own path, and a virtual-host
-        // bucket name is not a host this emulator resolves, so the request addresses its
-        // bucket in the path.
+        // The emulator serves one endpoint for every service, so the bucket travels in
+        // the path rather than in a per-bucket host the router could not resolve.
         .force_path_style(true)
         .credentials_provider(ctx.callback().aws_credentials_provider())
         .http_client(ctx.callback().http_client())

@@ -159,6 +159,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        let region = crate::state::request_region(ctx);
+        // A project is acted upon AS the role it names (model: `RoleArn` — "the IAM role
+        // to be assumed for this request"), so the role is resolved against this
+        // account's IAM, and the trust policy it carries, before anything is stored: the
+        // same reading `CreateRecipeJob` makes of the role its job runs as
+        // (`crate::state::role_is_unassumable`), awaited with no store guard held.
+        if crate::state::role_is_unassumable(ctx, &region, &input.role_arn).await {
+            return Err(CreateProjectErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::untrusted_role_message(&input.role_arn)),
+            })
+            .into());
+        }
+
         let now = ::std::time::SystemTime::now();
         let principal = crate::state::request_principal();
         let record = crate::state::ProjectRecord {
@@ -170,11 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // keeps reading the documented default rather than a frozen copy of it.
             sample: input.sample.clone(),
             tags: crate::state::stored_tags(input.tags.as_ref()),
-            resource_arn: crate::state::resource_arn(
-                &crate::state::request_region(ctx),
-                "project",
-                &input.name,
-            ),
+            resource_arn: crate::state::resource_arn(&region, "project", &input.name),
             // A project that has only been created has no modification to report, so
             // the audit's last-modified pair stays unset until an update runs.
             audit: crate::state::Audit::created(now, principal),

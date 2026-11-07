@@ -18,15 +18,19 @@ use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Dataset, FormatOptions, Input, JobRun, Output, PathOptions, Recipe, RecipeReference, RecipeStep,
-    Sample,
+    DataCatalogOutput, Dataset, DatabaseOutput, FormatOptions, Input, JobRun, Output, PathOptions,
+    Recipe, RecipeReference, RecipeStep, Sample,
 };
 
-/// What a recipe-job run DOES: the dataset columns it reads, the recipe steps it applies
-/// to them, and the terminal state that pair decides.
+/// What a recipe job RUN does: reads the dataset's object, applies the recipe version's
+/// steps and writes the result to the job's outputs.
 pub mod job_execution;
+/// The transformations a recipe's steps name, applied to a read table.
+pub mod recipe_steps;
+/// The tabular value a dataset's object holds and a job's output is written from.
+pub mod tabular_data;
 
-pub use job_execution::{apply_steps, dataset_columns, recipe_step_error_message, RunOutcome};
+pub use recipe_steps::recipe_step_error_message;
 
 /// The resource kinds DataBrew states a refusal about in its SHORT form: the kind, the
 /// identifier the request carried and the bare predicate, with no terminating period
@@ -244,6 +248,80 @@ pub fn dataset_in_use_by_project_message(dataset_name: &str, project_name: &str)
 /// The region an ARN carries when the request's SigV4 scope names none.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// The service principal a role must let assume it to be a role DataBrew runs a job as.
+///
+/// A job's `RoleArn` is "the IAM role to be assumed when DataBrew runs the job" (model:
+/// `CreateRecipeJobRequest$RoleArn`), and the principal that assumes it is this service.
+pub const SERVICE_PRINCIPAL: &str = "databrew.amazonaws.com";
+
+/// The message DataBrew answers its `ValidationException` with for a job whose data
+/// access role does not let this service assume it: the service's own sentence, with the
+/// role ARN the REQUEST carried as its variable part, so a client can tell which value
+/// was refused.
+///
+/// The sentence the model documents on the error SHAPE ("The input parameters for this
+/// request failed validation.") describes the error class rather than this refusal, and
+/// the error carries no per-member field, so the message is the only detail a client has.
+pub fn untrusted_role_message(role_arn: &str) -> String {
+    format!("DataBrew is not a trusted entity for the data access role {role_arn}.")
+}
+
+/// The message DataBrew answers its `ValidationException` with when a job create selects
+/// no output at all: every modelled output list (`Outputs`, `DataCatalogOutputs`,
+/// `DatabaseOutputs`) is absent, so the job has nowhere to write and DataBrew refuses it
+/// rather than creating a job whose run can produce nothing.
+pub const NO_OUTPUTS_SELECTED_MESSAGE: &str = "No outputs were selected for this job.";
+
+/// The `MaxCapacity` a job carries when the create asked for none.
+///
+/// `MaxCapacity` is "the maximum number of nodes that DataBrew can consume when the job
+/// processes data" (model: `CreateRecipeJobRequest$MaxCapacity`, whose wire default is
+/// 0 — "no value given"): a job runs on nodes, so DataBrew fills in its own default
+/// rather than running a job with none, and that is the capacity a later `DescribeJob`
+/// reports.
+pub const DEFAULT_MAX_CAPACITY: i32 = 5;
+
+/// The `MaxCapacity` a created job carries: the one the request asked for, else
+/// [`DEFAULT_MAX_CAPACITY`]. A request that carries no value sends the modelled default
+/// of 0, which is not a number of nodes a job can run on.
+pub fn effective_max_capacity(requested: i32) -> i32 {
+    if requested > 0 {
+        requested
+    } else {
+        DEFAULT_MAX_CAPACITY
+    }
+}
+
+/// Whether this emulator's own IAM ANSWERED that `role_arn` is a role DataBrew cannot
+/// assume: this account holds a role under the name the ARN carries, and the trust policy
+/// that role carries does not admit [`SERVICE_PRINCIPAL`].
+///
+/// A job RUNS AS its `RoleArn`, so a role DataBrew cannot assume backs no run at all and
+/// the service settles that before it stores the job. The whole question — which role of
+/// this account the value names, what IAM answers about it, and whether the trust document
+/// it carries admits a service principal — is the ONE reading every emulated service that
+/// resolves a caller-supplied execution role shares
+/// (`service_common::iam_role::held_role_is_unassumable`), so this crate states only WHICH
+/// principal has to be admitted and WHICH operations ask. IAM is reached the way any
+/// emulated service reaches another: an AWS SDK client over the emulator's own in-process
+/// callback, so nothing here opens a socket or reads an ambient credential.
+///
+/// `false` — do not refuse — wherever nothing is KNOWN about a role of this account: a
+/// value naming no role of this account, an emulator with no IAM mounted to ask, an answer
+/// this emulator could not read, and a role this account's IAM holds nothing under. The
+/// last case is why the reading is the one that SERVES such a request: a data access role
+/// is routinely provisioned out of band, so "IAM holds no such role" is evidence about
+/// this emulator's store rather than about the role the caller named. A refusal has to be
+/// grounded in the trust document IAM itself returned. Awaited with NO store guard held.
+pub async fn role_is_unassumable(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+) -> bool {
+    ::service_common::iam_role::held_role_is_unassumable(ctx, region, role_arn, SERVICE_PRINCIPAL)
+        .await
+}
+
 /// `MaxResults100`'s modelled maximum, used as the page size when a request asks
 /// for none (model: `ListDatasets`/`ListJobRuns` `maxResults` range 1..100).
 pub const MAX_PAGE_SIZE: i32 = 100;
@@ -413,6 +491,13 @@ pub struct JobRecord {
     pub project_name: Option<String>,
     pub recipe_reference: Option<RecipeReference>,
     pub outputs: Vec<Output>,
+    /// The Glue Data Catalog outputs the create selected, held so a read reports what the
+    /// job was created with. A recipe job run writes an Amazon S3 output; these are
+    /// reported, never written ([`job_execution::plan`]).
+    pub data_catalog_outputs: Vec<DataCatalogOutput>,
+    /// The JDBC database outputs the create selected, held for the reason
+    /// [`JobRecord::data_catalog_outputs`] gives.
+    pub database_outputs: Vec<DatabaseOutput>,
     pub role_arn: String,
     pub max_capacity: i32,
     pub max_retries: i32,
@@ -552,14 +637,57 @@ pub struct JobRunRecord {
     pub completed_on: Option<SystemTime>,
     pub error_message: Option<String>,
     pub outputs: Vec<Output>,
+    /// The other outputs the job was created with, copied onto the run for the reason
+    /// every other member of the job's shape is ([`JobRecord::data_catalog_outputs`]).
+    pub data_catalog_outputs: Vec<DataCatalogOutput>,
+    pub database_outputs: Vec<DatabaseOutput>,
     pub recipe_reference: Option<RecipeReference>,
     pub log_subscription: Option<String>,
     pub log_group_name: Option<String>,
-    /// The terminal state this run is owed once it has executed, decided when the run was
-    /// admitted from the dataset it reads and the recipe version it applies
-    /// ([`RunOutcome`]). [`JobRunRecord::advance_to`] is what materialises it.
-    pub outcome: RunOutcome,
+    /// What the run's WORK answered, recorded when the run was performed and revealed
+    /// by [`JobRunRecord::advance_to`] once the terminal transition falls due.
+    ///
+    /// A run is reported non-terminal first and reaches its terminal state on the clock,
+    /// but the state it reaches is not the clock's to choose: it is whatever reading the
+    /// dataset, applying the recipe and writing the outputs answered
+    /// ([`job_execution::perform`]). Holding the two apart is what keeps a `SUCCEEDED`
+    /// run backed by the objects the run wrote.
+    pub terminal_outcome: Option<RunOutcome>,
 }
+
+/// What performing a job run answered: the terminal `JobRunState` it reached and, for a
+/// run that did not finish its work, the `ErrorMessage` that says why.
+#[derive(Debug, Clone)]
+pub struct RunOutcome {
+    pub state: String,
+    pub error_message: Option<String>,
+}
+
+impl RunOutcome {
+    /// The outcome of a run that read its dataset, applied its recipe and wrote every
+    /// output.
+    pub fn succeeded() -> Self {
+        Self {
+            state: "SUCCEEDED".to_string(),
+            error_message: None,
+        }
+    }
+
+    /// The outcome of a run that did not write its output, carrying the reason as the
+    /// modelled `ErrorMessage`.
+    pub fn failed(reason: String) -> Self {
+        Self {
+            state: "FAILED".to_string(),
+            error_message: Some(reason),
+        }
+    }
+}
+
+/// The `ErrorMessage` a run reports when its work never reported an outcome at all —
+/// the handler that started it did not get to the end (the client went away, the
+/// process was shutting down). Nothing ran, so nothing may be reported as succeeded.
+pub const UNPERFORMED_RUN_MESSAGE: &str =
+    "The job run did not complete: the emulator did not finish performing it.";
 
 /// Per-service state for com-amazonaws-databrew-awsgluedatabrew. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -1066,19 +1194,24 @@ impl JobRunRecord {
     /// `ExecutionTime` is the whole seconds the run consumed (model:
     /// "The amount of time, in seconds, during which the job run consumed
     /// resources"), measured from `StartedOn` to the instant the run completed.
+    ///
+    /// The terminal state is the one the run's WORK reached
+    /// ([`JobRunRecord::terminal_outcome`]) — the clock decides WHEN it is reported, not
+    /// WHICH it is. A run whose work never reported an outcome reaches `FAILED` carrying
+    /// [`UNPERFORMED_RUN_MESSAGE`]: nothing performed it, so there is no success to
+    /// report for it.
     pub fn advance_to(&mut self, now: SystemTime) {
         if self.state == "STARTING" && now >= self.started_on + RUN_RUNNING_DUE_AFTER {
             self.state = "RUNNING".to_string();
         }
         if self.state == "RUNNING" && now >= self.started_on + RUN_TERMINAL_DUE_AFTER {
             let completed_on = self.started_on + RUN_TERMINAL_DUE_AFTER;
-            match &self.outcome {
-                RunOutcome::Succeeded => self.state = "SUCCEEDED".to_string(),
-                RunOutcome::Failed(diagnosis) => {
-                    self.state = "FAILED".to_string();
-                    self.error_message = Some(diagnosis.clone());
-                }
-            }
+            let outcome = self
+                .terminal_outcome
+                .clone()
+                .unwrap_or_else(|| RunOutcome::failed(UNPERFORMED_RUN_MESSAGE.to_string()));
+            self.state = outcome.state;
+            self.error_message = outcome.error_message;
             self.completed_on = Some(completed_on);
             self.execution_time = completed_on
                 .duration_since(self.started_on)
@@ -1102,8 +1235,8 @@ impl JobRunRecord {
             log_subscription: self.log_subscription.clone(),
             log_group_name: self.log_group_name.clone(),
             outputs: wire_list(&self.outputs),
-            data_catalog_outputs: None,
-            database_outputs: None,
+            data_catalog_outputs: wire_list(&self.data_catalog_outputs),
+            database_outputs: wire_list(&self.database_outputs),
             recipe_reference: self.recipe_reference.clone(),
             started_by: Some(self.started_by.clone()),
             started_on: Some(wire_date(self.started_on)),
