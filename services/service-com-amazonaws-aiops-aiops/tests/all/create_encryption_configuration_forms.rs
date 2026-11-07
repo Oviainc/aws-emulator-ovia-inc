@@ -3,16 +3,17 @@
 //! End-to-end HTTP tests for the `encryptionConfiguration` a CREATE stores, over every
 //! FORM the model admits for the structure.
 //!
-//! The rule: `encryptionConfiguration` is how a request asks for a customer managed KMS
-//! key, and the Amazon Web Services owned key is used when a request does not ask for
-//! one — so a create whose configuration names no key type stores the documented
-//! default, a create whose configuration DOES name one stores it as given, and the
-//! stored member therefore always names how the group's data is encrypted.
+//! The rule: `encryptionConfiguration` is how a request names the key its investigation
+//! data is encrypted with, so a write keeps the key the request names — a configuration
+//! carrying a `kmsKeyId` is stored with it, and one naming the id but no `type` is
+//! stored as the customer managed key type it asks for — while a request that names no
+//! key at all gets the documented Amazon Web Services owned key. The stored member
+//! therefore always names how the group's data is encrypted.
 //!
 //! Neither member of the structure is `@required`
 //! (`smithy_query(query="shape",shape="EncryptionConfiguration")`), so the member
 //! absent, a structure carrying nothing and a structure carrying only a `kmsKeyId` are
-//! all requests the model admits — and each of them names no key type.
+//! all requests the model admits.
 //!
 //! The rows are DERIVED from the modelled value set
 //! (`ENCRYPTION_CONFIGURATION_TYPE_VALUES`, which carries exactly what
@@ -37,6 +38,11 @@ const ACCOUNT: &str = "000000000000";
 
 /// A role ARN that satisfies the modelled `RoleArn` (len 20..2048, `^arn:.*$`).
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/AIOpsAssistantRole";
+
+/// The customer-managed member of the modelled `EncryptionConfigurationType` value set
+/// (`smithy_query(query="shape",shape="EncryptionConfigurationType")`), surfaced as
+/// `ENCRYPTION_CONFIGURATION_TYPE_VALUES`.
+const CUSTOMER_MANAGED_KEY_TYPE: &str = "CUSTOMER_MANAGED_KMS_KEY";
 
 /// Real AWS Regions the cases sign for, in order; past the list the names are synthetic
 /// ones inside what a SigV4 credential scope admits (`[a-zA-Z0-9-]`).
@@ -192,11 +198,15 @@ fn supplied(form: Form, key: &str) -> Option<Value> {
 }
 
 /// What the rule says the group stores for `form`, and so what every later read of it
-/// reports: the configuration as given when it names a key type, and the documented
-/// Amazon Web Services owned key when it names none.
+/// reports: the configuration as given when it names a key type, the customer managed
+/// key type with the supplied id when it names an id and no type, and the documented
+/// Amazon Web Services owned key when it names no key at all.
 fn expected(form: Form, key: &str) -> Value {
     match supplied(form, key) {
         Some(structure) if structure.get("type").is_some() => structure,
+        Some(structure) if structure.get("kmsKeyId").is_some() => {
+            json!({ "type": CUSTOMER_MANAGED_KEY_TYPE, "kmsKeyId": key })
+        }
         _ => json!({ "type": AWS_OWNED_KEY_TYPE }),
     }
 }

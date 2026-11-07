@@ -344,9 +344,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             region: region.clone(),
             name: input.name,
             role_arn: input.role_arn,
-            // A request that asks for no customer managed key — by omitting
-            // `encryptionConfiguration`, or by carrying a structure that names no key
-            // type — selects the Amazon Web Services owned key, which is a
+            // The key the request names is the key the group uses: a configuration
+            // carrying a `kmsKeyId` is stored with it, and one naming the id but no
+            // type is stored as the customer managed key type it asks for. A request
+            // that names no key at all — the member omitted, or a structure carrying
+            // neither member — selects the Amazon Web Services owned key, which is a
             // configuration like any other: it is stored, so every later read reports
             // how this group's data is encrypted. The rule is single-homed in
             // `crate::state::stored_encryption_configuration`, which the update path

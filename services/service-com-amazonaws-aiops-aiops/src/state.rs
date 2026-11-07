@@ -1188,6 +1188,11 @@ pub const TAGGING_RESOURCE_NOT_FOUND: &str = "Resource was not found";
 /// (`smithy_query(query="shape",shape="EncryptionConfigurationType")`).
 pub const AWS_OWNED_KEY_TYPE: &str = "AWS_OWNED_KEY";
 
+/// The `EncryptionConfigurationType` value naming a customer managed KMS key, taken
+/// from the modelled value set
+/// (`smithy_query(query="shape",shape="EncryptionConfigurationType")`).
+pub const CUSTOMER_MANAGED_KMS_KEY_TYPE: &str = "CUSTOMER_MANAGED_KMS_KEY";
+
 /// The encryption configuration a group carries when its create omitted one.
 ///
 /// From `encryptionConfiguration`'s own documentation: "If you omit this parameter,
@@ -1206,25 +1211,39 @@ pub fn default_encryption_configuration() -> EncryptionConfiguration {
 /// The encryption configuration a write STORES for the configuration it was given,
 /// which is what every later read of the group reports.
 ///
-/// `type` is not `@required` on the structure
+/// Neither member of the structure is `@required`
 /// (`smithy_query(query="shape",shape="EncryptionConfiguration")`), so a request may
-/// name the member while naming no key type at all — and `encryptionConfiguration` is
-/// documented as the way to ask for a customer managed KMS key, with the Amazon Web
-/// Services owned key used when the request does not ask for one. A configuration that
-/// names no type therefore asks for no customer managed key and selects the same
-/// documented default as omitting the member does
-/// ([`default_encryption_configuration`]), rather than being stored as given: the
-/// stored member always names how the group's data is encrypted.
+/// name the member while naming only a key type, only a key id, or neither. What a
+/// write stores follows from what the request NAMES:
+///
+/// * a key the request names is the key the group uses — `kmsKeyId` is documented as
+///   the id of the customer managed key the group's data is encrypted with, so a
+///   configuration carrying one is stored with that id, and a configuration naming the
+///   id but no type is stored as the customer managed key type
+///   ([`CUSTOMER_MANAGED_KMS_KEY_TYPE`]) it asks for: the structure's own documentation
+///   is "Use this structure to specify a customer managed KMS key to use to encrypt
+///   investigation data";
+/// * a request that names NO key at all — the member omitted, or a structure carrying
+///   neither member — asks for no customer managed key and gets the documented Amazon
+///   Web Services owned key ([`default_encryption_configuration`]).
+///
+/// Either way the stored member names how the group's data is encrypted, with the key
+/// the caller named when they named one.
 ///
 /// Single-homed here because every writer of the member — the create and the update —
 /// stores what this returns, so the two cannot disagree about what a configuration
-/// naming no type means.
+/// means.
 pub fn stored_encryption_configuration(
     supplied: Option<EncryptionConfiguration>,
 ) -> EncryptionConfiguration {
-    supplied
-        .filter(|configuration| configuration.r#type.is_some())
-        .unwrap_or_else(default_encryption_configuration)
+    match supplied {
+        Some(configuration) if configuration.r#type.is_some() => configuration,
+        Some(configuration) if configuration.kms_key_id.is_some() => EncryptionConfiguration {
+            r#type: Some(CUSTOMER_MANAGED_KMS_KEY_TYPE.to_string()),
+            kms_key_id: configuration.kms_key_id,
+        },
+        _ => default_encryption_configuration(),
+    }
 }
 
 /// Why a `crossAccountConfigurations` list is unacceptable, or `None` when every

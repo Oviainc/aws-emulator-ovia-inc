@@ -267,10 +267,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A configuration the request carries replaces the stored one through the same
         // normalisation the create path stores through
-        // (`crate::state::stored_encryption_configuration`): one that names no key type
-        // asks for no customer managed key and so selects the documented Amazon Web
-        // Services owned key, which means the stored member keeps naming how this
-        // group's data is encrypted rather than going blank.
+        // (`crate::state::stored_encryption_configuration`): the key it names is kept,
+        // and one that names no key at all asks for no customer managed key and so
+        // selects the documented Amazon Web Services owned key, which means the stored
+        // member keeps naming how this group's data is encrypted rather than going
+        // blank.
         if input.encryption_configuration.is_some() {
             group.encryption_configuration = Some(crate::state::stored_encryption_configuration(
                 input.encryption_configuration,

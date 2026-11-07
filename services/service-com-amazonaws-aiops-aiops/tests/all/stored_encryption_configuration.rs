@@ -8,12 +8,14 @@
 //! restJson1 serialization, the modelled-constraint walk and the handlers — so what is
 //! asserted is what a signed AWS SDK request observes.
 //!
-//! The rule under test: `encryptionConfiguration` is how a request asks for a customer
-//! managed KMS key, and the Amazon Web Services owned key is used when a request does
-//! not ask for one — so a write whose configuration names no key type (the member
-//! omitted, or a structure carrying no `type`; `type` is not `@required`, see
-//! `smithy_query(query="shape",shape="EncryptionConfiguration")`) stores that
-//! documented default, and a configuration that DOES name a type is stored as given.
+//! The rule under test: `encryptionConfiguration` is how a request names the key its
+//! investigation data is encrypted with, so a write keeps the key the request names — a
+//! configuration carrying a `kmsKeyId` is stored with it, and one naming the id but no
+//! `type` (`type` is not `@required`, see
+//! `smithy_query(query="shape",shape="EncryptionConfiguration")`) is stored as the
+//! customer managed key type it asks for — while a request that names no key at all
+//! (the member omitted, or a structure carrying neither member) gets the documented
+//! Amazon Web Services owned key.
 //! Both writers of the member apply it, so each row below is driven through
 //! `CreateInvestigationGroup` AND through `UpdateInvestigationGroup`.
 //!
@@ -205,8 +207,8 @@ struct Row {
 
 /// The rows, differing along the FORM of the configuration the request carries: the
 /// member absent, a structure carrying no member at all, a structure carrying only a
-/// `kmsKeyId`, and — the unchanged half of the rule — each member of the modelled value
-/// set named explicitly, with and without a key id.
+/// `kmsKeyId`, and each member of the modelled value set named explicitly, with and
+/// without a key id.
 fn rows(region: &str) -> Vec<Row> {
     let key = key_arn(region);
     let default = json!({ "type": AWS_OWNED_KEY_TYPE });
@@ -224,7 +226,7 @@ fn rows(region: &str) -> Vec<Row> {
         Row {
             case: "a kmsKeyId with no type",
             supplied: Some(json!({ "kmsKeyId": key })),
-            expected: default.clone(),
+            expected: json!({ "type": CUSTOMER_MANAGED_KEY_TYPE, "kmsKeyId": key }),
         },
         Row {
             case: "the AWS owned key, named",
@@ -265,8 +267,9 @@ async fn a_create_stores_a_configuration_that_names_the_key_type() {
 }
 
 /// An update that names the member stores the same configuration the create would have
-/// stored for it — so a configuration naming no key type replaces the stored one with
-/// the documented default rather than erasing what the group reports.
+/// stored for it — so the key the request names survives the write, and a configuration
+/// naming no key replaces the stored one with the documented default rather than erasing
+/// what the group reports.
 #[tokio::test]
 async fn an_update_naming_the_member_stores_a_configuration_that_names_the_key_type() {
     let router = emulator();
