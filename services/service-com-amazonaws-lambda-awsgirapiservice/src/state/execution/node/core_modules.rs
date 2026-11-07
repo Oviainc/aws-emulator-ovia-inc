@@ -17,11 +17,38 @@
 //! handler that needs one fails to import exactly as it would if the dependency were
 //! missing from its package; nothing here pretends to be a module it is not.
 
+/// The byte container and its codecs.
+mod buffer;
+/// The digests, keyed digests and random bytes.
+mod crypto;
+/// The in-memory filesystem a function has.
+mod fs;
+/// The stream object model and the text decoder over it.
+mod streams;
+/// The environment report, the assertions, and the two text codecs.
+mod system;
+/// The scheduling calls, as modules.
+mod timers;
+
 /// Every core module, by the name a handler imports it under.
 pub(super) const CORE_MODULES: &[(&str, &str)] = &[
     ("path", PATH_SOURCE),
     ("util", UTIL_SOURCE),
     ("events", EVENTS_SOURCE),
+    ("buffer", buffer::BUFFER_SOURCE),
+    ("crypto", crypto::CRYPTO_SOURCE),
+    ("fs", fs::FS_SOURCE),
+    ("fs/promises", fs::FS_PROMISES_SOURCE),
+    ("timers", timers::TIMERS_SOURCE),
+    ("timers/promises", timers::TIMERS_PROMISES_SOURCE),
+    ("stream", streams::STREAM_SOURCE),
+    ("stream/promises", streams::STREAM_PROMISES_SOURCE),
+    ("string_decoder", streams::STRING_DECODER_SOURCE),
+    ("os", system::OS_SOURCE),
+    ("assert", system::ASSERT_SOURCE),
+    ("assert/strict", system::ASSERT_SOURCE),
+    ("querystring", system::QUERYSTRING_SOURCE),
+    ("url", system::URL_SOURCE),
 ];
 
 /// The source of the core module `name` names, or `None` when this emulator supplies none.
@@ -536,7 +563,7 @@ mod tests {
                 );
             }
         }
-        for absent in ["fs", "net", "child_process", "node:fs", "os", "", "node:"] {
+        for absent in ["net", "child_process", "worker_threads", "node:net", "", "node:"] {
             assert!(
                 core_module_source(absent).is_none(),
                 "case {absent:?}: this emulator supplies no such core module, so none must \

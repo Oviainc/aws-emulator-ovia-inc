@@ -45,6 +45,26 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 sha2 = { workspace = true }
 # ...reported base64-encoded, as the model's CodeSha256 member describes it.
 base64 = "0.22"
+# The other two digest families the `crypto` core module a Node handler imports computes
+# (`state::execution::node::digest`), beside the SHA-2 one above, and the keyed form of all
+# of them. Taken from crates rather than written here: a digest is arithmetic a maintained
+# implementation already states.
+sha1 = "0.10"
+md-5 = "0.10"
+hmac = "0.12"
+# The hexadecimal the guest hands bytes over and reads digests back as.
+hex = { workspace = true }
+# The cryptographic random bytes `crypto.randomBytes`/`randomUUID` draw from: the one
+# source of randomness a run has, read from the platform rather than from a seed.
+getrandom = "0.3"
+# The IANA time-zone database a run's `Intl` and local `Date` readings stand on
+# (`state::execution::node::intl`): a zone's offset at an instant, with its daylight-saving
+# transitions, is this database's answer, compiled into the binary rather than read from a
+# host path. `chrono` is taken for the calendar arithmetic `chrono-tz` states its offsets in
+# terms of, with no clock feature, so no reading of the HOST's own zone is compiled in: the
+# only zone a run reads is the one its own `TZ` names.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = { version = "0.10", default-features = false }
 # RevisionId is a UUID, minted fresh on every change to a function.
 uuid = { version = "1", features = ["v4"] }
 # The AWS SDK clients the event source mapping poller (`state::event_source_poller`)
@@ -143,7 +163,6 @@ aws-smithy-eventstream = "0.60"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-hex = { workspace = true }
 # A deployment package the invoke tests upload is a .zip archive they write in memory.
 zip = { version = "9", default-features = false, features = ["deflate"] }
 # `time` on top of the workspace features: the data-plane tests wait out the state-settle

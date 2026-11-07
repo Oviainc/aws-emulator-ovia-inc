@@ -414,7 +414,13 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
             variables: resolved_config.environment.clone(),
             memory_size: resolved_config.memory_size,
             timeout: resolved_config.timeout,
+            architecture: resolved_config
+                .architectures
+                .first()
+                .cloned()
+                .unwrap_or_default(),
             zip_bytes: record.code_of(&version).zip_bytes.clone(),
+            layer_zips: crate::state::layer_archives(&resolved_config.layers),
             payload: self.event_for(target, incoming, ctx, &record.region),
             // A function URL request carries no `ClientContext` and no `TenantId`: both are
             // members of the `Invoke` API, which this plane is not.

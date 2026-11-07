@@ -71,6 +71,33 @@ pub use aws_api::AwsAccess;
 /// The AWS SDK modules a Python handler imports, which that seam is reached through.
 mod aws_sdk_guest;
 
+/// The AWS SDK modules a node handler imports, reached through that same seam.
+mod node_sdk_guest;
+
+/// How many LAYER archives one run reads.
+///
+/// AWS's own quota is five layers per function, so a configuration naming more than that
+/// has more layers than a function may have. The cap is applied in HOST code before an
+/// archive is read, so the number of archives one invocation holds and inflates does not
+/// grow with the list a caller wrote — the same ARN repeated is still one archive per entry.
+pub const MAX_RUN_LAYER_ARCHIVES: usize = 5;
+
+/// The archives of the layers one function's configuration holds, in the order it names
+/// them, at most [`MAX_RUN_LAYER_ARCHIVES`] of them.
+///
+/// A layer entry this emulator holds no archive bytes for contributes nothing: the layer
+/// root simply does not hold its files, which is what a handler importing from it sees. The
+/// bytes are SHARED rather than copied — a published layer version is immutable — so an
+/// invocation holds one reference per entry and not one copy.
+#[must_use]
+pub fn layer_archives(layers: &[super::FunctionLayer]) -> Vec<Arc<Vec<u8>>> {
+    layers
+        .iter()
+        .take(MAX_RUN_LAYER_ARCHIVES)
+        .filter_map(|layer| layer.zip_bytes.clone())
+        .collect()
+}
+
 /// The `posix` module a run's Python is built on: this emulator's own, with no host call
 /// in it.
 mod host_posix;
@@ -227,11 +254,19 @@ pub struct Invocation {
     pub variables: BTreeMap<String, String>,
     /// The function's `MemorySize`, in MB.
     pub memory_size: i32,
+    /// The ARCHITECTURE the function is configured for (`Architectures`), which is what
+    /// the runtime reports as its own.
+    pub architecture: String,
     /// The function's `Timeout`, in seconds.
     pub timeout: i32,
     /// The deployment package bytes of the resolved version, when this emulator holds
     /// them.
     pub zip_bytes: Option<Vec<u8>>,
+    /// The archives of the LAYERS the resolved configuration holds, in the order the
+    /// configuration names them — the content a managed runtime mounts under the layer
+    /// root, where a later layer's entry wins over an earlier one's. Shared rather than
+    /// copied: a published layer version is immutable.
+    pub layer_zips: Vec<Arc<Vec<u8>>>,
     /// The event payload the caller sent.
     pub payload: Vec<u8>,
     /// The `ClientContext` the caller sent, already decoded from base64 to its JSON text.
@@ -280,6 +315,10 @@ pub struct Invoked {
     pub log: String,
     /// How long the run took.
     pub duration: Duration,
+    /// The WRITES a response-streaming handler made, in order — empty for a handler that
+    /// returned a value instead. A streaming caller is delivered one chunk per entry, so
+    /// the chunk boundaries it sees are the handler's own.
+    pub chunks: Vec<Vec<u8>>,
 }
 
 impl Invoked {
@@ -319,18 +358,45 @@ pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnabl
         return Err(Unrunnable::NoHandler);
     };
     // Each engine imports the sources of its own language: the entries a package holds for
-    // the other one are not modules this run could load.
+    // the other one are not modules this run could load. One budget is spent across every
+    // mount this invocation reads ([`package::ReadBudget`]).
+    let mut read_budget = package::ReadBudget::default();
     let read = match engine {
         Engine::Python => package::python_modules(invocation.zip_bytes.as_deref()),
-        Engine::Node => package::javascript_modules(invocation.zip_bytes.as_deref()),
+        Engine::Node => package::javascript_modules_within(
+            invocation.zip_bytes.as_deref(),
+            &mut read_budget,
+        ),
     };
-    let modules = match read {
+    let mut modules = match read {
         Ok(modules) => modules,
         Err(package::PackageFault::NotHeld) => return Err(Unrunnable::PackageNotHeld),
         Err(package::PackageFault::Unreadable(why)) => {
             return Err(Unrunnable::PackageUnreadable(why))
         }
     };
+    // The layers' own entries, under the prefix the runtime keys the layer root by, read
+    // out of the SAME budget the deployment package was: what one invocation holds is
+    // bounded across its mounts rather than per archive. A layer this emulator holds no
+    // readable archive for mounts nothing, exactly as a deployment package it holds no
+    // bytes for imports nothing.
+    if engine == Engine::Node {
+        for archive in &invocation.layer_zips {
+            if let Ok(entries) =
+                package::javascript_modules_within(Some(archive.as_slice()), &mut read_budget)
+            {
+                modules.extend(entries.into_iter().map(|entry| package::PackageModule {
+                    path: format!("{}{}", node::LAYER_ID_PREFIX, entry.path),
+                    source: entry.source,
+                }));
+            }
+        }
+    }
+    // The modules the runtime itself supplies on the search path, which is where the AWS
+    // SDK a managed node runtime ships is found.
+    if engine == Engine::Node {
+        modules.extend(node_sdk_guest::runtime_modules());
+    }
 
     if abandoned_runs() >= MAX_ABANDONED_RUNS {
         return Err(Unrunnable::Overloaded(format!(
@@ -389,6 +455,8 @@ pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnabl
                 Engine::Node => node::run(&node::Run {
                     modules: &modules,
                     handler: &handler,
+                    runtime: invocation.runtime.as_deref().unwrap_or_default(),
+                    architecture: &invocation.architecture,
                     environment: &environment,
                     event: event.as_deref(),
                     request_id: &invocation.request_id,
@@ -397,6 +465,7 @@ pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnabl
                     tenant_id: invocation.tenant_id.as_deref(),
                     budget,
                     heap_bytes,
+                    aws: invocation.aws.as_ref(),
                 }),
             };
             let _ = sender.send(finished);
@@ -496,9 +565,14 @@ fn answered(
     budget: Budget,
     engine: Engine,
 ) -> Invoked {
-    let stack_member = stack_trace_member(engine);
     let (payload, function_error) = match &finished.completion {
         Completion::Returned(payload) => (payload.clone().into_bytes(), None),
+        // A response-streaming handler's answer is the bytes it WROTE. The stream IS the
+        // answer, and one that has been begun cannot be withdrawn, so no failure is
+        // attributed to the invocation: the caller is delivered what the handler wrote, and
+        // a handler that failed before its first write delivers nothing. Its failure is in
+        // the run's LOG, as the `Invoke Error` record the runtime writes for it.
+        Completion::Streamed(chunks) => (chunks.concat().into_bytes(), None),
         Completion::Raised {
             error_type,
             error_message,
@@ -509,7 +583,7 @@ fn answered(
                 Some(error_type),
                 request_id,
                 stack_trace,
-                stack_member,
+                engine,
             ),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
@@ -522,7 +596,7 @@ fn answered(
                 None,
                 request_id,
                 &[],
-                stack_member,
+                engine,
             ),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
@@ -534,7 +608,7 @@ fn answered(
                 Some(RUNTIME_EXIT_ERROR),
                 request_id,
                 &[],
-                stack_member,
+                engine,
             ),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
@@ -551,7 +625,7 @@ fn answered(
                 Some(RESPONSE_SIZE_TOO_LARGE),
                 request_id,
                 &[],
-                stack_member,
+                engine,
             ),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
@@ -561,7 +635,7 @@ fn answered(
                 Some(RUNTIME_EXIT_ERROR),
                 request_id,
                 &[],
-                stack_member,
+                engine,
             ),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
@@ -571,7 +645,7 @@ fn answered(
                 Some("Runtime.InternalError"),
                 request_id,
                 &[],
-                stack_member,
+                engine,
             ),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
@@ -587,6 +661,12 @@ fn answered(
         function_error,
         log,
         duration: finished.elapsed,
+        chunks: match &finished.completion {
+            Completion::Streamed(chunks) => {
+                chunks.iter().map(|chunk| chunk.clone().into_bytes()).collect()
+            }
+            _ => Vec::new(),
+        },
     }
 }
 
@@ -611,6 +691,19 @@ fn stack_trace_member(engine: Engine) -> &'static str {
     }
 }
 
+/// Whether the error payload carries the invocation's own request id.
+///
+/// A Python runtime's error payload names it (`requestId` beside `stackTrace`); a node
+/// runtime's does not — the id is carried in the RESPONSE rather than in the body, so the
+/// payload a node handler's failure answers with is exactly the three members
+/// `{errorType, errorMessage, trace}`.
+fn reports_request_id(engine: Engine) -> bool {
+    match engine {
+        Engine::Python => true,
+        Engine::Node => false,
+    }
+}
+
 /// The error payload an invocation that failed answers with: the members the function's
 /// own runtime reports for a handler that raised.
 fn error_document(
@@ -618,7 +711,7 @@ fn error_document(
     error_type: Option<&str>,
     request_id: &str,
     stack_trace: &[String],
-    stack_member: &str,
+    engine: Engine,
 ) -> Vec<u8> {
     let mut document = ::serde_json::Map::new();
     document.insert(
@@ -631,12 +724,14 @@ fn error_document(
             ::serde_json::Value::String(error_type.to_string()),
         );
     }
+    if reports_request_id(engine) {
+        document.insert(
+            "requestId".to_string(),
+            ::serde_json::Value::String(request_id.to_string()),
+        );
+    }
     document.insert(
-        "requestId".to_string(),
-        ::serde_json::Value::String(request_id.to_string()),
-    );
-    document.insert(
-        stack_member.to_string(),
+        stack_trace_member(engine).to_string(),
         ::serde_json::Value::Array(
             stack_trace
                 .iter()
@@ -736,9 +831,14 @@ fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap
         ("AWS_REGION", invocation.region.clone()),
         ("AWS_DEFAULT_REGION", invocation.region.clone()),
         ("AWS_LAMBDA_INITIALIZATION_TYPE", "on-demand".to_string()),
+        // "AWS_LAMBDA_RUNTIME_API – … The host and port of the runtime API", which a
+        // managed runtime's own environment always names. This emulator serves the
+        // invocation to the handler in process rather than over that interface, so the
+        // variable names the loopback address the interface is addressed at and nothing
+        // reads it.
+        ("AWS_LAMBDA_RUNTIME_API", "127.0.0.1:9001".to_string()),
         ("LAMBDA_TASK_ROOT", "/var/task".to_string()),
         ("LAMBDA_RUNTIME_DIR", "/var/runtime".to_string()),
-        ("TZ", ":UTC".to_string()),
         (
             "_HANDLER",
             invocation.handler.clone().unwrap_or_default(),
@@ -753,6 +853,37 @@ fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap
     ];
     for (name, value) in reserved {
         environment.insert((*name).to_string(), value.clone());
+    }
+    // The variables a managed runtime's own sandbox sets beside those, each at the value
+    // AWS documents for it. These are NOT reserved: the function's own variable of the same
+    // name is its value, so a function that sets its time zone or its module path runs with
+    // the one it set.
+    let defaults: &[(&str, String)] = &[
+        ("TZ", ":UTC".to_string()),
+        ("LANG", "en_US.UTF-8".to_string()),
+        (
+            "LD_LIBRARY_PATH",
+            "/var/lang/lib:/lib64:/usr/lib64:/var/runtime:/var/runtime/lib:/var/task:\
+             /var/task/lib:/opt/lib"
+                .to_string(),
+        ),
+    ];
+    for (name, value) in defaults {
+        environment
+            .entry((*name).to_string())
+            .or_insert_with(|| value.clone());
+    }
+    if engine_for(invocation.runtime.as_deref()) == Some(Engine::Node) {
+        // "NODE_PATH – The Node.js library path": the layer directory for this runtime's
+        // own major version, the layer's version-independent directory, and the runtime's
+        // own modules, which is the search path a `require` of a bare name walks.
+        let major = node::node_major(invocation.runtime.as_deref().unwrap_or_default());
+        environment.entry("NODE_PATH".to_string()).or_insert_with(|| {
+            format!(
+                "/opt/nodejs/node{major}/node_modules:/opt/nodejs/node_modules:\
+                 /var/runtime/node_modules:/var/runtime:/var/task"
+            )
+        });
     }
     environment
 }
@@ -890,7 +1021,7 @@ mod tests {
                 Some("Error"),
                 "11111111-2222-3333-4444-555555555555",
                 &["  at handler".to_string()],
-                stack_trace_member(*engine),
+                *engine,
             );
             let parsed: ::serde_json::Value =
                 ::serde_json::from_slice(&document).expect("the error document is JSON");
@@ -938,6 +1069,7 @@ mod tests {
                 function_error: None,
                 log: "L".repeat(size),
                 duration: Duration::ZERO,
+                chunks: Vec::new(),
             };
             let decoded = ::base64::Engine::decode(
                 &::base64::engine::general_purpose::STANDARD,
@@ -971,7 +1103,9 @@ mod tests {
             variables,
             memory_size: 256,
             timeout: 3,
+            architecture: "x86_64".to_string(),
             zip_bytes: None,
+            layer_zips: Vec::new(),
             payload: Vec::new(),
             client_context: None,
             tenant_id: None,

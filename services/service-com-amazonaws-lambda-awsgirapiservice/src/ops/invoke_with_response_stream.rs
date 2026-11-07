@@ -425,7 +425,13 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
             variables: resolved_config.environment.clone(),
             memory_size: resolved_config.memory_size,
             timeout: resolved_config.timeout,
+            architecture: resolved_config
+                .architectures
+                .first()
+                .cloned()
+                .unwrap_or_default(),
             zip_bytes: record.code_of(&version).zip_bytes.clone(),
+            layer_zips: crate::state::layer_archives(&resolved_config.layers),
             payload: payload.to_vec(),
             client_context,
             tenant_id: input.tenant_id.clone(),
@@ -494,8 +500,19 @@ fn streamed_response(
     tail_requested: bool,
 ) -> Result<RtResponse, InvokeWithResponseStreamError> {
     let mut frames = Vec::new();
-    if !invoked.payload.is_empty() {
-        frames.extend(framed_payload_chunk(&invoked.payload).map_err(|error| {
+    // One chunk per WRITE a response-streaming handler made, so the boundaries a client
+    // reads are the handler's own; a handler that returned a value instead wrote nothing,
+    // and its whole response travels as the one chunk it is.
+    let written: Vec<&[u8]> = if invoked.chunks.is_empty() {
+        vec![invoked.payload.as_slice()]
+    } else {
+        invoked.chunks.iter().map(Vec::as_slice).collect()
+    };
+    for chunk in written {
+        if chunk.is_empty() {
+            continue;
+        }
+        frames.extend(framed_payload_chunk(chunk).map_err(|error| {
             service_error(&format!("the payload chunk could not be framed: {error}"))
         })?);
     }

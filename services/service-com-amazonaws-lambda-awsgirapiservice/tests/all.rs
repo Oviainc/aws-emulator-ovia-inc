@@ -227,6 +227,8 @@ mod layer_versions;
 mod missing_policy_refusal;
 #[path = "all/node_invoke_run.rs"]
 mod node_invoke_run;
+#[path = "all/node_runtime_environment.rs"]
+mod node_runtime_environment;
 #[path = "all/nodejs_invoke_run.rs"]
 mod nodejs_invoke_run;
 #[path = "all/permission_and_policy_refusals.rs"]

@@ -314,8 +314,8 @@ pub use recursion::{
 /// module.
 pub mod execution;
 pub use execution::{
-    engine_for, environment_key_fault, mint_request_id, run_invocation, runs_handler, AwsAccess,
-    Engine, EnvironmentKeyFault, Invocation, Invoked, Unrunnable,
+    engine_for, environment_key_fault, layer_archives, mint_request_id, run_invocation,
+    runs_handler, AwsAccess, Engine, EnvironmentKeyFault, Invocation, Invoked, Unrunnable,
 };
 
 /// How large a stored .zip archive is once EXPANDED — the second size Lambda reports for a
@@ -1113,6 +1113,13 @@ pub struct FunctionLayer {
     /// by [`unzipped_bytes`] off the stored archive when the version was attached. A
     /// published layer version is immutable, so the number cannot go stale.
     pub uncompressed_code_size: i64,
+    /// The archive's own bytes, when this emulator holds them — the CONTENT a managed
+    /// runtime mounts under the layer root, which is what a handler importing from the
+    /// layer loads. Held with the resolution for the same reason the sizes are: a
+    /// published layer version is immutable, so the bytes cannot go stale. SHARED rather
+    /// than copied, so attaching a layer to a function and invoking it hold one copy of
+    /// the archive between them.
+    pub zip_bytes: Option<::std::sync::Arc<Vec<u8>>>,
 }
 
 /// The configuration of one function version — the members `FunctionConfiguration`
@@ -3769,6 +3776,7 @@ pub fn resolve_function_layers(
                 arn: arn.clone(),
                 code_size: 0,
                 uncompressed_code_size: 0,
+                zip_bytes: None,
             }),
             Some(LayerVersionReference::Published { name, version }) => {
                 let published = store
@@ -3782,6 +3790,12 @@ pub fn resolve_function_layers(
                     arn: published.0.version_arn(version),
                     code_size: published.1.code_size,
                     uncompressed_code_size: published.1.unzipped_code_size(),
+                    zip_bytes: published
+                        .1
+                        .archive
+                        .zip_bytes
+                        .clone()
+                        .map(::std::sync::Arc::new),
                 })
             }
         })

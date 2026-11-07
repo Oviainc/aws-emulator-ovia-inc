@@ -749,7 +749,14 @@ async fn a_run_past_the_functions_own_bounds_ends_with_lambdas_error() {
 #[tokio::test]
 async fn a_node_handler_cannot_reach_the_host() {
     let cases: &[(&str, &str)] = &[
-        ("the filesystem", "require('fs')"),
+        (
+            "a host file, read through the filesystem",
+            "require('fs').readFileSync('/etc/passwd')",
+        ),
+        (
+            "a write outside the one writable directory",
+            "require('fs').writeFileSync('/var/task/written', 'x')",
+        ),
         ("a child process", "require('child_process')"),
         ("a socket", "require('net')"),
         ("an http client", "require('http')"),
@@ -761,7 +768,7 @@ async fn a_node_handler_cannot_reach_the_host() {
             "require('/var/task/../../../etc/passwd')",
         ),
         ("the module loader itself", "require('module')"),
-        ("a dynamic host import", "import('fs')"),
+        ("a dynamic host import", "import('/etc/passwd')"),
         ("a dynamic traversal import", "import('../../../etc/passwd')"),
     ];
     let engine = Arc::new(engine::InMemoryEngine::new());

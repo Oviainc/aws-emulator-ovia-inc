@@ -59,6 +59,13 @@ impl Stop {
 pub enum Completion {
     /// The handler returned, and this is the JSON its value was serialized to.
     Returned(String),
+    /// A RESPONSE-STREAMING handler finished, and these are the writes it made to its
+    /// response stream, in the order it made them.
+    ///
+    /// Such a handler's answer is what it WROTE rather than what it returned, so the
+    /// boundaries here are the handler's own writes — which is what a streaming caller
+    /// reads as the stream's chunks.
+    Streamed(Vec<String>),
     /// The handler (or the runtime resolving it) raised.
     Raised {
         /// The exception's type name, or the `Runtime.*` class of a runtime failure.

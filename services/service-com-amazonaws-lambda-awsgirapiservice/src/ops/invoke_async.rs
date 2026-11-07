@@ -395,7 +395,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 variables: resolved_config.environment.clone(),
                 memory_size: resolved_config.memory_size,
                 timeout: resolved_config.timeout,
+                architecture: resolved_config
+                    .architectures
+                    .first()
+                    .cloned()
+                    .unwrap_or_default(),
                 zip_bytes: record.code_of(&version).zip_bytes.clone(),
+                layer_zips: crate::state::layer_archives(&resolved_config.layers),
                 payload: input.invoke_args.clone(),
                 // This operation carries neither member, so the run is given neither: a
                 // `ClientContext` and a `TenantId` reach a function only when the call that

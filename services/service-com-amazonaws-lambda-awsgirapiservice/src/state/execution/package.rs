@@ -54,6 +54,30 @@ pub const MAX_UNZIPPED_BYTES: u64 = 64 * 1024 * 1024;
 /// How many INFLATED bytes of ONE entry are read.
 pub const MAX_MODULE_BYTES: u64 = 8 * 1024 * 1024;
 
+/// What is left of one INVOCATION's read of its mounts: the entries and the inflated bytes
+/// still to be spent across the deployment package and every layer it holds.
+///
+/// A function's mounts are several archives, so a per-archive bound would multiply by the
+/// number of layers the configuration names. This is the one budget they SHARE, carried
+/// across the reads of a single invocation and spent as entries are produced, so what a run
+/// holds is bounded whatever the configuration lists.
+#[derive(Debug)]
+pub struct ReadBudget {
+    /// How many entries are left to read.
+    pub entries: usize,
+    /// How many inflated bytes are left to read.
+    pub bytes: u64,
+}
+
+impl Default for ReadBudget {
+    fn default() -> Self {
+        Self {
+            entries: MAX_PACKAGE_ENTRIES,
+            bytes: MAX_UNZIPPED_BYTES,
+        }
+    }
+}
+
 /// The suffixes of an entry the Python interpreter can import.
 const PYTHON_SUFFIXES: &[&str] = &[".py"];
 
@@ -67,7 +91,7 @@ const JAVASCRIPT_SUFFIXES: &[&str] = &[".js", ".mjs", ".cjs", ".json"];
 /// `Ok(vec![])` is a readable archive with no importable entry in it, which is a package
 /// whose handler cannot be imported — not a failure of the read.
 pub fn python_modules(zip_bytes: Option<&[u8]>) -> Result<Vec<PackageModule>, PackageFault> {
-    source_modules(zip_bytes, PYTHON_SUFFIXES)
+    source_modules(zip_bytes, PYTHON_SUFFIXES, &mut ReadBudget::default())
 }
 
 /// Every JavaScript (and JSON) module `zip_bytes` holds, in the archive's own order.
@@ -75,7 +99,16 @@ pub fn python_modules(zip_bytes: Option<&[u8]>) -> Result<Vec<PackageModule>, Pa
 /// `Ok(vec![])` is a readable archive with no loadable module in it, which is a package
 /// whose handler cannot be imported — not a failure of the read.
 pub fn javascript_modules(zip_bytes: Option<&[u8]>) -> Result<Vec<PackageModule>, PackageFault> {
-    source_modules(zip_bytes, JAVASCRIPT_SUFFIXES)
+    source_modules(zip_bytes, JAVASCRIPT_SUFFIXES, &mut ReadBudget::default())
+}
+
+/// The same, spending `budget` — the read of one archive of an invocation that reads several
+/// ([`ReadBudget`]).
+pub fn javascript_modules_within(
+    zip_bytes: Option<&[u8]>,
+    budget: &mut ReadBudget,
+) -> Result<Vec<PackageModule>, PackageFault> {
+    source_modules(zip_bytes, JAVASCRIPT_SUFFIXES, budget)
 }
 
 /// Every entry of `zip_bytes` whose path ends in one of `suffixes` and whose bytes are
@@ -83,6 +116,7 @@ pub fn javascript_modules(zip_bytes: Option<&[u8]>) -> Result<Vec<PackageModule>
 fn source_modules(
     zip_bytes: Option<&[u8]>,
     suffixes: &[&str],
+    budget: &mut ReadBudget,
 ) -> Result<Vec<PackageModule>, PackageFault> {
     let Some(zip_bytes) = zip_bytes else {
         return Err(PackageFault::NotHeld);
@@ -90,12 +124,12 @@ fn source_modules(
     let mut archive = ::zip::ZipArchive::new(::std::io::Cursor::new(zip_bytes))
         .map_err(|error| PackageFault::Unreadable(error.to_string()))?;
     let mut modules = Vec::new();
-    let mut inflated: u64 = 0;
-    let entries = archive.len().min(MAX_PACKAGE_ENTRIES);
+    let entries = archive.len().min(budget.entries);
     for index in 0..entries {
         let mut entry = archive
             .by_index(index)
             .map_err(|error| PackageFault::Unreadable(error.to_string()))?;
+        budget.entries = budget.entries.saturating_sub(1);
         if entry.is_dir() {
             continue;
         }
@@ -106,16 +140,16 @@ fn source_modules(
         if !suffixes.iter().any(|suffix| path.ends_with(suffix)) {
             continue;
         }
-        // The read is capped by what is LEFT of the whole-archive budget and by the
+        // The read is capped by what is LEFT of the whole-invocation budget and by the
         // per-entry one, never by the size the archive declares for the entry.
-        let room = MAX_UNZIPPED_BYTES.saturating_sub(inflated).min(MAX_MODULE_BYTES);
+        let room = budget.bytes.min(MAX_MODULE_BYTES);
         if room == 0 {
             break;
         }
         let mut bytes = Vec::new();
         ::std::io::Read::read_to_end(&mut ::std::io::Read::take(&mut entry, room), &mut bytes)
             .map_err(|error| PackageFault::Unreadable(error.to_string()))?;
-        inflated = inflated.saturating_add(bytes.len() as u64);
+        budget.bytes = budget.bytes.saturating_sub(bytes.len() as u64);
         // A module that is not UTF-8 is not source an engine here can compile; it is
         // left out rather than lossily decoded into something the caller never wrote.
         if let Ok(source) = String::from_utf8(bytes) {
