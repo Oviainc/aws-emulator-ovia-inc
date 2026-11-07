@@ -15,6 +15,13 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// How EC2 words the `IncorrectInstanceState` refusal across the family of operations that
+// act on an instance only from certain lifecycle states: the instance id the request named,
+// the action its state does not admit, and no disclosure of the state itself. Declared
+// beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood and
+// the tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/incorrect_instance_state_refusals.rs"]
+mod incorrect_instance_state_refusals;
 // Resolving a launch AMI the documented way out of the published catalog: every variant
 // Amazon publishes has a CURRENT build — available and not deprecated — so `Owners=amazon`
 // plus that variant's published name pattern and `state=available` reports an image, and the

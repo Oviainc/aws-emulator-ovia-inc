@@ -421,9 +421,11 @@ async fn only_an_instance_that_is_up_can_be_rebooted() {
             "case {case:?}: expected IncorrectInstanceState, got {}",
             answer.body
         );
-        assert!(
-            answer.error_message().contains(state.as_str()),
-            "case {case:?}: the refusal must name the state the instance is in, got {:?}",
+        assert_eq!(
+            answer.error_message(),
+            format!("The instance '{instance_id}' is not in a state from which it can be rebooted."),
+            "case {case:?}: the refusal must name the instance and the action its state \
+             does not admit, got {:?}",
             answer.error_message()
         );
     }

@@ -585,10 +585,12 @@ async fn unmonitor_instances_refuses_what_it_cannot_act_on_and_changes_nothing()
                     .find(|(parked_state, _)| *parked_state == state)
                     .map(|(_, instance_id)| instance_id.clone())
                     .unwrap_or_else(|| panic!("case {case:?}: the row must have an instance"));
+                // The refusal names the instance the request named and the action its
+                // state does not admit, and reports no state: the state the row parked
+                // the instance in does not appear in the sentence.
                 let message = format!(
-                    "The instance '{instance_id}' is in state '{}', which is not a state \
-                     from which it can be unmonitored",
-                    state.as_str()
+                    "The instance '{instance_id}' is not in a state from which it can be \
+                     unmonitored."
                 );
                 (
                     instance_fields(std::slice::from_ref(&instance_id)),

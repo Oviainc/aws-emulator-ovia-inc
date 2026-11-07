@@ -417,9 +417,14 @@ async fn only_an_instance_that_is_up_can_be_interrupted() {
             answer.body
         );
         let message = answer.error_message();
-        assert!(
-            message.contains(state.as_str()),
-            "case {case:?}: the refusal must name the state the instance is in, got {message:?}"
+        assert_eq!(
+            message,
+            format!(
+                "The instance '{instance_id}' is not in a state from which it can be sent a \
+                 diagnostic interrupt."
+            ),
+            "case {case:?}: the refusal must name the instance and the action its state does \
+             not admit, got {message:?}"
         );
         assert!(
             message.contains(&instance_id),

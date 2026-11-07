@@ -216,7 +216,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !admitted {
             return Err(Scaffolded::incorrect_instance_state(
                 &input.instance_id,
-                instance_state.as_str(),
                 &format!("reset for the {attribute} attribute"),
             ));
         }

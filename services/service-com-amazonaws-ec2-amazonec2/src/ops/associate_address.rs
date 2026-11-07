@@ -271,7 +271,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if instance.state.is_terminating() {
             return Err(Scaffolded::incorrect_instance_state(
                 &instance_id,
-                instance.state.as_str(),
                 "associated with an Elastic IP address",
             ));
         }

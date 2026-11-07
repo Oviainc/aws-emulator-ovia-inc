@@ -208,11 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             };
             if instance.state.is_terminating() {
-                return Err(Scaffolded::incorrect_instance_state(
-                    instance_id,
-                    instance.state.as_str(),
-                    "stopped",
-                ));
+                return Err(Scaffolded::incorrect_instance_state(instance_id, "stopped"));
             }
             if input.hibernate == Some(true) && !instance.hibernation_configured {
                 return Err(Scaffolded::unsupported_hibernation_configuration(

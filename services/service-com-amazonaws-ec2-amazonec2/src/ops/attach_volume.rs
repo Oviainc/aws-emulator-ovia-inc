@@ -271,7 +271,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(Scaffolded::incorrect_instance_state(
                 &input.instance_id,
-                instance_state.as_str(),
                 "attached a volume",
             ));
         }

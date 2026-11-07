@@ -189,11 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     | InstanceStateName::Pending
                     | InstanceStateName::Running
             ) {
-                return Err(Scaffolded::incorrect_instance_state(
-                    instance_id,
-                    instance.state.as_str(),
-                    "started",
-                ));
+                return Err(Scaffolded::incorrect_instance_state(instance_id, "started"));
             }
         }
 

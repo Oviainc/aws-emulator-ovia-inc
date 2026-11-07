@@ -391,14 +391,17 @@ impl<E> Scaffolded<E> {
 
     /// `IncorrectInstanceState` (HTTP 400): the instance exists, but its current
     /// state does not admit the requested lifecycle transition.
-    pub fn incorrect_instance_state(instance_id: &str, state: &str, action: &str) -> Self {
+    ///
+    /// EC2 words this refusal as one sentence whose only interpolated value is the
+    /// instance id the REQUEST named: it says which action the instance's state does not
+    /// admit and stops there. It does NOT report the state the instance is actually in —
+    /// a caller that wants it reads it back through a describe — so the state is not a
+    /// parameter of this constructor, and the sentence ends in a full stop.
+    pub fn incorrect_instance_state(instance_id: &str, action: &str) -> Self {
         Self::service_error(
             "IncorrectInstanceState",
             400,
-            format!(
-                "The instance '{instance_id}' is in state '{state}', \
-                 which is not a state from which it can be {action}"
-            ),
+            format!("The instance '{instance_id}' is not in a state from which it can be {action}."),
         )
     }
 

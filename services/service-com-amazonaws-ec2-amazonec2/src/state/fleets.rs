@@ -1478,7 +1478,6 @@ pub fn require_mac_instance<'store, E>(
     if instance.state.is_terminating() {
         return Err(Scaffolded::incorrect_instance_state(
             instance_id,
-            instance.state.as_str(),
             "given a Mac modification task",
         ));
     }

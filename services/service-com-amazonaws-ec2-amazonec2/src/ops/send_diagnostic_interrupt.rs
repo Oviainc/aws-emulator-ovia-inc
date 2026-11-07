@@ -207,7 +207,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(Scaffolded::incorrect_instance_state(
                 &instance.instance_id,
-                instance.state.as_str(),
                 "sent a diagnostic interrupt",
             ));
         }
