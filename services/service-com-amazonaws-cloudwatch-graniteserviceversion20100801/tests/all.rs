@@ -171,6 +171,8 @@ mod metrics_scalar_exclusion;
 mod missing_series_alarms;
 #[path = "all/not_found_messages.rs"]
 mod not_found_messages;
+#[path = "all/opaque_document_fidelity.rs"]
+mod opaque_document_fidelity;
 #[path = "all/otel_enrichment.rs"]
 mod otel_enrichment;
 #[path = "all/percentile_low_sample_alarms.rs"]
