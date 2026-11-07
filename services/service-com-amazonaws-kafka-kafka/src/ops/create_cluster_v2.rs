@@ -13,7 +13,12 @@
 //! provisioned path ([`crate::state::Cluster::provisioned`]); a `Serverless` body
 //! is minted by [`crate::state::Cluster::serverless`]. The two are alternatives,
 //! so a request naming both, or neither, describes no cluster and is a
-//! `BadRequestException`.
+//! `BadRequestException` — two DIFFERENT ones: naming neither is a refusal of the
+//! cluster-type parameter, while naming both is MSK's body-level rejection.
+//!
+//! A provisioned body also names the broker software its cluster would run, so
+//! its `KafkaVersion` is admitted against the catalog this service publishes
+//! ([`crate::state::create_kafka_version_violation`]) before anything is minted.
 //!
 //! A cluster name is unique within an account and region, so a second create under
 //! a name already taken — by a cluster of either kind — is a `ConflictException`,
@@ -106,6 +111,28 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The parameter Amazon MSK blames when a create names no cluster type: not
+/// either of the two alternative members, which is the point — each of them would
+/// have fixed the request — but the abstract parameter the API names for the
+/// choice between them. Reported as the refusal's `invalidParameter`.
+const CLUSTER_TYPE_MEMBER: &str = "clusterType";
+
+/// What MSK answers a create that names NEITHER cluster type: one fixed sentence,
+/// naming both the kinds a create may ask for and nothing of the request.
+const NO_CLUSTER_TYPE_MESSAGE: &str =
+    "You must specify a cluster type, either provisioned or serverless.";
+
+/// What MSK answers a create that names BOTH: its body-level rejection, which
+/// says that the body as a whole describes no cluster rather than pointing at one
+/// member of it to drop. A different refusal class from
+/// [`NO_CLUSTER_TYPE_MESSAGE`], so the two stay distinct and a client can tell
+/// the two input errors apart.
+const BOTH_CLUSTER_TYPES_MESSAGE: &str = "Invalid request body";
+
+/// The member a serverless body carries its VPC configurations — and so the
+/// subnets each one is reached through — in, as the wire spells it.
+const SERVERLESS_VPC_CONFIGS_MEMBER: &str = "vpcConfigs";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -207,20 +234,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let body = match (provisioned, serverless) {
             (Some(request), None) => ClusterBody::Provisioned(Box::new(request)),
             (None, Some(request)) => ClusterBody::Serverless(request),
+            // A body naming BOTH kinds is rejected as a body rather than as a
+            // parameter: MSK answers its one body-level sentence and says nothing
+            // about which of the two members to drop, which is what tells this
+            // refusal apart from the one below.
             (Some(_), Some(_)) => {
-                return Err(bad_request(
-                    "Serverless",
-                    "A create names one cluster type: Provisioned and Serverless \
-                     cannot both be given."
-                        .to_string(),
-                ))
+                return Err(bad_request("Serverless", BOTH_CLUSTER_TYPES_MESSAGE.to_string()))
             }
+            // A body naming NEITHER kind names no cluster type at all, and either
+            // member would have named one, so the refusal blames the abstract
+            // parameter MSK names rather than one of the two alternatives.
             (None, None) => {
                 return Err(bad_request(
-                    "Provisioned",
-                    "A create names one cluster type: either Provisioned or \
-                     Serverless must be given."
-                        .to_string(),
+                    CLUSTER_TYPE_MEMBER,
+                    NO_CLUSTER_TYPE_MESSAGE.to_string(),
                 ))
             }
         };
@@ -238,7 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .flatten()
                 .map(|(key, value)| (key.as_str(), value.as_str())),
         ) {
-            return Err(bad_request("Tags", reason));
+            return Err(bad_request("tags", reason));
         }
 
         // Both cluster kinds are PLACED in the subnets the request names — the
@@ -312,7 +339,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::RegisterRejected::RegionQuota => {
                     CreateClusterV2ErrorModeled::TooManyRequestsException(
                         TooManyRequestsException {
-                            invalid_parameter: Some("ClusterName".to_string()),
+                            invalid_parameter: Some("clusterName".to_string()),
                             message: Some(format!(
                                 "The account has reached its limit of {} clusters in {region}.",
                                 crate::state::MAX_CLUSTERS_PER_REGION
@@ -376,6 +403,16 @@ impl ClusterBody {
     fn violation(&self) -> Option<(&'static str, String)> {
         match self {
             Self::Provisioned(request) => {
+                // The Apache Kafka version is the broker software the cluster
+                // would run, so a version this service's catalog does not publish
+                // describes no cluster it could run. Answered from the request
+                // alone, and before the subnets are resolved.
+                if let Some(reason) = crate::state::create_kafka_version_violation(
+                    &request.kafka_version,
+                    &request.broker_node_group_info.instance_type,
+                ) {
+                    return Some((crate::state::KAFKA_VERSION_MEMBER, reason));
+                }
                 // The model's own 1..15 range refuses an out-of-range value at the
                 // boundary; it is checked again here because it is a request value
                 // that sizes the broker list.
@@ -384,7 +421,7 @@ impl ClusterBody {
                         > crate::state::MAX_BROKER_NODES_PER_CLUSTER)
                     .then(|| {
                         (
-                            "Provisioned.NumberOfBrokerNodes",
+                            "numberOfBrokerNodes",
                             format!(
                                 "NumberOfBrokerNodes must be between 1 and {}, not {}.",
                                 crate::state::MAX_BROKER_NODES_PER_CLUSTER,
@@ -400,26 +437,26 @@ impl ClusterBody {
                     // configuration names, so a create that names none describes
                     // a cluster no client could connect to.
                     return Some((
-                        "Serverless.VpcConfigs",
+                        SERVERLESS_VPC_CONFIGS_MEMBER,
                         "VpcConfigs must name at least one VPC configuration.".to_string(),
                     ));
                 }
                 if request.vpc_configs.len() > entries {
                     return Some((
-                        "Serverless.VpcConfigs",
+                        SERVERLESS_VPC_CONFIGS_MEMBER,
                         format!("VpcConfigs must name at most {entries} VPC configurations."),
                     ));
                 }
                 for config in &request.vpc_configs {
                     if config.subnet_ids.is_empty() {
                         return Some((
-                            "Serverless.VpcConfigs.SubnetIds",
+                            "subnetIds",
                             "Each VPC configuration must name at least one subnet.".to_string(),
                         ));
                     }
                     if config.subnet_ids.len() > entries {
                         return Some((
-                            "Serverless.VpcConfigs.SubnetIds",
+                            "subnetIds",
                             format!("A VPC configuration must name at most {entries} subnets."),
                         ));
                     }
@@ -429,7 +466,7 @@ impl ClusterBody {
                         .is_some_and(|groups| groups.len() > entries)
                     {
                         return Some((
-                            "Serverless.VpcConfigs.SecurityGroupIds",
+                            "securityGroupIds",
                             format!(
                                 "A VPC configuration must name at most {entries} security groups."
                             ),
@@ -451,21 +488,22 @@ impl ClusterBody {
     fn placement_subnets(&self) -> Vec<(&'static str, Vec<String>)> {
         match self {
             Self::Provisioned(request) => vec![(
-                "Provisioned.BrokerNodeGroupInfo.ClientSubnets",
+                "brokerNodeGroupInfo",
                 request.broker_node_group_info.client_subnets.clone(),
             )],
             Self::Serverless(request) => request
                 .vpc_configs
                 .iter()
-                .map(|config| ("Serverless.VpcConfigs.SubnetIds", config.subnet_ids.clone()))
+                .map(|config| (SERVERLESS_VPC_CONFIGS_MEMBER, config.subnet_ids.clone()))
                 .collect(),
         }
     }
 }
 
 /// Refuse the request with the modeled `BadRequestException`, naming the member at
-/// fault and what was wrong with it — the caller has to fix the request from this
-/// text alone.
+/// fault — by the camelCase name the API documents and the request itself carries,
+/// not the Smithy structure member's identifier — and what was wrong with it: the
+/// caller has to fix the request from this text alone.
 fn bad_request(parameter: &str, message: String) -> CreateClusterV2Error {
     CreateClusterV2ErrorModeled::BadRequestException(BadRequestException {
         invalid_parameter: Some(parameter.to_string()),

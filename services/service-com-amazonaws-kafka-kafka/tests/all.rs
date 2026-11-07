@@ -67,6 +67,8 @@ mod configuration_revisions;
 mod configuration_state_reporting;
 #[path = "all/connectivity_update.rs"]
 mod connectivity_update;
+#[path = "all/create_and_update_input_gates.rs"]
+mod create_and_update_input_gates;
 #[path = "all/create_cluster_v2.rs"]
 mod create_cluster_v2;
 #[path = "all/describe_cluster_v2.rs"]

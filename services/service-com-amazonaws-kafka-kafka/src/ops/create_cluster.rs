@@ -18,6 +18,12 @@
 //! a subnet the account does not have is a `BadRequestException` and no cluster
 //! record is written.
 //!
+//! `KafkaVersion` names the broker software the cluster runs, which is one of the
+//! versions this service's own catalog publishes
+//! ([`crate::state::create_kafka_version_violation`]), so a value that catalog
+//! does not name is a `BadRequestException` too — answered from the request alone,
+//! before the network it asks for is resolved.
+//!
 //! Authentication and authorization are NOT this handler's business: the emulator
 //! verifies every request signature centrally (see `AGENTS.md`), so the modelled
 //! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
@@ -208,16 +214,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.number_of_broker_nodes < 1
             || input.number_of_broker_nodes > crate::state::MAX_BROKER_NODES_PER_CLUSTER
         {
-            return Err(
-                CreateClusterErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("NumberOfBrokerNodes".to_string()),
-                    message: Some(format!(
-                        "NumberOfBrokerNodes must be between 1 and {}, not {}.",
-                        crate::state::MAX_BROKER_NODES_PER_CLUSTER, input.number_of_broker_nodes
-                    )),
-                })
-                .into(),
-            );
+            return Err(bad_request(
+                "numberOfBrokerNodes",
+                format!(
+                    "NumberOfBrokerNodes must be between 1 and {}, not {}.",
+                    crate::state::MAX_BROKER_NODES_PER_CLUSTER, input.number_of_broker_nodes
+                ),
+            ));
+        }
+
+        // The Apache Kafka version is the broker software the cluster would run,
+        // so a version this service's catalog does not publish describes no
+        // cluster it could run — refused from the request alone, and BEFORE the
+        // subnets below are resolved, because a request that names no version MSK
+        // has is answered about that version whatever its placement says.
+        if let Some(reason) = crate::state::create_kafka_version_violation(
+            &input.kafka_version,
+            &input.broker_node_group_info.instance_type,
+        ) {
+            return Err(bad_request(crate::state::KAFKA_VERSION_MEMBER, reason));
         }
 
         // The tag rules apply wherever a caller supplies tags, so the set a
@@ -232,13 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .flatten()
                 .map(|(key, value)| (key.as_str(), value.as_str())),
         ) {
-            return Err(
-                CreateClusterErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("Tags".to_string()),
-                    message: Some(reason),
-                })
-                .into(),
-            );
+            return Err(bad_request("tags", reason));
         }
 
         // "The list of subnets to connect to in the client virtual private cloud
@@ -249,7 +258,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // network no broker can be placed in. Resolved before the registry lock
         // is taken, because the call is made over the in-process callback and no
         // mutex is held across it; a refused create registers nothing, so no ARN
-        // is minted and no cluster is enumerable.
+        // is minted and no cluster is enumerable. The member MSK blames is the
+        // one the request carries the placement in — the broker node group — not
+        // the list inside it.
         if let Some(reason) = crate::state::network::placement_subnet_refusal(
             ctx,
             &region,
@@ -257,13 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await
         {
-            return Err(
-                CreateClusterErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("BrokerNodeGroupInfo.ClientSubnets".to_string()),
-                    message: Some(reason),
-                })
-                .into(),
-            );
+            return Err(bad_request("brokerNodeGroupInfo", reason));
         }
 
         let mut state = state.lock();
@@ -307,7 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(match rejected {
                 crate::state::RegisterRejected::RegionQuota => {
                     CreateClusterErrorModeled::TooManyRequestsException(TooManyRequestsException {
-                        invalid_parameter: Some("ClusterName".to_string()),
+                        invalid_parameter: Some("clusterName".to_string()),
                         message: Some(format!(
                             "The account has reached its limit of {} clusters in {region}.",
                             crate::state::MAX_CLUSTERS_PER_REGION
@@ -345,4 +350,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         Ok(output)
     }
+}
+
+/// Refuse the request with the modeled `BadRequestException`, naming the member at
+/// fault — by the camelCase name the API documents and the request itself carries,
+/// not the Smithy structure member's identifier — and what was wrong with it.
+fn bad_request(parameter: &str, message: String) -> CreateClusterError {
+    CreateClusterErrorModeled::BadRequestException(BadRequestException {
+        invalid_parameter: Some(parameter.to_string()),
+        message: Some(message),
+    })
+    .into()
 }

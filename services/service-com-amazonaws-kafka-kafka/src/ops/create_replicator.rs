@@ -435,7 +435,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .lock()
             .replicator_provisioning_failure(&input.kafka_clusters);
         if provisioning_failure.is_none() {
-            for (index, cluster) in input.kafka_clusters.iter().enumerate() {
+            for cluster in &input.kafka_clusters {
                 let subnet_ids = cluster
                     .vpc_config
                     .as_ref()
@@ -446,9 +446,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 {
                     return Err(CreateReplicatorErrorModeled::BadRequestException(
                         BadRequestException {
-                            invalid_parameter: Some(format!(
-                                "KafkaClusters[{index}].VpcConfig.SubnetIds"
-                            )),
+                            // The member the subnets came in, as the wire spells
+                            // it — the same member this handler's cardinality gate
+                            // above names, since both refuse the same list.
+                            invalid_parameter: Some("subnetIds".to_string()),
                             message: Some(reason),
                         },
                     )

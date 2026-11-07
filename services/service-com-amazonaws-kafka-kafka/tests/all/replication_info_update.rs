@@ -20,16 +20,15 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use service_com_amazonaws_kafka_kafka::state::REPLICATOR_ACTIVATION_DELAY;
 
-use crate::kafka_harness::{pct, Emulator, Reply, ACCOUNT, REGION};
+use crate::kafka_harness::{pct, ClusterRequest, Emulator, Reply, ACCOUNT, REGION};
 
 /// The IAM role every replicator below is created with. `ServiceExecutionRoleArn`
 /// is a plain `__string` in the model, so the service stores and reports it
 /// verbatim.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/service-role/MskReplicatorRole";
 
-/// The cluster-id segment of the MSK cluster ARNs these rows point at. The
-/// clusters themselves are never created: `CreateReplicator` is asynchronous and
-/// does not resolve them.
+/// The cluster-id segment of the MSK cluster ARNs the rows below point at where no
+/// cluster is meant to be there — a stranger to the replicator under test.
 const GHOST_CLUSTER_ID: &str = "11111111-2222-4333-8444-555555555555-1";
 
 /// The message MSK refuses an update whose pair of Kafka cluster aliases addresses
@@ -63,10 +62,17 @@ enum End {
 }
 
 impl End {
-    fn msk(name: &str) -> Self {
-        End::Msk(format!(
-            "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/{name}/{GHOST_CLUSTER_ID}"
-        ))
+    /// An Amazon MSK cluster this suite CREATES, named by the ARN the service
+    /// minted for it.
+    ///
+    /// A real cluster, not a fabricated ARN: Amazon MSK provisions a replicator
+    /// only once the Amazon MSK clusters its setup names resolve, and a replicator
+    /// that never provisions converges to the terminal `FAILED` — which is not a
+    /// state a configuration change is accepted from. Every suite here is about
+    /// the UPDATE, so its replicators are ones that reach `RUNNING`; the
+    /// unresolvable-cluster path is `crate::replicator_provisioning`.
+    async fn msk(emulator: &Emulator, name: &str) -> Self {
+        End::Msk(emulator.create_ok(&ClusterRequest::named(name)).await)
     }
 
     fn apache(id: &str) -> Self {
@@ -148,14 +154,23 @@ struct Setup {
 
 impl Setup {
     /// Two MSK clusters and one replication between them — the minimal setup.
-    fn named(name: &str) -> Self {
+    async fn named(emulator: &Emulator, name: &str) -> Self {
         Self {
             name: name.to_string(),
             clusters: vec![
-                End::msk(&format!("{name}-source")),
-                End::msk(&format!("{name}-target")),
+                End::msk(emulator, &format!("{name}-source")).await,
+                End::msk(emulator, &format!("{name}-target")).await,
             ],
             flows: vec![(0, 1, "NONE")],
+        }
+    }
+
+    /// A setup with the clusters and replications given, under `name`.
+    fn spanning(name: &str, clusters: Vec<End>, flows: Vec<(usize, usize, &'static str)>) -> Self {
+        Self {
+            name: name.to_string(),
+            clusters,
+            flows,
         }
     }
 
@@ -206,15 +221,12 @@ impl Setup {
     }
 
     /// The `ReplicatorState` the clock owes a replicator of this setup once the
-    /// activation span has passed: the terminal `FAILED` when the setup names an
-    /// Amazon MSK cluster that does not exist — no row here creates the cluster it
-    /// points at — and `RUNNING` when every end is a self-managed Apache Kafka
-    /// cluster, which is not a resource this service resolves.
+    /// activation span has passed: `RUNNING`, because every Amazon MSK cluster a
+    /// setup here names is one this suite created, so the replicator provisions.
+    /// The terminal `FAILED` a setup naming a cluster that does not exist converges
+    /// to is `crate::replicator_provisioning`'s rule.
     fn settled_state(&self) -> &'static str {
-        match self.clusters.iter().any(|end| matches!(end, End::Msk(_))) {
-            true => "FAILED",
-            false => "RUNNING",
-        }
+        "RUNNING"
     }
 }
 
@@ -448,9 +460,10 @@ async fn an_addressed_replication_is_updated_and_read_back() {
     // (both, topics only, consumer groups only), the booleans they set (all on,
     // all off), the pattern lists (one pattern, several, and empty), and whether
     // the request also replaces log delivery.
+    let emulator = Emulator::new();
     let rows = vec![
         UpdateCase {
-            setup: Setup::named("single-flow"),
+            setup: Setup::named(&emulator, "single-flow").await,
             flow: 0,
             topic: Some(TopicUpdate {
                 to_replicate: vec!["t-.*"],
@@ -463,14 +476,14 @@ async fn an_addressed_replication_is_updated_and_read_back() {
             log_delivery: None,
         },
         UpdateCase {
-            setup: Setup {
-                clusters: vec![
-                    End::msk("two-flows-msk"),
+            setup: Setup::spanning(
+                "two-flows",
+                vec![
+                    End::msk(&emulator, "two-flows-msk").await,
                     End::apache("two-flows-apache"),
                 ],
-                flows: vec![(1, 0, "GZIP"), (0, 1, "LZ4")],
-                ..Setup::named("two-flows")
-            },
+                vec![(1, 0, "GZIP"), (0, 1, "LZ4")],
+            ),
             // The SECOND replication, so the lookup is by pair and not "the first
             // one" — and its target is named by an Apache Kafka cluster id.
             flow: 1,
@@ -494,11 +507,14 @@ async fn an_addressed_replication_is_updated_and_read_back() {
             })),
         },
         UpdateCase {
-            setup: Setup {
-                clusters: vec![End::apache("left-cluster"), End::msk("right-cluster")],
-                flows: vec![(0, 1, "NONE"), (1, 0, "ZSTD")],
-                ..Setup::named("bidirectional")
-            },
+            setup: Setup::spanning(
+                "bidirectional",
+                vec![
+                    End::apache("left-cluster"),
+                    End::msk(&emulator, "right-cluster").await,
+                ],
+                vec![(0, 1, "NONE"), (1, 0, "ZSTD")],
+            ),
             // The pair is ORDERED: this addresses the reverse replication of a
             // setup that configures both directions between the same clusters.
             flow: 1,
@@ -512,11 +528,14 @@ async fn an_addressed_replication_is_updated_and_read_back() {
             log_delivery: None,
         },
         UpdateCase {
-            setup: Setup {
-                clusters: vec![End::apache("self-managed-a"), End::apache("self-managed-b")],
-                flows: vec![(0, 1, "SNAPPY")],
-                ..Setup::named("apache-only")
-            },
+            setup: Setup::spanning(
+                "apache-only",
+                vec![
+                    End::apache("self-managed-a"),
+                    End::apache("self-managed-b"),
+                ],
+                vec![(0, 1, "SNAPPY")],
+            ),
             flow: 0,
             topic: Some(TopicUpdate {
                 to_replicate: vec![".*"],
@@ -539,7 +558,6 @@ async fn an_addressed_replication_is_updated_and_read_back() {
         },
     ];
 
-    let emulator = Emulator::new();
     for row in &rows {
         let case = row.setup.name.clone();
         let arn = create_ok(&emulator, &row.setup).await;
@@ -654,11 +672,14 @@ async fn an_addressed_replication_is_updated_and_read_back() {
 #[tokio::test]
 async fn a_pair_that_addresses_no_replication_is_refused() {
     let emulator = Emulator::new();
-    let setup = Setup {
-        clusters: vec![End::msk("mismatch-source"), End::msk("mismatch-target")],
-        flows: vec![(0, 1, "NONE")],
-        ..Setup::named("mismatch")
-    };
+    let setup = Setup::spanning(
+        "mismatch",
+        vec![
+            End::msk(&emulator, "mismatch-source").await,
+            End::msk(&emulator, "mismatch-target").await,
+        ],
+        vec![(0, 1, "NONE")],
+    );
     let arn = create_ok(&emulator, &setup).await;
     sleep_past_running();
     let version = current_version(&emulator, &arn, "mismatch").await;
@@ -779,7 +800,7 @@ async fn a_pair_that_addresses_no_replication_is_refused() {
 #[tokio::test]
 async fn a_stale_current_version_is_refused() {
     let emulator = Emulator::new();
-    let setup = Setup::named("concurrency");
+    let setup = Setup::named(&emulator, "concurrency").await;
     let arn = create_ok(&emulator, &setup).await;
     sleep_past_running();
     let version = current_version(&emulator, &arn, "concurrency").await;
@@ -801,7 +822,11 @@ async fn a_stale_current_version_is_refused() {
 
     // Rows span the ways a quoted version can be wrong: a well-formed token the
     // replicator never had, another replicator's current token, and an empty one.
-    let other = create_ok(&emulator, &Setup::named("concurrency-other")).await;
+    let other = create_ok(
+        &emulator,
+        &Setup::named(&emulator, "concurrency-other").await,
+    )
+    .await;
     sleep_past_running();
     let foreign = current_version(&emulator, &other, "concurrency-other").await;
     assert_ne!(
@@ -845,6 +870,10 @@ async fn a_stale_current_version_is_refused() {
         replayed.body
     );
     let next = current_version(&emulator, &arn, "concurrency").await;
+    // The accepted update above moved the replicator to `UPDATING`, which is not a
+    // state a further change is accepted from, so the clock is allowed to settle it
+    // back to `RUNNING` before the new version is quoted.
+    sleep_past_running();
     let again = update(&emulator, &arn, row.body(&next)).await;
     assert_eq!(
         again.status, 200,
@@ -861,7 +890,7 @@ async fn a_stale_current_version_is_refused() {
 #[tokio::test]
 async fn an_unknown_or_malformed_replicator_arn_is_refused() {
     let emulator = Emulator::new();
-    let setup = Setup::named("resolving");
+    let setup = Setup::named(&emulator, "resolving").await;
     let present = create_ok(&emulator, &setup).await;
     sleep_past_running();
     let version = current_version(&emulator, &present, "resolving").await;

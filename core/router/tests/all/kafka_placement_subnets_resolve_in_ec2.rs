@@ -6,9 +6,10 @@
 //! RULE: a subnet is Amazon EC2's resource, not Amazon MSK's, so every subnet id an Amazon
 //! MSK create names as a placement is resolved against the account's EC2 inventory BEFORE
 //! anything is minted — a create naming an id EC2 holds no subnet for is refused with the
-//! modelled `BadRequestException` (HTTP 400) naming the member at fault and the offending
-//! id, writes no record and mints no ARN, while a create naming EC2's own subnets is
-//! accepted and the resource it mints is the one the readers then report.
+//! modelled `BadRequestException` (HTTP 400) naming the member at fault and carrying MSK's
+//! own fixed sentence for a client subnet it could not resolve (no id of the request is
+//! echoed back), writes no record and mints no ARN, while a create naming EC2's own subnets
+//! is accepted and the resource it mints is the one the readers then report.
 //!
 //! This suite lives beside the router because the subnets are EC2's: the VPC and the
 //! subnets below are minted by the real EC2 operations on the SAME engine that serves
@@ -37,6 +38,13 @@ use crate::query_wire::{element, form_encode};
 
 /// The region every request below is signed for.
 const REGION: &str = "us-west-2";
+
+/// What Amazon MSK answers a create whose client subnets EC2 holds none of: one fixed
+/// sentence (its apostrophe is U+2019), with no subnet id of the request in it. Written out
+/// here rather than read from the service's own constant, so the wording is pinned by this
+/// suite instead of by the code under test.
+const SUBNETS_ABSENT_MESSAGE: &str =
+    "One or more of the specified client subnets don\u{2019}t exist.";
 
 /// The EC2 API version a client sends in an ec2Query body.
 const EC2_API_VERSION: &str = "2016-11-15";
@@ -313,17 +321,25 @@ async fn listed_connection_count(router: &MultiServiceRouter) -> usize {
 }
 
 /// Values that name no subnet of the account, whatever operation names them: EC2's 17-hex
-/// id form, its older 8-hex form, and a value that is no subnet id at all.
-fn unresolvable_subnet_ids() -> Vec<(&'static str, String)> {
+/// id form, its older 8-hex form, and a value that is no subnet id at all. The flag says
+/// whether the value is SHAPED like a subnet id, which is what decides whether an operation
+/// that reads that shape itself (`CreateVpcConnection`) reaches the resolution gate at all.
+fn unresolvable_subnet_ids() -> Vec<(&'static str, String, bool)> {
     vec![
         (
             "EC2's 17-hex id form",
             "subnet-0f1e2d3c4b5a69780".to_string(),
+            true,
         ),
-        ("EC2's older 8-hex id form", "subnet-1a2b3c4d".to_string()),
+        (
+            "EC2's older 8-hex id form",
+            "subnet-1a2b3c4d".to_string(),
+            true,
+        ),
         (
             "a value that is no subnet id at all",
             "not-a-subnet".to_string(),
+            false,
         ),
     ]
 }
@@ -338,8 +354,11 @@ struct RefusalRow {
     body: Value,
     parameter: &'static str,
     cluster_name: Option<String>,
-    /// The id the request named that EC2 holds no subnet for, which the refusal has to
-    /// name so the caller can fix the request from the message alone.
+    /// The sentence the refusal must carry.
+    message: String,
+    /// The id the request named that EC2 holds no subnet for. MSK does not echo it back
+    /// from the resolution gate, so a refusal carrying
+    /// [`SUBNETS_ABSENT_MESSAGE`] must NOT name it.
     unknown: String,
 }
 
@@ -398,7 +417,7 @@ async fn a_replicator_s_subnets_are_resolved_once_its_clusters_have() {
 
     // Rows differ along which reference does not resolve: the subnets alone (the clusters
     // are EC2-backed clusters this emulator holds), the cluster alone, and BOTH at once.
-    for (index, (form, unknown)) in unresolvable_subnet_ids().into_iter().enumerate() {
+    for (index, (form, unknown, _)) in unresolvable_subnet_ids().into_iter().enumerate() {
         let unknown_subnets = vec![network.subnets[0].clone(), unknown.clone()];
 
         let refused = kafka(
@@ -423,14 +442,21 @@ async fn a_replicator_s_subnets_are_resolved_once_its_clusters_have() {
         );
         assert_eq!(
             refused.invalid_parameter(),
-            "KafkaClusters[0].VpcConfig.SubnetIds",
+            "subnetIds",
             "case clusters resolve, subnet unknown in {form}: expected the refusal to name \
              the placement at fault, got {}",
             refused.body
         );
+        assert_eq!(
+            refused.message(),
+            SUBNETS_ABSENT_MESSAGE,
+            "case clusters resolve, subnet unknown in {form}: expected the service's fixed \
+             sentence, got {}",
+            refused.body
+        );
         assert!(
-            refused.message().contains(unknown.as_str()),
-            "case clusters resolve, subnet unknown in {form}: expected the refusal to name \
+            !refused.message().contains(unknown.as_str()),
+            "case clusters resolve, subnet unknown in {form}: the refusal must not echo \
              {unknown:?}, got {}",
             refused.body
         );
@@ -572,7 +598,7 @@ async fn msk_placement_subnets_resolve_against_ec2() {
     let accepted_connections = listed_connection_count(&router).await;
 
     let mut rows: Vec<RefusalRow> = Vec::new();
-    for (form, unknown) in unresolvable_subnet_ids() {
+    for (form, unknown, shaped) in unresolvable_subnet_ids() {
         let only = vec![unknown.clone()];
         let unknown_last = vec![network.subnets[0].clone(), unknown.clone()];
         let unknown_first = vec![
@@ -585,8 +611,9 @@ async fn msk_placement_subnets_resolve_against_ec2() {
             method: "POST",
             uri: "/v1/clusters",
             body: v1_body("dead-v1-only", 2, &only),
-            parameter: "BrokerNodeGroupInfo.ClientSubnets",
+            parameter: "brokerNodeGroupInfo",
             cluster_name: Some("dead-v1-only".to_string()),
+            message: SUBNETS_ABSENT_MESSAGE.to_string(),
             unknown: unknown.clone(),
         });
         rows.push(RefusalRow {
@@ -596,8 +623,9 @@ async fn msk_placement_subnets_resolve_against_ec2() {
             method: "POST",
             uri: "/v1/clusters",
             body: v1_body("dead-v1-last", 2, &unknown_last),
-            parameter: "BrokerNodeGroupInfo.ClientSubnets",
+            parameter: "brokerNodeGroupInfo",
             cluster_name: Some("dead-v1-last".to_string()),
+            message: SUBNETS_ABSENT_MESSAGE.to_string(),
             unknown: unknown.clone(),
         });
         rows.push(RefusalRow {
@@ -607,8 +635,9 @@ async fn msk_placement_subnets_resolve_against_ec2() {
             method: "POST",
             uri: "/v1/clusters",
             body: v1_body("dead-v1-first", 3, &unknown_first),
-            parameter: "BrokerNodeGroupInfo.ClientSubnets",
+            parameter: "brokerNodeGroupInfo",
             cluster_name: Some("dead-v1-first".to_string()),
+            message: SUBNETS_ABSENT_MESSAGE.to_string(),
             unknown: unknown.clone(),
         });
         rows.push(RefusalRow {
@@ -618,8 +647,9 @@ async fn msk_placement_subnets_resolve_against_ec2() {
             method: "POST",
             uri: "/api/v2/clusters",
             body: v2_provisioned_body("dead-v2", 2, &unknown_last),
-            parameter: "Provisioned.BrokerNodeGroupInfo.ClientSubnets",
+            parameter: "brokerNodeGroupInfo",
             cluster_name: Some("dead-v2".to_string()),
+            message: SUBNETS_ABSENT_MESSAGE.to_string(),
             unknown: unknown.clone(),
         });
         rows.push(RefusalRow {
@@ -633,8 +663,9 @@ async fn msk_placement_subnets_resolve_against_ec2() {
                 "dead-serverless",
                 &[vec![network.subnets[0].clone()], only.clone()],
             ),
-            parameter: "Serverless.VpcConfigs.SubnetIds",
+            parameter: "vpcConfigs",
             cluster_name: Some("dead-serverless".to_string()),
+            message: SUBNETS_ABSENT_MESSAGE.to_string(),
             unknown: unknown.clone(),
         });
         rows.push(RefusalRow {
@@ -646,6 +677,13 @@ async fn msk_placement_subnets_resolve_against_ec2() {
             body: connection_body(&provisioned, &network.vpc, &unknown_last),
             parameter: "ClientSubnets",
             cluster_name: None,
+            // `CreateVpcConnection` reads the SHAPE of each id it is given itself, so a
+            // value that is no subnet id at all never reaches the resolution gate: that
+            // handler's own sentence for an unusable id is what the caller gets.
+            message: match shaped {
+                true => SUBNETS_ABSENT_MESSAGE.to_string(),
+                false => format!("'{unknown}' is not a valid subnet id."),
+            },
             unknown: unknown.clone(),
         });
     }
@@ -667,9 +705,16 @@ async fn msk_placement_subnets_resolve_against_ec2() {
             row.parameter,
             refused.body
         );
+        assert_eq!(
+            refused.message(),
+            row.message,
+            "case {case:?}: expected {:?}, got {}",
+            row.message,
+            refused.body
+        );
         assert!(
-            refused.message().contains(unknown.as_str()),
-            "case {case:?}: expected the refusal to name {unknown:?}, got {}",
+            row.message != SUBNETS_ABSENT_MESSAGE || !refused.message().contains(unknown.as_str()),
+            "case {case:?}: the refusal must not echo {unknown:?}, got {}",
             refused.body
         );
 
@@ -692,5 +737,73 @@ async fn msk_placement_subnets_resolve_against_ec2() {
             "case {case:?}: a refused create must register no VPC connection, got \
              {connections} of them"
         );
+    }
+}
+
+/// RULE: a create's own REQUEST is admitted before the account's network is asked about
+/// it, so a create that is wrong in both ways at once — an Apache Kafka version the
+/// service does not publish AND subnets EC2 holds none of — is answered about the
+/// version. The order is observable only with EC2 beside Amazon MSK, which is why it is
+/// asserted here: without one the placement gate never fires at all.
+#[tokio::test]
+async fn a_requests_own_rules_are_answered_before_the_subnets_are_resolved() {
+    let router = emulator();
+    let network = ec2_network(&router).await;
+
+    // Rows differ along the operation (the v1 create and the v2 provisioned one) and
+    // along how many of the subnets EC2 holds: none of them, and one of two. Neither
+    // changes the answer, because the version is settled first.
+    let unknown = "subnet-0f1e2d3c4b5a69780".to_string();
+    let subnet_rows = [
+        ("no subnet EC2 holds", vec![unknown.clone()]),
+        (
+            "one subnet EC2 holds and one it does not",
+            vec![network.subnets[0].clone(), unknown.clone()],
+        ),
+    ];
+
+    for (index, (subnet_case, subnets)) in subnet_rows.iter().enumerate() {
+        for (operation, uri, body) in [
+            (
+                "CreateCluster",
+                "/v1/clusters",
+                v1_body(&format!("order-v1-{index}"), 2, subnets),
+            ),
+            (
+                "CreateClusterV2",
+                "/api/v2/clusters",
+                v2_provisioned_body(&format!("order-v2-{index}"), 2, subnets),
+            ),
+        ] {
+            let case = format!("{operation} with an unknown version and {subnet_case}");
+            let mut body = body;
+            // A version the catalog does not publish, in the member the operation
+            // carries it in.
+            if body.get("provisioned").is_some() {
+                body["provisioned"]["kafkaVersion"] = json!("9.9.9");
+            } else {
+                body["kafkaVersion"] = json!("9.9.9");
+            }
+            let refused = kafka(&router, "POST", uri, Some(body)).await;
+            assert_eq!(
+                (refused.status, refused.error_code()),
+                (400, "BadRequestException"),
+                "case {case:?}: expected a 400 BadRequestException, got {} with {}",
+                refused.status,
+                refused.body
+            );
+            assert_eq!(
+                refused.invalid_parameter(),
+                "kafkaVersion",
+                "case {case:?}: expected the refusal to be about the version, got {}",
+                refused.body
+            );
+            assert!(
+                !refused.message().contains(unknown.as_str())
+                    && refused.message() != SUBNETS_ABSENT_MESSAGE,
+                "case {case:?}: the subnets must not be resolved at all, got {}",
+                refused.body
+            );
+        }
     }
 }

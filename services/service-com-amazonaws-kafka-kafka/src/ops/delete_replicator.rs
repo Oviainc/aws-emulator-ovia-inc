@@ -167,17 +167,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
+        // A value that is not a replicator ARN at all names no replicator: the
+        // service's one fixed sentence for an unusable value, which echoes none of
+        // it.
         if !crate::state::is_replicator_arn(&input.replicator_arn) {
-            return Err(
-                DeleteReplicatorErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some(crate::state::REPLICATOR_ARN_MEMBER.to_string()),
-                    message: Some(format!(
-                        "{} is not a valid Amazon MSK replicator ARN.",
-                        input.replicator_arn
-                    )),
-                })
-                .into(),
-            );
+            return Err(DeleteReplicatorErrorModeled::BadRequestException(
+                crate::state::invalid_replicator_arn(),
+            )
+            .into());
         }
 
         let mut state = state.lock();

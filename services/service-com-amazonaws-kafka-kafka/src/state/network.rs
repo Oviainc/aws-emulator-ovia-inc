@@ -14,6 +14,12 @@
 //! Every refusal built here is grounded in what EC2 ANSWERED. An emulator with no EC2
 //! mounted knows nothing about the account's subnets, and nothing is what it refuses on: a
 //! refusal is never assumed from silence.
+//!
+//! What the CALLER is told, though, is Amazon MSK's own sentence for a placement it could
+//! not resolve ([`CLIENT_SUBNETS_ABSENT_MESSAGE`]) — fixed text, with no subnet id of the
+//! request and nothing of EC2's own answer in it. MSK answers for the request it was given
+//! rather than reporting the call it made on the caller's behalf; the member at fault is
+//! named by the refusal's `invalidParameter`, which is the handler's to pass.
 
 /// An AWS SDK client over the in-process callback into this same emulator.
 ///
@@ -57,16 +63,17 @@ pub const MAX_PLACEMENT_SUBNETS: usize = super::MAX_SERVERLESS_VPC_ENTRIES;
 /// a value that is not a subnet id at all. Both say the same thing about a placement.
 const SUBNET_ID_REFUSAL_PREFIX: &str = "InvalidSubnetID.";
 
-/// The EC2 error code for an id the account holds no subnet for, which is what a read that
-/// resolved without reporting one of the requested ids ran into.
-const SUBNET_ID_NOT_FOUND: &str = "InvalidSubnetID.NotFound";
-
-/// The status an EC2 client fault carries, for a read that resolved without reporting one
-/// of the requested ids and so has no response of its own to read it off.
-const SUBNET_ID_NOT_FOUND_STATUS: u16 = 400;
-
-/// The EC2 service name an answer of EC2's is reported under.
-const EC2_SERVICE_NAME: &str = "AmazonEC2";
+/// What Amazon MSK answers a create whose client subnets it could not resolve against the
+/// account's network.
+///
+/// A CONSTANT of the service, not built from the request (the apostrophe is U+2019, as the
+/// service writes it): the ids the request named are not echoed back, nor is the count of
+/// them, nor anything of the answer EC2 gave the resolving call — one sentence for every
+/// create that places a resource in a client VPC it cannot be placed in, whichever member
+/// named the subnets. That member is reported in the refusal's `invalidParameter` by the
+/// handler that knows it.
+pub const CLIENT_SUBNETS_ABSENT_MESSAGE: &str =
+    "One or more of the specified client subnets don\u{2019}t exist.";
 
 /// Why the subnets `subnet_ids` names cannot be placed in, or `None` when they can — which
 /// includes the case where this emulator has no EC2 to ask, because a refusal has to be
@@ -80,10 +87,9 @@ const EC2_SERVICE_NAME: &str = "AmazonEC2";
 /// replicator's client) is reached through INSIDE the subnets a request names, so it
 /// resolves them before it provisions anything. The subnets of the account are EC2's, so
 /// EC2 is asked: it answers `InvalidSubnetID.NotFound` for an id no subnet of the account
-/// carries, and the message it gives — which names that id — is carried through to the
-/// caller with the service, status, error code, request id and proxy of the call it came
-/// from, the way an AWS service reports the failure of a call it made on the caller's
-/// behalf.
+/// carries, and an id it reports no subnet for says the same thing. Either way the caller
+/// is answered MSK's own [`CLIENT_SUBNETS_ABSENT_MESSAGE`] — EC2's answer decides WHETHER
+/// the create is refused, not what the refusal says.
 pub async fn placement_subnet_refusal(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -119,14 +125,10 @@ pub async fn placement_subnet_refusal(
                 .iter()
                 .filter_map(::aws_sdk_ec2::types::Subnet::subnet_id)
                 .collect();
-            let absent = subnet_ids
-                .iter()
-                .find(|id| !reported.contains(&id.as_str()))?;
-            return Some(reported_ec2_fault(
-                &format!("The subnet ID '{absent}' does not exist"),
-                SUBNET_ID_NOT_FOUND,
-                Some(SUBNET_ID_NOT_FOUND_STATUS),
-            ));
+            if subnet_ids.iter().all(|id| reported.contains(&id.as_str())) {
+                return None;
+            }
+            return Some(CLIENT_SUBNETS_ABSENT_MESSAGE.to_string());
         }
         Err(error) => error,
     };
@@ -145,39 +147,7 @@ pub async fn placement_subnet_refusal(
         );
         return None;
     }
-    let detail = error
-        .as_service_error()
-        .and_then(ProvideErrorMetadata::message)
-        // EC2 names the offending id in its message; with no message to carry, the ids the
-        // request named are what is reported instead, so the caller is still told which
-        // list did not resolve.
-        .map_or_else(
-            || format!("One of the subnet IDs {subnet_ids:?} does not exist"),
-            str::to_string,
-        );
-    Some(reported_ec2_fault(
-        &detail,
-        &code,
-        error.raw_response().map(|response| response.status().as_u16()),
-    ))
-}
-
-/// `detail`, as a failure EC2 reported to a call this service made on the caller's behalf.
-///
-/// The wrapped form AWS reports an inner service's failure in names the service, the
-/// status and the error code it answered, the id of the call that was made and the proxy
-/// it went through — there is none, so that field is `null`. The tail is what a caller (or
-/// its tooling) correlates this refusal with the call behind it by, so it is part of the
-/// message rather than an addition to it.
-fn reported_ec2_fault(detail: &str, code: &str, status: Option<u16>) -> String {
-    let status = status
-        .map(|status| format!("Status Code: {status}; "))
-        .unwrap_or_default();
-    let request_id = super::new_peer_request_id();
-    format!(
-        "{detail} (Service: {EC2_SERVICE_NAME}; {status}Error Code: {code}; \
-         Request ID: {request_id}; Proxy: null)"
-    )
+    Some(CLIENT_SUBNETS_ABSENT_MESSAGE.to_string())
 }
 
 /// The endpoint the in-process callback reaches `service` in `region` at, or `None` when

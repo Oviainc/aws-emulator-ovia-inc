@@ -174,7 +174,7 @@ async fn a_create_may_name_at_most_the_placement_ceiling_of_subnets() {
                         "clientSubnets": subnets,
                     },
                 }),
-                "BrokerNodeGroupInfo.ClientSubnets",
+                "brokerNodeGroupInfo",
             ),
             (
                 "CreateClusterV2",
@@ -190,7 +190,7 @@ async fn a_create_may_name_at_most_the_placement_ceiling_of_subnets() {
                         },
                     },
                 }),
-                "Provisioned.BrokerNodeGroupInfo.ClientSubnets",
+                "brokerNodeGroupInfo",
             ),
             (
                 "CreateVpcConnection",

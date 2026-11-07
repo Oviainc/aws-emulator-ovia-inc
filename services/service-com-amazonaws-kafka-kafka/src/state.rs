@@ -975,6 +975,67 @@ pub fn is_offered_kafka_version(version: &str) -> bool {
     kafka_version_status(version) == Some(KAFKA_VERSION_ACTIVE)
 }
 
+/// The input member a create names the Apache Kafka version of its brokers in,
+/// as the API documents it on the wire — the camelCase spelling the request
+/// itself carries, which is what a refusal of that value reports as the
+/// parameter at fault.
+pub const KAFKA_VERSION_MEMBER: &str = "kafkaVersion";
+
+/// The prefix of the Express broker instance types (`express.m7g.*`): the
+/// broker CATEGORY Amazon MSK offers beside the standard families
+/// (`kafka.m5.*`, `kafka.m7g.*`, `kafka.t3.small` — see
+/// [`is_broker_instance_type`]).
+const EXPRESS_INSTANCE_TYPE_PREFIX: &str = "express.";
+
+/// The category of brokers `instance_type` names, as Amazon MSK words it in the
+/// version refusal below: the two categories a provisioned cluster's brokers
+/// come in, each with its own set of Apache Kafka versions, so the refusal says
+/// which one the request asked for rather than assuming either.
+fn broker_instance_category(instance_type: &str) -> &'static str {
+    match instance_type.starts_with(EXPRESS_INSTANCE_TYPE_PREFIX) {
+        true => "Express",
+        false => "Standard",
+    }
+}
+
+/// Why a provisioned create naming Apache Kafka version `kafka_version` for
+/// brokers of `instance_type` describes no cluster the service could run, or
+/// `None` when the service knows that version.
+///
+/// Amazon MSK runs a cluster on a version of its OWN catalog — the one
+/// `ListKafkaVersions` serves ([`KAFKA_VERSION_CATALOG`]) — so a value the
+/// catalog does not publish at all names no broker software, and the create is
+/// refused from the REQUEST alone, before anything the request names is
+/// resolved against this account's network or registry.
+///
+/// The sentence is the service's: the broker category the request asked for
+/// ([`broker_instance_category`]), the version it named, and the versions MSK
+/// OFFERS for a new cluster ([`is_offered_kafka_version`]) in catalog order —
+/// the actionable half of the refusal, so it is derived from the catalog rather
+/// than written out beside it.
+///
+/// A version the catalog publishes but no longer offers is ADMITTED here: a
+/// cluster running one is exactly what the version-update surface moves a
+/// cluster away from ([`compatible_target_versions`]), and this emulator has no
+/// other way to hold such a cluster, so the catalog's membership is the gate and
+/// the offered set is what the refusal recommends.
+pub fn create_kafka_version_violation(kafka_version: &str, instance_type: &str) -> Option<String> {
+    if kafka_version_index(kafka_version).is_some() {
+        return None;
+    }
+    let offered: Vec<&str> = KAFKA_VERSION_CATALOG
+        .iter()
+        .filter(|entry| is_offered_kafka_version(entry.version))
+        .map(|entry| entry.version)
+        .collect();
+    Some(format!(
+        "{} instance types are not supported for Kafka version {kafka_version}. \
+         Valid values: [{}]",
+        broker_instance_category(instance_type),
+        offered.join(", ")
+    ))
+}
+
 /// Marker that prefixes a version page token's plaintext, so a token minted for
 /// some other list cannot be mistaken for one of these.
 const KAFKA_VERSION_PAGE_TOKEN_PREFIX: &str = "kafka:kafka-versions:";
@@ -1090,6 +1151,17 @@ pub const NOT_FOUND_STATUS: u16 = 404;
 /// one form instead of describing its own state.
 pub fn parameter_not_found_message(member: &str) -> String {
     format!("Invalid parameter {member}: {RESOURCE_NOT_FOUND_MESSAGE}")
+}
+
+/// The message Amazon MSK answers a request whose value for `member` is not one
+/// that member can carry at all — a value it could not have minted and will not
+/// read.
+///
+/// The same `Invalid parameter <member>` framing
+/// [`parameter_not_found_message`] puts a detail after, with nothing after it:
+/// the member is named, and no part of the offending value is echoed back.
+pub fn invalid_parameter_message(member: &str) -> String {
+    format!("Invalid parameter {member}.")
 }
 
 /// The message Amazon MSK answers a cluster call it refuses because the cluster
@@ -2281,6 +2353,36 @@ pub const REPLICATOR_STATE_UPDATING: &str = "UPDATING";
 /// reports WHY in `StateInfo` ([`Replicator::state_info`]).
 pub const REPLICATOR_STATE_FAILED: &str = "FAILED";
 
+/// The `ReplicatorState` values a call that CHANGES a replicator's replication
+/// configuration is accepted from: a replicator replicates while it is
+/// `RUNNING`, and every other state is one it is being set up in, rolled out in
+/// or taken out in — a configuration change is not applied to any of those.
+///
+/// Named here so the gate and the refusal built from it
+/// ([`replicator_not_in_accepted_state`]) cannot drift apart.
+pub const REPLICATOR_STATES_AN_UPDATE_IS_ACCEPTED_FROM: [&str; 1] = [REPLICATOR_STATE_RUNNING];
+
+/// How Amazon MSK refuses a call against a replicator whose current state that
+/// call is not accepted from: a `BadRequestException` (HTTP 400) whose message
+/// names the input member the replicator was addressed by and the set of states
+/// the call IS accepted from — `accepted`, in the spelling the model's
+/// `ReplicatorState` enum declares, so the sentence is built from the gate the
+/// handler applied rather than written out beside it.
+///
+/// The member travels in the MESSAGE here, in the service's `Invalid parameter
+/// <member>` framing, and the refusal names no `invalidParameter` of its own:
+/// the request is well formed and it is the resource's state that refused it.
+pub fn replicator_not_in_accepted_state(accepted: &[&str]) -> BadRequestException {
+    BadRequestException {
+        invalid_parameter: None,
+        message: Some(format!(
+            "Invalid parameter {REPLICATOR_ARN_MEMBER}: This operation is only valid for \
+             resources that are in one of the following states: [{}]",
+            accepted.join(", ")
+        )),
+    }
+}
+
 /// The `ReplicationStateInfo$Code` Amazon MSK reports for a replicator it could
 /// not provision because an Amazon MSK cluster its setup names does not exist.
 /// A fixed token, not built from the request.
@@ -3405,6 +3507,13 @@ pub const TARGET_REPLICATION_END: ReplicationEnd = ReplicationEnd {
 };
 
 impl ReplicationEnd {
+    /// The member carrying this end's Amazon MSK cluster ARN, as the wire spells
+    /// it: the parameter a refusal about this end names at fault, and the first
+    /// of the two members [`Self::unnamed_message`] tells the caller to send.
+    pub fn arn_member(&self) -> &'static str {
+        self.arn_member
+    }
+
     /// What the service refuses a request that does not name this end exactly
     /// once with: one fixed sentence per end, built from the two member names the
     /// wire carries and the word for the end, with NO part of it taken from the
@@ -4158,39 +4267,46 @@ fn uuid_v4_shaped_from_digest(digest: &[u8; 32]) -> String {
     rendered
 }
 
-/// The id of the call this service made to ANOTHER service on the caller's behalf,
-/// as it is reported back to that caller ([`network`]).
-///
-/// A request identifier is generated per call — it is what correlates one answer
-/// with the call behind it — so it is drawn afresh rather than derived from
-/// anything in the request: the seed is the system clock in nanoseconds together
-/// with the OS-seeded randomness a `RandomState` draws, and it is rendered by the
-/// one minter behind every identifier this module gives that shape to
-/// ([`uuid_v4_shaped_from_digest`]).
-fn new_peer_request_id() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::BuildHasher;
-
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|since| since.as_nanos())
-        .unwrap_or_default();
-    let entropy = RandomState::new().hash_one(nanos);
-    uuid_v4_shaped_from_digest(&stable_digest(&format!("{nanos}#{entropy}")))
-}
-
 /// An MSK `CurrentVersion` token: `K` followed by 13 upper-case alphanumerics,
 /// the form the real service's cluster version takes. It is a function of the
 /// cluster ARN and its revision, so it changes exactly when the cluster does.
 fn current_version_token(arn: &str, revision: u64) -> String {
-    const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     let digest = stable_digest(&format!("{arn}#{revision}"));
-    let mut token = String::with_capacity(14);
-    token.push('K');
-    for byte in digest.iter().take(13) {
-        token.push(ALPHABET[usize::from(*byte) % ALPHABET.len()] as char);
+    let mut token = String::with_capacity(CURRENT_VERSION_TOKEN_LEN);
+    token.push(CURRENT_VERSION_TOKEN_PREFIX);
+    for byte in digest.iter().take(CURRENT_VERSION_TOKEN_LEN - 1) {
+        token.push(CURRENT_VERSION_TOKEN_ALPHABET[usize::from(*byte) % 36] as char);
     }
     token
+}
+
+/// The character every [`current_version_token`] starts with.
+const CURRENT_VERSION_TOKEN_PREFIX: char = 'K';
+
+/// How many characters one carries in all.
+const CURRENT_VERSION_TOKEN_LEN: usize = 14;
+
+/// The characters its tail is drawn from.
+const CURRENT_VERSION_TOKEN_ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/// Whether `value` is shaped like a version token this service mints
+/// ([`current_version_token`]).
+///
+/// A `CurrentVersion` is a token the SERVICE hands out and the caller quotes
+/// back, so a value outside that shape is not a version of any resource — it is
+/// a parameter the service will not read, which is a different refusal from
+/// quoting a well-formed token the resource is not at
+/// ([`CLUSTER_VERSION_NOT_CURRENT_MESSAGE`]): the first is answered from the
+/// request alone, the second only against the stored record. The same
+/// distinction this module draws between an ARN that is not one
+/// ([`malformed_arn`]) and a well-formed ARN nothing holds.
+pub fn is_current_version_token(value: &str) -> bool {
+    let mut characters = value.chars();
+    characters.next() == Some(CURRENT_VERSION_TOKEN_PREFIX)
+        && value.len() == CURRENT_VERSION_TOKEN_LEN
+        && characters.all(|character| {
+            CURRENT_VERSION_TOKEN_ALPHABET.contains(&u8::try_from(character).unwrap_or_default())
+        })
 }
 
 /// Encode the registry key a page stopped at as a pagination token, marked with
@@ -4336,6 +4452,30 @@ pub fn malformed_arn(member: &str) -> BadRequestException {
 /// cluster's own ARN, which is what that sentence is about.
 pub fn invalid_cluster_arn() -> BadRequestException {
     parameter_refusal(CLUSTER_ARN_MEMBER, CLUSTER_ARN_NOT_VALID_MESSAGE)
+}
+
+/// The sentence the REPLICATOR surface answers a value its member cannot carry
+/// with: fixed text end to end, so the value the request sent is never echoed
+/// back and two calls carrying different unusable values are told the same thing.
+///
+/// A sentence of the service's own, beside the generic [`BAD_REQUEST_MESSAGE`]
+/// the cluster surface answers and the cluster-specific
+/// [`CLUSTER_ARN_NOT_VALID_MESSAGE`]: which of them a caller gets is the
+/// operation's, so they are named separately here rather than evened out.
+pub const VALUE_NOT_VALID_MESSAGE: &str = "The provided value is not valid.";
+
+/// The refusal every replicator operation answers a value that is not shaped like
+/// a replicator ARN ([`is_replicator_arn`]) with: a `BadRequestException` (HTTP
+/// 400) carrying [`VALUE_NOT_VALID_MESSAGE`] and naming
+/// [`REPLICATOR_ARN_MEMBER`] in `invalidParameter`.
+///
+/// Built HERE, like [`malformed_arn`], so the readers, the delete and the
+/// replication update cannot drift apart on how an unusable replicator reference
+/// is reported: one condition, one envelope, whichever operation met it. A
+/// well-formed ARN no live replicator holds is the DIFFERENT refusal those
+/// operations answer with [`parameter_not_found_message`].
+pub fn invalid_replicator_arn() -> BadRequestException {
+    parameter_refusal(REPLICATOR_ARN_MEMBER, VALUE_NOT_VALID_MESSAGE)
 }
 
 /// The sentence an operation that models NO `NotFoundException` answers a

@@ -1,6 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateReplicationInfo
+//! Changes the configuration of ONE of a replicator's replications — the one its
+//! pair of Kafka cluster aliases addresses.
+//!
+//! The gates run in the order Amazon MSK answers them in, which is the contract a
+//! caller fixes its request against: everything that depends on the REQUEST alone
+//! first — the shape of the replicator ARN, each end of the replication named
+//! exactly once ([`crate::state::replication_end_alias`]), the topic patterns, and
+//! the shape of the quoted `CurrentVersion`
+//! ([`crate::state::is_current_version_token`]) — so a malformed request is
+//! answered about the request even when the ARN it carries names nothing. Only
+//! then is the replicator resolved (`NotFoundException`), gated on the state a
+//! change is accepted from
+//! ([`crate::state::REPLICATOR_STATES_AN_UPDATE_IS_ACCEPTED_FROM`]), and asked for
+//! the replication the aliases address and the version it is at.
 //!
 //! ## Shape of an operation
 //!
@@ -124,13 +138,13 @@ impl From<UpdateReplicationInfoErrorModeled> for UpdateReplicationInfoError {
 
 /// The refusal a request that does not name one end of the replication it
 /// addresses earns: HTTP 400 `BadRequestException` carrying that end's fixed
-/// sentence. The two members are at fault as a PAIR — either one of them would
-/// have named the cluster — so no single member is reported as the invalid
-/// parameter.
-fn unnamed_end_refusal(message: String) -> UpdateReplicationInfoError {
+/// sentence and naming that end's Amazon MSK cluster ARN member as the parameter
+/// at fault — the first of the two members the sentence tells the caller to send,
+/// by the camelCase name the API documents and the request itself carries.
+fn unnamed_end_refusal(end: crate::state::ReplicationEnd) -> UpdateReplicationInfoError {
     UpdateReplicationInfoErrorModeled::BadRequestException(BadRequestException {
-        invalid_parameter: None,
-        message: Some(message),
+        invalid_parameter: Some(end.arn_member().to_string()),
+        message: Some(end.unnamed_message()),
     })
     .into()
 }
@@ -183,17 +197,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let region = crate::state::request_region(ctx.parts());
+        // A value that is not a replicator ARN at all names no replicator, and
+        // the service answers one fixed sentence for it — the value it could not
+        // read is not echoed back.
         if !crate::state::is_replicator_arn(&input.replicator_arn) {
-            return Err(
-                UpdateReplicationInfoErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some(crate::state::REPLICATOR_ARN_MEMBER.to_string()),
-                    message: Some(format!(
-                        "{} is not a valid Amazon MSK replicator ARN.",
-                        input.replicator_arn
-                    )),
-                })
-                .into(),
-            );
+            return Err(UpdateReplicationInfoErrorModeled::BadRequestException(
+                crate::state::invalid_replicator_arn(),
+            )
+            .into());
         }
 
         // Every rule this operation enforces on the REQUEST is enforced here,
@@ -213,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.source_kafka_cluster_id.as_deref(),
         ) {
             Ok(alias) => alias,
-            Err(message) => return Err(unnamed_end_refusal(message)),
+            Err(_) => return Err(unnamed_end_refusal(crate::state::SOURCE_REPLICATION_END)),
         };
         let target = match crate::state::replication_end_alias(
             crate::state::TARGET_REPLICATION_END,
@@ -221,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.target_kafka_cluster_id.as_deref(),
         ) {
             Ok(alias) => alias,
-            Err(message) => return Err(unnamed_end_refusal(message)),
+            Err(_) => return Err(unnamed_end_refusal(crate::state::TARGET_REPLICATION_END)),
         };
 
         // A flow selects the topics it replicates by regular expression, so a
@@ -244,11 +255,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // `CurrentVersion` is a token the SERVICE mints and the caller quotes
+        // back, so a value outside that shape is not a version of any replicator:
+        // it is a parameter this operation will not read, and like every other
+        // rule over the request alone it is answered BEFORE the path's ARN is
+        // resolved — whether that ARN names anything cannot change it. Quoting a
+        // well-formed token the replicator is not at is a different refusal, made
+        // against the stored record below.
+        if !crate::state::is_current_version_token(&input.current_version) {
+            return Err(
+                UpdateReplicationInfoErrorModeled::BadRequestException(BadRequestException {
+                    // The refusal is about the replicator this call addresses, and
+                    // the member whose value it will not read is named in the
+                    // message.
+                    invalid_parameter: Some(crate::state::REPLICATOR_ARN_MEMBER.to_string()),
+                    message: Some(crate::state::invalid_parameter_message(
+                        crate::state::CURRENT_VERSION_MEMBER,
+                    )),
+                })
+                .into(),
+            );
+        }
+
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
-        // Resolved through the settling lookup, as the reader does: the version
-        // checked below and the state reported back are the replicator's own, so
-        // this call must see the transition the clock already owed it.
+        // Resolved through the settling lookup, as the reader does: the state
+        // gated on below, the version checked against and the state reported back
+        // are the replicator's own, so this call must see the transition the clock
+        // already owed it.
         let Some(replicator) =
             state.settled_replicator_in(&region, &input.replicator_arn, now)
         else {
@@ -265,6 +299,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+        // A replicator accepts a change to its replication configuration only
+        // while it is replicating: in every other state it is being set up,
+        // rolling one out or being taken out, and MSK refuses the call rather than
+        // folding a second change into it. Gated on the state the clock has just
+        // settled, and before anything the request asks for is applied — the
+        // request itself is well formed by here, so the refusal is about the
+        // resource's state rather than about a parameter.
+        if !crate::state::REPLICATOR_STATES_AN_UPDATE_IS_ACCEPTED_FROM
+            .contains(&replicator.state.as_str())
+        {
+            return Err(UpdateReplicationInfoErrorModeled::BadRequestException(
+                crate::state::replicator_not_in_accepted_state(
+                    &crate::state::REPLICATOR_STATES_AN_UPDATE_IS_ACCEPTED_FROM,
+                ),
+            )
+            .into());
+        }
         // WHICH replication the call changes is settled before the version it
         // quotes: a request whose pair of cluster aliases addresses no configured
         // replication asks to change something the replicator does not have,

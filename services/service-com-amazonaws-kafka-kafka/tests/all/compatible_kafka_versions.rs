@@ -209,9 +209,13 @@ fn the_catalog_is_published_in_ascending_release_order() {
 /// Rows: the oldest catalogued version, a deprecated four-component version, the
 /// `.tiered` spelling, the version at the active boundary, a four-component patch
 /// of it, a `.x` version that has a KRaft version of its own release, a KRaft
-/// source, the `.link` line (terminal), the newest KRaft version (nothing left),
-/// a deprecated KRaft version, and a version the catalog does not list at all. The
-/// expected lists are written out from the catalog documented in `src/state.rs`.
+/// source, the `.link` line (terminal), the newest KRaft version (nothing left)
+/// and a deprecated KRaft version. The expected lists are written out from the
+/// catalog documented in `src/state.rs`.
+///
+/// Every row's source version is one the catalog PUBLISHES, because that is what a
+/// create admits: a cluster cannot be stored on a version the service does not
+/// name (`create_cluster`'s version gate), so the reader is never asked about one.
 #[tokio::test]
 async fn compatible_targets_are_the_upgrades_the_catalog_permits() {
     let emulator = Emulator::new();
@@ -246,9 +250,6 @@ async fn compatible_targets_are_the_upgrades_the_catalog_permits() {
         ("4.2.x.kraft", Vec::new()),
         // A line of its own with no newer member: terminal.
         ("3.8.link", Vec::new()),
-        // A version the catalog does not list, newer than every catalogued one:
-        // still a valid source, with no target above it.
-        ("9.9.9", Vec::new()),
     ];
 
     for (index, (version, expected)) in rows.iter().enumerate() {

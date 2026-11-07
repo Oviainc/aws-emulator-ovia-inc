@@ -19,7 +19,7 @@
 
 use serde_json::{json, Value};
 
-use crate::kafka_harness::{pct, Emulator, Reply, ACCOUNT, REGION};
+use crate::kafka_harness::{pct, ClusterRequest, Emulator, Reply, ACCOUNT, REGION};
 
 /// The IAM role every replicator below is created with. `ServiceExecutionRoleArn`
 /// is a plain `__string` in the model, so the service stores it verbatim.
@@ -48,7 +48,9 @@ const TARGET_UNNAMED_MESSAGE: &str =
 const NOT_FOUND_MESSAGE: &str =
     "Invalid parameter replicatorArn: The requested resource doesn\u{2019}t exist.";
 
-/// A well-formed Amazon MSK cluster ARN in the signing region.
+/// A well-formed Amazon MSK cluster ARN in the signing region that no cluster
+/// holds — enough for a request that is refused on its BODY, which never resolves
+/// the clusters it names.
 fn cluster_arn(name: &str) -> String {
     format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/{name}/{GHOST_ID}")
 }
@@ -141,12 +143,21 @@ fn update_body(ends: &Value, version: &str) -> Value {
 }
 
 /// A replicator spanning two MSK clusters with one replication between them, and
-/// the version the reader reports for it.
-async fn replicator(emulator: &Emulator, name: &str) -> (String, String) {
-    let (source, target) = (
-        cluster_arn(&format!("source-{name}")),
-        cluster_arn(&format!("target-{name}")),
-    );
+/// the version the reader reports for it — plus the ARNs of the two clusters it
+/// spans.
+///
+/// The clusters are CREATED here: Amazon MSK provisions a replicator only once the
+/// Amazon MSK clusters its setup names resolve, and a replicator that never
+/// provisions converges to the terminal `FAILED`, which is not a state a
+/// configuration change is accepted from. The control below changes this
+/// replicator, so it has to be one that reaches `RUNNING`.
+async fn replicator(emulator: &Emulator, name: &str) -> (String, String, String, String) {
+    let source = emulator
+        .create_ok(&ClusterRequest::named(&format!("source-{name}")))
+        .await;
+    let target = emulator
+        .create_ok(&ClusterRequest::named(&format!("target-{name}")))
+        .await;
     let ends = json!({
         "sourceKafkaClusterArn": source,
         "targetKafkaClusterArn": target,
@@ -167,7 +178,7 @@ async fn replicator(emulator: &Emulator, name: &str) -> (String, String) {
         .as_str()
         .unwrap_or_else(|| panic!("case {name}: DescribeReplicator reported no currentVersion"))
         .to_string();
-    (arn, version)
+    (arn, version, source, target)
 }
 
 /// Every way a request can fail to name one end of its replication exactly once,
@@ -250,12 +261,8 @@ fn unnamed_end_rows(source: &str, target: &str) -> Vec<(&'static str, Value, &'s
 #[tokio::test]
 async fn an_unnamed_replication_end_is_refused_before_the_replicator_is_resolved() {
     let emulator = Emulator::new();
-    let (present, version) = replicator(&emulator, "ends").await;
+    let (present, version, source, target) = replicator(&emulator, "ends").await;
     let intact = describe(&emulator, &present).await.body;
-    let (source, target) = (
-        cluster_arn("source-ends"),
-        cluster_arn("target-ends"),
-    );
 
     // The path dimension is what makes the ORDER of the two gates observable: the
     // same body is answered the same way against a replicator that exists and one
@@ -296,7 +303,13 @@ async fn an_unnamed_replication_end_is_refused_before_the_replicator_is_resolved
     );
 
     // The control: the same update with each end named exactly once IS carried out,
-    // and an independent read reports it.
+    // and an independent read reports it. The replicator has to be RUNNING for that:
+    // a change is applied only from the state that accepts one, so the clock is
+    // allowed to settle this replicator first.
+    std::thread::sleep(
+        service_com_amazonaws_kafka_kafka::state::REPLICATOR_ACTIVATION_DELAY
+            + std::time::Duration::from_millis(250),
+    );
     let accepted = update(
         &emulator,
         &present,
@@ -419,7 +432,7 @@ async fn a_created_replication_that_does_not_name_an_end_is_refused() {
 
     // The control: the same entry with both ends named exactly once is accepted,
     // and the replicator it mints is readable back.
-    let (arn, _) = replicator(&emulator, "created-control").await;
+    let (arn, _, _, _) = replicator(&emulator, "created-control").await;
     let described = describe(&emulator, &arn).await;
     assert_eq!(
         described
