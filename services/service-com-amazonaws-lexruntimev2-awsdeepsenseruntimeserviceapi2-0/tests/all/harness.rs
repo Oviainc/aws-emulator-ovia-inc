@@ -7,22 +7,33 @@
 //! real [`MultiServiceRouter`], and dispatches buffered HTTP requests — so what
 //! a suite asserts is wire behaviour (status, headers, body) and not a handler
 //! called directly.
+//!
+//! The Lex Models V2 control plane is mounted on the SAME engine, because the
+//! bot a turn is interpreted against is its resource: this runtime refuses a
+//! turn addressed to a bot locale with no built model, so a suite that drives a
+//! turn needs a locale that was built. A suite about the bot drives that control
+//! plane over HTTP like any client ([`Emulator::send`] reaches it, since each
+//! service claims its own modelled routes); a suite about the SESSION, where the
+//! bot is only a fixture, asks for one through [`Emulator::built_locale`].
 
 use bytes::Bytes;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde_json::Value;
+use service_com_amazonaws_lexmodelsv2_lexmodelbuildingservicev2 as lexmodels;
 use smithy_server_runtime::MultiServiceRouter;
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use service_com_amazonaws_lexruntimev2_awsdeepsenseruntimeserviceapi2_0::EmulatedService;
 
-/// The emulator under test: one shared engine, one registered service, driven
-/// through the router every front door uses.
+/// The emulator under test: one shared engine, the runtime and the control plane
+/// that holds its bots, driven through the router every front door uses.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -31,8 +42,69 @@ impl Emulator {
         let mut router = MultiServiceRouter::new();
         // Signatures are the framework's business, not this suite's.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(lexmodels::EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// Give the bot, alias and locale those labels address a BUILT locale that
+    /// declares no intent of its own, as a fixture for the suites whose subject
+    /// is the session rather than the bot.
+    ///
+    /// The record is written into the control plane's own store, because that is
+    /// where a bot lives: a locale `CreateBot` / `CreateBotLocale` /
+    /// `BuildBotLocale` produced carries a MINTED bot id, and these suites
+    /// address bots by the fixed labels their tables fix. A locale with no
+    /// intents is also what keeps them independent of any bot's content:
+    /// nothing can be matched in it, so every turn is the fallback intent,
+    /// which is the case the real service answers the same way.
+    pub(crate) fn built_locale(&self, bot_id: &str, bot_alias_id: &str, locale_id: &str) {
+        let now = SystemTime::now();
+        let control_plane = lexmodels::state::service_state(&*self.engine)
+            .expect("the control plane's store is reachable through the shared engine");
+        let mut control_plane = control_plane.lock();
+        control_plane.bot_aliases.insert(
+            lexmodels::state::bot_alias_key(bot_id, bot_alias_id),
+            lexmodels::state::BotAlias {
+                bot_id: bot_id.to_string(),
+                bot_alias_id: bot_alias_id.to_string(),
+                bot_alias_name: lexmodels::state::TEST_BOT_ALIAS_NAME.to_string(),
+                description: None,
+                bot_version: lexmodels::state::DRAFT_BOT_VERSION.to_string(),
+                bot_alias_status: lexmodels::state::BOT_ALIAS_STATUS_AVAILABLE.to_string(),
+                creation_date_time: now,
+                last_updated_date_time: now,
+            },
+        );
+        control_plane.bot_locales.insert(
+            lexmodels::state::bot_locale_key(bot_id, lexmodels::state::DRAFT_BOT_VERSION, locale_id),
+            lexmodels::state::BotLocale {
+                bot_id: bot_id.to_string(),
+                bot_version: lexmodels::state::DRAFT_BOT_VERSION.to_string(),
+                locale_id: locale_id.to_string(),
+                locale_name: lexmodels::state::locale_name(locale_id)
+                    .unwrap_or_default()
+                    .to_string(),
+                description: None,
+                // Inside the modelled `ConfidenceThreshold` range 0..1. The
+                // locale declares no intent, so nothing is scored against it.
+                nlu_intent_confidence_threshold: 0.4,
+                voice_settings: None,
+                unified_speech_settings: None,
+                audio_filler_settings: None,
+                speech_recognition_settings: None,
+                generative_ai_settings: None,
+                speech_detection_sensitivity: None,
+                speaker_diarization_settings: None,
+                bot_locale_status: lexmodels::state::BOT_LOCALE_STATUS_BUILT.to_string(),
+                creation_date_time: now,
+                last_updated_date_time: now,
+                last_build_submitted_date_time: Some(now),
+                failure_reasons: Vec::new(),
+                pending_failure_reasons: Vec::new(),
+                pending_status: None,
+            },
+        );
     }
 
     pub(crate) async fn send(&self, method: &str, path: &str, body: Option<Value>) -> Reply {

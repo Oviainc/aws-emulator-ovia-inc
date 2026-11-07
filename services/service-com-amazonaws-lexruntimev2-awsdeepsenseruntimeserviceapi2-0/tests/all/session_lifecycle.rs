@@ -124,6 +124,9 @@ fn lifecycle_cases() -> Vec<Case> {
 async fn a_session_is_created_read_advanced_and_deleted() {
     for case in lifecycle_cases() {
         let emulator = Emulator::new();
+        // The bot the session hangs off: a turn is interpreted against a built
+        // locale, so the labels this row addresses have to name one.
+        emulator.built_locale(case.bot_id, case.bot_alias_id, case.locale_id);
         let path = case.session_path();
 
         // --- PutSession ------------------------------------------------------
@@ -272,8 +275,10 @@ async fn a_session_is_created_read_advanced_and_deleted() {
         assert_eq!(
             turn.pointer("/sessionState/dialogAction/type")
                 .and_then(Value::as_str),
-            Some("Delegate"),
-            "case {:?}: the stored dialog action is kept, not overwritten, got {turn:?}",
+            Some("Close"),
+            "case {:?}: the turn reports the step the bot decided on \u{2014} a supplied \
+             `Delegate` asks Amazon Lex V2 to decide, and with nothing elicited the dialog \
+             closes \u{2014} got {turn:?}",
             case.name
         );
         assert_eq!(
@@ -462,6 +467,7 @@ async fn recognize_text_starts_a_session_and_interprets_the_intent_in_it() {
 
     for (index, (name, supplied, expected)) in rows.iter().enumerate() {
         let emulator = Emulator::new();
+        emulator.built_locale("ABCDEFGHIJ", "TSTALIASID", "en_US");
         let path = format!(
             "/bots/ABCDEFGHIJ/botAliases/TSTALIASID/botLocales/en_US/sessions/implicit-{index}"
         );
@@ -518,6 +524,7 @@ async fn recognize_text_starts_a_session_and_interprets_the_intent_in_it() {
 #[tokio::test]
 async fn session_attributes_accumulate_across_turns() {
     let emulator = Emulator::new();
+    emulator.built_locale("ABCDEFGHIJ", "TSTALIASID", "en_US");
     let path = "/bots/ABCDEFGHIJ/botAliases/TSTALIASID/botLocales/en_US/sessions/attrs";
     assert_eq!(
         emulator
@@ -589,6 +596,7 @@ async fn an_active_context_lives_for_its_turns_to_live() {
     // Every published bound of `turnsToLive`, plus two in between.
     for turns_to_live in [1_i64, 2, 3, 20] {
         let emulator = Emulator::new();
+        emulator.built_locale("ABCDEFGHIJ", "TSTALIASID", "en_US");
         let path = format!(
             "/bots/ABCDEFGHIJ/botAliases/TSTALIASID/botLocales/en_US/sessions/ctx-{turns_to_live}"
         );
@@ -824,6 +832,7 @@ async fn values_outside_the_modelled_constraints_are_refused() {
 #[tokio::test]
 async fn the_text_of_a_turn_is_bounded_by_the_model() {
     let emulator = Emulator::new();
+    emulator.built_locale("ABCDEFGHIJ", "TSTALIASID", "en_US");
     let path = "/bots/ABCDEFGHIJ/botAliases/TSTALIASID/botLocales/en_US/sessions/text-bounds";
 
     let rows: Vec<(&str, Value, u16)> = vec![
@@ -911,6 +920,7 @@ async fn an_audio_response_content_type_is_refused() {
 async fn an_over_large_attribute_map_is_refused() {
     const MAX_ATTRIBUTE_BYTES: usize = 12 * 1024;
     let emulator = Emulator::new();
+    emulator.built_locale("ABCDEFGHIJ", "TSTALIASID", "en_US");
     let path = "/bots/ABCDEFGHIJ/botAliases/TSTALIASID/botLocales/en_US/sessions/attr-bounds";
 
     // Rows on both sides of the cap, counting the key's bytes as well as the
@@ -1008,6 +1018,7 @@ async fn an_over_large_attribute_map_is_refused() {
 async fn a_refused_first_turn_starts_no_session() {
     const MAX_ATTRIBUTE_BYTES: usize = 12 * 1024;
     let emulator = Emulator::new();
+    emulator.built_locale("ABCDEFGHIJ", "TSTALIASID", "en_US");
 
     // One row per way a first turn can be refused after the session key is
     // known: an over-large attribute map, and a key in the reserved namespace.
@@ -1087,6 +1098,7 @@ async fn a_refused_first_turn_starts_no_session() {
 #[tokio::test]
 async fn a_request_attribute_in_the_reserved_namespace_is_refused() {
     let emulator = Emulator::new();
+    emulator.built_locale("ABCDEFGHIJ", "TSTALIASID", "en_US");
     let path = "/bots/ABCDEFGHIJ/botAliases/TSTALIASID/botLocales/en_US/sessions/reserved";
 
     // Rows around the reserved prefix: in it (any casing), and names that only

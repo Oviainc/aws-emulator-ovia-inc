@@ -9,6 +9,10 @@ build = "build.rs"
 [dependencies]
 # The shared request-claim rule for a SigV4 signing name several services share.
 service-common = { path = "../common" }
+# The Lex Models V2 control plane, which holds the BOT this runtime serves: a turn
+# is interpreted against the locale a client built there (`state::bot_model`), so
+# the runtime reads that store rather than inventing a bot of its own.
+service-com-amazonaws-lexmodelsv2-lexmodelbuildingservicev2 = { path = "../service-com-amazonaws-lexmodelsv2-lexmodelbuildingservicev2" }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

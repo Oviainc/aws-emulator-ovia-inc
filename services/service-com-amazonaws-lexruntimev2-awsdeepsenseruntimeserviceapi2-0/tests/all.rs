@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/recognize_text_nlu.rs"]
+mod recognize_text_nlu;
 #[path = "all/recognize_utterance.rs"]
 mod recognize_utterance;
 #[path = "all/session_lifecycle.rs"]

@@ -168,9 +168,10 @@ use super::types::*;
 use crate::state::headers::{
     decode_string_map, decode_struct, encode_json, encode_text, member_schema, HeaderRejected,
 };
+use crate::state::bot_model::{built_locale, BotLocaleModel, LocaleUnavailable};
 use crate::state::{
     asks_for_speech, AttributesRefused, SessionKey, SessionStoreFull, TurnRefused, AUDIO_PREFIX,
-    TEXT_CONTENT_TYPE,
+    MAX_UTTERANCE_CHARS, TEXT_CONTENT_TYPE,
 };
 use aws_smithy_schema::serde::ShapeSerializer;
 use std::time::SystemTime;
@@ -252,6 +253,24 @@ fn store_full(error: SessionStoreFull) -> RecognizeUtteranceError {
         message: error.message(),
     })
     .into()
+}
+
+/// The bot and locale the request addresses hold no model this runtime can
+/// interpret an utterance against, or the control plane that holds them cannot
+/// be reached at all — the same refusal the sibling `RecognizeText` gives, since
+/// both operations are one turn against one built locale.
+fn locale_unavailable(error: LocaleUnavailable) -> RecognizeUtteranceError {
+    match error {
+        LocaleUnavailable::NotBuilt => {
+            RecognizeUtteranceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: crate::state::bot_model::BOT_LOCALE_NOT_VALID_MESSAGE.to_string(),
+            })
+            .into()
+        }
+        LocaleUnavailable::StoreUnavailable => {
+            internal("the Lex V2 bot definitions are unavailable")
+        }
+    }
 }
 
 /// A turn this service would not take, in this operation's own error channel.
@@ -406,6 +425,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "inputStream must carry the user's utterance; it is empty".to_string(),
             ));
         }
+        // One turn is one turn whichever encoding carries it: the sibling
+        // operation's `text` is bounded by the model at `len 1..1024`, and this
+        // one carries the same utterance as a payload the model cannot bound, so
+        // the bound is applied here — BEFORE the utterance is split into words
+        // or matched against anything.
+        let length = transcript.chars().count();
+        if length > MAX_UTTERANCE_CHARS {
+            return Err(invalid(format!(
+                "inputStream must carry at most {MAX_UTTERANCE_CHARS} characters of text, the \
+                 most Amazon Lex V2 interprets in one turn; it carries {length}"
+            )));
+        }
 
         // The two members carried as gzipped, base64-encoded headers rather than
         // in a body. Both are optional, and both are decoded BEFORE the session
@@ -428,6 +459,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| internal("the Lex V2 runtime session store is unavailable"))?;
 
+        // The built bot locale the utterance is interpreted against, resolved
+        // before the session store is touched exactly as the sibling
+        // `RecognizeText` resolves it.
+        let model: BotLocaleModel = built_locale(
+            &*self.engine,
+            &input.bot_id,
+            &input.bot_alias_id,
+            &input.locale_id,
+        )
+        .map_err(locale_unavailable)?;
+
         let now = SystemTime::now();
         let key = SessionKey::new(
             &input.bot_id,
@@ -440,10 +482,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // encodings of "sends user input to Amazon Lex V2", so they share the
         // turn in `crate::state` and answer with the same session state,
         // messages and interpretations for the same input.
-        let turn = state
-            .lock()
-            .advance_turn(key, now, session_state, request_attributes)
-            .map_err(turn_refused)?;
+        let turn = crate::state::take_turn(
+            &state,
+            key,
+            now,
+            &transcript,
+            &model,
+            session_state,
+            request_attributes,
+        )
+        .map_err(turn_refused)?;
 
         // --- the response, encoded as the model documents ---
 

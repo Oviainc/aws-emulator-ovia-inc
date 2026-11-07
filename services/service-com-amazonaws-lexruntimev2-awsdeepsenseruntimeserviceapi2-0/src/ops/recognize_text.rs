@@ -107,6 +107,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::bot_model::{built_locale, BotLocaleModel, LocaleUnavailable};
 use crate::state::{AttributesRefused, SessionKey, SessionStoreFull, TurnRefused};
 use std::time::SystemTime;
 
@@ -116,6 +117,30 @@ fn refused(error: AttributesRefused) -> RecognizeTextError {
     RecognizeTextErrorModeled::ValidationException(ValidationException {
         message: error.message(),
     })
+    .into()
+}
+
+/// The bot and locale the request addresses hold no model this runtime can
+/// interpret an utterance against, or the control plane that holds them cannot
+/// be reached at all.
+///
+/// A locale that was never built has no runtime model, so the combination is not
+/// one a conversation can be held against: that is the modelled
+/// `ResourceNotFoundException`, and it is answered BEFORE the session store is
+/// touched, so a refused turn starts no session.
+fn locale_unavailable(error: LocaleUnavailable) -> RecognizeTextError {
+    match error {
+        LocaleUnavailable::NotBuilt => {
+            RecognizeTextErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: crate::state::bot_model::BOT_LOCALE_NOT_VALID_MESSAGE.to_string(),
+            })
+        }
+        LocaleUnavailable::StoreUnavailable => {
+            RecognizeTextErrorModeled::InternalServerException(InternalServerException {
+                message: "the Lex V2 bot definitions are unavailable".to_string(),
+            })
+        }
+    }
     .into()
 }
 
@@ -219,6 +244,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // What the utterance is interpreted against: the bot locale the alias
+        // this request addresses points at, which the client built through the
+        // Lex Models V2 control plane. Resolved BEFORE the session store is
+        // touched, so a turn for a locale with no built model is refused without
+        // starting a conversation.
+        let model: BotLocaleModel = built_locale(
+            &*self.engine,
+            &input.bot_id,
+            &input.bot_alias_id,
+            &input.locale_id,
+        )
+        .map_err(locale_unavailable)?;
+
         let now = SystemTime::now();
         let key = SessionKey::new(
             &input.bot_id,
@@ -233,10 +271,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The sibling `RecognizeUtterance` takes the same turn from a request
         // payload, so the turn itself lives in `crate::state` and neither
         // operation holds a second copy of it.
-        let turn = state
-            .lock()
-            .advance_turn(key, now, input.session_state, input.request_attributes)
-            .map_err(turn_refused)?;
+        let turn = crate::state::take_turn(
+            &state,
+            key,
+            now,
+            &input.text,
+            &model,
+            input.session_state,
+            input.request_attributes,
+        )
+        .map_err(turn_refused)?;
 
         Ok(RecognizeTextOutput {
             messages: Some(turn.messages),

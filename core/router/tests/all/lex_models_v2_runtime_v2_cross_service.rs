@@ -31,8 +31,10 @@
 //! owns, read through `pub(crate)` rather than copied.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
 
 use crate::lex_signing_name_routing::{
     build_router, claimants, dispatch, lex_family, Answer, MODELS_V2, ROLE_ARN, ROUTER_REFUSALS,
@@ -182,8 +184,48 @@ fn assert_sole_claimant(family: &[Box<dyn smithy_server_runtime::Service>], step
     );
 }
 
+/// Wait for the `Built` status the submitted build owes the locale, and answer what
+/// `DescribeBotLocale` then reports.
+///
+/// The runtime interprets an utterance against the model a build produced, so a
+/// conversation can only be held once the locale is `Built` — the status AWS documents as
+/// the one where "the bot is ready for use and can be tested using any utterance". The
+/// control plane materialises it at the instant the clock makes it due, which a read is
+/// what observes.
+pub(crate) async fn wait_until_built(
+    router: &MultiServiceRouter,
+    bot_id: &str,
+    locale: &str,
+) -> Value {
+    let uri = format!("/bots/{bot_id}/botversions/{DRAFT}/botlocales/{locale}");
+    let mut described = Value::Null;
+    for _ in 0..50 {
+        let answer = dispatch(router, "GET", &uri, "").await;
+        described = answer.body;
+        if described.get("botLocaleStatus").and_then(Value::as_str) == Some("Built") {
+            return described;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the locale {locale} of bot {bot_id} must reach Built, last saw {described:?}");
+}
+
+/// Author a locale with one intent carrying a sample utterance, build it, and wait for the
+/// `Built` the build owes — everything the runtime needs before a turn can be served.
+pub(crate) async fn author_and_build_locale(
+    router: &MultiServiceRouter,
+    bot_id: &str,
+    locale: &str,
+) {
+    for step in build_steps(bot_id, locale) {
+        let answer = dispatch(router, step.method, &step.path, &step.body).await;
+        assert_not_a_router_refusal(&step.case, &answer);
+    }
+    wait_until_built(router, bot_id, locale).await;
+}
+
 /// Assert that `answer` came from a service rather than from the router's own refusals.
-fn assert_not_a_router_refusal(case: &str, answer: &Answer) {
+pub(crate) fn assert_not_a_router_refusal(case: &str, answer: &Answer) {
     assert!(
         !ROUTER_REFUSALS.contains(&answer.error_code.as_str()),
         "case {case:?}: the call must be served by exactly one of the services sharing the \
@@ -243,6 +285,9 @@ async fn the_cross_service_build_then_talk_sequence_reaches_one_service_per_call
             let answer = dispatch(&router, step.method, &step.path, &step.body).await;
             assert_not_a_router_refusal(&step.case, &answer);
         }
+        // The runtime serves a turn against the model the build produced, so the
+        // conversation below waits for the locale to reach `Built`.
+        wait_until_built(&router, &bot_id, run.locale).await;
 
         // ---- the runtime talks to the SAME bot ------------------------------------
         let session = session_path(&bot_id, run.locale, &run.session);

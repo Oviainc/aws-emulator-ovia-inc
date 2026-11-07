@@ -210,6 +210,9 @@ async fn an_utterance_advances_the_session_exactly_as_the_same_text_does() {
         let by_utterance = Emulator::new();
         let by_text = Emulator::new();
         for emulator in [&by_utterance, &by_text] {
+            // A turn is interpreted against a built locale, so the labels this
+            // row addresses have to name one.
+            emulator.built_locale(case.bot_id, case.bot_alias_id, case.locale_id);
             if let Some(seed) = &case.seed {
                 let put = emulator
                     .send("POST", &case.session_path(), Some(seed.clone()))
@@ -397,6 +400,7 @@ async fn the_structured_request_headers_are_read_out_of_the_documented_encoding(
 
     for (case, state, expected) in rows {
         let emulator = Emulator::new();
+        emulator.built_locale("ABCDEFGHIJ", "TSTALIASID", "en_US");
         let path = "/bots/ABCDEFGHIJ/botAliases/TSTALIASID/botLocales/en_US/sessions/hdr";
         let reply = emulator
             .send_raw(
@@ -456,6 +460,11 @@ type Refusal = (
     &'static str,
 );
 
+/// An input stream one character past the most an utterance may carry: the
+/// sibling `Text` member's `len 1..1024` is the bound a turn applies whichever
+/// encoding carries it.
+const OVER_LONG_UTTERANCE: &[u8; 1025] = &[b'a'; 1025];
+
 /// Rule 4: a request this emulator cannot process is answered with the modelled
 /// error — and leaves no session behind, so a following `GetSession` is still
 /// the modelled 404.
@@ -467,9 +476,19 @@ async fn input_that_cannot_be_processed_is_refused_and_changes_nothing() {
     // The rows span the classes `requestContentType` divides input into (every
     // audio prefix the model lists, the text one, and a value outside all of
     // them), the speech values of `responseContentType`, an input stream that is
-    // not the text it claims to be, and each structured header carrying
-    // something that is not the documented encoding.
-    let rows: [Refusal; 11] = [
+    // not the text it claims to be, one a character past the longest utterance a
+    // turn interprets, and each structured header carrying something that is not
+    // the documented encoding.
+    let rows: [Refusal; 12] = [
+        (
+            "an input stream one character past the longest utterance",
+            TEXT_REQUEST_CONTENT_TYPE,
+            None,
+            OVER_LONG_UTTERANCE,
+            vec![],
+            400,
+            "ValidationException",
+        ),
         (
             "PCM audio input",
             "audio/l16; rate=16000; channels=1",
@@ -581,6 +600,9 @@ async fn input_that_cannot_be_processed_is_refused_and_changes_nothing() {
 
     for (case, request_content_type, response_content_type, body, extra, status, shape) in rows {
         let emulator = Emulator::new();
+        // The locale IS built, so what each row is refused for is the input it
+        // carries and not the bot it addresses.
+        emulator.built_locale("ABCDEFGHIJ", "TSTALIASID", "en_US");
         let path = "/bots/ABCDEFGHIJ/botAliases/TSTALIASID/botLocales/en_US/sessions/refused";
         let mut headers: Vec<(&str, &str)> = extra
             .iter()
@@ -634,6 +656,7 @@ async fn a_request_attribute_in_the_reserved_namespace_is_refused() {
         ("upper case", "X-Amz-Lex:Channel"),
     ] {
         let emulator = Emulator::new();
+        emulator.built_locale("ABCDEFGHIJ", "TSTALIASID", "en_US");
         let path = "/bots/ABCDEFGHIJ/botAliases/TSTALIASID/botLocales/en_US/sessions/reserved";
         let attributes = json!({key: "web"});
         let reply = emulator
@@ -668,6 +691,7 @@ async fn a_request_attribute_in_the_reserved_namespace_is_refused() {
 #[tokio::test]
 async fn the_response_headers_are_gzipped_before_they_are_base64_encoded() {
     let emulator = Emulator::new();
+    emulator.built_locale("ABCDEFGHIJ", "TSTALIASID", "en_US");
     let path = "/bots/ABCDEFGHIJ/botAliases/TSTALIASID/botLocales/en_US/sessions/encoding";
     let put = emulator
         .send(
@@ -692,33 +716,55 @@ async fn the_response_headers_are_gzipped_before_they_are_base64_encoded() {
         .await;
     assert_eq!(reply.status, 200, "the turn must succeed");
 
-    for header in [
-        "x-amz-lex-session-state",
-        "x-amz-lex-messages",
-        "x-amz-lex-interpretations",
-        "x-amz-lex-input-transcript",
+    // `PutSession` answers with the messages it was given, and the turn answers
+    // with the ones IT sends — none, here, since the locale this session is
+    // addressed to has no message authored for the step the dialog reached. Both
+    // responses carry every header they do have under the documented encoding.
+    for (what, answer, headers) in [
+        (
+            "PutSession",
+            &put,
+            &["x-amz-lex-session-state", "x-amz-lex-messages"][..],
+        ),
+        (
+            "the turn",
+            &reply,
+            &[
+                "x-amz-lex-session-state",
+                "x-amz-lex-interpretations",
+                "x-amz-lex-input-transcript",
+            ][..],
+        ),
     ] {
-        let raw = reply
-            .header(header)
-            .unwrap_or_else(|| panic!("{header} must be present"));
-        assert!(
-            serde_json::from_str::<Value>(&raw).is_err(),
-            "{header} must not be plain JSON: {raw}"
-        );
-        let decoded = aws_smithy_types::base64::decode(&raw)
-            .unwrap_or_else(|e| panic!("{header} must be base64 ({e}): {raw}"));
-        // The gzip magic number: the base64 layer wraps a gzip MEMBER, which is
-        // what a client is told to inflate.
-        assert_eq!(
-            decoded.first().copied().zip(decoded.get(1).copied()),
-            Some((0x1f, 0x8b)),
-            "{header} must carry a gzip stream, got {decoded:?}"
-        );
+        for header in headers {
+            let raw = answer
+                .header(header)
+                .unwrap_or_else(|| panic!("{what}: {header} must be present"));
+            assert!(
+                serde_json::from_str::<Value>(&raw).is_err(),
+                "{what}: {header} must not be plain JSON: {raw}"
+            );
+            let decoded = aws_smithy_types::base64::decode(&raw)
+                .unwrap_or_else(|e| panic!("{what}: {header} must be base64 ({e}): {raw}"));
+            // The gzip magic number: the base64 layer wraps a gzip MEMBER, which
+            // is what a client is told to inflate.
+            assert_eq!(
+                decoded.first().copied().zip(decoded.get(1).copied()),
+                Some((0x1f, 0x8b)),
+                "{what}: {header} must carry a gzip stream, got {decoded:?}"
+            );
+        }
     }
     assert_eq!(
-        reply.lex_header("x-amz-lex-messages"),
+        put.lex_header("x-amz-lex-messages"),
         Some(json!([{"content": "What size?", "contentType": "PlainText"}])),
-        "the decoded messages header is the stored messages' JSON"
+        "the decoded messages header is the messages PutSession was given"
+    );
+    assert_eq!(
+        reply.header("x-amz-lex-messages"),
+        None,
+        "a turn reports the messages it sends, and this one sent none, so the header is \
+         absent rather than carrying what was last sent before it"
     );
     assert_eq!(
         reply.lex_header_text("x-amz-lex-input-transcript"),

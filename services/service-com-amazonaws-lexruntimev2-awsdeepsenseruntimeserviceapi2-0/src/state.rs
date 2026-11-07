@@ -8,25 +8,24 @@
 //! five views of the one [`Session`] stored here, keyed by the four
 //! `@httpLabel` values that address it.
 //!
-//! Beside the store itself, this module holds the two things more than one of
-//! those operations needs: `advance_turn`, the one conversation turn
-//! `RecognizeText` and `RecognizeUtterance` are two encodings of, and
-//! [`headers`], the wire form of the structured `x-amz-lex-*` headers
-//! `PutSession` and `RecognizeUtterance` answer with.
+//! Beside the store itself, this module holds what more than one of those
+//! operations needs: `advance_turn`, the one conversation turn `RecognizeText`
+//! and `RecognizeUtterance` are two encodings of, [`headers`], the wire form of
+//! the structured `x-amz-lex-*` headers `PutSession` and `RecognizeUtterance`
+//! answer with, [`bot_model`], the built bot locale a turn is interpreted
+//! against, and [`nlu`], the interpretation and dialog of one turn.
 
+pub mod bot_model;
 pub mod headers;
+pub mod nlu;
 
-use crate::ops::types::{
-    ActiveContext, DialogAction, Intent, Interpretation, Message, SessionState,
-};
+use crate::ops::types::{ActiveContext, Interpretation, Message, SessionState};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 /// The intent Amazon Lex V2 reports when no intent of the bot locale matches
-/// the input. This runtime holds no bot locale definition — bots are built
-/// through the Lex *models* service, not this runtime — so no intent can be
-/// matched from an utterance, which is exactly the case the real service
-/// answers with the fallback intent.
+/// the input: the fallback intent every locale carries, which the control plane
+/// adds to a locale as it creates it.
 pub const FALLBACK_INTENT: &str = "FallbackIntent";
 
 /// `Close`: "indicates that there will not be a response from the user"
@@ -48,6 +47,17 @@ pub const TEXT_CONTENT_TYPE: &str = "text/plain;charset=utf-8";
 /// speech values (`audio/mpeg`, `audio/ogg`, `audio/pcm`, `audio/*`) begin with
 /// it, and so does every audio `requestContentType` it lists.
 pub const AUDIO_PREFIX: &str = "audio/";
+
+/// The most characters of utterance ONE turn interprets.
+///
+/// `RecognizeText` binds the utterance as `Text`, which the model bounds at
+/// `len 1..1024`, and the framework refuses a longer one before the handler
+/// runs. `RecognizeUtterance` carries the SAME utterance as a request payload,
+/// which the model cannot bound, so the bound is applied here: one turn is one
+/// turn whichever encoding carries it, and the work of interpreting it — the
+/// words it is split into, and the comparisons against the locale's sample
+/// utterances that each of them costs — is bounded by the same number for both.
+pub const MAX_UTTERANCE_CHARS: usize = 1024;
 
 /// Does this `responseContentType` ask for synthesized speech?
 ///
@@ -281,29 +291,24 @@ impl ComAmazonawsLexruntimev2Awsdeepsenseruntimeserviceapi20State {
         self.sessions.remove(key)
     }
 
-    /// Advance the conversation `key` addresses by ONE turn, and report what the
-    /// turn left on the session.
+    /// OPEN one turn of the conversation `key` addresses: charge the turn, fold
+    /// in what the request supplied, and report the dialog state the utterance
+    /// is then interpreted against.
     ///
-    /// This is the whole of what an utterance does to a session, held here
-    /// because the service offers the SAME turn through two encodings:
-    /// `RecognizeText`, which carries the input and the dialog state as JSON in
-    /// the body, and `RecognizeUtterance`, which carries them as a request
-    /// payload and gzipped headers. The two differ only in how a turn is spelled
-    /// on the wire ("Sends user input to Amazon Lex V2" is the documented
-    /// purpose of both), so both drive this one method and cannot drift apart.
+    /// The first of the two steps [`take_turn`] drives — the interpretation
+    /// itself runs between them, OUTSIDE this store's lock, so one caller's
+    /// utterance is not matched inside the critical section every session of the
+    /// service shares.
     ///
-    /// `supplied_state` and `supplied_attributes` are what the request carried.
-    /// The text the turn processes is what the real service runs its NLU model
-    /// over; this emulator holds no bot locale to match it against, and matching
-    /// on the utterance text would invent intents no bot declares, so it is not
-    /// interpreted into an intent of its own and is not passed here.
-    pub fn advance_turn(
+    /// `supplied_state` and `supplied_attributes` are the dialog state and
+    /// request attributes the request carried.
+    pub fn open_turn(
         &mut self,
         key: SessionKey,
         now: SystemTime,
         supplied_state: Option<SessionState>,
         supplied_attributes: Option<HashMap<String, String>>,
-    ) -> Result<Turn, TurnRefused> {
+    ) -> Result<SessionState, TurnRefused> {
         // Refuse an attribute map this turn may not store BEFORE the session is
         // looked up for writing, so a refused turn leaves the conversation
         // exactly as it was — and a refused FIRST turn leaves no session behind
@@ -351,35 +356,39 @@ impl ComAmazonawsLexruntimev2Awsdeepsenseruntimeserviceapi20State {
             merge_attributes(&mut session.request_attributes, supplied);
         }
 
-        // The active intent after this turn: the one the session carries (set by
-        // this request or an earlier PutSession), else the fallback intent.
-        let intent = session.session_state.intent.clone().unwrap_or(Intent {
-            name: FALLBACK_INTENT.to_string(),
-            slots: None,
-            state: None,
-            confirmation_state: None,
-        });
-        session.session_state.intent = Some(intent.clone());
-        // Nothing was elicited from the user, so unless the caller set the next
-        // step itself the dialog closes.
-        if session.session_state.dialog_action.is_none() {
-            session.session_state.dialog_action = Some(DialogAction {
-                r#type: DIALOG_ACTION_CLOSE.to_string(),
-                slot_to_elicit: None,
-                slot_elicitation_style: None,
-                sub_slot_to_elicit: None,
-            });
-        }
-        // The interpretation of this turn, written back onto the session so a
-        // following GetSession reports the same one. No `nluConfidence` is
-        // reported: no model scored this input, and a made-up score would be
-        // indistinguishable from one.
-        session.interpretations = vec![Interpretation {
-            nlu_confidence: None,
-            sentiment_response: None,
-            intent: Some(intent),
-            interpretation_source: Some(INTERPRETATION_SOURCE.to_string()),
-        }];
+        // What the utterance is interpreted against: the conversation as it
+        // stands, with the dialog state the request supplied already folded in.
+        Ok(session.session_state.clone())
+    }
+
+    /// RECORD the turn [`nlu::interpret`] decided on, and report what it left on
+    /// the session.
+    ///
+    /// The second of [`take_turn`]'s two steps. The session was opened for this
+    /// turn by [`Self::open_turn`]; it is looked up again through the one
+    /// bounded insertion path, so a conversation another request deleted in
+    /// between is started rather than resurrected silently.
+    pub fn record_turn(
+        &mut self,
+        key: SessionKey,
+        now: SystemTime,
+        plan: nlu::TurnPlan,
+    ) -> Result<Turn, TurnRefused> {
+        let session = self.session_mut(key, now).map_err(TurnRefused::StoreFull)?;
+        session.session_state.intent = Some(plan.intent);
+        // "The next action that the bot should take in its interaction with the
+        // user": the step the dialog reached, which is what a caller drives the
+        // conversation off. A `Delegate` a request carried is an instruction —
+        // "the next action is determined by Amazon Lex V2" — so what the turn
+        // reports is the decision, not the instruction.
+        session.session_state.dialog_action = Some(plan.dialog_action);
+        // "A list of messages last sent to the user": the ones THIS turn sends —
+        // a slot's prompt, or the intent's closing response — and none when the
+        // bot has nothing authored to say at the step the dialog reached.
+        session.messages = plan.messages;
+        // The interpretations of this turn, written back onto the session so a
+        // following GetSession reports the same ones.
+        session.interpretations = plan.interpretations;
 
         Ok(Turn {
             session_id: session.session_id.clone(),
@@ -389,6 +398,44 @@ impl ComAmazonawsLexruntimev2Awsdeepsenseruntimeserviceapi20State {
             request_attributes: session.request_attributes.clone(),
         })
     }
+}
+
+/// Take ONE turn of the conversation `key` addresses, and report what the turn
+/// left on the session.
+///
+/// This is the whole of what an utterance does to a session, held here because
+/// the service offers the SAME turn through two encodings: `RecognizeText`,
+/// which carries the input and the dialog state as JSON in the body, and
+/// `RecognizeUtterance`, which carries them as a request payload and gzipped
+/// headers. The two differ only in how a turn is spelled on the wire ("Sends
+/// user input to Amazon Lex V2" is the documented purpose of both), so both
+/// drive this one function and cannot drift apart.
+///
+/// `text` is the utterance the turn processes — bounded by
+/// [`MAX_UTTERANCE_CHARS`] before it gets here — and `model` the built bot
+/// locale it is interpreted against ([`bot_model::built_locale`]), which is what
+/// makes the turn this bot's turn rather than a bot-independent one: the intent,
+/// the slots it fills and the next dialog step all come out of
+/// [`nlu::interpret`].
+///
+/// The store is locked TWICE, once to open the turn and once to record it, so
+/// the interpretation — the only caller-driven work of a turn — runs outside the
+/// critical section every session of this service shares, and no request can
+/// hold that lock for longer than a map lookup and a clone.
+pub fn take_turn(
+    store: &::engine::ServiceState<ComAmazonawsLexruntimev2Awsdeepsenseruntimeserviceapi20State>,
+    key: SessionKey,
+    now: SystemTime,
+    text: &str,
+    model: &bot_model::BotLocaleModel,
+    supplied_state: Option<SessionState>,
+    supplied_attributes: Option<HashMap<String, String>>,
+) -> Result<Turn, TurnRefused> {
+    let opened = store
+        .lock()
+        .open_turn(key.clone(), now, supplied_state, supplied_attributes)?;
+    let plan = nlu::interpret(model, text, &opened);
+    store.lock().record_turn(key, now, plan)
 }
 
 /// The identity of a session: the four `@httpLabel` values every operation in
@@ -615,6 +662,19 @@ pub fn merge_attributes(stored: &mut HashMap<String, String>, supplied: HashMap<
     for (key, value) in supplied {
         stored.insert(key, value);
     }
+}
+
+/// What Amazon Lex V2 answers when the session a request addresses is not one it
+/// holds: the conversation was never started, or it has gone idle for longer
+/// than the bot keeps it.
+///
+/// The session id the request carried is the only variable part of the sentence
+/// — the bot, alias and locale that address it are not named — and the
+/// apostrophe is the typographic one (U+2019) the service writes it with. Held
+/// here because every operation that reads a session by its four labels answers
+/// an absent one the same way.
+pub fn session_not_found_message(session_id: &str) -> String {
+    format!("The session for user {session_id} doesn\u{2019}t exist or has expired.")
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

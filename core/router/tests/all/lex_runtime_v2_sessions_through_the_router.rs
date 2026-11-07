@@ -47,6 +47,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+use crate::lex_models_v2_runtime_v2_cross_service::author_and_build_locale;
 use crate::lex_signing_name_routing::{
     build_router, claimants, dispatch, lex_family, Answer, MODELS_V2, ROLE_ARN, ROUTER_REFUSALS,
     RUNTIME_V2,
@@ -195,6 +196,13 @@ async fn a_runtime_v2_session_is_seeded_advanced_read_and_deleted_through_the_wh
             .to_string();
 
         let path = session_path(&bot_id, run.locale, &run.session);
+
+        // ---- and the locale the conversation is held in, built ---------------------
+        //
+        // The runtime interprets a turn against the model a build produced, so a bot can
+        // only be conversed with once the locale is built: the authoring and the build are
+        // the cross-service suite's, reused rather than copied.
+        author_and_build_locale(&router, &bot_id, run.locale).await;
 
         // ---- every session route is the runtime's, and only the runtime's -----------
         //

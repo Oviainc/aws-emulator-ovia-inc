@@ -184,10 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(DeleteSessionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "no session {} for bot {} alias {} locale {}",
-                        input.session_id, input.bot_id, input.bot_alias_id, input.locale_id
-                    ),
+                    message: crate::state::session_not_found_message(&input.session_id),
                 },
             )
             .into());
