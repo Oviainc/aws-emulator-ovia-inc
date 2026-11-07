@@ -53,6 +53,8 @@ mod key_phrases;
 mod key_phrases_jobs;
 #[path = "all/language_value_sets.rs"]
 mod language_value_sets;
+#[path = "all/lifecycle_phase_observability.rs"]
+mod lifecycle_phase_observability;
 #[path = "all/not_found_refusals.rs"]
 mod not_found_refusals;
 #[path = "all/noun_phrase_key_phrases.rs"]

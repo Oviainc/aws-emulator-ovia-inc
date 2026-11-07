@@ -133,7 +133,7 @@ async fn wait_until_training_ended(comprehend: &Comprehend, arn: &str) {
             return;
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
+            started.elapsed() < std::time::Duration::from_secs(30),
             "case {arn:?}: the training never ended, last {output}"
         );
         std::thread::sleep(std::time::Duration::from_millis(40));
@@ -543,7 +543,7 @@ async fn every_resource_policy_operation_refuses_an_arn_that_names_no_model() {
             break;
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
+            started.elapsed() < std::time::Duration::from_secs(30),
             "case \"deleted model\": the model's record was never removed, last {response}"
         );
         std::thread::sleep(std::time::Duration::from_millis(40));

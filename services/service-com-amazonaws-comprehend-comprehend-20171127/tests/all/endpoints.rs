@@ -52,9 +52,10 @@ use crate::comprehend_client::{error_code, error_message, Comprehend, ACCOUNT_ID
 const RESOURCE_NOT_FOUND_MESSAGE: &str = "RESOURCE_NOT_FOUND: Could not find specified resource.";
 
 /// Longest a suite waits for the clock to owe an endpoint its settled status. The
-/// `ENDPOINT_CREATING_SPAN` in `crate::state` is well under a second; this leaves
-/// ample head-room on a loaded machine.
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// `ENDPOINT_CREATING_SPAN` in `crate::state` is one phase span
+/// (`crate::state::LIFECYCLE_PHASE_SPAN`); this leaves ample head-room on a loaded
+/// machine.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The gap between two consecutive seeded endpoints' creation instants. A whole
 /// number of seconds, so a filter bound sent as epoch seconds names one instant

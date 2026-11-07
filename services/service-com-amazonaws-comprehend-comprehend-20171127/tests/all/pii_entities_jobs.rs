@@ -39,9 +39,10 @@ const REDACTION_CONFIG_REQUIRED_MESSAGE: &str = "INPUT_CONFIG_INVALID_FOR_MODE: 
     parameter to ONLY_REDACTION. Add a RedactionConfig definition to your request, \
     including a non-empty list of PII entity types to redact, and try again.";
 
-/// Longest a suite waits for the clock to owe a job its terminal status. The spans
-/// in `crate::state` total 600 ms; this leaves ample head-room on a loaded machine.
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest a suite waits for the clock to owe a job its terminal status. A job walks
+/// two phase spans (`crate::state::LIFECYCLE_PHASE_SPAN` each) to a terminal status;
+/// this leaves ample head-room on a loaded machine.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A `StartPiiEntitiesDetectionJob` body carrying `mode`, and `redaction_config` when
 /// one is given.

@@ -46,9 +46,10 @@ const BUCKET: &str = "comprehend-batch";
 /// The role ARN a submission names; the modelled `IamRoleArn` form.
 const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/ComprehendRole";
 
-/// Longest a suite waits for the clock to owe a job its terminal status. The spans
-/// in `crate::state` total 600 ms; this leaves ample head-room on a loaded machine.
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest a suite waits for the clock to owe a job its terminal status. A job walks
+/// two phase spans (`crate::state::LIFECYCLE_PHASE_SPAN` each) to a terminal status;
+/// this leaves ample head-room on a loaded machine.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The analysis-type token AWS names an analysis job's output directory with, for
 /// this family (`<account-id>-LANGUAGE-<JobId>`).

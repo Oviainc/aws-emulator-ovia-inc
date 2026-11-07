@@ -111,10 +111,10 @@ const DEFAULT_PAGE_SIZE: usize = 100;
 const MIN_MAX_RESULTS: i64 = 1;
 const MAX_MAX_RESULTS: i64 = 500;
 
-/// Longest a suite waits for the clock to owe every job its terminal status. The
-/// spans in the service's state total 600 ms; this leaves ample head-room on a
-/// loaded machine.
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest a suite waits for the clock to owe every job its terminal status. A job
+/// walks two phase spans (`crate::state::LIFECYCLE_PHASE_SPAN` each) to a terminal
+/// status; this leaves ample head-room on a loaded machine.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The terminal status a started job of these families reaches: this emulator does
 /// not perform their batch run, so the run reports a failure (see

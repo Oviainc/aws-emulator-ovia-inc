@@ -82,10 +82,10 @@ const LIFECYCLE: &[&str] = &["SUBMITTED", "IN_PROGRESS", "FAILED"];
 /// The terminal status a started job reaches, as `JOB_STATUS_VALUES` spells it.
 const TERMINAL_STATUS: &str = "FAILED";
 
-/// Longest a suite waits for the clock to owe a job its terminal status. The spans
-/// in the service's state total 600 ms; this leaves ample head-room on a loaded
-/// machine.
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest a suite waits for the clock to owe a job its terminal status. A job walks
+/// two phase spans (`crate::state::LIFECYCLE_PHASE_SPAN` each) to a terminal status;
+/// this leaves ample head-room on a loaded machine.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The most tags a Comprehend resource can hold, from the modelled
 /// `TooManyTagsException` documentation: "50 tags per resource". Written out here

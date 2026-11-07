@@ -75,10 +75,10 @@ const LIFECYCLE: &[&str] = &["SUBMITTED", "TRAINING", "IN_ERROR"];
 /// The status a started training reaches, as `MODEL_STATUS_VALUES` spells it.
 const TERMINAL_STATUS: &str = "IN_ERROR";
 
-/// Longest a suite waits for the clock to owe a classifier its next status. The
-/// spans in `crate::state` total well under a second; this leaves ample head-room on
-/// a loaded machine.
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest a suite waits for the clock to owe a classifier its next status. A
+/// classifier walks two phase spans (`crate::state::LIFECYCLE_PHASE_SPAN` each) to
+/// reach a terminal status; this leaves ample head-room on a loaded machine.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A `CreateDocumentClassifier` body per case, differing along every member the
 /// operation persists.

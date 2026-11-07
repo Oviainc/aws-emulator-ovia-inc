@@ -52,10 +52,10 @@ const MODEL_NOT_FOUND_MESSAGE: &str = "Could not find specified model.";
 /// The sentence the analysis-job plane refuses an absent job with.
 const JOB_NOT_FOUND_MESSAGE: &str = "Could not find specified job.";
 
-/// Longest this suite waits for the clock to owe a classifier its next status. The
-/// spans the service holds total well under a second; this leaves head-room on a
-/// loaded machine.
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest this suite waits for the clock to owe a classifier its next status. A
+/// resource walks at most two phase spans (`crate::state::LIFECYCLE_PHASE_SPAN`
+/// each) to a terminal status; this leaves head-room on a loaded machine.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Which set of absent identifiers a row is tried over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

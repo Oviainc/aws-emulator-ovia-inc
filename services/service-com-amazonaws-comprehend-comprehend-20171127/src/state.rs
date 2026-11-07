@@ -131,23 +131,33 @@ use crate::ops::types::{
     SentimentDetectionJobProperties, Tag, VpcConfig,
 };
 
-/// How long a freshly submitted job stays `SUBMITTED` before the clock owes it
-/// `IN_PROGRESS`.
+/// How long ONE non-terminal phase of any asynchronous lifecycle this service runs
+/// lasts before the clock owes it the next status.
 ///
 /// The emulator's own span, not a documented AWS duration: a real Comprehend job
-/// takes minutes, which no test can wait for. It is deliberately non-zero, so a
-/// caller that reads a job straight back still observes `SUBMITTED`.
-pub const QUEUE_SPAN: Duration = Duration::from_millis(300);
+/// takes minutes and training a real model tens of minutes, which no test can wait
+/// for. It is wide enough that a client in ANOTHER PROCESS, polling the matching
+/// `Describe*` on a cadence of a second or more, observes every intermediate status
+/// of the walk and can still act on one — stop a training run, attach progress
+/// reporting — while the resource is in it. Every phase span below is this one span,
+/// so no lifecycle in this service settles faster than a caller can watch it.
+pub const LIFECYCLE_PHASE_SPAN: Duration = Duration::from_secs(3);
+
+/// How long a freshly submitted job stays `SUBMITTED` before the clock owes it
+/// `IN_PROGRESS`. One [`LIFECYCLE_PHASE_SPAN`], so a caller that reads a job straight
+/// back still observes `SUBMITTED`.
+pub const QUEUE_SPAN: Duration = LIFECYCLE_PHASE_SPAN;
 
 /// How long a job stays `IN_PROGRESS` before the clock owes it its terminal
-/// status. The emulator's own span, chosen for the same reason as [`QUEUE_SPAN`].
-pub const PROCESSING_SPAN: Duration = Duration::from_millis(300);
+/// status. One [`LIFECYCLE_PHASE_SPAN`], so the processing phase the status walk
+/// documents (`SUBMITTED` -> `IN_PROGRESS` -> terminal) is observable to a poller
+/// rather than merely non-zero.
+pub const PROCESSING_SPAN: Duration = LIFECYCLE_PHASE_SPAN;
 
 /// How long a job stays `STOP_REQUESTED` before the clock owes it `STOPPED`.
-/// The emulator's own span, chosen for the same reason as [`QUEUE_SPAN`]. It is
-/// deliberately non-zero, so a caller that stops a job and reads it straight back
+/// One [`LIFECYCLE_PHASE_SPAN`], so a caller that stops a job and polls it back
 /// still observes the intermediate `STOP_REQUESTED` state the stop reported.
-pub const STOPPING_SPAN: Duration = Duration::from_millis(300);
+pub const STOPPING_SPAN: Duration = LIFECYCLE_PHASE_SPAN;
 
 /// The most tags a Comprehend resource can carry.
 ///
@@ -1526,34 +1536,32 @@ impl Drop for RunOutcomeRecorder {
 /// How long a freshly created document classifier stays `SUBMITTED` before the
 /// clock owes it `TRAINING`.
 ///
-/// The emulator's own span, not a documented AWS duration: training a real custom
-/// model takes tens of minutes, which no test can wait for. It is deliberately
-/// non-zero, so a caller that describes a classifier straight back still observes
-/// `SUBMITTED`.
-pub const CLASSIFIER_SUBMITTED_SPAN: Duration = Duration::from_millis(300);
+/// One [`LIFECYCLE_PHASE_SPAN`], so a caller that describes a classifier straight
+/// back still observes `SUBMITTED`.
+pub const CLASSIFIER_SUBMITTED_SPAN: Duration = LIFECYCLE_PHASE_SPAN;
 
 /// How long a classifier stays `TRAINING` before the clock owes it its terminal
 /// `ModelStatus`.
 ///
-/// The emulator's own span, chosen for the same reason as
-/// [`CLASSIFIER_SUBMITTED_SPAN`] and deliberately at the top of the band the project
-/// allows, so an out-of-process client that provisions a classifier and then stops
-/// its training can still catch it `TRAINING`.
-pub const CLASSIFIER_TRAINING_SPAN: Duration = Duration::from_millis(450);
+/// One [`LIFECYCLE_PHASE_SPAN`], so an out-of-process client that polls
+/// `DescribeDocumentClassifier` until it reports `TRAINING` and then calls
+/// `StopTrainingDocumentClassifier` reaches a classifier that is still training, and
+/// the stop takes the documented `STOP_REQUESTED` -> `STOPPED` branch instead of the
+/// "completed before it could be stopped" one.
+pub const CLASSIFIER_TRAINING_SPAN: Duration = LIFECYCLE_PHASE_SPAN;
 
 /// How long a classifier stays `STOP_REQUESTED` before the clock owes it `STOPPED`.
-/// The emulator's own span, chosen for the same reason as
-/// [`CLASSIFIER_SUBMITTED_SPAN`].
-pub const CLASSIFIER_STOPPING_SPAN: Duration = Duration::from_millis(300);
+/// One [`LIFECYCLE_PHASE_SPAN`], so the state the stop reported is observable before
+/// the classifier reaches `STOPPED`.
+pub const CLASSIFIER_STOPPING_SPAN: Duration = LIFECYCLE_PHASE_SPAN;
 
 /// How long a classifier stays `DELETING` before the clock owes its removal.
 ///
 /// `DeleteDocumentClassifier` documents the asynchrony this span stands for: "This
 /// is an asynchronous action that puts the classifier into a DELETING state, and it
-/// is then removed by a background job." The span is the emulator's own, chosen for
-/// the same reason as [`CLASSIFIER_SUBMITTED_SPAN`], and non-zero so a caller that
-/// describes the classifier straight after the delete still observes `DELETING`.
-pub const CLASSIFIER_DELETING_SPAN: Duration = Duration::from_millis(300);
+/// is then removed by a background job." One [`LIFECYCLE_PHASE_SPAN`], so a caller
+/// polling the classifier after the delete still observes `DELETING`.
+pub const CLASSIFIER_DELETING_SPAN: Duration = LIFECYCLE_PHASE_SPAN;
 
 /// The `DocumentClassifierMode` a creation that names none is trained in.
 ///
@@ -2296,12 +2304,10 @@ pub fn document_classifier_arn(region: &str, name: &str, version_name: Option<&s
 /// How long a freshly created endpoint stays `CREATING` before the clock owes it the
 /// status [`Endpoint::provisioning`] holds.
 ///
-/// The emulator's own span, not a documented AWS duration: provisioning real
-/// inference capacity takes minutes, which no test can wait for. It is deliberately
-/// non-zero, so a caller that describes an endpoint straight back still observes
+/// One [`LIFECYCLE_PHASE_SPAN`], so a caller polling `DescribeEndpoint` observes
 /// `CREATING` — the state `EndpointProperties$Status` documents callers have to wait
-/// out before making inference requests.
-pub const ENDPOINT_CREATING_SPAN: Duration = Duration::from_millis(300);
+/// out before making inference requests — rather than only its settled status.
+pub const ENDPOINT_CREATING_SPAN: Duration = LIFECYCLE_PHASE_SPAN;
 
 /// The most endpoint records this emulator retains.
 ///
