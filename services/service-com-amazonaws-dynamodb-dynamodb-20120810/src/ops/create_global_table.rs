@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGlobalTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGlobalTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a global table from an existing table, for the WITHDRAWN 2017.11.29 version of
+//! global tables, which is why every call is refused
+//! ([`crate::state::legacy_version_withdrawn`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGlobalTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A global table is created by adding replicas to a table (`UpdateTable`'s
+//! `ReplicaUpdates`), which establishes a replication group under the current version; the
+//! version this operation creates one under is no longer offered, so the call is the
+//! client error it is rather than an unimplemented feature.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +180,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
+        // Neither the store nor the request's endpoint decides this answer: the version
+        // this operation creates a global table under is not offered at all, so the
+        // refusal is the same whatever table the request names and whichever Regions it
+        // asks for.
         let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGlobalTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGlobalTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGlobalTable"))
+        Err(crate::scaffolded::Scaffolded::validation(
+            crate::state::legacy_version_withdrawn(),
+        ))
     }
 }

@@ -2891,6 +2891,17 @@ pub struct Table {
     /// (`TableDescription$RestoreSummary`), which is what every description of a restored
     /// table reports ([`TableRestore`]).
     pub restore: Option<TableRestore>,
+    /// The replicas of this table in OTHER regions, in the order they were added: the
+    /// regional tables its replication group spans beside this one ([`TableReplica`]).
+    /// Empty for a table that is not replicated, which is what makes it no global table.
+    pub replicas: Vec<TableReplica>,
+    /// This table's server-side encryption with a KMS key, or `None` for a table
+    /// encrypted with the Amazon Web Services owned key — the default, which has no
+    /// `SSEDescription` of its own ([`TableEncryption`]).
+    pub encryption: Option<TableEncryption>,
+    /// The on-demand capacity ceilings in force for this table, as `OnDemandThroughput`
+    /// sets and reports them ([`OnDemandCeilings`]).
+    pub on_demand_throughput: OnDemandCeilings,
 }
 
 /// Where a restored table came from, as `RestoreSummary` reports it: the backup it was
@@ -3242,6 +3253,12 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
             self.queue_stream_record(Some(change));
         }
         self.regions.retain(|_, tables| !tables.is_empty());
+        // A replica whose create, update or delete has fallen due is settled, and the
+        // group it belonged to has shrunk if it is gone — owed at this instant whether or
+        // not anybody called ([`Self::apply_due_replica_transitions`]). Done after the
+        // tables a due delete removed are gone, so a departed replica's table and its
+        // record in the group leave together.
+        self.apply_due_replica_transitions(now);
     }
 
     /// The tables of one region, which is the only scope a table name resolves in.
@@ -3702,6 +3719,9 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         canonicalize_item(&mut item)?;
         let size = item_size(&item);
         let stored = self.stored_bytes();
+        // The key this write lands on, kept for the replication below: `key` itself is
+        // moved into the table's map.
+        let replicated_key = key.clone();
         let table = self.active_table_mut(region, name, now)?;
         // Whether this write INSERTS is whether the key is held, not whether the item it
         // holds sizes to zero — an item can legitimately size to nothing.
@@ -3711,9 +3731,18 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
             .stored_bytes
             .saturating_sub(replaced_size)
             .saturating_add(size);
+        // A write to a global table lands in every Region of its group, so it costs the
+        // store its own size ONCE PER REGIONAL TABLE: the host-protection ceiling is
+        // measured against that whole cost, which is what keeps the replication below
+        // inside the same bound as the write that drives it. The factor is bounded by
+        // [`MAX_REPLICA_REGIONS`].
+        let copies = i64::try_from(table.replicas.len().saturating_add(1)).unwrap_or(1);
         if (replaced.is_none() && table.items.len() >= MAX_ITEMS_PER_TABLE)
             || table_bytes > MAX_TABLE_SIZE_BYTES
-            || stored.saturating_sub(replaced_size).saturating_add(size) > MAX_STORE_SIZE_BYTES
+            || stored
+                .saturating_sub(replaced_size.saturating_mul(copies))
+                .saturating_add(size.saturating_mul(copies))
+                > MAX_STORE_SIZE_BYTES
         {
             return Err(store_exhausted(name));
         }
@@ -3737,6 +3766,17 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
             new_image,
         });
         self.queue_stream_record(change);
+        // A global table's data is the same in every Region of its group, so the item
+        // this write landed lands in each replica too ([`Self::replicate_item_change`]).
+        // Read back out of the stored table rather than kept from above, so one write
+        // path cannot replicate something else than it stored.
+        if let Some(stored) = self
+            .table(region, name)
+            .ok()
+            .and_then(|table| table.items.get(&replicated_key).cloned())
+        {
+            self.replicate_item_change(region, name, now, &replicated_key, Some(&stored));
+        }
         Ok(replaced)
     }
 
@@ -3766,6 +3806,11 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
             },
         );
         self.queue_stream_record(change);
+        // The same item change the local table applied is applied to every replica of it,
+        // so a key deleted in one Region of a global table is deleted in all of them.
+        if removed.is_some() {
+            self.replicate_item_change(region, name, now, key, None);
+        }
         Ok(removed)
     }
 
@@ -4905,4 +4950,28 @@ pub use expressions::*;
 pub use indexed_read::*;
 pub use projection::*;
 pub use reads::*;
+
+/// The on-demand capacity ceiling a table carries, in its own file: it is one setting of
+/// the on-demand capacity model, set and cleared through the same member. Re-exported
+/// below, so every caller still names it `crate::state::…`.
+mod ceilings;
+pub use ceilings::*;
+
+/// A table's server-side encryption and the KMS seam that resolves the key it names, in
+/// its own file: the key ARN is another service's, reached on the shared engine.
+/// Re-exported below, so every caller still names them `crate::state::…`.
+mod encryption;
+pub use encryption::*;
+
+/// The replicas a global table spans — the regional tables of its replication group, the
+/// `ReplicaUpdates` actions that add, change and remove them, and the item replication
+/// between them. Re-exported below, so every caller still names them `crate::state::…`.
+mod replicas;
+pub use replicas::*;
+
+/// What the LEGACY (2017.11.29) global-table operations answer, in one file so the five
+/// of them cannot word the same two refusals differently. Re-exported below, so every
+/// caller still names them `crate::state::…`.
+mod global_tables;
+pub use global_tables::*;
 

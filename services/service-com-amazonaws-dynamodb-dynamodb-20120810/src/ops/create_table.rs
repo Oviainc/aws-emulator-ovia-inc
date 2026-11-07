@@ -330,6 +330,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // REQUEST, so it is refused ahead of the scaffold refusal below.
         crate::state::check_on_demand_ceilings(&billing_mode, requested_on_demand_ceilings(&input))
             .map_err(lift)?;
+        // Each ceiling the request names is held to the values the member takes: 1 or more
+        // SETS a maximum and -1 removes one, so anything else asks for a maximum the
+        // capacity model has no meaning for
+        // ([`crate::state::check_on_demand_ceiling_values`]).
+        crate::state::check_on_demand_ceiling_values(input.on_demand_throughput.as_ref())
+            .map_err(lift)?;
         // A member this slice does not store is refused as "not written yet" rather
         // than accepted and silently dropped.
         if let Some(member) = unsupported_member(&input) {
@@ -450,6 +456,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             None => None,
         };
+        // The table's server-side encryption: a specification that enables it names a KMS
+        // key — or asks for the default DynamoDB one — and KMS is what resolves that
+        // identifier to the key ARN every later description reports
+        // ([`crate::state::resolve_sse_key`]). Resolved after every refusal above, so a
+        // create that fails associates no key, and in force from the instant the table is
+        // created, which is the instant this call is made.
+        let encryption = crate::state::requested_encryption(
+            &*self.engine,
+            &region,
+            input.sse_specification.as_ref(),
+            None,
+            now,
+        )
+        .map_err(sse_unresolved)?;
         let table = crate::state::Table {
             arn: crate::state::table_arn(&region, &name),
             name: name.clone(),
@@ -513,6 +533,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // This table was created, not restored, so it has no `RestoreSummary` to
             // report: only `RestoreTableFromBackup` writes one.
             restore: None,
+            // A new table is a regional table of its own: a replication group is
+            // established by `UpdateTable`'s `ReplicaUpdates`, so a created table has no
+            // replica and is no global table.
+            replicas: Vec::new(),
+            encryption,
+            on_demand_throughput: crate::state::OnDemandCeilings::default()
+                .apply(input.on_demand_throughput.as_ref()),
         };
         let description = table.describe(now);
         store.insert_table(table);
@@ -543,6 +570,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(CreateTableOutput {
             table_description: Some(description),
         })
+    }
+}
+
+/// The modelled refusal for a create whose `SSESpecification` could not be served: a key
+/// this Region's KMS endpoint does not serve, or a type the service does not offer, is the
+/// 400 the bad request it is, and a KMS store this process cannot reach at all is a server
+/// fault. Refusing either way is the only honest answer — a table reported as encrypted
+/// with a key ARN nothing minted would name a key no client could use.
+fn sse_unresolved(fault: crate::state::SseFault) -> CreateTableError {
+    match fault {
+        crate::state::SseFault::Invalid(error) => lift(error),
+        crate::state::SseFault::StoreUnavailable => {
+            CreateTableErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the KMS key store is unavailable".to_string()),
+            })
+            .into()
+        }
     }
 }
 
@@ -641,21 +685,11 @@ fn requested_on_demand_ceilings(
 
 /// The first input member present that this slice does not store, if any.
 fn unsupported_member(input: &CreateTableInput) -> Option<&'static str> {
-    if input
-        .sse_specification
-        .as_ref()
-        .is_some_and(|specification| specification.enabled.unwrap_or(false))
-    {
-        return Some("SSESpecification");
-    }
     if input.global_table_source_arn.is_some() {
         return Some("GlobalTableSourceArn");
     }
     if input.global_table_settings_replication_mode.is_some() {
         return Some("GlobalTableSettingsReplicationMode");
-    }
-    if input.on_demand_throughput.is_some() {
-        return Some("OnDemandThroughput");
     }
     // The same two members an index may carry: this slice stores an index's
     // PROVISIONED throughput only, so an on-demand or warm throughput asked for per

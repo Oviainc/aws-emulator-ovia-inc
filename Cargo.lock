@@ -10784,6 +10784,7 @@ dependencies = [
  "http",
  "serde_json",
  "service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810",
+ "service-com-amazonaws-kms-trentservice",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",
  "sha2 0.10.9",

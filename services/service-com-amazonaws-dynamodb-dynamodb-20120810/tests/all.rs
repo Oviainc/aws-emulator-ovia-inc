@@ -181,8 +181,14 @@ mod table_description_members;
 #[path = "all/table_description_shape.rs"]
 mod table_description_shape;
 
+#[path = "all/table_encryption_and_ceilings.rs"]
+mod table_encryption_and_ceilings;
+
 #[path = "all/table_items.rs"]
 mod table_items;
+
+#[path = "all/table_replicas.rs"]
+mod table_replicas;
 
 #[path = "all/table_scan.rs"]
 mod table_scan;

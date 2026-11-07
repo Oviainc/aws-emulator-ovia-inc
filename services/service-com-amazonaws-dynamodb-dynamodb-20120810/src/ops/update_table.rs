@@ -43,10 +43,28 @@
 //! carry is removed, its siblings keep serving `SearchVectors`, and the removal is index
 //! lifecycle work, so the table is left `UPDATING` for the span below like any other.
 //!
-//! Members this slice does not store (SSE, replicas, witnesses, on-demand
-//! throughput, a PER-INDEX warm throughput, multi-region consistency and a
-//! `VectorIndexUpdates` CREATE) are refused with the scaffold's 501 and are their own
-//! gap issues.
+//! A `ReplicaUpdates` entry addresses one REGION of the table's replication group. A
+//! `Create` makes the table a global table: the replica is a table of its own in the
+//! Region it names, holding this table's data and reported by every regional table of the
+//! group until a `Delete` removes it again; a `Disassociate` keeps the local replica as a
+//! standalone regional table. Each override the action carries is applied to that regional
+//! table — its read capacity, its on-demand read ceiling, its table class, the KMS key it
+//! is encrypted with (resolved by KMS, like the table's own `SSESpecification`) and the
+//! per-index settings of its `GlobalSecondaryIndexes`. An action that names the Region the
+//! table itself is in, a Region the group does not hold, or an index the group's table does
+//! not carry is refused with the 400 `ValidationException` it is
+//! ([`crate::state::validated_replica_updates`]).
+//!
+//! An `SSESpecification` moves the table's server-side encryption: the key it names is
+//! resolved by KMS, and the table reports the resolved key ARN under `SSEDescription`
+//! ([`crate::state::requested_encryption`]). An `OnDemandThroughput` sets and clears the
+//! table's on-demand capacity ceilings, each through the same member
+//! ([`crate::state::OnDemandCeilings`]).
+//!
+//! Members this slice does not store (witnesses, a PER-INDEX on-demand or warm
+//! throughput, multi-region consistency, the settings replication mode, disassociation
+//! protection and a `VectorIndexUpdates` CREATE) are refused with the scaffold's 501 and
+//! are their own gap issues.
 //!
 //! ## Shape of an operation
 //!
@@ -325,6 +343,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store lock is taken: a specification that cannot hold together refuses the
         // whole update.
         let stream_request = requested_stream_change(&input).map_err(lift)?;
+        // What the request's `ReplicaUpdates` ask for, read before the store lock is taken
+        // and held to every rule that is about the REQUEST: one action per entry, a Region
+        // named once, and an action that addresses the local table's own Region rather
+        // than a replica of it ([`crate::state::validated_replica_updates`]).
+        let mut replica_actions = crate::state::validated_replica_updates(
+            input.replica_updates.as_ref(),
+            &name,
+            &region,
+        )
+        .map_err(lift)?;
+        // Which KMS key each replica action named, resolved by KMS in the replica's own
+        // Region before anything is written: a key identifier KMS does not resolve refuses
+        // the whole update, the way the same identifier on an `SSESpecification` does.
+        crate::state::resolve_replica_keys(&*self.engine, &mut replica_actions)
+            .map_err(sse_unresolved)?;
+        // Each on-demand ceiling the request names is held to the values that member takes:
+        // 1 or more SETS a maximum, -1 removes one.
+        crate::state::check_on_demand_ceiling_values(input.on_demand_throughput.as_ref())
+            .map_err(lift)?;
         // Every other caller-sized list is clamped here too, BEFORE the store lock is
         // taken, so no loop whose length the request chooses runs inside the critical
         // section.
@@ -336,6 +373,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused update leaves the stored table exactly as it was.
         let stored = store.table(&region, &name).map_err(lift)?;
         let stored_billing_mode = stored.billing_mode.clone();
+        let stored_encryption = stored.encryption.clone();
         match stored.status(now) {
             crate::state::TableStatus::Active => {}
             crate::state::TableStatus::Creating => {
@@ -397,6 +435,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "UpdateTable with {member}"
             )));
         }
+        // What the replica actions ask of the STORED replication group: a Region the group
+        // does not hold cannot be updated or deleted, and one it already holds cannot be
+        // created again. Checked here, before anything is written, so a refused update
+        // leaves every regional table of the group exactly as it was.
+        store
+            .check_replica_actions(&region, &name, &replica_actions)
+            .map_err(lift)?;
+        // What those actions would COST: a created replica is a table of its own in
+        // another Region holding a copy of the group's data, so it is counted against the
+        // same quotas a create is. Past one of them the modelled limit error is the
+        // answer — the code a client backs off and retries fewer replicas on.
+        if let Some(message) = store.replica_creates_over_limit(&region, &name, &replica_actions) {
+            return Err(UpdateTableErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // The encryption this update leaves in force, with the key ARN KMS resolved for
+        // the identifier the request named ([`crate::state::requested_encryption`]). A
+        // change to a table that already exists is reported `UPDATING` for the span the
+        // rest of the update takes, so the instant it becomes effective is that span's.
+        let encryption = crate::state::requested_encryption(
+            &*self.engine,
+            &region,
+            input.sse_specification.as_ref(),
+            stored_encryption.as_ref(),
+            now + crate::state::STATUS_TRANSITION,
+        )
+        .map_err(sse_unresolved)?;
         let table = store.table_mut(&region, &name).map_err(lift)?;
         let table_throughput = resolve_table_throughput(table, &billing_mode, &input)
             .map_err(lift)?;
@@ -562,9 +631,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(protection) = input.deletion_protection_enabled {
             table.deletion_protection_enabled = protection;
         }
+        table.encryption = encryption;
+        // Each on-demand ceiling the request names is set or cleared, and one it leaves
+        // out stays as it was ([`crate::state::OnDemandCeilings::apply`]).
+        table.on_demand_throughput = table
+            .on_demand_throughput
+            .apply(input.on_demand_throughput.as_ref());
 
+        // The replica actions are applied LAST, because each one reaches tables of other
+        // Regions as well as this one: a created replica is a table of its own in its own
+        // Region, and every regional table of the group records it
+        // ([`crate::state::ComAmazonawsDynamodbDynamodb20120810State::apply_replica_actions`]).
+        store.apply_replica_actions(&region, &name, &replica_actions, now);
 
-        let description = table.describe(now);
+        // The description answers from the stored table, read back after every write this
+        // update made — including the ones the replica actions made to it.
+        let description = store.table(&region, &name).map_err(lift)?.describe(now);
         // The audit record for a state-changing call: who asked, what the table carries
         // after the change and that it succeeded. Never a credential — only the access
         // key id the caller presented.
@@ -594,6 +676,22 @@ fn store_unavailable() -> UpdateTableError {
         message: Some("the DynamoDB table store is unavailable".to_string()),
     })
     .into()
+}
+
+/// The modelled refusal for an update whose `SSESpecification` could not be served: a key
+/// this Region's KMS endpoint does not serve, or a type the service does not offer, is the
+/// 400 the bad request it is, and a KMS store this process cannot reach at all is a server
+/// fault — never a table reported as encrypted with a key ARN nothing minted.
+fn sse_unresolved(fault: crate::state::SseFault) -> UpdateTableError {
+    match fault {
+        crate::state::SseFault::Invalid(error) => lift(error),
+        crate::state::SseFault::StoreUnavailable => {
+            UpdateTableErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the KMS key store is unavailable".to_string()),
+            })
+            .into()
+        }
+    }
 }
 
 /// Lift a store refusal into this operation's error channel.
@@ -788,17 +886,25 @@ fn empty_update_message() -> String {
 /// own lifecycle in the streams service (a stream being turned off is `DISABLING` before
 /// it is `DISABLED`), so that too is settled after the call returns.
 ///
-/// Deletion protection is a guard flag with nothing behind it: the service applies it
-/// with the call and answers with the table still `ACTIVE`, so nothing is left for the
-/// clock to finish and the next control-plane call is served.
+/// Two more changes outlive the call for the same reason. A `ReplicaUpdates` entry acts on
+/// a table in ANOTHER Region — "this request invokes the `CreateTableReplica` action in
+/// the destination Region" — whose own `CREATING`/`DELETING` span is the replica's; and an
+/// `SSESpecification` re-encrypts the table, which is why `SSEDescription` has an
+/// `UPDATING` status of its own.
+///
+/// Deletion protection and the on-demand ceilings are settings with nothing behind them:
+/// the service applies each with the call and answers with the table still `ACTIVE`, so
+/// nothing is left for the clock to finish and the next control-plane call is served.
 fn asks_for_asynchronous_work(input: &UpdateTableInput) -> bool {
     input.billing_mode.is_some()
         || input.provisioned_throughput.is_some()
         || input.warm_throughput.is_some()
         || input.table_class.is_some()
         || input.stream_specification.is_some()
+        || input.sse_specification.is_some()
         || list_named(input.global_secondary_index_updates.as_ref())
         || list_named(input.vector_index_updates.as_ref())
+        || list_named(input.replica_updates.as_ref())
 }
 
 /// Every on-demand capacity ceiling this request names: the table's own, and the one
@@ -832,20 +938,6 @@ fn requested_on_demand_ceilings(
 /// The first input member present that this slice does not store, if any.
 fn unsupported_member(input: &UpdateTableInput) -> Option<&'static str> {
     if input
-        .sse_specification
-        .as_ref()
-        .is_some_and(|specification| specification.enabled.unwrap_or(false))
-    {
-        return Some("SSESpecification");
-    }
-    if input
-        .replica_updates
-        .as_ref()
-        .is_some_and(|updates| !updates.is_empty())
-    {
-        return Some("ReplicaUpdates");
-    }
-    if input
         .global_table_witness_updates
         .as_ref()
         .is_some_and(|updates| !updates.is_empty())
@@ -861,9 +953,6 @@ fn unsupported_member(input: &UpdateTableInput) -> Option<&'static str> {
         .any(|update| update.create.is_some())
     {
         return Some("VectorIndexUpdates carrying Create");
-    }
-    if input.on_demand_throughput.is_some() {
-        return Some("OnDemandThroughput");
     }
     if input.multi_region_consistency.is_some() {
         return Some("MultiRegionConsistency");

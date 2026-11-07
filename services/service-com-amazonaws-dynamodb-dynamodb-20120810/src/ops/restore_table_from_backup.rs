@@ -409,6 +409,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // the instant that backup was taken.
                 restore_date_time: backup.created_at,
             }),
+            // A restored table is a regional table of its own: a restore reproduces the
+            // backup's data, not a replication group, so it has no replica until
+            // `UpdateTable` adds one.
+            replicas: Vec::new(),
+            // Encryption is one of the settings a caller sets up again on the restored
+            // table, so it starts life encrypted with the Amazon Web Services owned key.
+            encryption: None,
+            // An on-demand ceiling is named through `OnDemandThroughputOverride`, which
+            // this slice does not store yet, so the restored table starts with none.
+            on_demand_throughput: crate::state::OnDemandCeilings::default(),
         };
         // The figures `ItemCount`/`TableSizeBytes` report are metered when a table is
         // created, and this one was created holding the restored items.

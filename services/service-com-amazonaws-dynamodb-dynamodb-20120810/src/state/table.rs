@@ -1400,6 +1400,27 @@ impl Table {
                 restore_date_time: ::aws_smithy_types::DateTime::from(restore.restore_date_time),
                 restore_in_progress: self.status(now) == TableStatus::Creating,
             }),
+            // "Represents replicas of the table", and the version of global tables they
+            // are replicated under: reported only for a table that HAS replicas, which is
+            // what a standalone regional table is not ([`Table::described_replicas`]).
+            replicas: self.described_replicas(now),
+            global_table_version: self.global_table_version(),
+            // "The description of the server-side encryption status on the specified
+            // table": reported only for a table encrypted with a KMS key, which is what
+            // the Amazon Web Services OWNED key a table is encrypted with by default is
+            // not ([`TableEncryption`]).
+            sse_description: self
+                .encryption
+                .as_ref()
+                .map(|encryption| encryption.describe(now)),
+            // "Sets the maximum number of read and write units for the specified
+            // on-demand table" (the `OnDemandThroughput` doc): the pair belongs to the
+            // on-demand capacity model, so it is reported for a table in that mode — each
+            // dimension either capped or reported as the -1 that means "no maximum"
+            // ([`OnDemandCeilings::describe`]) — and not for a provisioned one, whose
+            // capacity is its `ProvisionedThroughput`.
+            on_demand_throughput: (self.billing_mode == "PAY_PER_REQUEST")
+                .then(|| self.on_demand_throughput.describe()),
             ..TableDescription::default()
         }
     }

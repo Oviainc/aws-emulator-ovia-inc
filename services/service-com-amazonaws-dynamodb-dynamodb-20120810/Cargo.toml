@@ -38,6 +38,10 @@ hex = { workspace = true }
 # enabling a stream on CreateTable/UpdateTable registers it through that crate's
 # `state::register_stream` seam, which is what its own consumers then read.
 service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810 = { workspace = true }
+# The KMS service owns the keys a table's `SSESpecification` names: resolving the key id,
+# ARN, alias name or alias ARN a request carries into the key ARN `SSEDescription` reports
+# is that service's answer, read through its `state` seam (`state::encryption`).
+service-com-amazonaws-kms-trentservice = { workspace = true }
 # `query_error_envelope`: the tree's one statement of how a response names the request it
 # answers (`x-amzn-RequestId`), wired into this service's operation dispatch and its
 # framework-level error renderers (`service::EmulatedService`).
