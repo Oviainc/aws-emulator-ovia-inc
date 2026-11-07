@@ -1,25 +1,37 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudformation.export-value-update-refused-while-imported cloudformation.stack-export-removal-while-imported-rolls-back-producer cloudformation.deploy-cdk-cross-stack-export-ordering-and-in-use-guard cloudformation.export-deletion-blocked-while-imported-rejected cloudformation.export-in-use-blocks-stack-deletion cloudformation.e2e-resource-scan-generated-template-to-managed-stack cloudformation.concurrent-generated-template-limit cloudformation.generated-template-concurrency-limit-rejected cloudformation.delete-stack-retain-resources-leaves-the-retained-bucket-intact cloudformation.cdk-nested-stack-is-tracked-and-cascades-on-delete cloudformation.cdk-deploy-replaces-a-rollback-complete-stack-with-a-new-one cloudformation.cdk-deployed-l2-trio-serves-http-and-persists cloudformation.cdk-restapi-added-method-forces-a-new-deployment-that-serves cloudformation.cdk-restapi-cloudwatch-role-flag-governs-account-global-write
+Issue-Trace-Ids: cloudformation.export-value-update-refused-while-imported cloudformation.stack-export-removal-while-imported-rolls-back-producer cloudformation.export-deletion-blocked-while-imported-rejected cloudformation.export-in-use-blocks-stack-deletion cloudformation.delete-stack-retain-resources-leaves-the-retained-bucket-intact
 Issue-Shape-Id: com.amazonaws.cloudformation#CloudFormation
 Issue-Key: cloudformation.export-value-update-refused-while-imported|run#29|AssertionError|assert refused == expected_refusal, (
 Issue-Key: cloudformation.stack-export-removal-while-imported-rolls-back-producer|run#16|AssertionError|assert _settle(cfn, producer, timeout_s=_cap(ctx, _DEADLINE_S)) == "UPDATE_ROLLBACK_COMPLETE", f"dropping the used export: {_stack(cfn, producer)!r}"
-Issue-Key: cloudformation.deploy-cdk-cross-stack-export-ordering-and-in-use-guard|run#38|AssertionError|assert rc != 0, (
 Issue-Key: cloudformation.export-deletion-blocked-while-imported-rejected|run#22|AssertionError|assert got == expected, (
 Issue-Key: cloudformation.export-in-use-blocks-stack-deletion|run#23|AssertionError|assert got == expected, (
-Issue-Key: cloudformation.e2e-resource-scan-generated-template-to-managed-stack|run#10|AssertionError|assert found is not None, "resource scan did not surface the manually-created SNS topic"
-Issue-Key: cloudformation.concurrent-generated-template-limit|run#17|AssertionError|assert message.startswith(
-Issue-Key: cloudformation.generated-template-concurrency-limit-rejected|run#13|AssertionError|assert message.startswith(
-Issue-Key: cloudformation.delete-stack-retain-resources-leaves-the-retained-bucket-intact|run#22|AssertionError|assert re.fullmatch(_BUCKET_NOT_EMPTY_REASON, bucket_reason), (
 Issue-Key: cloudformation|DescribeStacks|ValidationError
-Issue-Key: cloudformation.cdk-deploy-replaces-a-rollback-complete-stack-with-a-new-one|run#16|AssertionError|assert (bad["ResourceStatus"], reasons) == ("DELETE_COMPLETE", [
-Issue-Key: cloudformation.cdk-deployed-l2-trio-serves-http-and-persists|_http_until#30|Timeout|time.sleep(3.0)
-Issue-Key: cloudformation.cdk-restapi-added-method-forces-a-new-deployment-that-serves|_http_until#37|Timeout|time.sleep(3.0)
-Issue-Key: cloudformation.cdk-restapi-cloudwatch-role-flag-governs-account-global-write|_http_until#38|Timeout|time.sleep(3.0)
+Issue-Key: cloudformation.delete-stack-retain-resources-leaves-the-retained-bucket-intact|run#22|AssertionError|assert re.fullmatch(_BUCKET_NOT_EMPTY_REASON, bucket_reason), (
 Issue-Commit: 765add48a71cdb59193040bf215c1324536972c5
 
 # cloudformation: 8 net-new root causes — in-use export guard missing on update, delete-canceled message, resource scan finds nothing, nested child stacks not addressable, collision reason wording, unsettled CDK deploys
+
+> _RESOLVED HERE: causes 1, 2 and 5 below — the in-use export guard on every deployment of
+> a publishing stack, the cancelled-operation reason's wording, and the SDK exception a
+> refused Amazon S3 call is reported as (which also needed `DeleteStack` with
+> `RetainResources`, implemented with it). Cause 3, the resource scan's inventory of the
+> resources no stack manages, was fixed on mainline in parallel by
+> `state::resource_inventory`; this change's own reading of it was dropped in favour of that
+> one, and its suite `tests/all/out_of_band_resource_scan.rs` is kept, over the catalogue that
+> landed. The header's keys are the ones the replay reports fixed or moved._
+>
+> _STILL OPEN, and carried to an issue of their own —
+> `issues/things-that-do-not-work/20261103T090000Z-cloudformation-generated-template-limit-wording-nested-stacks-collision-reason-cdk-deploys.md`
+> — are causes 4 (the generated-template limit wording, whose AWS sentence no reading of the
+> model matches), 6 (nested child stacks), 7 (the name-collision reason) and 8 (CDK deploys
+> that never settle), with the trace ids and keys that belong to each. Nothing about them was
+> implemented here, so neither their trace ids nor their keys are claimed above. Causes 3 and
+> 1's third trace are listed there too where their units still fail on one of those causes:
+> the resource-scan unit now gets past the scan and fails on `CreateChangeSet` with
+> `ChangeSetType IMPORT`, a scaffolded operation of its own, and the CDK-driven
+> export-ordering unit fails with every other CDK deploy (cause 8)._
 
 > _Note: this issue was identified against the code base at commit `765add48a71cdb59193040bf215c1324536972c5`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 

@@ -944,6 +944,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // exported output values in force in the Region this request is signed for,
             // read before the stack is resolved so the two cannot disagree about them.
             let exports = store.exported_values(&request_region);
+            // ...and which of this stack's exports another live stack IMPORTS, read in the
+            // same breath and for the same reason: an export in use is PINNED, so an update
+            // that would stop publishing it, or publish another value under it, is the one
+            // CloudFormation cancels ([`crate::state::exports`]).
+            let importers = store.importers_by_export(&request_region);
             let stack = store
                 .resolve_mut(&request_region, &input.stack_name)
                 .filter(|stack| stack.is_live())
@@ -1073,12 +1078,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(reason) = cannot_deploy {
                 stack.fail_pending_transition(status::UPDATE_FAILED, reason);
             }
+            // An exported output value another live stack still IMPORTS cannot be withdrawn:
+            // the importing stack resolved its `Fn::ImportValue` against the value this
+            // stack publishes, so an update that stops publishing that export — or publishes
+            // a different value under it — would break the reference. The model declares no
+            // error for it, so the CALL is accepted and the UPDATE is what is cancelled:
+            // CloudFormation refuses the deployment before anything is asked of the services
+            // that own the resources, naming the export and the stack that still imports it,
+            // and the update is rolled back below ([`crate::state::exports`]).
+            let withdraws_an_export_in_use = stack
+                .in_use_export_withdrawn(&importers)
+                .map(|(export_name, importing_stack_name)| {
+                    crate::state::exports::canceled_reason(
+                        crate::state::exports::CanceledOperation::Update,
+                        &export_name,
+                        &importing_stack_name,
+                    )
+                });
             // "The intrinsic function Fn::ImportValue returns the value of an output
             // exported by another stack": an export name no live stack of this account and
             // Region publishes has no value to import, so CloudFormation refuses the
             // deployment before anything is asked of the services that own the resources —
             // the update then fails naming the export and is rolled back below.
-            let refused_deployment = stack.unresolved_import_failure();
+            let refused_deployment =
+                withdraws_an_export_in_use.or_else(|| stack.unresolved_import_failure());
             (
                 stack.stack_id.clone(),
                 stack.region.clone(),

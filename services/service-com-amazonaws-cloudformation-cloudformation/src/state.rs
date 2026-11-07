@@ -89,7 +89,9 @@
 //! [`handler_progress::MAX_HANDLER_INVOCATIONS`] resource-handler invocations with a
 //! progress record (oldest-first),
 //! [`resource_scans::MAX_RESOURCE_SCANS`] recorded resource scans (oldest-first), each
-//! one carrying the resources this store already holds and so bounded by the ceilings above,
+//! one carrying the resources this store already holds plus at most
+//! [`resource_inventory::MAX_INVENTORIED_RESOURCES`] read from the services that own them,
+//! and so bounded by the ceilings above,
 //! [`stack_refactors::MAX_STACK_REFACTORS`] stack refactors (oldest-first), each one carrying
 //! at most [`stack_refactors::MAX_STACKS_PER_REFACTOR`] stack definitions and
 //! [`stack_refactors::MAX_RESOURCE_MAPPINGS_PER_REFACTOR`] resource mappings,
@@ -333,6 +335,10 @@ pub mod resource_scans;
 /// The resources this account holds in one Region as the services that OWN them report
 /// them, which is what a resource scan reads beside this service's own stack records.
 pub mod resource_inventory;
+
+/// Which exported output values another live stack IMPORTS, and what a stack operation
+/// that would withdraw one answers.
+pub mod exports;
 
 /// The Hook invocations planned for one change set, which `DescribeChangeSetHooks`
 /// reports.
@@ -4033,9 +4039,10 @@ pub fn export_in_use_delete_canceled_reason(
     export_name: &str,
     importing_stack_name: &str,
 ) -> String {
-    format!(
-        "Delete canceled. Cannot delete export {export_name} as it is in use by \
-         {importing_stack_name}"
+    exports::canceled_reason(
+        exports::CanceledOperation::Delete,
+        export_name,
+        importing_stack_name,
     )
 }
 

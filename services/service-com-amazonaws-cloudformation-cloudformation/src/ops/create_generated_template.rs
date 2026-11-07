@@ -217,11 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateGeneratedTemplateErrorModeled::ConcurrentResourcesLimitExceededException(
                     ConcurrentResourcesLimitExceededException {
-                        message: Some(format!(
-                            "No more than {} generated templates can be in an InProgress or \
-                             Pending status at one time",
-                            generated::MAX_CONCURRENT_GENERATIONS
-                        )),
+                        message: Some(generated::concurrent_generations_exceeded()),
                     },
                 )
                 .into(),

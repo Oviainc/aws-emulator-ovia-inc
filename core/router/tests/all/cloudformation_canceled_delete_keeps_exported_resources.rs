@@ -7,7 +7,7 @@
 //! The rule under test: **an exported output value another live stack still imports pins the
 //! stack that publishes it, so the accepted `DeleteStack` is cancelled: the stack goes back
 //! to the healthy status it held carrying
-//! `Delete canceled. Cannot delete export <export> as it is in use by <importing stack>`,
+//! `Delete canceled. Cannot delete export <export> as it is in use by <importing stack>.`,
 //! every resource it created is still held by the service that owns it, and once no live
 //! stack imports that value the identical call deletes the stack and those resources with
 //! it.** The second half of that sentence is what needs two crates to agree (CloudFormation
@@ -307,12 +307,12 @@ const ROWS: &[Row] = &[
 ];
 
 /// The reason a cancelled deletion carries, as AWS words it: the fixed text around the
-/// export and the stack that still imports it. Written out here rather than read off the
-/// emulator's own formatter, so the assertion pins the wording.
+/// export and the stack that still imports it, ending with its period. Written out here
+/// rather than read off the emulator's own formatter, so the assertion pins the wording.
 fn in_use_reason(export_name: &str, importing_stack_name: &str) -> String {
     format!(
         "Delete canceled. Cannot delete export {export_name} as it is in use by \
-         {importing_stack_name}"
+         {importing_stack_name}."
     )
 }
 

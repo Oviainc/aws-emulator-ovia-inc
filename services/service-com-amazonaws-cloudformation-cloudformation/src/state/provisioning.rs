@@ -3147,28 +3147,67 @@ const UNNAMED_CODE_PREFIX: &str = "HTTP ";
 ///
 /// One entry per service whose reported wording this emulator pins; a service with no entry
 /// has its message reported exactly as it worded it, with no diagnostic invented for it.
-const SDK_SERVICE_NAMES: &[(&str, &str)] =
-    &[("es", "OpenSearch"), ("iam", "Iam"), ("lambda", "Lambda")];
+const SDK_SERVICE_NAMES: &[(&str, &str)] = &[
+    ("es", "OpenSearch"),
+    ("iam", "Iam"),
+    ("lambda", "Lambda"),
+    ("s3", "S3"),
+];
+
+/// The services whose answers carry an EXTENDED request id beside the request id, which
+/// their SDK states in the diagnostic too.
+///
+/// Amazon S3 is the service that answers one: every S3 response carries `x-amz-id-2` beside
+/// `x-amz-request-id`, and the exception an S3 SDK raises states both ("Request ID: ...,
+/// Extended Request ID: ..."). A service with no entry answers one id, and its diagnostic
+/// states that one.
+const SDK_EXTENDED_REQUEST_ID_SERVICES: &[&str] = &["s3"];
+
+/// How many characters the request id of a service that answers an extended one carries, and
+/// the case it is written in: Amazon S3's `x-amz-request-id` is a short opaque token in
+/// upper case, where the request id of the services above is a uuid
+/// ([`super::new_request_id`]).
+const SDK_SHORT_REQUEST_ID_CHARACTERS: usize = 16;
+
+/// How many characters the EXTENDED request id carries: a long opaque token, which is what
+/// `x-amz-id-2` is.
+const SDK_EXTENDED_REQUEST_ID_CHARACTERS: usize = 64;
+
+/// The request id — and the extended request id where the service answers one — that the
+/// diagnostic states for a call to `signing_name`.
+///
+/// Both are this call's own, minted per call as every identifier this service hands out is:
+/// the in-process answer carries none of its own, and they identify the CALL rather than
+/// anything about the resource.
+fn sdk_request_ids(signing_name: &str) -> String {
+    if !SDK_EXTENDED_REQUEST_ID_SERVICES.contains(&signing_name) {
+        return format!("Request ID: {}", super::new_request_id());
+    }
+    format!(
+        "Request ID: {}, Extended Request ID: {}",
+        super::new_identifier_digits("sdk-request", SDK_SHORT_REQUEST_ID_CHARACTERS)
+            .to_uppercase(),
+        super::new_identifier_digits(
+            "sdk-extended-request",
+            SDK_EXTENDED_REQUEST_ID_CHARACTERS
+        ),
+    )
+}
 
 /// The diagnostic an AWS SDK appends to the message of the exception it raises for a refused
-/// call: which service refused it, the HTTP status it answered with, the id of the call and
-/// how many attempts the SDK made at it.
+/// call: which service refused it, the HTTP status it answered with, the id (or ids) of the
+/// call and how many attempts the SDK made at it.
 ///
 /// `None` for a service [`SDK_SERVICE_NAMES`] does not name, which leaves the message as
 /// that service worded it.
-///
-/// The request id is this call's own, minted per call as every identifier this service hands
-/// out is: the in-process answer carries none of its own, and the id identifies the CALL
-/// rather than anything about the resource.
 fn sdk_diagnostic(signing_name: &str, status: u16, code: &str) -> Option<String> {
     let service = SDK_SERVICE_NAMES
         .iter()
         .find(|(name, _)| *name == signing_name)
         .map(|(_, service)| *service)?;
     Some(format!(
-        "(Service: {service}, Status Code: {status}, Request ID: {}) \
-         (SDK Attempt Count: {})",
-        super::new_request_id(),
+        "(Service: {service}, Status Code: {status}, {}) (SDK Attempt Count: {})",
+        sdk_request_ids(signing_name),
         sdk_attempt_count(code),
     ))
 }
@@ -3251,7 +3290,20 @@ const HANDLER_ERROR_CLASSES: &[(&str, &[&str])] = &[
     ),
     (
         "GeneralServiceException",
-        &["InternalError", "InternalServerError", "ServiceUnavailable", "ServiceFailure"],
+        &[
+            "InternalError",
+            "InternalServerError",
+            "ServiceUnavailable",
+            "ServiceFailure",
+            // A call the owning service would not carry out because the resource it manages
+            // still HOLDS content (Amazon S3's `BucketNotEmpty` for a bucket that still has
+            // objects in it): the declaration is well formed and the provider asked for
+            // exactly what the stack said, so what it passes on is the called service's own
+            // exception rather than a fault it found in the request — and, like every other
+            // class here, a condition that clears on its own once that content is gone,
+            // which is why the SDK retried the call ([`SDK_RETRIED_CLASSES`]).
+            "NotEmpty",
+        ],
     ),
 ];
 

@@ -71,6 +71,8 @@ mod delete_canceled_export_in_use;
 mod delete_stack_export_in_use;
 #[path = "all/delete_stack_instances.rs"]
 mod delete_stack_instances;
+#[path = "all/delete_stack_retain_resources.rs"]
+mod delete_stack_retain_resources;
 #[path = "all/delete_stack_set.rs"]
 mod delete_stack_set;
 #[path = "all/denied_replacement_identity.rs"]
@@ -131,6 +133,8 @@ mod generated_template_body;
 mod generated_template_coverage;
 #[path = "all/generated_template_deletion.rs"]
 mod generated_template_deletion;
+#[path = "all/generated_template_limit_wording.rs"]
+mod generated_template_limit_wording;
 #[path = "all/generated_template_reads.rs"]
 mod generated_template_reads;
 #[path = "all/generated_template_refusals.rs"]
@@ -199,6 +203,8 @@ mod nested_resource_outputs;
 mod no_echo_parameters;
 #[path = "all/operation_events.rs"]
 mod operation_events;
+#[path = "all/out_of_band_resource_scan.rs"]
+mod out_of_band_resource_scan;
 #[path = "all/parameter_and_change_set_conflicts.rs"]
 mod parameter_and_change_set_conflicts;
 #[path = "all/provisioned_resources.rs"]
@@ -231,6 +237,8 @@ mod rds_stack_resources;
 mod refusals_name_their_modelled_taxonomy;
 #[path = "all/registry_and_scan_read_members.rs"]
 mod registry_and_scan_read_members;
+#[path = "all/refused_resource_sdk_exception.rs"]
+mod refused_resource_sdk_exception;
 #[path = "all/refused_stack_deletion.rs"]
 mod refused_stack_deletion;
 #[path = "all/regional_stack_namespace.rs"]
@@ -407,6 +415,8 @@ mod update_after_a_refused_delete;
 mod update_rollback_of_a_refused_update;
 #[path = "all/update_rollback_recovery.rs"]
 mod update_rollback_recovery;
+#[path = "all/update_stack_export_in_use.rs"]
+mod update_stack_export_in_use;
 #[path = "all/update_stack_instances.rs"]
 mod update_stack_instances;
 #[path = "all/validate_template.rs"]

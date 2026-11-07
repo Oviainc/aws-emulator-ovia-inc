@@ -495,6 +495,8 @@ const NOT_FOUND_EXCEPTION: &str = "GeneratedTemplateNotFoundException";
 /// The exception name the envelope states for a refusal of a name a record already holds.
 const ALREADY_EXISTS_EXCEPTION: &str = "AlreadyExistsException";
 
+
+
 /// `sentence` followed by the envelope the AWS SDK appends to a refusal of this surface:
 /// `(Service: <component>; Status Code: <status>; Error Code: <exception>; Request ID: <id>;
 /// Proxy: null)`.
@@ -541,6 +543,23 @@ pub fn already_exists(generated_template_name: &str) -> String {
     with_component_envelope(
         &already_exists_sentence(generated_template_name),
         ALREADY_EXISTS_EXCEPTION,
+    )
+}
+
+/// The message of the modelled `ConcurrentResourcesLimitExceededException` for a call that
+/// would start one more generation than may be in flight at once.
+///
+/// The sentence the model states for that error, with the number read off
+/// [`MAX_CONCURRENT_GENERATIONS`] rather than written into the text twice. It is the only
+/// refusal of this surface that does NOT go through [`with_component_envelope`]: the two that
+/// do were worded from a recording of this surface answering them, and there is no evidence
+/// of how AWS words THIS one — a sentence of this crate's own in that envelope would be an
+/// invented message, so what it answers is the model's statement of the error and nothing
+/// more. (See the open issue that still carries this cause.)
+pub fn concurrent_generations_exceeded() -> String {
+    format!(
+        "No more than {MAX_CONCURRENT_GENERATIONS} generated templates can be in an \
+         InProgress or Pending status at one time"
     )
 }
 

@@ -312,6 +312,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // What a `Fn::ImportValue` in the change set's template resolves against: the
             // exported output values in force in the Region this request is signed for.
             let exports = store.exported_values(&request_region);
+            // ...and which of the stack's own exports another live stack IMPORTS: an export
+            // in use is PINNED, so an execution that would withdraw one is cancelled rather
+            // than carried out ([`crate::state::exports`]).
+            let importers = store.importers_by_export(&request_region);
 
             // A change set named beside a stack is addressed WITHIN that stack, so the stack
             // is resolved first: a request naming one this Region holds none of is refused
@@ -659,12 +663,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 };
                 stack.fail_pending_transition(failed, reason);
             }
+            // An exported output value another live stack still IMPORTS cannot be withdrawn,
+            // whichever call deploys the template that would withdraw it: executing a change
+            // set against the publishing stack is cancelled exactly as `UpdateStack` is,
+            // naming the export and the stack that still imports it
+            // ([`crate::state::exports`]).
+            let withdraws_an_export_in_use = stack
+                .in_use_export_withdrawn(&importers)
+                .map(|(export_name, importing_stack_name)| {
+                    crate::state::exports::canceled_reason(
+                        crate::state::exports::CanceledOperation::Update,
+                        &export_name,
+                        &importing_stack_name,
+                    )
+                });
             // "The intrinsic function Fn::ImportValue returns the value of an output
             // exported by another stack": an export name no live stack of this account and
             // Region publishes has no value to import, so CloudFormation refuses the
             // deployment before anything is asked of the services that own the resources —
             // the execution then fails naming the export and is rolled back below.
-            let refused_deployment = stack.unresolved_import_failure();
+            let refused_deployment =
+                withdraws_an_export_in_use.or_else(|| stack.unresolved_import_failure());
             let region = stack.region.clone();
             let declared = stack.current_resources().to_vec();
             // A resource the plan ADOPTS already exists in the service that owns it, and

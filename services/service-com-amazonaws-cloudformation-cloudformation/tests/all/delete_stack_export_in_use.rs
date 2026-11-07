@@ -7,7 +7,7 @@
 //! so a `DeleteStack` the service accepts (200) for the stack that publishes it reports
 //! `DELETE_IN_PROGRESS` ("User Initiated") and is then CANCELLED: the stack goes back to
 //! the healthy status it held, carrying
-//! `Delete canceled. Cannot delete export <export> as it is in use by <importing stack>`
+//! `Delete canceled. Cannot delete export <export> as it is in use by <importing stack>.`
 //! as its `StackStatusReason`, with nothing of the stack disposed of; once no live stack
 //! imports it the identical call deletes the stack and reaches `DELETE_COMPLETE`.**
 //!
@@ -33,18 +33,24 @@ use crate::harness::{call, member, router, wait_for_the_transition, xml_text, xm
 use crate::stack_lifecycle::{deploy, describe_stack, expected_status};
 
 /// The reason a cancelled deletion carries, as AWS words it: the fixed text around the
-/// export and the stack that still imports it. Written out here rather than read off the
-/// emulator's own formatter, so the assertion pins the wording.
+/// export and the stack that still imports it, ending with its period. Written out here
+/// rather than read off the emulator's own formatter, so the assertion pins the wording.
 fn in_use_reason(export_name: &str, importing_stack_name: &str) -> String {
     format!(
         "Delete canceled. Cannot delete export {export_name} as it is in use by \
-         {importing_stack_name}"
+         {importing_stack_name}."
     )
 }
 
 /// A stack template publishing one export per entry of `exports`, over a resource no
 /// service has to provision.
 fn exporter_template(exports: &[(&str, &str)]) -> String {
+    exporter_template_over(exports, 1)
+}
+
+/// The same template over `resources` resources, for an update that has to be a real change
+/// to the stack without touching what it publishes.
+fn exporter_template_over(exports: &[(&str, &str)], resources: usize) -> String {
     let outputs: Vec<String> = exports
         .iter()
         .enumerate()
@@ -52,9 +58,14 @@ fn exporter_template(exports: &[(&str, &str)]) -> String {
             format!(r#""O{index}":{{"Value":"{value}","Export":{{"Name":"{name}"}}}}"#)
         })
         .collect();
+    let declared: Vec<String> = (0..resources)
+        .map(|index| {
+            format!(r#""Handle{index}":{{"Type":"AWS::CloudFormation::WaitConditionHandle"}}"#)
+        })
+        .collect();
     format!(
-        r#"{{"Resources":{{"Handle":{{"Type":"AWS::CloudFormation::WaitConditionHandle"}}}},
-            "Outputs":{{{}}}}}"#,
+        r#"{{"Resources":{{{}}},"Outputs":{{{}}}}}"#,
+        declared.join(","),
         outputs.join(",")
     )
 }
@@ -199,23 +210,17 @@ async fn a_delete_blocked_by_a_live_importer_is_canceled_and_the_stack_stays_hea
         // Whatever healthy status the stack holds when the call arrives, the cancelled
         // deletion puts it back into that one.
         let held_status = if row.update_first {
-            // The same export NAMES, carrying changed values: the update is a real change,
-            // and the reference the importing stack holds is still held.
-            let revalued: Vec<(&str, String)> = row
-                .exports
-                .iter()
-                .map(|(name, value)| (*name, format!("{value}-updated")))
-                .collect();
-            let revalued: Vec<(&str, &str)> = revalued
-                .iter()
-                .map(|(name, value)| (*name, value.as_str()))
-                .collect();
+            // The same exports, over one resource MORE: a real change to the stack that
+            // withdraws nothing the importing stack holds. (An update that CHANGED or
+            // dropped the imported export would be cancelled in its own right — see
+            // `update_stack_export_in_use.rs` — so the row that pins the DELETE being
+            // cancelled is driven by an update the export pin does not touch.)
             let (code, body) = call(
                 &router,
                 "UpdateStack",
                 &[
                     member("StackName", exporter),
-                    member("TemplateBody", &exporter_template(&revalued)),
+                    member("TemplateBody", &exporter_template_over(&row.exports, 2)),
                 ],
             )
             .await;
@@ -328,7 +333,7 @@ async fn a_delete_blocked_by_a_live_importer_is_canceled_and_the_stack_stays_hea
             row.case
         );
         assert!(
-            xml_texts(&resources, "LogicalResourceId").contains(&"Handle".to_string()),
+            xml_texts(&resources, "LogicalResourceId").contains(&"Handle0".to_string()),
             "case {:?}: expected the exporter's resource to be intact, got {resources}",
             row.case
         );
@@ -409,14 +414,17 @@ async fn a_canceled_delete_never_leaves_an_in_progress_status() {
     .await;
 
     // No wait between the two calls: the update is still in flight when the delete arrives
-    // (and if it loses the race to the clock, the delete is cancelled the same way).
-    let revalued = [("in-flight-export", "in-flight-value-updated")];
+    // (and if it loses the race to the clock, the delete is cancelled the same way). The
+    // update keeps publishing the export the importer holds — one that withdrew it would be
+    // cancelled in its own right (`update_stack_export_in_use.rs`) — and changes the stack
+    // by declaring one resource more.
+    let in_flight = [("in-flight-export", "in-flight-value")];
     let (code, body) = call(
         &router,
         "UpdateStack",
         &[
             member("StackName", "in-flight-exporter"),
-            member("TemplateBody", &exporter_template(&revalued)),
+            member("TemplateBody", &exporter_template_over(&in_flight, 2)),
         ],
     )
     .await;
