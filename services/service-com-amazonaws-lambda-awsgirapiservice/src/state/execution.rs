@@ -35,11 +35,15 @@
 //!   [`MAX_ABANDONED_RUNS`] for as long as its thread lasts, and past that cap an
 //!   invocation is refused with the modelled throttle rather than adding another thread.
 //!
-//! At most [`MAX_CONCURRENT_RUNS`] handlers run at once, so the memory and CPU the
-//! engines can hold is bounded however many invocations arrive; a call that waits
-//! [`PERMIT_WAIT`] for a slot is answered with the modelled throttle. Every run happens on
-//! a thread of its own with no state guard of this service held, so one caller's handler
-//! cannot stall another caller's request.
+//! At most [`max_concurrent_runs`] handlers run at once, so the memory and CPU the
+//! engines can hold is bounded however many invocations arrive. That pool is a RESOURCE
+//! bound of this process and not a concurrency limit of the API: an invocation the
+//! function's reservation and the account's capacity admit is one Lambda SERVES, so a
+//! caller that finds every slot busy WAITS for one — for as long as [`PERMIT_WAIT`], which
+//! is the longest a run ahead of it can hold a slot — and only a pool still full after that
+//! is answered with the modelled throttle. Every run happens on a thread of its own with no
+//! state guard of this service held, so one caller's handler cannot stall another caller's
+//! request.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -114,11 +118,46 @@ mod host_posix;
 pub mod environment_key;
 pub use environment_key::{durable_data_key_fault, environment_key_fault, EnvironmentKeyFault};
 
-/// How many handlers run at once.
-pub const MAX_CONCURRENT_RUNS: usize = 4;
+/// The FEWEST handlers this emulator runs at once, however few threads of execution the
+/// host offers.
+///
+/// A pool smaller than this would serialise callers behind one another on a small host,
+/// and an invocation that arrives while others are in flight is one Lambda serves rather
+/// than queues behind the run ahead of it.
+pub const MIN_CONCURRENT_RUNS: usize = 4;
+
+/// The MOST handlers this emulator runs at once, however many threads of execution the host
+/// offers.
+///
+/// Each run holds an engine, a [`RUN_STACK_BYTES`] stack and up to [`MAX_RUN_MEMORY_BYTES`]
+/// of heap, so the pool is capped: what this process can hold at once stays bounded on a
+/// machine with very many cores.
+pub const MAX_CONCURRENT_RUNS_CEILING: usize = 16;
+
+/// How many handlers run at once: one per thread of execution the HOST offers, between
+/// [`MIN_CONCURRENT_RUNS`] and [`MAX_CONCURRENT_RUNS_CEILING`].
+///
+/// The pool is sized to the machine because it bounds this process's RESOURCES rather than
+/// the API's concurrency: the invocations a function's reservation and the account's
+/// capacity admit are the ones Lambda runs, so the emulator runs as many handlers at once
+/// as the host can really run at once, and a caller beyond that waits for a slot
+/// ([`PERMIT_WAIT`]) instead of being refused for load of this process's own making.
+#[must_use]
+pub fn max_concurrent_runs() -> usize {
+    ::std::thread::available_parallelism()
+        .map_or(MIN_CONCURRENT_RUNS, ::std::num::NonZeroUsize::get)
+        .clamp(MIN_CONCURRENT_RUNS, MAX_CONCURRENT_RUNS_CEILING)
+}
 
 /// How long an invocation waits for one of those slots before it is throttled.
-pub const PERMIT_WAIT: Duration = Duration::from_secs(5);
+///
+/// The longest a run AHEAD of it can hold a slot: a caller's wait for a run is bounded by
+/// [`HOST_WAIT_CEILING`], and a run still going when that wait is spent is abandoned
+/// [`ABANDON_GRACE`] later and hands its slot straight back. So within this span a slot is
+/// certain to come free, and waiting it out is what keeps this emulator's own pool from
+/// answering the modelled throttle where neither the function's reservation nor the
+/// account's capacity was reached.
+pub const PERMIT_WAIT: Duration = HOST_WAIT_CEILING.saturating_add(ABANDON_GRACE);
 
 /// The longest a CALLER waits for a run, whatever the function's own timeout says.
 ///
@@ -423,10 +462,11 @@ pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnabl
              budget. Retry the request."
         )));
     }
-    // One of the run slots, waited for only as long as [`PERMIT_WAIT`]: past that the
-    // caller is throttled rather than queueing behind other callers' handlers. Held until
-    // this invocation is answered, including when its run is abandoned — which is what
-    // puts the slot back at once.
+    // One of the run slots, waited for as long as [`PERMIT_WAIT`] — the longest a run
+    // ahead of this one can hold a slot — so a caller that arrives while the pool is busy
+    // is served once a handler ahead of it ends, and only a pool still full after that is
+    // answered the modelled throttle. Held until this invocation is answered, including
+    // when its run is abandoned — which is what puts the slot back at once.
     let permit = ::tokio::time::timeout(PERMIT_WAIT, Arc::clone(run_slots()).acquire_owned())
         .await
         .map_err(|_| {
@@ -1024,10 +1064,13 @@ const RUN_FINISHED: u8 = 1;
 /// A run the caller gave up on.
 const RUN_ABANDONED: u8 = 2;
 
-/// The run slots, shared by every invocation this process serves.
+/// The run slots, shared by every invocation this process serves: as many of them as the
+/// host can run handlers on at once ([`max_concurrent_runs`]), handed out in the order they
+/// were asked for, because the semaphore is fair — so a waiting caller is served rather
+/// than passed over by the callers arriving behind it.
 fn run_slots() -> &'static Arc<::tokio::sync::Semaphore> {
     static SLOTS: OnceLock<Arc<::tokio::sync::Semaphore>> = OnceLock::new();
-    SLOTS.get_or_init(|| Arc::new(::tokio::sync::Semaphore::new(MAX_CONCURRENT_RUNS)))
+    SLOTS.get_or_init(|| Arc::new(::tokio::sync::Semaphore::new(max_concurrent_runs())))
 }
 
 /// How many abandoned runs are outstanding.

@@ -23,7 +23,7 @@
 //!
 //! The suite RUNS a handler, so it takes the target's one invocation stream
 //! ([`crate::invoke_request_id::one_invocation_stream_at_a_time`]): this emulator serves at
-//! most `MAX_CONCURRENT_RUNS` invocations at once for the whole process.
+//! most `max_concurrent_runs` invocations at once for the whole process.
 
 use std::sync::Arc;
 

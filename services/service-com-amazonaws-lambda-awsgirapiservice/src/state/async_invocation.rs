@@ -122,7 +122,7 @@ pub const MAX_QUEUED_ASYNC_INVOCATIONS: usize = 100;
 /// tasks — and the payloads they hold — bounded by the emulator rather than by the request
 /// rate. It is above [`MAX_QUEUED_ASYNC_INVOCATIONS`], so a function's whole queue can be in
 /// flight, and well above the handlers that can RUN at once
-/// ([`super::execution::MAX_CONCURRENT_RUNS`]), so a burst waits on the run slots rather than
+/// ([`super::execution::max_concurrent_runs`]), so a burst waits on the run slots rather than
 /// being dropped here.
 pub const MAX_IN_FLIGHT_DELIVERIES: usize = 256;
 

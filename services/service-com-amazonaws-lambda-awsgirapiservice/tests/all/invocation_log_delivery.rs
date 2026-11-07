@@ -27,7 +27,7 @@
 //!
 //! Every test here RUNS handlers, so each takes the target's one invocation stream
 //! ([`crate::invoke_request_id::one_invocation_stream_at_a_time`]): this emulator serves at
-//! most `MAX_CONCURRENT_RUNS` invocations at once for the whole process, and a suite that
+//! most `max_concurrent_runs` invocations at once for the whole process, and a suite that
 //! keeps several of those slots busy starves every other suite's runs.
 
 use std::sync::Arc;

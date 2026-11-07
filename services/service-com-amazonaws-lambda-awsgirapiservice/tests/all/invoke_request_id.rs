@@ -52,7 +52,7 @@ const SLACK: Duration = Duration::from_millis(150);
 /// It bounds the WALL CLOCK one run may spend (`state::execution::run_budget`), and the
 /// handlers here return at once, so what it has to cover is not their work but the host's
 /// own scheduling: this target runs its suites in parallel over
-/// `state::execution::MAX_CONCURRENT_RUNS` run slots, so a run can sit mid-flight while
+/// `state::execution::max_concurrent_runs` run slots, so a run can sit mid-flight while
 /// other suites' runs hold the CPU, and a value with no headroom would end such a run on
 /// its deadline and answer a failure document instead of the handler's value — a failure
 /// of the host's load rather than of the rule under test. Kept under
@@ -129,7 +129,7 @@ fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 /// Taken by every suite of this target that RUNS handlers for the rules of this issue, for as
 /// long as it is running them.
 ///
-/// This emulator serves at most `state::execution::MAX_CONCURRENT_RUNS` invocations at once
+/// This emulator serves at most `state::execution::max_concurrent_runs` invocations at once
 /// FOR THE WHOLE PROCESS, and this target runs its tests in parallel: a suite that keeps
 /// several of those slots busy starves every other suite's invocations until its own runs
 /// end. Holding this lock makes these suites one stream of invocations rather than ten, so
@@ -267,7 +267,7 @@ const HOST_STOP_ATTEMPTS: usize = 4;
 /// The handlers this suite runs allocate nothing and return at once, so no row of it can ask
 /// for an answer like that: the memory bound a run is stopped on is read from the WHOLE
 /// process (`state/execution/python.rs`), and this target runs its suites in parallel over
-/// `state::execution::MAX_CONCURRENT_RUNS` run slots, so a trivial run can be stopped for
+/// `state::execution::max_concurrent_runs` run slots, so a trivial run can be stopped for
 /// memory another suite holds. Such an answer is not an answer to the request the row made,
 /// so the request is made again — a bounded number of times, and the last answer is returned
 /// whatever it is, so a run that really failed still fails the row.

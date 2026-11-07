@@ -213,6 +213,8 @@ mod invocation_log_delivery;
 mod invocation_log_group_search;
 #[path = "all/invocation_refusal_diagnostics.rs"]
 mod invocation_refusal_diagnostics;
+#[path = "all/invocation_run_capacity.rs"]
+mod invocation_run_capacity;
 #[path = "all/invoke_addressed_function.rs"]
 mod invoke_addressed_function;
 #[path = "all/invoke_function_error_document.rs"]

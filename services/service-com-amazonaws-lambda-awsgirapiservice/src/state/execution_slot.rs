@@ -169,13 +169,12 @@ pub fn admit_invocation(
     };
     // "The number of simultaneous executions to reserve for the function": the invocation is
     // admitted only while the function is processing fewer than that, and a function that
-    // reserves nothing is bounded by the account's capacity instead — which in this emulator
-    // is the pool of run slots the execution substrate holds
-    // (`super::execution::MAX_CONCURRENT_RUNS`), far below the account ceiling
-    // (`super::CONCURRENT_EXECUTIONS_LIMIT`), and answers the same modelled throttle when it
-    // is full. So the account-level `ConcurrentInvocationLimitExceeded` reason is not one this
-    // admission produces: no run of this emulator reaches the account ceiling to be refused
-    // on it.
+    // reserves nothing is bounded by the account's capacity instead — which no run of this
+    // emulator reaches (`super::CONCURRENT_EXECUTIONS_LIMIT`), so the account-level
+    // `ConcurrentInvocationLimitExceeded` reason is not one this admission produces. How many
+    // handlers EXECUTE at once is a separate, host-sized bound
+    // (`super::execution::max_concurrent_runs`): it makes an admitted caller wait for an
+    // execution environment rather than refusing it, so it is no limit of the API.
     if let Some(reserved) = record.reserved_concurrent_executions {
         if record.concurrent_executions >= reserved {
             return Err(Throttled {

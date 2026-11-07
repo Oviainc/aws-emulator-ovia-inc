@@ -7,17 +7,21 @@
 //! structured record on the service's audit target, naming the operation, the
 //! access key id the request presented, the resource it changed and how the call
 //! came out — and a call that changes nothing (a read, or a refused write)
-//! leaves none. Each case installs a capturing `tracing` subscriber scoped to
-//! the calling thread, drives the operations through the real router, and
-//! asserts over the records that come out; nothing is written to disk and no
-//! global subscriber is installed.
+//! leaves none. Each case captures the records its own thread writes, drives the
+//! operations through the real router, and asserts over the records that come
+//! out; nothing is written to disk.
+//!
+//! The subscriber doing the capturing is this binary's ONE global default,
+//! installed on first use ([`capture_events`]), and what scopes a case to its own
+//! records is the per-thread buffer that subscriber hands them to.
 //!
 //! The table spans what the rule generalises over: which operation ran, whether
 //! the write created, replaced, removed or left the record as it was, and
 //! whether the call succeeded or was refused.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::json;
 use service_com_amazonaws_s3tables_s3tablebuckets as s3tables;
@@ -73,8 +77,7 @@ impl Visit for FieldCollector<'_> {
     }
 }
 
-/// A `tracing` subscriber that keeps every event it is handed, so a case can
-/// read the audit records back.
+/// The buffer one case's records are kept in, so it can read them back.
 #[derive(Clone, Default)]
 struct Capture {
     events: Arc<Mutex<Vec<CapturedEvent>>>,
@@ -116,9 +119,33 @@ impl Capture {
              record, captured {records:?}"
         );
     }
+
+    /// Keep `event`, with its fields rendered as strings.
+    fn event(&self, event: &Event<'_>) {
+        let mut fields = BTreeMap::new();
+        event.record(&mut FieldCollector(&mut fields));
+        self.events
+            .lock()
+            .expect("the capture buffer")
+            .push(CapturedEvent {
+                target: event.metadata().target().to_string(),
+                fields,
+            });
+    }
 }
 
-impl Subscriber for Capture {
+thread_local! {
+    /// The buffer the calling thread is capturing into, for as long as it holds a
+    /// [`CaptureGuard`]; `None` on every thread that is not capturing, whose
+    /// events are dropped.
+    static CAPTURING: RefCell<Option<Capture>> = const { RefCell::new(None) };
+}
+
+/// The subscriber this binary installs: it hands every event to the buffer the
+/// thread that emitted it is capturing into.
+struct ThreadCapture;
+
+impl Subscriber for ThreadCapture {
     fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
         true
     }
@@ -134,15 +161,15 @@ impl Subscriber for Capture {
     fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
 
     fn event(&self, event: &Event<'_>) {
-        let mut fields = BTreeMap::new();
-        event.record(&mut FieldCollector(&mut fields));
-        self.events
-            .lock()
-            .expect("the capture buffer")
-            .push(CapturedEvent {
-                target: event.metadata().target().to_string(),
-                fields,
-            });
+        CAPTURING.with(|capturing| {
+            let Ok(held) = capturing.try_borrow() else {
+                return;
+            };
+            let Some(capture) = held.as_ref() else {
+                return;
+            };
+            capture.event(event);
+        });
     }
 
     fn enter(&self, _span: &Id) {}
@@ -151,10 +178,35 @@ impl Subscriber for Capture {
 }
 
 /// Capture this thread's `tracing` events for the life of the returned guard.
-fn capture_events() -> (Capture, tracing::subscriber::DefaultGuard) {
+///
+/// The subscriber is installed ONCE, as this binary's global default, rather than
+/// scoped to the calling thread: `tracing` caches PER CALLSITE, for the whole
+/// process, whether any subscriber is interested in it, and recomputes that cache
+/// from the subscribers registered at the moment a callsite is first used. The
+/// suites of this binary run in parallel, so a record written for the first time
+/// by a sibling suite's call — on a thread holding no subscriber of its own —
+/// would cache its callsite as uninteresting and go unseen here ever after. One
+/// subscriber for the life of the binary leaves that cache interested whatever
+/// order the suites run in, and the per-thread buffer is what keeps one case's
+/// records out of another's assertions.
+fn capture_events() -> (Capture, CaptureGuard) {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        tracing::subscriber::set_global_default(ThreadCapture)
+            .expect("this module is the only installer of a global tracing subscriber");
+    });
     let capture = Capture::default();
-    let guard = tracing::subscriber::set_default(capture.clone());
-    (capture, guard)
+    CAPTURING.with(|capturing| *capturing.borrow_mut() = Some(capture.clone()));
+    (capture, CaptureGuard)
+}
+
+/// Stops the calling thread capturing when the case that started it ends.
+struct CaptureGuard;
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        CAPTURING.with(|capturing| *capturing.borrow_mut() = None);
+    }
 }
 
 /// Assert the shape every audit record of this service shares: the operation,
