@@ -265,7 +265,9 @@ pub const CLIENT_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// is the most pairs any response can carry: a resource holding more could not
 /// be reported. AWS enforces a tag quota of its own, which may differ; a write
 /// past this ceiling is refused with the modelled `ValidationException` naming
-/// the bound, since `TagResource` models no quota error.
+/// the bound, since `TagResource` models no quota error. The ceiling being that
+/// `@length` maximum is why the refusal is a CONSTRAINT clause for it
+/// ([`check_tag_count`]) rather than a sentence of this service's own.
 pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 
 /// The tag-key prefix AWS keeps for the tags it applies itself.
@@ -853,6 +855,51 @@ pub fn check_tag_keys<'a>(
         )),
         None => Ok(()),
     }
+}
+
+/// How a clause ECHOES a map whose ENTRY COUNT is what broke a bound: the
+/// rendering the framework's own validating walk writes into a clause for a
+/// map past its `@length` (`<n> entries`, beside a list's `<n> items`), so a
+/// count this service refuses reads exactly like one the boundary validator
+/// refuses. A map has no scalar spelling, so the count is the value — there is
+/// nothing of the caller's own text to echo.
+fn echoed_entries(count: usize) -> String {
+    format!("{count} entries")
+}
+
+/// Refuse a tag map that would leave a resource carrying more pairs than
+/// [`MAX_TAGS_PER_RESOURCE`], for every operation that MERGES tags into a
+/// resource the store already holds (`TagResource`).
+///
+/// `map_path` is where the request's tag map sat, and `stored` is the map that
+/// resource already carries: the ceiling bounds what the resource WILL carry, so
+/// the count judged is the MERGED set's — the pairs already stored plus each
+/// requested key the resource does not carry yet. A caller that only overwrites
+/// keys the resource already holds adds nothing, so it is never refused.
+///
+/// `Err` carries the clause for the bound, built through the shared renderer
+/// like every other refusal this service authors: the ceiling's value IS the
+/// modelled `TagMap`'s own `@length` maximum, so what the clause states is that
+/// maximum, in the framework's own wording for a collection past one
+/// ([`stated_violation`]), and cannot drift from how any other bound is worded.
+pub fn check_tag_count<'a>(
+    map_path: &str,
+    stored: &BTreeMap<String, String>,
+    requested: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    let added = requested
+        .into_iter()
+        .filter(|key| !stored.contains_key(*key))
+        .count();
+    let merged = stored.len() + added;
+    if merged > MAX_TAGS_PER_RESOURCE {
+        return Err(stated_violation(
+            map_path,
+            Some(&echoed_entries(merged)),
+            ViolationKind::MaxLength(i64::try_from(MAX_TAGS_PER_RESOURCE).unwrap_or(i64::MAX)),
+        ));
+    }
+    Ok(())
 }
 
 /// What the service states when an `aggregationPeriod` is outside the documented

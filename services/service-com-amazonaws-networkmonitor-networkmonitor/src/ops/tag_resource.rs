@@ -29,6 +29,13 @@
 //! `ValidationException` ([`crate::state::check_tag_keys`]) and stores none of
 //! the pairs it carried.
 //!
+//! The pairs the resource would be left carrying are bounded by the modelled
+//! `TagMap`'s own maximum ([`crate::state::MAX_TAGS_PER_RESOURCE`]), applied to
+//! the MERGED set this write would store, so a write past it is refused with
+//! that same modelled 400 `ValidationException` — stated as the constraint
+//! clause for the bound ([`crate::state::check_tag_count`]) — and stores none
+//! of the pairs it carried either.
+//!
 //! The write reports nothing back, so a success is answered with the no-content
 //! status ([`crate::state::TAG_MUTATION_SUCCESS_STATUS`]) rather than the
 //! model's defaulted 200.
@@ -240,21 +247,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The merged set is what the resource will carry, so it is the set the
         // modelled `TagMap` bound applies to — checked before anything is
-        // written, so a refused call stores none of the pairs it carried.
-        let merged_len = tags.len()
-            + input
-                .tags
-                .keys()
-                .filter(|key| !tags.contains_key(*key))
-                .count();
-        if merged_len > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(validation(format!(
-                "a monitor or probe keeps at most {} tags in this emulator; tagging {} with these keys would give it {}",
-                crate::state::MAX_TAGS_PER_RESOURCE,
-                input.resource_arn,
-                merged_len
-            )));
-        }
+        // written, so a refused call stores none of the pairs it carried. The
+        // bound is a MODELLED constraint this handler applies itself, so the
+        // refusal is stated through the shared clause renderer, exactly like the
+        // reserved-key refusal above.
+        crate::state::check_tag_count(
+            &crate::state::member_path("tags"),
+            tags,
+            input.tags.keys().map(String::as_str),
+        )
+        .map_err(validation)?;
 
         // Add or overwrite the named keys, in place: a key the request does not
         // name keeps the value it had, which is what makes two tag writes of

@@ -61,6 +61,8 @@ mod reserved_tag_keys;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_count_ceiling_refusal.rs"]
+mod tag_count_ceiling_refusal;
 #[path = "all/tag_mutation_no_content.rs"]
 mod tag_mutation_no_content;
 #[path = "all/tagging.rs"]
