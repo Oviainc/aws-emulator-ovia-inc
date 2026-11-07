@@ -504,6 +504,78 @@ pub fn tag_map(
     })
 }
 
+/// Render a stored FILTER's tag map for the wire: always PRESENT, and empty when the
+/// filter holds no tags at all.
+///
+/// A filter's tag set is reported unconditionally, so the shape of a filter in a response
+/// never depends on whether tags were set: a filter created without tags and one created
+/// with an empty map both report an empty map, and a client reading the tag set
+/// unconditionally never meets an absent member. That is why this is NOT [`tag_map`],
+/// which leaves the member out for the resources that report tags only when they have
+/// them.
+///
+/// Source: `smithy_query(query="shape", shape="Filter")` — `tags` targets `TagMap`.
+pub fn filter_tag_map(
+    tags: Option<&BTreeMap<String, String>>,
+) -> ::std::collections::HashMap<String, String> {
+    tag_map(tags).unwrap_or_default()
+}
+
+/// Whether `value` is a well-formed filter ARN of this service — the SHAPE check every
+/// operation that takes a `FilterArn` naming a filter applies before it looks the filter
+/// up, so a value that could not name any filter is refused as invalid input instead of
+/// being reported as a missing resource.
+///
+/// Well-formed means a resource ARN of this service's namespace
+/// (`::service_common::arn`, the one ARN parse) that carries a region and an account and
+/// whose resource is `owner/<owner>/filter/<id>` — the form
+/// [`ComAmazonawsInspector2Inspector2State::mint_filter_arn`] mints. An ARN may leave its
+/// region or account empty in general (a partition-global resource), but a filter is
+/// regional and account-owned, so neither is empty in one of its ARNs.
+///
+/// The resource form is the one this service's OTHER resource ARNs state as a modelled
+/// `@pattern` — `owner/(o-<org>|<account>)/<resource type>/<id>`; `FilterArn` is the shape
+/// that carries no pattern, which is why the check lives here instead of at the request
+/// boundary.
+/// Source: `smithy_query(query="shape",
+/// shape="FilterArn,CisScanConfigurationArn,ScanConfigurationArn")`.
+///
+/// The identity of the partition, region, account, owner and id is deliberately NOT
+/// checked: whether a well-formed ARN names a stored filter is the store's answer, not the
+/// shape's.
+pub fn is_filter_arn(value: &str) -> bool {
+    let Some(arn) = ::service_common::arn::parse_of(value, SERVICE_NAMESPACE) else {
+        return false;
+    };
+    if arn.region.is_empty() || arn.account.is_empty() {
+        return false;
+    }
+    // Everything the resource field carries after its `owner` type, which is the owner the
+    // filter belongs to and then the filter itself.
+    let Some(owned) = ::service_common::arn::resource_id_of_type(value, "owner") else {
+        return false;
+    };
+    let mut segments = owned.splitn(3, '/');
+    matches!(
+        (segments.next(), segments.next(), segments.next()),
+        (Some(owner), Some("filter"), Some(id))
+            if !owner.is_empty() && !id.is_empty() && !id.contains(['/', ':'])
+    )
+}
+
+/// How this service words its refusal of a `filterArn`/`arn` member that is not a
+/// well-formed filter ARN ([`is_filter_arn`]), so every operation that takes one refuses
+/// it the same way. The value is echoed exactly as the request sent it.
+pub fn invalid_filter_arn_message(value: &str) -> String {
+    format!("Invalid Filter Arn {value}")
+}
+
+/// The `ValidationExceptionReason` token for a request whose member carried a value the
+/// service rejects: the field itself failed validation.
+/// Source: `smithy_query(query="shape", shape="ValidationExceptionReason")` —
+/// `CANNOT_PARSE | FIELD_VALIDATION_FAILED | OTHER`.
+pub const VALIDATION_FIELD_FAILED: &str = "FIELD_VALIDATION_FAILED";
+
 /// The scope one encryption-key setting belongs to: a `ResourceType` token and a
 /// `ScanType` token, in that order, so iteration groups a resource type's settings
 /// together.

@@ -366,7 +366,7 @@ async fn created_filters_round_trip_through_list_filters() {
             filter["criteria"], request["filterCriteria"],
             "case {name}: criteria must survive the round trip: {filter}"
         );
-        for member in ["description", "reason", "tags"] {
+        for member in ["description", "reason"] {
             let sent = request.get(member).cloned().unwrap_or(Value::Null);
             let got = filter.get(member).cloned().unwrap_or(Value::Null);
             assert_eq!(
@@ -374,6 +374,14 @@ async fn created_filters_round_trip_through_list_filters() {
                 "case {name}: {member} must be stored as sent (sent {sent}, got {got})"
             );
         }
+        // `tags` is always reported, so a filter created without tags reports an empty
+        // map rather than leaving the member out (see `filter_tags_are_always_reported`).
+        let sent_tags = request.get("tags").cloned().unwrap_or_else(|| json!({}));
+        let got_tags = filter.get("tags").cloned().unwrap_or(Value::Null);
+        assert_eq!(
+            got_tags, sent_tags,
+            "case {name}: tags must be reported as stored (sent {sent_tags}, got {got_tags})"
+        );
         assert!(
             filter["createdAt"].is_number() && filter["updatedAt"].is_number(),
             "case {name}: createdAt/updatedAt must be timestamps, got {filter}"
@@ -770,15 +778,21 @@ async fn unknown_filter_arns_are_not_found() {
         "a deleted filter must be gone from ListFilters, got {listed}"
     );
 
-    // Rows: the ARN of a filter that was deleted, a syntactically valid ARN that was
-    // never minted, and a value that is no ARN at all.
+    // Rows: the ARN of a filter that was deleted, and a well-formed ARN that was never
+    // minted. A value that is not a well-formed filter ARN at all is a 400
+    // `ValidationException` instead, which `malformed_filter_arns_are_refused_as_invalid`
+    // covers.
     let unknown = [
         ("already deleted", arn.clone()),
         (
             "never minted",
             format!("arn:aws:inspector2:us-east-1:{ACCOUNT}:owner/{ACCOUNT}/filter/deadbeef"),
         ),
-        ("not an arn", "nonsense".to_string()),
+        (
+            "another account's",
+            "arn:aws:inspector2:us-east-1:111122223333:owner/111122223333/filter/0123456789abcdef"
+                .to_string(),
+        ),
     ];
     for (case, candidate) in unknown {
         let (status, error_type, body) = post_in(
@@ -1010,17 +1024,23 @@ async fn remembered_client_tokens_are_bounded() {
     );
 }
 
-/// A filter's `tags` member round-trips as sent: absent when the request carried none,
-/// an empty map when it carried an empty one, and the entries when it carried entries.
+/// A filter's stored tags round-trip through `ListFilters`: the entries it was created
+/// with, and an EMPTY map when it was created with none or with an empty one — the member
+/// is never left out. The table over presence and size lives in
+/// `filter_tags_are_always_reported`; this row set only pins the round trip.
 #[tokio::test]
 async fn filter_tags_round_trip_as_sent() {
-    let cases: [(&str, Value); 3] = [
-        ("absent", Value::Null),
-        ("empty map", json!({})),
-        ("one entry", json!({ "team": "appsec" })),
+    let cases: [(&str, Value, Value); 3] = [
+        ("absent", Value::Null, json!({})),
+        ("empty map", json!({}), json!({})),
+        (
+            "one entry",
+            json!({ "team": "appsec" }),
+            json!({ "team": "appsec" }),
+        ),
     ];
 
-    for (case, tags) in cases {
+    for (case, tags, expected) in cases {
         let router = router();
         let mut request = json!({
             "action": "NONE",
@@ -1043,8 +1063,9 @@ async fn filter_tags_round_trip_as_sent() {
             .cloned()
             .unwrap_or(Value::Null);
         assert_eq!(
-            got, tags,
-            "case {case}: tags must read back as sent (sent {tags}, got {got})"
+            got, expected,
+            "case {case}: tags must read back as stored (sent {tags}, expected {expected}, \
+             got {got})"
         );
     }
 }

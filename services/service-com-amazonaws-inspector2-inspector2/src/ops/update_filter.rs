@@ -157,6 +157,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The ARN's SHAPE is checked before the store is consulted: a value that could
+        // not name any filter is invalid input, not a missing resource, so it is refused
+        // with the operation's own `ValidationException` rather than reported as a 404.
+        if !crate::state::is_filter_arn(&input.filter_arn) {
+            return Err(UpdateFilterErrorModeled::ValidationException(ValidationException {
+                message: crate::state::invalid_filter_arn_message(&input.filter_arn),
+                reason: crate::state::VALIDATION_FIELD_FAILED.to_string(),
+                fields: None,
+            })
+            .into());
+        }
+
         let mut guard = state.lock();
         let stored = guard.filters.get_mut(&input.filter_arn).ok_or_else(|| {
             UpdateFilterErrorModeled::ResourceNotFoundException(ResourceNotFoundException {

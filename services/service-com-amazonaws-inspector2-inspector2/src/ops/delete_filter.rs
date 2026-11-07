@@ -151,6 +151,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The ARN's SHAPE is checked before the store is consulted, for the same reason
+        // it is in `UpdateFilter`: a value that could not name any filter is invalid
+        // input, not a missing resource.
+        if !crate::state::is_filter_arn(&input.arn) {
+            return Err(DeleteFilterErrorModeled::ValidationException(ValidationException {
+                message: crate::state::invalid_filter_arn_message(&input.arn),
+                reason: crate::state::VALIDATION_FIELD_FAILED.to_string(),
+                fields: None,
+            })
+            .into());
+        }
+
         let mut guard = state.lock();
         // `remove` is what makes a second delete of the same ARN a 404: the record is
         // gone, so the lookup that reports it cannot find it either.

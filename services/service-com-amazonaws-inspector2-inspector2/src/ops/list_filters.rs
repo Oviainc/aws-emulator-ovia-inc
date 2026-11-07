@@ -258,13 +258,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 updated_at: crate::state::timestamp(stored.updated_at),
                 description: stored.description.clone(),
                 reason: stored.reason.clone(),
-                // Rendered exactly as stored: absent when the request carried no `tags`,
-                // and an empty map when it carried an empty one.
-                tags: stored.tags.as_ref().map(|tags| {
-                    tags.iter()
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect()
-                }),
+                // Always present, and EMPTY when the filter holds no tags, so the shape
+                // of a listed filter never depends on whether tags were set.
+                tags: Some(crate::state::filter_tag_map(stored.tags.as_ref())),
             })
             .collect();
 
