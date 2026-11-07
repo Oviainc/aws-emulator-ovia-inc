@@ -30,9 +30,11 @@
 //! taken against the key policy, caller identity policies and grants KMS's and IAM's
 //! handlers wrote and under the encryption context the value is bound to, with
 //! `kms:ViaService` naming this service's endpoint — so a key policy that grants a
-//! role only `kms:Decrypt` lets that role read the secret and refuses its write, and
-//! the refusal a caller sees is the sentence KMS itself words for it, relayed like
-//! any other KMS refusal.
+//! role only `kms:Decrypt` lets that role read the secret and refuses its write. Such
+//! a refusal is NOT relayed, unlike every other KMS refusal here: the operation is
+//! answered `AccessDeniedException` carrying this service's own sentence for it
+//! ([`KMS_ACCESS_DENIED_MESSAGE`]), which states nothing about the principal, the
+//! action or the key — the access the operation needed was simply not allowed.
 //!
 //! A secret left on the service-managed key names no key a caller can act on — it
 //! cannot be disabled, scheduled for deletion or deleted — so there is no refusal
@@ -90,6 +92,19 @@ pub const DECRYPTION_FAILURE_MESSAGE: &str =
 pub const ENCRYPTION_FAILURE_MESSAGE: &str =
     "Secrets Manager can't encrypt the protected secret text using the provided KMS \
      key. Check that the KMS key is available, enabled, and not in an invalid state.";
+
+/// The `Message` of the `AccessDeniedException` an operation is refused with when the
+/// KMS call this service makes on the caller's behalf is refused for want of authority
+/// on the secret's key: "Access to KMS is not allowed".
+///
+/// This sentence is Secrets Manager's OWN, and it is the whole message: it names no
+/// principal, no action and no key, and it carries nothing of the answer KMS gave. The
+/// cryptographic call is one this service makes, so what KMS told THIS SERVICE about the
+/// authority behind it is not told to the caller; all the caller is told is that the
+/// access to KMS the operation needed was not allowed. It is the same sentence whichever
+/// cryptographic action the key withheld, so a read and a write of a secret under a key
+/// the caller cannot use are refused alike.
+pub const KMS_ACCESS_DENIED_MESSAGE: &str = "Access to KMS is not allowed";
 
 /// The service name the relayed KMS refusal names itself by, which is KMS's own in
 /// the wrapped failure Secrets Manager relays.
@@ -317,11 +332,11 @@ pub struct KmsRefusal {
     /// The KMS refusal to relay, when KMS answered with one; `None` when KMS did not
     /// answer at all, which is nothing to report about the key.
     relayed: Option<String>,
-    /// The sentence KMS worded for a refusal that was an AUTHORIZATION decision about
-    /// the key — no authority in force reaches the cryptographic operation for this
-    /// caller — which this service answers as the common `AccessDeniedException`
-    /// carrying that sentence, rather than as a failure to encrypt or decrypt.
-    denied: Option<String>,
+    /// Whether the refusal was an AUTHORIZATION decision about the key — no authority in
+    /// force reaches the cryptographic operation for this caller — which this service
+    /// answers as the common `AccessDeniedException`, rather than as a failure to encrypt
+    /// or decrypt.
+    denied: bool,
 }
 
 impl KmsRefusal {
@@ -329,7 +344,7 @@ impl KmsRefusal {
     fn unrelayed() -> Self {
         Self {
             relayed: None,
-            denied: None,
+            denied: false,
         }
     }
 
@@ -347,12 +362,13 @@ impl KmsRefusal {
     /// the call failed for a reason that is not one.
     ///
     /// A caller whose authority does not reach the cryptographic operation on the secret's
-    /// key is NOT AUTHORIZED, which is the IAM layer's own refusal rather than a failure of
-    /// the service to encrypt or decrypt: the operation is answered with the common
-    /// `AccessDeniedException`, carrying the sentence KMS worded about the action and the
-    /// key — so the caller is told which permission on which key it is missing.
-    pub fn denied_message(&self) -> Option<&str> {
-        self.denied.as_deref()
+    /// key is NOT AUTHORIZED, which is a refusal of the ACCESS the operation needed rather
+    /// than a failure of the service to encrypt or decrypt: the operation is answered with
+    /// the common `AccessDeniedException` carrying this service's own sentence for that
+    /// class ([`KMS_ACCESS_DENIED_MESSAGE`]), the same one whichever action the key
+    /// withheld and whichever operation needed it.
+    pub fn denied_message(&self) -> Option<&'static str> {
+        self.denied.then_some(KMS_ACCESS_DENIED_MESSAGE)
     }
 
     /// Whether KMS STATED this refusal, so what it says about the key is the key's own
@@ -361,22 +377,22 @@ impl KmsRefusal {
         self.relayed.is_some()
     }
 
-    /// An AUTHORIZATION refusal of the key: the sentence KMS worded for the action it
-    /// withheld, which this service answers as the common `AccessDeniedException` rather
-    /// than as a failure to encrypt or decrypt ([`Self::denied_message`]).
+    /// An AUTHORIZATION refusal of the key, which this service answers as the common
+    /// `AccessDeniedException` rather than as a failure to encrypt or decrypt
+    /// ([`Self::denied_message`]).
     ///
-    /// The sentence is relayed as every other KMS refusal this service wraps is — the
-    /// message KMS stated, then the clause naming the service, the status and the code it
-    /// was stated under — because what the caller is told is the answer this service's own
-    /// call to KMS met.
+    /// `message` is the sentence KMS worded for the action it withheld, kept as the
+    /// refusal this call MET — relayed as every other KMS refusal this service wraps is,
+    /// so a path that reports what the key could not do (a replica's status, say) reports
+    /// it — while the answer to the caller stays this service's own sentence for the
+    /// class.
     fn denied(message: &str) -> Self {
-        let relayed = format!(
-            "{message} {}",
-            relay_clause(ACCESS_DENIED_CODE, KMS_CLIENT_STATUS, None)
-        );
         Self {
-            denied: Some(relayed.clone()),
-            relayed: Some(relayed),
+            denied: true,
+            relayed: Some(format!(
+                "{message} {}",
+                relay_clause(ACCESS_DENIED_CODE, KMS_CLIENT_STATUS, None)
+            )),
         }
     }
 
@@ -696,11 +712,10 @@ fn call_failure<E: ProvideErrorMetadata + ::std::error::Error + 'static>(
         None => clause,
     };
     CallFailure::Failed(KmsRefusal {
-        relayed: Some(wrapped.clone()),
+        relayed: Some(wrapped),
         // A refusal KMS stated under its access-denied code is an AUTHORIZATION decision
-        // about the key, whoever the call was made for, so it is answered as one: the
-        // answer KMS gave, relayed as it stands.
-        denied: (code == Some(ACCESS_DENIED_CODE)).then_some(wrapped),
+        // about the key, whoever the call was made for, so it is answered as one.
+        denied: code == Some(ACCESS_DENIED_CODE),
     })
 }
 

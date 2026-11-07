@@ -363,8 +363,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The error this entry reports is the one the read of that secret
                 // alone would have been refused with: a caller whose authority does
                 // not reach `kms:Decrypt` on that secret's key is NOT AUTHORIZED,
-                // which is the common `AccessDeniedException` carrying the sentence
-                // KMS worded, and every other refusal is this service's own
+                // which is the common `AccessDeniedException` carrying this service's
+                // own sentence for it, and every other refusal is this service's own
                 // `DecryptionFailure` relaying the KMS refusal it met.
                 Err(refusal) => errors.push(match refusal.denied_message() {
                     Some(denied) => APIErrorType {

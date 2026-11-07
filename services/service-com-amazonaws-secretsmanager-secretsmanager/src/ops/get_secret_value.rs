@@ -359,8 +359,10 @@ struct Resolved {
 /// How a read the secret's KMS key refused is answered.
 ///
 /// A caller whose authority does not reach `kms:Decrypt` on that key is NOT AUTHORIZED,
-/// which the IAM layer refuses ahead of this service's own answer: the refusal is the common
-/// `AccessDeniedException` carrying the sentence KMS worded for the action and the key. Every
+/// which is a refusal of the ACCESS this read needed rather than a failure to decrypt: the
+/// refusal is the common `AccessDeniedException` carrying this service's own sentence for
+/// that class ([`crate::state::envelope::KMS_ACCESS_DENIED_MESSAGE`]), which states nothing
+/// about the key or the action. Every
 /// other refusal is `DecryptionFailure` — "Secrets Manager can't decrypt the protected secret
 /// text using the provided KMS key." — relaying the KMS refusal it met (see
 /// [`crate::state::envelope::KmsRefusal`]).

@@ -628,10 +628,11 @@ async fn reseal_staged<Eng: Send + Sync + 'static>(
 /// version's key refused is answered.
 ///
 /// A caller whose authority does not reach `kms:Decrypt` on that key is NOT AUTHORIZED,
-/// which the IAM layer refuses ahead of this service's own answer: the refusal is the common
-/// `AccessDeniedException` carrying the sentence KMS worded for the action and the key. Every
-/// other refusal is `DecryptionFailure` — "Secrets Manager can't decrypt the protected secret
-/// text using the provided KMS key." — relaying the KMS refusal it met (see
+/// which is a refusal of the ACCESS this update needed rather than a failure to decrypt: the
+/// common `AccessDeniedException` carrying this service's own sentence for it
+/// ([`crate::state::envelope::KMS_ACCESS_DENIED_MESSAGE`]). Every other refusal is
+/// `DecryptionFailure` — "Secrets Manager can't decrypt the protected secret text using the
+/// provided KMS key." — relaying the KMS refusal it met (see
 /// [`crate::state::envelope::KmsRefusal`]).
 fn decryption_failure(refusal: crate::state::envelope::KmsRefusal) -> UpdateSecretError {
     if let Some(denied) = refusal.denied_message() {
@@ -644,8 +645,9 @@ fn decryption_failure(refusal: crate::state::envelope::KmsRefusal) -> UpdateSecr
 }
 
 /// How a write the secret's KMS key refused is answered, which is the mirror of
-/// [`decryption_failure`]: the common `AccessDeniedException` for a caller whose authority
-/// does not reach `kms:GenerateDataKey` on the key, and `EncryptionFailure` otherwise.
+/// [`decryption_failure`]: the common `AccessDeniedException`, carrying the same sentence,
+/// for a caller whose authority does not reach `kms:GenerateDataKey` on the key, and
+/// `EncryptionFailure` otherwise.
 fn encryption_failure(refusal: crate::state::envelope::KmsRefusal) -> UpdateSecretError {
     if let Some(denied) = refusal.denied_message() {
         return crate::scaffolded::AccessDeniedException::new(denied).into();

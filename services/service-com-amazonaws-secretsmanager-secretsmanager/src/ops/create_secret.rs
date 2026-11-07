@@ -706,9 +706,9 @@ fn already_exists(name: &str) -> CreateSecretError {
 /// modelled `EncryptionFailure` for a value this service could not encrypt.
 fn encryption_failure(refusal: crate::state::envelope::KmsRefusal) -> CreateSecretError {
     // A caller whose authority does not reach `kms:GenerateDataKey` on the key is NOT
-    // AUTHORIZED, which the IAM layer refuses ahead of this service's own answer: the
-    // refusal is the common `AccessDeniedException` carrying the sentence KMS worded for
-    // the action and the key.
+    // AUTHORIZED, which is a refusal of the ACCESS this create needed rather than a
+    // failure to encrypt: the common `AccessDeniedException` carrying this service's own
+    // sentence for it (`crate::state::envelope::KMS_ACCESS_DENIED_MESSAGE`).
     if let Some(denied) = refusal.denied_message() {
         return crate::scaffolded::AccessDeniedException::new(denied).into();
     }

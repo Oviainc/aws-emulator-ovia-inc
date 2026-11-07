@@ -68,13 +68,13 @@ const RELAY_TAIL: &str = "; Proxy: null)";
 /// `Clone` shares that one router and that one engine, so a concurrency case can
 /// hand a copy to each task and every request still reaches the same store.
 #[derive(Clone)]
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::build(true)
     }
 
@@ -132,7 +132,7 @@ impl Emulator {
     }
 
     /// One Secrets Manager operation.
-    async fn sm(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn sm(&self, operation: &str, body: &Value) -> (u16, Value) {
         // A write that stores a value creates a version the caller has to name;
         // see `secret_client_request_token::with_staked_version`.
         let body = crate::secret_client_request_token::with_staked_version(operation, body);
@@ -141,7 +141,7 @@ impl Emulator {
     }
 
     /// One Secrets Manager operation that must succeed.
-    async fn sm_ok(&self, operation: &str, body: &Value, case: &str) -> Value {
+    pub(crate) async fn sm_ok(&self, operation: &str, body: &Value, case: &str) -> Value {
         let (status, parsed) = self.sm(operation, body).await;
         assert_eq!(
             status, 200,
@@ -152,7 +152,12 @@ impl Emulator {
 
     /// One Secrets Manager operation that must be refused, answered as
     /// `(error code, message)`.
-    async fn sm_err(&self, operation: &str, body: &Value, case: &str) -> (String, String) {
+    pub(crate) async fn sm_err(
+        &self,
+        operation: &str,
+        body: &Value,
+        case: &str,
+    ) -> (String, String) {
         let (status, parsed) = self.sm(operation, body).await;
         assert_eq!(
             status, 400,
@@ -176,7 +181,7 @@ impl Emulator {
     }
 
     /// One KMS operation that must succeed.
-    async fn kms_ok(&self, operation: &str, body: &Value, case: &str) -> Value {
+    pub(crate) async fn kms_ok(&self, operation: &str, body: &Value, case: &str) -> Value {
         let (status, parsed) = self
             .call("kms", "TrentService", operation, body)
             .await;
@@ -188,7 +193,7 @@ impl Emulator {
     }
 
     /// Mint a symmetric KMS key in [`REGION`] and answer it as `(key ARN, key id)`.
-    async fn create_key(&self, case: &str) -> (String, String) {
+    pub(crate) async fn create_key(&self, case: &str) -> (String, String) {
         let created = self.kms_ok("CreateKey", &json!({}), case).await;
         let metadata = &created["KeyMetadata"];
         let arn = metadata["Arn"]
@@ -223,7 +228,7 @@ impl Emulator {
 
 /// How many versions a secret holds, deprecated ones included — what a refused
 /// write must leave unchanged.
-async fn version_count(emulator: &Emulator, secret_id: &str, case: &str) -> usize {
+pub(crate) async fn version_count(emulator: &Emulator, secret_id: &str, case: &str) -> usize {
     let listed = emulator
         .sm_ok(
             "ListSecretVersionIds",
@@ -237,7 +242,7 @@ async fn version_count(emulator: &Emulator, secret_id: &str, case: &str) -> usiz
 }
 
 /// A `CreateSecret` body naming `name`, the key `kms_key_id` and this value.
-fn create_body(name: &str, kms_key_id: Option<&str>, value: &ValueCase) -> Value {
+pub(crate) fn create_body(name: &str, kms_key_id: Option<&str>, value: &ValueCase) -> Value {
     let mut body = Map::new();
     body.insert("Name".to_string(), json!(name));
     if let Some(kms_key_id) = kms_key_id {
@@ -1062,7 +1067,7 @@ const KEY_ADMIN_ACTIONS: [&str; 3] = ["kms:DescribeKey", "kms:GetKeyPolicy", "km
 
 /// A key policy granting `granted` plus [`KEY_ADMIN_ACTIONS`] to the principal this
 /// emulator authenticates every request as.
-fn key_policy(granted: &[&str]) -> String {
+pub(crate) fn key_policy(granted: &[&str]) -> String {
     let mut actions: Vec<&str> = KEY_ADMIN_ACTIONS.to_vec();
     actions.extend_from_slice(granted);
     json!({
@@ -1079,39 +1084,28 @@ fn key_policy(granted: &[&str]) -> String {
     .to_string()
 }
 
-/// The sentence KMS words an authorization refusal of a key with, which Secrets Manager
-/// relays as it stands: the principal it refused, the IAM action it asked for and the key it
-/// asked for it on.
+/// Assert an authorization refusal of the secret's key is worded as that class is: Secrets
+/// Manager's own sentence for it and nothing else.
 ///
-/// Read from the TREE's one spelling of that refusal class
-/// ([`::service_common::iam_authorization::not_authorized_by_resource_policy`]), which KMS's
-/// own `no_resource_policy_message` answers it from, so this suite follows a change to that
-/// wording rather than pinning a second copy of it in another service's tests.
-fn not_authorized(action: &str, key_arn: &str) -> String {
-    ::service_common::iam_authorization::not_authorized_by_resource_policy(
-        &service_com_amazonaws_kms_trentservice::state::caller_identity_arn(),
-        action,
-        key_arn,
-    )
-}
-
-/// Assert an authorization refusal of the key is worded as this class is: the sentence KMS
-/// stated, then the clause naming the answer it was relayed from.
-fn assert_denies_key_use(message: &str, action: &str, key_arn: &str, case: &str) {
-    assert_relays_kms(
+/// The table for that wording, and for what it must NOT carry, is
+/// [`crate::secret_kms_access_denied`]; this suite asserts the sentence so a key-policy row
+/// below is answered the same way as every other refusal of the access a secret's key
+/// withholds.
+fn assert_denies_key_use(message: &str, case: &str) {
+    assert_eq!(
         message,
-        &not_authorized(action, key_arn),
-        "AccessDeniedException",
-        action,
-        case,
+        crate::secret_kms_access_denied::KMS_ACCESS_DENIED_MESSAGE,
+        "case {case:?}: expected the refusal of the access the key withheld to read {:?}, got \
+         {message:?}",
+        crate::secret_kms_access_denied::KMS_ACCESS_DENIED_MESSAGE
     );
 }
 
 /// RULE: a read of a secret under a customer managed key performs `kms:Decrypt` on that key
 /// as the CALLER, and a write performs `kms:GenerateDataKey` — so the authority in force on
 /// the key decides each of them on its own, and a caller the key does not permit the action
-/// is NOT AUTHORIZED (HTTP 400 `AccessDeniedException`, carrying the sentence KMS worded)
-/// rather than served or told the value could not be encrypted.
+/// is NOT AUTHORIZED (HTTP 400 `AccessDeniedException`) rather than served or told the value
+/// could not be encrypted.
 #[tokio::test]
 async fn the_keys_own_grants_decide_each_read_and_each_write() {
     for (index, row) in KEY_POLICY_ROWS.iter().enumerate() {
@@ -1159,7 +1153,7 @@ async fn the_keys_own_grants_decide_each_read_and_each_write() {
                 code, "AccessDeniedException",
                 "case {read_case:?}: expected AccessDeniedException, got {code} with {message:?}"
             );
-            assert_denies_key_use(&message, "kms:Decrypt", &key_arn, &read_case);
+            assert_denies_key_use(&message, &read_case);
         }
 
         // The WRITE: `kms:GenerateDataKey` on the key.
@@ -1189,7 +1183,7 @@ async fn the_keys_own_grants_decide_each_read_and_each_write() {
                 code, "AccessDeniedException",
                 "case {write_case:?}: expected AccessDeniedException, got {code} with {message:?}"
             );
-            assert_denies_key_use(&message, "kms:GenerateDataKey", &key_arn, &write_case);
+            assert_denies_key_use(&message, &write_case);
             assert_eq!(
                 version_count(&emulator, &name, &write_case).await,
                 before,
@@ -1213,7 +1207,7 @@ async fn the_keys_own_grants_decide_each_read_and_each_write() {
                 "case {create_case:?}: expected AccessDeniedException, got {code} with \
                  {message:?}"
             );
-            assert_denies_key_use(&message, "kms:GenerateDataKey", &key_arn, &create_case);
+            assert_denies_key_use(&message, &create_case);
             let (status, parsed) = emulator
                 .sm("DescribeSecret", &json!({"SecretId": fresh}))
                 .await;
