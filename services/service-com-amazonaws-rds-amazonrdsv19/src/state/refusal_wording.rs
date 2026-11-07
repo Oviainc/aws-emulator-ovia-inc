@@ -121,14 +121,56 @@ pub enum ServerlessV2Rejection {
     Combination(String),
 }
 
+/// What a scaling configuration whose capacity floor is above its ceiling is refused with.
+///
+/// Entirely FIXED text, and a VALUE refusal rather than a combination one: the pair names a
+/// capacity floor the member does not accept, which is how this front door is held to
+/// answer it — `InvalidParameterValue` with this sentence — whichever of the two members
+/// the caller has to change, so nothing of the request is substituted into it.
+pub const SERVERLESS_V2_FLOOR_ABOVE_CEILING_MESSAGE: &str =
+    "Serverless v2 minimum capacity must be less than or equal to maximum capacity";
+
+/// What a capacity value outside the range the cluster can scale in is refused with.
+///
+/// The service states the VALUE it would not take and the range it will, and points at the
+/// call that changes that range; it names neither the member nor the engine version, so a
+/// floor and a ceiling outside the range are refused with the same sentence shape. The two
+/// capacities are written as the doubles the member takes (`256.0`, not `256`).
+pub fn serverless_v2_capacity_out_of_range_message(value: f64, min: f64, max: f64) -> String {
+    format!(
+        "Serverless v2 capacity value {value:?} is not valid. The valid scaling range for \
+         this cluster is {min:?} to {max:?}. To change the cluster's scaling range, use the \
+         ModifyDBCluster call."
+    )
+}
+
+/// The increment a serverless capacity value is specified in: "You can specify ACU values
+/// in half-step increments, such as 8, 8.5, 9, and so on"
+/// (`ServerlessV2ScalingConfiguration$MinCapacity`), which the Neptune model states in the
+/// same words for its own capacity units.
+pub const SERVERLESS_V2_CAPACITY_STEP: f64 = 0.5;
+
+/// What a capacity value off that grid is refused with: the service states the VALUE it
+/// would not take and the increment every capacity is a multiple of, naming neither the
+/// member nor the engine version — the same sentence shape as
+/// [`serverless_v2_capacity_out_of_range_message`].
+pub fn serverless_v2_capacity_step_message(value: f64) -> String {
+    format!(
+        "Serverless v2 capacity value {value:?} is not valid. It must be a multiple of \
+         {SERVERLESS_V2_CAPACITY_STEP:?}."
+    )
+}
+
 /// Refuse an Aurora Serverless v2 scaling configuration a cluster cannot run, whichever
 /// operation carries it: the create that provisions the cluster and the modification that
 /// rescales it hold one rule, so neither can drift from the other.
 ///
-/// `capacity` is the Aurora capacity unit range the cluster's engine VERSION publishes
-/// (`DescribeDBEngineVersions`' capacity profile), `None` for a version that runs no Aurora
-/// Serverless v2 capacity at all; `engine` and `version` name that version in the refusal.
-/// A capacity value is checked against the published range and against the half-step
+/// `capacity` is the capacity unit range the cluster's engine VERSION publishes
+/// (`DescribeDBEngineVersions`' capacity profile), `None` for a version that runs no
+/// Serverless v2 capacity at all; `engine` and `version` name that version in the refusal
+/// of a configuration the version cannot run at all.
+/// A capacity value is checked against the published range
+/// ([`serverless_v2_capacity_out_of_range_message`]) and against the half-step
 /// increments the member documents ("You can specify ACU values in half-step increments,
 /// such as 8, 8.5, 9, and so on"), and the pair against each other (the floor cannot exceed
 /// the ceiling).
@@ -146,31 +188,24 @@ pub fn check_serverless_v2_scaling(
              {version}: that version runs no Aurora Serverless v2 capacity"
         )));
     };
-    for (member, value) in [
-        ("MinCapacity", min_capacity),
-        ("MaxCapacity", max_capacity),
-    ] {
+    for value in [min_capacity, max_capacity] {
         let Some(value) = value else { continue };
         if !(min_acu..=max_acu).contains(&value) {
-            return Err(ServerlessV2Rejection::Value(format!(
-                "invalid value {value} for ServerlessV2ScalingConfiguration.{member}: engine \
-                 {engine} version {version} serves {min_acu} to {max_acu} Aurora capacity \
-                 units"
-            )));
+            return Err(ServerlessV2Rejection::Value(
+                serverless_v2_capacity_out_of_range_message(value, min_acu, max_acu),
+            ));
         }
-        if (value * 2.0).fract() != 0.0 {
-            return Err(ServerlessV2Rejection::Value(format!(
-                "invalid value {value} for ServerlessV2ScalingConfiguration.{member}: Aurora \
-                 capacity units are specified in half-step increments"
-            )));
+        if (value / SERVERLESS_V2_CAPACITY_STEP).fract() != 0.0 {
+            return Err(ServerlessV2Rejection::Value(
+                serverless_v2_capacity_step_message(value),
+            ));
         }
     }
     if let (Some(min), Some(max)) = (min_capacity, max_capacity) {
         if min > max {
-            return Err(ServerlessV2Rejection::Combination(format!(
-                "ServerlessV2ScalingConfiguration.MinCapacity ({min}) must not exceed \
-                 MaxCapacity ({max})"
-            )));
+            return Err(ServerlessV2Rejection::Value(
+                SERVERLESS_V2_FLOOR_ABOVE_CEILING_MESSAGE.to_string(),
+            ));
         }
     }
     if let Some(seconds) = seconds_until_auto_pause {

@@ -233,6 +233,9 @@ pub mod data_plane;
 // The subnets a request NAMES, resolved against the service that owns them: a subnet's
 // Availability Zone is Amazon EC2's fact, and this is the one place this crate asks for it.
 pub mod ec2_subnets;
+// The VPC security groups a request NAMES, resolved against the service that owns them:
+// whether a group exists is Amazon EC2's fact, asked here and nowhere else.
+mod ec2_security_groups;
 mod instances;
 mod clusters;
 // The Secrets Manager secret RDS manages for a resource's master user password: the
@@ -265,6 +268,7 @@ pub use data_plane::{
     ServedEndpoint,
 };
 pub use ec2_subnets::{subnet_zones, SubnetZones};
+pub use ec2_security_groups::{invalid_security_group_message, unresolved_vpc_security_groups};
 
 /// Per-service state for com-amazonaws-rds-amazonrdsv19. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -3114,6 +3118,26 @@ pub fn is_aurora(engine: &str) -> bool {
     engine.to_ascii_lowercase().starts_with("aurora")
 }
 
+/// Whether an instance running `engine` is always a MEMBER of a DB cluster, so that its
+/// master user credential is the CLUSTER's and the instance has none of its own.
+///
+/// These are the engines of the two sibling control planes this front door serves
+/// ([`is_sibling_control_plane_engine`]), whose OWN `CreateDBInstance` APIs carry no usable
+/// master-user member at all: `com.amazonaws.docdb#CreateDBInstanceMessage` declares
+/// neither `MasterUsername` nor `MasterUserPassword`, and the Amazon Neptune model declares
+/// both and documents each as "Not supported by Neptune"
+/// (`smithy_query(query="doc",shape="CreateDBInstanceMessage",member="MasterUserPassword")`
+/// on that model). An instance of such an engine exists only as a member of a cluster,
+/// which is where its master user lives. Named for the rule it carries rather than for the
+/// control plane, and resolved by the one predicate that holds the engine list.
+///
+/// The Aurora engines are NOT here even though their own instances take the member's value
+/// no more ("This setting doesn't apply to Amazon Aurora DB instances"): this predicate
+/// gates a REFUSAL, and nothing recorded says what the Aurora instance create answers.
+pub fn is_cluster_member_engine(engine: &str) -> bool {
+    is_sibling_control_plane_engine(engine)
+}
+
 /// The engine prefixes an instance-level start or stop does not apply to, from the
 /// documentation `StartDBInstance` and `StopDBInstance` share: "This command doesn't
 /// apply to RDS Custom, Aurora MySQL, and Aurora PostgreSQL. For Aurora DB clusters,
@@ -3301,6 +3325,10 @@ fn identifier_subject(member: &str) -> Option<&'static str> {
 /// ([`not_a_valid_identifier_message`]), which names the member at fault, states the rule
 /// and echoes nothing from the request.
 ///
+/// The wording is the MEMBER's, not the engine's: the same member is refused the same way
+/// whichever control plane's engine the request named, which is what the recorded answers
+/// of this one front door carry.
+///
 /// The CALLER answers this with `InvalidParameterValue`: a value outside the constraints
 /// its own member publishes is exactly what that Query API common error reports, and the
 /// error code is what a client branches on.
@@ -3314,33 +3342,10 @@ pub fn check_identifier(member: &str, value: &str, max_len: usize) -> Result<(),
     })
 }
 
-/// [`check_identifier`] for a create whose `Engine` names which control plane answers it.
-///
-/// A create of a resource of a SIBLING control plane's engine
-/// ([`is_sibling_control_plane_engine`]) is a create THAT service answers, and it refuses
-/// an identifier with the one sentence pair that names the member and states the rule
-/// ([`not_a_valid_identifier_message`]) rather than with the subject wording Amazon RDS
-/// uses for its own engines ([`identifier_subject`]) — the engine is what selects the
-/// control plane, so it is what selects the wording.
-pub fn check_identifier_for_engine(
-    member: &str,
-    value: &str,
-    max_len: usize,
-    engine: &str,
-) -> Result<(), String> {
-    if !is_sibling_control_plane_engine(engine) {
-        return check_identifier(member, value, max_len);
-    }
-    identifier_is_well_formed(value, max_len)
-        .then_some(())
-        .ok_or_else(|| not_a_valid_identifier_message(member))
-}
-
 /// The constraint walk behind [`check_identifier`]: whether `value` satisfies every clause
 /// the identifier members state — the alphabet, the member's own length bound, the leading
 /// letter, and the two hyphen rules. Which clause failed does not reach the caller, because
-/// Amazon RDS answers all of them with the one sentence pair that states the whole rule
-/// ([`not_a_valid_identifier_message`]).
+/// Amazon RDS answers all of them with the one text its member carries.
 fn identifier_is_well_formed(value: &str, max_len: usize) -> bool {
     let length = value.chars().count();
     value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')

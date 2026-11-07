@@ -11,10 +11,10 @@
 //!   `DBSubnetGroupNotFoundFault`, worded as the sentence the calls that ACT on a group
 //!   answer — "DB subnet group '<name>' does not exist." — whichever engine's cluster the
 //!   create was placing in it;
-//! * an identifier outside the identifier rule is refused in the wording of the control
-//!   plane the request's `Engine` names: a sibling control plane's engine gets the one
-//!   sentence pair that names the member and states the whole rule, while Amazon RDS's own
-//!   engines keep the subject wording this front door answers for them;
+//! * an identifier outside the identifier rule is refused in the wording its MEMBER carries
+//!   — the subject wording this front door answers for a DB cluster's and a DB instance's
+//!   identifier — whichever control plane's engine the request's `Engine` names, because one
+//!   front door answers them all;
 //! * a Multi-AZ DB cluster whose named DB subnet group covers fewer than three Availability
 //!   Zones is the modelled 400 `InvalidVPCNetworkStateFault`, and its message names the
 //!   zones of the Region that group does not cover yet — read off the group's stored
@@ -167,15 +167,13 @@ async fn a_cluster_create_naming_a_subnet_group_that_does_not_exist_says_so() {
     }
 }
 
-/// One identifier refusal: the engine the create names, and whether the control plane that
-/// owns it words the refusal by its SUBJECT (Amazon RDS's own engines) or with the sentence
-/// pair that states the rule (a sibling control plane's).
+/// One identifier refusal: the engine the create names, and the subject its identifier
+/// member is worded by — which is the MEMBER's, so every engine shares it.
 struct EngineWording {
     case: &'static str,
     engine: &'static str,
-    /// The subject Amazon RDS names a cluster identifier by, or `None` where the sentence
-    /// pair is the wording.
-    subject: Option<&'static str>,
+    /// The subject Amazon RDS names a cluster identifier by.
+    subject: &'static str,
 }
 
 /// Both control-plane groups this one front door serves, over every engine each publishes a
@@ -184,32 +182,32 @@ const ENGINE_WORDINGS: &[EngineWording] = &[
     EngineWording {
         case: "the Amazon DocumentDB control plane's engine",
         engine: "docdb",
-        subject: None,
+        subject: "database cluster identifier",
     },
     EngineWording {
         case: "the Amazon Neptune control plane's engine",
         engine: "neptune",
-        subject: None,
+        subject: "database cluster identifier",
     },
     EngineWording {
         case: "an Aurora MySQL cluster",
         engine: "aurora-mysql",
-        subject: Some("database cluster identifier"),
+        subject: "database cluster identifier",
     },
     EngineWording {
         case: "an Aurora PostgreSQL cluster",
         engine: "aurora-postgresql",
-        subject: Some("database cluster identifier"),
+        subject: "database cluster identifier",
     },
     EngineWording {
         case: "a Multi-AZ DB cluster",
         engine: "mysql",
-        subject: Some("database cluster identifier"),
+        subject: "database cluster identifier",
     },
 ];
 
 #[tokio::test]
-async fn an_identifier_refusal_is_worded_by_the_control_plane_that_owns_the_engine() {
+async fn an_identifier_refusal_is_worded_by_the_member_it_names() {
     let router = emulator();
 
     // Values spanning the clauses of the identifier rule: a leading digit, a character
@@ -239,38 +237,20 @@ async fn an_identifier_refusal_is_worded_by_the_control_plane_that_owns_the_engi
                 "InvalidParameterValue",
             );
             let message = text(&body, "Message");
-            let expected = match row.subject {
-                // The two spaces after the colon are part of that wording.
-                Some(subject) => format!("Invalid {subject}:  {value}"),
-                None => state::not_a_valid_identifier_message("DBClusterIdentifier"),
-            };
+            // The two spaces after the colon are part of that wording.
+            let expected = format!("Invalid {}:  {value}", row.subject);
             assert_eq!(
                 message, expected,
                 "case {case:?}: expected {expected:?}, got {message:?}"
             );
-            if row.subject.is_none() {
-                assert!(
-                    !message.contains(value),
-                    "case {case:?}: the sentence states the rule and must not echo the \
-                     rejected value, got {message:?}"
-                );
-            }
         }
     }
 
-    // The same split holds for the DB instance identifier, whose subject is the other one
-    // this front door words a refusal by.
-    for (case, engine, expected) in [
-        (
-            "a DocumentDB instance",
-            "docdb",
-            state::not_a_valid_identifier_message("DBInstanceIdentifier"),
-        ),
-        (
-            "an Amazon RDS instance",
-            "postgres",
-            "Invalid database identifier:  1emu-wording-db".to_string(),
-        ),
+    // The DB instance identifier, whose subject is the other one this front door words a
+    // refusal by — again the member's, whichever engine the create names.
+    for (case, engine) in [
+        ("a DocumentDB instance", "docdb"),
+        ("an Amazon RDS instance", "postgres"),
     ] {
         let body = expect_error(
             case,
@@ -288,6 +268,7 @@ async fn an_identifier_refusal_is_worded_by_the_control_plane_that_owns_the_engi
             "InvalidParameterValue",
         );
         let message = text(&body, "Message");
+        let expected = "Invalid database identifier:  1emu-wording-db";
         assert_eq!(
             message, expected,
             "case {case:?}: expected {expected:?}, got {message:?}"

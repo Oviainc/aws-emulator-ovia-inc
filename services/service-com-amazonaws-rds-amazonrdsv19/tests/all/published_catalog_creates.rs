@@ -401,6 +401,26 @@ async fn a_db_instance_is_created_only_in_an_offered_combination() {
             ("EngineVersion", row.engine_version.to_string()),
             ("DBInstanceClass", row.db_instance_class.to_string()),
         ];
+        // An instance of one of the sibling control planes' engines exists only as a MEMBER
+        // of a DB cluster (its master user is the cluster's), so a row naming such an
+        // engine joins a cluster created here — what is under test is the CLASS the
+        // combination names, not whether the instance has a cluster.
+        if matches!(row.engine, "docdb" | "neptune") {
+            let cluster = format!("{identifier}-cluster");
+            expect_ok(
+                row.case,
+                call(
+                    &router,
+                    "CreateDBCluster",
+                    &[
+                        ("DBClusterIdentifier", cluster.clone()),
+                        ("Engine", row.engine.to_string()),
+                    ],
+                )
+                .await,
+            );
+            params.push(("DBClusterIdentifier", cluster));
+        }
         if let Some(license_model) = row.license_model {
             params.push(("LicenseModel", license_model.to_string()));
         }

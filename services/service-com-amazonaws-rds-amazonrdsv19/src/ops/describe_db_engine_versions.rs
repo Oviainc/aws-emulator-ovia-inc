@@ -753,8 +753,27 @@ const DOCDB: VersionProfile = VersionProfile::provisioned()
     .global_databases()
     .certificate_rotation_without_restart();
 
-/// Amazon Neptune, the same kind of cluster engine with its own global database.
-const NEPTUNE: VersionProfile = DOCDB;
+/// Amazon Neptune, the same kind of cluster engine with its own global database, from the
+/// release that offers Neptune Serverless on.
+///
+/// Neptune Serverless scales a cluster between a floor and a ceiling of NEPTUNE capacity
+/// units, which this report carries in the one member that publishes a serverless capacity
+/// range (`ServerlessV2FeaturesSupport`), so a client reads the range it may configure from
+/// the version it is about to create a cluster with — exactly as an Aurora version
+/// publishes its ACU range. The range this front door reports for a Neptune Serverless
+/// cluster is the one its control plane answers with: a floor that scales to zero
+/// ([`SERVERLESS_V2_PAUSE_MIN_CAPACITY`]) up to [`SERVERLESS_V2_EARLIER_MAX_CAPACITY`]
+/// capacity units.
+const NEPTUNE: VersionProfile = NEPTUNE_BEFORE_SERVERLESS
+    .serverless_v2(SERVERLESS_V2_PAUSE_MIN_CAPACITY, SERVERLESS_V2_EARLIER_MAX_CAPACITY);
+
+/// An Amazon Neptune version from before Neptune Serverless: the cluster engine's
+/// capabilities without a serverless capacity range.
+///
+/// "Using Amazon Neptune Serverless" (Amazon Neptune User Guide) states the 1.2.0.1 minimum
+/// engine version, so the releases before it report no serverless capacity at all rather
+/// than claiming a range their clusters cannot be configured in.
+const NEPTUNE_BEFORE_SERVERLESS: VersionProfile = DOCDB;
 
 /// An Amazon Neptune version from BEFORE that engine's global database: the same cluster
 /// member capabilities without `SupportsGlobalDatabases`.
@@ -2034,7 +2053,8 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "neptune1.2",
         STATUS_AVAILABLE,
         DefaultLevel::Neither,
-        &NEPTUNE,
+        // The release before the one Neptune Serverless is offered from.
+        &NEPTUNE_BEFORE_SERVERLESS,
     ),
     row(
         "neptune",

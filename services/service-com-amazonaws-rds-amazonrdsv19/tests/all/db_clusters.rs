@@ -1133,7 +1133,8 @@ async fn a_request_outside_a_documented_constraint_is_refused_and_stores_nothing
                 ),
             ],
             400,
-            "InvalidParameterCombination",
+            // A capacity floor above the ceiling is a VALUE the member does not accept.
+            "InvalidParameterValue",
         ),
         (
             "one second below the lowest auto-pause delay",

@@ -376,12 +376,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusal quotes what the caller sent; "this parameter is stored as a lowercase
         // string", so the folded form is what is stored and echoed and every later lookup
         // folds the same way. The length bound is the one its own constraints give this
-        // cluster type.
-        crate::state::check_identifier_for_engine(
+        // cluster type; the refusal's wording follows what the value broke, not the engine
+        // it was sent for ([`crate::state::check_identifier`]).
+        crate::state::check_identifier(
             "DBClusterIdentifier",
             &input.db_cluster_identifier,
             crate::state::db_cluster_identifier_max_len(&input.engine),
-            &input.engine,
         )
         .map_err(CreateDBClusterError::invalid_parameter_value)?;
         let identifier = input.db_cluster_identifier.to_ascii_lowercase();
@@ -475,7 +475,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(CreateDBClusterError::invalid_parameter_value)?;
         }
         if let Some(password) = &input.master_user_password {
-            crate::state::check_master_user_password(&input.engine, password)
+            crate::state::check_supplied_master_user_password(&input.engine, password)
                 .map_err(CreateDBClusterError::invalid_parameter_value)?;
         }
         // `ManageMasterUserPassword` has RDS "generate and manage the master user password
@@ -682,9 +682,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.engine_version.as_deref(),
         )
         .map_err(CreateDBClusterError::invalid_parameter_combination)?;
-        // `EngineMode`: "either provisioned or serverless", and which of them a cluster can
-        // run is a property of its engine VERSION — the catalogue publishes it as
-        // `SupportedEngineModes`.
+        // `EngineMode`: "either provisioned or serverless". The value's own DOMAIN is the
+        // two the member publishes, checked here against the request alone; whether the
+        // engine VERSION the cluster resolves to RUNS the mode asked for is a capability of
+        // that version, and is answered under the store below with the rest of the
+        // configuration — after every resource this request names has been resolved.
         let engine_mode = input
             .engine_mode
             .clone()
@@ -698,54 +700,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::DB_CLUSTER_ENGINE_MODES.join(" | ")
             )));
         }
-        if let Some(entry) = resolved_version {
-            if !entry
-                .profile
-                .engine_modes
-                .iter()
-                .any(|known| known.eq_ignore_ascii_case(&engine_mode))
-            {
-                // Which modes a version runs is the DOMAIN of this member for that
-                // version, so a mode outside it is a value this parameter does not accept
-                // — the `InvalidParameterValue` the member's own value list is refused
-                // with above, not a combination that failed. It is how RDS refuses
-                // `serverless` (Aurora Serverless v1) on a current engine version, which
-                // publishes `provisioned` alone.
-                return Err(CreateDBClusterError::invalid_parameter_value(
-                    crate::state::unavailable_engine_mode_message(&engine_mode),
-                ));
-            }
-        }
-        // `ServerlessV2ScalingConfiguration`: the Aurora Serverless v2 capacity range,
-        // which only a version the catalogue publishes a Serverless v2 capacity range for
-        // can be created with — and only inside that range, in the half-step increments the
-        // member documents. The rule is the one `ModifyDBCluster` rescales a cluster by.
-        let serverless_v2_scaling = match &input.serverless_v2_scaling_configuration {
-            None => None,
-            Some(asked) => {
-                crate::state::check_serverless_v2_scaling(
-                    &input.engine,
-                    input.engine_version.as_deref().unwrap_or("(default)"),
-                    resolved_version.and_then(|entry| entry.profile.serverless_v2_capacity),
-                    asked.min_capacity,
-                    asked.max_capacity,
-                    asked.seconds_until_auto_pause,
-                )
-                .map_err(|rejection| match rejection {
-                    crate::state::ServerlessV2Rejection::Value(message) => {
-                        CreateDBClusterError::invalid_parameter_value(message)
-                    }
-                    crate::state::ServerlessV2Rejection::Combination(message) => {
-                        CreateDBClusterError::invalid_parameter_combination(message)
-                    }
-                })?;
-                Some(ServerlessV2ScalingConfigurationInfo {
-                    min_capacity: asked.min_capacity,
-                    max_capacity: asked.max_capacity,
-                    seconds_until_auto_pause: asked.seconds_until_auto_pause,
-                })
-            }
-        };
+        // `ServerlessV2ScalingConfiguration`: the serverless capacity range the cluster
+        // scales in, which the cluster reports back from its record. Whether the resolved
+        // engine version can be configured with it — a range it publishes at all, and this
+        // configuration inside that range — is the capability check below, beside the
+        // engine mode's.
+        let serverless_v2_scaling = input.serverless_v2_scaling_configuration.as_ref().map(
+            |asked| ServerlessV2ScalingConfigurationInfo {
+                min_capacity: asked.min_capacity,
+                max_capacity: asked.max_capacity,
+                seconds_until_auto_pause: asked.seconds_until_auto_pause,
+            },
+        );
 
         // No store means this service was mounted on an engine it has no state in, so it
         // cannot serve the operation at all. Unreachable with the engine the router builds;
@@ -785,6 +751,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into());
                 };
                 named_subnet_group = Some(group);
+            }
+            // What the cluster's engine VERSION can be configured with, answered once every
+            // resource the request NAMES has been resolved above: the mode it runs
+            // (`SupportedEngineModes`) and the serverless capacity range it publishes, both
+            // read from the resolved catalogue entry. A configuration this version cannot
+            // serve is the caller's to change, but a name that resolves to nothing is that
+            // resource's 404 — and the caller is told that first, because it is the obstacle
+            // it has to clear before any configuration of this cluster can be accepted.
+            if let Some(entry) = resolved_version {
+                if !entry
+                    .profile
+                    .engine_modes
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&engine_mode))
+                {
+                    // Which modes a version runs is the DOMAIN of this member for that
+                    // version, so a mode outside it is a value this parameter does not
+                    // accept — the `InvalidParameterValue` the member's own value list is
+                    // refused with above, not a combination that failed. It is how RDS
+                    // refuses `serverless` (Aurora Serverless v1) on a current engine
+                    // version, which publishes `provisioned` alone.
+                    return Err(CreateDBClusterError::invalid_parameter_value(
+                        crate::state::unavailable_engine_mode_message(&engine_mode),
+                    ));
+                }
+            }
+            // Only a version the catalogue publishes a serverless capacity range for can be
+            // created with a scaling configuration — and only inside that range, in the
+            // half-step increments the member documents, with the floor no higher than the
+            // ceiling. The rule is the one `ModifyDBCluster` rescales a cluster by.
+            if let Some(asked) = &input.serverless_v2_scaling_configuration {
+                crate::state::check_serverless_v2_scaling(
+                    &input.engine,
+                    input.engine_version.as_deref().unwrap_or("(default)"),
+                    resolved_version.and_then(|entry| entry.profile.serverless_v2_capacity),
+                    asked.min_capacity,
+                    asked.max_capacity,
+                    asked.seconds_until_auto_pause,
+                )
+                .map_err(|rejection| match rejection {
+                    crate::state::ServerlessV2Rejection::Value(message) => {
+                        CreateDBClusterError::invalid_parameter_value(message)
+                    }
+                    crate::state::ServerlessV2Rejection::Combination(message) => {
+                        CreateDBClusterError::invalid_parameter_combination(message)
+                    }
+                })?;
             }
             // A Multi-AZ DB cluster is placed across the zones its DB subnet group covers,
             // so the group a request NAMES has to cover enough of them before anything
@@ -975,6 +988,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 replication_source_arn,
             )
         };
+        // `KmsKeyId`: "the Amazon Web Services KMS key identifier for an encrypted DB
+        // cluster", so a cluster is encrypted only under a key KMS ANSWERS for. The key is
+        // resolved against this emulator's own KMS, over the in-process callback, which
+        // cannot be done under the store's guard — so it is asked here, with the guard
+        // released and nothing stored yet, and a key KMS will not encrypt under is the
+        // modelled `KMSKeyNotAccessibleFault` (the same check and the same sentence the
+        // snapshot export answers, [`crate::state::kms_key_is_inaccessible`]).
+        if let Some(key_id) = input.kms_key_id.as_deref() {
+            if crate::state::kms_key_is_inaccessible(ctx, &region, key_id).await {
+                return Err(CreateDBClusterErrorModeled::KMSKeyNotAccessibleFault(
+                    KMSKeyNotAccessibleFault {
+                        message: Some(crate::state::kms_key_not_accessible_message(key_id)),
+                    },
+                )
+                .into());
+            }
+        }
+        // `VpcSecurityGroupIds`: "A list of EC2 VPC security groups to associate with this
+        // DB cluster", which are Amazon EC2's resources — so each one the request names is
+        // resolved against EC2 over the in-process callback, which cannot be done under the
+        // store's guard either, and a group the account does not hold is refused for the
+        // value it carried rather than stored as a membership nothing could resolve.
+        let unresolved =
+            crate::state::unresolved_vpc_security_groups(ctx, &region, &vpc_security_group_ids)
+                .await;
+        if let Some(group_id) = unresolved.first() {
+            return Err(CreateDBClusterError::invalid_parameter_value(
+                crate::state::invalid_security_group_message(group_id),
+            ));
+        }
         let resource_id = crate::state::mint_db_cluster_resource_id(mint);
         // `MasterUsername`: what the request named, or — where the engine's own control
         // plane cannot be given one — the username it ASSIGNS the cluster

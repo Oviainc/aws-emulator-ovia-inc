@@ -58,7 +58,11 @@ const SUBNET_IDS_PER_HOP: usize = 64;
 /// (`service_common::arn::region_label`, the one place this tree states that grammar)
 /// instead of being interpolated as given: `None` for a value that would name an authority
 /// the caller chose rather than the peer service this emulator asks.
-fn ec2(
+///
+/// `pub(super)` so the sibling module that resolves the VPC security groups a request names
+/// ([`super::ec2_security_groups`]) asks EC2 through this one client rather than building a
+/// second one.
+pub(super) fn ec2(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> Option<::aws_sdk_ec2::Client> {

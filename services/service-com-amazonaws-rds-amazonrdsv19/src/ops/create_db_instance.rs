@@ -363,14 +363,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The constraints are checked against the value the REQUEST carried, so the
         // refusal quotes what the caller sent rather than something derived from it;
         // "this parameter is stored as a lowercase string", so the folded form is what is
-        // stored and echoed, and every later lookup folds the same way.
-        crate::state::check_identifier_for_engine(
-            "DBInstanceIdentifier",
-            &input.db_instance_identifier,
-            63,
-            &input.engine,
-        )
-        .map_err(CreateDBInstanceError::invalid_parameter_value)?;
+        // stored and echoed, and every later lookup folds the same way. The refusal's
+        // wording follows what the value broke, not the engine it was sent for
+        // ([`crate::state::check_identifier`]).
+        crate::state::check_identifier("DBInstanceIdentifier", &input.db_instance_identifier, 63)
+            .map_err(CreateDBInstanceError::invalid_parameter_value)?;
         let identifier = input.db_instance_identifier.to_ascii_lowercase();
 
         // Documented constraints this operation models no error for: refused as a 400
@@ -420,8 +417,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // becomes a live credential. The refusal names the member and the constraint; the
         // value is `@sensitive` and is never echoed.
         if let Some(password) = &input.master_user_password {
-            crate::state::check_master_user_password(&input.engine, password)
+            crate::state::check_supplied_master_user_password(&input.engine, password)
                 .map_err(CreateDBInstanceError::invalid_parameter_value)?;
+        }
+        // An instance of a cluster engine has no master user credential OF ITS OWN: the
+        // password "is managed by the DB cluster" the instance is a member of, and the
+        // request may not carry one for it ([`crate::state::is_cluster_member_engine`]). A
+        // create of such an instance that joins NO cluster therefore names a master
+        // credential that exists nowhere — not on the request, which cannot carry one, and
+        // not on a cluster, because there is none — so it is refused for that credential
+        // before anything is stored, rather than storing an instance with no way to be
+        // reached. An instance of an engine that DOES carry its own credential is not
+        // affected: it is created on its own, with or without a cluster.
+        if crate::state::is_cluster_member_engine(&input.engine)
+            && input.db_cluster_identifier.is_none()
+        {
+            return Err(CreateDBInstanceError::invalid_parameter_value(
+                crate::state::INVALID_MASTER_PASSWORD_MESSAGE,
+            ));
         }
         // `ManageMasterUserPassword` has RDS "generate and manage the master user password
         // with Amazon Web Services Secrets Manager" and report the secret it created as
@@ -471,47 +484,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_due_transitions(&region);
 
-        // The version the instance runs: one the catalogue publishes, or one the ACCOUNT
-        // minted in this region. A value that is neither names no version this service can
-        // provision, and is refused for the version, leaving no instance behind.
-        let custom_version = match &resolved_version {
-            Ok(_) => None,
-            Err(_) => store
-                .resolve_custom_db_engine_version(
-                    &region,
-                    &input.engine,
-                    input.engine_version.as_deref().unwrap_or_default(),
-                )
-                .cloned(),
-        };
-        let resolved_version = match resolved_version {
-            Ok(resolved) => resolved,
-            Err(message) => {
-                if custom_version.is_none() {
-                    return Err(CreateDBInstanceError::invalid_parameter_combination(message));
-                }
-                None
-            }
-        };
-        // The four members that together say WHICH DB instance is being ordered — the
-        // class, the engine, the version it resolved to and the license model — are
-        // resolved against the orderable options this service publishes: an instance is
-        // created only in a combination that can be ordered, so a class whose instance
-        // generation no option offers (or a licence the engine is offered under by none of
-        // them) is refused here, before any of it is stored. The check runs once the
-        // version is resolved and BEFORE the duplicate-identifier check below, so the
-        // refusal names the combination rather than a conflict with an instance this
-        // request should never have been able to create.
-        crate::state::check_orderable_db_instance(
-            &input.engine,
-            resolved_version
-                .map(|entry| entry.engine_version)
-                .or(input.engine_version.as_deref())
-                .unwrap_or_default(),
-            &input.db_instance_class,
-            input.license_model.as_deref(),
-        )
-        .map_err(CreateDBInstanceError::invalid_parameter_combination)?;
+        // The version the instance runs, and the combination it is ordered in, are resolved
+        // further down — after the DB cluster this instance would join has been resolved,
+        // because that cluster is the resource the request REFERENCES and a reference that
+        // names nothing is the obstacle the caller has to clear first.
 
         // Every resource this request REFERENCES by name is resolved in the store
         // before the instance is inserted, and a name that resolves to nothing is that
@@ -596,6 +572,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             },
         };
+        // What the instance RUNS and the combination it is ordered IN are resolved once the
+        // DB cluster above — the resource this request REFERENCES — has been resolved: a
+        // request naming a cluster that does not exist is told THAT, the obstacle it has to
+        // clear, rather than being sent to correct a setting of an instance that could not
+        // have been created anyway.
+        //
+        // The version is one the catalogue publishes, or one the ACCOUNT minted in this
+        // region. A value that is neither names no version this service can provision, and
+        // is refused for the version, leaving no instance behind.
+        let custom_version = match &resolved_version {
+            Ok(_) => None,
+            Err(_) => store
+                .resolve_custom_db_engine_version(
+                    &region,
+                    &input.engine,
+                    input.engine_version.as_deref().unwrap_or_default(),
+                )
+                .cloned(),
+        };
+        let resolved_version = match resolved_version {
+            Ok(resolved) => resolved,
+            Err(message) => {
+                if custom_version.is_none() {
+                    return Err(CreateDBInstanceError::invalid_parameter_combination(message));
+                }
+                None
+            }
+        };
+        // The four members that together say WHICH DB instance is being ordered — the
+        // class, the engine, the version it resolved to and the license model — are
+        // resolved against the orderable options this service publishes: an instance is
+        // created only in a combination that can be ordered, so a class whose instance
+        // generation no option offers (or a licence the engine is offered under by none of
+        // them) is refused here, before any of it is stored.
+        crate::state::check_orderable_db_instance(
+            &input.engine,
+            resolved_version
+                .map(|entry| entry.engine_version)
+                .or(input.engine_version.as_deref())
+                .unwrap_or_default(),
+            &input.db_instance_class,
+            input.license_model.as_deref(),
+        )
+        .map_err(CreateDBInstanceError::invalid_parameter_combination)?;
         // The region's DB instance quota, and the number of regions this store keeps
         // records for at all: a store that grows without bound is not what the real
         // service does, and the modelled fault says exactly this.

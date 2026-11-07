@@ -203,6 +203,10 @@ async fn describe(router: &MultiServiceRouter, case: &str, named: &str) -> Repor
 }
 
 /// Create one DB instance and hand back its identifier.
+///
+/// An instance of one of the sibling control planes' engines exists only as a MEMBER of a
+/// DB cluster — its master user is the cluster's, and this front door refuses a create that
+/// names no cluster for them — so such a row's instance joins a cluster created here.
 async fn create(
     router: &MultiServiceRouter,
     identifier: &str,
@@ -215,6 +219,22 @@ async fn create(
         ("Engine", engine.to_string()),
         ("DBInstanceClass", class.to_string()),
     ];
+    if matches!(engine, "docdb" | "neptune") {
+        let cluster = format!("{identifier}-cluster");
+        expect_ok(
+            &format!("create the cluster {cluster}"),
+            call(
+                router,
+                "CreateDBCluster",
+                &[
+                    ("DBClusterIdentifier", cluster.clone()),
+                    ("Engine", engine.to_string()),
+                ],
+            )
+            .await,
+        );
+        params.push(("DBClusterIdentifier", cluster));
+    }
     params.extend(extra.iter().cloned());
     expect_ok(
         &format!("create {identifier}"),

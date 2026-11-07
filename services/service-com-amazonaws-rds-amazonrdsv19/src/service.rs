@@ -76,6 +76,7 @@
 pub mod api_version;
 pub mod management_events;
 pub mod query_error_envelope;
+pub mod unresolved_reference;
 
 use api_version::UnsupportedApiVersionOperation;
 use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
@@ -147,7 +148,7 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     unsupported_api_version: UnsupportedApiVersionOperation,
     /// The envelope wrapper every other routable request is served through. Held in a
     /// field for the same reason.
-    envelope: RequestIdEnvelopeOperation,
+    envelope: RequestIdEnvelopeOperation<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -162,7 +163,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             // [`management_events`]). The envelope wrapper routes to it first and to the
             // generated table for anything it does not hold, which is what keeps the
             // `<RequestId>` element on every error response either way.
-            envelope: RequestIdEnvelopeOperation::new(management_events::audited_table(&engine)),
+            envelope: RequestIdEnvelopeOperation::new(
+                std::sync::Arc::clone(&engine),
+                management_events::audited_table(&engine),
+            ),
             entry: RdsDefinition::new(engine),
             unsupported_api_version: UnsupportedApiVersionOperation,
         }

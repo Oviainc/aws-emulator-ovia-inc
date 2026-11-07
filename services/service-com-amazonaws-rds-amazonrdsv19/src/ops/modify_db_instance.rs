@@ -522,7 +522,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .engine
                 .clone()
                 .unwrap_or_else(|| store.db_instances[&key].engine.clone());
-            crate::state::check_master_user_password(&engine, password)
+            crate::state::check_supplied_master_user_password(&engine, password)
                 .map_err(ModifyDBInstanceError::invalid_parameter_value)?;
         }
 

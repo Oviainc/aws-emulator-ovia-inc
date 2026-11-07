@@ -183,6 +183,8 @@ mod modify_db_cluster_state_refusal;
 mod modify_db_shard_group;
 #[path = "all/modify_event_subscription.rs"]
 mod modify_event_subscription;
+#[path = "all/neptune_create_gates.rs"]
+mod neptune_create_gates;
 #[path = "all/neptune_engine_catalog.rs"]
 mod neptune_engine_catalog;
 #[path = "all/neptune_probe.rs"]

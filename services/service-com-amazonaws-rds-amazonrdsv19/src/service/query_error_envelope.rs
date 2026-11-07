@@ -112,17 +112,26 @@ pub fn with_request_id(mut resp: RtResponse) -> RtResponse {
 /// framework still owns the whole deserialize → validate → handle → serialize sequence
 /// (and every status, code and message it answers with), and this wrapper owns one
 /// element of the envelope.
-pub struct RequestIdEnvelopeOperation {
+///
+/// It is also where the ONE refusal that cannot wait for that sequence is answered: the
+/// not-found fault of a resource a request REFERENCES, for a request the framework would
+/// refuse for an absent member before any handler ran (see
+/// [`crate::service::unresolved_reference`]). Every other request is served exactly as
+/// before.
+pub struct RequestIdEnvelopeOperation<Eng: Send + Sync + 'static> {
     /// Every modelled operation, each served behind the audit recorder, keyed by the same
     /// routing key the generated table uses.
     audited: OperationRoutingTable,
+    /// The shared engine, for the one pre-dispatch refusal above — which reads this
+    /// service's store and writes nothing to it.
+    engine: std::sync::Arc<Eng>,
 }
 
-impl RequestIdEnvelopeOperation {
+impl<Eng: Send + Sync + 'static> RequestIdEnvelopeOperation<Eng> {
     /// Serve requests through `audited`, falling back to the generated routing table for
     /// a key it does not hold.
-    pub fn new(audited: OperationRoutingTable) -> Self {
-        Self { audited }
+    pub fn new(engine: std::sync::Arc<Eng>, audited: OperationRoutingTable) -> Self {
+        Self { audited, engine }
     }
 
     /// The operation that serves this request, or `None` when nothing names one.
@@ -138,7 +147,7 @@ impl RequestIdEnvelopeOperation {
     }
 }
 
-impl ErasedOperation for RequestIdEnvelopeOperation {
+impl<Eng: Send + Sync + 'static> ErasedOperation for RequestIdEnvelopeOperation<Eng> {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
@@ -146,6 +155,14 @@ impl ErasedOperation for RequestIdEnvelopeOperation {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
+            if let Some(resp) = crate::service::unresolved_reference::refuse_absent_db_cluster(
+                &*self.engine,
+                svc,
+                req,
+                ctx,
+            ) {
+                return with_request_id(resp);
+            }
             match self.operation_for(svc, req) {
                 Some(op) => with_request_id(op.run(svc, req, ctx).await),
                 // Unreachable through `Service::override_operation`, which claims a

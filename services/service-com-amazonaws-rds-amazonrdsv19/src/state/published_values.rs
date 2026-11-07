@@ -1002,6 +1002,11 @@ pub const MAX_IAM_ROLE_ARN_LEN: usize = 2048;
 /// The password itself is never stored or reported — the member is `@sensitive` and RDS
 /// reports no member carrying it — so this is the only place it is looked at at all, and
 /// the refusal quotes the constraint rather than the value.
+///
+/// This is the ALPHABET and LENGTH policy alone, which the password RDS generates for a
+/// managed secret satisfies too. Whether the engine takes a caller-supplied password at all
+/// is [`check_supplied_master_user_password`], the check every operation that reads the
+/// member off a REQUEST runs.
 pub fn check_master_user_password(engine: &str, value: &str) -> Result<(), String> {
     let length = value.chars().count();
     let allowed = master_user_password_len(engine);
@@ -1053,6 +1058,46 @@ pub fn master_user_password_len(engine: &str) -> std::ops::RangeInclusive<usize>
     };
     8..=longest
 }
+
+/// Refuse a `MasterUserPassword` the REQUEST carried, wherever an operation of this front
+/// door reads one: the create that sets the credential and the modification that changes
+/// it, on a DB cluster and on a DB instance alike, so one rule holds across every operation
+/// that takes the member.
+///
+/// An engine whose own API documents the member as one it does not take
+/// ([`engine_takes_a_master_user_password`]) accepts no value for it at all, so every
+/// password supplied for such an engine is refused with [`INVALID_MASTER_PASSWORD_MESSAGE`]
+/// before any length or character rule is read — the request names a credential the
+/// resource has no place for, and a create that accepted it would store state AWS would
+/// never have created. Everything else is the engine's published password policy
+/// ([`check_master_user_password`]).
+pub fn check_supplied_master_user_password(engine: &str, value: &str) -> Result<(), String> {
+    if !engine_takes_a_master_user_password(engine) {
+        return Err(INVALID_MASTER_PASSWORD_MESSAGE.to_string());
+    }
+    check_master_user_password(engine, value)
+}
+
+/// Whether `engine` has a master user password a request may set at all.
+///
+/// The member is not offered by every control plane this front door serves: Amazon
+/// Neptune's own API documents `MasterUserPassword` as "Not supported by Neptune" on every
+/// operation that carries it (`smithy_query(query="doc",shape="CreateDBInstanceMessage",
+/// member="MasterUserPassword")` on that model, and the same sentence on
+/// `CreateDBClusterMessage`, `ModifyDBInstanceMessage` and `ModifyDBClusterMessage`), so
+/// that engine's resources have no master user credential for a request to name and no
+/// value is acceptable for it. Compared case-insensitively, the way every per-engine rule
+/// here compares an engine name.
+pub fn engine_takes_a_master_user_password(engine: &str) -> bool {
+    !engine.eq_ignore_ascii_case(NEPTUNE_ENGINE)
+}
+/// What a `MasterUserPassword` supplied for an engine that takes none
+/// ([`engine_takes_a_master_user_password`]) is refused with.
+///
+/// Entirely FIXED text: the value is `@sensitive`, and this front door echoes no part of it
+/// — not its length, not a character of it — so the sentence names neither the value nor
+/// the member's constraints, which the engine publishes none of.
+pub const INVALID_MASTER_PASSWORD_MESSAGE: &str = "Invalid master password";
 
 /// What a delete that names NEITHER of its two final-snapshot members is refused with.
 ///

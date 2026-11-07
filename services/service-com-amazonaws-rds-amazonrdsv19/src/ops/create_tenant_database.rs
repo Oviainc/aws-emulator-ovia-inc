@@ -331,7 +331,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bound is per engine ([`crate::state::master_user_password_len`]) — the engine
         // here being the one the instance this tenant database belongs to runs.
         if let Some(password) = &input.master_user_password {
-            crate::state::check_master_user_password(&instance_engine, password)
+            crate::state::check_supplied_master_user_password(&instance_engine, password)
                 .map_err(CreateTenantDatabaseError::invalid_parameter_value)?;
         }
 

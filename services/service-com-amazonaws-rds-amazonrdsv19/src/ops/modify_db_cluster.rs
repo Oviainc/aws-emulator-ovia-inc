@@ -529,7 +529,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // checked once the cluster's own engine is in hand — the same check every other
         // operation that sets one makes.
         if let Some(password) = &input.master_user_password {
-            crate::state::check_master_user_password(&engine, password)
+            crate::state::check_supplied_master_user_password(&engine, password)
                 .map_err(ModifyDBClusterError::invalid_parameter_value)?;
         }
 

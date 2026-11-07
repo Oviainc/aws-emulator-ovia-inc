@@ -436,7 +436,7 @@ async fn a_refusal_of_what_the_request_carries_is_a_query_api_parameter_error() 
         },
         // The Serverless v2 capacity a rescale asks for, over the axes the rule spans: past
         // the published ceiling, off the half-step grid, below the published auto-pause
-        // bound (each a VALUE), and a floor above the ceiling (a COMBINATION).
+        // bound, and a floor above the ceiling (each a VALUE the member does not accept).
         Row {
             case: "ModifyDBCluster past the engine version's capacity ceiling",
             action: "ModifyDBCluster",
@@ -446,7 +446,8 @@ async fn a_refusal_of_what_the_request_carries_is_a_query_api_parameter_error() 
             ],
             status: 400,
             code: INVALID_PARAMETER_VALUE,
-            wording: Wording::Says("ServerlessV2ScalingConfiguration.MaxCapacity"),
+            // The service states the value it would not take and the range it will.
+            wording: Wording::Says("Serverless v2 capacity value 256.5 is not valid."),
         },
         Row {
             case: "ModifyDBCluster with a capacity off the half-step grid",
@@ -457,7 +458,7 @@ async fn a_refusal_of_what_the_request_carries_is_a_query_api_parameter_error() 
             ],
             status: 400,
             code: INVALID_PARAMETER_VALUE,
-            wording: Wording::Says("half-step"),
+            wording: Wording::Says("It must be a multiple of 0.5."),
         },
         Row {
             case: "ModifyDBCluster one second below the auto-pause bound",
@@ -479,8 +480,14 @@ async fn a_refusal_of_what_the_request_carries_is_a_query_api_parameter_error() 
                 "ServerlessV2ScalingConfiguration.MaxCapacity" => "4",
             ],
             status: 400,
-            code: INVALID_PARAMETER_COMBINATION,
-            wording: Wording::Says("MinCapacity"),
+            // A floor above the ceiling is a capacity VALUE the member does not accept, and
+            // Amazon RDS answers it with one fixed sentence that names neither value \u2014 the
+            // recorded answer this front door is held to.
+            code: INVALID_PARAMETER_VALUE,
+            wording: Wording::Exact(
+                service_com_amazonaws_rds_amazonrdsv19::state::SERVERLESS_V2_FLOOR_ABOVE_CEILING_MESSAGE
+                    .to_string(),
+            ),
         },
         // A list member that names nothing is refused as the list it is — the modelled
         // `InvalidSubnet` — on both operations that carry such a list, and before the
