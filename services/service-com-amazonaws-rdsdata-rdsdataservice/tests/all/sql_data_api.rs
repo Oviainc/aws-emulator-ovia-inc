@@ -784,9 +784,8 @@ async fn the_json_record_format_returns_the_result_set_as_json() {
         "case NONE: the result set is returned in records, got {plain}"
     );
 
-    // Binary data has no JSON form of its own, so it is rendered the way
-    // PostgreSQL writes a binary value as text: `\x` and the bytes in
-    // hexadecimal.
+    // A binary column is rendered as the base64 text this protocol carries a
+    // `blobValue` as, so the bytes a client base64-decodes are the bytes stored.
     api.run(json!({"sql": "CREATE TABLE blobs (payload BYTEA)"}))
         .await;
     api.run(json!({
@@ -802,7 +801,7 @@ async fn the_json_record_format_returns_the_result_set_as_json() {
         .await;
     assert_eq!(
         rendered["formattedRecords"],
-        json!("[{\"payload\":\"\\\\x000000\"}]"),
+        json!("[{\"payload\":\"AAAA\"}]"),
         "case JSON over a binary value: got {rendered}"
     );
 
@@ -1560,6 +1559,80 @@ async fn an_endless_statement_is_aborted_at_its_deadline() {
         started.elapsed() < service_com_amazonaws_rdsdata_rdsdataservice::state::REQUEST_TIME_BUDGET,
         "case endless statement: the statement budget must cut in before the request budget, took {:?}",
         started.elapsed()
+    );
+}
+
+/// RULE: a statement is bounded at every point the engine can be stopped at, not
+/// only between its instructions. A pattern comparison is ONE instruction, so the
+/// pattern a statement carries is bounded by the engine's own pattern-length
+/// limit (set in `src/state.rs`, far below the engine's default), and a statement
+/// that outruns its deadline inside one operation is unwound from outside the
+/// engine — so every call answers with a modelled response inside the request
+/// budget, and the data plane is still usable afterwards.
+///
+/// The rows differ along the pattern: one a client writes, one past the limit, and
+/// one whose wildcards a pattern matcher would backtrack over.
+#[tokio::test]
+async fn a_pattern_comparison_is_bounded_and_leaves_the_data_plane_usable() {
+    const REQUEST_BUDGET: std::time::Duration =
+        service_com_amazonaws_rdsdata_rdsdataservice::state::REQUEST_TIME_BUDGET;
+    let api = DataApi::new();
+    api.run(json!({"sql": "CREATE TABLE haystack (straw TEXT)"}))
+        .await;
+    api.run(json!({
+        "sql": "INSERT INTO haystack (straw) VALUES (:straw)",
+        "parameters": [parameter("straw", json!({"stringValue": "a".repeat(4096)}))],
+    }))
+    .await;
+
+    for (case, pattern, served) in [
+        ("a pattern a client writes", "%aaa%".to_string(), true),
+        (
+            "a pattern of wildcards a matcher backtracks over",
+            format!("{}b", "%a".repeat(32)),
+            true,
+        ),
+        ("a pattern past the engine's limit", "%a".repeat(4096), false),
+    ] {
+        let started = std::time::Instant::now();
+        let (status, body) = api
+            .execute(json!({
+                "sql": "SELECT count(*) AS found FROM haystack WHERE straw LIKE :pattern",
+                "parameters": [parameter("pattern", json!({"stringValue": pattern}))],
+            }))
+            .await;
+        assert_eq!(
+            status,
+            if served { 200 } else { 400 },
+            "case {case}: got {status} {body}"
+        );
+        if !served {
+            // This refusal is the EMULATOR's own bound surfacing, not a modelled
+            // AWS failure: the real engine would run the comparison. What is
+            // asserted here is that the bound holds and is reported as a refusal
+            // of the request, rather than occupying the data plane.
+            assert_eq!(
+                error_code(&body),
+                "BadRequestException",
+                "case {case}: a pattern the engine refuses is the caller's request being \
+                 refused, got {body}"
+            );
+        }
+        assert!(
+            started.elapsed() < REQUEST_BUDGET,
+            "case {case}: the call must answer inside the request budget, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    // The data plane is still there afterwards: nothing was left holding it.
+    let counted = api
+        .run(json!({"sql": "SELECT count(*) AS rows FROM haystack"}))
+        .await;
+    assert_eq!(
+        counted["records"],
+        json!([[{"longValue": 1}]]),
+        "case after the refused patterns: the row is still readable, got {counted}"
     );
 }
 

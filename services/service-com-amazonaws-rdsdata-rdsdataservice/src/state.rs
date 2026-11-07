@@ -163,6 +163,18 @@ const MAX_EXPRESSION_DEPTH: i32 = 200;
 pub(crate) const MAX_COMPOUND_SELECT: i32 = 20;
 const MAX_BOUND_PARAMETERS: i32 = 1_000;
 
+/// `SQLITE_LIMIT_LIKE_PATTERN_LENGTH`: the longest `LIKE`/`GLOB` pattern one
+/// comparison may carry.
+///
+/// The engine's documented bound on the one operation its instruction counter
+/// cannot preempt: a pattern comparison is a single virtual-machine instruction,
+/// and the matcher's cost grows with the pattern, so the engine's own limit on
+/// pattern length is what bounds the longest stretch a statement can spend
+/// between two points where [`Database::run_within`]'s deadline is checked. Set
+/// far below the engine's own 50 000-byte default and well above any pattern a
+/// client writes (a `LIKE` a person or an ORM writes is a few dozen bytes).
+const MAX_LIKE_PATTERN_BYTES: i32 = 1_024;
+
 /// `max_page_count`: 64 MiB per database at SQLite's 4 KiB default page size. The
 /// engine answers `SQLITE_FULL` past it, so the rows a caller inserts cannot grow
 /// the process without limit. Applied to EVERY schema the connection has — see
@@ -622,6 +634,7 @@ impl Database {
             (Limit::SQLITE_LIMIT_EXPR_DEPTH, MAX_EXPRESSION_DEPTH),
             (Limit::SQLITE_LIMIT_COMPOUND_SELECT, MAX_COMPOUND_SELECT),
             (Limit::SQLITE_LIMIT_VARIABLE_NUMBER, MAX_BOUND_PARAMETERS),
+            (Limit::SQLITE_LIMIT_LIKE_PATTERN_LENGTH, MAX_LIKE_PATTERN_BYTES),
         ] {
             conn.set_limit(limit, value).map_err(SqlError::unavailable)?;
         }
@@ -752,6 +765,15 @@ impl Database {
     /// The engine decides everything: whether the statement produces a result set
     /// (`column_count`), how many rows it changed (`changes`), and the type of
     /// every value it returns.
+    ///
+    /// The deadline is enforced from BOTH sides of the engine, because the
+    /// progress handler alone cannot reach inside ONE virtual-machine instruction
+    /// (a single function call, one pattern comparison) — and this request holds
+    /// the state lock for as long as the engine stays inside it: the handler
+    /// aborts the statement at the first instruction boundary past the deadline,
+    /// and a [`Watchdog`] asks the engine to unwind whatever it is in when that
+    /// same deadline passes. Both arrive as the engine's interrupted code, which
+    /// is the modelled `StatementTimeoutException`.
     pub fn run_within(
         &mut self,
         budget: &mut RequestBudget,
@@ -763,7 +785,11 @@ impl Database {
             PROGRESS_HANDLER_OPS,
             Some(move || Instant::now() >= deadline),
         );
+        let watchdog = Watchdog::arm(self.conn.get_interrupt_handle(), deadline);
         let outcome = self.run_bounded(budget, sql, parameters);
+        // Dismissed first, so the engine is never asked to unwind a statement
+        // that is no longer running.
+        drop(watchdog);
         self.conn
             .progress_handler(PROGRESS_HANDLER_OPS, None::<fn() -> bool>);
         outcome
@@ -980,6 +1006,75 @@ impl Database {
     }
 }
 
+/// The statement deadline enforced from OUTSIDE the engine.
+///
+/// [`Database::run_within`]'s progress handler stops a statement between two
+/// virtual-machine instructions, which is every boundary the engine offers the
+/// caller — but ONE instruction runs to completion whatever the clock says, and
+/// it runs while this request holds the state lock, so the handler alone leaves
+/// the lock-holding window as long as the engine's longest single operation. This
+/// is the other side of the same deadline: a thread that waits for it and then
+/// asks the engine to unwind whatever it is in (the interrupt the engine reports
+/// as `StatementTimeoutException`), dismissed the moment the statement returns.
+///
+/// Dismissal is the SENDER being dropped: the thread waits on the channel until
+/// the deadline, so it costs nothing until it fires and never outlives the
+/// statement it was armed for.
+struct Watchdog {
+    dismiss: Option<std::sync::mpsc::Sender<()>>,
+    waiting: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watchdog {
+    /// Watch one statement until `deadline`.
+    ///
+    /// A thread this cannot start leaves the statement bounded by the progress
+    /// handler alone, which is the bound that was there before: it is reported
+    /// and the statement runs, rather than failing a request because the host
+    /// would not give out a thread.
+    fn arm(engine: rusqlite::InterruptHandle, deadline: Instant) -> Self {
+        let (dismiss, dismissed) = std::sync::mpsc::channel::<()>();
+        let waiting = std::thread::Builder::new()
+            .name("rdsdata-statement-deadline".to_string())
+            .spawn(move || {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                // A disconnected channel is the statement having returned; only
+                // the deadline passing interrupts the engine.
+                if dismissed.recv_timeout(wait) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                    engine.interrupt();
+                }
+            });
+        match waiting {
+            Ok(waiting) => Self {
+                dismiss: Some(dismiss),
+                waiting: Some(waiting),
+            },
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "the rds-data data plane could not watch a statement's deadline from outside \
+                     the engine"
+                );
+                Self {
+                    dismiss: None,
+                    waiting: None,
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        // Dismiss first, then wait for the thread to see it, so no interrupt is
+        // in flight once this returns.
+        drop(self.dismiss.take());
+        if let Some(waiting) = self.waiting.take() {
+            let _ = waiting.join();
+        }
+    }
+}
+
 /// A transaction a caller opened with `BeginTransaction`.
 #[derive(Debug)]
 pub struct Transaction {
@@ -1105,8 +1200,8 @@ impl StatementOutcome {
     /// allocated rather than materialising a map per row and then a second full
     /// copy of the whole body.
     ///
-    /// `Err` when the body would pass the budget, or when a value has no JSON form
-    /// in this emulator (a blob) — both answered with the modelled
+    /// `Err` when the body would pass the budget, or when a value has no JSON
+    /// form at all (see [`json_for`]) — both answered with the modelled
     /// `UnsupportedResultException`.
     pub fn formatted_records(&self, budget: &mut RequestBudget) -> Result<String, SqlError> {
         let mut formatted = String::from("[");
@@ -1772,20 +1867,10 @@ pub fn field_for(
 /// else, so an array carrying a NULL among its elements is refused rather than
 /// returned with that element silently dropped.
 fn array_value(text: &str, pg: &PgType) -> Result<ArrayValue, SqlError> {
-    let unsupported = || {
-        SqlError::UnsupportedResult(format!(
-            "The result contains the unsupported data type {}.",
-            pg.name.to_ascii_uppercase()
-        ))
-    };
+    let unsupported = || unsupported_type(pg);
     let elements = read_array(text).ok_or_else(unsupported)?;
-    if elements
-        .iter()
-        .any(|element| matches!(element, serde_json::Value::Array(_)))
-    {
-        return Err(SqlError::UnsupportedResult(
-            "The result contains a multidimensional array.".to_string(),
-        ));
+    if holds_an_array(&elements) {
+        return Err(multidimensional_array());
     }
     let element = pg.element().ok_or_else(unsupported)?;
     Ok(match element.class {
@@ -1977,7 +2062,42 @@ fn in_integer_range(number: f64) -> bool {
     number.is_finite() && number >= -(2_f64.powi(63)) && number < 2_f64.powi(63)
 }
 
+/// What the modelled `UnsupportedResultException` says about a result carrying a
+/// value of a type it has no form for — the model's own wording for the
+/// condition: "It contained an unsupported data type".
+fn unsupported_type(pg: &PgType) -> SqlError {
+    SqlError::UnsupportedResult(format!(
+        "The result contains the unsupported data type {}.",
+        pg.name.to_ascii_uppercase()
+    ))
+}
+
+/// The same exception for the OTHER result the model names: "It contained a
+/// multidimensional array". Worded once, in the type catalog, so a nested array
+/// is refused in the same words whichever form the result set was asked for.
+fn multidimensional_array() -> SqlError {
+    SqlError::UnsupportedResult(postgres::MULTIDIMENSIONAL_ARRAY.to_string())
+}
+
+/// Whether an array value holds an array among its elements, which is the
+/// multidimensional array the model names.
+fn holds_an_array(elements: &[serde_json::Value]) -> bool {
+    elements
+        .iter()
+        .any(|element| matches!(element, serde_json::Value::Array(_)))
+}
+
 /// One value inside a `formatRecordsAs=JSON` result set.
+///
+/// The rule: a value is rendered in the JSON form of the `Field` member its
+/// COLUMN's type names, so a client reading the JSON string sees the same value,
+/// of the same JSON type, as it would in `records`. The `Field` union models
+/// `booleanValue` as a boolean and `blobValue` as a blob — which this protocol
+/// carries base64-encoded — so a boolean column is one of the JSON literals
+/// `true`/`false` and a binary column is its base64 text; a number is a JSON
+/// number, text and a date or time are JSON strings, a NULL is `null`, and an
+/// array column is a JSON array whose elements take the form their ELEMENT type
+/// names (see [`json_element`]).
 fn json_for(value: &SqlValue, column: &ColumnInfo) -> Result<serde_json::Value, SqlError> {
     Ok(match value {
         SqlValue::Null => serde_json::Value::Null,
@@ -2002,21 +2122,62 @@ fn json_for(value: &SqlValue, column: &ColumnInfo) -> Result<serde_json::Value, 
         // An array column's value is the list of its elements, not the text the
         // engine holds that list as.
         SqlValue::Text(text) if column.pg.class == TypeClass::Array => {
-            let elements = read_array(text).ok_or_else(|| {
-                SqlError::UnsupportedResult(format!(
-                    "The result contains the unsupported data type {}.",
-                    column.pg.name.to_ascii_uppercase()
-                ))
-            })?;
-            serde_json::Value::Array(elements)
+            let elements = read_array(text).ok_or_else(|| unsupported_type(&column.pg))?;
+            if holds_an_array(&elements) {
+                return Err(multidimensional_array());
+            }
+            let element_type = column.pg.element().ok_or_else(|| unsupported_type(&column.pg))?;
+            serde_json::Value::Array(
+                elements
+                    .iter()
+                    .map(|element| json_element(element, element_type))
+                    .collect::<Option<Vec<serde_json::Value>>>()
+                    .ok_or_else(|| unsupported_type(&column.pg))?,
+            )
         }
         SqlValue::Text(text) => serde_json::Value::String(text.clone()),
-        // JSON has no form for binary data, so it is rendered the way PostgreSQL
-        // itself writes a binary value as text: `\x` followed by its bytes in
-        // hexadecimal, which is what its documented default `bytea_output`
-        // setting produces.
-        SqlValue::Blob(bytes) => serde_json::Value::String(format!("\\x{}", hex::encode(bytes))),
+        // A blob is what the `Field` union's `blobValue` carries, and this
+        // protocol carries a blob as its base64 text — so that is the text a
+        // binary column is rendered as here too, and a client that base64-decodes
+        // it gets the bytes that are stored. Coded by the same standard-alphabet
+        // codec the protocol itself uses, so the two cannot disagree.
+        SqlValue::Blob(bytes) => {
+            serde_json::Value::String(::aws_smithy_types::base64::encode(bytes))
+        }
     })
+}
+
+/// One element of an array column inside a `formatRecordsAs=JSON` result set: the
+/// JSON form the array's ELEMENT type names, read off the element the engine
+/// holds — the same element-type mapping [`array_value`] uses to choose the
+/// `ArrayValue` list an element comes back in, with the two differences JSON
+/// itself makes: an exact number is a JSON number (as a scalar one is above,
+/// where `records` follows `decimalReturnType` and writes it as text), and a NULL
+/// element has a JSON form where the union's lists have no room for one.
+///
+/// `None` for an element whose type has no form of its own: an array of arrays,
+/// or an array of a type the `Field` union cannot carry.
+fn json_element(element: &serde_json::Value, element_type: &PgType) -> Option<serde_json::Value> {
+    // JSON has a form for a missing value, so an array's NULL element is reported
+    // as that form whatever the element type is. It is the `ArrayValue` union's
+    // lists that have no room for one.
+    if element.is_null() {
+        return Some(serde_json::Value::Null);
+    }
+    match element_type.class {
+        TypeClass::Boolean => boolean_element(element).map(serde_json::Value::Bool),
+        TypeClass::Integer => integer_element(element).map(serde_json::Value::from),
+        // Both number classes are JSON numbers, as a scalar number of either is
+        // above; a value JSON cannot represent is refused rather than reported as
+        // something else.
+        TypeClass::Float | TypeClass::Decimal => float_element(element)
+            .and_then(serde_json::Number::from_f64)
+            .map(serde_json::Value::Number),
+        TypeClass::Text | TypeClass::Temporal => {
+            text_element(element).map(serde_json::Value::String)
+        }
+        TypeClass::Binary | TypeClass::Array | TypeClass::Other => None,
+    }
 }
 
 /// An owned copy of a value the engine handed back.

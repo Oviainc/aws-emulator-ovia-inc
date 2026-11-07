@@ -165,7 +165,7 @@ mod jdbc {
 /// What the modelled `UnsupportedResultException` says about a result whose type
 /// it cannot carry. The model's own wording for the condition: "It contained a
 /// multidimensional array."
-const MULTIDIMENSIONAL_ARRAY: &str = "The result contains a multidimensional array.";
+pub(super) const MULTIDIMENSIONAL_ARRAY: &str = "The result contains a multidimensional array.";
 
 /// What a value of a type is, as far as the `Field` union is concerned: the
 /// member a value comes back in, and whether a number is exact.

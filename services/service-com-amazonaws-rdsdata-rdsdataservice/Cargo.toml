@@ -20,10 +20,6 @@ tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
-# Hexadecimal, for the text form PostgreSQL gives a binary value
-# (`bytea_output = hex`), which is how a binary value is rendered in the JSON
-# record format.
-hex = { workspace = true }
 tracing = { workspace = true }
 # The SQL engine this service's data plane runs on: caller statements are parsed,
 # planned and executed by SQLite in-process, never by a hand-written SQL subset.
@@ -58,6 +54,10 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# Hexadecimal, for writing a byte string as text in this crate's suites: the
+# bytes a binary column holds are written in hex and the base64 the response
+# carries them as is decoded back to them.
+hex = { workspace = true }
 
 [lints]
 workspace = true
