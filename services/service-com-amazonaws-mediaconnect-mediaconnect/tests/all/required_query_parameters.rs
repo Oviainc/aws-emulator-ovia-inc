@@ -162,7 +162,11 @@ fn with_labels_filled(uri_pattern: &str) -> String {
 /// The clause this service states for a required member the request supplied nothing for:
 /// the framework's own sentence, which names the member and the rule it broke (see
 /// `src/service.rs`, where every boundary refusal of this service is worded).
-fn missing_member_clause(member_path: &str) -> String {
+///
+/// `pub(crate)` because the tag-removal suite asserts the same sentence for the routes it
+/// drives (`tests/all/tag_removal_without_tag_keys.rs`), so there is one spelling of it in
+/// this test binary.
+pub(crate) fn missing_member_clause(member_path: &str) -> String {
     format!("Value null at '{member_path}' failed to satisfy constraint: Member must not be null")
 }
 
@@ -176,7 +180,9 @@ fn with_parameter(target: &str, parameter: &str, value: &str) -> String {
 
 /// The message of a reply, whichever casing the envelope carries: a framework refusal
 /// renders `message`, a modelled error the model's own `Message` member.
-fn message_of(body: &Value) -> String {
+///
+/// `pub(crate)` because the tag-removal suite reads the message off a reply the same way.
+pub(crate) fn message_of(body: &Value) -> String {
     body.get("message")
         .or_else(|| body.get("Message"))
         .and_then(Value::as_str)

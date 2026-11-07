@@ -72,7 +72,11 @@ pub(crate) async fn tag_global(emulator: &Emulator, resource_arn: &str, tags: Va
 
 /// `POST /tags/{ResourceArn}` — the REGIONAL tag write, for the cases that pin which
 /// operation reaches which resource.
-async fn tag_regional(emulator: &Emulator, resource_arn: &str, tags: Value) -> Reply {
+///
+/// `pub(crate)` because the tag-removal suite tags its REGIONAL subject through this same
+/// write (`tests/all/tag_removal_without_tag_keys.rs`), so both suites put tags on a
+/// resource with one request shape.
+pub(crate) async fn tag_regional(emulator: &Emulator, resource_arn: &str, tags: Value) -> Reply {
     emulator
         .send(
             "POST",

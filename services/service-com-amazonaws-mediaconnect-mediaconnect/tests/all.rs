@@ -249,3 +249,5 @@ mod bridge_flow_output_capacity;
 mod router_input_configuration_consistency;
 #[path = "all/add_bridge_outputs_bridge_retirement.rs"]
 mod add_bridge_outputs_bridge_retirement;
+#[path = "all/tag_removal_without_tag_keys.rs"]
+mod tag_removal_without_tag_keys;
