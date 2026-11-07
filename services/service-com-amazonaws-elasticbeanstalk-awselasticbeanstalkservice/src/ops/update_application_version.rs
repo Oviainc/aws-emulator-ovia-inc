@@ -145,6 +145,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut store = state.lock();
+        // The version this call reports back carries the status its
+        // pre-processing reached, so the processing the clock has already
+        // finished is materialised before the record is read.
+        store.materialize_due_version_processing();
 
         // `ApplicationName`: "If no application is found with this name,
         // UpdateApplication returns an InvalidParameterValue error."

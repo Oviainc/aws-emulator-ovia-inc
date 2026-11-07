@@ -21,8 +21,9 @@
 //! file, re-exported here so every path into `crate::state` keeps working: the
 //! platform catalog ([`platform_catalog`]), the configuration-option catalog
 //! ([`configuration_option_catalog`]), the managed-action schedule
-//! ([`managed_action_schedule`]) and the enhanced-health derivations
-//! ([`environment_health`]).
+//! ([`managed_action_schedule`]), the enhanced-health derivations
+//! ([`environment_health`]) and the pre-processing of an application version's
+//! source bundle ([`version_processing`]).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -46,11 +47,13 @@ pub mod configuration_option_catalog;
 pub mod environment_health;
 pub mod managed_action_schedule;
 pub mod platform_catalog;
+pub mod version_processing;
 
 pub use configuration_option_catalog::*;
 pub use environment_health::*;
 pub use managed_action_schedule::*;
 pub use platform_catalog::*;
+pub use version_processing::*;
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
 /// (`arnNamespace: elasticbeanstalk`).
@@ -279,8 +282,10 @@ const WEB_SERVER_ONLY: &[&str] = &[TIER_WEB_SERVER];
 /// environment of either tier can run on it.
 const NO_TIERS: &[&str] = &[];
 
-/// The only `ApplicationVersionStatus` this service reports: it runs no version
-/// processing pipeline, so a stored version is never `Processing`/`Processed`.
+/// `ApplicationVersionStatus$Unprocessed` — "Application version wasn't
+/// pre-processed or validated", the status of a version whose create did not ask
+/// for pre-processing. A create that DID ask for it reports the statuses in
+/// [`version_processing`] instead.
 ///
 /// The modelled enum spells its values in mixed case (`Unprocessed`), but the
 /// real service puts an application version's processing status on the wire
@@ -750,6 +755,25 @@ fn s3_client(
     ::aws_sdk_s3::Client::from_conf(config)
 }
 
+/// Whether an Amazon S3 answer to a read of a caller-named object says anything
+/// about that OBJECT: a 404 (the bucket or the key is not there) and a 403
+/// carrying one of [`DENIED_ARCHIVE_CODES`] do; anything else says nothing about
+/// it — an emulator assembled without object storage answers the router's own
+/// `UnknownService`, an authentication refusal is about the signer, and a
+/// transport failure answers nothing at all.
+///
+/// The one statement of that classification, so the create's existence check
+/// ([`archive_download_refusal`]) and the pre-processing that reads the same
+/// archive ([`version_processing::process_source_bundle`]) cannot disagree about
+/// which answers are about the caller's archive.
+pub(crate) fn answer_is_about_the_object(status: Option<u16>, code: &str) -> bool {
+    match status {
+        Some(ARCHIVE_ABSENT_STATUS) => ABSENT_ARCHIVE_CODES.contains(&code),
+        Some(ARCHIVE_DENIED_STATUS) => DENIED_ARCHIVE_CODES.contains(&code),
+        _ => false,
+    }
+}
+
 /// The refusal message for the Amazon S3 archive at `location`, or `None` when object
 /// storage says the archive is there and readable.
 ///
@@ -810,12 +834,7 @@ pub async fn archive_download_refusal(
         .raw_response()
         .map(|response| response.status().as_u16());
     let code = failure.code().unwrap_or_default().to_string();
-    let about_the_object = match status {
-        Some(ARCHIVE_ABSENT_STATUS) => ABSENT_ARCHIVE_CODES.contains(&code.as_str()),
-        Some(ARCHIVE_DENIED_STATUS) => DENIED_ARCHIVE_CODES.contains(&code.as_str()),
-        _ => false,
-    };
-    if !about_the_object {
+    if !answer_is_about_the_object(status, &code) {
         ::tracing::warn!(
             bucket,
             key,
@@ -1576,8 +1595,11 @@ pub struct ApplicationVersion {
     pub arn: String,
     pub description: Option<String>,
     pub source_bundle: Option<S3Location>,
-    /// What the caller asked for in `Process`, echoed back. Nothing processes the
-    /// bundle here, so [`Self::status`] stays `Unprocessed` either way.
+    /// What the caller asked for in `Process`: whether Elastic Beanstalk
+    /// "pre-processed and validated the environment manifest (env.yaml) and
+    /// configuration files (*.config files in the .ebextensions folder) in the
+    /// source bundle of the application version", which is what moved
+    /// [`Self::status`] off `Unprocessed`.
     pub process: Option<bool>,
     pub status: String,
     pub date_created: ::aws_smithy_types::DateTime,
@@ -1586,6 +1608,9 @@ pub struct ApplicationVersion {
     /// Creation order within this emulator, so "newest first" is a total order
     /// even for versions created inside one clock tick.
     pub sequence: u64,
+    /// The pre-processing the clock owes this version, once a create that asked
+    /// for it has started one. See [`PendingVersionProcessing`].
+    pub pending_processing: Option<PendingVersionProcessing>,
 }
 
 impl ApplicationVersion {
@@ -3920,7 +3945,8 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     }
 
     /// Materialise every change the clock has already made due — an
-    /// environment's status, a platform version's status, an application whose
+    /// environment's status, a platform version's status, an application
+    /// version's pre-processing, an application whose
     /// deletion has completed and a managed action that has finished — record
     /// the event each completed change owes, and drop the events the clock has
     /// carried out of the reporting window. Every handler that reads or acts on
@@ -3929,6 +3955,7 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     pub fn materialize_due_transitions(&mut self) {
         let at = Instant::now();
         self.materialize_due_application_deletions(at);
+        self.materialize_due_version_processing_at(at);
         // The event cannot be appended while `environments` is borrowed, so the
         // completions are collected first and recorded below.
         let mut completed: Vec<CompletedTransition> = Vec::new();

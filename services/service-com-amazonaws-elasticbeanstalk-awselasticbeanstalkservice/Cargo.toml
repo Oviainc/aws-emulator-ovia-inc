@@ -33,6 +33,15 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", 
 # id needs no hash or codec written here.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# An Elastic Beanstalk source bundle is a single .zip (or .war, which is one too), and
+# `CreateApplicationVersion$Process` pre-processes the files INSIDE it, so the archive
+# format is read by the archive reader rather than by this emulator.
+zip = { version = "9", default-features = false, features = ["deflate"] }
+# Parses the `env.yaml` manifest and the `.ebextensions/*.config` files that
+# pre-processing validates; yaml-rust2 is the pure-Rust YAML 1.2 implementation the
+# other services that read caller-supplied YAML use (YAML 1.2 is a superset of JSON,
+# which a configuration file may be written in instead).
+yaml-rust2 = { version = "0.10", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -42,6 +51,9 @@ emulator-core-build-support = { workspace = true }
 # because CreateApplicationVersion and CreatePlatformVersion download the archive their
 # request names by calling object storage in process.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The pre-processing suite writes the source bundles it uploads in memory, the way a
+# caller writes the .zip it uploads.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true

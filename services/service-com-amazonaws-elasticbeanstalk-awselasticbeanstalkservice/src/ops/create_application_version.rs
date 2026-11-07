@@ -2,7 +2,9 @@
 
 //! @op CreateApplicationVersion
 //! Implemented: downloads the source bundle the request names (refusing the create when
-//! object storage cannot hand it back), stores the application version (creating its
+//! object storage cannot hand it back), pre-processes and validates that bundle when
+//! `Process` asks for it — so the version reports `Processing` and then the terminal
+//! status that validation reached — stores the application version (creating its
 //! application when `AutoCreateApplication` asks for it) and answers with the
 //! `ApplicationVersionDescription` built from what was stored. This is the ONLY file to
 //! touch for this operation.
@@ -211,6 +213,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
         }
+        // `Process`: "Pre-processes and validates the environment manifest
+        // (env.yaml) and configuration files (*.config files in the
+        // .ebextensions folder) in the source bundle." A create that asks for it
+        // reads the archive it named and validates those files, so the version
+        // reaches a terminal `ApplicationVersionStatus` — `Processed` when they
+        // validate, `Failed` when they do not — rather than staying at
+        // `Unprocessed` ("Application version wasn't pre-processed or
+        // validated"). The read happens HERE, before the store is locked: it
+        // awaits object storage.
+        //
+        // A request that asks for processing but names no source bundle in
+        // object storage has no archive this emulator can read — the sample
+        // application is not an object it holds, and nothing here runs the
+        // CodeBuild build a `SourceBuildInformation` version is built by — so
+        // nothing pre-processes such a version and it stays `Unprocessed`.
+        let pending_processing = match (input.process, input.source_bundle.as_ref()) {
+            (Some(true), Some(source_bundle)) => {
+                let verdict =
+                    crate::state::process_source_bundle(ctx, &region, source_bundle).await;
+                crate::state::PendingVersionProcessing::started(verdict)
+            }
+            _ => None,
+        };
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateApplicationVersionError::internal_failure(
                 "the Elastic Beanstalk store is unavailable",
@@ -335,15 +360,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .then(|| crate::state::sample_application_source_bundle(&region))
             }),
             process: input.process,
-            // Nothing here builds or validates a source bundle, so the version
-            // stays at the status a version has before processing: it is never
-            // reported `Processing`, `Processed`, `Building` or `Failed` for work
-            // that did not run.
-            status: crate::state::VERSION_STATUS_UNPROCESSED.to_string(),
+            // The status a version starts in: `Processing` while the
+            // pre-processing the clock owes it is outstanding, and `Unprocessed`
+            // when nothing is processing it.
+            status: crate::state::ApplicationVersion::initial_status(pending_processing.as_ref()),
             date_created: created,
             date_updated: created,
             tags: input.tags.unwrap_or_default(),
             sequence,
+            pending_processing,
         };
         let description = version.to_description();
         store.application_versions.insert(key, version);

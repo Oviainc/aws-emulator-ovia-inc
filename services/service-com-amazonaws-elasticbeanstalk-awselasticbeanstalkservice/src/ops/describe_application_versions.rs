@@ -152,10 +152,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the Elastic Beanstalk store is unavailable",
             )
         })?;
-        // A report: the store is only READ here. Nothing about an application
-        // version changes with the clock, so this operation owes no
-        // materialisation either.
-        let store = state.lock();
+        // A report: the store is only READ here, apart from the version
+        // pre-processing the clock has already finished, which was due at an
+        // instant that had passed whether or not anybody called.
+        let mut store = state.lock();
+        store.materialize_due_version_processing();
 
         // Both members are filters over the stored versions: "Specify an
         // application name to show only application versions for that

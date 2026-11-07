@@ -15,6 +15,8 @@
 mod abort_environment_update;
 #[path = "all/account_and_platform_catalog.rs"]
 mod account_and_platform_catalog;
+#[path = "all/application_version_processing.rs"]
+mod application_version_processing;
 #[path = "all/application_version_updates.rs"]
 mod application_version_updates;
 #[path = "all/application_versions.rs"]
