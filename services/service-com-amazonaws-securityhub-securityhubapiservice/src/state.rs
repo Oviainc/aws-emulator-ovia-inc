@@ -24,6 +24,13 @@ use crate::ops::types::{
     StandardsSubscription, StringFilter, Workflow,
 };
 
+/// The published security controls — the standard-agnostic control catalog and how a
+/// control definition is reported — kept beside the per-standard control sets below
+/// rather than inside them, because a security control belongs to no standard.
+mod security_controls;
+
+pub use security_controls::*;
+
 /// The hub resource is one per account and Region, named `hub/default`.
 pub type HubKey = (String, String);
 

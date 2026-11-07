@@ -30,6 +30,9 @@ mod member_unknown_accounts;
 // And this one, for the same reason.
 #[path = "all/standards_controls.rs"]
 mod standards_controls;
+// And this one, for the same reason.
+#[path = "all/security_control_definitions.rs"]
+mod security_control_definitions;
 #[path = "all/action_targets.rs"]
 mod action_targets;
 #[path = "all/automation_rules.rs"]
