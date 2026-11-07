@@ -24,6 +24,17 @@ aws-smithy-types = { workspace = true }
 # Invoking a user pool's configured Lambda triggers, over the in-process callback
 # into this same emulator (`src/state/lambda_triggers.rs`).
 aws-sdk-lambda = { version = "1", default-features = false }
+# The clients that resolve a user pool's log delivery destinations where the services
+# that own them hold them, over the in-process callback into this same emulator
+# (`src/ops/set_log_delivery_configuration/log_destinations.rs`): a CloudWatch Logs log
+# group, an Amazon Data Firehose stream and an Amazon S3 bucket. No network client
+# feature is enabled: the transport is the emulator's own.
+aws-sdk-cloudwatchlogs = { version = "1", default-features = false }
+# Pinned: from 1.127.0 this client requires `aws-smithy-http` 0.64.3, which the
+# workspace's signing stack does not resolve to; 1.126.0 is the newest release that
+# builds against the `aws-smithy-http` this lock already holds.
+aws-sdk-firehose = { version = "=1.126.0", default-features = false }
+aws-sdk-s3 = { version = "1", default-features = false }
 # `time` on top of the workspace features: a user-pool Lambda trigger invocation is
 # bounded by Amazon Cognito's own trigger budget (`src/state/lambda_triggers.rs`), which
 # `tokio::time::timeout` applies.
@@ -59,6 +70,13 @@ hex = { workspace = true }
 # awsJson body: the web-ACL suite encodes its search strings with the same coder the
 # wafv2 crate decodes them with.
 base64 = "0.22"
+# The log-delivery suite mounts the services that OWN a user pool's log delivery
+# destinations beside this one on a single engine — exactly as the assembled emulator
+# does — because `SetLogDeliveryConfiguration` resolves each destination by calling
+# them in process.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+service-com-amazonaws-firehose-firehose-20150804 = { workspace = true }
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

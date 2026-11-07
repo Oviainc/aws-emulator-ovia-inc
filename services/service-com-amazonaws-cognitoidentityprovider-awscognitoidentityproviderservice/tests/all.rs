@@ -153,6 +153,8 @@ mod managed_login_branding;
 mod managed_login_branding_updates;
 #[path = "all/log_delivery_configuration.rs"]
 mod log_delivery_configuration;
+#[path = "all/log_delivery_destinations.rs"]
+mod log_delivery_destinations;
 #[path = "all/message_delivery_and_live_codes.rs"]
 mod message_delivery_and_live_codes;
 #[path = "all/not_found_sentence_per_operation.rs"]

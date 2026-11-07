@@ -5,8 +5,9 @@
 //! This call SETS the whole collection: the pool's stored `LogConfigurations`
 //! become the ones the request carries, so an empty collection is a clear and a
 //! configuration the request leaves out is one the pool no longer has. Every entry
-//! is judged BEFORE anything is written, so a refused request leaves the pool's
-//! logging configuration exactly as it was.
+//! is judged BEFORE anything is written — including the DESTINATION it names, which
+//! is resolved against the service that holds it ([`log_destinations`]) — so a
+//! refused request leaves the pool's logging configuration exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +85,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// Resolving a log delivery destination against the service that owns it is this
+// operation's own concern, so it lives in this operation's own directory. The explicit
+// `#[path]` is needed because the generated `ops` module declares this file with a
+// `#[path]` of its own, which makes `src/ops/` the directory rustc looks in for a bare
+// child declaration.
+#[path = "set_log_delivery_configuration/log_destinations.rs"]
+mod log_destinations;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -157,19 +166,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
+
+        // The pool's feature plan and its Region are read under the guard, which is
+        // then released: resolving a destination against the service that holds it
+        // is an await, and no lock over this service's state is held across one.
+        let (user_pool_tier, pool_region) = {
+            let guard = state.lock();
+            let pool = guard
+                .pool(&input.user_pool_id)
+                .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+            (pool.user_pool_tier.clone(), pool.region.clone())
+        };
+
+        // The whole collection is judged before the first entry is stored, so a
+        // request with one unacceptable entry changes nothing at all.
+        check_request(&input.log_configurations, &user_pool_tier)?;
+
+        // A pool exports its logs to resources of OTHER services, so a destination
+        // is accepted only once the service that owns it reports holding what the
+        // ARN names.
+        if log_destinations::names_an_unresolvable_destination(
+            ctx,
+            &pool_region,
+            &input.log_configurations,
+        )
+        .await
+        {
+            return Err(invalid_parameter(
+                log_destinations::INVALID_DESTINATION_MESSAGE.to_string(),
+            ));
+        }
 
         let mut guard = state.lock();
         let pool = guard
             .pool_mut(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
-
-        // The whole collection is judged before the first entry is stored, so a
-        // request with one unacceptable entry changes nothing at all.
-        check_request(&input.log_configurations, &pool.user_pool_tier)?;
 
         // A SET replaces the collection: what the pool reports from here on is
         // exactly what this request carried, empty collection included.
