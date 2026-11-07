@@ -31,6 +31,8 @@ mod discovery_health_views;
 mod dns_config_defaults;
 #[path = "all/instance_health_status.rs"]
 mod instance_health_status;
+#[path = "all/instance_operations_missing_service.rs"]
+mod instance_operations_missing_service;
 #[path = "all/list_instances.rs"]
 mod list_instances;
 #[path = "all/list_operations.rs"]
