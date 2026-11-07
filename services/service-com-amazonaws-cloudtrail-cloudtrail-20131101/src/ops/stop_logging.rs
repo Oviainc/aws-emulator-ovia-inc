@@ -179,6 +179,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Whether the account's CloudTrail is LOGGING changes here, so the projection the
+        // management-event fan-out reads is refreshed when this call returns.
+        let _refreshed = crate::state::LoggingTrailsRefreshed::on_return(&*self.engine);
         let region = crate::state::request_region(ctx.parts());
         self.stop(input, &region)
     }

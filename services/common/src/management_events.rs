@@ -28,6 +28,13 @@
 //! Both are materialised on the WRITE path ([`ManagementEventLog::record`] prunes what
 //! the clock has already made due), never on a read: a lookup must not change what a
 //! later lookup sees.
+//!
+//! The log is also where the account's OTHER reader of a management event is served from.
+//! While a trail of the Region is logging, CloudTrail publishes each call it logs onto the
+//! account's default EventBridge bus, so the log carries the one fact that decision needs —
+//! which trails are logging, projected here by CloudTrail ([`DeliveringTrail`]) — and
+//! [`ManagementEventLog::record_delivered`] answers the event to publish beside the record
+//! it just wrote. The channel itself is [`crate::api_call_events`].
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1208,6 +1215,103 @@ pub struct ManagementEventLog {
     events: VecDeque<ManagementEvent>,
     /// The ordinal the next record takes.
     next_seq: u64,
+    /// Which trails of the account are LOGGING, keyed by trail ARN — the one fact a
+    /// recorded call needs that belongs to CloudTrail: whether the account's CloudTrail
+    /// delivers this Region's management events, which is what decides the EventBridge
+    /// fan-out ([`Self::record_delivered`]).
+    ///
+    /// Not a second copy of a trail: a trail's own record — its destination, its tags,
+    /// everything `DescribeTrails` reports — stays in CloudTrail's store, which is the only
+    /// writer here ([`Self::trails_delivering`]). What is projected is the DELIVERY
+    /// decision, because the service that records a call cannot read CloudTrail's store and
+    /// the fan-out is decided on the recording path.
+    delivering_trails: Vec<DeliveringTrail>,
+}
+
+/// Which class of management events a trail logs, as `EventSelector$ReadWriteType` states
+/// it: "ReadOnly", "WriteOnly" or "All".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ManagementEventClass {
+    /// Read-only calls only.
+    ReadOnly,
+    /// Write (mutating) calls only.
+    WriteOnly,
+    /// Both — the class a trail logs by default ("trails created without specific event
+    /// selectors will be configured to log all read and write management events").
+    #[default]
+    All,
+}
+
+impl ManagementEventClass {
+    /// The class `read_write_type` names, or [`Self::All`] for a value outside the three
+    /// the member publishes — which is also what a trail with no selector logs.
+    #[must_use]
+    pub fn from_read_write_type(read_write_type: Option<&str>) -> Self {
+        match read_write_type {
+            Some("ReadOnly") => Self::ReadOnly,
+            Some("WriteOnly") => Self::WriteOnly,
+            _ => Self::All,
+        }
+    }
+
+    /// Whether a call of this read/write kind falls in the class.
+    #[must_use]
+    pub fn covers(self, read_only: bool) -> bool {
+        match self {
+            Self::ReadOnly => read_only,
+            Self::WriteOnly => !read_only,
+            Self::All => true,
+        }
+    }
+}
+
+/// One trail of the account that is logging, as far as the management-event fan-out is
+/// concerned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveringTrail {
+    /// The trail's ARN, which identifies it.
+    pub trail_arn: String,
+    /// The Region the trail is homed in — the only Region a single-Region trail logs the
+    /// REGIONAL services of.
+    pub home_region: String,
+    /// Whether the trail applies to every Region of the account
+    /// (`Trail$IsMultiRegionTrail`).
+    pub multi_region: bool,
+    /// Whether the trail logs the calls of the partition's GLOBAL services
+    /// (`Trail$IncludeGlobalServiceEvents`: "whether the trail is publishing events from
+    /// global services such as IAM to the log files"), wherever it is homed.
+    pub global_service_events: bool,
+    /// Whether the trail's selectors include management events at all
+    /// (`EventSelector$IncludeManagementEvents`).
+    pub management_events: bool,
+    /// Which class of management events it logs.
+    pub event_class: ManagementEventClass,
+}
+
+/// The Region a partition's GLOBAL services record their management events in — the
+/// partition's leader Region, which is where a lookup over IAM's or CloudFront's event
+/// history is made.
+///
+/// A trail logging global-service events logs those records wherever the trail is homed,
+/// which is what the Region test below reads this constant for.
+pub const PARTITION_LEADER_REGION: &str = "us-east-1";
+
+impl DeliveringTrail {
+    /// Whether this trail logs a management call served in `region` of the given
+    /// read/write kind.
+    ///
+    /// Three ways a trail covers a Region: it applies to all of them, it is homed in this
+    /// one, or it logs global-service events and this is the Region the partition's global
+    /// services record in ([`PARTITION_LEADER_REGION`]). The last is read off the Region
+    /// alone, which is as far as a projection of the trail can tell: a call of a REGIONAL
+    /// service served in the leader Region is admitted by it too.
+    #[must_use]
+    pub fn logs(&self, region: &str, read_only: bool) -> bool {
+        let covers_region = self.multi_region
+            || self.home_region == region
+            || (self.global_service_events && region == PARTITION_LEADER_REGION);
+        self.management_events && self.event_class.covers(read_only) && covers_region
+    }
 }
 
 impl ManagementEventLog {
@@ -1269,6 +1373,69 @@ impl ManagementEventLog {
     /// reports the most recent event first walks it in reverse.
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &ManagementEvent> {
         self.events.iter()
+    }
+
+    /// Record `call` as [`record_answered`](Self::record_answered) does, and answer the
+    /// event the account's CloudTrail DELIVERS for it — or `None` when no trail of the
+    /// account logs a call of this kind in this Region.
+    ///
+    /// The two are one step because they are one fact: the event a rule on the default bus
+    /// matches is the CloudTrail record of the call, so the document published is the very
+    /// document `LookupEvents` reports and the two can never disagree. What decides whether
+    /// it is published at all is the trail projection
+    /// ([`trails_delivering`](Self::trails_delivering)): the fan-out is CloudTrail's, so it
+    /// runs while a trail of the Region is logging management events of the call's
+    /// read/write class and not otherwise.
+    ///
+    /// Publishing is the CALLER's: a store holds no transport, and the publication must not
+    /// happen under this lock ([`crate::api_call_events::DeliveredApiCall::publish`]).
+    pub fn record_delivered(
+        &mut self,
+        call: ServedApiCall,
+        at: SystemTime,
+        request_id: String,
+    ) -> Option<crate::api_call_events::DeliveredApiCall> {
+        let read_only = call.read_only;
+        let region = call.aws_region.clone();
+        let source = crate::api_call_events::event_source_of(&call.event_source);
+        self.record_answered(call, at, request_id);
+        if !self.delivers(&region, read_only) {
+            return None;
+        }
+        let event = self.events.back()?;
+        Some(crate::api_call_events::DeliveredApiCall {
+            source,
+            region,
+            time_millis: event.event_time_millis(),
+            detail: event.to_cloudtrail_event_json(),
+        })
+    }
+
+    /// Replace the account's logging trails with `trails` — CloudTrail's own write, made
+    /// whenever a trail of the account is created, reconfigured, started, stopped or
+    /// deleted, so the projection is never stale between two of those.
+    ///
+    /// The whole set is replaced rather than one entry amended: CloudTrail recomputes it
+    /// from its own store, which is the only account of what is logging, so there is no
+    /// state here to fall out of step with it.
+    pub fn trails_delivering(&mut self, trails: Vec<DeliveringTrail>) {
+        self.delivering_trails = trails;
+    }
+
+    /// The account's logging trails, as the last [`trails_delivering`](Self::trails_delivering)
+    /// left them.
+    #[must_use]
+    pub fn delivering_trails(&self) -> &[DeliveringTrail] {
+        &self.delivering_trails
+    }
+
+    /// Whether the account's CloudTrail delivers a management call served in `region`, of
+    /// the given read/write kind, onto the default event bus.
+    #[must_use]
+    pub fn delivers(&self, region: &str, read_only: bool) -> bool {
+        self.delivering_trails
+            .iter()
+            .any(|trail| trail.logs(region, read_only))
     }
 
     /// How many records the log holds.

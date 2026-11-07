@@ -50,7 +50,8 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, SystemTime};
 
 use service_common::management_events::{
-    ManagementEventLog, RecordedSession, SessionAuditDirectory,
+    DeliveringTrail, ManagementEventClass, ManagementEventLog, RecordedSession,
+    SessionAuditDirectory,
 };
 
 use crate::ops::types::{
@@ -3857,4 +3858,171 @@ pub const EVENT_SOURCE: &str = "cloudtrail.amazonaws.com";
 /// The CloudFormation-style type name of the resource a trail event refers to, as
 /// CloudTrail reports it in an event's `Resources`.
 pub const TRAIL_RESOURCE_TYPE: &str = "AWS::CloudTrail::Trail";
+
+/// Project this account's LOGGING trails onto the shared management-event log, so the
+/// services whose calls that log records know whether CloudTrail is fanning them out onto
+/// the account's default event bus.
+///
+/// Called by every operation that changes WHICH calls a trail logs — the create, the
+/// reconfiguration, the delete and the Start/StopLogging pair — after its own write, so the
+/// projection is never stale between two of them. It is a projection and not a copy: a
+/// trail's own record stays here, and what travels is the delivery decision
+/// ([`service_common::management_events::DeliveringTrail`]), because the service that
+/// records a call cannot read this store and the fan-out is decided on the recording path.
+///
+/// Best effort: an engine carrying no log has nobody to tell, which is the same engine on
+/// which nothing is recorded either.
+pub fn publish_logging_trails<Eng: Send + Sync + 'static>(engine: &Eng) {
+    let Some(state) = service_state(engine) else {
+        return;
+    };
+    // The guard is taken and dropped inside this statement: the projection is built here so
+    // no other store's lock is held while this one is.
+    let logging: Vec<DeliveringTrail> = state
+        .lock()
+        .trails
+        .values()
+        .filter(|trail| trail.status.is_logging)
+        .map(delivering_trail)
+        .collect();
+    let Some(log) = management_event_log(engine) else {
+        return;
+    };
+    log.lock().trails_delivering(logging);
+}
+
+/// Refresh the logging-trail projection ([`publish_logging_trails`]) when the call that may
+/// have changed it RETURNS — on every path out of it, the refusals included, because
+/// recomputing the projection from the registry is the same work either way.
+///
+/// Bound as the FIRST statement of such a handler, so it is dropped LAST: the registry's own
+/// guard is taken later in the handler and released before this runs, which is what keeps
+/// the two stores from ever being locked at once.
+pub struct LoggingTrailsRefreshed<'a, Eng: Send + Sync + 'static> {
+    engine: &'a Eng,
+}
+
+impl<'a, Eng: Send + Sync + 'static> LoggingTrailsRefreshed<'a, Eng> {
+    /// Refresh `engine`'s projection when the returned value is dropped.
+    pub fn on_return(engine: &'a Eng) -> Self {
+        Self { engine }
+    }
+}
+
+impl<Eng: Send + Sync + 'static> Drop for LoggingTrailsRefreshed<'_, Eng> {
+    fn drop(&mut self) {
+        publish_logging_trails(self.engine);
+    }
+}
+
+/// One logging trail as the fan-out reads it: where it logs, and which management events
+/// its selectors admit.
+fn delivering_trail(trail: &TrailRecord) -> DeliveringTrail {
+    let (management_events, event_class) = logged_management_events(trail);
+    DeliveringTrail {
+        trail_arn: trail.trail_arn.clone(),
+        home_region: trail.home_region.clone(),
+        multi_region: trail.is_multi_region_trail,
+        global_service_events: trail.include_global_service_events,
+        management_events,
+        event_class,
+    }
+}
+
+/// Whether `trail`'s selectors log management events at all, and which read/write class of
+/// them.
+///
+/// The three cases are the three a trail can be in:
+///
+/// * NOTHING configured — "trails created without specific event selectors will be
+///   configured to log all read and write management events" ([`default_event_selector`]),
+///   so every management call is logged;
+/// * BASIC selectors — a selector logs management events when its
+///   `IncludeManagementEvents` is set, in the class its `ReadWriteType` names, so the trail
+///   logs what any one of its selectors admits;
+/// * ADVANCED selectors — a selector admits management events when its `eventCategory`
+///   field equals `Management`, and narrows the class when it also pins `readOnly`.
+fn logged_management_events(trail: &TrailRecord) -> (bool, ManagementEventClass) {
+    let selectors = match &trail.event_selectors {
+        None => return (DEFAULT_INCLUDE_MANAGEMENT_EVENTS, ManagementEventClass::All),
+        Some(EventSelectorConfig::Basic(selectors)) => {
+            let logging: Vec<&EventSelector> = selectors
+                .iter()
+                .filter(|selector| selector.include_management_events.unwrap_or(false))
+                .collect();
+            let class = logging
+                .iter()
+                .map(|selector| {
+                    ManagementEventClass::from_read_write_type(selector.read_write_type.as_deref())
+                })
+                .fold(None, widest_class);
+            return (!logging.is_empty(), class.unwrap_or_default());
+        }
+        Some(EventSelectorConfig::Advanced(selectors)) => selectors,
+    };
+    let class = selectors
+        .iter()
+        .filter(|selector| selects_management_category(selector))
+        .map(advanced_event_class)
+        .fold(None, widest_class);
+    (class.is_some(), class.unwrap_or_default())
+}
+
+/// The class two selectors log between them: a trail logging both read-only and write-only
+/// management events logs all of them.
+fn widest_class(
+    carried: Option<ManagementEventClass>,
+    class: ManagementEventClass,
+) -> Option<ManagementEventClass> {
+    match carried {
+        None => Some(class),
+        Some(carried) if carried == class => Some(carried),
+        Some(_) => Some(ManagementEventClass::All),
+    }
+}
+
+/// Whether an advanced selector admits the `Management` event category — the field every
+/// advanced selector pins, and the one that says whether a selector is about management
+/// events at all.
+fn selects_management_category(selector: &AdvancedEventSelector) -> bool {
+    selector.field_selectors.iter().any(|field| {
+        field.field == ADVANCED_SELECTOR_EVENT_CATEGORY_FIELD
+            && field
+                .equals
+                .as_ref()
+                .is_some_and(|values| {
+                    values
+                        .iter()
+                        .any(|value| value == ::service_common::management_events::EVENT_CATEGORY_MANAGEMENT)
+                })
+    })
+}
+
+/// The read/write class an advanced selector logs: the one its `readOnly` field pins, or
+/// both when it pins none.
+fn advanced_event_class(selector: &AdvancedEventSelector) -> ManagementEventClass {
+    for field in &selector.field_selectors {
+        if field.field != ADVANCED_SELECTOR_READ_ONLY_FIELD {
+            continue;
+        }
+        let Some(values) = field.equals.as_ref() else {
+            continue;
+        };
+        return match values.first().map(String::as_str) {
+            Some("true") => ManagementEventClass::ReadOnly,
+            Some("false") => ManagementEventClass::WriteOnly,
+            _ => ManagementEventClass::All,
+        };
+    }
+    ManagementEventClass::All
+}
+
+/// The advanced-selector field that names an event's category
+/// (`AdvancedFieldSelector$Field`: "eventCategory").
+const ADVANCED_SELECTOR_EVENT_CATEGORY_FIELD: &str = "eventCategory";
+
+/// The advanced-selector field that names an event's read/write kind
+/// (`AdvancedFieldSelector$Field`: "readOnly").
+const ADVANCED_SELECTOR_READ_ONLY_FIELD: &str = "readOnly";
+
 

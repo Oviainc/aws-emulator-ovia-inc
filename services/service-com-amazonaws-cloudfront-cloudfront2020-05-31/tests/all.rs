@@ -187,6 +187,8 @@ mod managed_certificate_domain_ownership;
 mod managed_origin_request_policy_reference;
 #[path = "all/managed_policy_catalogs.rs"]
 mod managed_policy_catalogs;
+#[path = "all/management_event_recording.rs"]
+mod management_event_recording;
 #[path = "all/monitoring_subscription.rs"]
 mod monitoring_subscription;
 #[path = "all/origin_access_control_config_read.rs"]

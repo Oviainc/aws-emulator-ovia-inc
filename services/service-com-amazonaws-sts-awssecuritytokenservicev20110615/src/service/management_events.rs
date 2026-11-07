@@ -92,7 +92,11 @@ impl<Eng: Send + Sync + 'static> SecurityTokenAudit<Eng> {
 }
 
 impl<Eng: Send + Sync + 'static> AuditedService for SecurityTokenAudit<Eng> {
-    fn record(&self, call: ServedApiCall, answered_as: &str) {
+    fn record(
+        &self,
+        call: ServedApiCall,
+        answered_as: &str,
+    ) -> Option<::service_common::api_call_events::DeliveredApiCall> {
         let Some(log) = self.log() else {
             // Not silent: an unrecorded call leaves no trace in the log by definition, so
             // it leaves one here instead.
@@ -100,13 +104,18 @@ impl<Eng: Send + Sync + 'static> AuditedService for SecurityTokenAudit<Eng> {
                 operation = call.event_name,
                 "the engine carries no management-event log: the call was served unrecorded"
             );
-            return;
+            return None;
         };
-        log.lock().record_answered(
+        // The record, and the event the account's CloudTrail fans out for it while a trail
+        // of the Region is logging calls of its kind; publishing it is the wrapper's.
+        // The guard is BOUND rather than used as a temporary: a local is released before
+        // the handle it borrows, which a temporary at the end of this block would not be.
+        let mut recording = log.lock();
+        recording.record_delivered(
             call,
             ::std::time::SystemTime::now(),
             answered_as.to_string(),
-        );
+        )
     }
 
     fn recorded_session(&self, access_key_id: &str) -> Option<RecordedSession> {

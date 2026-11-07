@@ -385,6 +385,8 @@ mod cloudformation_provisions_sagemaker_model_package_group;
 mod cloudformation_provisions_scheduler_schedules;
 #[path = "all/cloudformation_provisions_stack_resources.rs"]
 mod cloudformation_provisions_stack_resources;
+#[path = "all/cloudfront_api_call_events.rs"]
+mod cloudfront_api_call_events;
 #[path = "all/cloudfront_key_value_store_handshake.rs"]
 mod cloudfront_key_value_store_handshake;
 // Declared HERE, in the sorted list beside the other CloudFront suite, rather than appended

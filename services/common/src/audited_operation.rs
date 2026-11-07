@@ -41,6 +41,15 @@
 //! ([`smithy_server_runtime::run_operation_http`]), forwards the operation's modelled auth
 //! schemes, and leaves every status, code and message to the framework.
 //!
+//! # The second reader of the same record
+//!
+//! A management event has two readers, so the wrapper has two sinks for one record: the
+//! log CloudTrail's `LookupEvents` reads, and — while a trail of the Region is logging
+//! calls of this kind — the account's default EventBridge bus, which CloudTrail publishes
+//! each logged call onto as `AWS API Call via CloudTrail`
+//! ([`crate::api_call_events`]). The record is written once and the event published from
+//! that same record, so a rule matching the fan-out sees exactly what a lookup reports.
+//!
 //! # What is NOT recorded
 //!
 //! A call the scaffold refused as not implemented ([`NOT_IMPLEMENTED_SHAPE_NAME`]) was
@@ -151,7 +160,16 @@ pub trait AuditedService: Send + Sync + 'static {
     ///
     /// `answered_as` is the request id the CALLER was answered under, which the record
     /// carries as its `requestID`.
-    fn record(&self, call: ServedApiCall, answered_as: &str);
+    ///
+    /// Answers the event the account's CloudTrail DELIVERS for the call, when a trail of
+    /// the Region is logging one of its kind — which [`RecordedCall`] publishes onto the
+    /// default event bus. `None` is a call nothing is published for: no trail logs it, or
+    /// this engine carries no log at all.
+    fn record(
+        &self,
+        call: ServedApiCall,
+        answered_as: &str,
+    ) -> Option<crate::api_call_events::DeliveredApiCall>;
 
     /// The `eventSource` every record of this service carries: its endpoint prefix in
     /// CloudTrail's `<prefix>.amazonaws.com` form.
@@ -465,7 +483,14 @@ impl<W: ErasedOperation, S: AuditedService> ErasedOperation for RecordedCall<W, 
             // two ids for one call.
             let (resp, answered_as) = named_request(resp);
             if let Some(call) = pending {
-                self.service.record(call, &answered_as);
+                // The record, and — while the account's CloudTrail is logging calls of its
+                // kind — the event that same record is fanned out onto the default event
+                // bus as. The publication is made OUTSIDE the log's lock, after the
+                // response the caller gets has been rendered, so it changes nothing about
+                // what this call answers.
+                if let Some(delivered) = self.service.record(call, &answered_as) {
+                    delivered.publish(ctx.callback()).await;
+                }
             }
             resp
         })

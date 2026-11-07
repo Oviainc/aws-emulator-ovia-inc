@@ -78,7 +78,7 @@ use smithy_server_runtime::{
 /// This service's `@xmlNamespace`, which its error envelope carries exactly as its
 /// success documents do (`smithy_query(query="service_info")`:
 /// `xmlNamespace.uri = http://cloudfront.amazonaws.com/doc/2020-05-31/`).
-const XML_NAMESPACE: &str = "http://cloudfront.amazonaws.com/doc/2020-05-31/";
+pub const XML_NAMESPACE: &str = "http://cloudfront.amazonaws.com/doc/2020-05-31/";
 
 /// The envelope element the request-correlation id sits beside `Error` in.
 const REQUEST_ID_ELEMENT: &str = "RequestId";
@@ -498,9 +498,13 @@ fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
 /// correlating a failure never has to care which layer refused it.
 ///
 /// Identity, the protocol and the routing table come from the generated
-/// [`crate::ServiceDefinition`] untouched — nothing model-derived is restated here.
+/// [`crate::ServiceDefinition`] untouched — nothing model-derived is restated here. The
+/// one thing between this wrapper and that entry is the AUDIT leg
+/// ([`super::management_events`]): the table every request is routed from is the audited
+/// one, whose keys are the same modelled operation names, so no request can be served by a
+/// path that records nothing.
 pub struct CloudFrontDefinition<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    entry: ::service_common::audited_operation::AuditedDefinition<crate::ServiceDefinition<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> CloudFrontDefinition<Eng> {
@@ -508,7 +512,10 @@ impl<Eng: Send + Sync + 'static> CloudFrontDefinition<Eng> {
     /// into every operation.
     pub fn new(engine: ::std::sync::Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: ::service_common::audited_operation::AuditedDefinition::new(
+                crate::ServiceDefinition::new(::std::sync::Arc::clone(&engine)),
+                super::management_events::audited_table(&engine),
+            ),
         }
     }
 

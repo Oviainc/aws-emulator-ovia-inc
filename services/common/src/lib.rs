@@ -90,7 +90,8 @@
 //! * [`management_events`], the account's management-event (audit) log — written by the
 //!   service that SERVED an API call, which is the only one that knows the call
 //!   happened, and read by CloudTrail, which is the service that reports it
-//!   (`LookupEvents`);
+//!   (`LookupEvents`) and, while a trail of the Region is logging, fanned out onto the
+//!   account's default event bus ([`api_call_events`]);
 //! * [`chime_identity_names`], the name an Amazon Chime SDK app instance's identity is
 //!   registered under, keyed by its ARN — written by Chime SDK Identity, which owns the
 //!   identity, and read by Chime SDK Messaging, which reports every participant of a
@@ -415,6 +416,13 @@ pub mod jwt;
 pub mod jsonata;
 pub mod lex;
 pub mod management_events;
+/// The ONE construction of the in-process EventBridge client a service publishing an event
+/// drives, so no two services configure that hop differently.
+pub mod eventbridge_client;
+/// The ONE publication of a recorded management call onto the account's default
+/// EventBridge bus — CloudTrail's `AWS API Call via CloudTrail` fan-out — so the channel is
+/// stated once for every service whose calls that log records rather than per service.
+pub mod api_call_events;
 /// The ONE reading of the JSON Schema document a gateway model carries, and the two
 /// documents a gateway control plane generates from it: the sample payload one answers a
 /// template request with, and the mapping skeleton the other does.

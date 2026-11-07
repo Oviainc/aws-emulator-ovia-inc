@@ -9,6 +9,14 @@ publish = false
 # `iam_client`: the in-process IAM client a service resolving a caller-supplied IAM
 # entity asks, built once here instead of per service.
 aws-sdk-iam = { version = "1", default-features = false }
+# `eventbridge_client`: the in-process EventBridge client a service publishing an event
+# drives — the management-event fan-out (`api_call_events`) among them — built once here
+# for every service that publishes. Only the generated client is needed: the emulator
+# supplies the transport, so the SDK's own HTTPS stack is left out.
+aws-sdk-eventbridge = { version = "1", default-features = false }
+# `api_call_events`: a publication that could not be made is traced rather than failing the
+# call it belongs to, so that path needs the workspace's logging facade.
+tracing = { workspace = true }
 # `kinesis_client`: the in-process Kinesis client a service DELIVERING a data record
 # writes through, built once here for the same reason. Only the generated client is
 # needed — the emulator supplies the transport, so the SDK's own HTTPS stack and runtime

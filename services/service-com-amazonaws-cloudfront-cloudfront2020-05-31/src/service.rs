@@ -76,9 +76,23 @@
 //!   is what narrows it: only a request whose host (or reserved data-plane path) names a
 //!   distribution of this account is served that way, and every other request keeps going
 //!   through the modelled routing table and its signature check.
+//!
+//! ## This service's other edited seam: the audit leg
+//!
+//! Every control-plane call this front door serves is a management event of the account,
+//! so the routing table the envelope above dispatches from is the AUDITED one
+//! ([`management_events`]): each served call is recorded in the account's event history
+//! where CloudTrail's `LookupEvents` reads it, and — while a trail of the account is
+//! logging — published onto the default EventBridge bus as `AWS API Call via CloudTrail`.
+//! The EDGE plane is deliberately outside it: a viewer request is not an API call of this
+//! account, so it is no management event.
 
 pub mod edge;
 pub mod envelope;
+/// This front door's AUDIT leg: every call it serves is recorded in the account's
+/// management-event history, and fanned out onto the default event bus while a trail is
+/// logging.
+pub mod management_events;
 pub mod origin_access;
 
 use smithy_server_runtime::{
