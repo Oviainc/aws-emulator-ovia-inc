@@ -21,6 +21,8 @@ mod code_security_scan_configurations;
 mod ec2_deep_inspection;
 #[path = "all/encryption_key.rs"]
 mod encryption_key;
+#[path = "all/encryption_key_scope.rs"]
+mod encryption_key_scope;
 #[path = "all/filters_and_enablement.rs"]
 mod filters_and_enablement;
 #[path = "all/finding_aggregations.rs"]

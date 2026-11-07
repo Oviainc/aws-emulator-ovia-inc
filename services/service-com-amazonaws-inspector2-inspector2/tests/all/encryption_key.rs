@@ -21,7 +21,7 @@ use crate::filters_and_enablement::{router, send_in};
 
 /// Every `ResourceType` token, in model order.
 /// Source: `smithy_query(query="shape", shape="ResourceType")`.
-const RESOURCE_TYPES: [&str; 8] = [
+pub(crate) const RESOURCE_TYPES: [&str; 8] = [
     "AWS_EC2_INSTANCE",
     "AWS_ECR_CONTAINER_IMAGE",
     "AWS_ECR_REPOSITORY",
@@ -36,7 +36,7 @@ const RESOURCE_TYPES: [&str; 8] = [
 /// Source: `smithy_query(query="shape", shape="ScanType")`, which lists them in this
 /// order; the generated contract header in `src/ops/get_encryption_key.rs` lists the same
 /// three alphabetically.
-const SCAN_TYPES: [&str; 3] = ["NETWORK", "PACKAGE", "CODE"];
+pub(crate) const SCAN_TYPES: [&str; 3] = ["NETWORK", "PACKAGE", "CODE"];
 
 /// Well-formed `KmsKeyArn` values, one per form the modelled pattern allows: a
 /// single-region key id, a multi-region (`mrk-`) key id, upper-case hex, and the
@@ -52,7 +52,7 @@ const KEY_ARNS: [&str; 5] = [
 ];
 
 /// `GetEncryptionKey` — `GET /encryptionkey/get`, both members bound to the query string.
-async fn get_encryption_key(
+pub(crate) async fn get_encryption_key(
     router: &MultiServiceRouter,
     resource_type: &str,
     scan_type: &str,
@@ -64,7 +64,7 @@ async fn get_encryption_key(
 }
 
 /// `UpdateEncryptionKey` — `PUT /encryptionkey/update`, every member in the body.
-async fn update_encryption_key(
+pub(crate) async fn update_encryption_key(
     router: &MultiServiceRouter,
     kms_key_id: &str,
     resource_type: &str,
@@ -87,7 +87,7 @@ async fn update_encryption_key(
 
 /// Assert `GetEncryptionKey` refuses this pair the way it refuses a pair encrypted with an
 /// Amazon Web Services owned key.
-async fn assert_no_customer_key(
+pub(crate) async fn assert_no_customer_key(
     router: &MultiServiceRouter,
     case: &str,
     resource_type: &str,
