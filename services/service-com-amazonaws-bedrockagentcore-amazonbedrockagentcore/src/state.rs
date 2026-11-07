@@ -70,9 +70,16 @@
 //! either is refused rather than evicting a file a caller still expects to read. Each
 //! stop a `clientToken` replays is recorded too, bounded by
 //! [`MAX_STOP_TOKENS_PER_SESSION`].
+//!
+//! The AgentCore A/B TESTING plane is a concern of its own, so it lives in
+//! [`ab_tests`]: the tests `CreateABTest` minted, what `ListABTests` reports from them,
+//! and the bound that plane grows under ([`MAX_AB_TESTS`]).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
+
+mod ab_tests;
+pub use ab_tests::*;
 
 use crate::ops::types::{
     Branch, Certificate, Event, ExtractionConfig, IngestPayloadType, MemoryContent, MemoryRecord,
@@ -279,6 +286,13 @@ pub struct ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
     pub code_interpreters: HashMap<String, CodeInterpreterStore>,
     /// Every workload access token this service issued and has not pruned.
     pub workload_access_tokens: IssuedWorkloadAccessTokens,
+    /// The A/B tests `CreateABTest` created, keyed by the `abTestId` this emulator
+    /// minted for each one. Bounded by [`MAX_AB_TESTS`]; see [`ab_tests`].
+    pub ab_tests: BTreeMap<String, ABTestRecord>,
+    /// The `abTestId` each `CreateABTest` `clientToken` already created, so a replayed
+    /// token answers with that test instead of creating a second one. Bounded by
+    /// [`MAX_AB_TEST_IDEMPOTENCY_RECORDS`].
+    pub ab_test_idempotency: BTreeMap<String, String>,
 }
 
 impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {

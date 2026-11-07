@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateABTest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateABTest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates an A/B test in [`crate::state`]: this emulator mints the `abTestId` and the
+//! ARN it is addressed by, stores the variants, gateway, filter, evaluation
+//! configuration, role and tags the request asked for, and reports that stored record
+//! back. `ListABTests` lists what this call wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateABTest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The response is 202 Accepted, so the test is `CREATING` and becomes `ACTIVE` once the
+//! store's provisioning span has passed. Traffic splitting runs from the creating
+//! instant when the request asked for the test to be enabled on create, and has never
+//! run otherwise.
+//!
+//! Two conditions this operation refuses, both from what the model documents: a `name`
+//! another test in the account already has (`name` "must be unique within your
+//! account") is a `ConflictException`, and variants that are not one control and one
+//! treatment whose weights sum to 100 are a `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -164,6 +169,38 @@ impl From<CreateABTestErrorModeled> for CreateABTestError {
     }
 }
 
+/// A stored A/B test as this operation reports it, as of `now`: the identity this call
+/// minted, the name it was created under and the status the clock implies for a test
+/// created at that instant.
+fn created_output(
+    record: &crate::state::ABTestRecord,
+    now: ::std::time::SystemTime,
+) -> CreateABTestOutput {
+    CreateABTestOutput {
+        ab_test_id: record.ab_test_id.clone(),
+        ab_test_arn: record.ab_test_arn.clone(),
+        name: Some(record.name.clone()),
+        status: record.status_as_of(now).to_string(),
+        execution_status: record.execution_status.clone(),
+        created_at: ::aws_smithy_types::DateTime::from(record.created_at),
+    }
+}
+
+/// The refusal for a `variants` list the service cannot route traffic with: a 400
+/// `ValidationException` naming the member that failed, with the reason this service's
+/// `ValidationExceptionReason` words a failed field with.
+fn variants_refused(message: &str) -> CreateABTestError {
+    CreateABTestErrorModeled::ValidationException(ValidationException {
+        message: message.to_string(),
+        reason: "FieldValidationFailed".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "variants".to_string(),
+            message: message.to_string(),
+        }]),
+    })
+    .into()
+}
+
 /// The `CreateABTest` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -200,18 +237,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateABTest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateABTestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateABTest"))
+        // The region segment of the ARN this call mints is the region the request was
+        // signed for, read off its SigV4 credential scope.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateABTestErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the shared engine does not carry this service's state".to_string()),
+            })
+        })?;
+
+        // `VariantList` is modelled exactly two long, and the two are documented as a
+        // control and a treatment whose weights are percentages of the gateway's
+        // traffic: anything else is not a split this service can route.
+        if !crate::state::names_one_control_and_one_treatment(&input.variants) {
+            return Err(variants_refused(
+                "Variants must be one control variant named C and one treatment variant named T1",
+            ));
+        }
+        let weight = crate::state::total_variant_weight(&input.variants);
+        if weight != crate::state::TOTAL_VARIANT_WEIGHT {
+            return Err(variants_refused(&format!(
+                "Variant weights must sum to {}, but they sum to {weight}",
+                crate::state::TOTAL_VARIANT_WEIGHT
+            )));
+        }
+
+        let mut store = state.lock();
+
+        // `clientToken` is an `@idempotencyToken` whose documented effect is that a
+        // token matching an earlier request is ignored rather than refused: answer with
+        // the test that token already created, so no second test is created and the
+        // name it took is not reported as a conflict with itself.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(created) = store.ab_test_for_token(token) {
+                return Ok(created_output(created, ::std::time::SystemTime::now()));
+            }
+        }
+
+        // `name` "must be unique within your account", and this emulator serves one
+        // account, so a name another test already holds is the documented conflict.
+        if store.ab_tests.values().any(|held| held.name == input.name) {
+            return Err(CreateABTestErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "An A/B test with the name {} already exists",
+                    input.name
+                )),
+            })
+            .into());
+        }
+
+        let seq = store.next_seq();
+        let created_at = ::std::time::SystemTime::now();
+        let record = crate::state::ABTestRecord::created(
+            seq,
+            &region,
+            input.name.clone(),
+            input.description.clone(),
+            input.gateway_arn.clone(),
+            input.variants.clone(),
+            input.gateway_filter.clone(),
+            input.evaluation_config.clone(),
+            input.role_arn.clone(),
+            input.tags.clone(),
+            input.enable_on_create.unwrap_or(false),
+            created_at,
+        );
+        // Built from what is about to be stored, so the response and the store cannot
+        // disagree.
+        let output = created_output(&record, created_at);
+        store.insert_ab_test(record, input.client_token);
+
+        Ok(output)
     }
 }

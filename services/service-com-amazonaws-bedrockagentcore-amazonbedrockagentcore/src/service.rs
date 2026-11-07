@@ -41,7 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -69,6 +69,16 @@ const CODE_INTERPRETERS_SEGMENT: &str = "code-interpreters";
 const TOOLS_SEGMENT: &str = "tools";
 /// See [`CODE_INTERPRETERS_SEGMENT`].
 const INVOKE_SEGMENT: &str = "invoke";
+
+/// Whether `violation` is a violated numeric `@range` bound, which is the one class this
+/// service states WITHOUT the value that violated it: such a refusal names the member
+/// path and the bound only.
+fn is_numeric_range(violation: &Violation) -> bool {
+    matches!(
+        violation.kind,
+        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)
+    )
+}
 
 /// The `com-amazonaws-bedrockagentcore-amazonbedrockagentcore` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -167,16 +177,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it.
+        //
+        // This service states a violated numeric `@range` bound WITHOUT the value that
+        // violated it: the message names the member path and the bound only, inside the
+        // AWS validation envelope. The code stays the modelled `ValidationException`
+        // (HTTP 400) — what the framework would have answered — so only the wording
+        // changes, and only for a refusal that carries such a bound: a refusal of any
+        // other class keeps the framework's own wording, which this service has no
+        // recorded wording to replace it with.
+        match refusal {
+            Refusal::Invalid(violations) if violations.iter().any(is_numeric_range) => {
+                service_common::validation_message::aws_validation_refusal_withholding_violations(
+                    refusal,
+                    is_numeric_range,
+                )
+            }
+            _ => None,
+        }
     }
 
     fn override_routing_error(
