@@ -67,6 +67,8 @@ mod invoice_line_item_listing;
 mod license_arn_region;
 #[path = "all/listing_resolution_order.rs"]
 mod listing_resolution_order;
+#[path = "all/optional_input_empty_pages.rs"]
+mod optional_input_empty_pages;
 #[path = "all/page_token_scopes.rs"]
 mod page_token_scopes;
 #[path = "all/payment_request_approval.rs"]
