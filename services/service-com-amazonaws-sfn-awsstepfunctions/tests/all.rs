@@ -93,6 +93,8 @@ mod express_run_a_job_refusal;
 mod form_protocol_integration;
 #[path = "all/history_event_provenance.rs"]
 mod history_event_provenance;
+#[path = "all/integration_failure_error_names.rs"]
+mod integration_failure_error_names;
 #[path = "all/integration_member_names.rs"]
 mod integration_member_names;
 #[path = "all/json_parse_diagnostics.rs"]
@@ -115,6 +117,8 @@ mod map_run_updates;
 mod map_runs;
 #[path = "all/nested_type_discriminator.rs"]
 mod nested_type_discriminator;
+#[path = "all/parallel_branch_stop.rs"]
+mod parallel_branch_stop;
 #[path = "all/parallel_run_a_job.rs"]
 mod parallel_run_a_job;
 #[path = "all/payload_byte_limits.rs"]

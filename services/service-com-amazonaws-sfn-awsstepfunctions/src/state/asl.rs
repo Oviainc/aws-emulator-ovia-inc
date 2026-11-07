@@ -3010,6 +3010,10 @@ impl Interpreter<'_> {
     /// branch that had PARKED at a job when that happened is stopped too, which is
     /// what [`Interpreter::abandoned`] carries.
     ///
+    /// The branches run CONCURRENTLY, so where the failing one sits in the `Branches`
+    /// list does not decide the outcome; this walk runs them one after another, in the
+    /// order the definition lists them.
+    ///
     /// One branch may SUSPEND, at the job a run-a-job task of it started: the state
     /// has no result then, so the walk reports the suspension by way of
     /// [`Interpreter::parked`] and records the frame that lets the continuation

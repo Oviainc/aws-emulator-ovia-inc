@@ -2285,6 +2285,24 @@ impl Interpreter<'_> {
         at: Duration,
         tally: &mut MapTally,
     ) -> Attempt {
+        // As for a `Parallel`'s branches: what stopped the walk AROUND this state goes
+        // on stopping it, and what one of this state's own iterations stops does not
+        // outlive the state ([`Interpreter::cancel_after`]).
+        let enclosing = self.cancel_after;
+        let attempt = self.walk_map_items(plan, effective, context, at, tally);
+        self.cancel_after = enclosing;
+        attempt
+    }
+
+    /// [`Interpreter::run_map_items`]' own work, inside the stop it restores.
+    fn walk_map_items(
+        &mut self,
+        plan: &MapPlan<'_>,
+        effective: &Value,
+        context: &Value,
+        at: Duration,
+        tally: &mut MapTally,
+    ) -> Attempt {
         *tally = MapTally::default();
         let batch = if plan.concurrency == 0 {
             plan.items.len().max(1)
@@ -2487,6 +2505,18 @@ impl Interpreter<'_> {
                             .is_none_or(|(_, when)| branch.end < *when)
                         {
                             first_failure = Some((failure, branch.end));
+                        }
+                        // A state that tolerates no failure has already failed, so the
+                        // iterations running BESIDE this one in the same batch are
+                        // stopped at the instant it failed, exactly as the items it had
+                        // not started yet are never started
+                        // ([`Interpreter::stopped_by_a_sibling`]).
+                        if !tolerant {
+                            let stop =
+                                first_failure.as_ref().map_or(branch.end, |(_, when)| *when);
+                            self.cancel_after = Some(
+                                self.cancel_after.map_or(stop, |enclosing| enclosing.min(stop)),
+                            );
                         }
                     }
                 }

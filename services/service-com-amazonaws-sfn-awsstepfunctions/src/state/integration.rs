@@ -3266,6 +3266,13 @@ pub fn sdk_exception_message(
 /// service's own model, or the request-handling framework in front of it
 /// ([`FRAMEWORK_NAMESPACES`]). Only the decoration that is no part of a shape id — a URL
 /// after `:` — is dropped.
+/// The error SHAPE an AWS JSON refusal names: the `X-Amzn-Errortype` header, else the
+/// body's `__type` discriminator, else its `code` member.
+///
+/// The NAMESPACE is kept, because it is what says whose shape the class belongs to: a
+/// service's own model, or the request-handling framework in front of it
+/// ([`FRAMEWORK_NAMESPACES`]). Only the decoration that is no part of a shape id — a URL
+/// after `:` — is dropped.
 fn error_shape(error_type: Option<&str>, document: Option<&Value>) -> Option<String> {
     let discriminator = error_type.map(str::to_string).or_else(|| {
         let document = document?;
