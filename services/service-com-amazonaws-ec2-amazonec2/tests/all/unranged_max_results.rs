@@ -5,10 +5,10 @@
 //! [`super::ec2_query`] harness).
 //!
 //! The rule under test: a paged describe refuses a `MaxResults` outside its bounds only
-//! where the MODEL declares those bounds; where the model declares none, a page size above
-//! the largest page this service serves asks for THAT page — the answer is one page plus a
-//! `NextToken` for the rest, not a refusal. A page of NONE is not a page, and stays
-//! refused.
+//! where those bounds are PUBLISHED — by the model's own `@range`, or by the member's own
+//! documentation; where neither publishes one, a page size above the largest page this
+//! service serves asks for THAT page — the answer is one page plus a `NextToken` for the
+//! rest, not a refusal. A page of NONE is not a page, and stays refused.
 //!
 //! Each row is one operation and one page size, and the rows differ along what the rule
 //! generalises over: whether the operation's `MaxResults` carries a modelled `@range`,
@@ -48,9 +48,10 @@ fn p(key: &str, value: impl Into<String>) -> (String, String) {
 /// `DescribeVolumesModifications` is deliberately NOT here: the model declares no range for
 /// it either, but its own member documents "the maximum number of results (up to a limit of
 /// 500)" — a bound the service publishes — so that operation keeps its refusal.
-const UNRANGED_PAGE_SIZE_OPERATIONS: [&str; 11] = [
+/// `DescribeInstances` is out for the same reason, on the other bound: AWS publishes a
+/// minimum of 5 for its `MaxResults`, which [`PUBLISHED_MINIMUM_OPERATIONS`] covers.
+const UNRANGED_PAGE_SIZE_OPERATIONS: [&str; 10] = [
     "DescribeVolumes",
-    "DescribeInstances",
     "DescribeImages",
     "DescribeVolumeStatus",
     "DescribePrefixLists",
@@ -61,6 +62,13 @@ const UNRANGED_PAGE_SIZE_OPERATIONS: [&str; 11] = [
     "DescribeSpotPriceHistory",
     "DescribeVpcEndpointConnectionNotifications",
 ];
+
+/// The paged describes whose `MaxResults` the MODEL leaves unbounded but whose own
+/// documentation publishes a MINIMUM page size, with that minimum: `DescribeInstances`
+/// targets a plain `Integer`, and the EC2 API Reference publishes "Valid Range: Minimum
+/// value of 5. Maximum value of 1000." for the member, so a smaller page is refused rather
+/// than served.
+const PUBLISHED_MINIMUM_OPERATIONS: [(&str, i64); 1] = [("DescribeInstances", 5)];
 
 /// The paged describes whose `MaxResults` the model DOES bound, with the bounds it
 /// declares, from the same `smithy_query` call as above: `DescribeSecurityGroupsMaxResults`
@@ -131,6 +139,42 @@ async fn a_page_of_none_is_refused_with_ec2s_own_code() {
                 status, 400,
                 "case {action} MaxResults={max_results}: expected HTTP 400, got {status} with \
                  body {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "InvalidParameterValue",
+                "case {action} MaxResults={max_results}: expected InvalidParameterValue, got \
+                 {body}"
+            );
+        }
+    }
+}
+
+/// Where the operation's own documentation publishes a MINIMUM page size, that minimum is
+/// served and anything below it is refused with EC2's `InvalidParameterValue` — a page size
+/// the operation will not page with is a value it cannot use.
+///
+/// The rows are the published bound and the values below it: the minimum itself, one below
+/// it, well below it but still a page, and the two that ask for no page at all.
+#[tokio::test]
+async fn a_published_minimum_is_served_and_anything_below_it_is_refused() {
+    let router = emulator();
+
+    for (action, minimum) in PUBLISHED_MINIMUM_OPERATIONS {
+        for max_results in [minimum, minimum + 1, largest_page()] {
+            let (status, body) = with_page_size(&router, action, max_results).await;
+            assert_eq!(
+                status, 200,
+                "case {action} MaxResults={max_results} (at or above the published minimum): \
+                 expected HTTP 200, got {status} with body {body}"
+            );
+        }
+        for max_results in [minimum - 1, 1, 0, -1] {
+            let (status, body) = with_page_size(&router, action, max_results).await;
+            assert_eq!(
+                status, 400,
+                "case {action} MaxResults={max_results} (below the published minimum): \
+                 expected HTTP 400, got {status} with body {body}"
             );
             assert_eq!(
                 error_code(&body),

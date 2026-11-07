@@ -251,6 +251,7 @@ pub const TRANSITION_DELAY: Duration = Duration::from_millis(500);
 pub const SUPPORTED_INSTANCE_FILTERS: &[&str] = &[
     "architecture",
     "availability-zone",
+    "availability-zone-id",
     "client-token",
     "ebs-optimized",
     "image-id",
@@ -262,6 +263,8 @@ pub const SUPPORTED_INSTANCE_FILTERS: &[&str] = &[
     "instance.group-name",
     "instance-lifecycle",
     "iam-instance-profile.arn",
+    "ip-address",
+    "kernel-id",
     "key-name",
     "launch-index",
     "monitoring-state",
@@ -270,8 +273,13 @@ pub const SUPPORTED_INSTANCE_FILTERS: &[&str] = &[
     "private-ip-address",
     "product-code",
     "product-code.type",
+    "ramdisk-id",
+    "reason",
     "reservation-id",
+    "source-dest-check",
     "spot-instance-request-id",
+    "state-reason-code",
+    "state-reason-message",
     "subnet-id",
     "tag-key",
     "vpc-id",
@@ -280,13 +288,29 @@ pub const SUPPORTED_INSTANCE_FILTERS: &[&str] = &[
     "network-interface.network-interface-id",
     "network-interface.subnet-id",
     "network-interface.vpc-id",
+    "network-interface.description",
     "network-interface.mac-address",
+    "network-interface.owner-id",
+    "network-interface.private-dns-name",
     "network-interface.private-ip-address",
+    "network-interface.source-dest-check",
     "network-interface.status",
+    "network-interface.group-id",
+    "network-interface.group-name",
     "network-interface.attachment.attachment-id",
     "network-interface.attachment.device-index",
+    "network-interface.attachment.network-card-index",
     "network-interface.attachment.status",
     "network-interface.attachment.delete-on-termination",
+    // The ADDRESSES of those interfaces, which is a different subject from the interface's
+    // own primary address: "`private-ip-address` … can only be used to filter by the primary
+    // IP address of the network interface attached to the instance. To filter by additional
+    // IP addresses assigned to the network interface, use the filter
+    // `network-interface.addresses.private-ip-address`"
+    // (`DescribeInstancesRequest$Filters`).
+    "network-interface.addresses.primary",
+    "network-interface.addresses.private-dns-name",
+    "network-interface.addresses.private-ip-address",
 ];
 
 /// The prefix of the `tag:<key>` filter family.
@@ -647,9 +671,29 @@ pub const MAX_RESULTS_MEMBER_PATH: &str = "maxResults";
 /// arbitrarily long response) and the minimum off the member's own `@range`, so an operation
 /// whose published minimum differs is refused with its own bound rather than a copied number.
 pub fn max_results_below_minimum_message(value: &str, minimum: &str) -> String {
+    max_results_below_bound(value, minimum, "than or equal to")
+}
+
+/// How EC2 states the SAME refusal for the operations it was recorded wording without the
+/// "or equal to" clause — "Value ( `<value>` ) for parameter maxResults is invalid.
+/// Expecting a value greater `<minimum>`."
+///
+/// The two sentences differ only in that clause, and WHICH one an operation answers is a
+/// fact of that operation recorded by its caller, not of the bound: `DescribeInstances` was
+/// recorded answering this one for a page size below the minimum its own documentation
+/// publishes, where the `@range`-bearing describes answer
+/// [`max_results_below_minimum_message`]. Both variable parts come from the request and the
+/// published bound, so nothing of one run's request is written into the template.
+pub fn max_results_below_bound_message(value: &str, minimum: &str) -> String {
+    max_results_below_bound(value, minimum, "than")
+}
+
+/// The one template both sentences above are built from, so the part they SHARE cannot drift
+/// between them: only the comparison clause differs.
+fn max_results_below_bound(value: &str, bound: &str, comparison: &str) -> String {
     format!(
         "Value ( {value} ) for parameter maxResults is invalid. Expecting a value greater \
-         than or equal to {minimum}."
+         {comparison} {bound}."
     )
 }
 
@@ -1194,6 +1238,27 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// module docs). Further caller-created resources go beside this field as they
     /// land.
     pub vpcs: BTreeMap<String, Vpc>,
+    /// The Region each VPC was created in, by `VpcId`.
+    ///
+    /// EC2 is a REGIONAL service: a resource created through one Region's endpoint is
+    /// invisible to a request signed for another, so every report of a stored resource has
+    /// to know which Region the resource belongs to. The modelled [`Vpc`] shape carries no
+    /// member for it — no describe of a VPC reports a Region — so it lives beside the VPC
+    /// record keyed by the same id, the way [`Self::vpc_attributes`] does, written by
+    /// [`Self::insert_vpc`] (the ONE writer of a VPC) and taken back out with the VPC by
+    /// [`Self::remove_vpc`], so the map cannot outgrow [`MAX_VPCS`].
+    ///
+    /// It is the Region index for the whole VPC-shaped half of this store rather than one
+    /// index per kind: a subnet, a security group, a network ACL and a route table each
+    /// belong to ONE VPC, so the Region they are in is their VPC's
+    /// ([`Self::vpc_is_in_region`]) and the two can never disagree. An instance's Region is
+    /// its Availability Zone's (`region_of_zone_name`), which the record already carries.
+    ///
+    /// PUBLIC, like [`Self::vpcs`] beside it: another service reads this store to resolve
+    /// the VPCs an account holds, and a test harness that seeds a VPC at a chosen id writes
+    /// that map directly rather than through [`Self::insert_vpc`] — such a writer records the
+    /// Region here, or the VPC it wrote belongs to no Region and no describe reports it.
+    pub vpc_regions: BTreeMap<String, String>,
     /// When each VPC's `pending` -> `available` transition falls due, for the VPCs that
     /// have one.
     ///
@@ -3029,6 +3094,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             next_reservation: 0,
             next_private_ip: 0,
             vpcs: BTreeMap::new(),
+            // No VPC, so no Region holds one yet; `insert_vpc` records each VPC's Region.
+            vpc_regions: BTreeMap::new(),
             vpc_available_at: BTreeMap::new(),
             vpc_attributes: BTreeMap::new(),
             // A fresh account has requested no VPC peering connection.

@@ -18,6 +18,7 @@
 //! however that VPC came to be known.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_ec2_amazonec2 as ec2;
 
 use super::harness::{emulator_with_ec2, ok, string_member, Emulator, REGION};
 
@@ -113,8 +114,14 @@ fn element(xml: &str, name: &str) -> Option<String> {
     elements(xml, name).into_iter().next()
 }
 
-/// Call one Amazon EC2 action over its ec2Query wire and require HTTP 200.
-async fn ec2_ok(router: &Emulator, action: &str, params: &[(&str, &str)]) -> String {
+/// Call one Amazon EC2 action over its ec2Query wire, signed for `region`, and
+/// require HTTP 200.
+async fn ec2_ok_in(
+    router: &Emulator,
+    region: &str,
+    action: &str,
+    params: &[(&str, &str)],
+) -> String {
     let mut body = format!("Action={action}&Version={EC2_API_VERSION}");
     for (name, value) in params {
         body.push('&');
@@ -125,13 +132,13 @@ async fn ec2_ok(router: &Emulator, action: &str, params: &[(&str, &str)]) -> Str
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
-        .header("host", format!("ec2.{REGION}.amazonaws.com"))
+        .header("host", format!("ec2.{region}.amazonaws.com"))
         .header("content-type", "application/x-www-form-urlencoded")
         // The SigV4 credential scope is what routes the request to Amazon EC2.
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20261021/{REGION}/ec2/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20261021/{region}/ec2/aws4_request, \
                  SignedHeaders=host;x-amz-date, Signature=not-verified-in-this-test"
             ),
         )
@@ -143,9 +150,14 @@ async fn ec2_ok(router: &Emulator, action: &str, params: &[(&str, &str)]) -> Str
     let text = String::from_utf8_lossy(response.body()).to_string();
     assert_eq!(
         status, 200,
-        "Amazon EC2 {action} must succeed, got {status}: {text}"
+        "Amazon EC2 {action} in {region} must succeed, got {status}: {text}"
     );
     text
+}
+
+/// Call one Amazon EC2 action over its ec2Query wire and require HTTP 200.
+async fn ec2_ok(router: &Emulator, action: &str, params: &[(&str, &str)]) -> String {
+    ec2_ok_in(router, REGION, action, params).await
 }
 
 /// Create one VPC in the account's own Amazon EC2 inventory and answer the
@@ -170,12 +182,25 @@ async fn delete_vpc(router: &Emulator, vpc_id: &str) {
 /// inventory the per-VPC configuration listings are views of. An account holds
 /// the ambient default VPC of its Region from the moment it exists, so this is
 /// never assumed empty.
+///
+/// Amazon EC2 is a REGIONAL service and its `DescribeVpcs` reports the VPCs of
+/// the Region it was asked in, while these listings are views of what the
+/// ACCOUNT holds. So the inventory is read in BOTH the Region this suite works
+/// in and the Region a fresh account's ambient network is seeded in, and the two
+/// answers are the account's whole inventory.
 async fn inventory_vpc_ids(router: &Emulator) -> Vec<String> {
-    let answered = ec2_ok(router, "DescribeVpcs", &[]).await;
-    let held = elements(&answered, "vpcId");
+    let mut held: Vec<String> = Vec::new();
+    for region in [REGION, ec2::state::DEFAULT_REGION] {
+        let answered = ec2_ok_in(router, region, "DescribeVpcs", &[]).await;
+        for vpc_id in elements(&answered, "vpcId") {
+            if !held.contains(&vpc_id) {
+                held.push(vpc_id);
+            }
+        }
+    }
     assert!(
         !held.is_empty(),
-        "DescribeVpcs must report the VPCs the account holds, got {answered}"
+        "DescribeVpcs must report the VPCs the account holds"
     );
     held
 }

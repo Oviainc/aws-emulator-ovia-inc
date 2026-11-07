@@ -272,11 +272,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_transitions();
         store.ensure_default_network(&region);
 
-        // An id that names no route table of the account is an error, not an absent row.
-        if let Some(unknown) = requested
-            .iter()
-            .find(|id| !store.route_tables.contains_key(id.as_str()))
-        {
+        // An id that names no route table of the account IN THIS REGION is an error, not an
+        // absent row — a route table belongs to one VPC, which belongs to one Region, and
+        // EC2 is reached through a regional endpoint.
+        if let Some(unknown) = requested.iter().find(|id| {
+            store
+                .route_tables
+                .get(id.as_str())
+                .is_none_or(|table| !store.vpc_is_in_region(table.vpc_id.as_deref(), &region))
+        }) {
             return Err(crate::state::invalid_route_table_id_not_found(unknown));
         }
         // A set, so narrowing below costs one lookup per table rather than a scan of the
@@ -296,6 +300,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for route_table in store.route_tables.values() {
             if budget.exhausted() {
                 break;
+            }
+            // The Region scope, asked before any filter: a route table of another Region is
+            // invisible to this request, so it is no candidate at all.
+            if !store.vpc_is_in_region(route_table.vpc_id.as_deref(), &region) {
+                continue;
             }
             if !wanted.is_empty()
                 && !wanted.contains(route_table.route_table_id.as_deref().unwrap_or_default())

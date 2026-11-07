@@ -282,10 +282,23 @@ pub(crate) async fn ec2_ok(
     action: &str,
     params: &[(&str, String)],
 ) -> String {
-    let (status, body) = ec2_call(router, REGION, action, params).await;
+    ec2_ok_in(case, router, REGION, action, params).await
+}
+
+/// [`ec2_ok`] signed for a Region of the caller's choosing: EC2 is a regional
+/// service, so which Region a resource is CREATED in decides which Region can
+/// discover it.
+pub(crate) async fn ec2_ok_in(
+    case: &str,
+    router: &MultiServiceRouter,
+    region: &str,
+    action: &str,
+    params: &[(&str, String)],
+) -> String {
+    let (status, body) = ec2_call(router, region, action, params).await;
     assert_eq!(
         status, 200,
-        "case {case:?}: expected HTTP 200 from {action}, got {status} with {body}"
+        "case {case:?}: expected HTTP 200 from {action} in {region}, got {status} with {body}"
     );
     body
 }
@@ -917,32 +930,55 @@ async fn a_resource_is_discovered_in_its_own_region() {
     );
 }
 
-/// The other half of the Region rule, and this emulator's documented limit on
-/// it: a resource whose owning service records NEITHER an ARN nor a Region for
-/// it has no recorded Region to be attributed to, so it is reported in whichever
-/// Region asks, under an ARN naming the Region that asked — exactly as that
-/// service's own Region-agnostic describes report it.
+/// The other half of the Region rule for a resource whose owning service records
+/// the Region ITSELF rather than an ARN: EC2 now records the Region each VPC was
+/// created in, so a VPC is discoverable in that Region and in no other, and the
+/// ambient default VPC the account has held in `us-east-1` since it existed is
+/// discoverable there rather than everywhere.
 ///
-/// EC2's VPC, instance, network-interface and address stores are such stores
-/// (unlike its subnet and security-group records, which keep `SubnetArn` /
-/// `SecurityGroupArn` and are filtered by Region above). This case therefore
-/// DOCUMENTS the chosen behaviour instead of asserting a Region filter the
-/// owning state cannot support; narrowing it needs those EC2 records to carry a
-/// Region or an ARN, which belongs to that service rather than to Firewall
-/// Manager.
+/// EC2's network-interface and address stores are still Region-agnostic (they
+/// keep neither an ARN nor a Region), so a resource of those two is reported in
+/// whichever Region asks — the documented limit this case does NOT cover.
 #[tokio::test]
-async fn a_resource_whose_service_records_no_region_is_discovered_from_every_region() {
+async fn a_vpc_is_discovered_only_in_the_region_it_was_created_in() {
     let (router, _engine) = emulator();
     associate_admin(&router).await;
 
-    let vpc = element(
-        "vpc",
-        &ec2_ok("vpc", &router, "CreateVpc", &[p("CidrBlock", "10.0.0.0/16")]).await,
-        "vpcId",
-    );
+    // One VPC per Region, so each Region has a VPC the other must not report and
+    // neither answer can be right by accident.
+    let created: Vec<(&str, String)> = vec![
+        (
+            REGION,
+            element(
+                "vpc",
+                &ec2_ok_in(
+                    "vpc",
+                    &router,
+                    REGION,
+                    "CreateVpc",
+                    &[p("CidrBlock", "10.0.0.0/16")],
+                )
+                .await,
+                "vpcId",
+            ),
+        ),
+        (
+            OTHER_REGION,
+            element(
+                "vpc elsewhere",
+                &ec2_ok_in(
+                    "vpc elsewhere",
+                    &router,
+                    OTHER_REGION,
+                    "CreateVpc",
+                    &[p("CidrBlock", "10.1.0.0/16")],
+                )
+                .await,
+                "vpcId",
+            ),
+        ),
+    ];
 
-    // One VPC, created once, asked for from two Regions: each answer names the
-    // Region it was asked in, and neither invents a second VPC.
     for region in [REGION, OTHER_REGION] {
         let mut seen = Vec::new();
         let mut token: Option<String> = None;
@@ -966,16 +1002,21 @@ async fn a_resource_whose_service_records_no_region_is_discovered_from_every_reg
                 break;
             }
         }
-        let expected = format!("arn:aws:ec2:{region}:{ACCOUNT}:vpc/{vpc}");
-        assert!(
-            seen.contains(&expected),
-            "case {region:?}: a VPC whose record keeps no Region is discoverable from every \
-             Region, as {expected:?}; got {seen:?}"
-        );
+        for (created_in, vpc) in &created {
+            let uri = format!("arn:aws:ec2:{region}:{ACCOUNT}:vpc/{vpc}");
+            let expected = created_in == &region;
+            assert_eq!(
+                seen.contains(&uri),
+                expected,
+                "case {region:?}: {vpc} was created in {created_in}, so it must {}be \
+                 discoverable here; got {seen:?}",
+                if expected { "" } else { "not " }
+            );
+        }
         assert_eq!(
-            seen.iter().filter(|uri| *uri == &expected).count(),
-            1,
-            "case {region:?}: the one VPC must be reported once, got {seen:?}"
+            seen.len(),
+            seen.iter().collect::<BTreeSet<&String>>().len(),
+            "case {region:?}: every VPC must be reported once, got {seen:?}"
         );
     }
 }

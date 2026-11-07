@@ -2,9 +2,12 @@
 
 //! @op DescribeVpcs
 //!
-//! Reports the account's VPCs out of [`crate::state`]: the whole store by default, or the
-//! subset the request's `VpcIds` and `Filters` select, one `MaxResults`-sized page at a
-//! time. A reporting operation — the only writes it makes are what was already owed at the
+//! Reports the account's VPCs out of [`crate::state`] IN THE REGION the request was signed
+//! for: that Region's whole set by default, or the subset the request's `VpcIds` and
+//! `Filters` select, one `MaxResults`-sized page at a time. EC2 is a regional service
+//! reached through a regional endpoint, so a VPC of another Region is invisible here and an
+//! id naming one is `InvalidVpcID.NotFound`. A reporting operation — the only writes it
+//! makes are what was already owed at the
 //! instant it was called: the state transitions the clock has ALREADY made due (a VPC's
 //! `pending` -> `available`), and the ambient default VPC the account holds in the Region
 //! the request is signed for
@@ -212,21 +215,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.ensure_default_network(&region);
 
         // "The IDs of the VPCs" (`DescribeVpcsRequest$VpcIds`): an id that names no VPC of
-        // the account is an error, not an absent row.
+        // the account IN THIS REGION is an error, not an absent row — a VPC of another
+        // Region is not one this request can name, EC2 being reached through a regional
+        // endpoint.
         let requested: &[String] = input.vpc_ids.as_deref().unwrap_or_default();
         if let Some(unknown) = requested
             .iter()
-            .find(|id| !store.vpcs.contains_key(id.as_str()))
+            .find(|id| !store.vpc_is_in_region(Some(id.as_str()), &region))
         {
             return Err(crate::state::invalid_vpc_id_not_found(unknown));
         }
 
-        // "The default is to describe all your VPCs": `VpcIds` narrows the store to the
-        // ids named, and every filter must then hold ("If you specify multiple filters,
-        // the filters are joined with an AND" — `Filter`).
+        // "The default is to describe all your VPCs": the VPCs of THIS Region, which
+        // `VpcIds` narrows to the ids named, and every filter must then hold ("If you
+        // specify multiple filters, the filters are joined with an AND" — `Filter`).
         let mut selected: Vec<&Vpc> = store
             .vpcs
             .values()
+            .filter(|vpc| store.vpc_is_in_region(vpc.vpc_id.as_deref(), &region))
             .filter(|vpc| {
                 requested.is_empty()
                     || requested
@@ -312,7 +318,13 @@ const DEFAULT_MAX_RESULTS: usize = 1000;
 ///
 /// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather
 /// than listed here. Every entry must be answered by [`filter_values`].
-const VPC_FILTERS: [&str; 14] = [
+///
+/// `isDefault` is the one name the member's own list does not carry: EC2 serves the
+/// default-VPC filter under the legacy camelCase spelling as well as the hyphenated
+/// `is-default` the model documents, which is the spelling the EC2 API has always accepted
+/// and which recorded `DescribeVpcs` calls use. Both name the same attribute, so
+/// [`filter_values`] answers them identically.
+const VPC_FILTERS: [&str; 15] = [
     "cidr",
     "cidr-block-association.association-id",
     "cidr-block-association.cidr-block",
@@ -323,6 +335,7 @@ const VPC_FILTERS: [&str; 14] = [
     "ipv6-cidr-block-association.ipv6-pool",
     "ipv6-cidr-block-association.state",
     "is-default",
+    "isDefault",
     "owner-id",
     "state",
     "tag-key",
@@ -396,8 +409,9 @@ fn filter_values<'a>(vpc: &'a Vpc, name: &str) -> Vec<&'a str> {
             .collect(),
         // A boolean attribute is filtered on the value a client sends for it, which is how
         // the wire renders it: `true` or `false`. A VPC whose flag is not set carries no
-        // value for the filter to match, like any other absent attribute.
-        "is-default" => vpc
+        // value for the filter to match, like any other absent attribute. Both spellings EC2
+        // serves the filter under answer from the one flag.
+        "is-default" | "isDefault" => vpc
             .is_default
             .map(|is_default| if is_default { "true" } else { "false" })
             .into_iter()

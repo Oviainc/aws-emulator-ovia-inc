@@ -207,6 +207,13 @@ pub(crate) fn create_network(
             ..Default::default()
         },
     );
+    // The Region the VPC belongs to: Amazon EC2 is a regional service, so a VPC written
+    // without one is in no Region and its own describes report neither it nor the subnets
+    // and groups of it. Written beside the record here because this seeds the store at
+    // chosen ids rather than going through EC2's own create, which records it.
+    store
+        .vpc_regions
+        .insert(vpc_id.to_string(), REGION.to_string());
     for (index, subnet_id) in subnets.iter().enumerate() {
         store.subnets.insert(
             (*subnet_id).to_string(),

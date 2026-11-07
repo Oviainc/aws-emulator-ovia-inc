@@ -169,25 +169,61 @@ pub fn commercial_regions() -> Vec<&'static str> {
     regions_in_partition_of(DEFAULT_REGION)
 }
 
-/// `region`'s opt-in status for an account calling in `signed_region`.
+/// `region`'s opt-in status for the account this emulator serves.
 ///
 /// A Region outside the commercial partition, and a commercial Region of
-/// [`REGIONS_ENABLED_BY_DEFAULT`], needs no opt-in at all. Of the rest — the ones an
-/// account must enable — the Region the request was SIGNED for is one the account has
-/// evidently enabled, since a regional endpoint of a disabled Region answers nothing;
-/// this emulator holds no account-level opt-in store and EC2 has no operation that opts a
-/// Region in or out (that is the Account API's `EnableRegion`), so that is the one opt-in
-/// a request itself evidences, and every other opt-in Region is reported
-/// `not-opted-in`.
-pub fn region_opt_in_status(region: &str, signed_region: &str) -> &'static str {
+/// [`REGIONS_ENABLED_BY_DEFAULT`], needs no opt-in at all. Every OTHER Region requires one
+/// the account has to make, and this emulator holds no account-level opt-in store — EC2 has
+/// no operation that opts a Region in or out (that is the Account API's `EnableRegion`) — so
+/// this account has made NONE of them and every opt-in Region is reported `not-opted-in`.
+///
+/// That is the same fact [`region_is_enabled_for_account`] gates a request on, so
+/// `DescribeRegions` cannot report a Region as available that a request signed for it would
+/// be refused in: a disabled Region answers nothing through its own endpoint, so calling in
+/// one is not evidence of an opt-in.
+pub fn region_opt_in_status(region: &str) -> &'static str {
     if partition_prefix_of(region).is_some() || REGIONS_ENABLED_BY_DEFAULT.contains(&region) {
         OPT_IN_NOT_REQUIRED
-    } else if region == signed_region {
-        OPT_IN_STATUS_OPTED_IN
     } else {
         OPT_IN_STATUS_NOT_OPTED_IN
     }
 }
+
+/// Whether a request signed for `region` reaches this account's EC2 at all.
+///
+/// A Region an account has not enabled serves it nothing: its regional endpoint refuses
+/// every request with `AuthFailure` rather than answering an empty result, which is what
+/// lets a client tell "this Region is not available to me" from "this Region is empty". So
+/// a Region of the catalog whose [`region_opt_in_status`] is `not-opted-in` is closed to
+/// this account.
+///
+/// Opt-in is a fact of a REGION, and only a Region the catalog holds ([`is_catalog_region`])
+/// has one: a well-formed code naming no Region at all carries no opt-in status to refuse
+/// on, so it is not closed here — the credential scope is caller-controlled text, and this
+/// gate answers what AWS publishes about Regions rather than reading authorization out of
+/// that text.
+pub fn region_is_enabled_for_account(region: &str) -> bool {
+    !is_catalog_region(region) || region_opt_in_status(region) != OPT_IN_STATUS_NOT_OPTED_IN
+}
+
+/// The sentence EC2 answers `AuthFailure` with for a request signed for a Region the
+/// account has not enabled.
+///
+/// FIXED text: it names nothing of the request — not the Region, not the operation — so it
+/// is the whole message rather than one run's sample of a varying one, and it is the
+/// sentence EC2 answers whenever it will not validate the credentials a request was signed
+/// with. Named here so the gate and the suites that assert it cannot drift apart.
+pub const REGION_NOT_ENABLED_MESSAGE: &str =
+    "AWS was not able to validate the provided access credentials";
+
+/// EC2's error code for a request its credentials do not authorize — the caller's standing
+/// with what the request reached, as opposed to [`UNAUTHORIZED_OPERATION`], which is about
+/// the caller's permission to call the operation at all.
+///
+/// Named here so the one place a handler answers it
+/// ([`crate::scaffolded::Scaffolded::auth_failure`]) and the request-dispatch Region gate
+/// cannot spell it two ways.
+pub const AUTH_FAILURE: &str = "AuthFailure";
 
 /// One Region of the account's partition, as the describe reads it.
 ///
@@ -258,7 +294,7 @@ pub fn regions_for_request(signed_region: &str) -> Vec<RegionRecord> {
         .map(|name| RegionRecord {
             region_name: name.to_string(),
             endpoint: region_endpoint(name),
-            opt_in_status: region_opt_in_status(name, signed_region),
+            opt_in_status: region_opt_in_status(name),
         })
         .collect()
 }

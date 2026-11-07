@@ -146,13 +146,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             MAX_RESOURCE_IDS, PageTokenRule, RESOURCE_TYPE_VPC, decode_page_token,
             invalid_pagination_token_for, invalid_vpc_id_not_found, page_from_cursor,
-            prefixed_id_is_well_formed, require_service_state, vpc_id_is_not_valid,
+            prefixed_id_is_well_formed, request_region, require_service_state, vpc_id_is_not_valid,
         };
 
-        // `ctx` carries request metadata only; this operation reads none of it — a VPC's
-        // ClassicLink DNS support is a fact of that VPC, not of the Region the request was
-        // signed for. The store is reached through the engine held on `self`.
-        let _ = ctx;
+        // EC2 is a REGIONAL service reached through a regional endpoint, so the VPCs whose
+        // ClassicLink DNS support this reports are the ones of the Region the request was
+        // signed for; a VPC of another Region is invisible here.
+        let region = request_region(ctx.parts());
 
         // "The IDs of the VPCs" (`VpcIds`): every entry is resolved against the store below,
         // so the list is capped the way every other EC2 request's id list is, before any work
@@ -208,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !prefixed_id_is_well_formed(RESOURCE_TYPE_VPC, vpc_id) {
                 return Err(vpc_id_is_not_valid(vpc_id));
             }
-            if !store.vpcs.contains_key(vpc_id) {
+            if !store.vpc_is_in_region(Some(vpc_id.as_str()), &region) {
                 return Err(invalid_vpc_id_not_found(vpc_id));
             }
         }
@@ -223,6 +223,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not supporting it rather than left out: the status is a fact every VPC has.
         let mut selected: Vec<ClassicLinkDnsSupport> = Vec::new();
         for vpc_id in store.vpcs.keys() {
+            // The Region scope, asked before any projection: a VPC of another Region is
+            // invisible to this request.
+            if !store.vpc_is_in_region(Some(vpc_id.as_str()), &region) {
+                continue;
+            }
             // The id narrowing is read off the key, so a VPC the request did not name costs
             // no projection at all.
             if !wanted.is_empty() && !wanted.contains(vpc_id.as_str()) {

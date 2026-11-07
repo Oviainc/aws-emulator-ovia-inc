@@ -606,6 +606,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .instance_type
             .clone()
             .unwrap_or_else(|| DEFAULT_INSTANCE_TYPE.to_string());
+        // An instance type is offered per Availability Zone, not per Region: AWS does not
+        // offer every type in every zone, so a launch into a zone that does not offer the
+        // requested type is refused `Unsupported` rather than placed there. Asked against
+        // the same offerings `DescribeInstanceTypeOfferings` reports
+        // ([`crate::state::zone_offers_instance_type`]), so a caller that enumerated the
+        // offerings to choose a zone and a launch into that zone cannot disagree.
+        if !crate::state::zone_offers_instance_type(&availability_zone, &instance_type) {
+            return Err(crate::state::unsupported_instance_type_in_zone(
+                &instance_type,
+                &availability_zone,
+            ));
+        }
         let monitoring_state = if input
             .monitoring
             .as_ref()

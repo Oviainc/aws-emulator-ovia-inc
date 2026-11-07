@@ -80,11 +80,22 @@ fn rows() -> Vec<Row> {
             code: ec2::state::INVALID_ADDRESS_NOT_FOUND,
         },
         Row {
+            // A SHORT-form instance id: that form carries no obfuscated identifier for the
+            // describe to decode, so it is looked up and reported absent — the other half
+            // of the id rule, which is what makes the malformed row below a distinct answer
+            // rather than the only one.
             case: "a describe of an instance the account does not hold",
+            action: "DescribeInstances",
+            params: vec![param("InstanceId.1", "i-0000beef")],
+            status: 400,
+            code: "InvalidInstanceID.NotFound",
+        },
+        Row {
+            case: "a describe of a long-form instance id this service never issued",
             action: "DescribeInstances",
             params: vec![param("InstanceId.1", "i-0000000000000beef")],
             status: 400,
-            code: "InvalidInstanceID.NotFound",
+            code: "InvalidInstanceID.Malformed",
         },
         Row {
             case: "a describe of something that is not an instance id at all",

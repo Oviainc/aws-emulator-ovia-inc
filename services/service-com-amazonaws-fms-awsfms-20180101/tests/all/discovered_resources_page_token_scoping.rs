@@ -43,7 +43,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::administrator_gated_operations::associate_admin;
 use crate::discovered_resources::{
-    ec2_ok, element, emulator, every_uri, p, put_account_scoped_policy,
+    ec2_ok, ec2_ok_in, element, emulator, every_uri, p, put_account_scoped_policy,
 };
 use crate::policy_lifecycle::{call_in, error_code, ACCOUNT, REGION};
 
@@ -118,6 +118,22 @@ async fn fixture() -> (MultiServiceRouter, Vec<Selection>) {
         if first_vpc.is_empty() {
             first_vpc = created;
         }
+        // The same block in the OTHER Region: EC2 is a regional service, so a VPC
+        // created here is discoverable only here — the page selected in that Region
+        // needs VPCs of its own for the rows below to be two DIFFERENT pages.
+        let case = format!("vpc {cidr} in {OTHER_REGION}");
+        element(
+            &case,
+            &ec2_ok_in(
+                &case,
+                &router,
+                OTHER_REGION,
+                "CreateVpc",
+                &[p("CidrBlock", cidr)],
+            )
+            .await,
+            "vpcId",
+        );
     }
     for cidr in SUBNET_CIDR_BLOCKS {
         let case = format!("subnet {cidr}");

@@ -358,14 +358,15 @@ async fn a_resource_count_quota_reports_the_accounts_own_count_over_the_value_in
     let emulator = Emulator::new();
 
     // Rows: each a Region of its own, creating a further batch of VPCs — none, one and
-    // several — so the reported utilization is read at a different count each time.
-    // EC2 answers `DescribeVpcs` for the whole account, so the counts accumulate; each
-    // row reads the count EC2 itself reports rather than assuming one.
+    // several more each time — so the reported utilization is read at a higher count each
+    // time. EC2 answers `DescribeVpcs` for the REGION the report is read in, so each row's
+    // count is that Region's own: the default VPC it comes with plus what the row created
+    // there. Each row reads the count EC2 itself reports rather than assuming one.
     let rows: &[(&str, usize, u8)] = &[
         ("us-east-1", 0, 10),
         ("us-west-2", 1, 20),
-        ("eu-west-1", 2, 30),
-        ("ap-south-1", 2, 40),
+        ("eu-west-1", 3, 30),
+        ("ap-south-1", 5, 40),
     ];
 
     let mut previous_utilization = -1.0_f64;
@@ -509,8 +510,14 @@ async fn a_vcpu_quota_reports_the_vcpus_of_the_accounts_running_instances() {
 
     // An instance of ANOTHER group moves that group only — and with a value in force of
     // zero and usage above it there is no finite percentage to report, so that record
-    // carries no `Utilization` at all rather than an invented number.
+    // carries no `Utilization` at all rather than an invented number. Read in a SECOND
+    // Region, because a start reuses the live report of its own Region — so that Region
+    // holds the same Standard launches beside the X instance, EC2 counting the instances
+    // of the Region the report is read in.
     let elsewhere = "ca-central-1";
+    for (instance_type, count) in launches {
+        launch_running(&emulator, elsewhere, instance_type, *count).await;
+    }
     launch_running(&emulator, elsewhere, "x2iedn.xlarge", 1).await;
     let records = report_records(&emulator, elsewhere).await;
     let case = "the Standard group with an X instance running";
@@ -664,8 +671,9 @@ async fn a_vcpu_quota_counts_every_running_type_however_many_reads_the_facts_tak
     // `MAX_INSTANCE_TYPES_PER_CALL`, which takes a second call (and, where the answer
     // pages, a second page) before the group's count is complete.
     //
-    // EC2 answers for the whole account, so the launches accumulate; each row reports
-    // in a Region of its own because a start reuses the live report of its Region.
+    // EC2 answers for the REGION the report is read in, so each row launches its whole set
+    // of types in its own Region — which is also what a start of a report needs, since a
+    // start reuses the live report of its Region.
     let rows: &[(&str, usize)] = &[
         ("us-west-1", 1),
         ("ap-northeast-1", 4),
@@ -678,14 +686,12 @@ async fn a_vcpu_quota_counts_every_running_type_however_many_reads_the_facts_tak
         .expect("the rows are not empty");
     let types = standard_types(&emulator, "us-west-1", largest).await;
 
-    let mut launched = 0usize;
     for (region, distinct) in rows {
         let case = format!("{distinct} distinct Standard instance types running");
-        for (instance_type, _) in &types[launched..*distinct] {
+        for (instance_type, _) in &types[..*distinct] {
             launch(&emulator, region, instance_type, 1).await;
         }
         wait_until_all_running(&emulator, region).await;
-        launched = *distinct;
 
         let expected_vcpus: f64 = types[..*distinct].iter().map(|(_, vcpus)| vcpus).sum();
         let records = report_records(&emulator, region).await;

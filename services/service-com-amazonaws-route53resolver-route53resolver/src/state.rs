@@ -1401,6 +1401,11 @@ pub fn unresolvable_vpc_id<'a, Eng: Send + Sync + 'static>(
 /// records name
 /// ([`ComAmazonawsRoute53resolverRoute53resolverState::known_vpc_ids`]).
 ///
+/// Amazon EC2 is a REGIONAL service and its `DescribeVpcs` reports the VPCs of
+/// the Region it was asked in, where this enumerates the account's whole VPC
+/// inventory: these listings are views of what the ACCOUNT holds rather than of
+/// one Region's endpoint, which is the reading this service has always taken.
+///
 /// A pure read: nothing is written to either store.
 ///
 /// LOCKING. As [`unresolvable_vpc_id`]: the Amazon EC2 store lock is taken for

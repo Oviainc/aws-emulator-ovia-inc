@@ -419,6 +419,9 @@ impl ComAmazonawsEc2Amazonec2State {
     pub fn remove_vpc(&mut self, vpc_id: &str) -> Option<Vpc> {
         let vpc = self.vpcs.remove(vpc_id)?;
         self.vpc_available_at.remove(vpc_id);
+        // The Region index entry goes with the VPC as well, so the map cannot outlive the
+        // VPCs it places and a VPC id this store no longer holds places nothing.
+        self.vpc_regions.remove(vpc_id);
         // The attributes `insert_vpc` wrote for this VPC go with it as well: a VPC created
         // later must start from the creation defaults, never from what a
         // `ModifyVpcAttribute` left behind for a VPC that no longer exists.

@@ -367,6 +367,11 @@ impl ComAmazonawsEc2Amazonec2State {
         // once its own due instant has passed; both were owed whether or not anybody called.
         self.expire_due_image_usage_reports(SystemTime::now());
         self.materialize_due_image_usage_reports(now);
+        // The primary private addresses the terminations that just COMPLETED release, taken
+        // while the moves are applied so each is released exactly ONCE: an instance already
+        // at `terminated` has no transition left to apply, so a later sweep collects nothing
+        // for it and cannot free an address a new holder has since been given.
+        let mut released: Vec<String> = Vec::new();
         for instance in self.instances.values_mut() {
             let due = instance
                 .pending_transition
@@ -376,6 +381,12 @@ impl ComAmazonawsEc2Amazonec2State {
             if let Some(state) = due {
                 instance.state = state;
                 instance.pending_transition = None;
+                // A completed termination releases the instance's primary private address:
+                // the interface that held it goes at this same instant (below), so EC2 has
+                // freed the address for reuse and a later launch may be given it.
+                if state == InstanceStateName::Terminated {
+                    released.push(instance.private_ip.clone());
+                }
             }
             // The monitoring move the clock owes the same instance: `pending` -> `enabled`
             // for a `MonitorInstances`, `disabling` -> `disabled` for an
@@ -390,6 +401,9 @@ impl ComAmazonawsEc2Amazonec2State {
                 instance.monitoring_state = monitoring_state.to_string();
                 instance.monitoring_transition = None;
             }
+        }
+        for address in released {
+            self.release_private_ip(&address);
         }
         // An instance that has reached `terminated` no longer holds the network interfaces
         // its attachments are marked to delete with it — "indicates whether the network
@@ -1809,7 +1823,15 @@ impl ComAmazonawsEc2Amazonec2State {
     /// (`Instance$SubnetId`) is the subnet of the interface at device index 0, so the
     /// instance report, the interface report and the `subnet-id` filter all answer from one
     /// record.
+    ///
+    /// `None` for a TERMINATED instance: its network interfaces were deleted when the
+    /// termination completed ([`Self::delete_interfaces_of_terminated_instances`]), so it is
+    /// attached to no subnet at all and reports none — which is also what keeps it out of a
+    /// `subnet-id` or `vpc-id` filtered enumeration of a network it no longer occupies.
     pub fn instance_subnet_id(&self, instance: &InstanceRecord) -> Option<String> {
+        if instance.state == InstanceStateName::Terminated {
+            return None;
+        }
         if let Some(subnet_id) = instance.subnet_id.clone() {
             return Some(subnet_id);
         }
@@ -1886,7 +1908,15 @@ impl ComAmazonawsEc2Amazonec2State {
     /// them. A launch that named no group is given its VPC's default group on that
     /// interface ([`Self::mint_launched_primary_interface`]), which is what AWS reports for
     /// such an instance.
+    ///
+    /// EMPTY for a TERMINATED instance, on the same terms as [`Self::instance_subnet_id`]:
+    /// the interface that carried its groups was deleted when the termination completed, so
+    /// the instance is in no security group any more and the launch's own list is not a
+    /// fallback for one.
     pub fn instance_security_groups(&self, instance: &InstanceRecord) -> Vec<GroupIdentifier> {
+        if instance.state == InstanceStateName::Terminated {
+            return Vec::new();
+        }
         let primary = self
             .instance_network_interfaces(&instance.instance_id)
             .into_iter()
@@ -1951,10 +1981,21 @@ impl ComAmazonawsEc2Amazonec2State {
                     code: Some(code.clone()),
                     message: Some(message.clone()),
                 }),
-            private_ip_address: Some(instance.private_ip.clone()),
+            // "The private IPv4 address assigned to the instance"
+            // (`Instance$PrivateIpAddress`): an address an instance HOLDS, which a
+            // terminated instance holds none of — its network interfaces are deleted when
+            // the termination completes
+            // ([`Self::delete_interfaces_of_terminated_instances`]) and the addresses they
+            // carried go back to the subnet — so the member is left out for a terminated
+            // instance rather than reporting an address EC2 has already freed for reuse.
+            private_ip_address: (instance.state != InstanceStateName::Terminated)
+                .then(|| instance.private_ip.clone()),
             // Documented on `Instance$privateDnsName`: "This name is not available
-            // until the instance enters the running state."
-            private_dns_name: (instance.state != InstanceStateName::Pending)
+            // until the instance enters the running state." It names the private address
+            // above, so an instance that no longer reports one reports no name for it
+            // either.
+            private_dns_name: (instance.state != InstanceStateName::Pending
+                && instance.state != InstanceStateName::Terminated)
                 .then(|| instance.private_dns_name.clone()),
             public_ip_address: instance.public_ip.clone(),
             launch_time: Some(system_time_to_date_time(instance.launch_time)),
@@ -2069,6 +2110,11 @@ impl ComAmazonawsEc2Amazonec2State {
         match name {
             "architecture" => single(Some(instance.architecture.clone())),
             "availability-zone" => single(Some(instance.placement_az.clone())),
+            // "availability-zone-id - The ID of the Availability Zone of the instance"
+            // (`DescribeInstancesRequest$Filters`): the id of the zone the instance's own
+            // placement names, through this crate's ONE name -> id lookup, so a filter and
+            // `DescribeAvailabilityZones` cannot disagree about one zone.
+            "availability-zone-id" => single(zone_id_for_zone_name(&instance.placement_az)),
             "client-token" => single(instance.client_token.clone()),
             "ebs-optimized" => single(Some(instance.ebs_optimized.to_string())),
             "image-id" => single(instance.image_id.clone()),
@@ -2114,16 +2160,54 @@ impl ComAmazonawsEc2Amazonec2State {
                     .and_then(|profile| profile.arn),
             ),
             "key-name" => single(instance.key_name.clone()),
+            // "kernel-id - The kernel ID" and "ramdisk-id - The RAM disk ID"
+            // (`DescribeInstancesRequest$Filters`): the EFFECTIVE values the instance
+            // reports, so a filter and the instance report cannot disagree.
+            "kernel-id" => single(instance.kernel_id.clone()),
+            "ramdisk-id" => single(instance.ramdisk_id.clone()),
+            // "ip-address - The public IPv4 address of the instance"
+            // (`DescribeInstancesRequest$Filters`): an instance with no public address holds
+            // no value for it, so a filter naming one selects only instances that have one.
+            "ip-address" => single(instance.public_ip.clone()),
+            // "reason - The reason for the current state of the instance", and the
+            // `state-reason-code` / `state-reason-message` pair beside it
+            // (`DescribeInstancesRequest$Filters`) — each read off the same members the
+            // instance report carries.
+            "reason" => single(instance.state_transition_reason.clone()),
+            "state-reason-code" => single(
+                instance
+                    .state_reason
+                    .as_ref()
+                    .map(|(code, _)| code.clone()),
+            ),
+            "state-reason-message" => single(
+                instance
+                    .state_reason
+                    .as_ref()
+                    .map(|(_, message)| message.clone()),
+            ),
+            // "source-dest-check - Indicates whether the instance performs
+            // source/destination checking" (`DescribeInstancesRequest$Filters`): a boolean
+            // attribute is filtered on the value a client sends for it, which is how the
+            // wire renders it.
+            "source-dest-check" => single(Some(instance.source_dest_check.to_string())),
             "launch-index" => single(Some(instance.ami_launch_index.to_string())),
             "monitoring-state" => single(Some(instance.monitoring_state.clone())),
             "owner-id" => single(Some(reservation.owner_id.clone())),
             // Matches what the instance REPORTS as its private DNS name, which is
-            // nothing until it runs.
+            // nothing until it runs and nothing again once it is terminated.
             "private-dns-name" => single(
-                (instance.state != InstanceStateName::Pending)
+                (instance.state != InstanceStateName::Pending
+                    && instance.state != InstanceStateName::Terminated)
                     .then(|| instance.private_dns_name.clone()),
             ),
-            "private-ip-address" => single(Some(instance.private_ip.clone())),
+            // Matches what the instance REPORTS as its private address, which a terminated
+            // instance no longer has ([`Self::instance_view`]), so a filter on an address
+            // EC2 has freed selects nothing rather than the instance that used to hold it.
+            "private-ip-address" => single(
+                (instance.state != InstanceStateName::Terminated)
+                    .then(|| instance.private_ip.clone()),
+            ),
             // "The product code associated with the AMI used to launch the instance",
             // and "the type of product code (devpay | marketplace)" — both read off the
             // same projection the instance report carries.
@@ -2166,6 +2250,13 @@ impl ComAmazonawsEc2Amazonec2State {
                         .iter()
                         .filter_map(|interface| interface.attachment.as_ref())
                 };
+                // The private addresses of those interfaces, the subject of the
+                // `network-interface.addresses.*` family.
+                let addresses = || {
+                    attached
+                        .iter()
+                        .flat_map(|interface| interface.private_ip_addresses.iter().flatten())
+                };
                 match name {
                     "network-interface.network-interface-id" => Some(
                         attached
@@ -2191,16 +2282,76 @@ impl ComAmazonawsEc2Amazonec2State {
                             .filter_map(|interface| interface.mac_address.clone())
                             .collect(),
                     ),
+                    "network-interface.description" => Some(
+                        attached
+                            .iter()
+                            .filter_map(|interface| interface.description.clone())
+                            .collect(),
+                    ),
+                    "network-interface.owner-id" => Some(
+                        attached
+                            .iter()
+                            .filter_map(|interface| interface.owner_id.clone())
+                            .collect(),
+                    ),
+                    "network-interface.private-dns-name" => Some(
+                        attached
+                            .iter()
+                            .filter_map(|interface| interface.private_dns_name.clone())
+                            .collect(),
+                    ),
                     "network-interface.private-ip-address" => Some(
                         attached
                             .iter()
                             .filter_map(|interface| interface.private_ip_address.clone())
                             .collect(),
                     ),
+                    "network-interface.source-dest-check" => Some(
+                        attached
+                            .iter()
+                            .filter_map(|interface| {
+                                interface.source_dest_check.map(|set| set.to_string())
+                            })
+                            .collect(),
+                    ),
                     "network-interface.status" => Some(
                         attached
                             .iter()
                             .filter_map(|interface| interface.status.clone())
+                            .collect(),
+                    ),
+                    "network-interface.group-id" => Some(
+                        attached
+                            .iter()
+                            .flat_map(|interface| interface.groups.iter().flatten())
+                            .filter_map(|group| group.group_id.clone())
+                            .collect(),
+                    ),
+                    "network-interface.group-name" => Some(
+                        attached
+                            .iter()
+                            .flat_map(|interface| interface.groups.iter().flatten())
+                            .filter_map(|group| group.group_name.clone())
+                            .collect(),
+                    ),
+                    // The ADDRESSES of the attached interfaces: every private IPv4 address
+                    // each one carries, not only the interface's primary — which is what
+                    // `network-interface.addresses.private-ip-address` is for, where the
+                    // instance's own `private-ip-address` filter "can only be used to filter
+                    // by the primary IP address" (`DescribeInstancesRequest$Filters`).
+                    "network-interface.addresses.private-ip-address" => Some(
+                        addresses()
+                            .filter_map(|address| address.private_ip_address.clone())
+                            .collect(),
+                    ),
+                    "network-interface.addresses.private-dns-name" => Some(
+                        addresses()
+                            .filter_map(|address| address.private_dns_name.clone())
+                            .collect(),
+                    ),
+                    "network-interface.addresses.primary" => Some(
+                        addresses()
+                            .filter_map(|address| address.primary.map(|set| set.to_string()))
                             .collect(),
                     ),
                     "network-interface.attachment.attachment-id" => Some(
@@ -2218,6 +2369,13 @@ impl ComAmazonawsEc2Amazonec2State {
                     "network-interface.attachment.status" => Some(
                         attachments()
                             .filter_map(|attachment| attachment.status.clone())
+                            .collect(),
+                    ),
+                    "network-interface.attachment.network-card-index" => Some(
+                        attachments()
+                            .filter_map(|attachment| {
+                                attachment.network_card_index.map(|index| index.to_string())
+                            })
                             .collect(),
                     ),
                     "network-interface.attachment.delete-on-termination" => Some(
@@ -2302,8 +2460,24 @@ impl CompiledFilter {
 }
 
 /// Whether this slice resolves `name` as a `DescribeInstances` filter.
+///
+/// A `tag:` prefix with no key names no tag, so it is as undocumented as any other
+/// misspelling — the same reading every other describe of this service takes.
 pub fn filter_name_supported(name: &str) -> bool {
-    name.starts_with(TAG_FILTER_PREFIX) || SUPPORTED_INSTANCE_FILTERS.contains(&name)
+    name.strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+        || SUPPORTED_INSTANCE_FILTERS.contains(&name)
+}
+
+/// The Region an instance runs in: the Region of its own Availability Zone.
+///
+/// EC2 is a regional service, so a request signed for another Region must not see this
+/// instance. The zone is the fact the record already carries, and `region_of_zone_name` is
+/// this crate's ONE reading of which Region a zone belongs to, so an instance and the
+/// resources its zone places (its root volume, its primary interface) can never be reported
+/// in two Regions.
+pub fn instance_region(instance: &InstanceRecord) -> &str {
+    region_of_zone_name(&instance.placement_az)
 }
 
 /// The caller-chosen bytes one stored instance holds.

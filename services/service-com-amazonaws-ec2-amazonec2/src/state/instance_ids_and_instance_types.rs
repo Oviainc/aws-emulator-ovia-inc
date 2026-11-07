@@ -299,6 +299,52 @@ pub fn require_known_instance<E>(
     require_instance_record(store, instance_id).map(|_| ())
 }
 
+/// The stored instance `instance_id` names for an operation that DECODES a long-form id
+/// before it looks anything up: a long-form id this service never issued is
+/// `InvalidInstanceID.Malformed`, where a short-form one it holds no instance for is
+/// `InvalidInstanceID.NotFound`.
+///
+/// EC2's long id form is an OBFUSCATED identifier, so an id the service cannot decode is
+/// answered "Unable to unobfuscate ID." rather than as a resource that is not there — the
+/// reading [`ComAmazonawsEc2Amazonec2State::id_was_issued`] states for the kinds recorded
+/// taking it. The ids this service has issued as an instance's own are the ones
+/// [`ComAmazonawsEc2Amazonec2State::mint_instance_id`] has counted, so a long-form
+/// identifier above that counter is a value no instance of this account was ever given and
+/// the describe cannot decode it. The retired SHORT form carries no identifier to decode
+/// ([`instance_id_is_well_formed`]), so it is looked up and reported absent, which is what
+/// `DescribeInstances` was recorded answering for one.
+///
+/// WHICH of the two readings an operation takes is a fact of that operation rather than of
+/// the id kind ([`instance_id_reads_as_one`]), so this is not generalised to the operations
+/// recorded answering `NotFound` for a long-form id.
+///
+/// ## Where each reading's evidence is, so they can be re-checked
+///
+/// * THIS reading: the recorded unit
+///   `ec2.ec2mr-xrg-absent-instance-id-rejected-but-filter-returns-empty` names an absent
+///   long-form instance id on `DescribeInstances` and asserts
+///   `InvalidInstanceID.Malformed`, while
+///   `cloudtrail__ec2.obs-ec2-3-rejected-ec2-calls-audit-client-error-codes-with-no-response-elements`
+///   names a SHORT-form id on the same operation and asserts `InvalidInstanceID.NotFound` —
+///   the two halves this function separates.
+/// * The LOOKUP reading, which the other instance-id readers keep: the SQL Server High
+///   Availability describes are recorded answering `InvalidInstanceID.NotFound` for a
+///   long-form id in that same gap (cited on [`instance_id_reads_as_one`]), so answering
+///   malformed there would contradict a recording.
+pub fn require_decoded_instance_record<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    instance_id: &str,
+) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
+    if long_form_identifier(instance_id)
+        .is_some_and(|identifier| identifier > u128::from(store.next_instance))
+    {
+        return Err(crate::scaffolded::Scaffolded::invalid_instance_id_malformed(
+            instance_id,
+        ));
+    }
+    require_instance_record(store, instance_id)
+}
+
 /// The stored instance `instance_id` names, refusing an id this service cannot resolve
 /// exactly as [`require_known_instance`] does — the ONE reading of those two refusals,
 /// for a caller that needs the record it resolved and not only the fact that it
@@ -847,11 +893,16 @@ pub fn locations_of_type(region: &str, location_type: &str) -> Vec<String> {
 /// exactly when the model declares it. AWS offers a Region-specific subset of them,
 /// and neither the model nor a request carries WHICH subset a Region has, so the set
 /// is the same in every Region rather than a per-Region subset invented here.
+///
+/// WITHIN a Region the zones differ, which is a fact the describe of offerings reports per
+/// zone: see [`location_offers_instance_type`] for which of these a given Availability Zone
+/// offers.
 pub fn offered_instance_types() -> &'static [&'static str] {
     INSTANCE_TYPE_VALUES
 }
 
-/// Every offering of `instance_types` in `locations`, reported as `location_type`.
+/// Every offering of `instance_types` in `locations` of `region`, reported as
+/// `location_type`.
 ///
 /// The caller passes the locations and the instance types that the request's filters
 /// leave, which is what keeps the cost of a filtered describe proportional to
@@ -859,11 +910,16 @@ pub fn offered_instance_types() -> &'static [&'static str] {
 /// against one field of an offering, so narrowing each field BEFORE the product is
 /// built answers exactly what testing every built offering would.
 ///
+/// Not every pair is an offering: an instance type is offered in a location only when
+/// [`location_offers_instance_type`] says that location has it, which is what makes the
+/// offerings of a Region's Availability Zones differ from one another.
+///
 /// The result is in cursor order — location first, then instance type, as
 /// [`offering_page_cursor`] joins them — which is the order a `NextToken` walk resumes
 /// in, so it is sorted here rather than inherited from the order `locations` or
 /// `instance_types` happen to arrive in.
 pub fn instance_type_offerings(
+    region: &str,
     locations: &[String],
     instance_types: &[&'static str],
     location_type: &'static str,
@@ -873,6 +929,9 @@ pub fn instance_type_offerings(
         .flat_map(|location| {
             instance_types
                 .iter()
+                .filter(move |instance_type| {
+                    location_offers_instance_type(region, location, location_type, instance_type)
+                })
                 .map(move |instance_type| InstanceTypeOfferingRecord {
                     instance_type,
                     location_type,
@@ -882,6 +941,115 @@ pub fn instance_type_offerings(
         .collect();
     offerings.sort_by_cached_key(offering_page_cursor);
     offerings
+}
+
+/// The `LocationType` value naming a Region's Availability Zones by NAME, as
+/// [`locations_of_type`] reads it — a member of the modelled `LocationType` enum.
+pub const LOCATION_TYPE_AVAILABILITY_ZONE: &str = "availability-zone";
+
+/// The `LocationType` value naming them by AZ ID.
+pub const LOCATION_TYPE_AVAILABILITY_ZONE_ID: &str = "availability-zone-id";
+
+/// Whether `location` of `region`, named as `location_type`, offers `instance_type`.
+///
+/// "The results can be filtered by location" and
+/// `DescribeInstanceTypeOfferings(LocationType='availability-zone')` reports an offering per
+/// ZONE precisely because the answer differs between the zones of one Region: AWS does not
+/// offer every instance type in every Availability Zone, which is why a launch into a zone
+/// that lacks the requested type is refused `Unsupported` and a capacity-aware client
+/// enumerates offerings to choose a zone.
+///
+/// WHICH zone lacks which type is per-account, per-Region data neither the model nor a
+/// request carries, so where the boundary falls is CHOSEN and derived, not invented per
+/// call: a Region's LAST Availability Zone in zone order does not offer the
+/// CURRENT-generation instance types ([`InstanceTypeName::current_generation`], which reads
+/// AWS's own "Previous generation instances" list), while every other zone of the Region
+/// offers the whole catalog. So the offerings of a Region are a strict subset relation
+/// between its zones, the newest families being the ones a zone can lack, and the previous
+/// generations — the ones every zone has had since it was built — are offered everywhere.
+///
+/// A whole REGION offers a type whenever any of its zones does, which every type satisfies,
+/// so a `region` location offers the whole catalog; a location kind that names no zone
+/// (`outpost`) has no offerings to narrow in the first place.
+pub fn location_offers_instance_type(
+    region: &str,
+    location: &str,
+    location_type: &str,
+    instance_type: &str,
+) -> bool {
+    if unoffering_location(region, location_type).as_deref() != Some(location) {
+        return true;
+    }
+    InstanceTypeName::parse(instance_type).is_none_or(|name| !name.current_generation())
+}
+
+/// The location of `region`'s LAST Availability Zone as `location_type` names it, or `None`
+/// when that kind of location names no single zone.
+///
+/// The ONE place the Region's offering boundary is placed, so [`location_offers_instance_type`]
+/// answers the same for a zone whether the request named it by name or by AZ ID.
+fn unoffering_location(region: &str, location_type: &str) -> Option<String> {
+    let zones = availability_zones_in_region(region);
+    let last = zones.last()?;
+    match location_type {
+        LOCATION_TYPE_AVAILABILITY_ZONE => Some(last.zone_name.clone()),
+        LOCATION_TYPE_AVAILABILITY_ZONE_ID => Some(last.zone_id.clone()),
+        _ => None,
+    }
+}
+
+/// Whether the Availability Zone named `zone_name` offers `instance_type`.
+///
+/// [`location_offers_instance_type`] for the zone's own Region, so a launch's offering check
+/// and `DescribeInstanceTypeOfferings` cannot disagree about one zone.
+pub fn zone_offers_instance_type(zone_name: &str, instance_type: &str) -> bool {
+    location_offers_instance_type(
+        region_of_zone_name(zone_name),
+        zone_name,
+        LOCATION_TYPE_AVAILABILITY_ZONE,
+        instance_type,
+    )
+}
+
+/// EC2's error code for a request asking for something the location it named cannot serve —
+/// "the requested configuration is currently not supported" (EC2 API error codes), which is
+/// what a launch of an instance type an Availability Zone does not offer is refused with.
+pub const UNSUPPORTED: &str = "Unsupported";
+
+/// Refuse a launch of `instance_type` into `zone_name`, which does not offer it: HTTP 400
+/// [`UNSUPPORTED`].
+///
+/// Every variable part comes from the request and from this emulator's own offerings — the
+/// type the launch asked for, the zone it asked for, and the zones of that Region that DO
+/// offer the type ([`zones_offering_instance_type`]) — so the sentence states the rule and
+/// names what a caller can retry with rather than carrying one run's values.
+pub fn unsupported_instance_type_in_zone<E>(
+    instance_type: &str,
+    zone_name: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    let offered =
+        zones_offering_instance_type(region_of_zone_name(zone_name), instance_type).join(", ");
+    crate::scaffolded::Scaffolded::service_error(
+        UNSUPPORTED,
+        400,
+        format!(
+            "Your requested instance type ({instance_type}) is not supported in your requested \
+             Availability Zone ({zone_name}). Please retry your request by not specifying an \
+             Availability Zone or choosing {offered}."
+        ),
+    )
+}
+
+/// The names of `region`'s Availability Zones that DO offer `instance_type`, in zone order.
+///
+/// What a refusal names the caller back as the zones to retry in, read through the same
+/// predicate the describe reports.
+pub fn zones_offering_instance_type(region: &str, instance_type: &str) -> Vec<String> {
+    availability_zones_in_region(region)
+        .into_iter()
+        .map(|zone| zone.zone_name)
+        .filter(|zone_name| zone_offers_instance_type(zone_name, instance_type))
+        .collect()
 }
 
 /// The pagination cursor naming `offering`: its location and its instance type, joined

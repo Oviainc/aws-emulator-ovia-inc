@@ -117,6 +117,11 @@ async fn launch(router: &MultiServiceRouter, image_id: &str) -> String {
         .unwrap_or_else(|| panic!("the launch must report the instance it minted: {body}"))
 }
 
+/// One row of the instance-id table: what the row probes, the id, the code an operation
+/// that LOOKS the id up refuses it with, and the code one that DECODES a long-form id first
+/// refuses it with.
+type InstanceIdRow = (&'static str, String, &'static str, &'static str);
+
 /// RULE 1: a long-form id whose identifier this service spent on another kind of resource is
 /// no id of the kind the member declares — that kind's malformed class, before any lookup —
 /// while an identifier it has issued to nothing, and the retired short form, are reported as
@@ -174,30 +179,36 @@ async fn a_long_form_id_the_mint_spent_on_another_kind_is_refused_before_any_loo
 
     // The same rule, over every operation that reads an INSTANCE id: the identifier the mint
     // spent on another kind is malformed, one it has issued to nothing is not found, and the
-    // short form is looked up.
-    let instance_rows: Vec<(&str, String, &str)> = vec![
+    // short form is looked up. `DescribeInstances` DECODES the long form before it looks
+    // anything up, so for it an identifier the mint has not reached is malformed too — there
+    // is nothing to decode — which is the fourth column.
+    let instance_rows: Vec<InstanceIdRow> = vec![
         (
             "the identifier of the published AMI's snapshot",
             long_id("i", spent_elsewhere),
+            "InvalidInstanceID.Malformed",
             "InvalidInstanceID.Malformed",
         ),
         (
             "an identifier the mint has not reached",
             long_id("i", never_issued),
             "InvalidInstanceID.NotFound",
+            "InvalidInstanceID.Malformed",
         ),
         (
             "the retired short form, nothing launched for it",
             "i-0abc1234".to_string(),
+            "InvalidInstanceID.NotFound",
             "InvalidInstanceID.NotFound",
         ),
         (
             "the all-zero placeholder, which no mint counts to",
             "i-00000000000000000".to_string(),
             "InvalidInstanceID.Malformed",
+            "InvalidInstanceID.Malformed",
         ),
     ];
-    for (case, instance_id, code) in &instance_rows {
+    for (case, instance_id, code, decoded) in &instance_rows {
         for action in [
             "DescribeInstances",
             "StopInstances",
@@ -210,11 +221,16 @@ async fn a_long_form_id_the_mint_spent_on_another_kind_is_refused_before_any_loo
             } else {
                 indexed("InstanceId", &[instance_id.as_str()])
             };
+            let expected = if action == "DescribeInstances" {
+                *decoded
+            } else {
+                *code
+            };
             let (status, body) = api(&router, action, &params).await;
             assert_eq!(
                 (status, error_code(&body).as_str()),
-                (REFUSAL, *code),
-                "case {case:?} ({instance_id}) on {action}: expected {REFUSAL} {code}, got \
+                (REFUSAL, expected),
+                "case {case:?} ({instance_id}) on {action}: expected {REFUSAL} {expected}, got \
                  {status} with body {body}"
             );
         }
@@ -222,7 +238,7 @@ async fn a_long_form_id_the_mint_spent_on_another_kind_is_refused_before_any_loo
 
     // The operations whose own validator WORDS a malformed instance id differently answer
     // the same class with their own sentence, over the same two halves of the rule.
-    for (case, instance_id, code) in &instance_rows {
+    for (case, instance_id, code, _decoded) in &instance_rows {
         let (status, body) = api(
             &router,
             "CreateMacSystemIntegrityProtectionModificationTask",

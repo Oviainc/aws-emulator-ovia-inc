@@ -4284,13 +4284,15 @@ fn ec2_resources<Eng: Send + Sync + 'static>(
         return Vec::new();
     };
     let store = state.lock();
-    // The ARN of a resource whose own record keeps none. EC2's VPC, instance,
-    // network interface and address stores are NOT Region-keyed and those
-    // records carry no ARN, so such a resource is reported in whichever Region
-    // asks — exactly as EC2's own Region-agnostic describes report it, and so
-    // [`in_region`] does no filtering for those four types. The Region filter
-    // bites for the types whose record DOES keep an ARN (`SubnetArn`,
-    // `SecurityGroupArn`).
+    // The ARN of a resource whose own record keeps none. EC2's network interface
+    // and address stores are NOT Region-keyed and those records carry no ARN, so
+    // such a resource is reported in whichever Region asks — exactly as EC2's own
+    // Region-agnostic describes report it, and so [`in_region`] does no filtering
+    // for those two types. The Region filter bites for the types whose record DOES
+    // keep an ARN (`SubnetArn`, `SecurityGroupArn`), and the VPC and instance arms
+    // below narrow themselves against the Region EC2's own store records for each
+    // (`vpc_is_in_region`, `instance_region`), which is what EC2's own describes of
+    // those two read.
     //
     // The ARN's ACCOUNT field is the account the record itself reports as the
     // owner, not this emulator's: a resource whose `OwnerId` is another account
@@ -4302,6 +4304,7 @@ fn ec2_resources<Eng: Send + Sync + 'static>(
         RESOURCE_TYPE_EC2_VPC => store
             .vpcs
             .values()
+            .filter(|vpc| store.vpc_is_in_region(vpc.vpc_id.as_deref(), region))
             .filter_map(|vpc| {
                 let id = vpc.vpc_id.clone()?;
                 let account = vpc.owner_id.clone().unwrap_or_else(emulator_owner);
@@ -4362,6 +4365,9 @@ fn ec2_resources<Eng: Send + Sync + 'static>(
         RESOURCE_TYPE_EC2_INSTANCE => store
             .instances
             .values()
+            .filter(|instance| {
+                ::service_com_amazonaws_ec2_amazonec2::state::instance_region(instance) == region
+            })
             .map(|instance| {
                 let account = emulator_owner();
                 HeldResource {

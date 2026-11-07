@@ -42,20 +42,22 @@ use crate::harness::{enable_discovery, harness, Reply};
 ///
 /// Every entry is a code of the ONE Region catalog this service holds a Region-valued member
 /// to (`crate::state::is_known_region`, asserted below), because `UpdateServiceSettings`
-/// refuses a `SourceRegions` entry that names no AWS Region.
+/// refuses a `SourceRegions` entry that names no AWS Region — and every one is a Region the
+/// account can use WITHOUT opting in, because discovery launches an instance in each through
+/// Amazon EC2 itself and a Region the account has not enabled refuses every EC2 call.
 const SOURCE_REGIONS: &[&str] = &[
-    "af-south-1",
-    "ap-east-1",
     "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
     "ap-south-1",
     "ap-southeast-1",
+    "ap-southeast-2",
     "ca-central-1",
     "eu-central-1",
     "eu-north-1",
     "eu-west-1",
     "eu-west-2",
-    "il-central-1",
-    "me-south-1",
+    "eu-west-3",
     "sa-east-1",
     "us-east-1",
 ];

@@ -275,13 +275,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // created, so it changes nothing a later caller would not have seen anyway.
         store.ensure_default_network(&region);
 
-        // An id that names no network ACL of the account is an error, not an absent row. A
-        // set, so narrowing below costs one lookup per ACL rather than a scan of the
-        // asked-for list.
-        if let Some(unknown) = requested
-            .iter()
-            .find(|id| !store.network_acls.contains_key(id.as_str()))
-        {
+        // An id that names no network ACL of the account IN THIS REGION is an error, not an
+        // absent row — an ACL belongs to one VPC, which belongs to one Region, and EC2 is
+        // reached through a regional endpoint. A set, so narrowing below costs one lookup per
+        // ACL rather than a scan of the asked-for list.
+        if let Some(unknown) = requested.iter().find(|id| {
+            store
+                .network_acls
+                .get(id.as_str())
+                .is_none_or(|acl| !store.vpc_is_in_region(acl.vpc_id.as_deref(), &region))
+        }) {
             return Err(crate::state::invalid_network_acl_id_not_found(unknown));
         }
         let wanted: HashSet<&str> = requested.iter().map(String::as_str).collect();
@@ -298,6 +301,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for network_acl in store.network_acls.values() {
             if budget.exhausted() {
                 break;
+            }
+            // The Region scope, asked before any filter: an ACL of another Region is
+            // invisible to this request, so it is no candidate at all.
+            if !store.vpc_is_in_region(network_acl.vpc_id.as_deref(), &region) {
+                continue;
             }
             if !wanted.is_empty()
                 && !wanted.contains(network_acl.network_acl_id.as_deref().unwrap_or_default())

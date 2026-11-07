@@ -2,9 +2,13 @@
 
 //! @op DescribeInstances
 //!
-//! Implemented: reports the reservations and instances [`crate::state`] holds, in
-//! launch order, narrowed by `InstanceIds` and `Filters` and paged by
-//! `MaxResults`/`NextToken`.
+//! Implemented: reports the reservations and instances [`crate::state`] holds IN THE REGION
+//! the request was signed for, in launch order, narrowed by `InstanceIds` and `Filters` and
+//! paged by `MaxResults`/`NextToken`.
+//!
+//! EC2 is a regional service reached through a regional endpoint, so an instance of another
+//! Region is invisible here: it is no candidate for a filter, and an `InstanceIds` entry
+//! naming one is `InvalidInstanceID.NotFound`.
 //!
 //! It also materialises any instance transition the CLOCK already owed before
 //! reporting — each one was due at this instant whether or not anybody called — and
@@ -177,13 +181,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            decode_page_token, filter_name_supported, page_from_cursor, require_known_instance,
-            require_service_state, CompiledFilter, MatchBudget, PageTokenRule, ReservationView,
-            MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES,
-            MAX_PAGE_SIZE, MAX_RESOURCE_IDS,
+            decode_page_token, filter_name_supported, instance_region,
+            max_results_below_bound_message, page_from_cursor, request_region,
+            require_decoded_instance_record, require_service_state, CompiledFilter, MatchBudget,
+            PageTokenRule, ReservationView, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES,
+            MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE, MAX_RESOURCE_IDS,
         };
 
-        let _ = ctx;
+        // EC2 is a REGIONAL service: "Describes the specified instances or all instances"
+        // means the ones of the Region the caller is asking in, so the Region this request
+        // was signed for is what the store is read through below.
+        let region = request_region(ctx.parts());
 
         let requested_ids = input.instance_ids.clone().unwrap_or_default();
         if requested_ids.len() > MAX_RESOURCE_IDS {
@@ -202,15 +210,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "MaxResults",
             ));
         }
-        if input.max_results.is_some_and(|max_results| max_results < 1) {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Invalid value '{}' for maxResults. It must be at least 1",
-                input.max_results.unwrap_or_default()
-            )));
-        }
-        // The model declares no `@range` on `MaxResults`, so the only bound on the page
-        // size is the largest page this operation serves: a value above it is not refused,
-        // it is served as that page with a `NextToken` for the rest (the clamp below).
+        // The model declares no `@range` on `MaxResults`, so the handler is the only place
+        // either bound can exist. The UPPER one is not a refusal: a value above the largest
+        // page this operation serves is served as that page with a `NextToken` for the rest
+        // (the clamp below). The LOWER one is refused BELOW, after the filter names, because
+        // EC2 refuses a request carrying both an unknown filter name and a page size it will
+        // not page with by naming the FILTER.
 
         // Matching cost is filters x values x stored instances and the model bounds
         // none of them, so the two request-controlled factors are capped here,
@@ -223,14 +228,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // A filter name the service does not resolve is refused, never silently
-        // ignored: ignoring it would answer a wider set than the caller asked for.
+        // A filter name EC2 does not document is refused, never silently ignored:
+        // ignoring it would answer a wider set than the caller asked for. The refusal is
+        // the one every describe of this service words — `InvalidParameterValue` with
+        // "The filter '<name>' is invalid" — with the name taken from the request.
         let mut filters: Vec<CompiledFilter> = Vec::new();
         for filter in input.filters.iter().flatten() {
             let name = filter.name.clone().unwrap_or_default();
             if !filter_name_supported(&name) {
                 return Err(Scaffolded::invalid_parameter_value(format!(
-                    "The filter '{name}' is not one this emulator resolves"
+                    "The filter '{name}' is invalid"
                 )));
             }
             let values = filter.values.clone().unwrap_or_default();
@@ -257,12 +264,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             filters.push(CompiledFilter::new(name, values));
         }
 
+        if input.max_results.is_some_and(|max_results| max_results < MIN_MAX_RESULTS) {
+            // EC2 refuses a page size below the smallest the operation pages with rather
+            // than serving it: a request that mis-sizes its page must not read as an empty
+            // account. The sentence is the one EC2 was recorded wording this operation's
+            // refused `maxResults` with ([`crate::state::max_results_below_bound_message`]),
+            // carrying the value the caller sent and the bound it has to reach. Asked AFTER
+            // the filter names, so a request that gets both wrong is told about the filter.
+            return Err(Scaffolded::invalid_parameter_value(
+                max_results_below_bound_message(
+                    &input.max_results.unwrap_or_default().to_string(),
+                    &MIN_MAX_RESULTS.to_string(),
+                ),
+            ));
+        }
+
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
         store.materialize_due_transitions();
 
         for instance_id in &requested_ids {
-            require_known_instance(&store, instance_id)?;
+            // A long-form id this service never issued is one it cannot decode, which is
+            // the malformed half; a short-form id it holds no instance for is the
+            // not-found half.
+            let instance = require_decoded_instance_record(&store, instance_id)?;
+            // And an instance of ANOTHER Region is not one this request can name: EC2 is
+            // reached through a regional endpoint, so the id names no instance here.
+            if instance_region(instance) != region {
+                return Err(Scaffolded::invalid_instance_id_not_found(instance_id));
+            }
         }
 
         // DryRun sits AFTER every parameter has been validated and every named
@@ -301,6 +331,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(instance) = store.instances.get(instance_id) else {
                     continue;
                 };
+                // The Region scope, asked before any filter: an instance of another Region
+                // is invisible to this request, so it is not a candidate at all.
+                if instance_region(instance) != region {
+                    continue;
+                }
                 if store.instance_matches(reservation, instance, &filters, &mut budget) {
                     instance_ids.push(instance_id.clone());
                 }
@@ -388,3 +423,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The smallest `MaxResults` this operation pages with.
+///
+/// The model declares no `@range` on `DescribeInstancesRequest$MaxResults`, so the bound
+/// comes from what AWS publishes for the member in the EC2 API Reference ("Valid Range:
+/// Minimum value of 5. Maximum value of 1000."): a page size below it is refused rather
+/// than served, so a paginating client that mis-sizes its page is told its value is wrong
+/// instead of reading an empty answer as an empty account. The MAXIMUM is
+/// [`crate::state::MAX_PAGE_SIZE`], which the handler clamps to rather than refuses,
+/// because a larger page is served as that page with a token for the rest.
+const MIN_MAX_RESULTS: i32 = 5;

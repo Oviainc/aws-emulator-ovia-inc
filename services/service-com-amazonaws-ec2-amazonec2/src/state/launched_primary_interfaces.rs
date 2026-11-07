@@ -176,6 +176,11 @@ impl ComAmazonawsEc2Amazonec2State {
     /// [`Self::remove_network_interface`], so the addresses it held go back to its subnet
     /// and nothing goes on referring to it.
     ///
+    /// The instance's own primary private address is released by that same caller, at the
+    /// instant the termination COMPLETES rather than here: this sweep sees every instance
+    /// that has ever reached `terminated`, so freeing an address from it would free one a
+    /// new holder has since been given.
+    ///
     /// An interface whose attachment says otherwise is left exactly where it is: it outlives
     /// the instance it was attached to, which is what `DeleteOnTermination` `false` means.
     pub(super) fn delete_interfaces_of_terminated_instances(&mut self) {

@@ -262,8 +262,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .copied()
             .filter(|instance_type| admitted("instance-type", instance_type))
             .collect();
-        let matching =
-            crate::state::instance_type_offerings(&locations, &instance_types, location_type);
+        let matching = crate::state::instance_type_offerings(
+            &region,
+            &locations,
+            &instance_types,
+            location_type,
+        );
 
         // `MaxResults` bounds one page of THAT set, and the cursor names the offering
         // the next page starts at, so a token always advances in the cursor order

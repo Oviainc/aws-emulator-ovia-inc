@@ -15,6 +15,14 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// EC2 as a regional service: a stored resource is reported only in the Region it was created
+// in, an account has one default VPC per Region, a Region it has not opted into refuses every
+// request, an instance type is offered in some of a Region's zones and not others, and a
+// terminated instance has released its network. Declared beside `prefix_lists` for the reason
+// the note above gives: the sorted neighbourhood and the tail of this file are where every new
+// ec2 suite inserts its lines.
+#[path = "all/region_scoped_state.rs"]
+mod region_scoped_state;
 // How EC2 words the `IncorrectInstanceState` refusal across the family of operations that
 // act on an instance only from certain lifecycle states: the instance id the request named,
 // the action its state does not admit, and no disclosure of the state itself. Declared

@@ -14,11 +14,11 @@
 //! spread over reservations — a reservation whose instances straddle a page boundary is
 //! reported on both pages, with the instances that fall in each.
 //!
-//! The rows span what that generalises over: the page size (1, a size that divides the set,
-//! one that does not, one larger than the set, and the largest the service serves) against
-//! two shapes of store — instances spread one per reservation and several per reservation —
-//! so a page boundary falls inside a reservation in some rows and between reservations in
-//! others.
+//! The rows span what that generalises over: the page size (the smallest page the operation
+//! pages with, a size that divides the set, one that does not, one larger than the set, and
+//! the largest the service serves) against two shapes of store — instances spread one per
+//! reservation and several per reservation — so a page boundary falls inside a reservation in
+//! some rows and between reservations in others.
 
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -123,9 +123,10 @@ async fn max_results_caps_a_page_and_the_token_walks_to_the_full_set() {
             whole.next_token
         );
 
-        // Rows: the smallest page, one that does not divide the set, one that does, one
-        // larger than the set, and the largest page the service serves.
-        for max_results in [1_u32, 4, 5, 6, 7, 1000] {
+        // Rows: the smallest page this operation pages with (`DescribeInstances` publishes
+        // a minimum of 5), one that divides the set, one larger than the set, and the
+        // largest page the service serves.
+        for max_results in [5_u32, 6, 7, 1000] {
             let case = format!("{setup} with MaxResults={max_results}");
             let mut walked: Vec<String> = Vec::new();
             let mut token: Option<String> = None;
@@ -187,8 +188,8 @@ async fn max_results_caps_a_page_and_the_token_walks_to_the_full_set() {
 #[tokio::test]
 async fn a_filtered_read_is_capped_over_the_instances_it_selected() {
     let (router, _engine) = super::ec2_query::emulator();
-    let first = launch("the first reservation", &router, 3).await;
-    let second = launch("the second reservation", &router, 3).await;
+    let first = launch("the first reservation", &router, 8).await;
+    let second = launch("the second reservation", &router, 8).await;
     let reservation = super::ec2_query::element(
         &ok(
             "the first reservation's instances",
@@ -202,9 +203,10 @@ async fn a_filtered_read_is_capped_over_the_instances_it_selected() {
     .unwrap_or_default();
 
     // Rows: a page size below, at and above the SELECTED set's size, where the store holds
-    // twice as many instances as the filter selects.
+    // twice as many instances as the filter selects. Each is at or above the smallest page
+    // this operation pages with.
     for (max_results, expected_first_page, expect_token) in
-        [(2_u32, 2_usize, true), (3, 3, false), (5, 3, false)]
+        [(5_u32, 5_usize, true), (8, 8, false), (10, 8, false)]
     {
         let case = format!("reservation-id with MaxResults={max_results}");
         let mut params = filters(&[("reservation-id", &[reservation.as_str()])]);

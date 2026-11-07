@@ -11,12 +11,14 @@
 //!
 //! The rules under test:
 //!
-//! 1. A Region reports every instance type of the modelled `InstanceType` catalog as
-//!    offered in each location of the requested `LocationType`: the Region itself for
-//!    `region` (the default when a request names none), its Availability Zones for
-//!    `availability-zone`, their AZ IDs for `availability-zone-id`, and nothing for
-//!    `outpost`, because no operation of this emulator creates an Outpost. A
-//!    `LocationType` outside the modelled enum is refused.
+//! 1. A Region reports the instance types it offers in each location of the requested
+//!    `LocationType`: the Region itself for `region` (the default when a request names
+//!    none, where the whole modelled `InstanceType` catalog is offered), its Availability
+//!    Zones for `availability-zone`, their AZ IDs for `availability-zone-id`, and nothing
+//!    for `outpost`, because no operation of this emulator creates an Outpost. Not every
+//!    zone offers every type — the Region's last zone offers only the previous generations
+//!    — which is why the describe reports per location at all. A `LocationType` outside the
+//!    modelled enum is refused.
 //! 2. `Filters` (`instance-type`, `location`) are ANDed with one another and ORed over
 //!    each filter's values, with EC2's `*` and `?` wildcards; a filter the operation
 //!    does not document is refused with `InvalidParameterValue`.
@@ -159,8 +161,23 @@ fn location_type(value: &str) -> Vec<(String, String)> {
 /// Instance types from the modelled `InstanceType` catalog
 /// (`smithy_query(query="shape",shape="InstanceType")`) used as the narrowing filter in
 /// the location tests. None of them is cited by the issue this suite closes, and they
-/// span four generations and three architectures.
+/// span four generations and three architectures — and every one of them is CURRENT
+/// generation, so the zones that offer them are the ones
+/// [`ZONES_OFFERING_CURRENT_GENERATION`] names.
 const CATALOG_SAMPLE: [&str; 4] = ["t2.nano", "m5.large", "c6g.medium", "r7iz.32xlarge"];
+
+/// The zone LETTERS of a Region that offer the current-generation instance types.
+///
+/// AWS does not offer every instance type in every Availability Zone, which is why a
+/// `LocationType` of `availability-zone` reports per zone at all; this emulator places that
+/// boundary at the LAST zone of a Region, which offers only the previous generations
+/// (`crate::state::location_offers_instance_type`). A Region here has three zones, so the
+/// current generation is offered in the first two.
+const ZONES_OFFERING_CURRENT_GENERATION: [&str; 2] = ["a", "b"];
+
+/// The AZ-ID indices matching [`ZONES_OFFERING_CURRENT_GENERATION`] — `<prefix>-az1` is the
+/// Region's first zone, so the two letters above are indices 1 and 2.
+const ZONE_IDS_OFFERING_CURRENT_GENERATION: [u32; 2] = [1, 2];
 
 /// One row of the location-type table: the case name, the `LocationType` form fields the
 /// request carries, and the locations the Region is expected to report.
@@ -204,7 +221,7 @@ async fn each_location_type_reports_the_locations_of_its_own_kind() {
             "availability-zone",
             location_type("availability-zone"),
             |region| {
-                ["a", "b", "c"]
+                ZONES_OFFERING_CURRENT_GENERATION
                     .iter()
                     .map(|letter| format!("{region}{letter}"))
                     .collect()
@@ -221,7 +238,10 @@ async fn each_location_type_reports_the_locations_of_its_own_kind() {
                     "ap-northeast-2" => "apne2",
                     other => panic!("no zone-id prefix pinned for {other:?}"),
                 };
-                (1..=3).map(|index| format!("{prefix}-az{index}")).collect()
+                ZONE_IDS_OFFERING_CURRENT_GENERATION
+                    .iter()
+                    .map(|index| format!("{prefix}-az{index}"))
+                    .collect()
             },
         ),
         // An Outpost is hardware in a customer's own facility and no operation of this
@@ -363,10 +383,21 @@ async fn an_unknown_location_type_is_refused() {
 /// The rows differ in which documented filter is used, in how many values it carries, in
 /// which wildcard narrows it, and in whether the filters select nothing. Every
 /// expectation is computed from the modelled catalog, never written out by hand.
+///
+/// The LOCATIONS a row reports follow the per-zone offerings: a row narrowed to
+/// current-generation types only reports the zones
+/// [`ZONES_OFFERING_CURRENT_GENERATION`] names, while one whose wildcard also matches a
+/// previous-generation family reports every zone of the Region, the previous generations
+/// being offered everywhere.
 #[tokio::test]
 async fn filters_and_over_names_and_or_over_values() {
     let (router, _engine) = super::ec2_query::emulator();
-    let zones = ["eu-west-1a", "eu-west-1b", "eu-west-1c"];
+    let region = "eu-west-1";
+    let current_generation_zones: BTreeSet<String> = ZONES_OFFERING_CURRENT_GENERATION
+        .iter()
+        .map(|letter| format!("{region}{letter}"))
+        .collect();
+    let every_zone = owned(&["eu-west-1a", "eu-west-1b", "eu-west-1c"]);
     let catalog = ec2::ops::types::INSTANCE_TYPE_VALUES;
 
     let cases: [FilterCase; 6] = [
@@ -374,13 +405,13 @@ async fn filters_and_over_names_and_or_over_values() {
             "one instance-type value",
             filters(&[("instance-type", &["m5.large"])]),
             owned(&["m5.large"]),
-            owned(&zones),
+            current_generation_zones.clone(),
         ),
         (
             "three instance-type values ORed",
             filters(&[("instance-type", &["m5.large", "t3.nano", "c6g.medium"])]),
             owned(&["m5.large", "t3.nano", "c6g.medium"]),
-            owned(&zones),
+            current_generation_zones.clone(),
         ),
         (
             "instance-type wildcard *",
@@ -390,9 +421,11 @@ async fn filters_and_over_names_and_or_over_values() {
                 .filter(|value| value.starts_with("m5d."))
                 .map(|value| (*value).to_string())
                 .collect(),
-            owned(&zones),
+            current_generation_zones.clone(),
         ),
         (
+            // `c?.large` matches previous-generation families too (`c3.large`), and those
+            // are offered in every zone of the Region.
             "instance-type wildcard ?",
             filters(&[("instance-type", &["c?.large"])]),
             catalog
@@ -404,7 +437,7 @@ async fn filters_and_over_names_and_or_over_values() {
                 })
                 .map(|value| (*value).to_string())
                 .collect(),
-            owned(&zones),
+            every_zone,
         ),
         (
             "location ANDed with instance-type",
@@ -426,7 +459,7 @@ async fn filters_and_over_names_and_or_over_values() {
     for (case, filter_fields, expected_types, expected_locations) in cases {
         let mut params = location_type("availability-zone");
         params.extend(filter_fields);
-        let (status, body) = describe(&router, "eu-west-1", &params).await;
+        let (status, body) = describe(&router, region, &params).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected 200, got {status} {body}"

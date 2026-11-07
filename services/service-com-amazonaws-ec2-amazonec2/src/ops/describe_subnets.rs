@@ -236,21 +236,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.ensure_default_network(&region);
 
         // "The IDs of the subnets" (`DescribeSubnetsRequest$SubnetIds`): an id that names
-        // no subnet of the account is an error, not an absent row.
+        // no subnet of the account IN THIS REGION is an error, not an absent row — a subnet
+        // belongs to one VPC, which belongs to one Region, and EC2 is reached through a
+        // regional endpoint.
         let requested: &[String] = input.subnet_ids.as_deref().unwrap_or_default();
-        if let Some(unknown) = requested
-            .iter()
-            .find(|id| !store.subnets.contains_key(id.as_str()))
-        {
+        if let Some(unknown) = requested.iter().find(|id| {
+            store
+                .subnets
+                .get(id.as_str())
+                .is_none_or(|subnet| !store.vpc_is_in_region(subnet.vpc_id.as_deref(), &region))
+        }) {
             return Err(crate::state::invalid_subnet_id_not_found(unknown));
         }
 
-        // "Default: Describes all your subnets": `SubnetIds` narrows the store to the ids
-        // named, and every filter must then hold ("If you specify multiple filters, the
-        // filters are joined with an AND" — `Filter`).
+        // "Default: Describes all your subnets": the subnets of THIS Region, which
+        // `SubnetIds` narrows to the ids named, and every filter must then hold ("If you
+        // specify multiple filters, the filters are joined with an AND" — `Filter`).
         let mut selected: Vec<&Subnet> = store
             .subnets
             .values()
+            .filter(|subnet| store.vpc_is_in_region(subnet.vpc_id.as_deref(), &region))
             .filter(|subnet| {
                 requested.is_empty()
                     || requested

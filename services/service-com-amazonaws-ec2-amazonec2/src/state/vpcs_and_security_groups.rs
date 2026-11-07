@@ -59,6 +59,29 @@ impl ComAmazonawsEc2Amazonec2State {
         self.vpcs.len() < MAX_VPCS
     }
 
+    /// The Region the VPC `vpc_id` names was created in, or `None` when this store holds no
+    /// such VPC.
+    ///
+    /// The ONE reading of "which Region is this VPC in" ([`Self::vpc_regions`]), so every
+    /// operation that reports a VPC-shaped resource scopes it the same way.
+    pub fn vpc_region(&self, vpc_id: &str) -> Option<&str> {
+        self.vpc_regions.get(vpc_id).map(String::as_str)
+    }
+
+    /// Whether the resource that belongs to the VPC `vpc_id` names is in `region`.
+    ///
+    /// EC2 is a regional service reached through a regional endpoint, so a resource created
+    /// in one Region is invisible to a request signed for another. A subnet, a security
+    /// group, a network ACL and a route table each belong to ONE VPC, so this answers for
+    /// all of them off the VPC's own Region — the resource and its VPC can never be
+    /// reported in two Regions.
+    ///
+    /// `false` for a resource that names no VPC, or names one this store does not hold:
+    /// there is no Region to place it in, so no Region's caller may see it.
+    pub fn vpc_is_in_region(&self, vpc_id: Option<&str>, region: &str) -> bool {
+        vpc_id.and_then(|vpc_id| self.vpc_region(vpc_id)) == Some(region)
+    }
+
     /// Whether another subnet fits inside the store's ceiling ([`MAX_SUBNETS`]).
     ///
     /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
@@ -278,6 +301,11 @@ impl ComAmazonawsEc2Amazonec2State {
         };
         self.add_stored_bytes(tag_list_bytes(vpc.tags.as_deref().unwrap_or_default()));
         self.vpcs.insert(vpc_id.clone(), vpc);
+        // The Region this VPC belongs to, recorded HERE because this is the one writer of a
+        // VPC: EC2 is a regional service, so a request signed for another Region must not
+        // see this VPC or anything that belongs to it (see [`Self::vpc_regions`]).
+        self.vpc_regions
+            .insert(vpc_id.clone(), region.to_string());
         // The attributes the VPC starts life with, written here rather than by each
         // writer so `DescribeVpcAttribute` reads the same defaults whichever operation
         // created the VPC.

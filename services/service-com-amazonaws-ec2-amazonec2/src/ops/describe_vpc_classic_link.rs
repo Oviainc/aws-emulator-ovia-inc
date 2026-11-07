@@ -143,13 +143,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             CompiledFilter, MatchBudget, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES,
             MAX_FILTER_VALUE_BYTES, MAX_RESOURCE_IDS, dry_run_operation,
-            invalid_vpc_id_not_found, matches_every_filter, require_service_state,
+            invalid_vpc_id_not_found, matches_every_filter, request_region, require_service_state,
         };
 
-        // `ctx` carries request metadata only; this operation reads none of it — whether a
-        // VPC is enabled for ClassicLink is a fact of that VPC, not of the Region the
-        // request was signed for. The store is reached through the engine held on `self`.
-        let _ = ctx;
+        // EC2 is a REGIONAL service reached through a regional endpoint, so the VPCs whose
+        // ClassicLink status this reports are the ones of the Region the request was signed
+        // for; a VPC of another Region is invisible here.
+        let region = request_region(ctx.parts());
 
         // "The VPCs for which you want to describe the ClassicLink status" (`VpcIds`): every
         // entry is resolved against the store below, so the list is capped the way every
@@ -212,10 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = require_service_state(&*self.engine)?;
         let store = state.lock();
 
-        // An id that names no VPC of the account is an error, not an absent row — the same
-        // answer every other describe of a VPC gives for one.
+        // An id that names no VPC of the account IN THIS REGION is an error, not an absent
+        // row — the same answer every other describe of a VPC gives for one.
         for vpc_id in requested_ids {
-            if !store.vpcs.contains_key(vpc_id) {
+            if !store.vpc_is_in_region(Some(vpc_id.as_str()), &region) {
                 return Err(invalid_vpc_id_not_found(vpc_id));
             }
         }
@@ -244,6 +244,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for vpc_id in store.vpcs.keys() {
             if budget.exhausted() {
                 break;
+            }
+            // The Region scope, asked before any projection: a VPC of another Region is
+            // invisible to this request.
+            if !store.vpc_is_in_region(Some(vpc_id.as_str()), &region) {
+                continue;
             }
             // The id narrowing is read off the key, so a VPC the request did not name costs
             // no projection and no comparison at all.

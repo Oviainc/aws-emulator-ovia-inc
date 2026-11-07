@@ -1158,22 +1158,46 @@ async fn describe_instances_resolves_each_supported_filter() {
     }
 }
 
-/// An instance id nothing was launched for is refused with
-/// `InvalidInstanceID.NotFound` by every operation that takes one, and a resource id
-/// of a kind the slice does not store is refused with `InvalidID`.
+/// One row of the unknown-id table: the action, the form fields it carries, and the error
+/// code EC2 refuses it with.
+type UnknownIdCase = (&'static str, Vec<(String, String)>, &'static str);
+
+/// An instance id nothing was launched for is refused with EC2's own code for it by every
+/// operation that takes one — `InvalidInstanceID.NotFound` where the operation looks the id
+/// up, and `InvalidInstanceID.Malformed` where it DECODES a long-form id first and this one
+/// is a value the service never issued — and a resource id of a kind the slice does not
+/// store is refused with `InvalidID`.
 #[tokio::test]
 async fn an_unknown_resource_id_is_refused_by_every_operation() {
     let ec2 = Ec2::new();
     let known = launch_one(&ec2, Vec::new()).await;
     // Well formed and not the null id (which EC2 refuses as malformed), so every
-    // operation here has to look it up and find nothing.
+    // operation here has to resolve it and find nothing.
     let unknown = "i-00000000000000999";
 
-    let cases: Vec<(&str, Vec<(String, String)>)> = vec![
-        ("DescribeInstances", vec![p("InstanceId.1", unknown)]),
-        ("StartInstances", vec![p("InstanceId.1", unknown)]),
-        ("StopInstances", vec![p("InstanceId.1", unknown)]),
-        ("TerminateInstances", vec![p("InstanceId.1", unknown)]),
+    let cases: Vec<UnknownIdCase> = vec![
+        // `DescribeInstances` decodes a long-form id before it looks anything up, so an
+        // identifier above everything this service has issued is one it cannot decode.
+        (
+            "DescribeInstances",
+            vec![p("InstanceId.1", unknown)],
+            "InvalidInstanceID.Malformed",
+        ),
+        (
+            "StartInstances",
+            vec![p("InstanceId.1", unknown)],
+            "InvalidInstanceID.NotFound",
+        ),
+        (
+            "StopInstances",
+            vec![p("InstanceId.1", unknown)],
+            "InvalidInstanceID.NotFound",
+        ),
+        (
+            "TerminateInstances",
+            vec![p("InstanceId.1", unknown)],
+            "InvalidInstanceID.NotFound",
+        ),
         (
             "CreateTags",
             vec![
@@ -1181,15 +1205,17 @@ async fn an_unknown_resource_id_is_refused_by_every_operation() {
                 p("Tag.1.Key", "k"),
                 p("Tag.1.Value", "v"),
             ],
+            "InvalidInstanceID.NotFound",
         ),
         // A batch that mixes a known id with an unknown one is refused whole.
         (
             "TerminateInstances",
             vec![p("InstanceId.1", &known), p("InstanceId.2", unknown)],
+            "InvalidInstanceID.NotFound",
         ),
     ];
 
-    for (action, params) in cases {
+    for (action, params, expected) in cases {
         let answer = ec2.call(action, params).await;
         assert_eq!(
             answer.status, 400,
@@ -1198,8 +1224,8 @@ async fn an_unknown_resource_id_is_refused_by_every_operation() {
         );
         assert_eq!(
             answer.error_code(),
-            "InvalidInstanceID.NotFound",
-            "case {action}: expected InvalidInstanceID.NotFound, got {}",
+            expected,
+            "case {action}: expected {expected}, got {}",
             answer.body
         );
     }
@@ -1270,12 +1296,15 @@ async fn an_unknown_resource_id_is_refused_by_every_operation() {
 async fn max_results_pages_over_reservations() {
     let ec2 = Ec2::new();
     let mut launched: Vec<String> = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..12 {
         let answer = launch(&ec2, 1, Vec::new()).await;
         launched.push(answer.reservations()[0].id.clone());
     }
 
-    for page_size in [1_usize, 2, 3, 5, 7] {
+    // Page sizes at and above the smallest page this operation pages with (AWS publishes a
+    // minimum of 5 for its `MaxResults`): one that divides the set, ones that do not, and
+    // one larger than the set.
+    for page_size in [5_usize, 6, 7, 12, 14] {
         let mut seen: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
         let mut pages = 0;
@@ -1305,7 +1334,7 @@ async fn max_results_pages_over_reservations() {
             seen.extend(ids);
             pages += 1;
             assert!(
-                pages <= 10,
+                pages <= 20,
                 "case page size {page_size}: paging did not terminate after {pages} pages"
             );
             token = answer.next_token();
@@ -1336,7 +1365,7 @@ async fn max_results_pages_over_reservations() {
     let combined = ec2
         .call(
             "DescribeInstances",
-            vec![p("MaxResults", "1"), p("InstanceId.1", "i-00000000000000001")],
+            vec![p("MaxResults", "5"), p("InstanceId.1", "i-00000000000000001")],
         )
         .await;
     assert_eq!(
@@ -1356,14 +1385,17 @@ async fn max_results_pages_over_reservations() {
         bad_token.body
     );
 
-    for max_results in ["0", "-1"] {
+    // A page size below the smallest this operation pages with is refused as a value the
+    // service cannot use, whether it asks for a smaller page or for no page at all.
+    for max_results in ["0", "-1", "1", "4"] {
         let answer = ec2
             .call("DescribeInstances", vec![p("MaxResults", max_results)])
             .await;
         assert_eq!(
             answer.error_code(),
             "InvalidParameterValue",
-            "case MaxResults={max_results}: a page of none must be refused, got {}",
+            "case MaxResults={max_results}: a page below the published minimum must be \
+             refused, got {}",
             answer.body
         );
     }
@@ -1522,20 +1554,35 @@ async fn dry_run_refuses_with_412_and_changes_nothing() {
 
     // DryRun says "this WOULD have succeeded", so a request that would in fact have
     // been refused is refused with that reason rather than answered 412. The id
-    // resolution the five id-taking operations do only reads state.
-    let unresolvable: [(&str, &str); 3] = [
-        ("i-00000000000000999", "InvalidInstanceID.NotFound"),
-        ("i-nope", "InvalidInstanceID.Malformed"),
+    // resolution the five id-taking operations do only reads state. Each row carries the
+    // code `DescribeInstances` answers and the code the operations that LOOK the id up
+    // answer: the describe decodes a long-form id first, so one this service never issued
+    // is malformed there while a lookup reports it absent.
+    let unresolvable: [(&str, &str, &str); 3] = [
+        (
+            "i-00000000000000999",
+            "InvalidInstanceID.Malformed",
+            "InvalidInstanceID.NotFound",
+        ),
+        (
+            "i-nope",
+            "InvalidInstanceID.Malformed",
+            "InvalidInstanceID.Malformed",
+        ),
         // The null id is not an id EC2 issues, so it is refused by syntax rather
         // than reported missing.
-        ("i-00000000000000000", "InvalidInstanceID.Malformed"),
+        (
+            "i-00000000000000000",
+            "InvalidInstanceID.Malformed",
+            "InvalidInstanceID.Malformed",
+        ),
     ];
-    for (bad_id, code) in unresolvable {
-        for action in [
-            "DescribeInstances",
-            "StartInstances",
-            "StopInstances",
-            "TerminateInstances",
+    for (bad_id, described, resolved) in unresolvable {
+        for (action, code) in [
+            ("DescribeInstances", described),
+            ("StartInstances", resolved),
+            ("StopInstances", resolved),
+            ("TerminateInstances", resolved),
         ] {
             let answer = ec2
                 .call(action, vec![p("InstanceId.1", bad_id), p("DryRun", "true")])
@@ -1558,13 +1605,13 @@ async fn dry_run_refuses_with_412_and_changes_nothing() {
                 ],
             )
             .await;
-        let expected = if code == "InvalidInstanceID.Malformed" {
+        let expected = if resolved == "InvalidInstanceID.Malformed" {
             // CreateTags takes any EC2 resource id, so something that is not an
             // instance id is an unresolvable resource rather than a malformed
             // instance id.
             "InvalidID"
         } else {
-            code
+            resolved
         };
         assert_eq!(
             tagged.error_code(),

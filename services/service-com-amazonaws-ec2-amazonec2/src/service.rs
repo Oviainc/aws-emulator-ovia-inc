@@ -692,6 +692,17 @@ impl ErasedOperation for FinishedEnvelope {
         ctx: &'r smithy_server_runtime::OperationContext<'r>,
     ) -> smithy_server_runtime::BoxFuture<'r, RtResponse> {
         Box::pin(async move {
+            // The Region gate, ahead of every operation: EC2 is reached through a REGIONAL
+            // endpoint, and a Region the account has not enabled serves it nothing at all —
+            // every request to that endpoint is refused `AuthFailure` rather than answered
+            // with an empty result, which is what lets a client tell "this Region is not
+            // available to me" from "this Region is empty". It belongs here rather than in
+            // any one handler because it is a fact of the ENDPOINT the request reached, not
+            // of the operation it named ([`crate::state::region_is_enabled_for_account`]).
+            if let Some(mut response) = region_refusal(ctx) {
+                stamp_envelope(&mut response);
+                return response;
+            }
             let mut response = match modeled_operation(svc, req) {
                 Some(operation) => operation.run(svc, req, ctx).await,
                 // `override_operation` claims a request only for a routing key the table
@@ -716,6 +727,30 @@ impl ErasedOperation for FinishedEnvelope {
         // `override_operation` answered.
         None
     }
+}
+
+/// EC2's `AuthFailure` response for a request signed for a Region this account has not
+/// enabled, or `None` when the Region it was signed for is one the account can reach.
+///
+/// The code and the sentence are EC2's own
+/// ([`crate::state::REGION_NOT_ENABLED_MESSAGE`]); the status and the envelope are the
+/// protocol's, taken from the framework's own ec2Query error renderer so this refusal is
+/// rendered exactly like every other pre-dispatch one rather than by a second hand-written
+/// envelope. The violation list it is rendered from is empty, because the refusal is about
+/// the ENDPOINT the request reached and names no member of the request.
+fn region_refusal(ctx: &smithy_server_runtime::OperationContext<'_>) -> Option<RtResponse> {
+    let region = crate::state::request_region(ctx.parts());
+    if crate::state::region_is_enabled_for_account(&region) {
+        return None;
+    }
+    Some(smithy_server_runtime::protocol_error_response_with(
+        smithy_server_runtime::PreDispatchProtocol::Query { ec2: true },
+        ProtocolError::Invalid(Vec::new()),
+        Some(Refused {
+            code: crate::state::AUTH_FAILURE.to_string(),
+            message: crate::state::REGION_NOT_ENABLED_MESSAGE.to_string(),
+        }),
+    ))
 }
 
 /// EC2's own code and sentence for a value this service knows how EC2 refuses, or `None`

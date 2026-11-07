@@ -479,7 +479,7 @@ impl<E> Scaffolded<E> {
     /// `UnauthorizedOperation`, which is about the caller's permission to call the
     /// operation at all.
     pub fn auth_failure(message: impl Into<String>) -> Self {
-        Self::service_error("AuthFailure", 400, message)
+        Self::service_error(crate::state::AUTH_FAILURE, 400, message)
     }
 
     /// `DryRunOperation` (HTTP 412): `DryRun` was set and the request would

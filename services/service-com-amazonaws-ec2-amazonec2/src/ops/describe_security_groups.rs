@@ -281,21 +281,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The IDs of the security groups" / "the names of the security groups"
         // (`DescribeSecurityGroupsRequest$GroupIds`, `$GroupNames`): an id or a name that
-        // names no group of the account is an error, not an absent row. Sets, so narrowing
-        // below costs one lookup per group rather than a scan of the asked-for lists.
+        // names no group of the account IN THIS REGION is an error, not an absent row — a
+        // group belongs to one VPC, which belongs to one Region, and EC2 is reached through
+        // a regional endpoint. Sets, so narrowing below costs one lookup per group rather
+        // than a scan of the asked-for lists.
         let wanted_ids: HashSet<&str> = requested_ids.iter().map(String::as_str).collect();
-        if let Some(unknown) = requested_ids
-            .iter()
-            .find(|id| !store.security_groups.contains_key(id.as_str()))
-        {
+        if let Some(unknown) = requested_ids.iter().find(|id| {
+            store
+                .security_groups
+                .get(id.as_str())
+                .is_none_or(|group| !store.vpc_is_in_region(group.vpc_id.as_deref(), &region))
+        }) {
             return Err(crate::state::invalid_group_not_found(unknown));
         }
         let wanted_names: HashSet<&str> = requested_names.iter().map(String::as_str).collect();
         if !wanted_names.is_empty() {
-            // The names the store holds, collected ONCE rather than rescanned per name.
+            // The names the store holds IN THIS REGION, collected ONCE rather than
+            // rescanned per name.
             let stored_names: HashSet<&str> = store
                 .security_groups
                 .values()
+                .filter(|group| store.vpc_is_in_region(group.vpc_id.as_deref(), &region))
                 .filter_map(|group| group.group_name.as_deref())
                 .collect();
             if let Some(unknown) = requested_names
@@ -321,6 +327,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for group in store.security_groups.values() {
             if budget.exhausted() {
                 break;
+            }
+            // The Region scope, asked before any filter: a group of another Region is
+            // invisible to this request, so it is no candidate at all.
+            if !store.vpc_is_in_region(group.vpc_id.as_deref(), &region) {
+                continue;
             }
             if named_any
                 && !wanted_ids.contains(group.group_id.as_deref().unwrap_or_default())

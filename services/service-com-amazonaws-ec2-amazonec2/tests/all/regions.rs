@@ -271,35 +271,47 @@ async fn a_call_reports_the_regions_of_its_own_partition() {
     }
 }
 
-/// Calling in a Region that requires an opt-in is itself evidence the account opted in, so
-/// that Region is reported `opted-in` and listed beside the enabled-by-default ones —
-/// a caller is never told the Region it is calling in is not available to it.
+/// A Region that requires an opt-in this account has not made serves it NOTHING: a request
+/// signed for one is refused `AuthFailure` rather than answered with an empty result, so a
+/// client can tell "this Region is not available to me" from "this Region is empty".
 ///
 /// The rows are opt-in Regions of different geographies, none of them the Region any other
-/// case here signs for.
+/// case here signs for, and each is probed through two different operations so the refusal
+/// belongs to the endpoint rather than to one handler.
 #[tokio::test]
-async fn the_region_a_call_is_signed_for_is_reported_as_enabled() {
+async fn a_region_the_account_has_not_opted_in_to_refuses_every_request() {
     let router = emulator();
     for signed in OPT_IN_SAMPLE {
+        for action in ["DescribeRegions", "DescribeInstances"] {
+            let (status, body) =
+                super::ec2_query::call(&router, signed, action, &[]).await;
+            assert_eq!(
+                status, 400,
+                "case {signed:?}/{action}: expected HTTP 400, got {status} {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "AuthFailure",
+                "case {signed:?}/{action}: expected AuthFailure, got {body}"
+            );
+            assert!(
+                unescaped(&body).contains(ec2::state::REGION_NOT_ENABLED_MESSAGE),
+                "case {signed:?}/{action}: expected the credentials sentence, got {body}"
+            );
+        }
+    }
+}
+
+/// A Region of the enabled-by-default table, and one of another partition, are served — the
+/// refusal above is about the opt-in, not about every Region that is not `us-east-1`.
+#[tokio::test]
+async fn an_enabled_region_is_served() {
+    let router = emulator();
+    for signed in ["us-east-1", "ap-northeast-3", "us-gov-west-1", "cn-north-1"] {
         let (status, body) = describe(&router, signed, &[]).await;
         assert_eq!(
             status, 200,
             "case {signed:?}: expected 200, got {status} {body}"
-        );
-        let mut expected: Vec<&str> = ENABLED_BY_DEFAULT.to_vec();
-        expected.push(signed);
-        assert_eq!(
-            region_names(signed, &body),
-            sorted(&expected),
-            "case {signed:?}: expected the enabled Regions plus the signed one, got {body}"
-        );
-        let signed_region = regions(signed, &body)
-            .into_iter()
-            .find(|region| region.name == signed)
-            .unwrap_or_else(|| panic!("case {signed:?}: the signed Region must be reported"));
-        assert_eq!(
-            signed_region.opt_in_status, "opted-in",
-            "case {signed:?}: the Region a call reaches is one the account opted in to, got {signed_region:?}"
         );
     }
 }

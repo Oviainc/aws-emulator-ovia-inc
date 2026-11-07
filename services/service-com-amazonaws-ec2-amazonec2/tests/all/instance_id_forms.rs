@@ -6,8 +6,7 @@
 //!
 //! The rule under test: EC2 READS A RESOURCE ID IN EITHER OF THE TWO FORMS IT HAS ISSUED
 //! IDS IN — a prefix and 8 lowercase hexadecimal digits, or a prefix and 17 of them whose
-//! leading digit is `0` — so a value in EITHER form is LOOKED UP, and an account holding no
-//! instance for it is answered `InvalidInstanceID.NotFound`, while a value in neither is
+//! leading digit is `0` — so a value in EITHER form is resolved, and a value in neither is
 //! answered `InvalidInstanceID.Malformed` before any lookup. The two forms are the ones the
 //! model's own id patterns publish (`^vpc-([0-9a-f]{8}|[0-9a-f]{17})$`, the pattern quoted
 //! on `crate::state::prefixed_id_is_well_formed`); the long form's leading `0` is what
@@ -16,6 +15,13 @@
 //! leading digit. The distinction is what a client branches on: a malformed id is a
 //! permanent defect in the caller, while a not-found id is a resource that has gone or
 //! never existed.
+//!
+//! What "resolved" means differs by OPERATION, which the rows carry: an operation that LOOKS
+//! the id up answers `InvalidInstanceID.NotFound` for a value in a published form the account
+//! holds no instance for, while one that DECODES the long form first — the long id being an
+//! obfuscated identifier — answers `InvalidInstanceID.Malformed` for a long-form value this
+//! service never issued, because there is nothing to decode. The short form carries no
+//! identifier to decode, so it is looked up either way.
 //!
 //! The rows span what that generalises over: the NUMBER of digits (both published forms and
 //! one digit either side of each), the LEADING digit, the CASE of the digits, the all-zero
@@ -45,12 +51,14 @@ const MALFORMED: &str = "InvalidInstanceID.Malformed";
 const NOT_FOUND: &str = "InvalidInstanceID.NotFound";
 
 /// One operation that resolves an instance id: the action, the form fields that name one
-/// id and nothing else of consequence, and whether its OUTPUT reports the id it resolved —
-/// a reboot answers the envelope's success flag and no id of its own.
+/// id and nothing else of consequence, whether its OUTPUT reports the id it resolved —
+/// a reboot answers the envelope's success flag and no id of its own — and whether it
+/// DECODES a long-form id before looking anything up.
 struct Resolver {
     action: &'static str,
     fields: fn(&str) -> Vec<Param>,
     reports_the_id: bool,
+    decodes_long_form: bool,
 }
 
 /// The operations each row is driven through — a describe, a password read and a reboot, so
@@ -64,25 +72,31 @@ const RESOLVERS: [Resolver; 3] = [
         action: "DescribeInstances",
         fields: |instance_id| vec![param("InstanceId.1", instance_id)],
         reports_the_id: true,
+        decodes_long_form: true,
     },
     Resolver {
         action: "GetPasswordData",
         fields: |instance_id| vec![param("InstanceId", instance_id)],
         reports_the_id: true,
+        decodes_long_form: false,
     },
     Resolver {
         action: "RebootInstances",
         fields: |instance_id| vec![param("InstanceId.1", instance_id)],
         reports_the_id: false,
+        decodes_long_form: false,
     },
 ];
 
-/// One row: what is notable about the value, the value, and the code every operation above
-/// must refuse it with.
+/// One row: what is notable about the value, the value, the code an operation that LOOKS the
+/// id up refuses it with, and the code an operation that DECODES the long form first refuses
+/// it with — the same for every value but a long-form id in the published form, which has
+/// nothing to decode and so cannot be reported as merely absent.
 struct Row {
     case: &'static str,
     instance_id: &'static str,
     code: &'static str,
+    decoded_code: &'static str,
 }
 
 /// Every row of the id-form table.
@@ -96,91 +110,109 @@ fn rows() -> Vec<Row> {
             case: "the short form, eight digits under a leading digit above zero",
             instance_id: "i-9f3c71de",
             code: NOT_FOUND,
+            decoded_code: NOT_FOUND,
         },
         Row {
             case: "the short form, eight digits under a leading zero",
             instance_id: "i-0f3c71de",
             code: NOT_FOUND,
+            decoded_code: NOT_FOUND,
         },
         Row {
             case: "one digit short of the short form",
             instance_id: "i-9f3c71d",
             code: MALFORMED,
+            decoded_code: MALFORMED,
         },
         Row {
             case: "one digit past the short form",
             instance_id: "i-9f3c71de0",
             code: MALFORMED,
+            decoded_code: MALFORMED,
         },
         Row {
             case: "the all-zero short id, which the mint counting from one never produces",
             instance_id: "i-00000000",
             code: MALFORMED,
+            decoded_code: MALFORMED,
         },
         Row {
             case: "the long form, seventeen digits under a leading zero",
             instance_id: "i-0a1b2c3d4e5f60718",
             code: NOT_FOUND,
+            decoded_code: MALFORMED,
         },
         Row {
             case: "the long form at its largest under a leading zero",
             instance_id: "i-0ffffffffffffffff",
             code: NOT_FOUND,
+            decoded_code: MALFORMED,
         },
         Row {
             case: "the long form with a leading digit above zero, which EC2 does not issue",
             instance_id: "i-9a1b2c3d4e5f60718",
             code: MALFORMED,
+            decoded_code: MALFORMED,
         },
         Row {
             case: "one digit short of the long form",
             instance_id: "i-0a1b2c3d4e5f6071",
             code: MALFORMED,
+            decoded_code: MALFORMED,
         },
         Row {
             case: "one digit past the long form",
             instance_id: "i-0a1b2c3d4e5f607182",
             code: MALFORMED,
+            decoded_code: MALFORMED,
         },
         Row {
             case: "the all-zero long id, the placeholder every client reaches for",
             instance_id: "i-00000000000000000",
             code: MALFORMED,
+            decoded_code: MALFORMED,
         },
         Row {
             case: "upper-case hexadecimal digits, which no issued id carries",
             instance_id: "i-0A1B2C3D",
             code: MALFORMED,
+            decoded_code: MALFORMED,
         },
         Row {
             case: "a digit that is not hexadecimal",
             instance_id: "i-0a1b2c3z",
             code: MALFORMED,
+            decoded_code: MALFORMED,
         },
         Row {
             case: "the prefix with no digits at all",
             instance_id: "i-",
             code: MALFORMED,
+            decoded_code: MALFORMED,
         },
         Row {
             case: "digits in a published form under no prefix",
             instance_id: "0a1b2c3d",
             code: MALFORMED,
+            decoded_code: MALFORMED,
         },
         Row {
             case: "digits in a published form under another resource kind's prefix",
             instance_id: "vol-0a1b2c3d4e5f60718",
             code: MALFORMED,
+            decoded_code: MALFORMED,
         },
         Row {
             case: "a prefix that spells the resource out rather than naming its kind",
             instance_id: "instance-0a1b2c3d",
             code: MALFORMED,
+            decoded_code: MALFORMED,
         },
         Row {
             case: "free text",
             instance_id: "not-an-instance",
             code: MALFORMED,
+            decoded_code: MALFORMED,
         },
     ]
 }
@@ -198,6 +230,11 @@ async fn an_instance_id_is_read_in_either_published_form_before_it_is_looked_up(
     for row in rows() {
         for resolver in &RESOLVERS {
             let case = format!("{} ({})", row.case, resolver.action);
+            let expected_code = if resolver.decodes_long_form {
+                row.decoded_code
+            } else {
+                row.code
+            };
             let (status, body) = call(
                 &router,
                 REGION,
@@ -212,15 +249,14 @@ async fn an_instance_id_is_read_in_either_published_form_before_it_is_looked_up(
             );
             assert_eq!(
                 error_code(&body),
-                row.code,
-                "case {case:?} ({:?}): expected {}, got {body}",
-                row.instance_id,
-                row.code
+                expected_code,
+                "case {case:?} ({:?}): expected {expected_code}, got {body}",
+                row.instance_id
             );
             // Which sentence the refusal carries is the other half of telling the two
             // apart: the not-found half names the id as an instance ID, the malformed half
             // quotes the value back as one the id space could not read.
-            let expected_message = if row.code == NOT_FOUND {
+            let expected_message = if expected_code == NOT_FOUND {
                 format!("The instance ID '{}' does not exist", row.instance_id)
             } else {
                 format!("Invalid id: \"{}\"", row.instance_id)

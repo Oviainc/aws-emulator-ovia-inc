@@ -7,11 +7,11 @@
 //! scope, so every call here carries one.
 //!
 //! The rule under test is that the operation REPORTS THE STORE: the set it answers with
-//! is the account's VPCs narrowed by the `VpcIds` and `Filters` the request names and cut
-//! into `MaxResults`-sized pages. Every table row is a distinct input along what that
-//! generalises over — which filter, how many values, how many filters, which ids, which
-//! page size — so the fresh-account default VPC is one row among many rather than the
-//! specification.
+//! is the account's VPCs IN THE REGION THE REQUEST WAS SIGNED FOR, narrowed by the `VpcIds`
+//! and `Filters` the request names and cut into `MaxResults`-sized pages. Every table row is
+//! a distinct input along what that generalises over — which filter, how many values, how
+//! many filters, which ids, which page size — so the fresh-account default VPC is one row
+//! among many rather than the specification.
 
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use ec2::ops::types::{Tag, VpcCidrBlockState, VpcIpv6CidrBlockAssociation};
@@ -20,9 +20,9 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::ec2_query::{elements, error_code, filters, indexed, unescaped};
 
-/// The Region every call here is signed for. `DescribeVpcs` reports the account's VPCs,
-/// which this store holds per account rather than per Region, so the Region only selects
-/// the ec2Query envelope.
+/// The Region every call here is signed for. `DescribeVpcs` reports the account's VPCs of
+/// the Region the request reached, so the Region both selects the ec2Query envelope and
+/// decides which of the seeded VPCs are reported at all.
 const REGION: &str = "us-east-1";
 
 /// The IPv6 CIDR block associated with the one seeded VPC that has one.
@@ -78,8 +78,22 @@ struct VpcSpec {
 const SEEDED_REGION: &str = REGION;
 
 /// The Region the one seeded VPC that is not in [`SEEDED_REGION`] is created in, so the
-/// store holds two default DHCP option sets and `dhcp-options-id` selects a proper subset.
+/// store holds two default DHCP option sets — and a VPC no call here may report, EC2 being
+/// a regional service.
 const OTHER_REGION: &str = "eu-west-1";
+
+/// The index, in store order, of the one seeded VPC created in [`OTHER_REGION`]: the
+/// default VPC is index 0 and each spec below follows in order, so the fifth spec is index
+/// 5. Every table expectation is written over [`in_region`], which leaves it out.
+const OTHER_REGION_INDEX: usize = 5;
+
+/// The indices, in store order, of the VPCs a call signed for [`SEEDED_REGION`] reports:
+/// every seeded VPC but the one created in [`OTHER_REGION`].
+fn in_region(seeded: &Seeded) -> Vec<usize> {
+    (0..seeded.ids.len())
+        .filter(|index| *index != OTHER_REGION_INDEX)
+        .collect()
+}
 
 /// The VPCs the filter and paging tables are written against, beyond the default VPC a
 /// fresh account already has. They differ along every attribute the documented filters
@@ -130,12 +144,21 @@ fn seeded_specs() -> Vec<VpcSpec> {
             region: SEEDED_REGION,
             tags: vec![tag("Project", "atlas")],
         },
+        // A seventh VPC, so the Region the calls are signed for holds SIX non-default VPCs
+        // and a page of five cuts that set in two.
+        VpcSpec {
+            cidr_block: "192.168.1.0/24",
+            instance_tenancy: "default",
+            state: "available",
+            region: SEEDED_REGION,
+            tags: Vec::new(),
+        },
     ]
 }
 
 /// What a seeded store holds, for the tables to name rows by.
 struct Seeded {
-    /// Every VPC id, in the order `DescribeVpcs` reports them (the store's key order).
+    /// Every VPC id, in the order the store holds them (its key order).
     ids: Vec<String>,
     /// The `DhcpOptionsId` of each VPC, in the same order.
     dhcp_options_ids: Vec<String>,
@@ -273,8 +296,10 @@ async fn every_stored_vpc_is_reported_and_a_later_write_is_visible() {
 
     let reported = described_ids(&router, "all VPCs", &[]).await;
     assert_eq!(
-        reported, seeded.ids,
-        "all VPCs: expected every stored VPC in store order, got {reported:?}"
+        reported,
+        ids_at(&seeded, &in_region(&seeded)),
+        "all VPCs: expected every stored VPC of the signed-for Region in store order, got \
+         {reported:?}"
     );
 
     let late_id = engine.state::<Ec2State>().lock().insert_vpc(
@@ -286,7 +311,7 @@ async fn every_stored_vpc_is_reported_and_a_later_write_is_visible() {
         vec![tag("Name", "late")],
     );
     let after = described_ids(&router, "after a later write", &[]).await;
-    let mut expected = seeded.ids.clone();
+    let mut expected = ids_at(&seeded, &in_region(&seeded));
     expected.push(late_id.clone());
     assert_eq!(
         after, expected,
@@ -305,7 +330,7 @@ async fn each_documented_filter_selects_the_vpcs_whose_attribute_equals_a_value(
     let (router, engine) = super::ec2_query::emulator();
     let seeded = seed(&engine);
     let account = engine::emulator_account_id().to_string();
-    let all: Vec<usize> = (0..seeded.ids.len()).collect();
+    let all: Vec<usize> = in_region(&seeded);
 
     // One row per filter name `DescribeVpcsRequest$Filters` documents (plus the
     // variable-key `tag:<key>` form), each asserted on a VPC the issue never cited.
@@ -335,17 +360,18 @@ async fn each_documented_filter_selects_the_vpcs_whose_attribute_equals_a_value(
             all.clone(),
         ),
         // The Region's default DHCP option set is what a VPC inherits, so this selects
-        // every VPC of the signed-for Region — all but the one seeded in another.
+        // every VPC the signed-for Region reports.
         (
             "dhcp-options-id",
             vec![seeded.dhcp_options_ids[0].clone()],
-            vec![0, 1, 2, 3, 4, 6],
+            all.clone(),
         ),
-        // The other Region's set selects exactly the one VPC created there.
+        // The other Region's set selects nothing here: the one VPC that inherited it lives
+        // in that Region, and this call cannot see it.
         (
             "dhcp-options-id",
-            vec![seeded.dhcp_options_ids[5].clone()],
-            vec![5],
+            vec![seeded.dhcp_options_ids[OTHER_REGION_INDEX].clone()],
+            vec![],
         ),
         (
             "ipv6-cidr-block-association.ipv6-cidr-block",
@@ -368,7 +394,7 @@ async fn each_documented_filter_selects_the_vpcs_whose_attribute_equals_a_value(
             vec![4],
         ),
         ("is-default", vec!["true".into()], vec![0]),
-        ("is-default", vec!["false".into()], vec![1, 2, 3, 4, 5, 6]),
+        ("is-default", vec!["false".into()], vec![1, 2, 3, 4, 6, 7]),
         ("owner-id", vec![account], all.clone()),
         ("owner-id", vec!["111122223333".into()], vec![]),
         ("state", vec!["pending".into()], vec![3]),
@@ -377,9 +403,9 @@ async fn each_documented_filter_selects_the_vpcs_whose_attribute_equals_a_value(
             vec!["available".into(), "pending".into()],
             all.clone(),
         ),
-        ("tag-key", vec!["Owner".into()], vec![1, 2, 5]),
+        ("tag-key", vec!["Owner".into()], vec![1, 2]),
         ("tag-key", vec!["Project".into()], vec![6]),
-        ("tag:Owner", vec!["TeamA".into()], vec![1, 5]),
+        ("tag:Owner", vec!["TeamA".into()], vec![1]),
         ("tag:Name", vec!["web".into()], vec![1, 3]),
         // "Filter values are case-sensitive" (`Filter$Values`).
         ("tag:Owner", vec!["teama".into()], vec![]),
@@ -397,7 +423,7 @@ async fn each_documented_filter_selects_the_vpcs_whose_attribute_equals_a_value(
         ("cidr", vec!["10.??.0.0/16".into()], vec![]),
         ("tag:Name", vec!["we*".into()], vec![1, 3]),
         ("tag:Name", vec!["*atch".into()], vec![2]),
-        ("tag-key", vec!["*".into()], vec![1, 2, 3, 5, 6]),
+        ("tag-key", vec!["*".into()], vec![1, 2, 3, 6]),
         // A documented filter carrying no value at all: there is no value for the
         // attribute to match, so it selects nothing rather than everything.
         ("state", vec![], vec![]),
@@ -512,8 +538,8 @@ async fn vpc_ids_narrow_the_report_to_the_ids_named() {
         vec![6],
         vec![2, 4],
         vec![4, 2],
-        vec![5, 1, 3],
-        (0..seeded.ids.len()).collect(),
+        vec![7, 1, 3],
+        in_region(&seeded),
     ];
     for asked in cases {
         let ids = ids_at(&seeded, &asked);
@@ -538,14 +564,17 @@ async fn a_vpc_id_that_names_no_vpc_is_refused() {
     let seeded = seed(&engine);
     let known = seeded.ids[0].clone();
 
-    // Rows: a well-formed id nothing has, the 8-hex-digit id form, a malformed id, and an
-    // unknown id carried beside a known one.
+    // Rows: a well-formed id nothing has, the 8-hex-digit id form, a malformed id, an
+    // unknown id carried beside a known one, and the id of a VPC that exists in ANOTHER
+    // Region — which this call cannot see, so it names no VPC here either.
     let cases: Vec<Vec<String>> = vec![
         vec!["vpc-0ffffffffffffffff".to_string()],
         vec!["vpc-0abc1234".to_string()],
         vec!["not-a-vpc-id".to_string()],
         vec![known.clone(), "vpc-0ffffffffffffffff".to_string()],
-        vec!["vpc-0ffffffffffffffff".to_string(), known],
+        vec!["vpc-0ffffffffffffffff".to_string(), known.clone()],
+        vec![seeded.ids[OTHER_REGION_INDEX].clone()],
+        vec![known, seeded.ids[OTHER_REGION_INDEX].clone()],
     ];
     for ids in cases {
         let borrowed: Vec<&str> = ids.iter().map(String::as_str).collect();
@@ -612,7 +641,8 @@ async fn paging_covers_every_vpc_exactly_once_for_each_page_size() {
             }
         }
         assert_eq!(
-            walked, seeded.ids,
+            walked,
+            ids_at(&seeded, &in_region(&seeded)),
             "case {case:?}: expected every VPC exactly once in store order, got {walked:?}"
         );
     }
@@ -630,7 +660,7 @@ async fn a_page_is_cut_from_the_filtered_set() {
     let first = described_ids(&router, "filtered first page", &params).await;
     assert_eq!(
         first,
-        ids_at(&seeded, &[1, 2, 3, 4, 5]),
+        ids_at(&seeded, &[1, 2, 3, 4, 6]),
         "filtered first page: expected the first five non-default VPCs, got {first:?}"
     );
 
@@ -647,7 +677,7 @@ async fn a_page_is_cut_from_the_filtered_set() {
     let second = described_ids(&router, "filtered second page", &next).await;
     assert_eq!(
         second,
-        ids_at(&seeded, &[6]),
+        ids_at(&seeded, &[7]),
         "filtered second page: expected the remaining non-default VPC, got {second:?}"
     );
 }
@@ -742,7 +772,8 @@ async fn dry_run_reports_the_permitted_outcome_without_describing() {
     )
     .await;
     assert_eq!(
-        reported, seeded.ids,
+        reported,
+        ids_at(&seeded, &in_region(&seeded)),
         "DryRun=false: expected the ordinary report, got {reported:?}"
     );
 }

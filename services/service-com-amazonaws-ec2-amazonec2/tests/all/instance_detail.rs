@@ -1110,11 +1110,13 @@ async fn monitoring_refuses_what_it_cannot_act_on_and_changes_nothing() {
 async fn a_tag_filtered_describe_reports_the_matching_instances_across_pages() {
     let (router, _engine) = ec2_query::emulator();
 
-    // Six instances, tagged two ways: the rule is about which instances a tag selects, so
-    // both the selected and the unselected set carry more than one member.
+    // Twelve instances, tagged two ways: the rule is about which instances a tag selects, so
+    // both the selected and the unselected set carry more than one member — and the selected
+    // set is larger than the smallest page this operation pages with, so the paged row below
+    // really spans pages.
     let mut selected = Vec::new();
     let mut unselected = Vec::new();
-    for index in 0..6 {
+    for index in 0..12 {
         let (key, value) = if index % 2 == 0 {
             ("Stage", "replay")
         } else {
@@ -1157,7 +1159,7 @@ async fn a_tag_filtered_describe_reports_the_matching_instances_across_pages() {
     ];
 
     for (case, narrowing) in &rows {
-        for page_size in [None, Some(2)] {
+        for page_size in [None, Some(5)] {
             let mut params = narrowing.clone();
             if let Some(page_size) = page_size {
                 params.push(p("MaxResults", &page_size.to_string()));

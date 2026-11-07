@@ -74,7 +74,7 @@ async fn option_set_of_another_region(
     cidr: &str,
 ) -> (String, String) {
     let vpc_id = create_vpc(router, case, region, cidr).await;
-    let set = reported_dhcp_options_id(router, case, &vpc_id).await;
+    let set = reported_dhcp_options_id(router, case, region, &vpc_id).await;
     (vpc_id, set)
 }
 
@@ -95,14 +95,17 @@ async fn default_vpc(router: &MultiServiceRouter, case: &str) -> String {
         .unwrap_or_else(|| panic!("case {case:?}: expected a default VPC in {body}"))
 }
 
-/// The `DhcpOptionsId` `DescribeVpcs` reports for the one VPC `vpc_id` names.
+/// The `DhcpOptionsId` `DescribeVpcs` reports for the one VPC `vpc_id` names, read in the
+/// Region that VPC was created in — EC2 is a regional service, so a describe signed for
+/// another Region reports no VPC at all.
 async fn reported_dhcp_options_id(
     router: &MultiServiceRouter,
     case: &str,
+    region: &str,
     vpc_id: &str,
 ) -> String {
     let (status, body) =
-        super::ec2_query::call(router, REGION, "DescribeVpcs", &indexed("VpcId", &[vpc_id])).await;
+        super::ec2_query::call(router, region, "DescribeVpcs", &indexed("VpcId", &[vpc_id])).await;
     assert_eq!(
         status, 200,
         "case {case:?}: expected HTTP 200 from DescribeVpcs for {vpc_id}, got {status} \
@@ -128,6 +131,7 @@ async fn held_option_sets(router: &MultiServiceRouter, case: &str) -> Vec<String
 async fn associate_ok(
     router: &MultiServiceRouter,
     case: &str,
+    region: &str,
     vpc_id: &str,
     dhcp_options_id: &str,
 ) {
@@ -154,7 +158,7 @@ async fn associate_ok(
         "case {case:?}: expected one <requestId> beside the flag, got {request_ids:?} \
          with body {body}"
     );
-    let stored = reported_dhcp_options_id(router, case, vpc_id).await;
+    let stored = reported_dhcp_options_id(router, case, region, vpc_id).await;
     assert_eq!(
         stored, dhcp_options_id,
         "case {case:?}: expected {vpc_id} to report {dhcp_options_id:?} afterwards, got \
@@ -183,7 +187,7 @@ async fn associate_dhcp_options_points_the_vpc_at_the_value_the_request_names() 
     let (third_vpc, third_set) =
         option_set_of_another_region(&router, "a third option set", "eu-west-1", "10.12.0.0/16")
             .await;
-    let own_set = reported_dhcp_options_id(&router, "the subject VPC", &subject).await;
+    let own_set = reported_dhcp_options_id(&router, "the subject VPC", REGION, &subject).await;
 
     for (case, set) in [
         ("the subject VPC", &own_set),
@@ -219,14 +223,26 @@ async fn associate_dhcp_options_points_the_vpc_at_the_value_the_request_names() 
     ];
 
     for (case, value) in steps {
-        associate_ok(&router, case, &subject, &value).await;
+        associate_ok(&router, case, REGION, &subject, &value).await;
         // The association is made on the VPC the request named and on no other: the two
-        // VPCs that minted the other sets still report the sets they were created with.
-        for (other_case, vpc_id, expected) in [
-            ("the VPC of the second set", &other_vpc, &other_set),
-            ("the VPC of the third set", &third_vpc, &third_set),
+        // VPCs that minted the other sets still report the sets they were created with,
+        // read in the Region each was created in.
+        for (other_case, other_region, vpc_id, expected) in [
+            (
+                "the VPC of the second set",
+                "us-west-2",
+                &other_vpc,
+                &other_set,
+            ),
+            (
+                "the VPC of the third set",
+                "eu-west-1",
+                &third_vpc,
+                &third_set,
+            ),
         ] {
-            let reported = reported_dhcp_options_id(&router, other_case, vpc_id).await;
+            let reported =
+                reported_dhcp_options_id(&router, other_case, other_region, vpc_id).await;
             assert_eq!(
                 &reported, expected,
                 "case {case:?}: {other_case} must still report {expected:?} after the \
@@ -262,8 +278,8 @@ async fn either_kind_of_vpc_can_be_associated_and_disassociated() {
     ];
 
     for (case, vpc_id) in cases {
-        associate_ok(&router, case, vpc_id, &elsewhere).await;
-        associate_ok(&router, case, vpc_id, ec2::state::DHCP_OPTIONS_DEFAULT).await;
+        associate_ok(&router, case, REGION, vpc_id, &elsewhere).await;
+        associate_ok(&router, case, REGION, vpc_id, ec2::state::DHCP_OPTIONS_DEFAULT).await;
     }
 }
 
@@ -291,6 +307,7 @@ async fn a_set_stays_associable_after_the_vpc_it_was_minted_for_is_gone() {
     associate_ok(
         &router,
         "the minting VPC points elsewhere",
+        "eu-central-1",
         &minted_for,
         ec2::state::DHCP_OPTIONS_DEFAULT,
     )
@@ -301,12 +318,13 @@ async fn a_set_stays_associable_after_the_vpc_it_was_minted_for_is_gone() {
         "case \"after the minting VPC moved off\": expected the account to still hold \
          {set:?}, got {held:?}"
     );
-    associate_ok(&router, "after the minting VPC moved off", &late, &set).await;
+    associate_ok(&router, "after the minting VPC moved off", REGION, &late, &set).await;
 
     // And the minting VPC is deleted outright: the set outlives it.
     associate_ok(
         &router,
         "the late VPC moves off again",
+        REGION,
         &late,
         ec2::state::DHCP_OPTIONS_DEFAULT,
     )
@@ -329,7 +347,7 @@ async fn a_set_stays_associable_after_the_vpc_it_was_minted_for_is_gone() {
         "case \"after the minting VPC was deleted\": expected the account to still hold \
          {set:?}, got {held:?}"
     );
-    associate_ok(&router, "after the minting VPC was deleted", &late, &set).await;
+    associate_ok(&router, "after the minting VPC was deleted", REGION, &late, &set).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -350,7 +368,8 @@ async fn a_set_stays_associable_after_the_vpc_it_was_minted_for_is_gone() {
 async fn a_bad_request_is_refused_with_the_ec2_error_code_for_it() {
     let router = emulator();
     let vpc_id = create_vpc(&router, "the refusal table's VPC", REGION, "10.30.0.0/16").await;
-    let own_set = reported_dhcp_options_id(&router, "the refusal table's VPC", &vpc_id).await;
+    let own_set =
+        reported_dhcp_options_id(&router, "the refusal table's VPC", REGION, &vpc_id).await;
     /// A VPC id of the right shape that no VPC of the account has.
     const ABSENT_VPC: &str = "vpc-0000000000000beef";
     /// A dhcp-options id of the right shape, in its 17-digit form, that no option set of
@@ -484,7 +503,8 @@ async fn a_bad_request_is_refused_with_the_ec2_error_code_for_it() {
 
     // None of those refusals wrote anything: the VPC still reports the set it was created
     // with, the dry run included.
-    let reported = reported_dhcp_options_id(&router, "after every refusal", &vpc_id).await;
+    let reported =
+        reported_dhcp_options_id(&router, "after every refusal", REGION, &vpc_id).await;
     assert_eq!(
         reported, own_set,
         "case \"after every refusal\": expected {vpc_id} to still report {own_set:?}, \
