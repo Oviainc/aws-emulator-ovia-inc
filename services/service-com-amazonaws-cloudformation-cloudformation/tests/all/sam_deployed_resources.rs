@@ -95,18 +95,24 @@ fn routed_function(logical_id: &str, api: &str, path: &str, method: &str) -> Str
 
 /// The resources a serverless application is monitored by, which the macro has nothing to
 /// do with: they are part of the processed template exactly as the client wrote them.
-fn monitoring_resources() -> String {
-    r#""Failures":{"Type":"AWS::Logs::LogGroup",
-         "Properties":{"LogGroupName":"/aws/lambda/orders","RetentionInDays":7}},
-       "FailureCount":{"Type":"AWS::Logs::MetricFilter",
-         "Properties":{"LogGroupName":{"Ref":"Failures"},"FilterPattern":"ERROR",
-           "MetricTransformations":[{"MetricName":"Failures","MetricNamespace":"Orders",
-             "MetricValue":"1"}]}},
-       "FailureAlarm":{"Type":"AWS::CloudWatch::Alarm",
-         "Properties":{"AlarmName":"orders-failures","ComparisonOperator":"GreaterThanThreshold",
+///
+/// `group` names the log group, because the rows below deploy against ONE emulator: a log
+/// group is really created in Amazon CloudWatch Logs now
+/// (`state::provisioning::logs_resources`), and two stacks cannot both create the group of
+/// the same name — the second create is refused, exactly as it is in an account.
+fn monitoring_resources(group: &str) -> String {
+    format!(
+        r#""Failures":{{"Type":"AWS::Logs::LogGroup",
+         "Properties":{{"LogGroupName":"{group}","RetentionInDays":7}}}},
+       "FailureCount":{{"Type":"AWS::Logs::MetricFilter",
+         "Properties":{{"LogGroupName":{{"Ref":"Failures"}},"FilterPattern":"ERROR",
+           "MetricTransformations":[{{"MetricName":"Failures","MetricNamespace":"Orders",
+             "MetricValue":"1"}}]}}}},
+       "FailureAlarm":{{"Type":"AWS::CloudWatch::Alarm",
+         "Properties":{{"AlarmName":"orders-failures","ComparisonOperator":"GreaterThanThreshold",
            "EvaluationPeriods":1,"Threshold":1,"MetricName":"Failures","Namespace":"Orders",
-           "Period":60,"Statistic":"Sum"}}"#
-        .to_string()
+           "Period":60,"Statistic":"Sum"}}}}"#
+    )
 }
 
 fn rows() -> Vec<Row> {
@@ -122,7 +128,7 @@ fn rows() -> Vec<Row> {
                      "Properties":{{"PrimaryKey":{{"Name":"orderId","Type":"String"}}}}}},
                    {},{}}}"#,
                 routed_function("Place", "OrdersApi", "/orders", "post"),
-                monitoring_resources()
+                monitoring_resources("/aws/lambda/orders")
             )),
             types: vec![
                 "AWS::ApiGateway::Deployment",
@@ -218,7 +224,10 @@ fn rows() -> Vec<Row> {
         Row {
             case: "the macro declared over resources it expands nothing of",
             stack: "sam-deployed-nothing-to-expand",
-            template: sam_template(&format!("{{{}}}", monitoring_resources())),
+            template: sam_template(&format!(
+                "{{{}}}",
+                monitoring_resources("/aws/lambda/orders-unexpanded")
+            )),
             types: vec![
                 "AWS::CloudWatch::Alarm",
                 "AWS::Logs::LogGroup",

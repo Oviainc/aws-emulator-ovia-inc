@@ -205,12 +205,20 @@ mod cognito_identity_pool;
 pub(super) mod dynamodb_table;
 mod ec2_vpc_network;
 mod iam_policy;
+/// `AWS::IoT::Authorizer`: the custom authorizer a stack declares, created in AWS IoT
+/// itself ([`iot_authorizer`]).
+pub(super) mod iot_authorizer;
 mod lambda_alias;
 mod lambda_event_source_mapping;
 mod lambda_function;
 mod lambda_layer_version;
 mod lambda_permission;
 mod lambda_version;
+/// The Amazon CloudWatch Logs types a stack declares — a log group, a stream inside one and
+/// a metric filter on one: visible to the rest of this service's state because the types'
+/// own NAMES live here, beside the arms that provision them, and more than one module answers
+/// about them ([`super::template`] reads a metric filter's own name property).
+pub(super) mod logs_resources;
 /// `AWS::CloudFormation::Stack`: the NESTED STACK a stack declares, created in
 /// CloudFormation itself ([`nested_stack`]).
 mod nested_stack;
@@ -623,6 +631,12 @@ pub(super) enum Owner {
     LambdaPermission,
     /// `AWS::Lambda::Version`, whose arms are [`lambda_version`]'s.
     LambdaVersion,
+    /// One of the three Amazon CloudWatch Logs types [`logs_resources`] creates: the log
+    /// group, the stream inside one, and the metric filter on one. Which of them it is
+    /// travels with the owner, so the algorithm resolves the type once.
+    LogsResource(logs_resources::Kind),
+    /// `AWS::IoT::Authorizer`, whose arms are [`iot_authorizer`]'s.
+    IotAuthorizer,
     /// One of the Amazon EC2 VPC-network types [`ec2_vpc_network`] creates: the route table,
     /// the subnet association that puts a subnet on one, the VPC endpoint reached through it,
     /// the internet and virtual private gateways, the attachment that puts one of those on a
@@ -668,6 +682,12 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if resource_type == lambda_version::LAMBDA_VERSION {
         return Some(Owner::LambdaVersion);
+    }
+    if let Some(kind) = logs_resources::kind_of(resource_type) {
+        return Some(Owner::LogsResource(kind));
+    }
+    if resource_type == iot_authorizer::IOT_AUTHORIZER {
+        return Some(Owner::IotAuthorizer);
     }
     if let Some(kind) = ec2_vpc_network::kind_of(resource_type) {
         return Some(Owner::Ec2VpcNetwork(kind));
@@ -725,6 +745,12 @@ impl Owner {
             // A policy statement carries no tags of its own: it is not a resource, so
             // CloudFormation propagates none to it.
             Self::LambdaPermission => lambda_permission::create(ctx, region, resource).await,
+            Self::LogsResource(kind) => {
+                logs_resources::create(ctx, region, kind, resource, propagated).await
+            }
+            Self::IotAuthorizer => {
+                iot_authorizer::create(ctx, region, resource, propagated).await
+            }
             Self::Ec2VpcNetwork(kind) => {
                 ec2_vpc_network::create(ctx, region, kind, resource, propagated).await
             }
@@ -739,6 +765,16 @@ impl Owner {
             // `CreateStack`, so the whole deploy-a-stack chain — this walk included — runs
             // again inside it. Boxing keeps the inner chain's state off this future, so the
             // stack a request needs does not multiply with the nesting the template declares.
+            //
+            // HOW DEEP that re-entry can go is bounded before the call is made, not here:
+            // every level carries the chain of template references above it, and
+            // `nested_stack::beyond_the_bounds` refuses a child past
+            // `nested_stack::MAX_NESTING_DEPTH` — and one whose own reference the chain is
+            // already deploying, which is what a template that nests itself is — as this
+            // resource's failure. So the number of re-entries is fixed by that ceiling rather
+            // than by the template graph, and a cyclic reference fails the resource instead of
+            // recursing. The same bound is applied by the update and delete arms below, which
+            // re-enter the same way.
             Self::NestedStack => {
                 Box::pin(nested_stack::create(
                     ctx,
@@ -790,6 +826,11 @@ impl Owner {
             Self::LambdaLayerVersion => Ok(Readiness::Ready),
             // The statement is in force the moment `AddPermission` answers.
             Self::LambdaPermission => Ok(Readiness::Ready),
+            // A log group, a stream and a metric filter are each in force the moment the
+            // call that made them answers, and an authorizer exists in the status its
+            // declaration asked for.
+            Self::LogsResource(_) => Ok(logs_resources::ready()),
+            Self::IotAuthorizer => Ok(iot_authorizer::ready()),
             // Each of these resources EXISTS from the moment its create answers: the table
             // takes its routes, the association holds, the gateway is there to be attached,
             // the attachment is in force, the address is allocated, and the endpoint's own
@@ -844,6 +885,11 @@ impl Owner {
             // A table's `Arn` and `StreamArn` are the ones its own `CreateTable` answered
             // with, so there is nothing left to read once the resource is up.
             Self::DynamodbTable => Ok(BTreeMap::new()),
+            // A log group's `Arn` is the one CloudFormation's own naming rules compute for
+            // it, and neither a stream nor a metric filter publishes an attribute at all; an
+            // authorizer's `Arn` is the one its create answered with. So there is nothing
+            // left to read once any of them is up.
+            Self::LogsResource(_) | Self::IotAuthorizer => Ok(BTreeMap::new()),
             // Each of these types publishes its own identifier (an Elastic IP address its
             // address and allocation id, an attachment nothing at all), and the create
             // answered it, so there is nothing to read once the resource is up.
@@ -893,6 +939,11 @@ impl Owner {
             Self::LambdaLayerVersion => Ok(Removal::Gone),
             // `RemovePermission` takes the statement away, so there is nothing to wait for.
             Self::LambdaPermission => Ok(Removal::Gone),
+            // Each of these deletes takes the resource away as it answers: neither
+            // CloudWatch Logs nor AWS IoT reports a state a removed one is still being
+            // deleted in.
+            Self::LogsResource(_) => Ok(logs_resources::removal()),
+            Self::IotAuthorizer => Ok(iot_authorizer::removal()),
             // Each of these deletes takes the resource away as it answers — Amazon EC2
             // reports no state a deleted route table, association, endpoint, gateway,
             // attachment, address or route is still being removed in — except the NAT
@@ -967,6 +1018,12 @@ impl Owner {
             Self::LambdaPermission => lambda_permission::update(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            Self::LogsResource(kind) => {
+                logs_resources::update(ctx, region, kind, resource, declared).await
+            }
+            Self::IotAuthorizer => {
+                iot_authorizer::update(ctx, region, resource, declared).await
+            }
             // Neither an association nor a route table has a property that can change on the
             // resource that exists (both of an association's are its identity, and a route
             // table's VPC is create-only), every property of a gateway, of an attachment and
@@ -1041,6 +1098,10 @@ impl Owner {
             | Self::LambdaLayerVersion
             | Self::LambdaPermission
             | Self::LambdaVersion => Ok(()),
+            // Neither a log stream nor a metric filter is taggable at all, and the tags of a
+            // log group and of an authorizer that already exist are reconciled by no arm here
+            // yet ([`Provisioner::retag`]'s own default), so nothing is asked about them.
+            Self::LogsResource(_) | Self::IotAuthorizer => Ok(()),
             // The tags of an Amazon EC2 resource that already exists are reconciled by no arm
             // here yet — as for every other type of that service ([`Provisioner::retag`]'s
             // own default) — so nothing is asked about them.
@@ -1107,6 +1168,14 @@ impl Owner {
                 lambda_layer_version::delete(ctx, region, resource).await
             }
             Self::LambdaPermission => lambda_permission::delete(ctx, region, resource).await,
+            // Neither CloudWatch Logs nor AWS IoT takes a snapshot of one of these on the way
+            // out: there is no such call for a log group, a stream, a metric filter or an
+            // authorizer, so a `Snapshot` deletion policy on one of them deletes the resource
+            // with no snapshot invented for it.
+            Self::LogsResource(kind) => {
+                logs_resources::delete(ctx, region, kind, resource).await
+            }
+            Self::IotAuthorizer => iot_authorizer::delete(ctx, region, resource).await,
             // Amazon EC2 takes no snapshot of any of these on the way out: there is no such
             // call for a route table, an association, an endpoint, a gateway, an attachment
             // or an address, so a `Snapshot` deletion policy on one of them deletes the
@@ -1180,6 +1249,12 @@ impl Owner {
             // statement belongs to is read by the function's own drift read, so a statement
             // reports no configuration of its own to compare either.
             Self::LambdaLayerVersion | Self::LambdaPermission => Ok(None),
+            Self::LogsResource(kind) => {
+                logs_resources::actual_configuration(ctx, region, kind, resource).await
+            }
+            Self::IotAuthorizer => {
+                iot_authorizer::actual_configuration(ctx, region, resource).await
+            }
             // These types report no configuration of their own to compare either: every
             // property each one has is part of its identity or of the call that made it, so
             // there is no member a later read could find changed.
@@ -1219,6 +1294,8 @@ impl Owner {
             | Self::LambdaVersion => message.to_string(),
             // Amazon DynamoDB's does the same.
             Self::DynamodbTable => message.to_string(),
+            // Amazon CloudWatch Logs's and AWS IoT's do the same.
+            Self::LogsResource(_) | Self::IotAuthorizer => message.to_string(),
             // Amazon EC2's does the same.
             Self::Ec2VpcNetwork(_) => message.to_string(),
             // Amazon Cognito Identity's does the same.

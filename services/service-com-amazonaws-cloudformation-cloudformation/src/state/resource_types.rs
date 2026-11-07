@@ -584,6 +584,7 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::IAM::UserToGroupAddition",
     "AWS::IAM::VirtualMFADevice",
     // AWS IoT
+    "AWS::IoT::Authorizer",
     "AWS::IoT::Certificate",
     "AWS::IoT::Policy",
     "AWS::IoT::PolicyPrincipalAttachment",

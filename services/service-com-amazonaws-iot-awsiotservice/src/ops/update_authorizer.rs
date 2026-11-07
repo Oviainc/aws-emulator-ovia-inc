@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAuthorizer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAuthorizer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: applies the members the request states to the authorizer record this
+//! service holds under `authorizerName` ([`crate::state::RegisteredAuthorizer`]) and reports
+//! the name and the ARN that record carries; `DescribeAuthorizer` reads the change back.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAuthorizer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The authorizer keeps its identity: the name addresses the record and the ARN was minted
+//! on the create, so an update changes the authorizer rather than replacing it. A member the
+//! request does not state is left exactly as it was — the call "updates an authorizer"
+//! rather than replacing one — and `signingDisabled` is not a member of this call at all, so
+//! whether the token signature is validated is fixed when the authorizer is created. A name
+//! the store does not hold is the modelled `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +162,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAuthorizer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAuthorizerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAuthorizer"))
+        // A write to this service's own store; `ctx` carries request metadata only.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateAuthorizerErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The name addresses the record: a name the store does not hold is the modelled
+        // `ResourceNotFoundException` ("The specified resource does not exist", HTTP 404)
+        // rather than a 200 that changed nothing.
+        let authorizer = store
+            .authorizers
+            .get_mut(&input.authorizer_name)
+            .ok_or_else(|| {
+                UpdateAuthorizerErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Authorizer {} does not exist",
+                            input.authorizer_name
+                        )),
+                    },
+                )
+            })?;
+
+        // Each member the request states replaces what the record carries; a member it does
+        // not state leaves that part of the authorizer as it was, the call being documented
+        // "Updates an authorizer" rather than one that replaces its whole configuration.
+        // Every modelled constraint has already been checked before this handler runs.
+        if let Some(function_arn) = input.authorizer_function_arn {
+            authorizer.authorizer_function_arn = function_arn;
+        }
+        if let Some(token_key_name) = input.token_key_name {
+            authorizer.token_key_name = Some(token_key_name);
+        }
+        if let Some(keys) = input.token_signing_public_keys {
+            authorizer.token_signing_public_keys = Some(keys.into_iter().collect());
+        }
+        if let Some(status) = input.status {
+            authorizer.status = status;
+        }
+        if let Some(caching) = input.enable_caching_for_http {
+            authorizer.enable_caching_for_http = caching;
+        }
+        // "The UNIX timestamp of when the authorizer was last updated"
+        // (`AuthorizerDescription$lastModifiedDate`): this write is what moves it.
+        authorizer.last_modified_date = ::std::time::SystemTime::now();
+
+        // The response is built from the record that was just written, so what this call
+        // reports and what the next `DescribeAuthorizer` reads are one value, not two that
+        // could drift.
+        Ok(UpdateAuthorizerOutput {
+            authorizer_name: Some(authorizer.authorizer_name.clone()),
+            authorizer_arn: Some(authorizer.authorizer_arn.clone()),
+        })
     }
 }

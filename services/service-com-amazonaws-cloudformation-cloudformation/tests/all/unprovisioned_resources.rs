@@ -16,7 +16,9 @@
 //!    CloudFormation's documented naming rules give the resource — and the stack's
 //!    deletion, which has nothing to delete, completes too. (What those identifiers ARE is
 //!    `stack_outputs.rs`'s table; what this row adds is that no call was made for them and
-//!    that the stack's lifecycle completes anyway.)
+//!    that the stack's lifecycle completes anyway.) `AWS::CloudWatch::Alarm` is such a type:
+//!    this emulator has no provisioner for it, so neither of the two the row declares is
+//!    created anywhere.
 //!
 //! The same stack with the owning service mounted beside CloudFormation is
 //! `core/router/tests/all/cloudformation_provisions_stack_resources.rs`, which is where
@@ -105,7 +107,7 @@ async fn a_resource_whose_owning_service_does_not_answer_fails_the_stack() {
 #[tokio::test]
 async fn resource_types_with_no_provisioner_are_declared_only_and_the_stack_completes() {
     let router = crate::stack_lifecycle::router();
-    let case = "an alarm and a log group, neither of which this emulator provisions";
+    let case = "two alarms, a type this emulator provisions nothing for";
     let stack_name = "declared-only-stack";
     let template = json!({
         "Resources": {
@@ -113,14 +115,14 @@ async fn resource_types_with_no_provisioner_are_declared_only_and_the_stack_comp
                 "Type": "AWS::CloudWatch::Alarm",
                 "Properties": { "AlarmName": "declared-only-alarm" }
             },
-            "Group": {
-                "Type": "AWS::Logs::LogGroup",
-                "Properties": { "LogGroupName": "declared-only-group" }
+            "Second": {
+                "Type": "AWS::CloudWatch::Alarm",
+                "Properties": { "AlarmName": "declared-only-second-alarm" }
             }
         },
         "Outputs": {
             "AlarmName": { "Value": { "Ref": "Alarm" } },
-            "GroupArn": { "Value": { "Fn::GetAtt": ["Group", "Arn"] } }
+            "SecondArn": { "Value": { "Fn::GetAtt": ["Second", "Arn"] } }
         }
     })
     .to_string();
@@ -142,7 +144,8 @@ async fn resource_types_with_no_provisioner_are_declared_only_and_the_stack_comp
         values,
         vec![
             "declared-only-alarm".to_string(),
-            "arn:aws:logs:us-east-1:000000000000:log-group:declared-only-group:*".to_string(),
+            "arn:aws:cloudwatch:us-east-1:000000000000:alarm:declared-only-second-alarm"
+                .to_string(),
         ],
         "case {case:?}: expected the documented Ref and Fn::GetAtt values, got {values:?}"
     );

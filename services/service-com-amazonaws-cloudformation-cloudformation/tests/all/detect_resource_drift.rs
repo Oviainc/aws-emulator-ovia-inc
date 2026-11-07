@@ -597,9 +597,9 @@ async fn a_check_of_a_type_drift_detection_is_not_supported_for_is_refused() {
         concat!(
             "Resources:\n",
             "  Signal:\n",
-            "    Type: AWS::Logs::LogGroup\n",
+            "    Type: AWS::CloudWatch::Alarm\n",
             "    Properties:\n",
-            "      LogGroupName: detect-one-unsupported-signal\n",
+            "      AlarmName: detect-one-unsupported-signal\n",
             "  Escalation:\n",
             "    Type: AWS::Bedrock::KnowledgeBase\n",
             "    Properties:\n",
@@ -611,9 +611,9 @@ async fn a_check_of_a_type_drift_detection_is_not_supported_for_is_refused() {
 
     for (case, logical_id, resource_type) in [
         (
-            "a log group, which no owning service here reports",
+            "an alarm, which no owning service here reports",
             "Signal",
-            "AWS::Logs::LogGroup",
+            "AWS::CloudWatch::Alarm",
         ),
         (
             "a knowledge base, which nothing here provisions",

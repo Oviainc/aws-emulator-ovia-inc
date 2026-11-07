@@ -199,6 +199,8 @@ mod list_stack_set_operations;
 mod list_stack_sets;
 #[path = "all/list_types.rs"]
 mod list_types;
+#[path = "all/logs_and_iot_resources.rs"]
+mod logs_and_iot_resources;
 #[path = "all/macro_acknowledgement_and_include_refresh.rs"]
 mod macro_acknowledgement_and_include_refresh;
 #[path = "all/malformed_policy_document_rollback.rs"]

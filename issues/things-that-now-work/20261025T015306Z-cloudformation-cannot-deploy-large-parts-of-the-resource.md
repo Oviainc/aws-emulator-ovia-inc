@@ -26,6 +26,8 @@ Issue-Commit: 461d317fc71f56ed8ab822edc66618d36d651bfa
 
 > _Note: this issue was identified against the code base at commit `461d317fc71f56ed8ab822edc66618d36d651bfa`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _Resolution note: causes 2 to 10 are served — the `AWS::Logs::LogGroup`/`LogStream`/`MetricFilter` and `AWS::IoT::Authorizer` providers were added for causes 2 and 9, and causes 3 to 8 and 10 were already served when this was fixed. Cause 1 is served only in part: `AWS::CloudFormation::GuardHook` and `AWS::CloudFormation::LambdaHook` are recognised resource types, so a template declaring one deploys, but nothing INVOKES a hook yet — no hook activation is stored, no Guard rule set is evaluated and no Lambda hook is called, so a `FAIL`-mode hook does not block a non-compliant resource and a `WARN`-mode one records no warning. That half needs a hook store and a Guard evaluation engine, and is still open: the trace ids `cloudformation.deep-cloudformation-1-cfn-enforce-fail-hook-blocks-unencrypted-queue-create`, `cloudformation.deep-cloudformation-1-cfn-enforce-warn-hook-flags-but-allows-unencrypted-queue-create` and `cloudformation__lambda__sqs.deploy-cloudformation-2-lambdahook-rejects-deny-queue` are not satisfied by this fix._
+
 ## Operation
 CreateStack
 

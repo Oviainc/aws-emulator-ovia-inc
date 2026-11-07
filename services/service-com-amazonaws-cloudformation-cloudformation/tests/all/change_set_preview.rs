@@ -44,17 +44,19 @@ use crate::stack_lifecycle::{
 /// parameter and the other reading an attribute off the first.
 ///
 /// `TopicName` is the property `AWS::SNS::Topic` takes its physical name from and
-/// `LogGroupName` the one `AWS::Logs::LogGroup` does (CloudFormation's own convention: the
+/// `AlarmName` the one `AWS::CloudWatch::Alarm` does (CloudFormation's own convention: the
 /// type's last segment plus `Name`), so an edit to either recreates its resource while an
-/// edit to `DisplayName` does not.
+/// edit to `DisplayName` does not. The reader is an ALARM because the rows below deploy this
+/// one template to SEVERAL stacks of one account: this emulator provisions nothing for that
+/// type, so no owning service is asked to hold two resources of the same name.
 fn base_template() -> String {
     r#"{"Parameters":{"TopicName":{"Type":"String","Default":"first-topic"},
          "Label":{"Type":"String","Default":"first-label"}},
        "Resources":{
          "Topic":{"Type":"AWS::SNS::Topic","Properties":{
             "TopicName":{"Ref":"TopicName"},"DisplayName":{"Ref":"Label"}}},
-         "Reader":{"Type":"AWS::Logs::LogGroup","Properties":{
-            "LogGroupName":"reader-log",
+         "Reader":{"Type":"AWS::CloudWatch::Alarm","Properties":{
+            "AlarmName":"reader-alarm",
             "Tags":[{"Key":"topic","Value":{"Fn::GetAtt":["Topic","TopicArn"]}}]}}}}"#
         .to_string()
 }
@@ -190,7 +192,7 @@ fn preview_cases() -> Vec<PreviewCase> {
                 ExpectedChange {
                     action: change_action::MODIFY,
                     logical_resource_id: "Reader",
-                    resource_type: "AWS::Logs::LogGroup",
+                    resource_type: "AWS::CloudWatch::Alarm",
                     replacement: Some(replacement::FALSE),
                     policy_action: None,
                     scope: vec!["Properties"],
@@ -288,18 +290,18 @@ fn preview_cases() -> Vec<PreviewCase> {
         PreviewCase {
             case: "the name property stated outright, which recreates the resource",
             stack: "preview-literal-name",
-            template: Some(edited(r#""LogGroupName":"reader-log""#, r#""LogGroupName":"reader-log-2""#)),
+            template: Some(edited(r#""AlarmName":"reader-alarm""#, r#""AlarmName":"reader-alarm-2""#)),
             parameters: Vec::new(),
             changes: vec![ExpectedChange {
                 action: change_action::MODIFY,
                 logical_resource_id: "Reader",
-                resource_type: "AWS::Logs::LogGroup",
+                resource_type: "AWS::CloudWatch::Alarm",
                 replacement: Some(replacement::TRUE),
                 policy_action: Some(policy_action::REPLACE_AND_DELETE),
                 scope: vec!["Properties"],
                 details: vec![detail(
                     "Properties",
-                    Some("LogGroupName"),
+                    Some("AlarmName"),
                     requires_recreation::ALWAYS,
                     evaluation::STATIC,
                     change_source::DIRECT_MODIFICATION,
@@ -314,23 +316,23 @@ fn preview_cases() -> Vec<PreviewCase> {
             case: "a replaced resource whose UpdateReplacePolicy retains the old one",
             stack: "preview-retain",
             template: Some(edited(
-                r#""Reader":{"Type":"AWS::Logs::LogGroup","Properties":{
-            "LogGroupName":"reader-log","#,
-                r#""Reader":{"Type":"AWS::Logs::LogGroup","UpdateReplacePolicy":"Retain","Properties":{
-            "LogGroupName":"renamed-log","#,
+                r#""Reader":{"Type":"AWS::CloudWatch::Alarm","Properties":{
+            "AlarmName":"reader-alarm","#,
+                r#""Reader":{"Type":"AWS::CloudWatch::Alarm","UpdateReplacePolicy":"Retain","Properties":{
+            "AlarmName":"renamed-alarm","#,
             )),
             parameters: Vec::new(),
             changes: vec![ExpectedChange {
                 action: change_action::MODIFY,
                 logical_resource_id: "Reader",
-                resource_type: "AWS::Logs::LogGroup",
+                resource_type: "AWS::CloudWatch::Alarm",
                 replacement: Some(replacement::TRUE),
                 policy_action: Some(policy_action::REPLACE_AND_RETAIN),
                 scope: vec!["Properties", "UpdateReplacePolicy"],
                 details: vec![
                     detail(
                         "Properties",
-                        Some("LogGroupName"),
+                        Some("AlarmName"),
                         requires_recreation::ALWAYS,
                         evaluation::STATIC,
                         change_source::DIRECT_MODIFICATION,
@@ -351,23 +353,23 @@ fn preview_cases() -> Vec<PreviewCase> {
             case: "a replaced resource whose UpdateReplacePolicy snapshots the old one",
             stack: "preview-snapshot",
             template: Some(edited(
-                r#""Reader":{"Type":"AWS::Logs::LogGroup","Properties":{
-            "LogGroupName":"reader-log","#,
-                r#""Reader":{"Type":"AWS::Logs::LogGroup","UpdateReplacePolicy":"Snapshot","Properties":{
-            "LogGroupName":"renamed-log","#,
+                r#""Reader":{"Type":"AWS::CloudWatch::Alarm","Properties":{
+            "AlarmName":"reader-alarm","#,
+                r#""Reader":{"Type":"AWS::CloudWatch::Alarm","UpdateReplacePolicy":"Snapshot","Properties":{
+            "AlarmName":"renamed-alarm","#,
             )),
             parameters: Vec::new(),
             changes: vec![ExpectedChange {
                 action: change_action::MODIFY,
                 logical_resource_id: "Reader",
-                resource_type: "AWS::Logs::LogGroup",
+                resource_type: "AWS::CloudWatch::Alarm",
                 replacement: Some(replacement::TRUE),
                 policy_action: Some(policy_action::REPLACE_AND_SNAPSHOT),
                 scope: vec!["Properties", "UpdateReplacePolicy"],
                 details: vec![
                     detail(
                         "Properties",
-                        Some("LogGroupName"),
+                        Some("AlarmName"),
                         requires_recreation::ALWAYS,
                         evaluation::STATIC,
                         change_source::DIRECT_MODIFICATION,
@@ -440,7 +442,7 @@ fn preview_cases() -> Vec<PreviewCase> {
                 ExpectedChange {
                     action: change_action::REMOVE,
                     logical_resource_id: "Reader",
-                    resource_type: "AWS::Logs::LogGroup",
+                    resource_type: "AWS::CloudWatch::Alarm",
                     replacement: None,
                     policy_action: None,
                     scope: Vec::new(),
@@ -453,7 +455,7 @@ fn preview_cases() -> Vec<PreviewCase> {
             case: "a resource whose type changed",
             stack: "preview-retyped",
             template: Some(edited(
-                r#""Reader":{"Type":"AWS::Logs::LogGroup""#,
+                r#""Reader":{"Type":"AWS::CloudWatch::Alarm""#,
                 r#""Reader":{"Type":"AWS::SQS::Queue""#,
             )),
             parameters: Vec::new(),
@@ -461,7 +463,7 @@ fn preview_cases() -> Vec<PreviewCase> {
                 ExpectedChange {
                     action: change_action::REMOVE,
                     logical_resource_id: "Reader",
-                    resource_type: "AWS::Logs::LogGroup",
+                    resource_type: "AWS::CloudWatch::Alarm",
                     replacement: None,
                     policy_action: None,
                     scope: Vec::new(),

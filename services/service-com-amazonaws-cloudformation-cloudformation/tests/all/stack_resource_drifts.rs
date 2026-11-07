@@ -300,9 +300,9 @@ fn report_cases() -> Vec<ReportCase> {
                 "    Properties:\n",
                 "      BucketName: drifts-mixed-kept\n",
                 "  Signal:\n",
-                "    Type: AWS::Logs::LogGroup\n",
+                "    Type: AWS::CloudWatch::Alarm\n",
                 "    Properties:\n",
-                "      LogGroupName: drifts-mixed-signal\n",
+                "      AlarmName: drifts-mixed-signal\n",
             )
             .to_string(),
             tamper: Tamper::DeleteBucket("Gone"),
@@ -325,7 +325,8 @@ fn report_cases() -> Vec<ReportCase> {
                 },
             ],
             // "Resources that don't currently support drift detection aren't checked, and
-            // so not included": nothing mounted here provisions a log group.
+            // so not included": nothing here provisions a CloudWatch alarm, so no service
+            // reports a configuration for one.
             omitted: vec!["Signal"],
         },
     ]
@@ -561,8 +562,8 @@ fn filter_template() -> String {
                 "Properties": {"BucketName": "drifts-filtered-kept"}
             },
             "Signal": {
-                "Type": "AWS::Logs::LogGroup",
-                "Properties": {"LogGroupName": "drifts-filtered-signal"}
+                "Type": "AWS::CloudWatch::Alarm",
+                "Properties": {"AlarmName": "drifts-filtered-signal"}
             }
         }
     })

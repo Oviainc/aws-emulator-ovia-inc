@@ -120,6 +120,14 @@ service-com-amazonaws-cognitoidentity-awscognitoidentityservice = { workspace = 
 # its owning service mounted beside CloudFormation, or the create is refused and the stack
 # fails.
 service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
+# Amazon CloudWatch Logs, for the `AWS::Logs::LogGroup`, `AWS::Logs::LogStream` and
+# `AWS::Logs::MetricFilter` a stack really creates there
+# (`state::provisioning::logs_resources`): a suite that deploys one must have its owning
+# service mounted beside CloudFormation, or the create is refused and the stack fails.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+# AWS IoT, for the `AWS::IoT::Authorizer` a stack really creates there
+# (`state::provisioning::iot_authorizer`), for the same reason.
+service-com-amazonaws-iot-awsiotservice = { workspace = true }
 # Amazon API Gateway v2, for the `AWS::ApiGatewayV2::Api` a stack really creates there
 # (`state::provisioner`): a suite that deploys one — and grants API Gateway permission to
 # invoke a function behind it — must have its owning service mounted beside CloudFormation,

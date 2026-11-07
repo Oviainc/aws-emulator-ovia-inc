@@ -102,6 +102,19 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
     router.register_service(
         service_com_amazonaws_sfn_awsstepfunctions::EmulatedService::new(Arc::clone(&engine)),
     );
+    // Amazon CloudWatch Logs, for the `AWS::Logs::LogGroup`, `AWS::Logs::LogStream` and
+    // `AWS::Logs::MetricFilter` a stack really creates there, so a suite that deploys one
+    // reads the group, its stream and the filter on it back through that service's own wire.
+    router.register_service(
+        service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
+    );
+    // AWS IoT, for the `AWS::IoT::Authorizer` a stack really creates there, so a suite that
+    // deploys one reads the authorizer back through that service's own wire.
+    router.register_service(
+        service_com_amazonaws_iot_awsiotservice::EmulatedService::new(Arc::clone(&engine)),
+    );
     // Amazon API Gateway v2, for the `AWS::ApiGatewayV2::Api` a stack really creates there,
     // so a suite that deploys an HTTP api — and a grant that names it — reads the api back
     // through that service's own wire.

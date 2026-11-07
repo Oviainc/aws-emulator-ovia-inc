@@ -121,8 +121,12 @@ async fn the_same_stack_name_in_a_second_region_is_a_second_stack() {
             first: "eu-central-1",
             second: "ap-southeast-2",
             stack_name: "a-very-long-stack-name-for-one-template-everywhere",
+            // The log group's name carries the Region it is deployed in: the group is really
+            // created in Amazon CloudWatch Logs now
+            // (`state::provisioning::logs_resources`), and this row's subject is the stack
+            // NAME being per-Region rather than the resource name being reusable.
             template: r#"{"Resources":{"Group":{"Type":"AWS::Logs::LogGroup",
-                 "Properties":{"LogGroupName":"everywhere-group"}}},
+                 "Properties":{"LogGroupName":{"Fn::Sub":"everywhere-group-${AWS::Region}"}}}},
                  "Outputs":{"DeployedIn":{"Value":{"Ref":"AWS::Region"}}}}"#,
         },
         RegionPair {

@@ -2612,6 +2612,19 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // Amazon CloudWatch Logs `CreateLogGroup.logGroupName`: `LogGroupName`,
         // `@length(min: 1, max: 512)` (CloudWatch Logs's own Smithy model).
         "AWS::Logs::LogGroup" => rules(512, Characters::AsGenerated),
+        // The same service's `CreateLogStream.logStreamName` (`LogStreamName`) and
+        // `PutMetricFilter.filterName` (`FilterName`): each `@length(min: 1, max: 512)` with
+        // pattern `^[^:*]*$` (that same model), which a generated name is already inside —
+        // it carries neither a colon nor an asterisk — but may be longer than.
+        super::provisioning::logs_resources::LOGS_LOG_STREAM
+        | super::provisioning::logs_resources::LOGS_METRIC_FILTER => {
+            rules(512, Characters::AsGenerated)
+        }
+        // AWS IoT `CreateAuthorizer.authorizerName`: `AuthorizerName`,
+        // `@length(min: 1, max: 128)` with pattern `^[\w=,@-]+$` (AWS IoT's own Smithy
+        // model), which a generated name is already inside — letters, digits and the hyphen
+        // are all admitted — but may be longer than.
+        super::provisioning::iot_authorizer::IOT_AUTHORIZER => rules(128, Characters::AsGenerated),
         // Amazon CloudWatch `PutMetricAlarm.AlarmName`: `AlarmName`,
         // `@length(min: 1, max: 255)` (CloudWatch's own Smithy model).
         "AWS::CloudWatch::Alarm" => rules(255, Characters::AsGenerated),
@@ -3095,6 +3108,10 @@ fn declared_name_property(resource_type: &str) -> Option<&'static str> {
         // neither `ServerlessClusterName` nor `Name` finds it. (The provisioned type's own
         // `ClusterName` IS the convention, its last segment being `Cluster`.)
         MSK_SERVERLESS_CLUSTER => Some("ClusterName"),
+        // Amazon CloudWatch Logs's `PutMetricFilter` takes a `filterName` — "Ref returns the
+        // metric filter name" — so the type publishes `FilterName`; the type's last segment
+        // is `MetricFilter`, so neither `MetricFilterName` nor `Name` finds it.
+        super::provisioning::logs_resources::LOGS_METRIC_FILTER => Some("FilterName"),
         _ => None,
     }
 }

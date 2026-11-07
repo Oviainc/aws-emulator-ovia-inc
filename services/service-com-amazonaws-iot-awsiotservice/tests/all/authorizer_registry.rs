@@ -2,7 +2,7 @@
 
 //! End-to-end HTTP coverage of the AWS IoT custom-authorizer store:
 //! `CreateAuthorizer`, the `DescribeAuthorizer` reader that proves what it persisted,
-//! and `DeleteAuthorizer`.
+//! `UpdateAuthorizer` and `DeleteAuthorizer`.
 //!
 //! Every case drives the real wire path — `MultiServiceRouter::dispatch` over a
 //! restJson1 request signed for the `iot` signing name — so what is asserted is what
@@ -159,6 +159,13 @@ impl Emulator {
 
     async fn delete(&self, name: &str) -> Reply {
         self.call("DELETE", &format!("/authorizer/{name}"), None, REGION)
+            .await
+    }
+
+    /// `UpdateAuthorizer`, bound to `PUT /authorizer/{authorizerName}` by this service's
+    /// own model.
+    async fn update(&self, name: &str, body: &Value) -> Reply {
+        self.call("PUT", &format!("/authorizer/{name}"), Some(body), REGION)
             .await
     }
 }
@@ -758,4 +765,158 @@ async fn the_authorizer_store_is_bounded() {
             "case {index}: a recorded authorizer must still be readable, got {read:?}"
         );
     }
+}
+
+/// `UpdateAuthorizer` applies the members the request states to the authorizer that name
+/// holds, leaves the ones it does not state exactly as they were, and keeps the
+/// authorizer's identity — its name and the ARN its create minted.
+///
+/// The rows span what the rule generalises over: which member the update states (the
+/// function ARN, the status, the token key name, the signing public keys, the caching
+/// flag), how many it states at once, and a request that states none at all.
+#[tokio::test]
+async fn an_update_applies_the_members_it_states_and_leaves_the_rest() {
+    let emulator = Emulator::new();
+    let name = "updated_authorizer";
+    let created = json!({
+        "authorizerFunctionArn": format!("arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:first"),
+        "tokenKeyName": "token",
+        "tokenSigningPublicKeys": {"FIRST_KEY": "-----BEGIN PUBLIC KEY-----first"},
+        "status": "ACTIVE",
+        "signingDisabled": false,
+        "enableCachingForHttp": false,
+    });
+    let create = emulator.create(name, &created).await;
+    assert_eq!(
+        create.status, 200,
+        "case \"the create the updates are applied to\": expected 200, got {create:?}"
+    );
+
+    // One row of the table below: a case name, the update's body, and the members the
+    // authorizer must then report.
+    struct Row {
+        case: &'static str,
+        body: Value,
+        expected: Vec<(&'static str, Value)>,
+    }
+
+    let rows: Vec<Row> = vec![
+        Row {
+            case: "a request that states nothing: every member is left as it was",
+            body: json!({}),
+            expected: vec![
+                (
+                    "authorizerFunctionArn",
+                    json!(format!("arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:first")),
+                ),
+                ("tokenKeyName", json!("token")),
+                ("status", json!("ACTIVE")),
+                ("signingDisabled", json!(false)),
+                ("enableCachingForHttp", json!(false)),
+            ],
+        },
+        Row {
+            case: "only the status",
+            body: json!({"status": "INACTIVE"}),
+            expected: vec![
+                ("status", json!("INACTIVE")),
+                (
+                    "authorizerFunctionArn",
+                    json!(format!("arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:first")),
+                ),
+                ("tokenKeyName", json!("token")),
+            ],
+        },
+        Row {
+            case: "the function ARN and the caching flag together",
+            body: json!({
+                "authorizerFunctionArn":
+                    format!("arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:second"),
+                "enableCachingForHttp": true,
+            }),
+            expected: vec![
+                (
+                    "authorizerFunctionArn",
+                    json!(format!("arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:second")),
+                ),
+                ("enableCachingForHttp", json!(true)),
+                // Still the status the row before set, and still the first token key.
+                ("status", json!("INACTIVE")),
+                ("tokenKeyName", json!("token")),
+            ],
+        },
+        Row {
+            case: "the token key name and the signing public keys",
+            body: json!({
+                "tokenKeyName": "other-token",
+                "tokenSigningPublicKeys": {"SECOND_KEY": "-----BEGIN PUBLIC KEY-----second"},
+            }),
+            expected: vec![
+                ("tokenKeyName", json!("other-token")),
+                (
+                    "tokenSigningPublicKeys",
+                    json!({"SECOND_KEY": "-----BEGIN PUBLIC KEY-----second"}),
+                ),
+                ("enableCachingForHttp", json!(true)),
+            ],
+        },
+    ];
+
+    for Row {
+        case,
+        body,
+        expected,
+    } in rows
+    {
+        let updated = emulator.update(name, &body).await;
+        assert_eq!(
+            updated.status, 200,
+            "case {case:?}: expected HTTP 200 from UpdateAuthorizer, got {updated:?}"
+        );
+        // The authorizer keeps its identity: the update reports the name it was created
+        // under and the ARN that create minted.
+        assert_eq!(
+            updated.text("authorizerName").as_deref(),
+            Some(name),
+            "case {case:?}: expected the update to report the authorizer's name, got {updated:?}"
+        );
+        assert_eq!(
+            updated.text("authorizerArn"),
+            Some(expected_arn(REGION, name)),
+            "case {case:?}: expected the update to report the minted ARN, got {updated:?}"
+        );
+
+        let read = emulator.describe(name).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: expected the updated authorizer to be readable, got {read:?}"
+        );
+        for (member, want) in expected {
+            assert_eq!(
+                read.member(member),
+                Some(&want),
+                "case {case:?}: expected {member} to be {want}, got {read:?}"
+            );
+        }
+    }
+
+    // A name the store does not hold is the modelled not-found refusal rather than a
+    // success that recorded a new authorizer.
+    let refused = emulator.update("no_such_authorizer", &json!({"status": "ACTIVE"})).await;
+    assert_eq!(
+        refused.status, 404,
+        "case \"a name the store does not hold\": expected 404, got {refused:?}"
+    );
+    assert_eq!(
+        refused.error_code.as_deref(),
+        Some("ResourceNotFoundException"),
+        "case \"a name the store does not hold\": expected ResourceNotFoundException, got \
+         {refused:?}"
+    );
+    let read = emulator.describe("no_such_authorizer").await;
+    assert_eq!(
+        read.status, 404,
+        "case \"a name the store does not hold\": the refused update must record nothing, got \
+         {read:?}"
+    );
 }
