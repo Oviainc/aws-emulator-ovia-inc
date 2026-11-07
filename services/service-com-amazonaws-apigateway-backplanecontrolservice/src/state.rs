@@ -683,6 +683,20 @@ pub struct StageEntry {
     /// of this service REPORTS it: API Gateway's `Stage` has no member for what its cache
     /// holds.
     pub response_cache: BTreeMap<String, CachedResponse>,
+    /// The authorizer RESULTS this stage is holding, keyed by the authorizer and the value
+    /// the request carried for its identity source ([`crate::service::invoke`]); empty on a
+    /// stage no authorizer has decided a call of yet.
+    ///
+    /// `Authorizer$authorizerResultTtlInSeconds` is "the TTL in seconds of cached
+    /// authorizer results", so a result is HELD for that long and the authorizer is not
+    /// called again while it is: written by the `execute-api` data plane while serving a
+    /// request, which is the only thing that can obtain a result to hold. Bounded at
+    /// [`MAX_CACHED_AUTHORIZER_RESULTS_PER_STAGE`] entries
+    /// ([`StageEntry::cache_authorizer_result`]), and dropped before its TTL by
+    /// `FlushStageAuthorizersCache` through [`StageEntry::authorizers_cache_flushed_at`].
+    /// No operation of this service REPORTS it: API Gateway's `Stage` has no member for
+    /// what its authorizer cache holds.
+    pub authorizer_results: BTreeMap<String, CachedAuthorizerResult>,
     pub tags: BTreeMap<String, String>,
     pub created_date: Option<::aws_smithy_types::DateTime>,
     pub last_updated_date: Option<::aws_smithy_types::DateTime>,
@@ -770,6 +784,79 @@ impl StageEntry {
     pub fn flush_response_cache(&mut self) {
         self.response_cache.clear();
     }
+
+    /// The authorizer result this stage is holding under `key`, or `None` when it holds
+    /// none, the one it holds has stopped being usable, or a flush has dropped it.
+    ///
+    /// Two things end an entry, both materialised here from stored instants rather than by
+    /// a timer: its own `authorizerResultTtlInSeconds` passing, and a
+    /// `FlushStageAuthorizersCache` that ran after it was stored
+    /// ([`Self::authorizers_cache_flushed_at`] is the stage's invalidation watermark, so an
+    /// entry cached before it is no longer one the stage holds).
+    pub fn cached_authorizer_result(&self, key: &str) -> Option<&CachedAuthorizerResult> {
+        let now = ::std::time::Instant::now();
+        self.authorizer_results.get(key).filter(|held| {
+            now < held.expires_at
+                && self
+                    .authorizers_cache_flushed_at
+                    .is_none_or(|flushed_at| flushed_at <= held.cached_at)
+        })
+    }
+
+    /// Hold `result` under `key`, as a stage holds the result an authorizer returned for
+    /// one identity.
+    ///
+    /// Every entry whose TTL has passed is dropped first — nothing else reclaims them — and
+    /// a stage at its bound makes room by dropping the entry due to expire first, which is
+    /// the one that would be a miss soonest anyway. See
+    /// [`MAX_CACHED_AUTHORIZER_RESULTS_PER_STAGE`] for why there is a bound at all.
+    pub fn cache_authorizer_result(&mut self, key: String, result: CachedAuthorizerResult) {
+        let now = ::std::time::Instant::now();
+        self.authorizer_results
+            .retain(|_, held| now < held.expires_at);
+        while self.authorizer_results.len() >= MAX_CACHED_AUTHORIZER_RESULTS_PER_STAGE
+            && !self.authorizer_results.contains_key(&key)
+        {
+            let Some(dropped) = self
+                .authorizer_results
+                .iter()
+                .min_by_key(|(_, held)| held.expires_at)
+                .map(|(held_under, _)| held_under.clone())
+            else {
+                break;
+            };
+            self.authorizer_results.remove(&dropped);
+        }
+        self.authorizer_results.insert(key, result);
+    }
+}
+
+/// One result an `Authorizer` returned for one identity, as the `execute-api` data plane
+/// stored it.
+///
+/// What is held is the authorizer's OWN return value — the principal it named and the IAM
+/// policy document it returned, with the context it published — rather than the decision
+/// taken from it: the policy is what API Gateway caches ("the TTL in seconds of cached
+/// authorizer results"), and it is evaluated against each method the identity goes on to
+/// address, so one held result admits a call to one method and refuses another exactly as
+/// the document says.
+#[derive(Debug, Clone)]
+pub struct CachedAuthorizerResult {
+    /// The `principalId` the authorizer named for this identity, which the integration
+    /// reads as `$context.authorizer.principalId`.
+    pub principal_id: String,
+    /// The IAM policy document the authorizer returned, verbatim.
+    pub policy_document: String,
+    /// The `context` map the authorizer published, each entry of which the integration
+    /// reads as `$context.authorizer.{key}`.
+    pub context: BTreeMap<String, String>,
+    /// When this result was stored, which is what a later flush of the stage's authorizer
+    /// cache is compared against ([`StageEntry::cached_authorizer_result`]).
+    pub cached_at: ::std::time::Instant,
+    /// When it stops being usable: when it was stored plus the authorizer's
+    /// `authorizerResultTtlInSeconds`. A read at or after this instant is a MISS, so the
+    /// authorizer is called again.
+    pub expires_at: ::std::time::Instant,
 }
 
 /// One response a stage's cache cluster is holding for a method request, as the
@@ -2151,6 +2238,15 @@ pub const CACHE_CLUSTER_DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
 /// rather than by how many distinct requests reach it. The COUNT is the emulator's own:
 /// AWS publishes a capacity in bytes, not in entries.
 pub const MAX_CACHED_RESPONSES_PER_STAGE: usize = 512;
+
+/// How many authorizer results one stage holds at once.
+///
+/// An authorizer result is cached per identity ([`CachedAuthorizerResult`]), and a stage
+/// is reached by as many identities as its callers hold, so what the stage holds is bounded
+/// by the stage rather than by how many identities reach it: a full stage makes room for a
+/// new result by dropping one ([`StageEntry::cache_authorizer_result`]). The COUNT is the
+/// emulator's own — AWS publishes no capacity for the authorizer cache.
+pub const MAX_CACHED_AUTHORIZER_RESULTS_PER_STAGE: usize = 512;
 
 /// How long a stage's cache cluster stays `DELETE_IN_PROGRESS` after an `UpdateStage`
 /// disabled it, after which the stage reports `NOT_AVAILABLE`. API Gateway documents no

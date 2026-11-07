@@ -427,7 +427,7 @@ async fn a_template_this_emulator_does_not_render_is_a_configuration_error() {
         ),
         (
             "a context member this call carries no value for",
-            r#"{"id":"$context.requestId"}"#,
+            r#"{"who":"$context.status"}"#,
         ),
         (
             "a stage variable the stage does not define",
@@ -488,7 +488,7 @@ async fn a_request_template_this_emulator_does_not_render_is_a_configuration_err
         ("a directive", "#set($code = 200)\n{\"statusCode\": $code}"),
         (
             "a context member this call carries no value for",
-            r#"{"statusCode": 200, "id": "$context.requestId"}"#,
+            r#"{"statusCode": 200, "who": "$context.status"}"#,
         ),
     ];
     let gateway = Gateway::new();

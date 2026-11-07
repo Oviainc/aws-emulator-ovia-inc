@@ -155,22 +155,21 @@ const BASE64_MEMBER: &str = "isBase64Encoded";
 /// its headers.
 const CONTENT_TYPE_HEADER: &str = "content-type";
 
-/// The `$context` member path an authorizer's claims are published under, which the event
-/// carries as `requestContext.authorizer.claims`.
-const AUTHORIZER_CLAIMS_MEMBER: &str = "authorizer.claims";
+/// The `$context` member path an authorizer's values are published under, which the event
+/// carries as `requestContext.authorizer`.
+const AUTHORIZER_MEMBER: &str = super::custom_authorizer::AUTHORIZER_MEMBER;
+
+/// The member of it a user-pool authorizer's token claims are published under, which the
+/// event carries as `requestContext.authorizer.claims`.
+const CLAIMS_MEMBER: &str = "claims";
 
 /// The request header a proxy integration reads the caller's address off where the request
 /// reached the emulator through a forwarder; a request carrying none names no address, so
-/// the event carries none either.
-const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
+/// the event carries none either. The ONE spelling, shared with the call's own `$context`.
+const FORWARDED_FOR_HEADER: &str = super::FORWARDED_FOR_HEADER;
 
-/// The request header the caller's user agent travels in.
-const USER_AGENT_HEADER: &str = "user-agent";
-
-/// The address a request that no forwarder recorded an address for came from: this emulator
-/// is reached in process or over the loopback interface, so that is where such a request
-/// arrived from.
-const LOOPBACK_SOURCE_IP: &str = "127.0.0.1";
+/// The request header the caller's user agent travels in; see [`FORWARDED_FOR_HEADER`].
+const USER_AGENT_HEADER: &str = super::USER_AGENT_HEADER;
 
 /// The request headers the event does NOT carry over from the caller's request: the two the
 /// caller's own SigV4 CREDENTIAL travels in.
@@ -286,7 +285,10 @@ pub(super) async fn performed(
 ///
 /// `None` for a value that is not the function-invoking action's path at all, which is an
 /// integration this call cannot be performed through rather than an address guessed at.
-fn invoked_function(uri: &str) -> Option<(&str, &str)> {
+///
+/// `pub(super)` because an `Authorizer$authorizerUri` names its function in the same form,
+/// so one reading serves both ([`super::custom_authorizer`]).
+pub(super) fn invoked_function(uri: &str) -> Option<(&str, &str)> {
     // Six fields, because the SIXTH — the resource — carries the function's own ARN, whose
     // colons must stay where they are.
     let mut fields = uri.splitn(6, ':');
@@ -441,6 +443,32 @@ async fn unpermitted(
     // A call that reached no stage names no method for a grant's `aws:SourceArn` to be
     // judged against, so there is no decision to take about it.
     let source_arn = call.proxy.source_arn.as_deref()?;
+    if invocation_admitted(client, function, source_arn).await {
+        return None;
+    }
+    Some(format!(
+        "the AWS_PROXY integration's function allows {SERVICE_PRINCIPAL} no \
+         {INVOKE_FUNCTION_ACTION} for this method, so no invocation was made"
+    ))
+}
+
+/// Whether the resource policy of `function` admits an invocation API Gateway makes for
+/// `source_arn` — the ARN of the resource of this api the grant's `aws:SourceArn` narrows a
+/// permission to, which is the invoked METHOD for an integration and the AUTHORIZER itself
+/// for an authorizer's function.
+///
+/// `true` also when nothing about the function could be shown, which refuses nothing: a
+/// `uri` whose function Lambda does not answer about at all, and an emulator with no Lambda
+/// mounted, are not evidence of a missing grant. A function whose policy Lambda REPORTS as
+/// absent is an answer rather than a silence: it grants nothing.
+///
+/// `pub(super)` because an authorizer's function is admitted by the same grant, read the
+/// same way ([`super::custom_authorizer`]).
+pub(super) async fn invocation_admitted(
+    client: &::aws_sdk_lambda::Client,
+    function: &str,
+    source_arn: &str,
+) -> bool {
     // The RESOURCE a grant is taken on is the function's own ARN, whatever spelling the
     // integration's `uri` addressed it by, so it is resolved from Lambda rather than assumed
     // to be what the `uri` carried. A function Lambda answers nothing about is one this
@@ -455,10 +483,10 @@ async fn unpermitted(
         Err(error) => {
             ::tracing::warn!(
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "the proxy integration's function was not judged: nothing answered for its \
+                "the invoked function was not judged: nothing answered for its \
                  configuration"
             );
-            return None;
+            return true;
         }
     };
     let answer = client.get_policy().function_name(&resolved).send().await;
@@ -468,10 +496,10 @@ async fn unpermitted(
             if !refused_by_lambda(&error) {
                 ::tracing::warn!(
                     error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                    "the proxy integration's function was not judged: nothing answered for \
-                     its resource policy"
+                    "the invoked function was not judged: nothing answered for its \
+                     resource policy"
                 );
-                return None;
+                return true;
             }
             // A function Lambda reports no resource policy for carries none, which grants
             // nothing.
@@ -489,13 +517,7 @@ async fn unpermitted(
     let request = iam::Request::new(INVOKE_FUNCTION_ACTION, &resolved, &principals)
         .with_context(&context)
         .with_published_keys(&[SOURCE_ARN_KEY, SOURCE_ACCOUNT_KEY]);
-    if iam::resource_decision(&document, &request) == Decision::Allowed {
-        return None;
-    }
-    Some(format!(
-        "the AWS_PROXY integration's function allows {SERVICE_PRINCIPAL} no \
-         {INVOKE_FUNCTION_ACTION} for this method, so no invocation was made"
-    ))
+    iam::resource_decision(&document, &request) == Decision::Allowed
 }
 
 /// Whether `error` is LAMBDA refusing the call rather than the emulator failing to carry it.
@@ -521,7 +543,10 @@ fn refused_by_lambda<E>(
 /// The transport is the emulator's own, in process, so the call is served by the Lambda this
 /// emulator mounts and no connection is opened; the credentials are the ones the callback
 /// hands over, which sign this call and are never reported or logged.
-fn lambda_client(ctx: &OperationContext<'_>, region: &str) -> ::aws_sdk_lambda::Client {
+///
+/// `pub(super)` because an authorizer's function is invoked over the same transport
+/// ([`super::custom_authorizer`]).
+pub(super) fn lambda_client(ctx: &OperationContext<'_>, region: &str) -> ::aws_sdk_lambda::Client {
     let config = ::aws_sdk_lambda::Config::builder()
         .behavior_version(::aws_sdk_lambda::config::BehaviorVersion::latest())
         .http_client(ctx.callback().http_client())
@@ -547,15 +572,42 @@ fn lambda_client(ctx: &OperationContext<'_>, region: &str) -> ::aws_sdk_lambda::
 /// entries for is `null` rather than empty, which is the value API Gateway sends for a
 /// request carrying no query string, no path parameter and no stage variable.
 fn proxy_event(call: &MethodRequest) -> Value {
+    let mut event = described(call, event_headers(&call.proxy.multi_value_header));
+    let (body, base64_encoded) = event_body(call.inputs.payload.as_deref());
+    event.insert(BODY_MEMBER.to_string(), body);
+    event.insert(BASE64_MEMBER.to_string(), json!(base64_encoded));
+    Value::Object(event)
+}
+
+/// The event a `REQUEST` authorizer is handed: the same description of the method request,
+/// under the `type` that authorizer type names and beside the ARN of the method the call
+/// addresses.
+///
+/// It carries no body: a `REQUEST` authorizer "receives the caller's identity in a request
+/// context" (`AuthorizerType`), and that context is the request's parameters, headers and
+/// the stage's own values rather than its payload — so the one event builder serves both,
+/// and the authorizer cannot see a member a proxy integration does not report either.
+///
+/// It DOES carry every header the request sent, including the ones an integration's event
+/// withholds ([`HEADERS_WITHHELD_FROM_THE_EVENT`]): the authorizer is the api's own, its
+/// `identitySource` is "the identity source for which authorization is requested" and the
+/// `Authorization` header is the source such an authorizer is usually declared with, so
+/// withholding it would withhold the very value the authorizer is asked about.
+pub(super) fn request_authorizer_event(call: &MethodRequest, method_arn: &str) -> Value {
+    let mut event = described(call, canonical_headers(&call.proxy.multi_value_header));
+    event.insert("type".to_string(), json!("REQUEST"));
+    event.insert("methodArn".to_string(), json!(method_arn));
+    Value::Object(event)
+}
+
+/// What both events say about the method request: the resource template it matched, the path
+/// it arrived at, the verb, the `headers` given, the query string in both its forms, the
+/// path parameters, the stage's variables and the call's context.
+fn described(call: &MethodRequest, headers: BTreeMap<String, Vec<String>>) -> Map<String, Value> {
     let inputs = &call.inputs;
     let proxy = &call.proxy;
     let context = &inputs.context;
     let stage = context.get("stage").cloned().unwrap_or_default();
-    let (body, base64_encoded) = event_body(inputs.payload.as_deref());
-    // Both header maps are built from the one multi-valued reading of the request: the
-    // single-valued one carries the LAST value of each name and the other carries them all,
-    // under the names the event reports them by ([`event_headers`]).
-    let headers = event_headers(&proxy.multi_value_header);
     let mut event = Map::new();
     event.insert(
         "resource".to_string(),
@@ -588,9 +640,7 @@ fn proxy_event(call: &MethodRequest) -> Value {
         "requestContext".to_string(),
         request_context(call, &stage),
     );
-    event.insert(BODY_MEMBER.to_string(), body);
-    event.insert(BASE64_MEMBER.to_string(), json!(base64_encoded));
-    Value::Object(event)
+    event
 }
 
 /// The `requestContext` of the event: what this api, this stage and this request are, each
@@ -627,34 +677,65 @@ fn request_context(call: &MethodRequest, stage: &str) -> Value {
             reported.insert("domainPrefix".to_string(), json!(prefix));
         }
     }
-    // The request id is minted where it is reported, as every other response of this data
-    // plane reports one: `service_common` owns the minting.
-    let request_id = ::service_common::query_error_envelope::new_request_id();
+    // The request id is the one THIS call is answered under: a response of this data plane
+    // names the request it answers in its own header, and the event the function is handed
+    // names the same request, so a client correlating what it holds with what the function
+    // logged reads one value. A call that carries none (a simulated invocation, which
+    // reaches no wire) is reported under a freshly minted one, as it was before.
+    let request_id = context
+        .get("requestId")
+        .cloned()
+        .unwrap_or_else(::service_common::query_error_envelope::new_request_id);
     reported.insert("requestId".to_string(), json!(request_id.clone()));
-    reported.insert("extendedRequestId".to_string(), json!(request_id));
-    if let Some(clf) = common_log_time(now) {
-        reported.insert("requestTime".to_string(), json!(clf));
+    reported.insert(
+        "extendedRequestId".to_string(),
+        json!(context
+            .get("extendedRequestId")
+            .cloned()
+            .unwrap_or(request_id)),
+    );
+    match context.get("requestTime").cloned() {
+        Some(stated) => {
+            reported.insert("requestTime".to_string(), json!(stated));
+        }
+        None => {
+            if let Some(clf) = common_log_time(now) {
+                reported.insert("requestTime".to_string(), json!(clf));
+            }
+        }
     }
     reported.insert(
         "requestTimeEpoch".to_string(),
-        json!(epoch_millis(now)),
+        context
+            .get("requestTimeEpoch")
+            .and_then(|stated| stated.parse::<i64>().ok())
+            .map_or_else(|| json!(epoch_millis(now)), |millis| json!(millis)),
     );
     reported.insert("identity".to_string(), identity(call));
-    // The claims the method's authorizer published for this call, under the member path a
-    // proxy event carries them in; a method whose authorization publishes none adds none.
-    let claims: Map<String, Value> = context
-        .iter()
-        .filter_map(|(member, value)| {
-            member
-                .strip_prefix(&format!("{AUTHORIZER_CLAIMS_MEMBER}."))
-                .map(|claim| (claim.to_string(), json!(value)))
-        })
-        .collect();
+    // What the method's authorizer published for this call, under the member paths a proxy
+    // event carries them in: a user pool's `claims` as the object they are, and a custom
+    // authorizer's own values beside it. A method whose authorization publishes nothing adds
+    // nothing.
+    let mut authorizer = Map::new();
+    let mut claims = Map::new();
+    for (member, value) in context {
+        let Some(published) = member.strip_prefix(&format!("{AUTHORIZER_MEMBER}.")) else {
+            continue;
+        };
+        match published.strip_prefix(&format!("{CLAIMS_MEMBER}.")) {
+            Some(claim) => {
+                claims.insert(claim.to_string(), json!(value));
+            }
+            None => {
+                authorizer.insert(published.to_string(), json!(value));
+            }
+        }
+    }
     if !claims.is_empty() {
-        reported.insert(
-            "authorizer".to_string(),
-            json!({ "claims": Value::Object(claims) }),
-        );
+        authorizer.insert(CLAIMS_MEMBER.to_string(), Value::Object(claims));
+    }
+    if !authorizer.is_empty() {
+        reported.insert(AUTHORIZER_MEMBER.to_string(), Value::Object(authorizer));
     }
     Value::Object(reported)
 }
@@ -673,11 +754,12 @@ fn request_context(call: &MethodRequest, stage: &str) -> Value {
 /// arrived from somewhere.
 fn identity(call: &MethodRequest) -> Value {
     let mut reported = Map::new();
-    let address = header_of(call, FORWARDED_FOR_HEADER)
-        .and_then(|forwarded| forwarded.split(',').next().map(str::trim).map(str::to_string))
-        .filter(|address| !address.is_empty())
-        .unwrap_or_else(|| LOOPBACK_SOURCE_IP.to_string());
-    reported.insert("sourceIp".to_string(), json!(address));
+    reported.insert(
+        "sourceIp".to_string(),
+        json!(super::source_address(
+            header_of(call, FORWARDED_FOR_HEADER).as_deref()
+        )),
+    );
     if let Some(agent) = header_of(call, USER_AGENT_HEADER) {
         reported.insert("userAgent".to_string(), json!(agent));
     }
@@ -767,9 +849,14 @@ fn withheld<V: Clone>(headers: &BTreeMap<String, V>) -> BTreeMap<String, V> {
 /// the form a client writes and the form API Gateway hands the function. A function reading
 /// the event by name therefore finds the header it would find on AWS.
 fn event_headers(headers: &BTreeMap<String, Vec<String>>) -> BTreeMap<String, Vec<String>> {
-    withheld(headers)
-        .into_iter()
-        .map(|(name, values)| (canonical_header_name(&name), values))
+    canonical_headers(&withheld(headers))
+}
+
+/// `headers` under the HTTP-canonical spelling of each name; see [`event_headers`].
+fn canonical_headers(headers: &BTreeMap<String, Vec<String>>) -> BTreeMap<String, Vec<String>> {
+    headers
+        .iter()
+        .map(|(name, values)| (canonical_header_name(name), values.clone()))
         .collect()
 }
 
@@ -809,31 +896,12 @@ fn or_null(object: Value) -> Value {
     }
 }
 
-/// The instant `at` in the Common Log Format API Gateway reports `requestTime` in
-/// (`dd/Mon/yyyy:HH:mm:ss +0000`), built from the one HTTP-date rendering this tree has, so
-/// there is no second calendar here.
-fn common_log_time(at: SystemTime) -> Option<String> {
-    // The HTTP date is `Wed, 21 Oct 2015 07:28:00 GMT`: the same fields, in the same units.
-    let http_date = ::aws_smithy_types::DateTime::from(at)
-        .fmt(::aws_smithy_types::date_time::Format::HttpDate)
-        .ok()?;
-    let (_weekday, rest) = http_date.split_once(", ")?;
-    let mut fields = rest.split(' ');
-    let day = fields.next()?;
-    let month = fields.next()?;
-    let year = fields.next()?;
-    let time = fields.next()?;
-    Some(format!("{day}/{month}/{year}:{time} +0000"))
-}
-
-/// The instant `at` in milliseconds since the epoch, which is the unit `requestTimeEpoch`
-/// reports.
-fn epoch_millis(at: SystemTime) -> i64 {
-    at.duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .and_then(|since| i64::try_from(since.as_millis()).ok())
-        .unwrap_or_default()
-}
+// The instant `at` in the Common Log Format API Gateway reports `requestTime` in, and the
+// same instant in the milliseconds `requestTimeEpoch` reports: the ONE rendering of each
+// lives beside the call's own `$context`, which is built with them too
+// (`super::call_context`), so the event and a mapping template cannot report one instant two
+// ways.
+use super::{common_log_time, epoch_millis};
 
 /// The method response the function's returned document IS, or the reason it is not a
 /// well-formed proxy response.

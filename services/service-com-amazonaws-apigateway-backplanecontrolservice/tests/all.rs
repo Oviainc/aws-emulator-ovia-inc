@@ -22,6 +22,9 @@ mod documentation_part_creation;
 #[path = "all/stage_lambda_proxy_integration.rs"]
 mod stage_lambda_proxy_integration;
 // Declared here, at the head, for the reason the entry above records.
+#[path = "all/stage_custom_authorizer.rs"]
+mod stage_custom_authorizer;
+// Declared here, at the head, for the reason the entry above records.
 #[path = "all/passed_through_integration.rs"]
 mod passed_through_integration;
 // Declared here, at the head, for the reason the entry above records.

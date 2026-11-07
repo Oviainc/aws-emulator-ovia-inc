@@ -17,15 +17,19 @@
 //! ([`claims_parts`], read by `Service::can_handle`) and the serving
 //! ([`serve`], reached from the one seam the router offers before it authenticates
 //! anything). Every status it answers is computed from the control plane's own
-//! records, and the two things it WRITES are the metering a usage plan's throttle consists
+//! records, and the three things it WRITES are the metering a usage plan's throttle consists
 //! of ([`metered_refusal`]) — the rate a key's requests are admitted at cannot be computed
-//! without recording the ones already admitted — and the stage's own RESPONSE CACHE
+//! without recording the ones already admitted — the stage's own RESPONSE CACHE
 //! ([`crate::state::StageEntry::response_cache`]), for the same reason: a cached response
 //! is the response a previous request was served, held and served again ("whether
 //! responses should be cached and returned for requests",
 //! `MethodSetting$cachingEnabled`), so a method whose settings enable caching cannot
-//! answer from the cache without the serving that filled it. Nothing else about a stage,
-//! an api or a key changes because it was invoked, and neither of those two is reported by
+//! answer from the cache without the serving that filled it — and the stage's AUTHORIZER
+//! cache ([`crate::state::StageEntry::authorizer_results`]), which is that same rule again:
+//! "the TTL in seconds of cached authorizer results"
+//! (`Authorizer$authorizerResultTtlInSeconds`) is a result a previous request obtained,
+//! held and reused. Nothing else about a stage,
+//! an api or a key changes because it was invoked, and none of those three is reported by
 //! any operation of this service.
 //!
 //! A client on the machine this emulator runs on cannot reach that host at all: nothing
@@ -49,7 +53,11 @@
 //!    `{parameter}`, which beats a greedy `{proxy+}`;
 //! 4. the request's verb names a method of that resource in the deployment, or the
 //!    `ANY` catch-all;
-//! 5. the method's deployed `authorizationType` is enforced, and then the API's own
+//! 5. the method's deployed `authorizationType` is enforced — including a `CUSTOM`
+//!    authorizer, whose decision is the RETURN VALUE of the Lambda function its
+//!    `authorizerUri` names ([`custom_authorizer`]), obtained by invoking that function and
+//!    then HELD on the stage for the authorizer's own `authorizerResultTtlInSeconds` — and
+//!    then the API's own
 //!    RESOURCE POLICY is applied ([`super::resource_policy`]): `RestApi$policy` "applies to
 //!    this RestApi regardless of the caller and Method configuration", so a document the
 //!    developer attached decides every request this endpoint answers — a private API pinned
@@ -77,6 +85,18 @@
 //!    deployment reached through two stages addresses each stage's own backend — and what
 //!    it answers is what the stage's cache then holds.
 //!
+//! Every step from 4 on reads the method out of the DEPLOYMENT
+//! ([`crate::state::DeploymentEntry::resources`]), not out of the api as it now stands: "a
+//! Deployment resource is a snapshot of your REST API configuration" and a stage serves the
+//! deployment its `deploymentId` names, so an edit to a method, its integration, that
+//! integration's templates, responses or cache configuration is served only once the api is
+//! deployed again. What a deployment does NOT hold is the records a method names BY ID — its
+//! `Authorizer`, its `RequestValidator`, the `Model` a validator checks a payload against —
+//! and the api's own `policy` and `binaryMediaTypes`: `DeploymentEntry` snapshots the
+//! resource tree alone, so those are read from the api as it stands. That is a narrowing of
+//! the snapshot rule, stated here rather than hidden: editing one of them takes effect at
+//! the stage without a redeploy, where AWS would want one.
+//!
 //! A step that resolves nothing is answered the way API Gateway answers it: through the
 //! API's GATEWAY RESPONSE for the matching response type ([`GatewayRefusal`]), so a
 //! developer's `PutGatewayResponse` customization of that type — its status code and its
@@ -88,10 +108,12 @@
 //! declare for the data plane any more than it declares the endpoint itself.
 //!
 //! Whatever the outcome, the response NAMES THE REQUEST it answered: every response this
-//! endpoint serves carries a freshly minted per-request id in the header API Gateway
-//! reports it in, which is what lets a client correlate the answer it holds with what the
-//! API processed. [`serve`] is the one funnel both seams reach, so no outcome can answer
-//! without one.
+//! endpoint serves carries a per-request id in the header API Gateway reports it in, which
+//! is what lets a client correlate the answer it holds with what the API processed. The id is
+//! minted ONCE per request, by [`serve`] — the one funnel both seams reach, so no outcome can
+//! answer without one — and it is the same id the call carries as `$context.requestId` and
+//! `$context.extendedRequestId` ([`call_context`]), so a mapping template, a proxy event and
+//! the response header cannot name one request three ways.
 //!
 //! # What it does not do, and what it answers instead
 //!
@@ -219,6 +241,7 @@
 
 pub mod aws_integration;
 pub mod cognito_user_pools;
+mod custom_authorizer;
 pub mod execute_api_authorization;
 pub mod lambda_proxy;
 mod onward_endpoint;
@@ -654,11 +677,25 @@ const INTEGRATION_TIMEOUT: GatewayRefusal = GatewayRefusal {
 };
 
 /// The method is authorized by an `Authorizer` whose decision this emulator cannot
-/// obtain — the authorizer runs a Lambda function, and no deployment package runs here.
+/// obtain — the authorizer names a function this emulator cannot invoke at all.
 /// `500` `{"message":"Internal server error"}`, the same class API Gateway reports when it
 /// cannot invoke the authorizer.
 const AUTHORIZER_CONFIGURATION_ERROR: GatewayRefusal = GatewayRefusal {
     response_type: "AUTHORIZER_CONFIGURATION_ERROR",
+    message: Cow::Borrowed("Internal server error"),
+    error_type: None,
+    validation_detail: Cow::Borrowed(""),
+    message_member: MESSAGE_MEMBER,
+};
+
+/// The method's `Authorizer` RAN and produced no decision: its function errored, did not
+/// answer in time, or returned something that is not an authorizer output. `500`
+/// `{"message":"Internal server error"}` through `AUTHORIZER_FAILURE`, the gateway response
+/// type API Gateway answers an authorizer that failed with — a type of its own, so a
+/// developer's customization of it reaches a caller whose authorizer broke without also
+/// covering an api that cannot invoke one at all.
+const AUTHORIZER_FAILURE: GatewayRefusal = GatewayRefusal {
+    response_type: "AUTHORIZER_FAILURE",
     message: Cow::Borrowed("Internal server error"),
     error_type: None,
     validation_detail: Cow::Borrowed(""),
@@ -1144,8 +1181,16 @@ pub async fn serve<Eng: Send + Sync + 'static>(
     req: &RtRequest,
     ctx: &OperationContext<'_>,
 ) -> RtResponse {
-    ::service_common::query_error_envelope::with_request_id_header(
-        serve_resolved(engine, req, ctx, 0).await,
+    // Minted HERE, before anything is served, because the id names the request in TWO
+    // places: the header this response reports it in and the `$context.requestId` the
+    // call's own mapping templates and proxy event read, which a client correlates the
+    // answer it holds with what the API processed by. `service_common` owns the minting and
+    // the header, so this data plane reports the id in the one spelling the rest of the
+    // emulator reports it in.
+    let request_id = ::service_common::query_error_envelope::new_request_id();
+    ::service_common::query_error_envelope::with_stated_request_id_header(
+        serve_resolved(engine, req, ctx, 0, &request_id).await,
+        &request_id,
     )
 }
 
@@ -1157,13 +1202,17 @@ pub async fn serve<Eng: Send + Sync + 'static>(
 /// integration is served by passing the request on to this same function, so the count is
 /// what bounds a chain of them ([`MAX_PASSED_THROUGH_HOPS`]). The future is BOXED for
 /// exactly that reason: a function that awaits itself has no sized future.
+///
+/// `request_id` is the id the response this computes is reported under, which is also what
+/// the call carries as `$context.requestId`.
 fn serve_resolved<'a, 'c: 'a, Eng: Send + Sync + 'static>(
     engine: &'a Eng,
     req: &'a RtRequest,
     ctx: &'a OperationContext<'c>,
     hop: u8,
+    request_id: &'a str,
 ) -> BoxFuture<'a, RtResponse> {
-    Box::pin(async move { serving(engine, req, ctx, hop).await })
+    Box::pin(async move { serving(engine, req, ctx, hop, request_id).await })
 }
 
 /// [`serve_resolved`]'s body, written as an ordinary `async fn` so only the recursion
@@ -1173,6 +1222,7 @@ async fn serving<Eng: Send + Sync + 'static>(
     req: &RtRequest,
     ctx: &OperationContext<'_>,
     hop: u8,
+    request_id: &str,
 ) -> RtResponse {
     let Some(state) = crate::state::service_state(engine) else {
         return refusal_response(None, API_CONFIGURATION_ERROR);
@@ -1208,298 +1258,398 @@ async fn serving<Eng: Send + Sync + 'static>(
     // a caller's own records decide, so it must not hold the lock every other request to
     // this service waits on, and recording a metered request needs an exclusive lock of
     // its own.
-    let (integration, pending_body, metering, caching) = {
-        let store = state.lock();
-        let Some(resolved) = resolve(&store, &addressed) else {
-            // The api was deleted between the claim and now, or another process minted the
-            // host: an endpoint that serves no api of this account is `403 Forbidden`.
-            return refusal_response(None, FORBIDDEN);
-        };
-        let api = resolved.api;
-        if api.disable_execute_api_endpoint {
-            // `disableExecuteApiEndpoint`: "Specifies whether clients can invoke your API by
-            // using the default execute-api endpoint." Turned off, the endpoint serves nothing.
-            return refusal_response(Some(api), FORBIDDEN);
-        }
-
-        let Some((stage_name, resource_path)) = split_stage(resolved.invoke_path) else {
-            return refusal_response(Some(api), FORBIDDEN);
-        };
-        let Some(stage) = api.stages.get(stage_name) else {
-            return refusal_response(Some(api), FORBIDDEN);
-        };
-        let Some(deployment) = api.deployments.get(&stage.deployment_id) else {
-            return refusal_response(Some(api), FORBIDDEN);
-        };
-
-        // The DEPLOYMENT decides what is served: a method put on the API after the stage's
-        // deployment was created is not in it, and one deleted afterwards still is.
-        let Some(matched_path) = match_resource_path(deployment, &resource_path) else {
-            return refusal_response(Some(api), MISSING_AUTHENTICATION_TOKEN);
-        };
-        let Some((verb, snapshot)) = match_method(deployment, matched_path, req.method()) else {
-            return refusal_response(Some(api), MISSING_AUTHENTICATION_TOKEN);
-        };
-
-        let authorization_type = snapshot
-            .authorization_type
-            .as_deref()
-            .unwrap_or(AUTHORIZATION_NONE);
-        // The live method carries the integration, the authorizer and the request
-        // validator the deployed method names; `Deployment$apiSummary`'s `MethodSnapshot`
-        // models only `authorizationType` and `apiKeyRequired`, so the rest of the method
-        // is read from the API itself.
-        let live_method = api
-            .resources
-            .values()
-            .find(|resource| resource.path == matched_path)
-            .and_then(|resource| resource.methods.get(verb));
-
-        let authorizer_claims =
-            match authorization_refusal(engine, api, live_method, authorization_type, req) {
-                Ok(claims) => claims,
-                Err(refusal) => return refusal_response(Some(api), refusal),
+    //
+    // The resolution runs at most TWICE, because one step of it is a call: a method whose
+    // `CUSTOM` authorizer the stage holds no result for cannot be decided without INVOKING
+    // the authorizer's function, which is made with no lock held ([`custom_authorizer`]) and
+    // then handed back to the resolution, which decides the request with the result in hand.
+    let mut decided: Option<CustomDecision> = None;
+    let plan = loop {
+        let planned = 'planned: {
+            let store = state.lock();
+            let Some(resolved) = resolve(&store, &addressed) else {
+                // The api was deleted between the claim and now, or another process minted
+                // the host: an endpoint that serves no api of this account is `403 Forbidden`.
+                break 'planned Planned::Answered(Box::new(refusal_response(None, FORBIDDEN)));
             };
-        // The api's own RESOURCE POLICY, which "applies to this RestApi regardless of the
-        // caller and Method configuration" (`RestApi$policy`): a document the developer
-        // attached decides every request this endpoint answers, so it is applied here —
-        // before the api key, the request validator, the metering and the integration, none
-        // of which a request it refuses ever reaches. An api carrying no document is asked
-        // nothing and is served as it was before resource policies were read at all.
-        //
-        // Who the request speaks for is the METHOD's authorization, not what the request
-        // carries: API Gateway authenticates nobody for a method whose `authorizationType`
-        // is `NONE`, so such a call speaks for nobody however it is signed, while an
-        // `AWS_IAM` method speaks for the principal the credential it signed with was
-        // minted for — the session STS holds for it, which is what makes a credential an
-        // identity pool VENDED a principal this api's policies can be written about
-        // ([`execute_api_authorization`]).
-        let signing = (authorization_type == AUTHORIZATION_AWS_IAM).then(|| {
-            execute_api_authorization::signing_caller(
-                engine,
-                sigv4_access_key_id(req).unwrap_or_default().as_str(),
-                ctx.credential_store(),
-                SystemTime::now(),
-            )
-        });
-        let signed_as = signing.as_ref().map(|caller| caller.arn.clone());
-        // A credential the clock has already run out on speaks for nobody, so nothing below has
-        // a principal to decide about: it is refused here, BEFORE the api's own document is
-        // asked, rather than letting a wildcard `Principal` match a credential that names no
-        // one. (In the assembled emulator the layer that authenticates a request refuses such a
-        // credential before this plane is reached at all.)
-        if let Some(message) = signing
-            .as_ref()
-            .and_then(execute_api_authorization::expired_refusal)
-        {
-            return refusal_response(Some(api), access_denied(message));
-        }
-        // Built once, because THREE decisions are taken about this call: whether the
-        // caller's own policies let it invoke the method, whether the document the api
-        // carries does, and whether that document lets the caller ask for the stage's
-        // cached response to be reloaded.
-        let call_of = resource_policy::Call {
-            // The api's own Region, from the record: an api lives in exactly one
-            // Region, so the ARN a statement names its methods by carries the Region
-            // the api was created in, not one read off whichever endpoint this
-            // caller reached the emulator by (the path-addressed data plane reaches
-            // it at a host that spells no Region at all).
-            region: api.arn_region(),
-            api_id: &api.id,
-            stage: &stage.stage_name,
-            verb,
-            resource_path: matched_path,
-            source_vpce: resolved.source_vpce,
-            caller: match signed_as.as_deref() {
-                Some(principal) => resource_policy::Caller::Signed(principal),
-                None => resource_policy::Caller::Anonymous,
-            },
-        };
-        let attached_policy = api
-            .policy
-            .as_deref()
-            .filter(|policy| !policy.trim().is_empty());
-        if let Some(policy) = attached_policy {
-            if let Some(message) = resource_policy::denial(policy, &call_of) {
-                tracing::warn!(
-                    api_id = %api.id,
-                    stage = %stage.stage_name,
-                    path = %matched_path,
-                    verb = %verb,
-                    "the api's resource policy does not allow this invoke"
-                );
-                return refusal_response(Some(api), access_denied(message));
+            let api = resolved.api;
+            if api.disable_execute_api_endpoint {
+                // `disableExecuteApiEndpoint`: "Specifies whether clients can invoke your API
+                // by using the default execute-api endpoint." Turned off, the endpoint serves
+                // nothing.
+                break 'planned Planned::answered(refusal_response(Some(api), FORBIDDEN));
             }
-        }
-        // An `AWS_IAM` method is authorized by IAM, and that is a decision about the
-        // PRINCIPAL the verified credential speaks for: `execute-api:Invoke` on this
-        // method's own ARN, allowed by the caller's identity-based policies or by the
-        // document the api carries. Taken after the resource policy's own deny, so an
-        // explicit deny there keeps answering first.
-        if let Some(signing) = signing.as_ref() {
-            let allowed_by_policy = resource_policy::allows_invoke(attached_policy, &call_of);
-            if let Some(message) =
-                execute_api_authorization::refusal(signing, &call_of, allowed_by_policy)
+
+            let Some((stage_name, resource_path)) = split_stage(resolved.invoke_path) else {
+                break 'planned Planned::answered(refusal_response(Some(api), FORBIDDEN));
+            };
+            let Some(stage) = api.stages.get(stage_name) else {
+                break 'planned Planned::answered(refusal_response(Some(api), FORBIDDEN));
+            };
+            let Some(deployment) = api.deployments.get(&stage.deployment_id) else {
+                break 'planned Planned::answered(refusal_response(Some(api), FORBIDDEN));
+            };
+
+            // The DEPLOYMENT decides what is served: a method put on the API after the
+            // stage's deployment was created is not in it, and one deleted afterwards still
+            // is.
+            let Some(matched_path) = match_resource_path(deployment, &resource_path) else {
+                break 'planned Planned::answered(refusal_response(
+                    Some(api),
+                    MISSING_AUTHENTICATION_TOKEN,
+                ));
+            };
+            let Some((verb, snapshot)) = match_method(deployment, matched_path, req.method())
+            else {
+                break 'planned Planned::answered(refusal_response(
+                    Some(api),
+                    MISSING_AUTHENTICATION_TOKEN,
+                ));
+            };
+
+            let authorization_type = snapshot
+                .authorization_type
+                .as_deref()
+                .unwrap_or(AUTHORIZATION_NONE);
+            // The whole method is the DEPLOYMENT's own record of it, not the api's live one:
+            // "a Deployment resource is a snapshot of your REST API configuration"
+            // (`Deployment`), and a stage serves the deployment its `deploymentId` names, so
+            // the integration this call is served through — its templates, its responses, its
+            // cache configuration, the authorizer and the request validator it names — is the
+            // one that stood when the deployment was created
+            // ([`crate::state::DeploymentEntry::resources`] holds that tree). An edit made
+            // after it is not served until the api is redeployed, which is what makes a stage
+            // serve one configuration while the developer changes another.
+            // `Deployment$apiSummary`'s `MethodSnapshot` cannot stand in for it: it models
+            // only `authorizationType` and `apiKeyRequired`.
+            let deployed_resource = deployment
+                .resources
+                .values()
+                .find(|resource| resource.path == matched_path);
+            let deployed_method =
+                deployed_resource.and_then(|resource| resource.methods.get(verb));
+
+            // Who the request speaks for is the METHOD's authorization, not what the request
+            // carries: API Gateway authenticates nobody for a method whose
+            // `authorizationType` is `NONE`, so such a call speaks for nobody however it is
+            // signed, while an `AWS_IAM` method speaks for the principal the credential it
+            // signed with was minted for — the session STS holds for it, which is what makes
+            // a credential an identity pool VENDED a principal this api's policies can be
+            // written about ([`execute_api_authorization`]).
+            let signing = (authorization_type == AUTHORIZATION_AWS_IAM).then(|| {
+                execute_api_authorization::signing_caller(
+                    engine,
+                    sigv4_access_key_id(req).unwrap_or_default().as_str(),
+                    ctx.credential_store(),
+                    SystemTime::now(),
+                )
+            });
+            let signed_as = signing.as_ref().map(|caller| caller.arn.clone());
+            // A credential the clock has already run out on speaks for nobody, so nothing
+            // below has a principal to decide about: it is refused here, BEFORE the api's own
+            // document is asked, rather than letting a wildcard `Principal` match a
+            // credential that names no one. (In the assembled emulator the layer that
+            // authenticates a request refuses such a credential before this plane is reached
+            // at all.)
+            if let Some(message) = signing
+                .as_ref()
+                .and_then(execute_api_authorization::expired_refusal)
             {
-                tracing::warn!(
-                    api_id = %api.id,
-                    stage = %stage.stage_name,
-                    path = %matched_path,
-                    verb = %verb,
-                    "the caller is not authorized to invoke this method"
-                );
-                return refusal_response(Some(api), access_denied(message));
+                break 'planned Planned::answered(refusal_response(
+                    Some(api),
+                    access_denied(message),
+                ));
             }
-        }
-        // A key-required method is admitted by the key the records associate with this
-        // stage, and the association is also what says which usage plans METER the call.
-        let admission = if snapshot.api_key_required {
-            match api_key_admission(&store, api, &stage.stage_name, req) {
-                Some(admission) => Some(admission),
-                None => return refusal_response(Some(api), INVALID_API_KEY),
-            }
-        } else {
-            // A method that requires no key presents the records no key to meter: a usage
-            // plan is what "specify[ies] who can access associated API stages", so it
-            // meters the calls it admits.
-            None
-        };
+            // Built once, because FOUR decisions are taken about this call: what the method's
+            // own authorizer says about the method it addressed, whether the caller's own
+            // policies let it invoke that method, whether the document the api carries does,
+            // and whether that document lets the caller ask for the stage's cached response
+            // to be reloaded.
+            let call_of = resource_policy::Call {
+                // The api's own Region, from the record: an api lives in exactly one
+                // Region, so the ARN a statement names its methods by carries the Region
+                // the api was created in, not one read off whichever endpoint this
+                // caller reached the emulator by (the path-addressed data plane reaches
+                // it at a host that spells no Region at all).
+                region: api.arn_region(),
+                api_id: &api.id,
+                stage: &stage.stage_name,
+                verb,
+                resource_path: matched_path,
+                source_vpce: resolved.source_vpce,
+                caller: match signed_as.as_deref() {
+                    Some(principal) => resource_policy::Caller::Signed(principal),
+                    None => resource_policy::Caller::Anonymous,
+                },
+            };
+            let method_arn = call_of.method_arn();
 
-        let call = MethodRequest::of_request(
-            req,
-            // What a mapping template of this call renders against: the method request as
-            // it arrived, the path parameters the matched resource template binds, and the
-            // STAGE's own variables and identity.
-            TemplateInputs {
-                payload: req.body().bytes().map(<[u8]>::to_vec),
-                path: matched_path_parameters(matched_path, &resource_path),
-                querystring: sent_query_parameters(query_of(req.uri())),
-                header: sent_headers(req),
-                stage_variables: stage.variables.clone(),
-                context: call_context(
-                    &api.id,
-                    &stage.stage_name,
-                    verb,
-                    matched_path,
-                    req.uri(),
-                    &authorizer_claims,
-                ),
-            },
-            // What a PROXY integration's event names this call by, which a template has no
-            // reference for: the request as the CLIENT sent it (its own verb, every value a
-            // repeated parameter or header carries, the endpoint it arrived on) and the
-            // records it resolved to — the `Resource` whose path matched, and the ARN of the
-            // method a grant to API Gateway is narrowed by.
-            lambda_proxy::ProxyInputs {
-                resource_id: api
-                    .resources
-                    .values()
-                    .find(|resource| resource.path == matched_path)
-                    .map(|resource| resource.id.clone())
-                    .unwrap_or_default(),
-                http_method: req.method().to_ascii_uppercase(),
-                request_path: resource_path.clone(),
-                domain_name: request_host_of(req).unwrap_or_default(),
-                multi_value_querystring: every_query_parameter(query_of(req.uri())),
-                multi_value_header: every_header(req),
-                source_arn: Some(call_of.method_arn()),
-                // What the api declares BINARY, which decides whether a base64 body the
-                // function returns reaches the client as the bytes it names or as the
-                // base64 text it is ([`lambda_proxy`]).
-                binary_media_types: api.binary_media_types.clone(),
-            },
-        );
-        // The method's own request validator, before the integration is reached: a
-        // request the method declares invalid never gets to the backend. The PARAMETERS
-        // half is decided here, from the request's own query string and headers; the BODY
-        // half is prepared here and decided below, off the lock.
-        if let Some(refusal) = parameters_refusal(api, live_method, req) {
-            return refusal_response(Some(api), refusal);
-        }
-        let pending_body = pending_body_check(api, live_method, &call);
+            let mut call = MethodRequest::of_request(
+                req,
+                // What a mapping template of this call renders against: the method request as
+                // it arrived, the path parameters the matched resource template binds, and
+                // the STAGE's own variables and identity.
+                TemplateInputs {
+                    payload: req.body().bytes().map(<[u8]>::to_vec),
+                    path: matched_path_parameters(matched_path, &resource_path),
+                    querystring: sent_query_parameters(query_of(req.uri())),
+                    header: sent_headers(req),
+                    stage_variables: stage.variables.clone(),
+                    context: call_context(
+                        &api.id,
+                        &stage.stage_name,
+                        verb,
+                        matched_path,
+                        req,
+                        request_id,
+                        SystemTime::now(),
+                    ),
+                },
+                // What a PROXY integration's event names this call by, which a template has
+                // no reference for: the request as the CLIENT sent it (its own verb, every
+                // value a repeated parameter or header carries, the endpoint it arrived on)
+                // and the records it resolved to — the `Resource` whose path matched, and the
+                // ARN of the method a grant to API Gateway is narrowed by.
+                lambda_proxy::ProxyInputs {
+                    resource_id: deployed_resource
+                        .map(|resource| resource.id.clone())
+                        .unwrap_or_default(),
+                    http_method: req.method().to_ascii_uppercase(),
+                    request_path: resource_path.clone(),
+                    domain_name: request_host_of(req).unwrap_or_default(),
+                    multi_value_querystring: every_query_parameter(query_of(req.uri())),
+                    multi_value_header: every_header(req),
+                    source_arn: Some(method_arn.clone()),
+                    // What the api declares BINARY, which decides whether a base64 body the
+                    // function returns reaches the client as the bytes it names or as the
+                    // base64 text it is ([`lambda_proxy`]).
+                    binary_media_types: api.binary_media_types.clone(),
+                },
+            );
 
-        // The STAGE's own cache, which answers this call instead of its integration when
-        // the cluster holds an entry for it: WHICH entry, for how long, and what became of
-        // a cache-control header asking for it to be reloaded are all the stage's own
-        // settings ([`cache_plan`]). The lookup itself happens below, once the request has
-        // got past everything the method declares about it.
-        let caching = match cache_plan(
-            stage,
-            live_method.and_then(|method| method.integration.as_ref()),
-            &resource_path,
-            req,
-            attached_policy,
-            &call_of,
-        ) {
-            Caching::Off => None,
-            Caching::On(plan) => Some(plan),
-            // The stage requires authorization for a cache-control header, this caller
-            // holds none and the stage's strategy is to fail such a request: answered
-            // through `ACCESS_DENIED`, carrying the sentence for the action it asked for.
-            Caching::Refused(message) => {
-                tracing::warn!(
-                    api_id = %api.id,
-                    stage = %stage.stage_name,
-                    path = %matched_path,
-                    verb = %verb,
-                    "the caller is not authorized to invalidate this stage's cached response"
-                );
-                return refusal_response(Some(api), access_denied(message));
-            }
-        };
+            // What the METHOD's own authorization makes of the call. A `CUSTOM` authorizer
+            // the stage holds no result for stops the resolution here: its function has to
+            // be asked, which happens off this lock.
+            let published = match authorization_refusal(
+                engine,
+                api,
+                deployed_method,
+                authorization_type,
+                req,
+                CustomAuthorization {
+                    stage,
+                    method_arn: &method_arn,
+                    call: &call,
+                    decided: decided.as_ref(),
+                },
+            ) {
+                Authorized::Published(published) => published,
+                Authorized::Refused(refusal) => {
+                    break 'planned Planned::answered(refusal_response(Some(api), refusal))
+                }
+                Authorized::Pending(pending) => {
+                    // Asked once per request: a second pass that still has no result is an
+                    // authorizer this call cannot obtain a decision from at all.
+                    if decided.is_some() {
+                        break 'planned Planned::answered(refusal_response(
+                            Some(api),
+                            AUTHORIZER_FAILURE,
+                        ));
+                    }
+                    break 'planned Planned::Pending(pending);
+                }
+            };
+            // What the authorization published is part of the call: a mapping template reads
+            // a user pool's claims and a custom authorizer's own values off `$context`.
+            call.inputs.context.extend(published);
 
-        // The integration is what answers, and it is READ here and PERFORMED below, after
-        // the payload check: the step list this module opens with has the request validator
-        // ahead of the integration, so a payload the method's model does not admit is
-        // refused with the integration never performed at all. Performing it is the half
-        // this module shares with `TestInvokeMethod`, so the SAME records decide a
-        // simulated invocation and a real one.
-        // The STAGE's own variables are part of what the integration addresses: a
-        // reference to one in its configuration resolves against the stage this call
-        // arrived at, so one deployment reached through two stages addresses each stage's
-        // own backend ([`with_stage_variables`]).
-        let performed_method = match live_method {
-            Some(method) => match with_stage_variables(method, &stage.variables) {
-                Ok(resolved) => Some(resolved),
-                Err(unserved) => {
+            // The api's own RESOURCE POLICY, which "applies to this RestApi regardless of the
+            // caller and Method configuration" (`RestApi$policy`): a document the developer
+            // attached decides every request this endpoint answers, so it is applied here —
+            // before the api key, the request validator, the metering and the integration,
+            // none of which a request it refuses ever reaches. An api carrying no document is
+            // asked nothing and is served as it was before resource policies were read at
+            // all.
+            let attached_policy = api
+                .policy
+                .as_deref()
+                .filter(|policy| !policy.trim().is_empty());
+            if let Some(policy) = attached_policy {
+                if let Some(message) = resource_policy::denial(policy, &call_of) {
                     tracing::warn!(
                         api_id = %api.id,
                         stage = %stage.stage_name,
                         path = %matched_path,
                         verb = %verb,
-                        reason = %unserved.reason,
-                        "the stage cannot serve this call through the method's integration"
+                        "the api's resource policy does not allow this invoke"
                     );
-                    return refusal_response(Some(api), unserved.refusal);
+                    break 'planned Planned::answered(refusal_response(
+                        Some(api),
+                        access_denied(message),
+                    ));
                 }
-            },
-            None => None,
+            }
+            // An `AWS_IAM` method is authorized by IAM, and that is a decision about the
+            // PRINCIPAL the verified credential speaks for: `execute-api:Invoke` on this
+            // method's own ARN, allowed by the caller's identity-based policies or by the
+            // document the api carries. Taken after the resource policy's own deny, so an
+            // explicit deny there keeps answering first.
+            if let Some(signing) = signing.as_ref() {
+                let allowed_by_policy = resource_policy::allows_invoke(attached_policy, &call_of);
+                if let Some(message) =
+                    execute_api_authorization::refusal(signing, &call_of, allowed_by_policy)
+                {
+                    tracing::warn!(
+                        api_id = %api.id,
+                        stage = %stage.stage_name,
+                        path = %matched_path,
+                        verb = %verb,
+                        "the caller is not authorized to invoke this method"
+                    );
+                    break 'planned Planned::answered(refusal_response(
+                        Some(api),
+                        access_denied(message),
+                    ));
+                }
+            }
+            // A key-required method is admitted by the key the records associate with this
+            // stage, and the association is also what says which usage plans METER the call.
+            let admission = if snapshot.api_key_required {
+                match api_key_admission(&store, api, &stage.stage_name, req) {
+                    Some(admission) => Some(admission),
+                    None => {
+                        break 'planned Planned::answered(refusal_response(
+                            Some(api),
+                            INVALID_API_KEY,
+                        ))
+                    }
+                }
+            } else {
+                // A method that requires no key presents the records no key to meter: a usage
+                // plan is what "specify[ies] who can access associated API stages", so it
+                // meters the calls it admits.
+                None
+            };
+
+            // The method's own request validator, before the integration is reached: a
+            // request the method declares invalid never gets to the backend. The PARAMETERS
+            // half is decided here, from the request's own query string and headers; the BODY
+            // half is prepared here and decided below, off the lock.
+            if let Some(refusal) = parameters_refusal(api, deployed_method, req) {
+                break 'planned Planned::answered(refusal_response(Some(api), refusal));
+            }
+            let pending_body = pending_body_check(api, deployed_method, &call);
+
+            // The STAGE's own cache, which answers this call instead of its integration when
+            // the cluster holds an entry for it: WHICH entry, for how long, and what became
+            // of a cache-control header asking for it to be reloaded are all the stage's own
+            // settings ([`cache_plan`]). The lookup itself happens below, once the request
+            // has got past everything the method declares about it.
+            let caching = match cache_plan(
+                stage,
+                deployed_method.and_then(|method| method.integration.as_ref()),
+                &resource_path,
+                req,
+                attached_policy,
+                &call_of,
+            ) {
+                Caching::Off => None,
+                Caching::On(plan) => Some(plan),
+                // The stage requires authorization for a cache-control header, this caller
+                // holds none and the stage's strategy is to fail such a request: answered
+                // through `ACCESS_DENIED`, carrying the sentence for the action it asked for.
+                Caching::Refused(message) => {
+                    tracing::warn!(
+                        api_id = %api.id,
+                        stage = %stage.stage_name,
+                        path = %matched_path,
+                        verb = %verb,
+                        "the caller is not authorized to invalidate this stage's cached response"
+                    );
+                    break 'planned Planned::answered(refusal_response(
+                        Some(api),
+                        access_denied(message),
+                    ));
+                }
+            };
+
+            // The integration is what answers, and it is READ here and PERFORMED below, after
+            // the payload check: the step list this module opens with has the request
+            // validator ahead of the integration, so a payload the method's model does not
+            // admit is refused with the integration never performed at all. Performing it is
+            // the half this module shares with `TestInvokeMethod`, so the SAME records decide
+            // a simulated invocation and a real one.
+            // The STAGE's own variables are part of what the integration addresses: a
+            // reference to one in its configuration resolves against the stage this call
+            // arrived at, so one deployment reached through two stages addresses each stage's
+            // own backend ([`with_stage_variables`]).
+            let performed_method = match deployed_method {
+                Some(method) => match with_stage_variables(method, &stage.variables) {
+                    Ok(resolved) => Some(resolved),
+                    Err(unserved) => {
+                        tracing::warn!(
+                            api_id = %api.id,
+                            stage = %stage.stage_name,
+                            path = %matched_path,
+                            verb = %verb,
+                            reason = %unserved.reason,
+                            "the stage cannot serve this call through the method's integration"
+                        );
+                        break 'planned Planned::answered(refusal_response(
+                            Some(api),
+                            unserved.refusal,
+                        ));
+                    }
+                },
+                None => None,
+            };
+            let integration = ResolvedIntegration {
+                api_id: api.id.clone(),
+                stage: stage.stage_name.clone(),
+                path: matched_path.to_string(),
+                verb: verb.to_string(),
+                region: api.arn_region().to_string(),
+                // The private connection a passed-through integration is carried over is this
+                // service's own record, so it is resolved here, under the one lock that read
+                // the integration itself — off the configuration the stage's variables have
+                // already been resolved into, so a `connectionId` that named one names the
+                // link that variable's value names.
+                unusable_connection: performed_method
+                    .as_ref()
+                    .and_then(|method| method.integration.as_ref())
+                    .and_then(|integration| unusable_vpc_link(&store, integration)),
+                method: performed_method,
+                call,
+            };
+            // The 429 this call earns if the plans metering it have no request left for it,
+            // rendered now because it is rendered from the api's own gateway responses.
+            let metering = admission
+                .filter(|admission| !admission.throttled_plans.is_empty())
+                .map(|admission| (admission, refusal_response(Some(api), THROTTLED)));
+            Planned::Ready(Box::new(Plan {
+                integration,
+                pending_body,
+                metering,
+                caching,
+            }))
         };
-        let integration = ResolvedIntegration {
-            api_id: api.id.clone(),
-            stage: stage.stage_name.clone(),
-            path: matched_path.to_string(),
-            verb: verb.to_string(),
-            region: api.arn_region().to_string(),
-            // The private connection a passed-through integration is carried over is this
-            // service's own record, so it is resolved here, under the one lock that read
-            // the integration itself — off the configuration the stage's variables have
-            // already been resolved into, so a `connectionId` that named one names the
-            // link that variable's value names.
-            unusable_connection: performed_method
-                .as_ref()
-                .and_then(|method| method.integration.as_ref())
-                .and_then(|integration| unusable_vpc_link(&store, integration)),
-            method: performed_method,
-            call,
-        };
-        // The 429 this call earns if the plans metering it have no request left for it,
-        // rendered now because it is rendered from the api's own gateway responses.
-        let metering = admission
-            .filter(|admission| !admission.throttled_plans.is_empty())
-            .map(|admission| (admission, refusal_response(Some(api), THROTTLED)));
-        (integration, pending_body, metering, caching)
+        match planned {
+            Planned::Answered(response) => return *response,
+            // The authorizer is asked with NO lock held, and what it returned is handed back
+            // to the resolution above — which then decides this request, and every later one
+            // the stage serves from the result it now holds.
+            Planned::Pending(pending) => {
+                decided = Some(obtained_decision(ctx, &state, *pending).await);
+            }
+            Planned::Ready(plan) => break *plan,
+        }
     };
+    let Plan {
+        integration,
+        pending_body,
+        metering,
+        caching,
+    } = plan;
 
     // The usage plan METERS the call before its payload is checked, as API Gateway's
     // method-request flow does: a request the plan sheds is answered 429 whatever its
@@ -1587,7 +1737,12 @@ async fn serving<Eng: Send + Sync + 'static>(
         }
         match passed_on {
             PassedThrough::Unserved(unserved) => return refuse(unserved),
-            PassedThrough::Request(onward) => serve_resolved(engine, &onward, ctx, hop + 1).await,
+            PassedThrough::Request(onward) => {
+                // The onward request is a request of its own at another endpoint, so it is
+                // answered under its own id, as AWS names each request it processes by one.
+                let onward_id = ::service_common::query_error_envelope::new_request_id();
+                serve_resolved(engine, &onward, ctx, hop + 1, &onward_id).await
+            }
             // Another endpoint of this emulator: the request crosses the in-process
             // transport, and what the service claiming that endpoint answered IS the
             // method response.
@@ -1627,6 +1782,83 @@ async fn serving<Eng: Send + Sync + 'static>(
         }
     }
     warned(served, caching.is_some_and(|plan| plan.warn))
+}
+
+/// What the request's own records make of it: how a pass of [`serving`]'s resolution ends.
+#[derive(Debug)]
+enum Planned {
+    /// The records answered the request outright — a refusal, or a response served from
+    /// them. Boxed: a whole response is far larger than the other variants.
+    Answered(Box<RtResponse>),
+    /// The resolution needs a `CUSTOM` authorizer's decision, which is a CALL: this is what
+    /// making it needs, and the resolution runs again with what it returned.
+    Pending(Box<custom_authorizer::Pending>),
+    /// The request got past everything the method declares about it: this is what serving it
+    /// then needs.
+    Ready(Box<Plan>),
+}
+
+impl Planned {
+    /// [`Planned::Answered`] for a response built in place.
+    fn answered(response: RtResponse) -> Self {
+        Self::Answered(Box::new(response))
+    }
+}
+
+/// What a resolved request needs to be SERVED, read under one shared read of the store and
+/// used with no lock held.
+#[derive(Debug)]
+struct Plan {
+    /// The integration that is to answer, with the call it answers.
+    integration: ResolvedIntegration,
+    /// What validating the payload against the method's model needs, when the method
+    /// declares a validator that checks it.
+    pending_body: Option<PendingBodyCheck>,
+    /// The metering this call is subject to, and the `429` it earns when the plans metering
+    /// it have no request left for it.
+    metering: Option<(Metered, RtResponse)>,
+    /// How the stage's cache serves this call, when the method's settings cache it.
+    caching: Option<CachePlan>,
+}
+
+/// Ask the `CUSTOM` authorizer `pending` names, and HOLD what it returned on the stage for
+/// as long as the authorizer's own TTL says.
+///
+/// Made with NO lock held, which is why it is a step of its own: the invocation crosses the
+/// in-process transport into Lambda, and nothing else about this service may wait on that.
+/// The result is held because that is what `authorizerResultTtlInSeconds` means — the next
+/// request presenting the same identity is decided from it, with the function not invoked
+/// again — and an authorizer that caches nothing (a TTL of zero) holds nothing.
+async fn obtained_decision(
+    ctx: &OperationContext<'_>,
+    state: &::engine::ServiceState<crate::state::ComAmazonawsApigatewayBackplanecontrolserviceState>,
+    pending: custom_authorizer::Pending,
+) -> CustomDecision {
+    match custom_authorizer::obtained(ctx, &pending).await {
+        custom_authorizer::Obtained::Returned(result) => {
+            if let Some(key) = pending.cache_key.clone() {
+                let mut store = state.lock();
+                if let Some(stage) = store
+                    .rest_apis
+                    .get_mut(&pending.api_id)
+                    .and_then(|api| api.stages.get_mut(&pending.stage))
+                {
+                    stage.cache_authorizer_result(key, result.clone());
+                }
+            }
+            CustomDecision::Returned(result)
+        }
+        custom_authorizer::Obtained::Unobtained { refusal, reason } => {
+            tracing::warn!(
+                api_id = %pending.api_id,
+                stage = %pending.stage,
+                authorizer = %pending.authorizer_name,
+                %reason,
+                "the method's authorizer produced no decision for this call"
+            );
+            CustomDecision::Unobtained(refusal)
+        }
+    }
 }
 
 /// What the WAFv2 web ACL in front of the addressed stage made of the request.
@@ -2225,8 +2457,10 @@ fn warned(mut response: RtResponse, warn: bool) -> RtResponse {
 ///   `authorizationScopes` — all of which are records this emulator holds
 ///   ([`cognito_user_pools`]) — and the claims of an accepted token are what the
 ///   integration sees as `$context.authorizer.claims`;
-/// * `CUSTOM` is a Lambda function's return value, which no deployment package produces here,
-///   so it is answered through `AUTHORIZER_CONFIGURATION_ERROR` rather than guessed at.
+/// * `CUSTOM` is a Lambda function's RETURN VALUE ([`custom_authorizer`]): the result the
+///   stage is already holding for this identity decides the call, and otherwise the function
+///   has to be asked — which is a call this cannot make, so it answers
+///   [`Authorized::Pending`] and [`serving`] asks before deciding.
 ///
 /// The api's own RESOURCE policy is a separate decision, taken on every request whatever the
 /// authorization type — [`super::resource_policy`], applied by [`serving`] straight after
@@ -2237,20 +2471,21 @@ fn authorization_refusal<Eng: Send + Sync + 'static>(
     method: Option<&MethodEntry>,
     authorization_type: &str,
     req: &RtRequest,
-) -> Result<BTreeMap<String, String>, GatewayRefusal> {
+    custom: CustomAuthorization<'_>,
+) -> Authorized {
     if authorization_type == AUTHORIZATION_NONE {
-        return Ok(BTreeMap::new());
+        return Authorized::Published(BTreeMap::new());
     }
     if authorization_type == AUTHORIZATION_AWS_IAM {
         return if carries_sigv4_credential(req) {
-            Ok(BTreeMap::new())
+            Authorized::Published(BTreeMap::new())
         } else {
-            Err(MISSING_AUTHENTICATION_TOKEN)
+            Authorized::Refused(MISSING_AUTHENTICATION_TOKEN)
         };
     }
     if !AUTHORIZATION_BY_AUTHORIZER.contains(&authorization_type) {
         // A value outside the documented set is a method this emulator cannot authorize.
-        return Err(API_CONFIGURATION_ERROR);
+        return Authorized::Refused(API_CONFIGURATION_ERROR);
     }
     // A method whose `authorizerId` names no authorizer of this API cannot authorize the
     // call at all, which is a configuration the stage cannot serve.
@@ -2258,12 +2493,13 @@ fn authorization_refusal<Eng: Send + Sync + 'static>(
         .and_then(|method| method.authorizer_id.as_deref())
         .and_then(|id| api.authorizers.get(id))
     else {
-        return Err(API_CONFIGURATION_ERROR);
+        return Authorized::Refused(API_CONFIGURATION_ERROR);
     };
     // The value the authorizer EXTRACTS from the request, which is what it then evaluates:
     // the first identity source that names a part of the request, in the order the authorizer
-    // declares them.
+    // declares them, with every one of them keying the result the stage holds.
     let mut presented: Option<String> = None;
+    let mut identity_values: Vec<String> = Vec::new();
     for source in authorizer
         .identity_source
         .as_deref()
@@ -2282,8 +2518,9 @@ fn authorization_refusal<Eng: Send + Sync + 'static>(
                 .get(header.to_ascii_lowercase())
                 .filter(|value| !value.is_empty())
             else {
-                return Err(UNAUTHORIZED);
+                return Authorized::Refused(UNAUTHORIZED);
             };
+            identity_values.push(value.to_string());
             presented.get_or_insert_with(|| value.to_string());
             continue;
         }
@@ -2294,8 +2531,9 @@ fn authorization_refusal<Eng: Send + Sync + 'static>(
                     .map(|(_, value)| value.to_string())
             });
             let Some(value) = carried else {
-                return Err(UNAUTHORIZED);
+                return Authorized::Refused(UNAUTHORIZED);
             };
+            identity_values.push(value.clone());
             presented.get_or_insert(value);
         }
     }
@@ -2305,7 +2543,7 @@ fn authorization_refusal<Eng: Send + Sync + 'static>(
         // No value extracted at all is an authorizer that was not called: the identity source
         // it declares is one this emulator could not read, or it declares none.
         let Some(presented) = presented else {
-            return Err(UNAUTHORIZED);
+            return Authorized::Refused(UNAUTHORIZED);
         };
         return match cognito_user_pools::evaluate(
             engine,
@@ -2318,7 +2556,15 @@ fn authorization_refusal<Eng: Send + Sync + 'static>(
             &presented,
             SystemTime::now(),
         ) {
-            cognito_user_pools::Decision::Authorized(authorized) => Ok(authorized.claims),
+            // The claims of an accepted token, each under the `$context` member path a
+            // mapping template reads one by.
+            cognito_user_pools::Decision::Authorized(authorized) => Authorized::Published(
+                authorized
+                    .claims
+                    .into_iter()
+                    .map(|(claim, value)| (format!("{AUTHORIZER_CLAIMS_MEMBER}.{claim}"), value))
+                    .collect(),
+            ),
             cognito_user_pools::Decision::Unauthorized(reason) => {
                 tracing::warn!(
                     authorizer = %authorizer.name,
@@ -2326,16 +2572,155 @@ fn authorization_refusal<Eng: Send + Sync + 'static>(
                     "refusing an invoke: the user-pool authorizer does not accept the presented \
                      token"
                 );
-                Err(UNAUTHORIZED)
+                Authorized::Refused(UNAUTHORIZED)
             }
         };
     }
-    tracing::warn!(
-        authorizer = %authorizer.name,
-        kind = %authorizer.r#type,
-        "the authorizer's decision cannot be obtained: this emulator runs no authorizer code"
-    );
-    Err(AUTHORIZER_CONFIGURATION_ERROR)
+    // A `CUSTOM` authorizer of either Lambda type: the decision is its function's return
+    // value. A `TOKEN` authorizer carries no request beyond its token, so a call presenting
+    // none was not authorized at all; a `REQUEST` authorizer declaring no identity source is
+    // called for every request, which is what makes its caching turn off
+    // (`crate::ops::create_authorizer` holds that rule).
+    let token = authorizer.r#type == crate::ops::create_authorizer::AUTHORIZER_TYPE_TOKEN;
+    if token && presented.is_none() {
+        return Authorized::Refused(UNAUTHORIZED);
+    }
+    // Where this stage holds a result for this identity, which is both where one is looked
+    // for and where the one the caller obtains is stored.
+    let cache_key = authorizer_cache_key(authorizer, &identity_values);
+    // What the authorizer returned for THIS identity, from the stage or from the invocation
+    // the caller has just made on this module's behalf.
+    let held = match custom.decided {
+        Some(CustomDecision::Returned(held)) => Cow::Borrowed(held),
+        // The function was asked and produced no result: the request is answered through the
+        // gateway response that outcome earns, never by guessing at a decision.
+        Some(CustomDecision::Unobtained(refusal)) => return Authorized::Refused(refusal.clone()),
+        None => match cache_key
+            .as_deref()
+            .and_then(|key| custom.stage.cached_authorizer_result(key))
+        {
+            Some(held) => Cow::Borrowed(held),
+            // Nothing held for this identity: the function has to be asked, which the caller
+            // does off the store lock before deciding this request.
+            None => {
+                let event = if token {
+                    custom_authorizer::token_event(
+                        presented.as_deref().unwrap_or_default(),
+                        custom.method_arn,
+                    )
+                } else {
+                    lambda_proxy::request_authorizer_event(custom.call, custom.method_arn)
+                };
+                return Authorized::Pending(Box::new(custom_authorizer::Pending {
+                    api_id: api.id.clone(),
+                    stage: custom.stage.stage_name.clone(),
+                    region: api.arn_region().to_string(),
+                    authorizer_name: authorizer.name.clone(),
+                    authorizer_uri: authorizer.authorizer_uri.clone().unwrap_or_default(),
+                    authorizer_arn: authorizer_arn(api, &authorizer.id),
+                    event,
+                    cache_key,
+                    ttl: authorizer_result_ttl(authorizer),
+                }));
+            }
+        },
+    };
+    match custom_authorizer::decided(&held, custom.method_arn) {
+        custom_authorizer::Judged::Published(published) => Authorized::Published(published),
+        custom_authorizer::Judged::Refused(sentence) => {
+            tracing::warn!(
+                authorizer = %authorizer.name,
+                kind = %authorizer.r#type,
+                "refusing an invoke: the authorizer's policy does not allow this method"
+            );
+            Authorized::Refused(access_denied(sentence.to_string()))
+        }
+    }
+}
+
+/// What a `CUSTOM` authorizer's decision needs that the authorization step cannot read off
+/// the method alone: where a held result lives, what the call is, and what has already been
+/// obtained for it.
+#[derive(Debug)]
+struct CustomAuthorization<'a> {
+    /// The stage the request reached, which is what HOLDS an authorizer result.
+    stage: &'a StageEntry,
+    /// The ARN of the method the request addressed, which the returned policy is evaluated
+    /// against and which the authorizer's event names.
+    method_arn: &'a str,
+    /// The call, for the event a `REQUEST` authorizer is handed.
+    call: &'a MethodRequest,
+    /// What the caller has already obtained from the authorizer for this request, on a
+    /// second pass through the resolution; `None` on the first.
+    decided: Option<&'a CustomDecision>,
+}
+
+/// What asking a `CUSTOM` authorizer produced, as [`serving`] holds it between the two
+/// passes of the resolution.
+#[derive(Debug)]
+enum CustomDecision {
+    /// The authorizer's own return value, which decides this call and every later one the
+    /// stage serves from the held result.
+    Returned(crate::state::CachedAuthorizerResult),
+    /// No result at all: this is the gateway response the request is answered through.
+    Unobtained(GatewayRefusal),
+}
+
+/// What the authorization step made of a request.
+#[derive(Debug)]
+enum Authorized {
+    /// The request is authorized, and these are the `$context` members the method's
+    /// authorization published for the integration — empty for a type that publishes none.
+    Published(BTreeMap<String, String>),
+    /// The request is refused, through this gateway response.
+    Refused(GatewayRefusal),
+    /// The request is authorized by a `CUSTOM` authorizer whose result nothing holds, so its
+    /// function has to be asked: this is what asking it needs. Boxed because it is far
+    /// larger than the other two variants.
+    Pending(Box<custom_authorizer::Pending>),
+}
+
+/// The ARN of one `Authorizer` of `api`:
+/// `arn:aws:execute-api:{region}:{account}:{api-id}/authorizers/{authorizer-id}`.
+///
+/// The `aws:SourceArn` a `lambda:InvokeFunction` grant to `apigateway.amazonaws.com` for an
+/// authorizer's function is narrowed by — the resource an `AddPermission` for an authorizer
+/// names, as the invoked METHOD's own ARN is for an integration's function
+/// ([`resource_policy::Call::method_arn`] builds that one the same way).
+fn authorizer_arn(api: &RestApiEntry, authorizer_id: &str) -> String {
+    ::emulator_server::emulator_arn(
+        "execute-api",
+        api.arn_region(),
+        &format!("{api_id}/authorizers/{authorizer_id}", api_id = api.id),
+    )
+}
+
+/// How long a result this authorizer returns stays usable:
+/// "`authorizerResultTtlInSeconds`: the TTL in seconds of cached authorizer results. If it
+/// equals 0, authorization caching is disabled." A stored value below zero is no duration at
+/// all, which is the same no-caching answer.
+fn authorizer_result_ttl(authorizer: &crate::state::AuthorizerEntry) -> ::std::time::Duration {
+    ::std::time::Duration::from_secs(
+        u64::try_from(authorizer.authorizer_result_ttl_in_seconds).unwrap_or_default(),
+    )
+}
+
+/// Where the stage holds the result this authorizer returned for the identity
+/// `identity_values`, or `None` when it holds none at all — an authorizer whose TTL is zero
+/// ("if it equals 0, authorization caching is disabled") and one the request presented no
+/// identity value to.
+fn authorizer_cache_key(
+    authorizer: &crate::state::AuthorizerEntry,
+    identity_values: &[String],
+) -> Option<String> {
+    if authorizer.authorizer_result_ttl_in_seconds <= 0 || identity_values.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{id}|{identity}",
+        id = authorizer.id,
+        identity = identity_values.join("|")
+    ))
 }
 
 /// What the records say about the API key a request presented: which stored key admitted
@@ -4100,39 +4485,122 @@ fn request_host_of(req: &RtRequest) -> Option<String> {
 /// The `$context` values of this call, keyed by the member path a mapping template writes.
 ///
 /// Only what the api's own records and the request itself say about the call: which api and
-/// stage answered it, the method it reached, the path it arrived at, and the CLAIMS the
-/// method's authorizer published for it. The per-request id is NOT among them — it is minted
-/// where the response reports it (`service_common` owns both the minting and the header), so
-/// it is not a value this call carries — and a member no value here names is a reference the
-/// template is not rendered from at all.
+/// stage answered it, the method it reached, the path it arrived at, WHICH REQUEST it is and
+/// WHEN it arrived, the account the api belongs to, the endpoint it was addressed on and the
+/// address it came from. A member no value here names is a reference the template is not
+/// rendered from at all.
 ///
-/// An authorizer's claims are published under `authorizer.claims.<name>`, the member path a
-/// template reads a signed-in user by (`$context.authorizer.claims.sub`); a method whose
-/// authorization publishes none adds no member, so such a reference stays unrendered exactly
-/// as it did before any authorizer published anything.
+/// `request_id` is the id the response to this call is reported under, so
+/// `$context.requestId` and the header a client reads the id off name ONE request; it is
+/// also `$context.extendedRequestId`, which is "the same request's id under the member API
+/// Gateway reports it in" (`crate::ops::update_stage` holds that reading for an access-log
+/// format). The instants are `now`'s, in the units each member documents: `requestTime` in
+/// the Common Log Format the access log writes it in and `requestTimeEpoch` in milliseconds.
+///
+/// What the method's AUTHORIZATION published is added by the caller, once the authorizer has
+/// decided: a user pool's claims under `authorizer.claims.<name>` (the member path a
+/// template reads a signed-in user by, `$context.authorizer.claims.sub`) and a custom
+/// authorizer's own values under `authorizer.<key>`. A method whose authorization publishes
+/// none adds no member, so such a reference stays unrendered.
 fn call_context(
     api_id: &str,
     stage: &str,
     verb: &str,
     resource_path: &str,
-    uri: &str,
-    authorizer_claims: &BTreeMap<String, String>,
+    req: &RtRequest,
+    request_id: &str,
+    now: SystemTime,
 ) -> BTreeMap<String, String> {
-    [
+    let uri = req.uri();
+    let mut context: BTreeMap<String, String> = [
         ("apiId", api_id.to_string()),
         ("stage", stage.to_string()),
         ("httpMethod", verb.to_string()),
         ("resourcePath", resource_path.to_string()),
         ("path", path_of(uri).to_string()),
+        ("accountId", ::engine::emulator_account_id().to_string()),
+        ("requestId", request_id.to_string()),
+        ("extendedRequestId", request_id.to_string()),
+        ("requestTimeEpoch", epoch_millis(now).to_string()),
+        ("identity.sourceIp", source_address_of(req)),
     ]
     .into_iter()
     .map(|(member, value)| (member.to_string(), value))
-    .chain(
-        authorizer_claims
-            .iter()
-            .map(|(claim, value)| (format!("{AUTHORIZER_CLAIMS_MEMBER}.{claim}"), value.clone())),
-    )
-    .collect()
+    .collect();
+    if let Some(stated) = common_log_time(now) {
+        context.insert("requestTime".to_string(), stated);
+    }
+    if let Some(host) = request_host_of(req) {
+        if let Some((prefix, _)) = host.split_once('.') {
+            context.insert("domainPrefix".to_string(), prefix.to_string());
+        }
+        context.insert("domainName".to_string(), host);
+    }
+    if let Some(agent) = req.headers().get(USER_AGENT_HEADER) {
+        context.insert("identity.userAgent".to_string(), agent.to_string());
+    }
+    context
+}
+
+/// The request header the caller's user agent travels in, which `$context.identity.userAgent`
+/// reports.
+const USER_AGENT_HEADER: &str = "user-agent";
+
+/// The request header the address the request came from is recorded in where it reached the
+/// emulator through a forwarder.
+const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
+
+/// The address a request that no forwarder recorded an address for came from: this emulator
+/// is reached in process or over the loopback interface, so that is where such a request
+/// arrived from.
+const LOOPBACK_SOURCE_ADDRESS: &str = "127.0.0.1";
+
+/// The address this call came from, as `$context.identity.sourceIp` reports it ("the source
+/// IP address of the TCP connection making the request"): the FIRST hop a forwarder recorded
+/// where the request reached the emulator through one, and the loopback address otherwise.
+fn source_address_of(req: &RtRequest) -> String {
+    source_address(req.headers().get(FORWARDED_FOR_HEADER))
+}
+
+/// The address a request whose forwarded-for header is `forwarded` came from; see
+/// [`source_address_of`].
+///
+/// `pub(super)` because a PROXY integration's event reports the same address under the same
+/// rule, off the call's own header map rather than off the wire request
+/// ([`lambda_proxy::identity`]) — one rule, one place.
+pub(super) fn source_address(forwarded: Option<&str>) -> String {
+    forwarded
+        .and_then(|forwarded| forwarded.split(',').next())
+        .map(str::trim)
+        .filter(|address| !address.is_empty())
+        .unwrap_or(LOOPBACK_SOURCE_ADDRESS)
+        .to_string()
+}
+
+/// The instant `at` in the Common Log Format API Gateway reports `requestTime` in
+/// (`dd/Mon/yyyy:HH:mm:ss +0000`), built from the one HTTP-date rendering this tree has, so
+/// there is no second calendar here.
+fn common_log_time(at: SystemTime) -> Option<String> {
+    // The HTTP date is `Wed, 21 Oct 2015 07:28:00 GMT`: the same fields, in the same units.
+    let http_date = ::aws_smithy_types::DateTime::from(at)
+        .fmt(::aws_smithy_types::date_time::Format::HttpDate)
+        .ok()?;
+    let (_weekday, rest) = http_date.split_once(", ")?;
+    let mut fields = rest.split(' ');
+    let day = fields.next()?;
+    let month = fields.next()?;
+    let year = fields.next()?;
+    let time = fields.next()?;
+    Some(format!("{day}/{month}/{year}:{time} +0000"))
+}
+
+/// The instant `at` in milliseconds since the epoch, which is the unit `requestTimeEpoch`
+/// reports.
+fn epoch_millis(at: SystemTime) -> i64 {
+    at.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| i64::try_from(since.as_millis()).ok())
+        .unwrap_or_default()
 }
 
 /// The `$context` member path an authorizer's claims are published under.
@@ -4350,211 +4818,4 @@ fn query_of(uri: &str) -> &str {
 }
 
 #[cfg(test)]
-mod tests {
-    //! The two pure rules this module owns that a wire test cannot vary cheaply: which
-    //! host is an `execute-api` endpoint, and how specifically a deployed resource path
-    //! matches a request path. The served behaviour is pinned end to end in
-    //! `tests/all/execute_api_data_plane.rs`.
-
-    use super::*;
-
-    #[test]
-    fn an_execute_api_host_is_recognised_by_its_second_label() {
-        // Rows differ along the api id, the region, the port, the scheme-level userinfo
-        // and the endpoint variant — everything the rule generalises over — plus the hosts
-        // that are NOT an api's invoke endpoint.
-        let cases: &[(&str, Option<&str>)] = &[
-            ("abc1230000.execute-api.us-east-1.amazonaws.com", Some("abc1230000")),
-            ("0123456789.execute-api.eu-west-3.amazonaws.com", Some("0123456789")),
-            ("a.execute-api.ap-southeast-2.amazonaws.com:443", Some("a")),
-            (
-                "abc1230000.execute-api-fips.us-gov-west-1.amazonaws.com",
-                Some("abc1230000"),
-            ),
-            ("abc1230000.execute-api.cn-north-1.amazonaws.com.cn", Some("abc1230000")),
-            // A label that merely starts with the endpoint's: a different host.
-            ("abc1230000.execute-apifoo.us-east-1.amazonaws.com", None),
-            // The control plane, whose first label names the service.
-            ("apigateway.us-east-1.amazonaws.com", None),
-            // The management API's own endpoint host: no api id in front of the label.
-            ("execute-api.us-east-1.amazonaws.com", None),
-            // Not an endpoint at all.
-            ("127.0.0.1:9297", None),
-            ("localhost", None),
-            ("abc1230000.execute-api", None),
-        ];
-        for (host, expected) in cases {
-            let resolved = api_id_of_host(host);
-            assert_eq!(
-                resolved, *expected,
-                "case {host:?}: expected the api id {expected:?}, got {resolved:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_vpc_endpoints_own_dns_name_names_the_endpoint_and_not_an_api() {
-        // Rows differ along the id width EC2's pattern admits, the zonal suffix an
-        // endpoint's per-zone name carries, the region, the port and the endpoint variant —
-        // plus the hosts that name NO endpoint, which keep resolving by api id.
-        let cases: &[(&str, Option<&str>)] = &[
-            (
-                "vpce-0123456789abcdef0.execute-api.us-west-2.vpce.amazonaws.com",
-                Some("vpce-0123456789abcdef0"),
-            ),
-            // The zonal name of the SAME endpoint, which EC2 reports beside the regional
-            // one: the zone is a suffix of the label, not part of the id.
-            (
-                "vpce-0123456789abcdef0-us-west-2a.execute-api.us-west-2.vpce.amazonaws.com",
-                Some("vpce-0123456789abcdef0"),
-            ),
-            // AWS's own endpoint-specific public name carries a suffix of its own.
-            (
-                "vpce-0123456789abcdef0-01234567.execute-api.eu-west-1.vpce.amazonaws.com:443",
-                Some("vpce-0123456789abcdef0"),
-            ),
-            // The eight-digit width the id pattern also admits.
-            (
-                "vpce-0123abcd.execute-api-fips.us-gov-west-1.vpce.amazonaws.com",
-                Some("vpce-0123abcd"),
-            ),
-            // An api id that merely begins with the prefix is no endpoint id: neither
-            // width, and not hexadecimal.
-            ("vpce-xyz.execute-api.us-west-2.amazonaws.com", None),
-            ("vpcezzzzzzz.execute-api.us-west-2.amazonaws.com", None),
-            ("abc1230000.execute-api.us-east-1.amazonaws.com", None),
-            // Not an `execute-api` endpoint host at all.
-            ("vpce-0123456789abcdef0.s3.us-west-2.vpce.amazonaws.com", None),
-            ("localhost", None),
-        ];
-        for (host, expected) in cases {
-            let resolved = endpoint_of_host(host);
-            assert_eq!(
-                resolved, *expected,
-                "case {host:?}: expected the endpoint id {expected:?}, got {resolved:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_data_plane_path_prefix_names_the_api_before_the_stage() {
-        // Rows differ along what follows the prefix (an api id with an invoke path, with a
-        // stage alone, with nothing), along the spelling of the prefix itself (extra
-        // slashes, a label that merely starts with it, one segment of it alone) and along
-        // paths that carry no prefix at all, which the other addressings read.
-        let cases: &[(&str, Option<(&str, &str)>)] = &[
-            (
-                "/_aws/execute-api/abc1230000/prod/pets",
-                Some(("abc1230000", "prod/pets")),
-            ),
-            (
-                "/_aws/execute-api/abc1230000/prod",
-                Some(("abc1230000", "prod")),
-            ),
-            ("/_aws/execute-api/abc1230000", Some(("abc1230000", ""))),
-            // Empty segments are not segments, so the same address spelled with extra
-            // slashes names the same api, and the invoke path it leaves is read by
-            // [`split_stage`], which drops them too.
-            (
-                "//_aws//execute-api//abc1230000//prod//pets",
-                Some(("abc1230000", "/prod//pets")),
-            ),
-            // The prefix is read by exact segment equality, so a segment that merely starts
-            // with it is a different path.
-            ("/_awsx/execute-api/abc1230000/prod", None),
-            ("/_aws/execute-apifoo/abc1230000/prod", None),
-            // The prefix with nothing after it names no api.
-            ("/_aws/execute-api", None),
-            ("/_aws", None),
-            // No prefix at all: the api id or the stage leads, for the other addressings.
-            ("/abc1230000/prod/pets", None),
-            ("/prod/pets", None),
-            ("/", None),
-            ("", None),
-        ];
-        for (path, expected) in cases {
-            let split = split_execute_api_prefix(path);
-            assert_eq!(
-                split, *expected,
-                "case {path:?}: expected the api id and invoke path {expected:?}, got {split:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_template_carries_a_directive_only_where_it_states_one() {
-        // Rows differ along the construct and along the literal characters that merely
-        // LOOK like one: a template that states no directive is RENDERED, so the detector
-        // must not claim it has to be executed — and a reference is not a directive.
-        let cases: &[(&str, bool)] = &[
-            (r#"{"ok":true}"#, false),
-            ("", false),
-            // Literal `#` and `$` that introduce nothing.
-            (r##"{"color":"#fff"}"##, false),
-            (r#"{"price":"$5"}"#, false),
-            (r##"{"anchor":"#"}"##, false),
-            // Non-ASCII text, which nothing restricts a stored template to: the scan must
-            // answer for it rather than fail on a byte index inside a character.
-            (r#"{"msg":"café"}"#, false),
-            ("☃", false),
-            ("🙂 $ 🙂", false),
-            ("☃#set($x = 1)", true),
-            // References are the half that is rendered, not executed.
-            (r#"{"msg":"café $input.params('x')"}"#, false),
-            (r#"{"id":"$input.params('id')"}"#, false),
-            (r#"{"id":"${input}"}"#, false),
-            (r#"{"id":"$!input"}"#, false),
-            // Directives and comments.
-            ("#set($root = $input.path('$'))", true),
-            ("#if($x)a#end", true),
-            // A word that merely starts with a directive's name is literal text.
-            ("#sets", false),
-            ("#ifconfig", false),
-            (r##"{"tag":"#end2end"}"##, false),
-            ("#end", true),
-            ("#set($x = 1)", true),
-            ("## a comment", true),
-            ("#* a block comment *#", true),
-        ];
-        for (template, directive) in cases {
-            let detected = carries_velocity_directive(template);
-            assert_eq!(
-                detected, *directive,
-                "case {template:?}: expected carries_velocity_directive to be {directive}, \
-                 got {detected}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_literal_segment_beats_a_parameter_which_beats_a_greedy_parameter() {
-        // Rows differ along the template's form and the request's segment count: the
-        // dimensions the specificity rule generalises over.
-        let cases: &[(&str, &str, bool)] = &[
-            ("/", "/", true),
-            ("/pets", "/pets", true),
-            ("/pets", "/pets/1", false),
-            ("/pets/{petId}", "/pets/1", true),
-            ("/pets/{petId}", "/pets", false),
-            ("/pets/{petId}", "/pets/1/toys", false),
-            ("/{proxy+}", "/pets/1/toys", true),
-            ("/{proxy+}", "/", false),
-            ("/pets/{proxy+}", "/pets/1/toys", true),
-        ];
-        for (template, request, matches) in cases {
-            let scored = match_score(template, request).is_some();
-            assert_eq!(
-                scored, *matches,
-                "case {template:?} vs {request:?}: expected a match of {matches}, got {scored}"
-            );
-        }
-        let literal = match_score("/pets/mine", "/pets/mine").expect("the literal matches");
-        let parameter = match_score("/pets/{petId}", "/pets/mine").expect("the parameter matches");
-        let greedy = match_score("/{proxy+}", "/pets/mine").expect("the greedy parameter matches");
-        assert!(
-            literal > parameter && parameter > greedy,
-            "case specificity: expected literal > parameter > greedy, got \
-             {literal:?} > {parameter:?} > {greedy:?}"
-        );
-    }
-}
+mod tests;

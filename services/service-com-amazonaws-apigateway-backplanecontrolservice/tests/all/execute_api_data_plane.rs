@@ -16,7 +16,8 @@
 //!   the api's own records, over a table of paths (root, literal, path parameter, greedy
 //!   parameter, unmatched), verbs (the method's own, the `ANY` catch-all, one not
 //!   deployed), and stages (deployed, unknown) — plus the deployment-snapshot rule in both
-//!   directions, by redeploying;
+//!   directions, by redeploying: both for the methods the deployment holds and for the
+//!   CONFIGURATION of a method it holds, which an undeployed edit does not change;
 //! * a `MOCK` integration's response is built from the selected integration response, over
 //!   a table of status codes, response templates, negotiated content types and header
 //!   mappings;
@@ -1364,6 +1365,175 @@ async fn only_the_invoke_endpoint_of_an_api_this_service_holds_is_served() {
                 answered.body
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn a_stage_serves_the_deployed_configuration_of_a_method_until_the_api_is_redeployed() {
+    // A deployment is "a snapshot of your REST API configuration" and a stage serves the
+    // deployment its `deploymentId` names, so an edit to a method takes effect at the stage
+    // only once the api is deployed again. The rows differ along WHICH part of the method's
+    // configuration the edit changes — the body the integration response renders, the
+    // integration request that selects which response answers (and so the status), and
+    // whether the method has an integration at all — because the rule is about the whole
+    // configuration rather than about one member of it.
+    struct Row {
+        case: &'static str,
+        /// The control-plane call that edits the method after the deployment.
+        verb: &'static str,
+        /// The path within the method, under
+        /// `/restapis/{api}/resources/{resource}/methods/GET`.
+        path: &'static str,
+        body: Option<Value>,
+        /// The status that edit is accepted with.
+        accepted: u16,
+        /// What the stage answers once the api is deployed AGAIN.
+        redeployed: (u16, &'static str),
+    }
+    /// What every row's method answers while the deployment that was taken before the edit
+    /// is the one the stage serves.
+    const DEPLOYED: (u16, &str) = (200, r#"{"v":"one"}"#);
+    let rows: &[Row] = &[
+        Row {
+            case: "the integration response's body template",
+            verb: "PATCH",
+            path: "/integration/responses/200",
+            body: Some(json!({
+                "patchOperations": [{
+                    "op": "replace",
+                    "path": "/responseTemplates/application~1json",
+                    "value": r#"{"v":"two"}"#,
+                }],
+            })),
+            accepted: 200,
+            redeployed: (200, r#"{"v":"two"}"#),
+        },
+        Row {
+            case: "the integration request that selects which response answers",
+            verb: "PATCH",
+            path: "/integration",
+            body: Some(json!({
+                "patchOperations": [{
+                    "op": "replace",
+                    "path": "/requestTemplates/application~1json",
+                    "value": r#"{"statusCode": 201}"#,
+                }],
+            })),
+            accepted: 200,
+            redeployed: (201, r#"{"v":"created"}"#),
+        },
+        Row {
+            case: "the integration itself, deleted",
+            verb: "DELETE",
+            path: "/integration",
+            body: None,
+            accepted: 204,
+            redeployed: (500, r#"{"message":"Internal server error"}"#),
+        },
+    ];
+
+    let gateway = Gateway::new();
+    let (api, root) = create_api(&gateway, "deployed-configuration").await;
+    // One resource per row, each carrying the SAME method configuration, so the rows differ
+    // only in the edit they make to it.
+    let mut resources: Vec<String> = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let resource = create_resource(&gateway, &api, &root, &format!("r{index}")).await;
+        let resource = string_member(&resource, "id", row.case);
+        put_method(
+            &gateway,
+            &api,
+            &resource,
+            "GET",
+            json!({ "authorizationType": "NONE" }),
+        )
+        .await;
+        put_integration(
+            &gateway,
+            &api,
+            &resource,
+            "GET",
+            json!({
+                "type": "MOCK",
+                "requestTemplates": { "application/json": r#"{"statusCode": 200}"# },
+            }),
+        )
+        .await;
+        for (status, body) in [("200", r#"{"v":"one"}"#), ("201", r#"{"v":"created"}"#)] {
+            method_response(&gateway, &api, &resource, "GET", status, json!({})).await;
+            integration_response(
+                &gateway,
+                &api,
+                &resource,
+                "GET",
+                status,
+                json!({ "responseTemplates": json_template(body) }),
+            )
+            .await;
+        }
+        resources.push(resource);
+    }
+    deploy(&gateway, &api, "prod").await;
+
+    // What the deployment holds, before any edit.
+    for (index, row) in rows.iter().enumerate() {
+        let answered = invoke(&gateway, &api, "GET", &format!("/prod/r{index}"), &[]).await;
+        assert_eq!(
+            (answered.status, answered.body.as_str()),
+            DEPLOYED,
+            "case {:?}: expected the deployed answer {DEPLOYED:?} before the edit, got {} with \
+             {:?}",
+            row.case,
+            answered.status,
+            answered.body
+        );
+    }
+
+    // The edits, each accepted by the control plane — and each leaving what the stage serves
+    // exactly as it was, because the stage serves the deployment it points at.
+    for (index, row) in rows.iter().enumerate() {
+        let edited = gateway
+            .call(
+                row.verb,
+                &format!(
+                    "/restapis/{api}/resources/{resource}/methods/GET{path}",
+                    resource = resources[index],
+                    path = row.path
+                ),
+                row.body.clone(),
+            )
+            .await;
+        assert_eq!(
+            edited.status, row.accepted,
+            "case {:?}: expected the edit to be accepted with {}, got {} with {:?}",
+            row.case, row.accepted, edited.status, edited.body
+        );
+        let answered = invoke(&gateway, &api, "GET", &format!("/prod/r{index}"), &[]).await;
+        assert_eq!(
+            (answered.status, answered.body.as_str()),
+            DEPLOYED,
+            "case {:?}: an undeployed edit must not change what the stage serves, got {} with \
+             {:?}",
+            row.case,
+            answered.status,
+            answered.body
+        );
+    }
+
+    // The rule in the other direction: deploying again takes the configuration as it now
+    // stands, so every row's edit is what the stage serves from then on.
+    deploy(&gateway, &api, "prod").await;
+    for (index, row) in rows.iter().enumerate() {
+        let answered = invoke(&gateway, &api, "GET", &format!("/prod/r{index}"), &[]).await;
+        assert_eq!(
+            (answered.status, answered.body.as_str()),
+            row.redeployed,
+            "case {:?}: expected {:?} once the api is redeployed, got {} with {:?}",
+            row.case,
+            row.redeployed,
+            answered.status,
+            answered.body
+        );
     }
 }
 

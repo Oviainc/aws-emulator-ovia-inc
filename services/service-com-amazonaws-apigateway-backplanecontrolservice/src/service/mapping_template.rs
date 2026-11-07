@@ -667,6 +667,10 @@ mod tests {
                 ("httpMethod".to_string(), "POST".to_string()),
                 ("stage".to_string(), "test".to_string()),
                 (
+                    "requestId".to_string(),
+                    "6c3e2a77-0000-4000-8000-9f1c2d3e4f50".to_string(),
+                ),
+                (
                     "authorizer.claims.sub".to_string(),
                     "6b1d0f0e-user".to_string(),
                 ),
@@ -704,6 +708,9 @@ mod tests {
             ("$stageVariables.backend", "beta"),
             ("$stageVariables.get('backend')", "beta"),
             ("$context.httpMethod/$context.stage", "POST/test"),
+            // The id the call is answered under, which the data plane carries for every
+            // request it serves.
+            ("$context.requestId", "6c3e2a77-0000-4000-8000-9f1c2d3e4f50"),
             // An authorizer's claims, by the bare member path and by the two spellings a
             // claim whose name is no bare identifier is reached by.
             ("$context.authorizer.claims.sub", "6b1d0f0e-user"),
@@ -735,7 +742,7 @@ mod tests {
             "$util.escapeJavaScript($input.body)",
             "$whatever.body",
             // A member of a documented variable that this call has no value for.
-            "$context.requestId",
+            "$context.status",
             "$stageVariables.undefined",
             // A method the variable does not document, and one called wrongly.
             "$input.query('$.id')",

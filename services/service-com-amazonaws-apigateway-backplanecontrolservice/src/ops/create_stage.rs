@@ -436,6 +436,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A stage this call creates has served nothing, so its cache holds nothing
             // whether or not it asked for a cluster.
             response_cache: BTreeMap::new(),
+            // Nor has any authorizer decided a call of it yet.
+            authorizer_results: BTreeMap::new(),
             tags: input
                 .tags
                 .unwrap_or_default()

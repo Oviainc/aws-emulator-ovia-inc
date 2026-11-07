@@ -9,7 +9,9 @@
 //! and the stage — a label naming neither is a 404 `NotFoundException` — and then
 //! invalidates that stage's cached authorizer results by stamping the stage's
 //! invalidation watermark ([`crate::state::StageEntry::authorizers_cache_flushed_at`]):
-//! a result cached before that instant is no longer usable.
+//! a result cached before that instant is no longer usable, and the results the stage was
+//! holding ([`crate::state::StageEntry::authorizer_results`]) are dropped with it, so the
+//! next request presenting one of those identities has its authorizer invoked again.
 //!
 //! Every stage has an authorizer cache — each authorizer caches its result for its own
 //! `authorizerResultTtlInSeconds` — so, unlike `FlushStageCache`, which can address a
@@ -198,6 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // watermark, which is what a fresh flush means; the authorizers themselves and
         // every other member of the stage are left exactly as they were.
         stage.authorizers_cache_flushed_at = Some(::std::time::Instant::now());
+        // And the results the stage was holding go with it: the watermark alone already
+        // makes every one of them a miss ([`crate::state::StageEntry::cached_authorizer_result`]),
+        // so dropping them leaves nothing behind that any reader can still see.
+        stage.authorizer_results.clear();
         Ok(FlushStageAuthorizersCacheOutput)
     }
 }

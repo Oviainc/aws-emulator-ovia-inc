@@ -14,9 +14,9 @@
 //! round trip over a table spanning the status codes the modelled `StatusCode` pattern
 //! admits (each published bound and one past it), the selection pattern, both
 //! `ContentHandlingStrategy` values and the presence and size of the two caller-supplied
-//! maps; the documented forms a `responseParameters` key and value take; the conflict a
-//! status code that already names a response is; and every identifier these operations
-//! resolve over the records that do and do not exist.
+//! maps; the documented forms a `responseParameters` key and value take; the replacement a
+//! put for a status code that already names a response is; and every identifier these
+//! operations resolve over the records that do and do not exist.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::ops::put_integration_response::{
@@ -503,9 +503,9 @@ async fn a_response_parameter_maps_a_method_response_header_from_a_documented_va
 }
 
 #[tokio::test]
-async fn a_status_code_that_already_names_a_response_is_a_conflict_and_the_record_stands() {
+async fn a_status_code_that_already_names_a_response_is_replaced_by_the_last_write() {
     let gateway = Gateway::new();
-    let (api, root) = create_api(&gateway, "integration-response-conflict").await;
+    let (api, root) = create_api(&gateway, "integration-response-replacement").await;
     let resource = resource_with_an_integration(&gateway, &api, &root, "pets", "GET").await;
 
     let first = put_integration_response(
@@ -523,9 +523,9 @@ async fn a_status_code_that_already_names_a_response_is_a_conflict_and_the_recor
         first.status, first.body
     );
 
-    // Rows differ in what the second request carries: a put for a status code that
-    // already names a response is a conflict whatever its body says, and it changes
-    // nothing.
+    // Rows differ in what the second request carries: a put for a status code that already
+    // names a response REPLACES it, whole, whatever its body says — so what the integration
+    // then carries is the last write and nothing of the one before it.
     let seconds: Vec<(&str, Value)> = vec![
         (
             "the same body again",
@@ -536,21 +536,43 @@ async fn a_status_code_that_already_names_a_response_is_a_conflict_and_the_recor
             json!({ "selectionPattern": ".*", "contentHandling": "CONVERT_TO_TEXT" }),
         ),
         ("an empty body", json!({})),
+        (
+            "a body setting what the one before it did not",
+            json!({ "responseParameters": { "method.response.header.x-made": "'yes'" } }),
+        ),
     ];
     for (case, request) in &seconds {
         let answer =
             put_integration_response(&gateway, &api, &resource, "GET", "200", request.clone())
                 .await;
-        assert_failure(&answer, 409, "ConflictException", case);
+        assert_eq!(
+            answer.status, 201,
+            "case {case}: expected 201, got {} with {:?}",
+            answer.status, answer.body
+        );
         let read = get_integration_response(&gateway, &api, &resource, "GET", "200").await;
         assert_eq!(
-            read.body, first.body,
-            "case {case}: the stored response must stand after the conflict, got {:?} after {:?}",
-            read.body, first.body
+            read.body, answer.body,
+            "case {case}: the stored response must be the one this write described, got {:?} \
+             after {:?}",
+            read.body, answer.body
         );
+        // Nothing of the write before it survives: a member this request did not set is
+        // absent, as it is on a first write.
+        for dropped in ["selectionPattern", "responseTemplates", "responseParameters"] {
+            if request.get(dropped).is_none() {
+                assert_eq!(
+                    read.body.get(dropped),
+                    None,
+                    "case {case}: {dropped} must not survive a write that did not set it, got \
+                     {:?}",
+                    read.body
+                );
+            }
+        }
     }
 
-    // A DIFFERENT status code on the same integration is not a conflict: the key is the
+    // A DIFFERENT status code on the same integration is its own record: the key is the
     // status code, not the integration.
     let other =
         put_integration_response(&gateway, &api, &resource, "GET", "404", json!({})).await;

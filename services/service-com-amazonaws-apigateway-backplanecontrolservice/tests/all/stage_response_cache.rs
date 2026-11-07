@@ -139,9 +139,15 @@ impl Deployed {
         }
     }
 
-    /// Rewrite the integration response's `application/json` template to `body`, so a
-    /// request answered from the records reads it and one answered from the cluster does
+    /// Rewrite the integration response's `application/json` template to `body` AND REDEPLOY,
+    /// so a request answered from the records reads it and one answered from the cluster does
     /// not.
+    ///
+    /// The redeploy is what makes the edit the stage's: a stage serves the deployment its
+    /// `deploymentId` names, so an edit to a method takes effect at the stage only once the
+    /// api is deployed again (`crate::execute_api_data_plane`'s own snapshot rows pin that).
+    /// It does not empty the cluster — `FlushStageCache` is the call that does — so what the
+    /// stage HOLDS is what the rows below are about.
     async fn rewrite_response(&self, gateway: &Gateway, case: &str, body: &str) {
         let patched = gateway
             .call(
@@ -165,6 +171,7 @@ impl Deployed {
             "case {case}: expected 200 from UpdateIntegrationResponse, got {} with {:?}",
             patched.status, patched.body
         );
+        deploy(gateway, &self.api, STAGE).await;
     }
 
     /// `UpdateStage` with `operations`, asserting the modelled 200.
@@ -291,6 +298,9 @@ impl Deployed {
             "case {case}: expected 200 from UpdateIntegration, got {} with {:?}",
             patched.status, patched.body
         );
+        // Deployed, for the reason [`Self::rewrite_response`] gives: the group an edit put
+        // the resource in is the stage's once the api is deployed again.
+        deploy(gateway, &self.api, STAGE).await;
     }
 }
 

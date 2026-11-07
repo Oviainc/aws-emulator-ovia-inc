@@ -2,13 +2,18 @@
 
 //! @op PutIntegrationResponse
 //!
-//! Creates one `IntegrationResponse` of a method's integration: the record that maps a
+//! Writes one `IntegrationResponse` of a method's integration: the record that maps a
 //! backend response — selected by `selectionPattern` — onto a method response status
 //! code, with the header mappings and body templates that transform it. The record is
 //! stored on the integration the method carries ([`crate::state::MethodEntry::integration`]'s
 //! `integrationResponses`), keyed by its `statusCode`, so `GetIntegrationResponse` and
 //! `GetIntegration` report the same one record. It is also the OUTPUT MAPPING the
 //! execute-api data plane answers a request with (`crate::service::invoke`).
+//!
+//! It is a PUT keyed by that status code: repeating the call for a status code the
+//! integration already carries a response under REPLACES that response with the one this
+//! request describes, so a caller re-applying its configuration writes the same record
+//! again rather than being refused.
 //!
 //! ## Shape of an operation
 //!
@@ -401,24 +406,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_mut()
             .ok_or_else(|| not_found(crate::state::NO_SUCH_INTEGRATION))?;
 
-        // A status code names at most one response of an integration: adding one that is
-        // already there is a conflict, not an overwrite — `UpdateIntegrationResponse` is
-        // the call that changes a stored response. Checked BEFORE the map is reached for
-        // writing, so the record is touched only once the request is known to succeed.
-        if integration
-            .integration_responses
-            .as_ref()
-            .is_some_and(|responses| responses.contains_key(&input.status_code))
-        {
-            return Err(PutIntegrationResponseErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(
-                        "Integration response already exists for this method".to_string(),
-                    ),
-                },
-            )
-            .into());
-        }
+        // A status code names at most one response of an integration, and this call WRITES
+        // the one it names: `PutIntegrationResponse` is a PUT keyed by the status code, so
+        // repeating it for a status code that already names a response replaces that
+        // response — the last write is what the integration then carries, whole, rather
+        // than the two merged. Nothing is read off the response that was there: a member the
+        // request did not set is absent from the stored record, exactly as it is on a first
+        // write.
         integration
             .integration_responses
             .get_or_insert_with(::std::collections::HashMap::new)
