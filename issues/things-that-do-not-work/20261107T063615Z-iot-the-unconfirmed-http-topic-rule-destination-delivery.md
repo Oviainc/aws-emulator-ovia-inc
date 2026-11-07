@@ -1,0 +1,40 @@
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: iot.topic-rule-with-unconfirmed-destination-blocks-delivery
+Issue-Key: iot.topic-rule-with-unconfirmed-destination-blocks-delivery|_scan_logs_for#1|Timeout|time.sleep(interval_s)
+Issue-Commit: c74166b22384866127bf5623ef4df12500ab7617
+
+# iot: the unconfirmed-HTTP-topic-rule-destination delivery gate never reaches a verdict — the confirm-then-deliver trajectory hangs to the 60 s cap (1 cause)
+
+> _Note: this issue was identified against the code base at commit `c74166b22384866127bf5623ef4df12500ab7617`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+ConfirmTopicRuleDestination
+
+## Description
+Cause 1 of 1: the HTTP topic-rule-destination confirmation/delivery trajectory never settles, so the "an unconfirmed destination receives nothing, a confirmed+enabled one receives the message" gate produces no verdict at all. Failing check: iot.topic-rule-with-unconfirmed-destination-blocks-delivery.
+
+AWS: CreateTopicRuleDestination (Smithy: POST /destinations, success 200, output topicRuleDestination: TopicRuleDestination; modeled errors InvalidRequestException 400, ConflictingResourceUpdateException 409, ResourceAlreadyExistsException 409, UnauthorizedException 401, InternalException 500, ServiceUnavailableException 503) registers an httpUrlConfiguration destination in IN_PROGRESS and AWS then sends a single HTTPS DestinationConfirmation POST to the supplied confirmationUrl carrying a confirmationToken. UpdateTopicRuleDestination (Smithy: PATCH /destinations, required arn + status of enum TopicRuleDestinationStatus, success 200) with status=IN_PROGRESS re-sends that confirmation request. ConfirmTopicRuleDestination (Smithy: GET /confirmdestination/{confirmationToken+}, confirmationToken @length 1..2048, success 200, empty output) accepts the token; the destination leaves IN_PROGRESS asynchronously and rests at DISABLED, and only UpdateTopicRuleDestination status=ENABLED makes it ENABLED. GetTopicRuleDestination (GET /destinations/{arn+}, 200) reports that status. While the destination is not ENABLED, an enabled topic rule's `http` action must deliver nothing to that URL; once it is ENABLED the published payload is POSTed to it.
+
+Emulator: the replay reaches no verdict — the only output for this check is `Error: Check timed out after 60.0s`. Every step of this trajectory is a blocking poll with a budget far larger than the harness cap (endpoint self-test 60 s, confirmation-token poll 240 s with UpdateTopicRuleDestination status=IN_PROGRESS resends, destination status polls 60 s each, post-enable delivery poll 180 s), so the cap fires because some step never yields the value AWS would have produced. The replay output carries no per-call response, so the output does not isolate which call stalls; what it does establish is that the trajectory never completes. Consistent with that, in this same run iot CreateTopicRuleDestination is an unimplemented scaffold stub (open issue 20261106T201842Z-iot-createtopicruledestination-stub.md), and no outbound DestinationConfirmation POST or destination-status gate on the `http` action is observable anywhere in this suite. That stub issue does not cover this finding: the suite did not attribute this check to it, and implementing the create call alone would still leave the confirmation POST, the IN_PROGRESS -> DISABLED -> ENABLED transitions and the delivery gate unexercised. Related but also not covering it: 20261106T193703Z-iot-an-in-function-boto3-dynamodb-putitem-from.md (the confirm-then-deliver check's in-function DynamoDB PutItem) and 20261029T175031Z-iot-cfn-deployed-aws-iot-topicrule-is-not.md.
+
+Why: a client that follows AWS — create the destination, wait for the confirmation POST, call ConfirmTopicRuleDestination with the token, set ENABLED, then publish — never progresses: it neither gets the confirmation request nor a modeled refusal (InvalidRequestException 400 / ConflictingResourceUpdateException 409) telling it the flow is unavailable, so it blocks until its own timeout. The security-relevant guarantee this check exists to assert — that an enabled rule delivers NOTHING to a destination that has not been confirmed and enabled — is unobservable, so neither the block nor the post-enable delivery can be relied on.
+
+Fix: the iot topic-rule-destination component — the CreateTopicRuleDestination / ConfirmTopicRuleDestination / UpdateTopicRuleDestination / GetTopicRuleDestination handlers and the destination state machine they share (IN_PROGRESS on create, DISABLED after confirm, ENABLED only on explicit update), the outbound HTTPS DestinationConfirmation POST that carries the confirmationToken to the configured confirmationUrl (re-sent when status is set back to IN_PROGRESS), and the topic-rule `http` action's delivery path, which must consult the destination's status and suppress delivery unless it is ENABLED. Each of those must either do the work or answer one of the modeled errors promptly rather than leaving the caller waiting.
+
+Traces: iot.topic-rule-with-unconfirmed-destination-blocks-delivery.
+
+## Evidence
+Expected (AWS): CreateTopicRuleDestination returns 200 with topicRuleDestination.status=IN_PROGRESS and a DestinationConfirmation POST carrying a confirmationToken query parameter arrives at the confirmationUrl; a message published to the rule's topic while the destination is unconfirmed is NOT delivered; ConfirmTopicRuleDestination(confirmationToken) returns 200 and GetTopicRuleDestination then reports DISABLED; UpdateTopicRuleDestination(arn, status="ENABLED") returns 200 and GetTopicRuleDestination reports ENABLED; a message published after that IS POSTed to the URL. Every one of these is a bounded, promptly answered call.
+
+Actual (emulator): the whole trajectory produces no response the check can act on. The suite reports exactly `Error: Check timed out after 60.0s` for iot.topic-rule-with-unconfirmed-destination-blocks-delivery — no status, no error code, no delivered or suppressed payload. The check's own budgets (240 s token poll, 2x60 s status polls, 180 s delivery poll) are all larger than the cap, so the cap is reached because a step that AWS answers never produces its value. No modeled refusal (400 InvalidRequestException, 409 ConflictingResourceUpdateException, 401 UnauthorizedException, 503 ServiceUnavailableException) is returned in its place either — a prompt refusal would at least have given the client a verdict.
+
+## Steps to Reproduce
+1. Stand up an HTTPS endpoint that logs what it receives (the check uses an API Gateway v2 HTTP API fronting a python3.12 Lambda that prints the confirmationToken query parameter and the request body's `marker`).
+2. iot.create_topic_rule_destination(destinationConfiguration={"httpUrlConfiguration": {"confirmationUrl": <endpoint url>}}) and keep topicRuleDestination.arn. Expect status IN_PROGRESS.
+3. Wait for the DestinationConfirmation POST to arrive at the endpoint and read its confirmationToken; if it does not arrive, call iot.update_topic_rule_destination(arn=<arn>, status="IN_PROGRESS") to ask for a resend. Observe that no confirmation request ever arrives.
+4. iot.create_topic_rule(ruleName=<name>, topicRulePayload={"sql": "SELECT * FROM '<topic>'", "actions": [{"http": {"url": <endpoint url>}}], "ruleDisabled": False}).
+5. Publish to <topic> via the iot-data plane and assert the marker never reaches the endpoint (the unconfirmed-destination block).
+6. iot.confirm_topic_rule_destination(confirmationToken=<token>), poll iot.get_topic_rule_destination(arn=<arn>) for DISABLED, then iot.update_topic_rule_destination(arn=<arn>, status="ENABLED") and poll for ENABLED.
+7. Publish again and assert the marker now reaches the endpoint. Against the emulator the run never reaches step 6/7 — it is killed at the harness's 60 s cap with no verdict.
