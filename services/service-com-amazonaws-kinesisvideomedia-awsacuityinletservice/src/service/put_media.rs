@@ -243,6 +243,9 @@ impl<Eng: Send + Sync + 'static> PutMediaIngest<Eng> {
             Ok(session) => session,
             Err(refusal) => return refusal.response(),
         };
+        // ONE instant dates everything this session persists: the server timestamp of
+        // every fragment it takes.
+        let received_at = SystemTime::now();
         // The router buffers every request before dispatch, so a body it cannot hand
         // back in memory is media this plane cannot read — the same thing an unreadable
         // container is, and reported the same way.
@@ -257,7 +260,6 @@ impl<Eng: Send + Sync + 'static> PutMediaIngest<Eng> {
 
         // ONE instant dates everything this session persists: the server timestamp of
         // every fragment it takes.
-        let received_at = SystemTime::now();
         let name = session.stream_name.as_deref();
         let arn = session.stream_arn.as_deref();
         let submitted_bytes = body.len();

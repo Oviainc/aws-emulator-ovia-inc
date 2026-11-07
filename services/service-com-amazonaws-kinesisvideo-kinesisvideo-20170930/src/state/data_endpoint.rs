@@ -6,17 +6,25 @@
 //! control-plane endpoint the call itself is made to — "Gets an endpoint for a
 //! specified stream for either reading or writing … The returned endpoint does not
 //! have the API name appended" — and because there is more than one such endpoint per
-//! stream. Kinesis Video Media names the two: `InvalidEndpointException` is "Status
-//! Code: 400, Caller used wrong endpoint to write data to a stream. On receiving such
-//! an exception, the user must call `GetDataEndpoint` with `AccessMode` set to "READ"
-//! and use the endpoint Kinesis Video returns in the next `GetMedia` call." Which
-//! endpoint is REPORTED therefore follows from the access mode the requested API needs.
+//! stream.
+//!
+//! WHICH endpoint an `APIName` resolves to is decided by the ACCESS MODE the API it
+//! names needs. Kinesis Video Media states the rule: `InvalidEndpointException` is
+//! "Status Code: 400, Caller used wrong endpoint to write data to a stream. On receiving
+//! such an exception, the user must call `GetDataEndpoint` with `AccessMode` set to
+//! \"READ\" and use the endpoint Kinesis Video returns in the next `GetMedia` call" — so
+//! the endpoint a WRITE is served at is not the one a READ is, and `GetMedia`'s is
+//! obtained under the read mode. `PUT_MEDIA` is the one API that writes media onto a
+//! stream; every other published `APIName` reads media back off it — `GET_MEDIA` the
+//! live stream, and `LIST_FRAGMENTS`, `GET_MEDIA_FOR_FRAGMENT_LIST`, `GET_CLIP`,
+//! `GET_HLS_STREAMING_SESSION_URL`, `GET_DASH_STREAMING_SESSION_URL` and `GET_IMAGES`
+//! its archive.
 //!
 //! So the value reported is a bare `<scheme>://<authority>` base URL — scheme and host
 //! only, no path, because the client appends the API name itself — of the plane the
-//! requested `APIName` needs. Every API of one access mode resolves to one endpoint,
-//! the two modes resolve to different ones, and neither is the control-plane endpoint
-//! the call arrived on.
+//! requested `APIName` needs. Every API of one access mode resolves to one endpoint, the
+//! two modes resolve to different ones, and neither is the control-plane endpoint the
+//! call arrived on.
 //!
 //! What this module decides is which endpoint each API is TOLD to use, and which plane
 //! an address that arrives on a request BELONGS to ([`published_plane`]) — the reading a
@@ -76,26 +84,25 @@ use super::ComAmazonawsKinesisvideoKinesisvideo20170930State as ServiceState;
 /// The access mode a stream's media API needs, and so the data endpoint that serves it.
 ///
 /// The two modes Kinesis Video Media names ("the user must call `GetDataEndpoint` with
-/// `AccessMode` set to \"READ\"", said of a write addressed to the wrong endpoint):
-/// media is WRITTEN to a stream through one endpoint and READ back through another.
+/// `AccessMode` set to \"READ\"", said of a write addressed to the wrong endpoint): media
+/// is WRITTEN to a stream through one endpoint and READ back through another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DataPlane {
-    /// The plane media is written to.
+    /// The endpoint media is written to: the ingest front end `PUT_MEDIA` names.
     Write,
-    /// The plane a stream's media is read from.
+    /// The endpoint media is read back through: the live read and every archived-media
+    /// API.
     Read,
 }
 
+
 /// Which plane serves one `APIName`, or `None` for a value the model does not publish.
 ///
-/// The catalog below is the `APIName` enum
-/// (`smithy_query(query="shape", shape="APIName")`, mirrored in
-/// [`crate::ops::types::A_P_I_NAME_VALUES`]), each value paired with the access mode the
-/// API it names needs: `PUT_MEDIA` writes media onto the stream (Kinesis Video Media
-/// `PutMedia`), and every other published value reads the stream — its media
-/// (`GetMedia`) or its archive (`ListFragments`, `GetMediaForFragmentList`, `GetClip`,
-/// `GetHLSStreamingSessionURL`, `GetDASHStreamingSessionURL`, `GetImages`, all of
-/// Kinesis Video Archived Media).
+/// The catalog below is the `APIName` enum (`smithy_query(query="shape",
+/// shape="APIName")`, mirrored in [`crate::ops::types::A_P_I_NAME_VALUES`]), each value
+/// paired with the access mode the API it names needs: `PUT_MEDIA` WRITES media onto a
+/// stream, and every other published value reads media back off it — `GET_MEDIA` the
+/// live stream, the rest its archive.
 ///
 /// `None` is what refuses an `APIName` outside that published set, so a value this
 /// service cannot place on a plane is answered as a bad argument rather than handed an
@@ -321,3 +328,4 @@ fn data_plane_response(status: u16, message: &'static str) -> ::http::Response<V
             response
         })
 }
+

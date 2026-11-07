@@ -199,19 +199,20 @@ async fn a_control_call_is_not_served_at_an_address_announced_for_a_data_plane()
                 response.status(),
                 String::from_utf8_lossy(response.body())
             );
-            assert_eq!(
-                response
-                    .headers()
-                    .get("x-amzn-errortype")
-                    .and_then(|value| value.to_str().ok()),
-                Some("UnknownOperationException"),
-                "case {case:?}: the refusal names the operation it could not route, got {:?}",
+            // The refusal is the framework's own answer for an unrouted path: the bare
+            // element naming the condition, with no error-type header, because no
+            // operation was identified to name one for.
+            assert!(
+                response.headers().get("x-amzn-errortype").is_none(),
+                "case {case:?}: no operation was identified, so none is named in the \
+                 error-type header, got {:?}",
                 response.headers().get("x-amzn-errortype")
             );
-            assert!(
-                response.body().is_empty(),
-                "case {case:?}: no operation was named, so there is no message to report, \
-                 got {:?}",
+            assert_eq!(
+                String::from_utf8_lossy(response.body()),
+                smithy_server_runtime::UNRECOGNISED_PROTOCOL_BODY,
+                "case {case:?}: expected the one wording this emulator states an unrouted \
+                 path in, got {:?}",
                 String::from_utf8_lossy(response.body())
             );
         }

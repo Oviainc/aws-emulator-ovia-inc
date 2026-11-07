@@ -15,9 +15,9 @@
 //! `InvalidEndpointException`, "Caller used wrong endpoint to write data to a stream …
 //! the user must call `GetDataEndpoint` with `AccessMode` set to \"READ\"", is why the
 //! two modes are reported as two addresses) and distinct from the control-plane endpoint
-//! the call itself arrived on. Which operations each address SERVES is a separate rule
-//! these cases do not assert: this emulator's one front door answers every address of it
-//! (see the module header of `crate::state::data_endpoint`).
+//! the call itself arrived on. Which operations each address SERVES is the rule
+//! `crate::service::data_plane_address` and the media services' own route claims state,
+//! asserted by `tests/all/data_plane_addresses.rs`.
 //!
 //! The concrete host and port are the environment's and nothing here asserts them. What
 //! the cases assert is the shape of the value, that the address accepts a connection and
@@ -150,9 +150,10 @@ async fn data_endpoint(
 }
 
 /// The authority of a `scheme://host` base URL, failing the case when the value carries
-/// a path, a query or no scheme at all: "The returned endpoint does not have the API
-/// name appended. The client needs to add the API name to the returned endpoint", so
-/// anything after the host would be appended to rather than replaced.
+/// a path, a query or not the scheme the plane's address serves: "The returned endpoint
+/// does not have the API name appended. The client needs to add the API name to the
+/// returned endpoint", so anything after the host would be appended to rather than
+/// replaced.
 fn base_url_authority(case: &str, endpoint: &str) -> String {
     let scheme = format!("{}://", kvs::state::DATA_PLANE_SCHEME);
     let rest = endpoint.strip_prefix(&scheme).unwrap_or_else(|| {
@@ -646,6 +647,8 @@ async fn a_data_endpoint_is_stable_across_reads_and_is_the_planes_own() {
              for it, got {values:?}"
         );
     }
+    // The partition is by the ACCESS MODE each API needs: the one that writes media to
+    // the stream, and the ones that read it.
     let write = seen
         .get(PUT_MEDIA)
         .unwrap_or_else(|| panic!("no endpoint for {PUT_MEDIA}"));
@@ -659,6 +662,11 @@ async fn a_data_endpoint_is_stable_across_reads_and_is_the_planes_own() {
              got {seen:?}"
         );
     }
+    assert_eq!(
+        seen.get("GET_MEDIA"),
+        seen.get("LIST_FRAGMENTS"),
+        "the APIs that read a stream share one endpoint, got {seen:?}"
+    );
 }
 
 /// Every value the model publishes is placed on a plane, and a value it does not

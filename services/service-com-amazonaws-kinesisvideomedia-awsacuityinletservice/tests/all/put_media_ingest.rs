@@ -508,6 +508,9 @@ pub(crate) fn ingest_headers(
         addressing,
         ("x-amzn-fragment-timecode-type", timecode_type.to_string()),
         ("x-amzn-producer-start-timestamp", format!("{seconds:.3}")),
+        // A producer SIGNS its media, and this is the header the signature covers the
+        // body through: what it sends for an unsigned-length stream.
+        ("x-amz-content-sha256", "UNSIGNED-PAYLOAD".to_string()),
     ]
 }
 
@@ -958,6 +961,7 @@ async fn a_request_level_fault_is_refused_and_ingests_nothing() {
             vec![
                 ("x-amzn-stream-name", name.to_string()),
                 valid[2].clone(),
+                valid[3].clone(),
             ],
             400,
             "InvalidArgumentException",
@@ -973,17 +977,12 @@ async fn a_request_level_fault_is_refused_and_ingests_nothing() {
             "InvalidArgumentException",
         ),
         (
-            "no producer start timestamp",
-            valid[..2].to_vec(),
-            400,
-            "InvalidArgumentException",
-        ),
-        (
             "a producer start timestamp that is not a timestamp",
             vec![
                 ("x-amzn-stream-name", name.to_string()),
                 ("x-amzn-fragment-timecode-type", "RELATIVE".to_string()),
                 ("x-amzn-producer-start-timestamp", "yesterday".to_string()),
+                valid[3].clone(),
             ],
             400,
             "InvalidArgumentException",
@@ -1048,6 +1047,145 @@ async fn a_request_level_fault_is_refused_and_ingests_nothing() {
         harness.stored_chunks(&arn).is_empty(),
         "case \"after the refusals\": the media log must be empty"
     );
+
+    // The sentence a missing stream is refused with is this FAMILY's: the one its
+    // control plane answers every missing-stream read with, so one condition reads one
+    // way whichever plane reports it.
+    let refused = harness
+        .put_media(
+            &ingest_headers(
+                ("x-amzn-stream-name", "ingest-probe-never-created".to_string()),
+                "RELATIVE",
+                producer_start,
+            ),
+            container.bytes(),
+        )
+        .await;
+    assert_eq!(
+        json(&refused).get("Message").and_then(serde_json::Value::as_str),
+        Some(control_plane::state::STREAM_NOT_FOUND_MESSAGE),
+        "case \"a stream the registry does not hold\": expected the family's own sentence, \
+         got {}",
+        text(&refused)
+    );
+}
+
+/// RULE: a session's producer start timestamp is what a RELATIVE Cluster timecode is an
+/// offset FROM, so an ABSOLUTE session — whose timecodes already name their instants — is
+/// taken without one, and a timestamp AHEAD of this service's clock by more than two
+/// clocks can differ by is a fault of the session's timing, reported in band, for which
+/// nothing is taken.
+///
+/// The rows differ in how the session is dated: not at all (ABSOLUTE), in the past, and
+/// well beyond the allowance in the future.
+#[tokio::test]
+async fn a_sessions_producer_start_timestamp_is_optional_and_may_not_be_in_the_future() {
+    let now = SystemTime::now();
+    // (case, the start timestamp the session states, its timecode type, whether it is
+    // taken)
+    let rows: Vec<(&str, Option<SystemTime>, &str, bool)> = vec![
+        ("no start timestamp at all", None, "ABSOLUTE", true),
+        (
+            "a minute in the past",
+            Some(now - Duration::from_secs(60)),
+            "RELATIVE",
+            true,
+        ),
+        (
+            "a day in the future",
+            Some(now + Duration::from_secs(86_400)),
+            "RELATIVE",
+            false,
+        ),
+        (
+            "a year in the future",
+            Some(now + Duration::from_secs(365 * 86_400)),
+            "RELATIVE",
+            false,
+        ),
+    ];
+
+    for (index, (case, start, timecode_type, taken)) in rows.into_iter().enumerate() {
+        let harness = Harness::new();
+        let name = format!("ingest-probe-dated-{index}");
+        let arn = harness.create_stream(&name).await;
+        let headers: IngestHeaders = match start {
+            Some(start) => ingest_headers(
+                ("x-amzn-stream-name", name.clone()),
+                timecode_type,
+                start,
+            ),
+            // Everything a producer sends EXCEPT the start timestamp.
+            None => vec![
+                ("x-amzn-stream-name", name.clone()),
+                ("x-amzn-fragment-timecode-type", timecode_type.to_string()),
+                ("x-amz-content-sha256", "UNSIGNED-PAYLOAD".to_string()),
+            ],
+        };
+        let container = Container::of(vec![cluster(0, 2, 20, 0x61)]);
+        let response = harness.put_media(&headers, container.bytes()).await;
+        assert_eq!(
+            status(&response),
+            200,
+            "case {case:?}: a session's own timing is reported in band, so the status \
+             stays 200, got {} ({}) {}",
+            status(&response),
+            error_code(&response),
+            text(&response)
+        );
+        let acks = acknowledgements(case, &response);
+        let errors: Vec<(String, u64)> = acks
+            .iter()
+            .filter(|ack| event_type(ack) == "ERROR")
+            .map(|ack| {
+                (
+                    ack.get("ErrorCode")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    ack.get("ErrorId")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        if taken {
+            assert!(
+                errors.is_empty(),
+                "case {case:?}: a session dated at or before this service's clock is \
+                 taken, got {}",
+                text(&response)
+            );
+            assert_eq!(
+                persisted(&acks).len(),
+                1,
+                "case {case:?}: the session's one Cluster is acknowledged persisted, got {}",
+                text(&response)
+            );
+            assert_eq!(
+                harness.stored_chunks(&arn).len(),
+                1,
+                "case {case:?}: the stream holds the fragment the session produced"
+            );
+            continue;
+        }
+        assert_eq!(
+            errors,
+            vec![("INVALID_PRODUCER_TIMESTAMP".to_string(), 4007)],
+            "case {case:?}: expected one ERROR acknowledgement of the session's timing, \
+             got {}",
+            text(&response)
+        );
+        assert!(
+            persisted(&acks).is_empty(),
+            "case {case:?}: nothing is acknowledged persisted for a refused session, got {}",
+            text(&response)
+        );
+        assert!(
+            harness.stored_chunks(&arn).is_empty(),
+            "case {case:?}: nothing is taken for a refused session"
+        );
+    }
 }
 
 /// RULE: a fault in the submitted MEDIA is reported in band — inside the same `200`, as

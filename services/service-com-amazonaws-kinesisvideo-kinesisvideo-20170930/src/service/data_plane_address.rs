@@ -13,11 +13,11 @@
 //!
 //! So a control-plane call that reached an address this store announced for a plane
 //! ([`super::super::state::published_plane`]) reached an endpoint that binds no operation
-//! for its path, and is answered as such: HTTP 404 naming
-//! [`UNKNOWN_OPERATION`] as the error, with no operation run, no member reported and
-//! nothing in the store touched. Every other address — the endpoint the client is already
-//! talking to, this service's published regional host — keeps serving the whole control
-//! surface.
+//! for its path, and is answered as such: the framework's own refusal of an unrouted path
+//! — HTTP 404 with the bare `UnknownOperationException` element as the whole body — with
+//! no operation run, no member reported and nothing in the store touched. Every other
+//! address — the endpoint the client is already talking to, this service's published
+//! regional host — keeps serving the whole control surface.
 
 use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use ::aws_smithy_types::body::SdkBody;
@@ -65,25 +65,16 @@ impl ErasedOperation for UnroutedOnDataPlaneAddress {
     }
 }
 
-/// HTTP 404 with the error type named in the field this emulator states an error code in,
-/// and no body: the path is bound to no operation here, so there is no operation, no
-/// member and no value to report — a client reads the code and nothing else.
+/// HTTP 404 with the bare `UnknownOperationException` element as the whole body and no
+/// error-type header: the path is bound to no operation here, so no operation was
+/// identified to name one for, and there is no member and no value to report.
+///
+/// The body is the framework's own ([`::smithy_server_runtime::UNRECOGNISED_PROTOCOL_BODY`]),
+/// which is the one wording this emulator states an unrouted path in — the same answer
+/// the ingest plane gives a `/putMedia` that reached an address that does not route it.
 fn unrouted_address_response() -> RtResponse {
-    let mut response = RtResponse::new(
+    RtResponse::new(
         StatusCode::try_from(404).expect("the status is a constant of this module"),
-        SdkBody::empty(),
-    );
-    response
-        .headers_mut()
-        .insert(ERROR_TYPE_FIELD, UNKNOWN_OPERATION);
-    response
+        SdkBody::from(::smithy_server_runtime::UNRECOGNISED_PROTOCOL_BODY),
+    )
 }
-
-/// The HTTP field this emulator states an error code in, which is also where a Kinesis
-/// Video Streams media endpoint states one. Field names are case-insensitive, so a client
-/// matches it however the transport cases the bytes.
-const ERROR_TYPE_FIELD: &str = "x-amzn-errortype";
-
-/// The error a path an endpoint binds no operation for earns: the operation could not be
-/// named at all, which is what a client branches on here.
-pub const UNKNOWN_OPERATION: &str = "UnknownOperationException";

@@ -15,6 +15,8 @@
 mod boundary_refusal_wording;
 #[path = "all/data_plane_addresses.rs"]
 mod data_plane_addresses;
+#[path = "all/data_plane_front_door.rs"]
+mod data_plane_front_door;
 #[path = "all/route_claims.rs"]
 mod route_claims;
 #[path = "all/signaling_channel_lifecycle.rs"]
