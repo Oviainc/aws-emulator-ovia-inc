@@ -941,3 +941,251 @@ async fn a_match_reports_the_status_the_clock_owes() {
         after.body
     );
 }
+
+/// What one row of the write table writes to a content between its create and the search.
+enum Write {
+    /// Members written through `UpdateContent`.
+    Update(Value),
+    /// A replacement asset, named by the media type its upload is started for and pointed
+    /// at through `UpdateContent`'s `uploadId`.
+    ReplaceAsset(&'static str),
+    /// Tags written through `TagResource` on the content's own ARN.
+    Tag(Value),
+}
+
+/// One row of the write table: a case name, the write it lands, the summary members the
+/// search must report once it has landed, and whether it is one of the content's own
+/// revisions.
+struct WriteRow {
+    case: &'static str,
+    write: Write,
+    expected: Value,
+    moves_revision: bool,
+}
+
+/// The writes a later search's answer must follow, one row per member a write of a content
+/// can move: the whole set `UpdateContent` documents it writes
+/// (`smithy_query(query="operation",operation="UpdateContent")`: `title`, `metadata`,
+/// `overrideLinkOutUri`/`removeOverrideLinkOutUri` and `uploadId`), two of them written
+/// together, a map replaced by an empty one at its own published lower bound (`metadata`,
+/// `length 0..10`), and the `tags` map the OTHER write path of the same record reaches.
+fn write_rows() -> Vec<WriteRow> {
+    vec![
+        WriteRow {
+            case: "a replaced title",
+            write: Write::Update(json!({ "title": "The title the write gave" })),
+            expected: json!({ "title": "The title the write gave" }),
+            moves_revision: true,
+        },
+        WriteRow {
+            case: "a replaced metadata map",
+            write: Write::Update(json!({
+                "metadata": { "locale": "fr-FR", "system": "servicenow" },
+            })),
+            expected: json!({ "metadata": { "locale": "fr-FR", "system": "servicenow" } }),
+            moves_revision: true,
+        },
+        WriteRow {
+            case: "metadata replaced by an empty map",
+            write: Write::Update(json!({ "metadata": {} })),
+            expected: json!({ "metadata": {} }),
+            moves_revision: true,
+        },
+        WriteRow {
+            case: "a title and a metadata map written together",
+            write: Write::Update(json!({
+                "title": "Both members at once",
+                "metadata": { "table": "kb" },
+            })),
+            expected: json!({
+                "title": "Both members at once",
+                "metadata": { "table": "kb" },
+            }),
+            moves_revision: true,
+        },
+        WriteRow {
+            case: "the override link-out URI removed",
+            write: Write::Update(json!({ "removeOverrideLinkOutUri": true })),
+            expected: json!({}),
+            moves_revision: true,
+        },
+        WriteRow {
+            case: "a replaced asset, of another media type",
+            write: Write::ReplaceAsset("text/html"),
+            expected: json!({ "contentType": "text/html" }),
+            moves_revision: true,
+        },
+        WriteRow {
+            case: "a tag written onto the content after its create",
+            write: Write::Tag(json!({ "team": "billing" })),
+            expected: json!({ "tags": { "owner": "support", "team": "billing" } }),
+            moves_revision: false,
+        },
+    ]
+}
+
+/// Create one content under `knowledge_base_id`, named `name`, carrying a value in every
+/// member a row of [`write_rows`] goes on to replace.
+async fn create_content_named(emulator: &Emulator, knowledge_base_id: &str, name: &str) -> Reply {
+    let upload_id = emulator
+        .written_upload(knowledge_base_id, "text/plain", b"the asset the create finalized")
+        .await;
+    let reply = emulator
+        .send(
+            "POST",
+            &format!("/knowledgeBases/{knowledge_base_id}/contents"),
+            Some(json!({
+                "name": name,
+                "uploadId": upload_id,
+                "title": "The title the create gave",
+                "metadata": { "source": "crm" },
+                "tags": { "owner": "support" },
+                "overrideLinkOutUri": "https://example.test/articles/created",
+            })),
+        )
+        .await;
+    assert_eq!(
+        reply.status, 200,
+        "case {name:?}: expected HTTP 200 from the create, got {} with {}",
+        reply.status, reply.body
+    );
+    reply
+}
+
+/// RULE: a reporting operation answers out of the stored record as it stands at the call,
+/// so a match carries what the LAST write to that content persisted — never the values the
+/// create first gave it.
+#[tokio::test]
+async fn a_match_reports_the_record_as_the_last_write_left_it() {
+    let emulator = Emulator::new();
+    let (knowledge_base_id, _) = emulator
+        .knowledge_base("rewritten-search-kb", "CUSTOM")
+        .await;
+
+    // One content per row, all created before the span the create's ingestion is owed
+    // over, so a single wait leaves every record in its terminal status and the search and
+    // the read of one content are comparable member by member.
+    let rows = write_rows();
+    let mut contents = Vec::new();
+    for index in 0..rows.len() {
+        let name = format!("rewritten content {index}");
+        let created = create_content_named(&emulator, &knowledge_base_id, &name).await;
+        contents.push((
+            name,
+            created.string("/content/contentId"),
+            created.string("/content/contentArn"),
+            created.string("/content/revisionId"),
+        ));
+    }
+    tokio::time::sleep(state::CONTENT_ACTIVATION_DELAY + Duration::from_millis(50)).await;
+
+    for (row, (name, content_id, content_arn, revision_before)) in rows.iter().zip(&contents) {
+        let case = row.case;
+        let written = match &row.write {
+            Write::Update(members) => {
+                emulator
+                    .send(
+                        "POST",
+                        &format!("/knowledgeBases/{knowledge_base_id}/contents/{content_id}"),
+                        Some(members.clone()),
+                    )
+                    .await
+            }
+            Write::ReplaceAsset(content_type) => {
+                let upload_id = emulator
+                    .written_upload(&knowledge_base_id, content_type, b"the replacement asset")
+                    .await;
+                emulator
+                    .send(
+                        "POST",
+                        &format!("/knowledgeBases/{knowledge_base_id}/contents/{content_id}"),
+                        Some(json!({ "uploadId": upload_id })),
+                    )
+                    .await
+            }
+            Write::Tag(tags) => {
+                emulator
+                    .send(
+                        "POST",
+                        &format!("/tags/{}", encode_label(content_arn)),
+                        Some(json!({ "tags": tags })),
+                    )
+                    .await
+            }
+        };
+        assert!(
+            written.status == 200 || written.status == 204,
+            "case {case:?}: expected the write to be served, got {} with {}",
+            written.status,
+            written.body
+        );
+
+        let reply = emulator
+            .search(&knowledge_base_id, by_names(&[name.as_str()]), "")
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: expected HTTP 200, got {} with {}",
+            reply.status, reply.body
+        );
+        let matches = reply.array("/contentSummaries");
+        assert_eq!(
+            matches.len(),
+            1,
+            "case {case:?}: a write of these members leaves the content matching its own \
+             name, got {}",
+            reply.body
+        );
+        let matched = matches[0].as_object().cloned().unwrap_or_default();
+
+        // Every member the write moved is reported with the value the write persisted.
+        for (member, value) in row.expected.as_object().expect("the expected members") {
+            assert_eq!(
+                matched.get(member),
+                Some(value),
+                "case {case:?}: member {member:?} must be the one the write persisted \
+                 ({value}), got {:?}",
+                matched.get(member)
+            );
+        }
+
+        // And the match is that one record rather than a separately kept copy of it: it
+        // equals the read of the same content with the asset locator members dropped — the
+        // ones `ContentData` carries and `ContentSummary` does not
+        // (`smithy_query(query="shape",shape="ContentSummary,ContentData")`).
+        let fetched = emulator.content(&knowledge_base_id, content_id).await;
+        let mut stored = fetched.object("/content");
+        for locator in ["linkOutUri", "url", "urlExpiry"] {
+            stored.remove(locator);
+        }
+        assert_eq!(
+            matched, stored,
+            "case {case:?}: a match must be the stored record a read of the same content \
+             reports ({stored:?}), got {matched:?}"
+        );
+
+        // A write of the content's own members mints the next revision of it, and the
+        // search reports that one, not the revision the create first persisted.
+        if row.moves_revision {
+            let reported = matched
+                .get("revisionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert_ne!(
+                reported, revision_before,
+                "case {case:?}: a landed write moves the revision the search reports, got \
+                 {reported:?}"
+            );
+            assert_eq!(
+                Some(reported),
+                written
+                    .body
+                    .pointer("/content/revisionId")
+                    .and_then(Value::as_str),
+                "case {case:?}: the search must report the revision the write minted ({}), \
+                 got {reported:?}",
+                written.body
+            );
+        }
+    }
+}
