@@ -47,6 +47,8 @@ mod deobfuscation_source_maps;
 mod destination_scoped_definition_members;
 #[path = "all/dimension_keys_constraints.rs"]
 mod dimension_keys_constraints;
+#[path = "all/established_generated_values.rs"]
+mod established_generated_values;
 #[path = "all/event_instant_round_trip.rs"]
 mod event_instant_round_trip;
 #[path = "all/extended_metric_dimension_entries.rs"]
