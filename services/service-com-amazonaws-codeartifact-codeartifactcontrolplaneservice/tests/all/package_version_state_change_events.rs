@@ -25,6 +25,11 @@
 //! plane, a status move, a removal, a copy into another repository, a retention from an
 //! upstream repository), WHICH repository the change therefore happened in, whether the
 //! package carries a NAMESPACE, and what each change did to the version's content.
+//!
+//! A further suite walks ONE version through several changes of its own, which is the
+//! other dimension of the same rule: each change of a version the repository already holds
+//! is announced in its own right, with the next sequence number of that version and a
+//! deduplication id of its own, and a call that changes nothing is announced not at all.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -982,6 +987,230 @@ async fn a_call_that_changes_no_version_announces_nothing() {
              {withheld:?}"
         );
     }
+}
+
+/// What the announcement of one [`Step`] must say about the change that step made.
+struct Announced {
+    operation_type: &'static str,
+    version_state: &'static str,
+    sequence_number: i64,
+    changes: Value,
+}
+
+/// One publish into the SAME generic package version, and the announcement it must
+/// produce — `None` for a publish that leaves the version exactly as it stood, which is
+/// not a state change and so is announced not at all.
+struct Step {
+    case: &'static str,
+    /// The asset this publish carries; its bytes are derived from the name, so two steps
+    /// naming different assets publish different content.
+    asset: &'static str,
+    /// Whether the version stays open for further assets after this publish —
+    /// `unfinished`, the member that keeps it in `Unfinished`
+    /// (`smithy_query(query="operation",operation="PublishPackageVersion")`).
+    unfinished: bool,
+    announced: Option<Announced>,
+}
+
+/// RULE: a change to a version the repository ALREADY holds is announced in its own right
+/// — as an `Updated` operation carrying what that change did to the version, the state the
+/// version now has and the NEXT sequence number of that version, under a deduplication id
+/// of its own — while a publish that changes nothing is announced not at all.
+///
+/// The rows walk one generic version through its whole life over the wire, which is the
+/// dimension the `Created`-per-row table above does not span: the asset that creates it
+/// while it stays open, that identical asset repeated, a second asset, and the final asset
+/// that closes it at `Published`. Each row's `packageVersionRevision` is checked against
+/// the revision `DescribePackageVersion` reports at that point, so an announcement cannot
+/// carry a revision no read of the version agrees with.
+#[tokio::test]
+async fn each_change_of_a_held_version_is_announced_with_the_next_sequence_number() {
+    let steps = [
+        Step {
+            case: "the asset that creates the version, left unfinished",
+            asset: "part-one.bin",
+            unfinished: true,
+            announced: Some(Announced {
+                operation_type: "Created",
+                version_state: "Unfinished",
+                sequence_number: 1,
+                // A generic publish carries assets and no metadata document.
+                changes: json!({
+                    "assetsAdded": 1,
+                    "assetsRemoved": 0,
+                    "assetsUpdated": 0,
+                    "metadataUpdated": false,
+                    "statusChanged": true,
+                }),
+            }),
+        },
+        Step {
+            case: "the same asset again, byte for byte, into the open version",
+            asset: "part-one.bin",
+            unfinished: true,
+            announced: None,
+        },
+        Step {
+            case: "a second asset into the open version",
+            asset: "part-two.bin",
+            unfinished: true,
+            announced: Some(Announced {
+                operation_type: "Updated",
+                version_state: "Unfinished",
+                sequence_number: 2,
+                // The version gained an asset and stayed in the status it was in.
+                changes: json!({
+                    "assetsAdded": 1,
+                    "assetsRemoved": 0,
+                    "assetsUpdated": 0,
+                    "metadataUpdated": false,
+                    "statusChanged": false,
+                }),
+            }),
+        },
+        Step {
+            case: "the final asset, which closes the version at Published",
+            asset: "part-three.bin",
+            unfinished: false,
+            announced: Some(Announced {
+                operation_type: "Updated",
+                version_state: "Published",
+                sequence_number: 3,
+                changes: json!({
+                    "assetsAdded": 1,
+                    "assetsRemoved": 0,
+                    "assetsUpdated": 0,
+                    "metadataUpdated": false,
+                    "statusChanged": true,
+                }),
+            }),
+        },
+    ];
+
+    let router = emulator();
+    let domain = "seq-domain";
+    let repository = "seq-repo";
+    let namespace = "tools";
+    let package = "seq-pkg";
+    let version = "2.1.0";
+    let setup = "the version's own repository";
+
+    let (url, queue_arn) = queue(&router, setup, "seq-queue").await;
+    control(
+        &router,
+        setup,
+        "POST",
+        &format!("/v1/domain?domain={domain}"),
+        Some(json!({})),
+    )
+    .await;
+    rule(&router, setup, domain, &queue_arn).await;
+    control(
+        &router,
+        setup,
+        "POST",
+        &format!("/v1/repository?domain={domain}&repository={repository}"),
+        Some(json!({})),
+    )
+    .await;
+
+    let expected_arn = format!(
+        "arn:aws:codeartifact:{REGION}:{ACCOUNT}:package/{domain}/{repository}/generic/\
+         {namespace}/{package}"
+    );
+    // Every deduplication id announced so far: one change, one id.
+    let mut announced_ids: Vec<String> = Vec::new();
+
+    for step in &steps {
+        let case = step.case;
+        publish_generic_version(
+            &router,
+            case,
+            &format!(
+                "/v1/package/version/publish?domain={domain}&repository={repository}\
+                 &format=generic&namespace={namespace}&package={package}&version={version}\
+                 &asset={}&unfinished={}",
+                step.asset, step.unfinished
+            ),
+            tarball(step.asset, version),
+        )
+        .await;
+        let revision = described_revision(
+            &router,
+            case,
+            &Coordinate {
+                domain,
+                repository,
+                format: "generic",
+                namespace: Some(namespace),
+                package,
+                version,
+            },
+        )
+        .await;
+
+        let Some(expected) = &step.announced else {
+            // Longer than the span the announcements of the other steps took to arrive, so
+            // an empty queue is evidence that nothing was announced rather than evidence of
+            // having looked too early.
+            tokio::time::sleep(Duration::from_millis(750)).await;
+            let withheld = drain(&router, case, &url).await;
+            assert!(
+                withheld.is_empty(),
+                "case {case:?}: a publish that changed nothing must announce nothing, got \
+                 {withheld:?}"
+            );
+            continue;
+        };
+
+        let arrived = collect(&router, case, &url, 1).await;
+        assert_eq!(
+            arrived.len(),
+            1,
+            "case {case:?}: expected exactly one announcement on the queue, got {} in \
+             {arrived:?}",
+            arrived.len()
+        );
+        let envelope = &arrived[0];
+        for (pointer, wanted) in [
+            ("/source", json!(SOURCE)),
+            ("/detail-type", json!(STATE_CHANGE)),
+            ("/resources", json!([&expected_arn])),
+            ("/detail/domainName", json!(domain)),
+            ("/detail/repositoryName", json!(repository)),
+            ("/detail/packageFormat", json!("generic")),
+            ("/detail/packageNamespace", json!(namespace)),
+            ("/detail/packageName", json!(package)),
+            ("/detail/packageVersion", json!(version)),
+            ("/detail/packageVersionState", json!(expected.version_state)),
+            ("/detail/packageVersionRevision", json!(&revision)),
+            ("/detail/operationType", json!(expected.operation_type)),
+            ("/detail/sequenceNumber", json!(expected.sequence_number)),
+            ("/detail/changes", expected.changes.clone()),
+        ] {
+            let actual = envelope.pointer(pointer).cloned().unwrap_or(Value::Null);
+            assert_eq!(
+                actual, wanted,
+                "case {case:?}: expected {pointer} to be {wanted}, got {actual} in {envelope}"
+            );
+        }
+
+        let id = member(case, envelope, "/detail/eventDeduplicationId");
+        assert!(
+            !announced_ids.contains(&id),
+            "case {case:?}: each change carries its own deduplication id, but {id:?} was \
+             announced before, among {announced_ids:?}"
+        );
+        announced_ids.push(id);
+    }
+
+    let announced_count = steps.iter().filter(|step| step.announced.is_some()).count();
+    assert_eq!(
+        announced_ids.len(),
+        announced_count,
+        "case \"the whole progression\": expected {announced_count} announcement(s) in all, got \
+         {announced_ids:?}"
+    );
 }
 
 /// The SHA-256 of `content`, hex-encoded — the `assetSHA256` a generic publish declares
