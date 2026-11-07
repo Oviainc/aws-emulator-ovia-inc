@@ -9,7 +9,7 @@
 //! `@httpLabel` values that address it.
 //!
 //! Beside the store itself, this module holds what more than one of those
-//! operations needs: `advance_turn`, the one conversation turn `RecognizeText`
+//! operations needs: [`take_turn`], the one conversation turn `RecognizeText`
 //! and `RecognizeUtterance` are two encodings of, [`headers`], the wire form of
 //! the structured `x-amz-lex-*` headers `PutSession` and `RecognizeUtterance`
 //! answer with, [`bot_model`], the built bot locale a turn is interpreted
@@ -20,6 +20,7 @@ pub mod headers;
 pub mod nlu;
 
 use crate::ops::types::{ActiveContext, Interpretation, Message, SessionState};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
@@ -90,6 +91,8 @@ pub struct ComAmazonawsLexruntimev2Awsdeepsenseruntimeserviceapi20State {
     /// Every live session, keyed by its bot / alias / locale / session id.
     /// Bounded: see this struct's own documentation.
     pub sessions: HashMap<SessionKey, Session>,
+    /// The monotonic source the minted `originatingRequestId`s are derived from.
+    request_ids_minted: u64,
 }
 
 /// How long a session survives without a request.
@@ -275,14 +278,54 @@ impl ComAmazonawsLexruntimev2Awsdeepsenseruntimeserviceapi20State {
         now: SystemTime,
     ) -> Result<&mut Session, SessionStoreFull> {
         self.expire_idle_sessions(now);
-        if !self.sessions.contains_key(&key) && self.sessions.len() >= MAX_SESSIONS {
+        let fresh = !self.sessions.contains_key(&key);
+        if fresh && self.sessions.len() >= MAX_SESSIONS {
             return Err(SessionStoreFull);
         }
+        // "Amazon Lex V2 creates a session when the user starts a
+        // conversation", and the session it creates carries the
+        // `originatingRequestId` every state it reports is stamped with, so the
+        // id is minted where a session comes into existence and lives as long as
+        // the session does. A turn of a conversation that is already there mints
+        // nothing — it is stamped with the id its own first turn earned — which
+        // is why minting is done only for a key the map does not hold, and the
+        // insertion below runs in exactly that case.
+        let minted = if fresh {
+            self.mint_originating_request_id()
+        } else {
+            String::new()
+        };
         let session_id = key.session_id.clone();
         Ok(self
             .sessions
             .entry(key)
-            .or_insert_with(|| Session::new(&session_id, now)))
+            .or_insert_with(|| Session::new(&session_id, now, minted)))
+    }
+
+    /// Mint an `originatingRequestId` no live session holds: "a unique
+    /// identifier for a specific request" (`SessionState$originatingRequestId`,
+    /// a `NonEmptyString`), in the hyphenated form Amazon Lex reports it in.
+    ///
+    /// The bytes are derived from a monotonic counter through a digest, so two
+    /// sessions never share one, and the result is checked against the live
+    /// sessions before it is handed out; the LAYOUT is
+    /// [`service_common::uuid_from_random_bytes`]'s, so this module spells out
+    /// no group boundaries of its own.
+    fn mint_originating_request_id(&mut self) -> String {
+        loop {
+            self.request_ids_minted += 1;
+            let digest = Sha256::digest(self.request_ids_minted.to_be_bytes());
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            let candidate = ::service_common::uuid_from_random_bytes(bytes);
+            if !self
+                .sessions
+                .values()
+                .any(|session| session.originating_request_id == candidate)
+            {
+                return candidate;
+            }
+        }
     }
 
     /// Remove the session `key` addresses, if it is still live.
@@ -496,6 +539,13 @@ pub struct Session {
     pub interpretations: Vec<Interpretation>,
     /// Request attributes accumulated over the session.
     pub request_attributes: HashMap<String, String>,
+    /// The `originatingRequestId` every state this session reports is stamped
+    /// with: minted when the session came into existence and stable for its
+    /// whole life, which is what lets a client tell the turns of one
+    /// conversation apart from a conversation started on the same session id
+    /// after a `DeleteSession`. A caller that supplies one of its own in a
+    /// `sessionState` replaces it.
+    pub originating_request_id: String,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
     /// Conversation turns served for this session. "Each request and response
@@ -505,8 +555,9 @@ pub struct Session {
 }
 
 impl Session {
-    /// A brand-new, empty session.
-    pub fn new(session_id: &str, now: SystemTime) -> Self {
+    /// A brand-new, empty session, stamped with the `originatingRequestId` the
+    /// store minted for it.
+    pub fn new(session_id: &str, now: SystemTime, originating_request_id: String) -> Self {
         Self {
             session_id: session_id.to_string(),
             session_state: SessionState::default(),
@@ -514,6 +565,7 @@ impl Session {
             messages: Vec::new(),
             interpretations: Vec::new(),
             request_attributes: HashMap::new(),
+            originating_request_id,
             created_at: now,
             updated_at: now,
             turns: 0,
@@ -568,11 +620,22 @@ impl Session {
     }
 
     /// The session state a caller observes at `now`: the stored dialog state
-    /// with the contexts that are still active.
+    /// with the contexts that are still active, stamped with the session's
+    /// `originatingRequestId`.
     pub fn visible_session_state(&self, now: SystemTime) -> SessionState {
         let mut state = self.session_state.clone();
         let live = self.live_contexts(now);
         state.active_contexts = (!live.is_empty()).then_some(live);
+        // "A unique identifier for a specific request": the service reports it
+        // on every state it answers with, so it is read off the session rather
+        // than only echoed back when a caller supplied one.
+        state.originating_request_id = Some(self.originating_request_id.clone());
+        // `sessionAttributes` is the "map of key/value pairs representing
+        // session-specific context information" a client reads and writes across
+        // the turns of a conversation: the map is reported on every state, empty
+        // for a session nothing has put an attribute on, so a client can index
+        // it without first testing whether the member is there.
+        state.session_attributes = Some(state.session_attributes.unwrap_or_default());
         state
     }
 
@@ -593,8 +656,12 @@ impl Session {
     /// every member the request carried becomes the session's state.
     pub fn replace_session_state(&mut self, supplied: SessionState, now: SystemTime) {
         let active_contexts = supplied.active_contexts.clone().unwrap_or_default();
+        if let Some(originating_request_id) = supplied.originating_request_id.clone() {
+            self.originating_request_id = originating_request_id;
+        }
         self.session_state = SessionState {
             active_contexts: None,
+            originating_request_id: None,
             ..supplied
         };
         self.set_active_contexts(active_contexts, now);
@@ -614,7 +681,10 @@ impl Session {
             self.session_state.intent = Some(intent);
         }
         if let Some(originating_request_id) = supplied.originating_request_id {
-            self.session_state.originating_request_id = Some(originating_request_id);
+            // A caller that names the request its conversation originated from
+            // sets the session's own id to it, so every later state reports what
+            // it named rather than the one minted with the session.
+            self.originating_request_id = originating_request_id;
         }
         if let Some(runtime_hints) = supplied.runtime_hints {
             self.session_state.runtime_hints = Some(runtime_hints);
@@ -728,7 +798,7 @@ mod tests {
         ];
 
         for (case, seconds, elapsed, expected) in cases {
-            let mut session = Session::new("s", set_at);
+            let mut session = Session::new("s", set_at, "request-1".to_string());
             session.set_active_contexts(vec![context("checkout", *seconds, 20)], set_at);
             let now = set_at + Duration::from_secs(*elapsed);
             let live = session.live_contexts(now);
@@ -753,7 +823,7 @@ mod tests {
     #[test]
     fn reading_a_session_does_not_change_it() {
         let set_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let mut session = Session::new("s", set_at);
+        let mut session = Session::new("s", set_at, "request-1".to_string());
         session.set_active_contexts(
             vec![context("short", 5, 20), context("long", 86400, 20)],
             set_at,
@@ -784,7 +854,7 @@ mod tests {
     #[test]
     fn a_turn_spends_one_turn_of_each_context() {
         let set_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let mut session = Session::new("s", set_at);
+        let mut session = Session::new("s", set_at, "request-1".to_string());
         session.set_active_contexts(
             vec![context("one", 86400, 1), context("three", 86400, 3)],
             set_at,

@@ -581,18 +581,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "The prompt or statement to send to the user": with a text
-        // `responseContentType` that prompt is the text of the messages the
-        // session carries, which is what the `x-amz-lex-messages` header reports
-        // in full. One message is its own content; several are run together one
-        // per line, so nothing the session holds is dropped and nothing is
-        // invented.
-        let audio_stream = turn
-            .messages
-            .iter()
-            .filter_map(|message| message.content.as_deref())
-            .collect::<Vec<_>>()
-            .join("\n")
-            .into_bytes();
+        // `responseContentType` the prompt travels as TEXT — the
+        // `x-amz-lex-messages` header carries the messages in full — and this
+        // member carries the speech Amazon Lex V2 synthesized, which a turn that
+        // asked for text has none of. The recorded behavioural check states the
+        // same thing of a real text turn: "asking for text must suppress speech
+        // synthesis", where the response it compares against carries no audio
+        // bytes at all even though the turn's messages are not empty.
+        let audio_stream = Vec::new();
 
         Ok(RecognizeUtteranceOutput {
             // The input was text, so that is the mode this turn ran in.

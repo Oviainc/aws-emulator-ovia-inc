@@ -1177,13 +1177,31 @@ async fn the_lex_headers_are_gzipped_and_base64_encoded() {
         );
     }
 
+    // The dialog state a caller reads back carries the session's own
+    // `originatingRequestId` beside what the request set: the service mints one
+    // when the session comes into existence and reports it on every state it
+    // answers with, so it is asserted as a present, non-empty value and the rest
+    // of the state is compared against what was stored.
+    let decoded = put
+        .lex_header("x-amz-lex-session-state")
+        .expect("x-amz-lex-session-state is required");
+    let originating_request_id = decoded
+        .get("originatingRequestId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !originating_request_id.is_empty(),
+        "the session state must carry the originatingRequestId the service minted, got {decoded:?}"
+    );
     assert_eq!(
-        put.lex_header("x-amz-lex-session-state"),
-        Some(json!({
+        decoded,
+        json!({
             "dialogAction": {"type": "ElicitSlot", "slotToElicit": "Size"},
             "intent": {"name": "OrderPizza", "state": "InProgress"},
             "sessionAttributes": {"cart": "2"},
-        })),
+            "originatingRequestId": originating_request_id,
+        }),
         "the decoded session-state header is the stored state's JSON"
     );
     assert_eq!(

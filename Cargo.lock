@@ -13241,7 +13241,6 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "flate2",
- "hex",
  "http",
  "serde_json",
  "service-com-amazonaws-lexmodelsv2-lexmodelbuildingservicev2",

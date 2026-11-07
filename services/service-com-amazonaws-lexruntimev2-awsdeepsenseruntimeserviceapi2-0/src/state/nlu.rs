@@ -9,8 +9,8 @@
 //! in, it answers with the intent of the turn, the slots it filled, the next
 //! dialog action and the messages to send. `RecognizeText` and
 //! `RecognizeUtterance` are two encodings of the same turn, so both reach it
-//! through `crate::state::ComAmazonawsLexruntimev2Awsdeepsenseruntimeserviceapi20State::advance_turn`
-//! and neither holds a second copy of the dialog.
+//! through [`crate::state::take_turn`] and neither holds a second copy of the
+//! dialog.
 //!
 //! The three rules it implements, each from the modelled contract:
 //!
@@ -18,7 +18,8 @@
 //!    declare; the best match at or above the locale's own
 //!    `nluIntentConfidenceThreshold` is the intent of the turn, and when nothing
 //!    matches the conversation stays on the intent it is already on, or falls
-//!    back to [`crate::state::FALLBACK_INTENT`].
+//!    back to [`crate::state::FALLBACK_INTENT`] — with the locale's own intents
+//!    reported beside it at the scores they did reach, nought included.
 //! 2. A sample utterance names a slot of its intent in braces, and the words in
 //!    that position are what the user said for the slot; the answer to a slot the
 //!    previous turn elicited is the whole utterance. Either way the words are
@@ -27,8 +28,12 @@
 //!    to nothing leaves the slot unfilled.
 //! 3. While a required slot of the intent has no value the turn ends on
 //!    `ElicitSlot` for that slot, with the prompt authored on it and the intent
-//!    `InProgress`; once every required slot has one the intent is
-//!    `ReadyForFulfillment` and the dialog closes.
+//!    `InProgress`; once every required slot has one the dialog closes, and the
+//!    intent is `Fulfilled` where the bot has a closing response to convey that
+//!    it is and `ReadyForFulfillment` where it authored none.
+//! 4. Every turn reports both members a client drives a dialog off:
+//!    `Intent.slots` — the map of the intent's slots, empty while nothing is
+//!    filled rather than absent — and `Intent.state`.
 
 use super::bot_model::{resolve_slot_value, BotLocaleModel, ModelIntent};
 use super::{DIALOG_ACTION_CLOSE, FALLBACK_INTENT, INTERPRETATION_SOURCE, MAX_UTTERANCE_CHARS};
@@ -75,6 +80,13 @@ pub const INTENT_STATE_IN_PROGRESS: &str = "InProgress";
 /// intent and is ready to fulfill the intent" (`Intent$state`).
 pub const INTENT_STATE_READY_FOR_FULFILLMENT: &str = "ReadyForFulfillment";
 
+/// `Fulfilled`: "the bot has completed fulfillment of the intent"
+/// (`Intent$state`) — where an intent whose dialog the bot closed with its own
+/// closing response lands, that response being the statement Amazon Lex conveys
+/// "when the intent is successfully fulfilled"
+/// (`IntentClosingSetting$closingResponse`).
+pub const INTENT_STATE_FULFILLED: &str = "Fulfilled";
+
 /// The most interpretations one turn reports: the modelled `Interpretations`
 /// list is `len 0..5`.
 pub const MAX_INTERPRETATIONS: usize = 5;
@@ -99,14 +111,22 @@ pub struct TurnPlan {
 pub fn interpret(model: &BotLocaleModel, text: &str, state: &SessionState) -> TurnPlan {
     let said = tokens(text);
 
-    // Every intent of the locale, scored against the utterance, best first —
-    // within the work one turn may spend on the scan.
+    // Every intent of the locale an utterance CAN be matched against, scored
+    // against this one, best first — within the work one turn may spend on the
+    // scan. An intent that declares no sample utterance is left out: there is
+    // nothing to match it on, which is why the fallback intent the control plane
+    // adds to a locale is not scored but inserted by the threshold rule below.
+    //
+    // An intent that scored 0.00 STAYS: "ranges between 0.00 and 1.00"
+    // (`ConfidenceScore$score`), so nought is a score the bot's intent earned
+    // and reporting it is what tells a fallback the threshold caused from a bot
+    // that matches nothing at all.
     let mut budget = MAX_MATCH_WORK;
     let mut scored: Vec<(&ModelIntent, Matched)> = model
         .intents
         .iter()
+        .filter(|intent| !intent.sample_utterances.is_empty())
         .map(|intent| (intent, best_match(intent, &said, &mut budget)))
-        .filter(|(_, matched)| matched.score > 0.0)
         .collect();
     scored.sort_by(|(left, left_match), (right, right_match)| {
         right_match
@@ -116,10 +136,11 @@ pub fn interpret(model: &BotLocaleModel, text: &str, state: &SessionState) -> Tu
     });
     // "The specified confidence threshold for inserting the
     // AMAZON.FallbackIntent": a best match below the locale's own threshold is
-    // not a match at all.
-    let recognized = scored
-        .first()
-        .filter(|(_, matched)| matched.score >= model.nlu_intent_confidence_threshold);
+    // not a match at all, and neither is one that matched nothing of the
+    // utterance, however low the threshold is set.
+    let recognized = scored.first().filter(|(_, matched)| {
+        matched.score > 0.0 && matched.score >= model.nlu_intent_confidence_threshold
+    });
 
     // The intent of this turn: the one the utterance recognised, else the one
     // the conversation is already on (an answer to a slot elicitation names no
@@ -187,22 +208,37 @@ pub fn interpret(model: &BotLocaleModel, text: &str, state: &SessionState) -> Tu
             }
             None => {
                 messages = authored.closing_messages.clone();
-                (
-                    Some(INTENT_STATE_READY_FOR_FULFILLMENT.to_string()),
-                    close(),
-                )
+                // Nothing is left to elicit. The bot has COMPLETED the intent
+                // where it has a closing response to convey that it has, and is
+                // ready for the client to fulfil it where it authored none.
+                let state = if authored.closing_messages.is_empty() {
+                    INTENT_STATE_READY_FOR_FULFILLMENT
+                } else {
+                    INTENT_STATE_FULFILLED
+                };
+                (Some(state.to_string()), close())
             }
         },
         // An intent the locale does not declare — a name a caller put in the
         // session itself — has no slots here to elicit, so this turn elicits
         // nothing, the dialog closes, and the state the session carries for it
-        // is left as the caller set it.
-        None => (continued.and_then(|intent| intent.state.clone()), close()),
+        // stands; with none carried, there is nothing left to elicit for it
+        // either.
+        None => (
+            continued
+                .and_then(|intent| intent.state.clone())
+                .or_else(|| Some(INTENT_STATE_READY_FOR_FULFILLMENT.to_string())),
+            close(),
+        ),
     };
 
     let intent = Intent {
         name,
-        slots: (!slots.is_empty()).then_some(slots),
+        // "A map of all of the slots for the intent. The name of the slot maps to
+        // the value of the slot" (`Intent$slots`): the map is reported on every
+        // turn — empty while nothing is filled — so a client can index it
+        // without first testing whether the member is there.
+        slots: Some(slots),
         state: intent_state,
         confirmation_state: continued.and_then(|intent| intent.confirmation_state.clone()),
     };
@@ -229,7 +265,10 @@ pub fn interpret(model: &BotLocaleModel, text: &str, state: &SessionState) -> Tu
             sentiment_response: None,
             intent: Some(Intent {
                 name: candidate.name.clone(),
-                slots: None,
+                // An alternative is an intent the utterance MIGHT have
+                // satisfied: nothing is filled for it, which the same rule
+                // reports as the empty map.
+                slots: Some(HashMap::new()),
                 state: None,
                 confirmation_state: None,
             }),

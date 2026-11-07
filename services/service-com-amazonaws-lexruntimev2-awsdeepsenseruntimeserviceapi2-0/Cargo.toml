@@ -25,6 +25,10 @@ aws-smithy-types = { workspace = true }
 # gzip: this service's `x-amz-lex-*` header payloads are "compressed with gzip
 # and then base64 encoded" (RecognizeUtterance's own documentation).
 flate2 = "1"
+# sha2: the `originatingRequestId` a session is stamped with is derived from a
+# monotonic counter through a digest, so two sessions never share one (the
+# hyphenated layout itself is `service_common::uuid_from_random_bytes`).
+sha2 = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
@@ -33,10 +37,6 @@ tracing = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

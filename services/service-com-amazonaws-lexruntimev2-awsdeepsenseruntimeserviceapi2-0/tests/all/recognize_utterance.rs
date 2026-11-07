@@ -310,25 +310,16 @@ async fn an_utterance_advances_the_session_exactly_as_the_same_text_does() {
             "case {:?}: a text turn reports the default content type",
             case.name
         );
-        // "The prompt or statement to send to the user", as text: the content of
-        // the messages the session carries, which the messages header reports in
-        // full.
-        let expected_prompt = expected
-            .get("messages")
-            .and_then(Value::as_array)
-            .map(|messages| {
-                messages
-                    .iter()
-                    .filter_map(|message| message.get("content").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        assert_eq!(
-            String::from_utf8_lossy(&utterance.body),
-            expected_prompt,
-            "case {:?}: the payload is the text of the messages",
-            case.name
+        // "The prompt or statement to send to the user": a turn that asked for
+        // text is answered with no audio at all — the messages travel as text on
+        // their own header, which the assertions above compare member by member,
+        // and nothing synthesized speech for this turn. A recorded text turn
+        // whose messages are NOT empty carries no audio bytes either.
+        assert!(
+            utterance.body.is_empty(),
+            "case {:?}: a text turn carries no audio stream, got {:?}",
+            case.name,
+            String::from_utf8_lossy(&utterance.body)
         );
 
         // Rule 3: both encodings leave the same session behind.

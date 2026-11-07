@@ -43,12 +43,12 @@ use crate::harness::Emulator;
 const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lex-runtime-suite";
 
 /// The prompt authored on the slot every conversation here elicits.
-const SIZE_PROMPT: &str = "What size pizza would you like?";
+pub(crate) const SIZE_PROMPT: &str = "What size pizza would you like?";
 
 /// The intent every conversation here is about, and its slot.
-const ORDER_PIZZA: &str = "OrderPizza";
+pub(crate) const ORDER_PIZZA: &str = "OrderPizza";
 /// See [`ORDER_PIZZA`].
-const PIZZA_SIZE: &str = "PizzaSize";
+pub(crate) const PIZZA_SIZE: &str = "PizzaSize";
 
 /// The sample utterances authored on [`ORDER_PIZZA`]: one that names no slot
 /// value and one that names the slot in the position its value is said in.
@@ -58,7 +58,7 @@ const UTTERANCES: [&str; 2] = ["I want to order a pizza", "I want a {PizzaSize} 
 /// inside the modelled `ConfidenceThreshold` range 0..1.
 const LOCALE: &str = "en_US";
 /// See [`LOCALE`].
-const THRESHOLD: f64 = 0.4;
+pub(crate) const THRESHOLD: f64 = 0.4;
 
 /// `TopResolution` and the two other members of the modelled
 /// `SlotValueResolutionStrategy` enum
@@ -69,15 +69,15 @@ const TOP_RESOLUTION: &str = "TopResolution";
 const ORIGINAL_VALUE: &str = "OriginalValue";
 
 /// The bot a conversation is held with, as the control plane minted it.
-struct Bot {
-    bot_id: String,
-    bot_alias_id: String,
-    locale_id: String,
+pub(crate) struct Bot {
+    pub(crate) bot_id: String,
+    pub(crate) bot_alias_id: String,
+    pub(crate) locale_id: String,
 }
 
 impl Bot {
     /// The session address of one conversation with this bot.
-    fn session(&self, session_id: &str) -> String {
+    pub(crate) fn session(&self, session_id: &str) -> String {
         format!(
             "/bots/{}/botAliases/{}/botLocales/{}/sessions/{session_id}",
             self.bot_id, self.bot_alias_id, self.locale_id
@@ -86,7 +86,7 @@ impl Bot {
 }
 
 /// Dispatch one control-plane call and assert the status it answered with.
-async fn control(
+pub(crate) async fn control(
     emulator: &Emulator,
     method: &str,
     uri: &str,
@@ -106,7 +106,7 @@ async fn control(
 }
 
 /// A response member as a string, for the ids the control plane mints.
-fn id(body: &Value, member: &str) -> String {
+pub(crate) fn id(body: &Value, member: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("the response must carry {member}, got {body:?}"))
@@ -119,12 +119,15 @@ fn id(body: &Value, member: &str) -> String {
 /// [`SIZE_PROMPT`] authored on it and a priority ordering it.
 ///
 /// `built` decides whether `BuildBotLocale` is run and waited out: a locale is
-/// servable only once it is `Built`.
-async fn pizza_bot(
+/// servable only once it is `Built`. `closing` is the plain text of the intent's
+/// `intentClosingSetting` closing response, or `None` for a bot that authors
+/// none.
+pub(crate) async fn pizza_bot(
     emulator: &Emulator,
     bot_name: &str,
     strategy: Option<&str>,
     built: bool,
+    closing: Option<&str>,
 ) -> Bot {
     let created = control(
         emulator,
@@ -190,11 +193,28 @@ async fn pizza_bot(
         .iter()
         .map(|utterance| json!({"utterance": utterance}))
         .collect();
+    // The statement Amazon Lex conveys "when the intent is successfully
+    // fulfilled" (`IntentClosingSetting$closingResponse`), for the bots whose
+    // author wrote one.
+    let closing_setting = closing.map(|text| {
+        json!({
+            "closingResponse": {
+                "messageGroups": [{"message": {"plainTextMessage": {"value": text}}}],
+            },
+        })
+    });
+    let mut create_intent = json!({
+        "intentName": ORDER_PIZZA,
+        "sampleUtterances": sample_utterances.clone(),
+    });
+    if let Some(setting) = closing_setting.clone() {
+        create_intent["intentClosingSetting"] = setting;
+    }
     let intent = control(
         emulator,
         "PUT",
         &format!("/bots/{bot_id}/botversions/DRAFT/botlocales/{LOCALE}/intents"),
-        json!({"intentName": ORDER_PIZZA, "sampleUtterances": sample_utterances.clone()}),
+        create_intent,
         200,
         "CreateIntent",
     )
@@ -225,16 +245,21 @@ async fn pizza_bot(
     let slot_id = id(&slot, "slotId");
 
     // The elicitation order of an intent's slots is its `slotPriorities`, which
-    // a build requires every slot of the intent to appear in.
+    // a build requires every slot of the intent to appear in. An update replaces
+    // the intent, so everything the create gave it goes with the priorities.
+    let mut update_intent = json!({
+        "intentName": ORDER_PIZZA,
+        "sampleUtterances": sample_utterances,
+        "slotPriorities": [{"priority": 1, "slotId": slot_id}],
+    });
+    if let Some(setting) = closing_setting {
+        update_intent["intentClosingSetting"] = setting;
+    }
     control(
         emulator,
         "PUT",
         &format!("/bots/{bot_id}/botversions/DRAFT/botlocales/{LOCALE}/intents/{intent_id}"),
-        json!({
-            "intentName": ORDER_PIZZA,
-            "sampleUtterances": sample_utterances,
-            "slotPriorities": [{"priority": 1, "slotId": slot_id}],
-        }),
+        update_intent,
         200,
         "UpdateIntent",
     )
@@ -271,7 +296,7 @@ async fn pizza_bot(
 
 /// Build the locale and wait for the `Built` the clock owes, asserting
 /// `DescribeBotLocale` reports it.
-async fn build(emulator: &Emulator, bot_id: &str) {
+pub(crate) async fn build(emulator: &Emulator, bot_id: &str) {
     control(
         emulator,
         "POST",
@@ -302,7 +327,7 @@ async fn build(emulator: &Emulator, bot_id: &str) {
 }
 
 /// One `RecognizeText` turn.
-async fn say(emulator: &Emulator, bot: &Bot, session_id: &str, text: &str) -> Value {
+pub(crate) async fn say(emulator: &Emulator, bot: &Bot, session_id: &str, text: &str) -> Value {
     let path = format!("{}/text", bot.session(session_id));
     let reply = emulator.send("POST", &path, Some(json!({"text": text}))).await;
     assert_eq!(
@@ -335,7 +360,7 @@ fn resolved(body: &Value, slot: &str) -> Option<Vec<String>> {
 }
 
 /// The `PlainText` contents of a turn's `messages`, in order.
-fn messages(body: &Value) -> Vec<String> {
+pub(crate) fn messages(body: &Value) -> Vec<String> {
     body.get("messages")
         .and_then(Value::as_array)
         .map(|messages| {
@@ -465,7 +490,7 @@ fn assert_turn(turn: &Value, expected: &Expected<'_>) {
 #[tokio::test]
 async fn an_utterance_is_interpreted_against_the_built_locale() {
     let emulator = Emulator::new();
-    let bot = pizza_bot(&emulator, "SingleTurnPizzaBot", Some(TOP_RESOLUTION), true).await;
+    let bot = pizza_bot(&emulator, "SingleTurnPizzaBot", Some(TOP_RESOLUTION), true, None).await;
 
     let large: &[&str] = &["large"];
     let small: &[&str] = &["small"];
@@ -591,7 +616,7 @@ async fn an_utterance_is_interpreted_against_the_built_locale() {
 #[tokio::test]
 async fn an_elicited_slot_is_filled_from_the_answer_and_read_back() {
     let emulator = Emulator::new();
-    let bot = pizza_bot(&emulator, "MultiTurnPizzaBot", Some(TOP_RESOLUTION), true).await;
+    let bot = pizza_bot(&emulator, "MultiTurnPizzaBot", Some(TOP_RESOLUTION), true, None).await;
 
     let large: &[&str] = &["large"];
     let small: &[&str] = &["small"];
@@ -778,7 +803,8 @@ async fn the_resolution_strategy_decides_what_an_answer_resolves_to() {
     ];
 
     for (index, (case, strategy, answer, interpreted, resolved_values)) in rows.iter().enumerate() {
-        let bot = pizza_bot(&emulator, &format!("StrategyBot{index}"), *strategy, true).await;
+        let bot =
+            pizza_bot(&emulator, &format!("StrategyBot{index}"), *strategy, true, None).await;
         let session = format!("strategy-{index}");
         say(&emulator, &bot, &session, UTTERANCES[0]).await;
         let answered = say(&emulator, &bot, &session, answer).await;
@@ -828,7 +854,7 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
     let emulator = Emulator::new();
     // Authored but NOT built: a locale leaves `Creating` for `NotBuilt`, the
     // status AWS documents for one that "was saved but not built".
-    let bot = pizza_bot(&emulator, "UnbuiltPizzaBot", Some(TOP_RESOLUTION), false).await;
+    let bot = pizza_bot(&emulator, "UnbuiltPizzaBot", Some(TOP_RESOLUTION), false, None).await;
     let locale_uri = format!(
         "/bots/{}/botversions/DRAFT/botlocales/{}",
         bot.bot_id, bot.locale_id
