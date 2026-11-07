@@ -221,6 +221,7 @@ pub mod aws_integration;
 pub mod cognito_user_pools;
 pub mod execute_api_authorization;
 pub mod lambda_proxy;
+mod onward_endpoint;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -408,6 +409,19 @@ const METHOD_REQUEST_MULTI_HEADER_PREFIX: &str = "method.request.multivalueheade
 /// `integration.request.{location}.{name}` over the same three locations a method request
 /// parameter is written over.
 const INTEGRATION_REQUEST_HEADER_PREFIX: &str = "integration.request.header.";
+
+/// The header API Gateway adds to the request it passes to an HTTP integration endpoint,
+/// naming the api the request came through: a backend shared by several apis reads which one
+/// called it off this header, and it is added by the api rather than by the caller.
+const INTEGRATION_API_ID_HEADER: &str = "x-amzn-apigateway-api-id";
+
+/// The same prefix for a PATH parameter of the integration request: the value the `uri`'s
+/// own `{name}` placeholder is addressed with; see [`INTEGRATION_REQUEST_HEADER_PREFIX`].
+const INTEGRATION_REQUEST_PATH_PREFIX: &str = "integration.request.path.";
+
+/// The same prefix for a QUERY-STRING parameter of the integration request: a pair the
+/// backend is called with; see [`INTEGRATION_REQUEST_HEADER_PREFIX`].
+const INTEGRATION_REQUEST_QUERY_PREFIX: &str = "integration.request.querystring.";
 
 /// The query parameters a PRESIGNED SigV4 credential is carried in — the query-string form
 /// of the headers [`HEADERS_NOT_PASSED_THROUGH`] withholds, and the set AWS documents a
@@ -1389,6 +1403,10 @@ async fn serving<Eng: Send + Sync + 'static>(
                 multi_value_querystring: every_query_parameter(query_of(req.uri())),
                 multi_value_header: every_header(req),
                 source_arn: Some(call_of.method_arn()),
+                // What the api declares BINARY, which decides whether a base64 body the
+                // function returns reaches the client as the bytes it names or as the
+                // base64 text it is ([`lambda_proxy`]).
+                binary_media_types: api.binary_media_types.clone(),
             },
         );
         // The method's own request validator, before the integration is reached: a
@@ -1551,7 +1569,15 @@ async fn serving<Eng: Send + Sync + 'static>(
         .method
         .as_ref()
         .and_then(|method| method.integration.as_ref())
-        .and_then(|record| passed_through(record, req, hop));
+        .and_then(|record| {
+            passed_through(
+                record,
+                req,
+                hop,
+                &integration.call.inputs.path,
+                &integration.api_id,
+            )
+        });
     let served = if let Some(passed_on) = passed_on {
         if let Some(reason) = integration.unusable_connection.clone() {
             return refuse(UnservedIntegration {
@@ -1562,6 +1588,13 @@ async fn serving<Eng: Send + Sync + 'static>(
         match passed_on {
             PassedThrough::Unserved(unserved) => return refuse(unserved),
             PassedThrough::Request(onward) => serve_resolved(engine, &onward, ctx, hop + 1).await,
+            // Another endpoint of this emulator: the request crosses the in-process
+            // transport, and what the service claiming that endpoint answered IS the
+            // method response.
+            PassedThrough::Onward(onward) => match onward_endpoint::answered(ctx, *onward).await {
+                Ok(answered) => answered,
+                Err(unserved) => return refuse(unserved),
+            },
         }
     } else {
         match performed_integration(
@@ -2922,6 +2955,11 @@ enum PassedThrough {
     /// Boxed: a whole request is far larger than the refusal beside it, and this value
     /// is returned by value from the resolution below.
     Request(Box<RtRequest>),
+    /// The same request, addressed at an endpoint of this emulator that is NOT a stage of
+    /// this api plane (a Lambda function URL, another service's data plane): it is passed
+    /// on over the in-process transport instead, and what that endpoint answered is the
+    /// method response ([`onward_endpoint`]).
+    Onward(Box<RtRequest>),
     /// The integration passes the request to a backend, or through a mapping, this
     /// emulator cannot perform.
     Unserved(UnservedIntegration),
@@ -2930,27 +2968,38 @@ enum PassedThrough {
 /// How `integration` passes this request on, or `None` when it passes nothing on — so the
 /// call is performed from the api's own records instead ([`perform_integration`]).
 ///
-/// Only an `HTTP_PROXY` whose `uri` names an `execute-api` INVOKE ENDPOINT passes anything
-/// on here, and the destination is checked against that shape BEFORE any request is built:
-/// such an endpoint is one this emulator serves itself, so the pass-through is a request
-/// handed back to [`serve_resolved`] in process — no connection is opened, no name is
-/// resolved and no address the caller chose is dialled. The endpoint's own records then
-/// decide the answer — which api, which stage, which method, and that api's resource policy
-/// — exactly as they would for a client that addressed the endpoint directly, so a proxy
-/// integration's answer is never assembled here.
+/// Only an `HTTP_PROXY` passes anything on here. A `uri` naming an `execute-api` INVOKE
+/// ENDPOINT is a stage of THIS api plane, so the pass-through is a request handed back to
+/// [`serve_resolved`] in process — no connection is opened, no name is resolved and no
+/// address the caller chose is dialled. The endpoint's own records then decide the answer —
+/// which api, which stage, which method, and that api's resource policy — exactly as they
+/// would for a client that addressed the endpoint directly, so a proxy integration's answer
+/// is never assembled here.
 ///
-/// A `uri` naming any other host is a backend over the network, and an `HTTP` integration's
-/// response is chosen by a mapping this emulator does not evaluate: both are left to
-/// [`perform_integration`]'s refusal. A `uri` carrying a mapping placeholder — the stage's
-/// own variables are resolved into the configuration before this
-/// ([`with_stage_variables`]), so what is left is a placeholder this emulator does not
-/// expand — and a
-/// `requestParameters` entry outside the two forms that member documents (a static value in
-/// single quotes, or a `method.request.{header|querystring}.{name}` source) onto a header of
-/// the integration request, are stated as integrations this call cannot perform rather than
-/// silently dropped. A mapping whose SOURCE the request simply does not carry is a different
-/// thing from one written in a form that is not read: the header is left off, and the
-/// request is still passed on ([`MappedParameter`]).
+/// A `uri` naming ANY OTHER endpoint is passed on just the same, over the in-process
+/// transport, because this emulator publishes data planes other than this one — a Lambda
+/// function URL is an HTTP endpoint a proxy integration names — and the answer is whichever
+/// service CLAIMS that endpoint ([`onward_endpoint`]), or the refusal of an integration this
+/// stage cannot perform when nothing claims it at all. The two differ only in how the
+/// request is carried: one re-enters this plane's own serving, the other crosses the
+/// transport, and neither invents a backend answer.
+///
+/// The endpoint the request is passed on to, and what the api names ITSELF to that endpoint,
+/// are the integration's own: the `uri`'s authority is the `Host` the onward request carries
+/// and the api's id travels in [`INTEGRATION_API_ID_HEADER`], both of which replace whatever
+/// the caller sent under those names.
+///
+/// An `HTTP` integration's response is chosen by a mapping this emulator does not evaluate,
+/// so it is left to [`perform_integration`]'s refusal. The integration's own
+/// `requestParameters` are applied on the way: each entry maps "a method request parameter
+/// value or static value" onto a header, a path parameter or a query-string parameter of the
+/// integration request, the three locations that member names, and the `uri`'s own `{name}`
+/// placeholders are addressed from the path ones ([`expanded_uri`]). An entry whose KEY names
+/// none of those three locations, one whose VALUE is in neither documented form, and a `uri`
+/// placeholder no mapping names are each stated as an integration this call cannot perform
+/// rather than silently dropped. A mapping whose SOURCE the request simply does not carry is
+/// a different thing from one written in a form that is not read: the parameter is left off,
+/// and the request is still passed on ([`MappedParameter`]).
 ///
 /// `hop` is how many integrations of this emulator's own endpoints this request has already
 /// been passed through, and it is checked HERE, before any onward request is built: an
@@ -2962,6 +3011,8 @@ fn passed_through(
     integration: &GetIntegrationOutput,
     req: &RtRequest,
     hop: u8,
+    path_parameters: &BTreeMap<String, String>,
+    api_id: &str,
 ) -> Option<PassedThrough> {
     if integration.r#type.as_deref() != Some(HTTP_PROXY_INTEGRATION_TYPE) {
         return None;
@@ -2977,22 +3028,72 @@ fn passed_through(
         }));
     }
     let uri = integration.uri.as_deref().unwrap_or_default();
-    // The host the request is passed on to. A `uri` with no authority at all addresses
-    // nothing, and one whose authority is not an `execute-api` endpoint addresses a backend
-    // outside this emulator: neither is served here.
+    // The endpoint the request is passed on to. A `uri` with no authority at all addresses
+    // nothing, so nothing is passed on for it; an authority that is an `execute-api`
+    // endpoint is a stage of THIS plane, which is served by re-entering it, and any other
+    // is an endpoint reached over the in-process transport.
     let host = authority_of(uri)?;
-    endpoint_labels(host)?;
-    if uri.contains('{') {
+    let within_this_plane = endpoint_labels(host).is_some();
+
+    // What `requestParameters` maps onto the integration request, read BEFORE anything is
+    // built from it: the PATH parameters decide the address itself, so the mappings are
+    // resolved first and the request is addressed from them.
+    let mut mapped = MappedRequest::default();
+    for (key, value) in integration.request_parameters.iter().flatten() {
+        let Some((location, name)) = integration_request_parameter(key) else {
+            return Some(PassedThrough::Unserved(UnservedIntegration {
+                refusal: API_CONFIGURATION_ERROR,
+                reason: format!(
+                    "the integration maps {key}, which is not a parameter of the integration \
+                     request's header, path or query string, so the mapping is not applied \
+                     and the request is not sent"
+                ),
+            }));
+        };
+        let value = match mapped_request_parameter(value, req, path_parameters) {
+            MappedParameter::Value(mapped) => mapped,
+            // The source names a location this emulator reads and the request carries
+            // nothing there, so the mapping maps nothing: the backend is called without
+            // that parameter, which is what it would be called with on AWS.
+            MappedParameter::SourceAbsent => continue,
+            MappedParameter::NotRead => {
+                return Some(PassedThrough::Unserved(UnservedIntegration {
+                    refusal: API_CONFIGURATION_ERROR,
+                    reason: format!(
+                        "the integration maps {key} from {value}, which is neither a static \
+                         value in single quotes nor a method request parameter this emulator \
+                         reads"
+                    ),
+                }));
+            }
+        };
+        match location {
+            ParameterIn::Header => mapped.headers.push((name.to_string(), value)),
+            ParameterIn::Path => {
+                mapped.path.insert(name.to_string(), value);
+            }
+            ParameterIn::Query => mapped.querystring.push((name.to_string(), value)),
+        }
+    }
+
+    // The address the backend is called at: the `uri`, with each `{name}` placeholder
+    // replaced by the path parameter the integration maps onto that name, and then the
+    // query string the call carries onward. A placeholder still left after that names a
+    // path parameter the integration maps nothing onto, so the address is unknown.
+    let addressed = expanded_uri(uri, &mapped.path);
+    if addressed.contains('{') {
         return Some(PassedThrough::Unserved(UnservedIntegration {
             refusal: API_CONFIGURATION_ERROR,
-            reason: "the integration's uri carries a mapping placeholder, which this \
-                     emulator does not expand: no request is passed on to a guessed-at \
-                     address"
+            reason: "the integration's uri carries a placeholder its requestParameters map \
+                     no path parameter onto: no request is passed on to a guessed-at address"
                 .to_string(),
         }));
     }
     let mut passed = RtRequest::new(SdkBody::from(request_payload(req)));
-    if passed.set_uri(onward_uri(uri, req.uri()).as_str()).is_err() {
+    if passed
+        .set_uri(onward_uri(&addressed, req.uri(), &mapped.querystring).as_str())
+        .is_err()
+    {
         return Some(PassedThrough::Unserved(UnservedIntegration {
             refusal: API_CONFIGURATION_ERROR,
             reason: "the integration's uri is not a URI a request can be addressed at"
@@ -3001,10 +3102,12 @@ fn passed_through(
     }
     // "Specifies the integration's HTTP method type" (`Integration$httpMethod`): the verb
     // the backend is called with, which is the caller's own where the integration names
-    // none.
+    // none — and where it names the `ANY` catch-all, which is a verb no backend is called
+    // with but the stand-in for every one of them, exactly as it is on a method.
     let verb = integration
         .http_method
         .as_deref()
+        .filter(|declared| !declared.eq_ignore_ascii_case(ANY_METHOD))
         .unwrap_or_else(|| req.method());
     if passed.set_method(verb).is_err() {
         return Some(PassedThrough::Unserved(UnservedIntegration {
@@ -3034,78 +3137,142 @@ fn passed_through(
             );
         }
     }
-    for (key, value) in integration.request_parameters.iter().flatten() {
-        let Some(name) = key.strip_prefix(INTEGRATION_REQUEST_HEADER_PREFIX) else {
-            return Some(PassedThrough::Unserved(UnservedIntegration {
-                refusal: API_CONFIGURATION_ERROR,
-                reason: format!(
-                    "the integration maps {key}, which is not a header of the integration \
-                     request: this emulator passes a request through rather than rewriting \
-                     its address, so the mapping is not applied and the request is not sent"
-                ),
-            }));
-        };
-        let mapped = match mapped_request_parameter(value, req) {
-            MappedParameter::Value(mapped) => mapped,
-            // The source names a location this emulator reads and the request carries
-            // nothing there, so the mapping maps nothing: the backend is called without
-            // that header, which is what it would be called with on AWS.
-            MappedParameter::SourceAbsent => continue,
-            MappedParameter::NotRead => {
-                return Some(PassedThrough::Unserved(UnservedIntegration {
-                    refusal: API_CONFIGURATION_ERROR,
-                    reason: format!(
-                        "the integration maps {key} from {value}, which is neither a static \
-                         value in single quotes nor a method request parameter this emulator \
-                         reads"
-                    ),
-                }));
-            }
-        };
+    // The endpoint the request is passed on to is the one the `uri` names, so that is the
+    // host the onward request is ADDRESSED to — the header a client sets from the URL it
+    // dials, and what the service claiming that endpoint reads the address off. Set before
+    // the integration's own mapped headers, so a mapping onto `host` still has the last
+    // word.
+    if let Err(refused) = passed.headers_mut().try_insert("host", host.to_string()) {
+        tracing::warn!(
+            host = %host,
+            error = %refused,
+            "the endpoint the integration's uri names is not a host a request can carry"
+        );
+    }
+    // The api the request came through, which API Gateway names to the endpoint it passes
+    // the request on to ([`INTEGRATION_API_ID_HEADER`]). It is the api's own record rather
+    // than anything the caller sent, so it REPLACES a header of that name the caller
+    // carried.
+    if let Err(refused) = passed
+        .headers_mut()
+        .try_insert(INTEGRATION_API_ID_HEADER, api_id.to_string())
+    {
+        tracing::warn!(
+            api_id = %api_id,
+            error = %refused,
+            "the api id is not a value a header can carry, so the integration request does \
+             not name the api"
+        );
+    }
+    for (name, value) in mapped.headers {
         // A mapped header REPLACES what the caller sent under that name, which is what a
         // mapping onto it declares; a value the wire cannot carry is stated rather than
         // dropped, because the backend would then be called without it.
         if passed
             .headers_mut()
-            .try_insert(name.to_string(), mapped)
+            .try_insert(name.clone(), value)
             .is_err()
         {
             return Some(PassedThrough::Unserved(UnservedIntegration {
                 refusal: API_CONFIGURATION_ERROR,
-                reason: format!("the value the integration maps onto {key} is not one a \
-                                 header can carry"),
+                reason: format!(
+                    "the value the integration maps onto \
+                     {INTEGRATION_REQUEST_HEADER_PREFIX}{name} is not one a header can carry"
+                ),
             }));
         }
     }
-    Some(PassedThrough::Request(Box::new(passed)))
+    Some(if within_this_plane {
+        PassedThrough::Request(Box::new(passed))
+    } else {
+        PassedThrough::Onward(Box::new(passed))
+    })
 }
 
-/// The URI the onward request is addressed at: the integration's `uri`, carrying the
-/// CALLER's query string as well as any the `uri` itself names.
+/// What an integration's `requestParameters` map onto the integration request, by the
+/// location each parameter travels in.
+#[derive(Debug, Default)]
+struct MappedRequest {
+    /// The headers the integration request carries, in the order the mappings were read.
+    headers: Vec<(String, String)>,
+    /// The PATH parameters, by name: what the `uri`'s own `{name}` placeholders are
+    /// addressed with.
+    path: BTreeMap<String, String>,
+    /// The query-string pairs the integration request carries, in the order read.
+    querystring: Vec<(String, String)>,
+}
+
+/// Where `key` says a parameter of the INTEGRATION request travels and under what name, or
+/// `None` for a key that names no integration request parameter at all.
+///
+/// `Integration$requestParameters`' key is "an integration request parameter name", written
+/// `integration.request.{location}.{name}` over the three locations a request parameter
+/// travels in — `querystring`, `path` or `header`, the same three
+/// `Method$requestParameters` names.
+fn integration_request_parameter(key: &str) -> Option<(ParameterIn, &str)> {
+    [
+        (INTEGRATION_REQUEST_HEADER_PREFIX, ParameterIn::Header),
+        (INTEGRATION_REQUEST_PATH_PREFIX, ParameterIn::Path),
+        (INTEGRATION_REQUEST_QUERY_PREFIX, ParameterIn::Query),
+    ]
+    .into_iter()
+    .find_map(|(prefix, location)| {
+        key.strip_prefix(prefix)
+            .filter(|name| !name.is_empty())
+            .map(|name| (location, name))
+    })
+}
+
+/// `uri` with each `{name}` placeholder replaced by the value `path` gives that name.
+///
+/// `Integration$uri` is the address the backend is called at, and a path parameter of the
+/// integration request is what one of its segments is: the `{name}` the `uri` carries is
+/// the parameter `integration.request.path.{name}` maps a value onto, which is how one
+/// integration addresses the path the caller asked for — the greedy `{proxy}` of a catch-all
+/// resource among them. A placeholder no mapping names is left in place, so the caller can
+/// tell an address it cannot resolve from one it can.
+fn expanded_uri(uri: &str, path: &BTreeMap<String, String>) -> String {
+    let mut expanded = uri.to_string();
+    for (name, value) in path {
+        expanded = expanded.replace(&format!("{{{name}}}"), value);
+    }
+    expanded
+}
+
+/// The URI the onward request is addressed at: the integration's `uri` (already addressed,
+/// see [`expanded_uri`]), carrying the query parameters the integration MAPS onto the
+/// integration request and the CALLER's own query string as well as any the `uri` itself
+/// names.
 ///
 /// A proxy integration passes the request through, and a request's query string is part of
 /// it: a backend method that declares a query parameter must see the one the caller sent.
-/// The `uri`'s own pairs come first — they are the configuration, and a caller cannot
-/// displace them — and the caller's follow; a caller that sent none leaves the `uri`
-/// untouched.
+/// The `uri`'s own pairs come first and the integration's mapped ones follow — both are the
+/// configuration, and a caller cannot displace them — and the caller's come last; a caller
+/// that sent none and an integration that maps none leave the `uri` untouched.
 ///
 /// What does NOT travel is the credential a PRESIGNED caller carries in the query string
 /// ([`SIGNED_QUERY_PARAMETERS`]), for the reason [`HEADERS_NOT_PASSED_THROUGH`] gives for
 /// the header form of the same credential: a signature over the address the caller used
 /// authenticates nothing at the address the request is passed on to.
-fn onward_uri(uri: &str, request_uri: &str) -> String {
-    let sent: Vec<&str> = query_of(request_uri)
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .filter(|pair| {
-            let name = pair.split('=').next().unwrap_or(pair).to_ascii_lowercase();
-            !SIGNED_QUERY_PARAMETERS.contains(&name.as_str())
-        })
+fn onward_uri(uri: &str, request_uri: &str, mapped: &[(String, String)]) -> String {
+    let mut pairs: Vec<String> = mapped
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
         .collect();
-    if sent.is_empty() {
+    pairs.extend(
+        query_of(request_uri)
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .filter(|pair| {
+                let name = pair.split('=').next().unwrap_or(pair).to_ascii_lowercase();
+                !SIGNED_QUERY_PARAMETERS.contains(&name.as_str())
+            })
+            .map(str::to_string),
+    );
+    if pairs.is_empty() {
         return uri.to_string();
     }
-    let sent = sent.join("&");
+    let sent = pairs.join("&");
     let separator = if query_of(uri).is_empty() { '?' } else { '&' };
     format!("{uri}{separator}{sent}")
 }
@@ -3127,13 +3294,20 @@ enum MappedParameter {
 ///
 /// The member documents the two forms: "a method request parameter value or static value
 /// that must be enclosed within single quotes". The static one is the literal between the
-/// quotes; a method request parameter is read off the request this call arrived as — its
-/// headers and its query string, the two locations a passed-through request carries whole.
+/// quotes; a method request parameter "must match the pattern of
+/// `method.request.{location}.{name}`, where `location` is `querystring`, `path`, or
+/// `header`", and each of the three is read off this call: its headers, its query string and
+/// the PATH PARAMETERS the matched resource template bound (`path_parameters`), which is
+/// what lets a catch-all resource's greedy parameter address the backend.
 /// The query string is read through `service_common`'s one definition of what a query
 /// parameter's value is, so this reads a pair the way the rest of the emulator does; it is
 /// the FIRST value under that name, which is the one a single-valued mapping expression
 /// names ([`METHOD_REQUEST_MULTI_QUERY_PREFIX`] is the spelling that names them all).
-fn mapped_request_parameter(value: &str, req: &RtRequest) -> MappedParameter {
+fn mapped_request_parameter(
+    value: &str,
+    req: &RtRequest,
+    path_parameters: &BTreeMap<String, String>,
+) -> MappedParameter {
     if is_static_mapping_value(value) {
         return match value
             .strip_prefix('\'')
@@ -3152,6 +3326,12 @@ fn mapped_request_parameter(value: &str, req: &RtRequest) -> MappedParameter {
     if let Some(name) = value.strip_prefix(METHOD_REQUEST_QUERY_PREFIX) {
         return match ::service_common::query_parameter(query_of(req.uri()), name) {
             Some(sent) => MappedParameter::Value(sent.to_string()),
+            None => MappedParameter::SourceAbsent,
+        };
+    }
+    if let Some(name) = value.strip_prefix(METHOD_REQUEST_PATH_PREFIX) {
+        return match path_parameters.get(name) {
+            Some(bound) => MappedParameter::Value(bound.clone()),
             None => MappedParameter::SourceAbsent,
         };
     }

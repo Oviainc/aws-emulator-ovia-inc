@@ -379,13 +379,17 @@ async fn an_integration_naming_an_endpoint_of_this_emulator_passes_the_request_t
             Expect::NotPerformed,
         ),
         (
-            "a proxy mapping something that is not a header of the integration request",
+            // `integration.request.{location}.{name}` names a header, a path parameter or a
+            // query-string parameter of the integration request; a key naming any other
+            // location is a mapping this emulator does not apply, and the request is not
+            // passed on with it dropped.
+            "a proxy mapping something that is no parameter of the integration request",
             json!({
                 "type": "HTTP_PROXY",
                 "httpMethod": "GET",
                 "uri": format!("https://{host}{onward_path}", host = api_host(&api)),
                 "requestParameters": {
-                    "integration.request.querystring.who": "'nobody'",
+                    "integration.request.body.who": "'nobody'",
                 },
             }),
             Vec::new(),

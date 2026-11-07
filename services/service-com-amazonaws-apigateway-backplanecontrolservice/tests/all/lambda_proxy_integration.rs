@@ -553,7 +553,11 @@ async fn an_aws_proxy_method_is_served_by_the_function_its_uri_names() {
 
     // The api: one literal resource behind a key-required method, one resource binding a
     // path parameter behind the `ANY` catch-all, and one the function's policy will NOT be
-    // granted for.
+    // granted for. It declares `application/octet-stream` BINARY, which is what makes the
+    // base64 body the handler returns under that media type reach the client as the bytes
+    // it names: "the list of binary media types supported by the RestApi. By default, the
+    // RestApi supports only UTF-8-encoded text payloads"
+    // (`smithy_query(query="doc", shape="RestApi", member="binaryMediaTypes")`).
     let api = member(
         "CreateRestApi",
         &apigw(
@@ -561,7 +565,10 @@ async fn an_aws_proxy_method_is_served_by_the_function_its_uri_names() {
             "CreateRestApi",
             "POST",
             "/restapis",
-            Some(json!({ "name": "aws-proxy-integration" })),
+            Some(json!({
+                "name": "aws-proxy-integration",
+                "binaryMediaTypes": ["application/octet-stream"],
+            })),
             201,
         )
         .await,
@@ -881,7 +888,9 @@ async fn an_aws_proxy_method_is_served_by_the_function_its_uri_names() {
         "resource": "/things/{id}",
         "path": "/things/t-9",
         "pathParameters": { "id": "t-9" },
-        "query": { "mode": "echo", "tag": "a" },
+        // `tag` is sent twice: the single-valued map carries the LAST value, the
+        // multi-valued one beside it carries them all.
+        "query": { "mode": "echo", "tag": "b" },
         "multiQuery": { "mode": ["echo"], "tag": ["a", "b"] },
         "stageVariables": { STAGE_VARIABLE: STAGE_VARIABLE_VALUE },
         "requestBody": r#"{"sent":true}"#,

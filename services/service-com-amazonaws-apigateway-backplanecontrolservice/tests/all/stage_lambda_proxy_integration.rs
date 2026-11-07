@@ -151,7 +151,7 @@ def lambda_handler(event, context):
                 "pathParameters": event.get("pathParameters"),
                 "query": event.get("queryStringParameters"),
                 "multiQuery": event.get("multiValueQueryStringParameters"),
-                "trace": event.get("multiValueHeaders", {}).get("x-trace"),
+                "trace": event.get("multiValueHeaders", {}).get("X-Trace"),
                 "stage": event["requestContext"]["stage"],
                 "apiId": event["requestContext"]["apiId"],
                 "requestId": event["requestContext"]["requestId"],
@@ -531,7 +531,15 @@ async fn deployed(router: &MultiServiceRouter) -> String {
         "CreateRestApi",
         "POST",
         "/restapis",
-        Some(json!({ "name": "lambda-proxy-integration" })),
+        // `application/octet-stream` is declared BINARY, which is what makes the base64
+        // body the handler returns under that media type reach the client as the bytes it
+        // encodes: "the list of binary media types supported by the RestApi. By default,
+        // the RestApi supports only UTF-8-encoded text payloads"
+        // (`smithy_query(query="doc", shape="RestApi", member="binaryMediaTypes")`).
+        Some(json!({
+            "name": "lambda-proxy-integration",
+            "binaryMediaTypes": ["application/octet-stream"],
+        })),
         201,
     )
     .await;
@@ -922,7 +930,9 @@ async fn the_event_the_function_is_handed_is_the_method_request() {
         "httpMethod": "GET",
         "case": "echo",
         "pathParameters": { "case": "echo" },
-        "query": { "first": "a", "second": "c" },
+        // A name the request REPEATS is carried in both maps: every value in the
+        // multi-valued one, the LAST of them in the single-valued one beside it.
+        "query": { "first": "b", "second": "c" },
         "multiQuery": { "first": ["a", "b"], "second": ["c"] },
         "trace": ["t1", "t2"],
         "stage": STAGE,

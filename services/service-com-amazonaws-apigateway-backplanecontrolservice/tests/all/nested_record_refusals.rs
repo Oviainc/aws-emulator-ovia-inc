@@ -9,12 +9,13 @@
 //! helpers are this crate's existing harness.
 //!
 //! The RULE under test: a call addressed by a record nested under a REST API resolves that
-//! record by its WHOLE key in ONE lookup, so the refusal names the record whose existence
-//! the call needs — the stage a stage-addressed call acts on or renders a document from,
-//! the resource a resource-addressed call acts on or hangs a new child off — with that
-//! record's own fixed sentence, whether the child label, the `restApiId` or both resolve to
-//! nothing. The account-qualified API-identifier sentence belongs to a call whose own
-//! target IS the API (`rest_api_identifier_refusals` asserts that side of the boundary).
+//! record by its WHOLE key in ONE lookup, and the refusal names the identifier that did not
+//! resolve. For a STAGE that is the stage's own fixed sentence whether the stage name, the
+//! `restApiId` or both resolve to nothing. For a RESOURCE the two halves are told apart: an
+//! API this account does not hold is reported as the API, with the account-qualified
+//! identifier sentence, and only an API that IS held but holds no such resource is reported
+//! as the resource — which is what API Gateway answers a resource-addressed call on a
+//! deleted API (`Invalid API identifier specified <account>:<restApiId>`).
 //!
 //! The rows span what the rule generalises over rather than repeating one recorded call:
 //! both record families (the stage and the resource), every operation of this service
@@ -23,8 +24,7 @@
 //! operations, which address a record by its ARN — each of the three ways the address can
 //! fail (an unresolvable API with a stored child label, a stored API with an unresolvable
 //! child label, and both unresolvable), and unknown identifiers differing in length,
-//! alphabet and case — the sentences are fixed text, so no row may quote an identifier or
-//! the account back.
+//! alphabet and case.
 
 use serde_json::{json, Value};
 
@@ -271,23 +271,38 @@ async fn a_stage_arn_is_reported_as_the_stage_and_an_api_arn_as_the_api() {
 }
 
 #[tokio::test]
-async fn a_resource_addressed_call_reports_the_resource_it_cannot_resolve() {
+async fn a_resource_addressed_call_reports_the_identifier_it_cannot_resolve() {
     let gateway = Gateway::new();
     let (stored, root) = create_api(&gateway, "nested-resource-refusals").await;
     let resource = resource_under(&gateway, &stored, &root, "pets").await;
 
     for (index, unknown) in UNKNOWN_APIS.iter().enumerate() {
         let unknown_resource = UNKNOWN_CHILDREN[index];
+        // The three ways a resource address fails, each with the identifier it reports:
+        // the API that is not held is named with its own account-qualified sentence, and
+        // only a resource missing from an API that IS held is named as the resource.
         let addresses = [
-            (*unknown, resource.as_str()),
-            (stored.as_str(), unknown_resource),
-            (*unknown, unknown_resource),
+            (
+                *unknown,
+                resource.as_str(),
+                crate::rest_api_identifier_refusals::no_such_api(unknown),
+            ),
+            (
+                stored.as_str(),
+                unknown_resource,
+                NO_SUCH_RESOURCE.to_string(),
+            ),
+            (
+                *unknown,
+                unknown_resource,
+                crate::rest_api_identifier_refusals::no_such_api(unknown),
+            ),
         ];
-        for (api, addressed) in addresses {
+        for (api, addressed, reported) in addresses {
             for (operation, method, uri, body) in resource_requests(api, addressed) {
                 let case = format!("{operation} [{method} {uri}]");
                 let answer = gateway.call(method, &uri, body).await;
-                assert_reports(&answer, &case, NO_SUCH_RESOURCE);
+                assert_reports(&answer, &case, &reported);
             }
         }
     }

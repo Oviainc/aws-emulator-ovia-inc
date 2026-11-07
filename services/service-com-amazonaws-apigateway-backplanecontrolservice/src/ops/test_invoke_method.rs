@@ -525,6 +525,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 multi_value_querystring: every_simulated_query_parameter(query),
                 multi_value_header: every_simulated_header(&input),
                 source_arn: None,
+                // What the api declares BINARY, which decides whether a base64 body the
+                // function returns is reported as the bytes it names or as the base64
+                // text it is — the same records the data plane reads it from.
+                binary_media_types: api.binary_media_types.clone(),
             },
         );
         let performed = match with_stage_variables(&method, &simulated_variables) {

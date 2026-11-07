@@ -24,6 +24,18 @@ mod stage_lambda_proxy_integration;
 // Declared here, at the head, for the reason the entry above records.
 #[path = "all/passed_through_integration.rs"]
 mod passed_through_integration;
+// Declared here, at the head, for the reason the entry above records.
+#[path = "all/stage_cors_preflight.rs"]
+mod stage_cors_preflight;
+// Declared here, at the head, for the reason the entry above records.
+#[path = "all/proxy_binary_media_types.rs"]
+mod proxy_binary_media_types;
+// Declared here, at the head, for the reason the entry above records.
+#[path = "all/http_proxy_function_url.rs"]
+mod http_proxy_function_url;
+// Declared here, at the head, for the reason the entry above records.
+#[path = "all/proxy_event_repeated_names.rs"]
+mod proxy_event_repeated_names;
 #[path = "all/stage_web_acl_edge.rs"]
 mod stage_web_acl_edge;
 #[path = "all/stage_web_acl_association_report.rs"]

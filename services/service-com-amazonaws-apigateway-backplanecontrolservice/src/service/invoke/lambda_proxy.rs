@@ -29,7 +29,17 @@
 //! invented: a member whose value this emulator does not have is left out rather than
 //! filled in, and the body travels exactly as it arrived — as text where the request's bytes
 //! are text, and base64-encoded with `isBase64Encoded` set where they are not, which is the
-//! encoding the member documents.
+//! encoding the member documents. A name the request REPEATS is reported in both forms: every
+//! value it carries in the multi-valued member, and the LAST of them in the single-valued one
+//! beside it — each under the spelling HTTP capitalises a field name in
+//! ([`canonical_header_name`]).
+//!
+//! What comes back the other way is bounded by the same records: `RestApi$binaryMediaTypes`
+//! is "the list of binary media types supported by the RestApi. By default, the RestApi
+//! supports only UTF-8-encoded text payloads", so a `body` the function declared
+//! base64-encoded is handed to the client as the BYTES it names only where the response's
+//! media type is one the API declares binary, and as the base64 TEXT it is otherwise
+//! ([`proxy_response`]).
 //!
 //! # Who the call is made as, and what refuses it
 //!
@@ -157,6 +167,11 @@ const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
 /// The request header the caller's user agent travels in.
 const USER_AGENT_HEADER: &str = "user-agent";
 
+/// The address a request that no forwarder recorded an address for came from: this emulator
+/// is reached in process or over the loopback interface, so that is where such a request
+/// arrived from.
+const LOOPBACK_SOURCE_IP: &str = "127.0.0.1";
+
 /// The request headers the event does NOT carry over from the caller's request: the two the
 /// caller's own SigV4 CREDENTIAL travels in.
 ///
@@ -226,6 +241,11 @@ pub struct ProxyInputs {
     /// grant to API Gateway is narrowed by — or `None` for a call that reached no stage,
     /// which names no method for a grant to be judged against.
     pub source_arn: Option<String>,
+    /// The media types the API declares BINARY — `RestApi$binaryMediaTypes`, "the list of
+    /// binary media types supported by the RestApi. By default, the RestApi supports only
+    /// UTF-8-encoded text payloads" — which is what decides whether a base64 body the
+    /// function returned is decoded to the bytes it names ([`proxy_response`]).
+    pub binary_media_types: Vec<String>,
 }
 
 /// Perform this call through the method's `AWS_PROXY` integration, or `None` when the
@@ -373,7 +393,7 @@ async fn served(
         .map(|payload| payload.as_ref().to_vec())
         .unwrap_or_default();
     bounded(returned.len())?;
-    match proxy_response(&returned) {
+    match proxy_response(&returned, &call.proxy.binary_media_types) {
         Ok(response) => Ok(response),
         Err(reason) => {
             ::tracing::warn!(
@@ -532,6 +552,10 @@ fn proxy_event(call: &MethodRequest) -> Value {
     let context = &inputs.context;
     let stage = context.get("stage").cloned().unwrap_or_default();
     let (body, base64_encoded) = event_body(inputs.payload.as_deref());
+    // Both header maps are built from the one multi-valued reading of the request: the
+    // single-valued one carries the LAST value of each name and the other carries them all,
+    // under the names the event reports them by ([`event_headers`]).
+    let headers = event_headers(&proxy.multi_value_header);
     let mut event = Map::new();
     event.insert(
         "resource".to_string(),
@@ -539,17 +563,14 @@ fn proxy_event(call: &MethodRequest) -> Value {
     );
     event.insert("path".to_string(), json!(proxy.request_path));
     event.insert("httpMethod".to_string(), json!(proxy.http_method));
-    event.insert(
-        "headers".to_string(),
-        single_valued(&withheld(&inputs.header)),
-    );
+    event.insert("headers".to_string(), last_valued(&headers));
     event.insert(
         MULTI_VALUE_HEADERS_MEMBER.to_string(),
-        multi_valued(&withheld(&proxy.multi_value_header)),
+        multi_valued(&headers),
     );
     event.insert(
         "queryStringParameters".to_string(),
-        or_null(single_valued(&inputs.querystring)),
+        or_null(last_valued(&proxy.multi_value_querystring)),
     );
     event.insert(
         "multiValueQueryStringParameters".to_string(),
@@ -640,18 +661,23 @@ fn request_context(call: &MethodRequest, stage: &str) -> Value {
 
 /// The `identity` of the event: what the REQUEST says about who made it, and nothing else.
 ///
-/// Only the two values a request off the wire carries are reported — the address a forwarder
-/// named it by and the user agent it declared — because every other member of this object
+/// Only the two values a request off the wire carries are reported — the address the request
+/// came from and the user agent it declared — because every other member of this object
 /// names a principal API Gateway authenticated, and a method is authenticated by its own
 /// `authorizationType` rather than by this object.
+///
+/// `sourceIp` is "the source IP address of the TCP connection making the request": the
+/// FIRST hop a forwarder recorded where the request reached the emulator through one, and
+/// otherwise the loopback address, which is the interface this emulator is reached over when
+/// nothing forwarded the request. The member is always reported, because every request
+/// arrived from somewhere.
 fn identity(call: &MethodRequest) -> Value {
     let mut reported = Map::new();
-    if let Some(address) = header_of(call, FORWARDED_FOR_HEADER)
+    let address = header_of(call, FORWARDED_FOR_HEADER)
         .and_then(|forwarded| forwarded.split(',').next().map(str::trim).map(str::to_string))
         .filter(|address| !address.is_empty())
-    {
-        reported.insert("sourceIp".to_string(), json!(address));
-    }
+        .unwrap_or_else(|| LOOPBACK_SOURCE_IP.to_string());
+    reported.insert("sourceIp".to_string(), json!(address));
     if let Some(agent) = header_of(call, USER_AGENT_HEADER) {
         reported.insert("userAgent".to_string(), json!(agent));
     }
@@ -697,6 +723,27 @@ fn single_valued(values: &BTreeMap<String, String>) -> Value {
     )
 }
 
+/// The SINGLE-VALUED view of a multi-valued map of the call, as the event's `headers` and
+/// `queryStringParameters` carry it: the LAST value each name carries.
+///
+/// A proxy event reports a repeated name twice — every value it carries in the multi-valued
+/// member beside this one, and one value here — so this half has to choose, and API Gateway
+/// reports the last of them: `?a=1&a=2` is `{"a": "2"}` beside `{"a": ["1", "2"]}`. A name
+/// whose values are somehow empty is left out rather than reported as a null.
+fn last_valued(values: &BTreeMap<String, Vec<String>>) -> Value {
+    Value::Object(
+        values
+            .iter()
+            .filter_map(|(name, carried)| {
+                carried
+                    .iter()
+                    .next_back()
+                    .map(|last| (name.clone(), json!(last)))
+            })
+            .collect(),
+    )
+}
+
 /// `headers` without the names [`HEADERS_WITHHELD_FROM_THE_EVENT`] lists, compared
 /// case-insensitively because a header name is.
 fn withheld<V: Clone>(headers: &BTreeMap<String, V>) -> BTreeMap<String, V> {
@@ -709,6 +756,38 @@ fn withheld<V: Clone>(headers: &BTreeMap<String, V>) -> BTreeMap<String, V> {
         })
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
+}
+
+/// The request's headers as the EVENT reports them: the ones it carries at all
+/// ([`withheld`]), each under the HTTP-canonical spelling of its name.
+///
+/// The names are canonicalised because the wire layer a request arrives over normalises
+/// every header name to lower case, while the event reports the spelling HTTP itself
+/// capitalises a field name in — `User-Agent`, `X-Forwarded-For`, `Content-Type` — which is
+/// the form a client writes and the form API Gateway hands the function. A function reading
+/// the event by name therefore finds the header it would find on AWS.
+fn event_headers(headers: &BTreeMap<String, Vec<String>>) -> BTreeMap<String, Vec<String>> {
+    withheld(headers)
+        .into_iter()
+        .map(|(name, values)| (canonical_header_name(&name), values))
+        .collect()
+}
+
+/// `name` in the capitalisation HTTP spells a field name with: every `-`-separated token's
+/// first letter upper-cased and the rest lower-cased (`x-multi` -> `X-Multi`).
+fn canonical_header_name(name: &str) -> String {
+    name.split('-')
+        .map(|token| {
+            let mut glyphs = token.chars();
+            match glyphs.next() {
+                Some(first) => {
+                    first.to_ascii_uppercase().to_string() + &glyphs.as_str().to_ascii_lowercase()
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<String>>()
+        .join("-")
 }
 
 /// One multi-valued map of the call as a JSON object of arrays.
@@ -761,8 +840,20 @@ fn epoch_millis(at: SystemTime) -> i64 {
 ///
 /// A proxy integration maps nothing, so every part of the response is read straight out of
 /// the document: the status it names, the headers it declares in either member, and the body
-/// it carries — decoded from base64 where it says it is encoded.
-fn proxy_response(returned: &[u8]) -> Result<IntegratedResponse, String> {
+/// it carries.
+///
+/// `binary_media_types` is the API's own `RestApi$binaryMediaTypes` — "the list of binary
+/// media types supported by the RestApi. By default, the RestApi supports only UTF-8-encoded
+/// text payloads" — and it is what decides what the BODY is. A document declaring
+/// `isBase64Encoded` says its `body` is the base64 TEXT of some bytes; those bytes are what
+/// the client receives only where the response's own media type is one the API declares
+/// binary. An API that declares none supports only text payloads, so the base64 text IS the
+/// payload and travels unchanged — which is why the decoding is decided here, after the media
+/// type the headers declare is known, rather than off the member alone.
+fn proxy_response(
+    returned: &[u8],
+    binary_media_types: &[String],
+) -> Result<IntegratedResponse, String> {
     let Ok(Value::Object(document)) = ::serde_json::from_slice::<Value>(returned) else {
         return Err("the function returned no JSON object".to_string());
     };
@@ -799,25 +890,6 @@ fn proxy_response(returned: &[u8]) -> Result<IntegratedResponse, String> {
         headers.insert(name.clone(), values);
     }
 
-    let base64_encoded = match document.get(BASE64_MEMBER) {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(encoded)) => *encoded,
-        Some(_) => return Err(format!("the function's {BASE64_MEMBER} is not a boolean")),
-    };
-    let body = match document.get(BODY_MEMBER) {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::String(text)) if base64_encoded => {
-            ::base64::engine::general_purpose::STANDARD
-                .decode(text)
-                .map_err(|_| {
-                    format!("the function's {BODY_MEMBER} is not the base64 its \
-                             {BASE64_MEMBER} declares")
-                })?
-        }
-        Some(Value::String(text)) => text.clone().into_bytes(),
-        Some(_) => return Err(format!("the function's {BODY_MEMBER} is not a string")),
-    };
-
     // The media type is one of the headers the function declared, and `application/json` is
     // what API Gateway sends for a proxy response that declares none.
     let declared = headers
@@ -831,12 +903,62 @@ fn proxy_response(returned: &[u8]) -> Result<IntegratedResponse, String> {
                 .and_then(|values| values.into_iter().next())
         })
         .unwrap_or_else(|| JSON_CONTENT_TYPE.to_string());
+
+    let base64_encoded = match document.get(BASE64_MEMBER) {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(encoded)) => *encoded,
+        Some(_) => return Err(format!("the function's {BASE64_MEMBER} is not a boolean")),
+    };
+    let decoded = base64_encoded && declares_binary(&content_type, binary_media_types);
+    let body = match document.get(BODY_MEMBER) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(text)) if decoded => {
+            ::base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .map_err(|_| {
+                    format!("the function's {BODY_MEMBER} is not the base64 its \
+                             {BASE64_MEMBER} declares")
+                })?
+        }
+        Some(Value::String(text)) => text.clone().into_bytes(),
+        Some(_) => return Err(format!("the function's {BODY_MEMBER} is not a string")),
+    };
+
     Ok(IntegratedResponse {
         status,
         content_type,
         body,
         headers,
     })
+}
+
+/// Whether `media` is one of the media types `declared` names as binary.
+///
+/// `RestApi$binaryMediaTypes` carries media types, and a media type's two tokens may each be
+/// the wildcard `*` (`*/*` for every payload, `image/*` for a whole type), which is how an
+/// api declares a class of payloads binary rather than listing every subtype. Compared
+/// without the parameters a `Content-Type` may carry (`; charset=…`) and case-insensitively,
+/// because a media type's type and subtype are.
+fn declares_binary(media: &str, declared: &[String]) -> bool {
+    let (media_type, media_subtype) = media_type_tokens(media);
+    declared.iter().any(|binary| {
+        let (declared_type, declared_subtype) = media_type_tokens(binary);
+        let matches = |declared: &str, sent: &str| {
+            declared == "*" || declared.eq_ignore_ascii_case(sent)
+        };
+        matches(declared_type, media_type) && matches(declared_subtype, media_subtype)
+    })
+}
+
+/// The type and subtype of a media type, with any parameters dropped: `image/png;
+/// charset=x` is `("image", "png")`. A value carrying no `/` at all has no subtype, which
+/// no media type matches but the wildcard.
+fn media_type_tokens(media: &str) -> (&str, &str) {
+    let without_parameters = media.split(';').next().unwrap_or(media).trim();
+    match without_parameters.split_once('/') {
+        Some((media_type, subtype)) => (media_type.trim(), subtype.trim()),
+        None => (without_parameters, ""),
+    }
 }
 
 /// The status the function's `statusCode` names, which the member carries as a number or as
@@ -993,9 +1115,11 @@ mod tests {
     /// and the ones that are not proxy responses at all.
     #[test]
     fn a_proxy_response_is_the_document_the_function_returned() {
+        let no_binary_types: [String; 0] = [];
         let served = proxy_response(
             br#"{"statusCode":201,"headers":{"Content-Type":"text/plain","X-One":"1"},
                  "multiValueHeaders":{"Set-Cookie":["a=1","b=2"]},"body":"hello"}"#,
+            &no_binary_types,
         )
         .expect("case \"a well-formed proxy response\": expected it to be read");
         assert_eq!(
@@ -1022,19 +1146,52 @@ mod tests {
 
         let encoded = proxy_response(
             br#"{"statusCode":"200","body":"AAEC","isBase64Encoded":true}"#,
+            &[JSON_CONTENT_TYPE.to_string()],
         )
-        .expect("case \"a base64 body\": expected it to be read");
+        .expect("case \"a base64 body of a media type the api declares binary\": expected it \
+                 to be read");
         assert_eq!(
             encoded.body,
             vec![0u8, 1, 2],
-            "case \"a base64 body\": expected the decoded bytes, got {:?}",
+            "case \"a base64 body of a media type the api declares binary\": expected the \
+             decoded bytes, got {:?}",
             encoded.body
         );
         assert_eq!(
             encoded.content_type, JSON_CONTENT_TYPE,
-            "case \"a base64 body\": expected the default media type, got {:?}",
+            "case \"a base64 body of a media type the api declares binary\": expected the \
+             default media type, got {:?}",
             encoded.content_type
         );
+
+        // The same document on an api that declares the media type NOT binary: the base64
+        // text IS the payload, and a text that is not base64 at all is still that payload.
+        for (case, declared) in [
+            ("an api declaring no binary media type at all", &[][..]),
+            (
+                "an api declaring another media type binary",
+                &["image/png".to_string()][..],
+            ),
+        ] {
+            for (body, expected) in [("AAEC", "AAEC"), ("!", "!")] {
+                let text = proxy_response(
+                    format!(
+                        r#"{{"statusCode":200,"body":"{body}","isBase64Encoded":true}}"#
+                    )
+                    .as_bytes(),
+                    declared,
+                )
+                .unwrap_or_else(|reason| {
+                    panic!("case {case:?} ({body:?}): expected it to be read, got {reason}")
+                });
+                assert_eq!(
+                    text.body,
+                    expected.as_bytes(),
+                    "case {case:?} ({body:?}): expected the base64 text unchanged, got {:?}",
+                    String::from_utf8_lossy(&text.body)
+                );
+            }
+        }
 
         for (case, returned) in [
             ("no status at all", &br#"{"body":"hi"}"#[..]),
@@ -1044,11 +1201,46 @@ mod tests {
             ("headers that are not an object", &br#"{"statusCode":200,"headers":[]}"#[..]),
             ("no JSON object at all", &b"not json"[..]),
         ] {
-            let read = proxy_response(returned);
+            let read = proxy_response(returned, &[JSON_CONTENT_TYPE.to_string()]);
             assert!(
                 read.is_err(),
                 "case {case:?}: expected no proxy response to be read, got {:?}",
                 read.map(|response| response.status)
+            );
+        }
+    }
+
+    /// Which media types an api's `binaryMediaTypes` declares binary: the wildcard forms a
+    /// media type takes, the parameters a `Content-Type` carries, and the case neither is
+    /// compared in.
+    #[test]
+    fn the_apis_binary_media_types_decide_which_payloads_are_binary() {
+        // (case, the api's declared list, the response's media type, binary)
+        let rows: &[(&str, &[&str], &str, bool)] = &[
+            ("no type declared at all", &[], "image/png", false),
+            ("the exact type", &["image/png"], "image/png", true),
+            ("another type", &["image/png"], "image/jpeg", false),
+            ("a type whose case differs", &["Image/PNG"], "image/png", true),
+            (
+                "a declared type against a media type carrying parameters",
+                &["text/plain"],
+                "text/plain; charset=utf-8",
+                true,
+            ),
+            ("the subtype wildcard", &["image/*"], "image/png", true),
+            ("the subtype wildcard of another type", &["image/*"], "text/plain", false),
+            ("the whole wildcard", &["*/*"], "application/octet-stream", true),
+            ("one entry of several", &["image/png", "application/pdf"], "application/pdf", true),
+            ("none of several", &["image/png", "application/pdf"], "text/csv", false),
+            ("a value that is no media type", &["image/png"], "octet-stream", false),
+        ];
+        for (case, declared, media, expected) in rows {
+            let declared: Vec<String> = declared.iter().map(|one| (*one).to_string()).collect();
+            let read = declares_binary(media, &declared);
+            assert_eq!(
+                read, *expected,
+                "case {case:?} ({media:?} against {declared:?}): expected {expected}, got \
+                 {read}"
             );
         }
     }

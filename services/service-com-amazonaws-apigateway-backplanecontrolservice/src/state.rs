@@ -2812,15 +2812,18 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// The resource a `(restApiId, resourceId)` pair addresses, or the message that pair is
     /// refused with.
     ///
-    /// Resolved as ONE lookup for the resource the request addresses, the way
-    /// [`Self::api_and_stage`] resolves a stage: a resource cannot exist without its API,
-    /// so an unresolvable `restApiId` leaves the addressed resource unresolvable too and
-    /// the refusal reports the RESOURCE ([`NO_SUCH_RESOURCE`]) rather than the API
-    /// identifier.
+    /// The pair is refused by naming the identifier that did not resolve: an API this
+    /// account does not hold is reported as the API ([`no_such_rest_api`], which names the
+    /// identifier it could not resolve), and only an API that IS held but holds no such
+    /// resource is reported as the resource ([`NO_SUCH_RESOURCE`]). A stage's own lookup
+    /// ([`Self::api_and_stage`]) reports the STAGE either way, which is that operation's own
+    /// recorded contract rather than a disagreement with this one.
     pub fn resource(&self, rest_api_id: &str, resource_id: &str) -> Result<&ResourceEntry, String> {
         self.rest_apis
             .get(rest_api_id)
-            .and_then(|api| api.resources.get(resource_id))
+            .ok_or_else(|| no_such_rest_api(rest_api_id))?
+            .resources
+            .get(resource_id)
             .ok_or_else(|| NO_SUCH_RESOURCE.to_string())
     }
 
@@ -2833,7 +2836,9 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
     ) -> Result<&mut ResourceEntry, String> {
         self.rest_apis
             .get_mut(rest_api_id)
-            .and_then(|api| api.resources.get_mut(resource_id))
+            .ok_or_else(|| no_such_rest_api(rest_api_id))?
+            .resources
+            .get_mut(resource_id)
             .ok_or_else(|| NO_SUCH_RESOURCE.to_string())
     }
 
