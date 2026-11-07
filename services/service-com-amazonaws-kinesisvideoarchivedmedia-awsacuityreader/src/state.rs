@@ -407,6 +407,148 @@ impl ResolvedStream<'_> {
     ) -> Vec<&StoredFragment> {
         fragments_in_range(self.fragments, origin, start_millis, end_millis)
     }
+
+    /// The manifest/playlist snapshot a streaming session over this stream
+    /// serves at `now`: the fragment numbers `window` selects, at most
+    /// `max_fragments` of them.
+    ///
+    /// EMPTY when the session would serve nothing, which both streaming-session
+    /// operations report as `ResourceNotFoundException` with
+    /// [`NO_FRAGMENTS_MESSAGE`]. The one selection rule both of them use, so an
+    /// HLS and an MPEG-DASH session over the same archive and the same
+    /// parameters carry the same fragments.
+    #[must_use]
+    pub fn session_fragment_numbers(
+        &self,
+        window: SessionWindow,
+        origin: TimestampOrigin,
+        max_fragments: usize,
+        now: SystemTime,
+    ) -> Vec<String> {
+        match window {
+            SessionWindow::Live => {
+                // LIVE serves the most recently INGESTED fragments and only
+                // exists while the stream head is fresh. The ordering is by
+                // server timestamp whatever `FragmentSelectorType` the request
+                // names, because that is what the selector's own documentation
+                // says of LIVE: "the most recently ingested fragments based on
+                // server timestamps are included" — "this means that even if
+                // fragments ingested in the past have producer timestamps with
+                // values now, they are not included".
+                let window_start = epoch_millis(now - LIVE_FRAGMENT_WINDOW);
+                let fresh = self
+                    .fragments
+                    .iter()
+                    .any(|fragment| epoch_millis(fragment.server_timestamp) >= window_start);
+                if !fresh {
+                    return Vec::new();
+                }
+                let mut newest: Vec<&StoredFragment> = self.fragments.iter().collect();
+                newest.sort_by_key(|fragment| epoch_millis(fragment.server_timestamp));
+                let skip = newest.len().saturating_sub(max_fragments);
+                newest
+                    .into_iter()
+                    .skip(skip)
+                    .map(|fragment| fragment.fragment_number.clone())
+                    .collect()
+            }
+            // ON_DEMAND and LIVE_REPLAY serve the OLDEST fragments in the
+            // requested range, up to the maximum.
+            SessionWindow::Range {
+                start_millis,
+                end_millis,
+            } => self
+                .fragments_in_range(origin, start_millis, end_millis)
+                .into_iter()
+                .take(max_fragments)
+                .map(|fragment| fragment.fragment_number.clone())
+                .collect(),
+        }
+    }
+}
+
+/// `Expires` when a streaming-session request names none: "The default is 300
+/// (5 minutes)."
+pub const DEFAULT_SESSION_EXPIRES_SECS: u32 = 300;
+
+/// How many fragments a session's manifest or playlist carries when the request
+/// names no maximum and the playback mode is LIVE or LIVE_REPLAY: "The default
+/// is 5 fragments if PlaybackMode is LIVE or LIVE_REPLAY".
+pub const DEFAULT_LIVE_SESSION_FRAGMENTS: usize = 5;
+
+/// How many fragments a session's manifest or playlist carries when the request
+/// names no maximum and the playback mode is ON_DEMAND: "and 1,000 if
+/// PlaybackMode is ON_DEMAND".
+pub const DEFAULT_ON_DEMAND_SESSION_FRAGMENTS: usize = 1000;
+
+/// How recent a fragment must be for a LIVE session to exist: the
+/// `ResourceNotFoundException` documentation states the error is thrown "if a
+/// session with a PlaybackMode of LIVE is requested for a stream that has no
+/// fragments within the last 30 seconds".
+pub const LIVE_FRAGMENT_WINDOW: Duration = Duration::from_secs(30);
+
+/// The refusal a streaming-session request carries when the stream holds no
+/// fragment the session could serve — none in the requested range for
+/// `ON_DEMAND`/`LIVE_REPLAY`, none in the last 30 seconds for `LIVE`, the two
+/// cases `ResourceNotFoundException`'s own documentation gives these
+/// operations. Entirely fixed text: it names neither the stream nor the window.
+pub const NO_FRAGMENTS_MESSAGE: &str =
+    "No fragments found in the stream for the streaming request.";
+
+/// The host a session URL names when the request carries neither a `Host`
+/// header nor an authority to read the emulator's own endpoint from. A
+/// loopback literal, never a real AWS host: the session this URL names is
+/// served by this emulator.
+pub const LOOPBACK_HOST: &str = "127.0.0.1";
+
+/// The URL a minted streaming session is reported in: the manifest or playlist
+/// resource of `protocol`, carrying `token`, on the endpoint the CALLER reached
+/// this emulator on.
+///
+/// The host is read from the request itself — its `Host` header, else the
+/// authority of the URI it addressed, else [`LOOPBACK_HOST`] — exactly as the
+/// real service answers on its own data endpoint, and deliberately names no
+/// real AWS host: this emulator serves the playback session, so a player or
+/// test that follows the URL must come back here. The one rule both
+/// streaming-session operations use, so they cannot drift on which endpoint a
+/// session URL names.
+#[must_use]
+pub fn session_url(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    protocol: SessionProtocol,
+    token: &str,
+) -> String {
+    let host = ctx
+        .parts()
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| ctx.parts().uri.host())
+        .unwrap_or(LOOPBACK_HOST);
+    format!(
+        "https://{host}/{}/v1/{}?SessionToken={token}",
+        protocol.url_prefix(),
+        protocol.manifest_resource()
+    )
+}
+
+/// Which fragments of a stream a streaming session serves, as the request's
+/// `PlaybackMode` and fragment selector describe them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionWindow {
+    /// `LIVE`: the most recently INGESTED fragments, and only while the stream
+    /// head is fresh — a LIVE session over a stream with no fragment in the
+    /// last [`LIVE_FRAGMENT_WINDOW`] serves nothing.
+    Live,
+    /// `ON_DEMAND` / `LIVE_REPLAY`: the oldest fragments whose selected
+    /// timestamp falls in the inclusive requested range. An unset bound leaves
+    /// that end of the range open.
+    Range {
+        /// The inclusive start of the requested range, in epoch milliseconds.
+        start_millis: i64,
+        /// The inclusive end of the requested range, in epoch milliseconds.
+        end_millis: i64,
+    },
 }
 
 /// Which playback protocol a streaming session serves.
@@ -427,6 +569,18 @@ impl SessionProtocol {
             Self::Dash => "dash",
         }
     }
+
+    /// The resource a media player fetches first for this protocol: the HLS
+    /// master playlist (`GetHLSMasterPlaylist`) or the MPEG-DASH manifest
+    /// (`GetDASHManifest`), the "root resource needed for streaming" each
+    /// operation's own documentation names.
+    #[must_use]
+    pub fn manifest_resource(self) -> &'static str {
+        match self {
+            Self::Hls => "getHLSMasterPlaylist.m3u8",
+            Self::Dash => "getMPDManifest.mpd",
+        }
+    }
 }
 
 /// A recorded streaming session: what a session URL resolves back to.
@@ -440,12 +594,20 @@ pub struct StreamingSession {
     pub protocol: SessionProtocol,
     /// The session's `PlaybackMode`.
     pub playback_mode: String,
-    /// The session's `ContainerFormat`.
+    /// The session's `ContainerFormat`. An MPEG-DASH session carries no such
+    /// parameter: its manifest serves the MP4 initialization and media
+    /// fragments `GetMP4InitFragment`/`GetMP4MediaFragment` answer, so it is
+    /// recorded as the fragmented-MP4 container.
     pub container_format: String,
-    /// The session's `DiscontinuityMode`.
-    pub discontinuity_mode: String,
+    /// The session's `DiscontinuityMode`, which only an HLS session carries:
+    /// `None` for an MPEG-DASH session, whose input models no such parameter.
+    pub discontinuity_mode: Option<String>,
     /// The session's `DisplayFragmentTimestamp`.
     pub display_fragment_timestamp: String,
+    /// The session's `DisplayFragmentNumber`, which only an MPEG-DASH session
+    /// carries: `None` for an HLS session, whose input models no such
+    /// parameter.
+    pub display_fragment_number: Option<String>,
     /// The playlist snapshot: the fragment numbers the session serves, capped
     /// by the request's max-results.
     pub fragment_numbers: Vec<String>,
@@ -746,9 +908,8 @@ impl ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState {
     ///   oldest is evicted to make room, so the map can never hold more than
     ///   that many entries however many requests arrive.
     ///
-    /// Every operation that mints a session — HLS now, DASH when it is
-    /// implemented — records it through this one method, so the bound covers
-    /// them all.
+    /// Every operation that mints a session — HLS and MPEG-DASH alike —
+    /// records it through this one method, so the bound covers them all.
     pub fn record_session(&mut self, session: StreamingSession) {
         let now = session.created_at;
         self.sessions.retain(|_, held| held.expires_at() > now);

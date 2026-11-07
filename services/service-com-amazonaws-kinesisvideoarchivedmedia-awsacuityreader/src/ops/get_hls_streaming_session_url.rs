@@ -205,41 +205,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    date_time_millis, epoch_millis, service_state, SessionProtocol, StreamLookupError,
-    StreamingSession, TimestampOrigin, NO_DATA_RETENTION_MESSAGE, TIMESTAMP_RANGE_ORDER_MESSAGE,
+    date_time_millis, service_state, session_url, SessionProtocol, SessionWindow,
+    StreamLookupError, StreamingSession, TimestampOrigin, DEFAULT_LIVE_SESSION_FRAGMENTS,
+    DEFAULT_ON_DEMAND_SESSION_FRAGMENTS, DEFAULT_SESSION_EXPIRES_SECS, NO_DATA_RETENTION_MESSAGE,
+    NO_FRAGMENTS_MESSAGE, TIMESTAMP_RANGE_ORDER_MESSAGE,
 };
-use std::time::{Duration, SystemTime};
-
-/// `Expires` when the request names none: "The default is 300 (5 minutes)."
-const DEFAULT_EXPIRES_SECS: u32 = 300;
-
-/// `MaxMediaPlaylistFragmentResults` when the request names none and the
-/// playback mode is LIVE or LIVE_REPLAY: "The default is 5 fragments if
-/// PlaybackMode is LIVE or LIVE_REPLAY".
-const DEFAULT_LIVE_PLAYLIST_FRAGMENTS: usize = 5;
-
-/// `MaxMediaPlaylistFragmentResults` when the request names none and the
-/// playback mode is ON_DEMAND: "and 1,000 if PlaybackMode is ON_DEMAND".
-const DEFAULT_ON_DEMAND_PLAYLIST_FRAGMENTS: usize = 1000;
-
-/// How recent a fragment must be for a LIVE session to exist: the
-/// `ResourceNotFoundException` documentation states the error is thrown "if a
-/// session with a PlaybackMode of LIVE is requested for a stream that has no
-/// fragments within the last 30 seconds".
-const LIVE_FRAGMENT_WINDOW: Duration = Duration::from_secs(30);
-
-/// The host a session URL names when the request carries neither a `Host`
-/// header nor an authority to read the emulator's own endpoint from. A
-/// loopback literal, never a real AWS host: the session this URL names is
-/// served by this emulator.
-const LOOPBACK_HOST: &str = "127.0.0.1";
-
-/// The refusal a streaming-session request carries when the stream holds no
-/// fragment the session could serve — none in the requested range for
-/// `ON_DEMAND`/`LIVE_REPLAY`, none in the last 30 seconds for `LIVE`, the two
-/// cases `ResourceNotFoundException`'s own documentation gives this operation.
-/// Entirely fixed text: it names neither the stream nor the window.
-const NO_FRAGMENTS_MESSAGE: &str = "No fragments found in the stream for the streaming request.";
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -333,7 +304,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into()
         };
 
-        // Documented parameter defaults.
+        // Documented parameter defaults. The membership checks are
+        // belt-and-braces rather than the authoritative enum check: the
+        // framework's walk already refuses a value outside a modelled enum
+        // before this handler runs.
         let playback_mode = input.playback_mode.clone().unwrap_or_else(|| "LIVE".to_string());
         if !H_L_S_PLAYBACK_MODE_VALUES.contains(&playback_mode.as_str()) {
             return Err(invalid(format!(
@@ -387,14 +361,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let expires_in_secs = input
             .expires
             .and_then(|secs| u32::try_from(secs).ok())
-            .unwrap_or(DEFAULT_EXPIRES_SECS);
+            .unwrap_or(DEFAULT_SESSION_EXPIRES_SECS);
         let max_fragments = input
             .max_media_playlist_fragment_results
             .and_then(|max| usize::try_from(max).ok())
             .unwrap_or(if playback_mode == "ON_DEMAND" {
-                DEFAULT_ON_DEMAND_PLAYLIST_FRAGMENTS
+                DEFAULT_ON_DEMAND_SESSION_FRAGMENTS
             } else {
-                DEFAULT_LIVE_PLAYLIST_FRAGMENTS
+                DEFAULT_LIVE_SESSION_FRAGMENTS
             });
 
         // The time range the selector asks for, checked against the playback
@@ -439,6 +413,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // Which fragments the session serves, as the mode and the selector
+        // describe them; the archive itself is read through this below.
+        let window = match range {
+            Some(range) if !live => SessionWindow::Range {
+                start_millis: range
+                    .start_timestamp
+                    .as_ref()
+                    .map_or(i64::MIN, date_time_millis),
+                end_millis: range
+                    .end_timestamp
+                    .as_ref()
+                    .map_or(i64::MAX, date_time_millis),
+            },
+            _ => SessionWindow::Live,
+        };
+
         let Some(state) = service_state(&*self.engine) else {
             // See the note in `list_fragments`: unreachable in the assembled
             // emulator, and reported as a modelled failure rather than as an
@@ -475,55 +465,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
 
-            let selected: Vec<String> = if live {
-                // LIVE serves the most recently INGESTED fragments and only
-                // exists while the stream head is fresh. The ordering is by
-                // server timestamp whatever `FragmentSelectorType` the request
-                // names, because that is what the selector's own documentation
-                // says of LIVE: "the most recently ingested fragments based on
-                // server timestamps are included in the HLS media playlist.
-                // This means that even if fragments ingested in the past have
-                // producer timestamps with values now, they are not included."
-                let now = SystemTime::now();
-                let window_start = epoch_millis(now - LIVE_FRAGMENT_WINDOW);
-                let fresh = stream.fragments.iter().any(|fragment| {
-                    epoch_millis(fragment.server_timestamp) >= window_start
-                });
-                if !fresh {
-                    return Err(not_found(NO_FRAGMENTS_MESSAGE.to_string()));
-                }
-                let mut newest: Vec<&crate::state::StoredFragment> =
-                    stream.fragments.iter().collect();
-                newest.sort_by_key(|fragment| epoch_millis(fragment.server_timestamp));
-                let skip = newest.len().saturating_sub(max_fragments);
-                newest
-                    .into_iter()
-                    .skip(skip)
-                    .map(|fragment| fragment.fragment_number.clone())
-                    .collect()
-            } else {
-                // ON_DEMAND and LIVE_REPLAY serve the oldest fragments in the
-                // requested range, up to the maximum. An unset LIVE_REPLAY
-                // EndTimestamp leaves the range open-ended.
-                let range = range.expect("checked above for the non-LIVE modes");
-                let start_millis = range
-                    .start_timestamp
-                    .as_ref()
-                    .map_or(i64::MIN, date_time_millis);
-                let end_millis = range
-                    .end_timestamp
-                    .as_ref()
-                    .map_or(i64::MAX, date_time_millis);
-                let in_range = stream.fragments_in_range(origin, start_millis, end_millis);
-                if in_range.is_empty() {
-                    return Err(not_found(NO_FRAGMENTS_MESSAGE.to_string()));
-                }
-                in_range
-                    .into_iter()
-                    .take(max_fragments)
-                    .map(|fragment| fragment.fragment_number.clone())
-                    .collect()
-            };
+            // The playlist snapshot, by the one selection rule both
+            // streaming-session operations share. A session with nothing to
+            // serve does not exist.
+            let selected =
+                stream.session_fragment_numbers(window, origin, max_fragments, SystemTime::now());
+            if selected.is_empty() {
+                return Err(not_found(NO_FRAGMENTS_MESSAGE.to_string()));
+            }
 
             (stream.name.clone(), selected)
         };
@@ -541,32 +490,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             protocol: SessionProtocol::Hls,
             playback_mode,
             container_format,
-            discontinuity_mode,
+            discontinuity_mode: Some(discontinuity_mode),
             display_fragment_timestamp,
+            display_fragment_number: None,
             fragment_numbers,
             created_at,
             expires_in_secs,
         });
 
         // The URL addresses the endpoint the CALLER reached this emulator on,
-        // read from the request itself, exactly as the real service answers on
-        // its own data endpoint. It deliberately names no real AWS host: this
-        // emulator serves the playback session, so a player or test that
-        // follows the URL must come back here and must never be sent to the
-        // real service.
-        let host = ctx
-            .parts()
-            .headers
-            .get(::http::header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .or_else(|| ctx.parts().uri.host())
-            .unwrap_or(LOOPBACK_HOST)
-            .to_string();
+        // read from the request itself by the one rule both streaming-session
+        // operations share.
         Ok(GetHLSStreamingSessionURLOutput {
-            hls_streaming_session_url: Some(format!(
-                "https://{host}/{}/v1/getHLSMasterPlaylist.m3u8?SessionToken={token}",
-                SessionProtocol::Hls.url_prefix()
-            )),
+            hls_streaming_session_url: Some(session_url(ctx, SessionProtocol::Hls, &token)),
         })
     }
 }

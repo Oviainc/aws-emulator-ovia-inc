@@ -26,20 +26,20 @@ use archived_media::state::{
 const REGION: &str = "us-east-1";
 /// The endpoint every request in this suite addresses: this emulator, on
 /// loopback. A session URL must come back here, never to a real AWS host.
-const EMULATOR_ENDPOINT: &str = "127.0.0.1:9297";
+pub(crate) const EMULATOR_ENDPOINT: &str = "127.0.0.1:9297";
 /// The seeded stream with an archive and 24 hours of retention.
 pub(crate) const STREAM: &str = "demo-stream";
 /// A seeded stream with `DataRetentionInHours` of 0.
-const NO_RETENTION_STREAM: &str = "no-retention-stream";
+pub(crate) const NO_RETENTION_STREAM: &str = "no-retention-stream";
 /// A seeded stream whose fragments were ingested just now.
-const LIVE_STREAM: &str = "live-stream";
+pub(crate) const LIVE_STREAM: &str = "live-stream";
 /// The base of the seeded range: an instant well in the past, so nothing in
 /// this stream's archive is within the LIVE 30-second window.
-const T0_SECS: i64 = 1_761_000_000;
+pub(crate) const T0_SECS: i64 = 1_761_000_000;
 /// How many fragments `STREAM` holds.
 const SEEDED_FRAGMENTS: u64 = 5;
 /// How many fragments `LIVE_STREAM` holds.
-const LIVE_FRAGMENTS: u64 = 7;
+pub(crate) const LIVE_FRAGMENTS: u64 = 7;
 /// A realistic Kinesis Video fragment number: a long, increasing decimal.
 const FRAGMENT_BASE: u64 = 9_134_385_233_318_143_200;
 
@@ -239,6 +239,19 @@ pub(crate) fn read_loop_operations() -> Vec<(&'static str, serde_json::Value)> {
             serde_json::json!({
                 "PlaybackMode": "ON_DEMAND",
                 "HLSFragmentSelector": {
+                    "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                    "TimestampRange": {
+                        "StartTimestamp": T0_SECS,
+                        "EndTimestamp": T0_SECS + 1000,
+                    },
+                },
+            }),
+        ),
+        (
+            "/getDASHStreamingSessionURL",
+            serde_json::json!({
+                "PlaybackMode": "ON_DEMAND",
+                "DASHFragmentSelector": {
                     "FragmentSelectorType": "PRODUCER_TIMESTAMP",
                     "TimestampRange": {
                         "StartTimestamp": T0_SECS,
@@ -1047,8 +1060,9 @@ async fn minting_a_session_bounds_the_session_store() {
         protocol: SessionProtocol::Hls,
         playback_mode: "ON_DEMAND".to_string(),
         container_format: "FRAGMENTED_MP4".to_string(),
-        discontinuity_mode: "NEVER".to_string(),
+        discontinuity_mode: Some("NEVER".to_string()),
         display_fragment_timestamp: "NEVER".to_string(),
+        display_fragment_number: None,
         fragment_numbers: Vec::new(),
         created_at,
         expires_in_secs,
@@ -1190,7 +1204,8 @@ async fn get_hls_streaming_session_url_applies_the_documented_defaults() {
             "case {case}: the default DisplayFragmentTimestamp is NEVER, got {session:?}"
         );
         assert_eq!(
-            session.discontinuity_mode, discontinuity,
+            session.discontinuity_mode.as_deref(),
+            Some(discontinuity),
             "case {case}: wrong default DiscontinuityMode, got {session:?}"
         );
         assert_eq!(
@@ -1407,22 +1422,20 @@ async fn get_hls_streaming_session_url_refuses_a_stream_with_no_retention() {
     );
 }
 
-/// The operation this slice leaves unimplemented still answers 501, so a
-/// caller can tell "nobody has written it yet" from a real, empty answer.
+/// Every operation of this service is implemented, so none of them answers
+/// 501: `GetDASHStreamingSessionURL`, the last scaffold, is exercised in depth
+/// by the `get_dash_streaming_session_url` suite.
 #[tokio::test]
-async fn the_operations_outside_this_slice_still_answer_not_implemented() {
+async fn no_operation_of_this_service_answers_not_implemented() {
     let harness = seeded();
-    let cases: Vec<(&str, serde_json::Value)> = vec![(
-        "/getDASHStreamingSessionURL",
-        serde_json::json!({ "StreamName": STREAM, "PlaybackMode": "ON_DEMAND" }),
-    )];
+    let named = serde_json::json!({ "StreamName": STREAM });
 
-    for (path, body) in cases {
-        let response = harness.post(path, &body).await;
+    for (path, body) in read_loop_operations() {
+        let response = harness.post(path, &with_members(&body, &named)).await;
         assert_eq!(
             response.status().as_u16(),
-            501,
-            "case {path}: expected HTTP 501, got {} with body {:?}",
+            200,
+            "case {path}: expected HTTP 200, got {} with body {:?}",
             response.status(),
             String::from_utf8_lossy(response.body())
         );

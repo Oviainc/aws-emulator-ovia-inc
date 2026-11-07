@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDASHStreamingSessionURL
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDASHStreamingSessionURL`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints an MPEG-DASH streaming session over one stream's archive and returns
+//! the URL that resolves to it. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDASHStreamingSessionURL::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## Behaviour
+//!
+//! * The request names exactly one stream, by `StreamName` or `StreamARN`;
+//!   neither or both is `InvalidArgumentException` (400) and a name or ARN no
+//!   stream answers to is `ResourceNotFoundException` (404). The stream is
+//!   resolved in the Kinesis Video Streams registry — the store `CreateStream`
+//!   writes — so a stream the control plane holds is found here, with its
+//!   current retention.
+//! * "Data retention must be greater than 0": a stream with
+//!   `DataRetentionInHours` of 0 is `NoDataRetentionException` (400).
+//! * The documented parameter defaults are applied: `PlaybackMode` LIVE,
+//!   `FragmentSelectorType` SERVER_TIMESTAMP, `DisplayFragmentTimestamp` NEVER,
+//!   `DisplayFragmentNumber` NEVER, `Expires` 300 seconds, and
+//!   `MaxManifestFragmentResults` 5 for LIVE / LIVE_REPLAY and 1000 for
+//!   ON_DEMAND.
+//! * `DASHFragmentSelector` is required for ON_DEMAND and LIVE_REPLAY and must
+//!   carry a `TimestampRange`; a `TimestampRange` on a LIVE session is refused.
+//!   `EndTimestamp` is required for ON_DEMAND and optional for LIVE_REPLAY.
+//! * The session is RECORDED in state with the manifest snapshot it serves — by
+//!   the same selection rule `GetHLSStreamingSessionURL` uses — so two calls
+//!   mint two distinct sessions. A session with no fragments to serve — none in
+//!   the requested range for ON_DEMAND / LIVE_REPLAY, none in the last 30
+//!   seconds for LIVE — is `ResourceNotFoundException`, exactly as the error's
+//!   own documentation states.
 //!
 //! ## Shape of an operation
 //!
@@ -173,6 +192,20 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    date_time_millis, service_state, session_url, SessionProtocol, SessionWindow,
+    StreamLookupError, StreamingSession, TimestampOrigin, DEFAULT_LIVE_SESSION_FRAGMENTS,
+    DEFAULT_ON_DEMAND_SESSION_FRAGMENTS, DEFAULT_SESSION_EXPIRES_SECS, NO_DATA_RETENTION_MESSAGE,
+    NO_FRAGMENTS_MESSAGE, TIMESTAMP_RANGE_ORDER_MESSAGE,
+};
+use std::time::SystemTime;
+
+/// The container an MPEG-DASH session serves, recorded on the session: the
+/// manifest references the MP4 initialization and media fragments
+/// `GetMP4InitFragment` and `GetMP4MediaFragment` answer, which is the only
+/// container form this protocol has — the operation models no
+/// `ContainerFormat` parameter.
+const DASH_CONTAINER_FORMAT: &str = "FRAGMENTED_MP4";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -249,18 +282,217 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDASHStreamingSessionURL` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDASHStreamingSessionURLErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDASHStreamingSessionURL"))
+        let invalid = |message: String| -> Self::Error {
+            GetDASHStreamingSessionURLErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+        let not_found = |message: String| -> Self::Error {
+            GetDASHStreamingSessionURLErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        // Documented parameter defaults. The membership checks are
+        // belt-and-braces rather than the authoritative enum check: the
+        // framework's walk already refuses a value outside a modelled enum
+        // before this handler runs.
+        let playback_mode = input
+            .playback_mode
+            .clone()
+            .unwrap_or_else(|| "LIVE".to_string());
+        if !D_A_S_H_PLAYBACK_MODE_VALUES.contains(&playback_mode.as_str()) {
+            return Err(invalid(format!(
+                "PlaybackMode must be one of [{}]",
+                D_A_S_H_PLAYBACK_MODE_VALUES.join(", ")
+            )));
+        }
+        let selector = input.dash_fragment_selector.as_ref();
+        let origin_value = selector
+            .and_then(|s| s.fragment_selector_type.clone())
+            .unwrap_or_else(|| TimestampOrigin::Server.as_str().to_string());
+        let Some(origin) = TimestampOrigin::parse(&origin_value) else {
+            return Err(invalid(format!(
+                "DASHFragmentSelector.FragmentSelectorType must be one of [{}]",
+                D_A_S_H_FRAGMENT_SELECTOR_TYPE_VALUES.join(", ")
+            )));
+        };
+        let display_fragment_timestamp = input
+            .display_fragment_timestamp
+            .clone()
+            .unwrap_or_else(|| "NEVER".to_string());
+        if !D_A_S_H_DISPLAY_FRAGMENT_TIMESTAMP_VALUES.contains(&display_fragment_timestamp.as_str())
+        {
+            return Err(invalid(format!(
+                "DisplayFragmentTimestamp must be one of [{}]",
+                D_A_S_H_DISPLAY_FRAGMENT_TIMESTAMP_VALUES.join(", ")
+            )));
+        }
+        let display_fragment_number = input
+            .display_fragment_number
+            .clone()
+            .unwrap_or_else(|| "NEVER".to_string());
+        if !D_A_S_H_DISPLAY_FRAGMENT_NUMBER_VALUES.contains(&display_fragment_number.as_str()) {
+            return Err(invalid(format!(
+                "DisplayFragmentNumber must be one of [{}]",
+                D_A_S_H_DISPLAY_FRAGMENT_NUMBER_VALUES.join(", ")
+            )));
+        }
+        let expires_in_secs = input
+            .expires
+            .and_then(|secs| u32::try_from(secs).ok())
+            .unwrap_or(DEFAULT_SESSION_EXPIRES_SECS);
+        let max_fragments = input
+            .max_manifest_fragment_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(if playback_mode == "ON_DEMAND" {
+                DEFAULT_ON_DEMAND_SESSION_FRAGMENTS
+            } else {
+                DEFAULT_LIVE_SESSION_FRAGMENTS
+            });
+
+        // The time range the selector asks for, checked against the playback
+        // mode's documented requirements before any state is touched.
+        let range = selector.and_then(|s| s.timestamp_range.as_ref());
+        let live = playback_mode == "LIVE";
+        if live {
+            if range.is_some() {
+                return Err(invalid(
+                    "DASHFragmentSelector.TimestampRange must not be set when PlaybackMode is LIVE"
+                        .to_string(),
+                ));
+            }
+        } else {
+            let Some(range) = range else {
+                return Err(invalid(format!(
+                    "DASHFragmentSelector with a TimestampRange is required when PlaybackMode is \
+                     {playback_mode}"
+                )));
+            };
+            if range.start_timestamp.is_none() {
+                return Err(invalid(
+                    "DASHFragmentSelector.TimestampRange.StartTimestamp is required".to_string(),
+                ));
+            }
+            if playback_mode == "ON_DEMAND" && range.end_timestamp.is_none() {
+                return Err(invalid(
+                    "DASHFragmentSelector.TimestampRange.EndTimestamp is required when \
+                     PlaybackMode is ON_DEMAND"
+                        .to_string(),
+                ));
+            }
+            // STRICTER than the `TimestampRange` of ListFragments and GetClip,
+            // which accept a single-instant range: `DASHTimestampRange`'s own
+            // documentation says the end "must be later than the StartTimestamp
+            // value", wording the other two ranges do not carry. The divergence
+            // is the model's, not an inconsistency here.
+            if let (Some(start), Some(end)) = (&range.start_timestamp, &range.end_timestamp) {
+                if date_time_millis(end) <= date_time_millis(start) {
+                    return Err(invalid(TIMESTAMP_RANGE_ORDER_MESSAGE.to_string()));
+                }
+            }
+        }
+
+        // Which fragments the session serves, as the mode and the selector
+        // describe them; the archive itself is read through this below.
+        let window = match range {
+            Some(range) if !live => SessionWindow::Range {
+                start_millis: range
+                    .start_timestamp
+                    .as_ref()
+                    .map_or(i64::MIN, date_time_millis),
+                end_millis: range
+                    .end_timestamp
+                    .as_ref()
+                    .map_or(i64::MAX, date_time_millis),
+            },
+            _ => SessionWindow::Live,
+        };
+
+        let Some(state) = service_state(&*self.engine) else {
+            // See the note in `list_fragments`: unreachable in the assembled
+            // emulator, and reported as a modelled failure rather than as an
+            // empty success.
+            return Err(
+                GetDASHStreamingSessionURLErrorModeled::ClientLimitExceededException(
+                    ClientLimitExceededException {
+                        message: Some("the archived-media store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        // Resolve the stream and take the manifest snapshot while the borrow of
+        // the archive is still immutable, then record the session.
+        let (stream_name, fragment_numbers) = {
+            let stream = match state.resolve_stream(
+                &*self.engine,
+                input.stream_name.as_deref(),
+                input.stream_arn.as_deref(),
+            ) {
+                Ok(stream) => stream,
+                Err(StreamLookupError::InvalidArgument(message)) => return Err(invalid(message)),
+                Err(StreamLookupError::NotFound(message)) => return Err(not_found(message)),
+            };
+
+            // "Data retention must be greater than 0."
+            if !stream.retains_data() {
+                return Err(
+                    GetDASHStreamingSessionURLErrorModeled::NoDataRetentionException(
+                        NoDataRetentionException {
+                            message: Some(NO_DATA_RETENTION_MESSAGE.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // The manifest snapshot, by the one selection rule both
+            // streaming-session operations share. A session with nothing to
+            // serve does not exist.
+            let selected =
+                stream.session_fragment_numbers(window, origin, max_fragments, SystemTime::now());
+            if selected.is_empty() {
+                return Err(not_found(NO_FRAGMENTS_MESSAGE.to_string()));
+            }
+
+            (stream.name.clone(), selected)
+        };
+
+        // The session is a resource this call MINTS — the operation's own
+        // documentation says "Kinesis Video Streams creates an MPEG-DASH
+        // streaming session to be used for accessing content in a stream" — so
+        // it is recorded, with the manifest snapshot it serves, and a second
+        // call mints a distinct one.
+        let created_at = SystemTime::now();
+        let token = state.mint_session_token(created_at);
+        state.record_session(StreamingSession {
+            token: token.clone(),
+            stream_name,
+            protocol: SessionProtocol::Dash,
+            playback_mode,
+            container_format: DASH_CONTAINER_FORMAT.to_string(),
+            discontinuity_mode: None,
+            display_fragment_timestamp,
+            display_fragment_number: Some(display_fragment_number),
+            fragment_numbers,
+            created_at,
+            expires_in_secs,
+        });
+
+        // The URL addresses the endpoint the CALLER reached this emulator on,
+        // read from the request itself by the one rule both streaming-session
+        // operations share.
+        Ok(GetDASHStreamingSessionURLOutput {
+            dash_streaming_session_url: Some(session_url(ctx, SessionProtocol::Dash, &token)),
+        })
     }
 }

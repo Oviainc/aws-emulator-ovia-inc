@@ -1,0 +1,797 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! `GetDASHStreamingSessionURL`, end to end over HTTP.
+//!
+//! The harness and the seeded archive are `archived_media_read_path`'s — the
+//! real `MultiServiceRouter` with this one service registered — so every
+//! assertion below is about what the handler computes FROM that archive and
+//! records in the service's own state.
+
+use std::time::SystemTime;
+
+use service_com_amazonaws_kinesisvideoarchivedmedia_awsacuityreader as archived_media;
+
+use archived_media::state::{service_state, SessionProtocol, StreamingSession};
+
+use crate::archived_media_read_path::{
+    body_json, fragment_number, seeded, Harness, EMULATOR_ENDPOINT, LIVE_FRAGMENTS, LIVE_STREAM,
+    NO_RETENTION_STREAM, STREAM, T0_SECS,
+};
+
+/// The route this suite drives.
+const PATH: &str = "/getDASHStreamingSessionURL";
+
+/// The sentence a session with nothing to serve is refused with, as
+/// `ResourceNotFoundException`'s own documentation describes the two cases that
+/// raise it.
+const NO_FRAGMENTS: &str = "No fragments found in the stream for the streaming request.";
+
+/// The `Expires` bounds the model publishes for this operation
+/// (`smithy_query(query="operation",operation="GetDASHStreamingSessionURL")`:
+/// `Expires` range 300..43200).
+const EXPIRES_MIN: i64 = 300;
+/// The upper `Expires` bound of that same range.
+const EXPIRES_MAX: i64 = 43200;
+
+/// The session the URL in `response_body` names, read back out of the service's
+/// own state, with the token the URL carries.
+fn recorded_session(harness: &Harness, url: &str) -> StreamingSession {
+    let token = url
+        .rsplit("SessionToken=")
+        .next()
+        .expect("the URL carries a session token")
+        .to_string();
+    let state = service_state(&*harness.engine).expect("the service store");
+    let state = state.lock();
+    state
+        .sessions
+        .get(&token)
+        .cloned()
+        .unwrap_or_else(|| panic!("no session recorded for token {token:?}"))
+}
+
+/// The `DASHStreamingSessionURL` of a successful response.
+fn session_url(response: &http::Response<bytes::Bytes>) -> String {
+    body_json(response)["DASHStreamingSessionURL"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The error code a refusal carries.
+fn error_code(response: &http::Response<bytes::Bytes>) -> String {
+    body_json(response)["__type"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The error message a refusal carries.
+fn error_message(response: &http::Response<bytes::Bytes>) -> String {
+    let reported = body_json(response);
+    reported["message"]
+        .as_str()
+        .or_else(|| reported["Message"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// RULE: a session is minted over the fragments the playback mode and selector
+/// select — the oldest in the requested range for ON_DEMAND and LIVE_REPLAY,
+/// the most recently ingested for LIVE — capped by `MaxManifestFragmentResults`
+/// (default 5 for LIVE / LIVE_REPLAY, 1,000 for ON_DEMAND), and the URL
+/// returned resolves to that recorded session.
+///
+/// The rows differ along what the rule generalises over: the playback mode, the
+/// timestamp the selector reads, whether the range is closed or open-ended, and
+/// the cap on the snapshot.
+#[tokio::test]
+async fn a_minted_session_serves_the_fragments_its_mode_and_selector_select() {
+    // (case, request body, the seeded fragment indices the session must serve)
+    let rows: Vec<(&str, serde_json::Value, Vec<u64>)> = vec![
+        (
+            "ON_DEMAND over producer timestamps, uncapped",
+            serde_json::json!({
+                "StreamName": STREAM,
+                "PlaybackMode": "ON_DEMAND",
+                "DASHFragmentSelector": {
+                    "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                    "TimestampRange": { "StartTimestamp": T0_SECS, "EndTimestamp": T0_SECS + 1000 },
+                },
+            }),
+            vec![0, 1, 2, 3, 4],
+        ),
+        (
+            "ON_DEMAND over server timestamps, capped at two",
+            serde_json::json!({
+                "StreamName": STREAM,
+                "PlaybackMode": "ON_DEMAND",
+                "MaxManifestFragmentResults": 2,
+                "DASHFragmentSelector": {
+                    "FragmentSelectorType": "SERVER_TIMESTAMP",
+                    "TimestampRange": { "StartTimestamp": T0_SECS, "EndTimestamp": T0_SECS + 1000 },
+                },
+            }),
+            vec![0, 1],
+        ),
+        (
+            "ON_DEMAND over a range that starts inside the archive",
+            serde_json::json!({
+                "StreamName": STREAM,
+                "PlaybackMode": "ON_DEMAND",
+                "DASHFragmentSelector": {
+                    "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                    "TimestampRange": {
+                        "StartTimestamp": T0_SECS + 20,
+                        "EndTimestamp": T0_SECS + 30,
+                    },
+                },
+            }),
+            vec![2, 3],
+        ),
+        (
+            "LIVE_REPLAY with an open-ended range, at the LIVE default of five",
+            serde_json::json!({
+                "StreamName": STREAM,
+                "PlaybackMode": "LIVE_REPLAY",
+                "DASHFragmentSelector": {
+                    "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                    "TimestampRange": { "StartTimestamp": T0_SECS },
+                },
+            }),
+            vec![0, 1, 2, 3, 4],
+        ),
+        (
+            "LIVE_REPLAY capped at three",
+            serde_json::json!({
+                "StreamName": STREAM,
+                "PlaybackMode": "LIVE_REPLAY",
+                "MaxManifestFragmentResults": 3,
+                "DASHFragmentSelector": {
+                    "FragmentSelectorType": "SERVER_TIMESTAMP",
+                    "TimestampRange": { "StartTimestamp": T0_SECS, "EndTimestamp": T0_SECS + 1000 },
+                },
+            }),
+            vec![0, 1, 2],
+        ),
+        (
+            "LIVE over a freshly ingested archive, at the LIVE default of five",
+            serde_json::json!({ "StreamName": LIVE_STREAM, "PlaybackMode": "LIVE" }),
+            ((LIVE_FRAGMENTS - 5)..LIVE_FRAGMENTS).collect(),
+        ),
+        (
+            "LIVE capped at two",
+            serde_json::json!({
+                "StreamName": LIVE_STREAM,
+                "PlaybackMode": "LIVE",
+                "MaxManifestFragmentResults": 2,
+            }),
+            ((LIVE_FRAGMENTS - 2)..LIVE_FRAGMENTS).collect(),
+        ),
+    ];
+
+    for (case, body, snapshot) in rows {
+        let harness = seeded();
+        let response = harness.post(PATH, &body).await;
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "case {case}: expected HTTP 200, got {} with body {:?}",
+            response.status(),
+            String::from_utf8_lossy(response.body())
+        );
+
+        // The URL comes back to THIS emulator — the endpoint the request was
+        // addressed to — and names the MPEG-DASH manifest resource.
+        let url = session_url(&response);
+        let prefix = format!("https://{EMULATOR_ENDPOINT}/dash/v1/getMPDManifest.mpd?SessionToken=");
+        assert!(
+            url.starts_with(&prefix),
+            "case {case}: expected a URL starting {prefix:?}, got {url:?}"
+        );
+        assert!(
+            url.len() > prefix.len(),
+            "case {case}: the URL must carry a session token, got {url:?}"
+        );
+
+        let session = recorded_session(&harness, &url);
+        assert_eq!(
+            session.protocol,
+            SessionProtocol::Dash,
+            "case {case}: the session must be an MPEG-DASH one, got {session:?}"
+        );
+        assert_eq!(
+            Some(session.stream_name.as_str()),
+            body["StreamName"].as_str(),
+            "case {case}: the session must name the requested stream, got {session:?}"
+        );
+        assert_eq!(
+            session.fragment_numbers,
+            snapshot
+                .iter()
+                .copied()
+                .map(fragment_number)
+                .collect::<Vec<_>>(),
+            "case {case}: wrong manifest snapshot, got {session:?}"
+        );
+    }
+}
+
+/// RULE: the documented parameter defaults are what an unspecified member means
+/// — `Expires` 300 seconds, `DisplayFragmentTimestamp` NEVER and
+/// `DisplayFragmentNumber` NEVER — and a member the request does name is the
+/// one recorded on the session.
+///
+/// The rows differ along which of the three members the request carries and
+/// which value it asks for.
+#[tokio::test]
+async fn the_documented_defaults_apply_and_a_stated_parameter_is_recorded() {
+    // (case, the members added to the request, expected Expires, expected
+    // DisplayFragmentTimestamp, expected DisplayFragmentNumber)
+    let rows: Vec<(&str, serde_json::Value, u32, &str, &str)> = vec![
+        (
+            "every optional member unspecified",
+            serde_json::json!({}),
+            300,
+            "NEVER",
+            "NEVER",
+        ),
+        (
+            "fragment timestamps displayed",
+            serde_json::json!({ "DisplayFragmentTimestamp": "ALWAYS" }),
+            300,
+            "ALWAYS",
+            "NEVER",
+        ),
+        (
+            "fragment numbers displayed",
+            serde_json::json!({ "DisplayFragmentNumber": "ALWAYS" }),
+            300,
+            "NEVER",
+            "ALWAYS",
+        ),
+        (
+            "both displayed, at the Expires minimum",
+            serde_json::json!({
+                "DisplayFragmentTimestamp": "ALWAYS",
+                "DisplayFragmentNumber": "ALWAYS",
+                "Expires": EXPIRES_MIN,
+            }),
+            300,
+            "ALWAYS",
+            "ALWAYS",
+        ),
+        (
+            "at the Expires maximum",
+            serde_json::json!({ "Expires": EXPIRES_MAX }),
+            43200,
+            "NEVER",
+            "NEVER",
+        ),
+        (
+            "an Expires between the bounds",
+            serde_json::json!({ "Expires": 3600 }),
+            3600,
+            "NEVER",
+            "NEVER",
+        ),
+    ];
+
+    for (case, extra, expires, timestamp, number) in rows {
+        let harness = seeded();
+        let mut body = serde_json::json!({
+            "StreamName": STREAM,
+            "PlaybackMode": "ON_DEMAND",
+            "DASHFragmentSelector": {
+                "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                "TimestampRange": { "StartTimestamp": T0_SECS, "EndTimestamp": T0_SECS + 1000 },
+            },
+        });
+        for (key, value) in extra.as_object().expect("an object of members") {
+            body[key.clone()] = value.clone();
+        }
+
+        let response = harness.post(PATH, &body).await;
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "case {case}: expected HTTP 200, got {} with body {:?}",
+            response.status(),
+            String::from_utf8_lossy(response.body())
+        );
+        let session = recorded_session(&harness, &session_url(&response));
+        assert_eq!(
+            session.expires_in_secs, expires,
+            "case {case}: expected Expires {expires}, got {session:?}"
+        );
+        assert_eq!(
+            session.display_fragment_timestamp, timestamp,
+            "case {case}: expected DisplayFragmentTimestamp {timestamp}, got {session:?}"
+        );
+        assert_eq!(
+            session.display_fragment_number.as_deref(),
+            Some(number),
+            "case {case}: expected DisplayFragmentNumber {number}, got {session:?}"
+        );
+        // MPEG-DASH models no `ContainerFormat` and no `DiscontinuityMode`: the
+        // manifest serves MP4 fragments, and the HLS-only member is unset.
+        assert_eq!(
+            session.container_format, "FRAGMENTED_MP4",
+            "case {case}: an MPEG-DASH session serves fragmented MP4, got {session:?}"
+        );
+        assert_eq!(
+            session.discontinuity_mode, None,
+            "case {case}: MPEG-DASH carries no DiscontinuityMode, got {session:?}"
+        );
+        assert!(
+            session.expires_at() > SystemTime::now(),
+            "case {case}: a freshly minted session must still be inside its window, got {session:?}"
+        );
+    }
+}
+
+/// RULE: `Expires` is bounded at 300 and 43,200 seconds by the model, so a
+/// value outside that range is refused 400 `ValidationException` before the
+/// handler runs — and nothing is recorded for a refused request.
+///
+/// The rows are each published bound and one past it, on both ends.
+#[tokio::test]
+async fn an_expires_outside_the_published_bounds_is_refused() {
+    // (case, the Expires the request carries, the status expected)
+    let rows: [(&str, i64, u16); 6] = [
+        ("one second under the minimum", EXPIRES_MIN - 1, 400),
+        ("exactly at the minimum", EXPIRES_MIN, 200),
+        ("one second over the minimum", EXPIRES_MIN + 1, 200),
+        ("one second under the maximum", EXPIRES_MAX - 1, 200),
+        ("exactly at the maximum", EXPIRES_MAX, 200),
+        ("one second over the maximum", EXPIRES_MAX + 1, 400),
+    ];
+
+    for (case, expires, status) in rows {
+        let harness = seeded();
+        let body = serde_json::json!({
+            "StreamName": STREAM,
+            "PlaybackMode": "ON_DEMAND",
+            "Expires": expires,
+            "DASHFragmentSelector": {
+                "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                "TimestampRange": { "StartTimestamp": T0_SECS, "EndTimestamp": T0_SECS + 1000 },
+            },
+        });
+        let response = harness.post(PATH, &body).await;
+        assert_eq!(
+            response.status().as_u16(),
+            status,
+            "case {case}: expected HTTP {status}, got {} with body {:?}",
+            response.status(),
+            String::from_utf8_lossy(response.body())
+        );
+        if status == 400 {
+            let code = error_code(&response);
+            assert_eq!(
+                code, "ValidationException",
+                "case {case}: expected ValidationException, got {code:?}"
+            );
+            let state = service_state(&*harness.engine).expect("the service store");
+            let state = state.lock();
+            assert!(
+                state.sessions.is_empty(),
+                "case {case}: a refused request must record no session, held {:?}",
+                state.sessions.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+/// RULE: the playback mode decides which selector a session may carry —
+/// `DASHFragmentSelector` with a `TimestampRange` is required for ON_DEMAND and
+/// LIVE_REPLAY, `EndTimestamp` is required for ON_DEMAND and optional for
+/// LIVE_REPLAY, the end must be later than the start, and a LIVE session must
+/// carry no `TimestampRange`.
+#[tokio::test]
+async fn the_selector_rules_of_each_mode_are_enforced() {
+    let harness = seeded();
+    // (case, request body, the status expected)
+    let rows: Vec<(&str, serde_json::Value, u16)> = vec![
+        (
+            "ON_DEMAND with no selector",
+            serde_json::json!({ "StreamName": STREAM, "PlaybackMode": "ON_DEMAND" }),
+            400,
+        ),
+        (
+            "LIVE_REPLAY with no selector",
+            serde_json::json!({ "StreamName": STREAM, "PlaybackMode": "LIVE_REPLAY" }),
+            400,
+        ),
+        (
+            "ON_DEMAND with a selector carrying no range",
+            serde_json::json!({
+                "StreamName": STREAM,
+                "PlaybackMode": "ON_DEMAND",
+                "DASHFragmentSelector": { "FragmentSelectorType": "SERVER_TIMESTAMP" },
+            }),
+            400,
+        ),
+        (
+            "ON_DEMAND with no EndTimestamp",
+            serde_json::json!({
+                "StreamName": STREAM,
+                "PlaybackMode": "ON_DEMAND",
+                "DASHFragmentSelector": {
+                    "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                    "TimestampRange": { "StartTimestamp": T0_SECS },
+                },
+            }),
+            400,
+        ),
+        (
+            "ON_DEMAND with an end that precedes the start",
+            serde_json::json!({
+                "StreamName": STREAM,
+                "PlaybackMode": "ON_DEMAND",
+                "DASHFragmentSelector": {
+                    "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                    "TimestampRange": {
+                        "StartTimestamp": T0_SECS + 10,
+                        "EndTimestamp": T0_SECS,
+                    },
+                },
+            }),
+            400,
+        ),
+        (
+            "LIVE_REPLAY with an end equal to the start",
+            serde_json::json!({
+                "StreamName": STREAM,
+                "PlaybackMode": "LIVE_REPLAY",
+                "DASHFragmentSelector": {
+                    "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                    "TimestampRange": {
+                        "StartTimestamp": T0_SECS,
+                        "EndTimestamp": T0_SECS,
+                    },
+                },
+            }),
+            400,
+        ),
+        (
+            "LIVE with a TimestampRange",
+            serde_json::json!({
+                "StreamName": LIVE_STREAM,
+                "PlaybackMode": "LIVE",
+                "DASHFragmentSelector": {
+                    "FragmentSelectorType": "SERVER_TIMESTAMP",
+                    "TimestampRange": {
+                        "StartTimestamp": T0_SECS,
+                        "EndTimestamp": T0_SECS + 1000,
+                    },
+                },
+            }),
+            400,
+        ),
+        (
+            "LIVE with a selector carrying only a selector type",
+            serde_json::json!({
+                "StreamName": LIVE_STREAM,
+                "PlaybackMode": "LIVE",
+                "DASHFragmentSelector": { "FragmentSelectorType": "PRODUCER_TIMESTAMP" },
+            }),
+            200,
+        ),
+        (
+            "LIVE_REPLAY with an open-ended range",
+            serde_json::json!({
+                "StreamName": STREAM,
+                "PlaybackMode": "LIVE_REPLAY",
+                "DASHFragmentSelector": {
+                    "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                    "TimestampRange": { "StartTimestamp": T0_SECS },
+                },
+            }),
+            200,
+        ),
+    ];
+
+    for (case, body, status) in rows {
+        let response = harness.post(PATH, &body).await;
+        assert_eq!(
+            response.status().as_u16(),
+            status,
+            "case {case}: expected HTTP {status}, got {} with body {:?}",
+            response.status(),
+            String::from_utf8_lossy(response.body())
+        );
+        if status == 400 {
+            let code = error_code(&response);
+            assert_eq!(
+                code, "InvalidArgumentException",
+                "case {case}: expected InvalidArgumentException, got {code:?}"
+            );
+        }
+    }
+}
+
+/// RULE: a session that would serve nothing does not exist —
+/// `ResourceNotFoundException` (404) with one fixed sentence for ON_DEMAND /
+/// LIVE_REPLAY with no fragment in the requested range, and for LIVE with no
+/// fragment in the last 30 seconds — while the same stream in a mode that does
+/// select fragments is served.
+#[tokio::test]
+async fn a_session_with_no_fragments_to_serve_is_not_found() {
+    // (case, request body, the status expected)
+    let rows: Vec<(&str, serde_json::Value, u16)> = vec![
+        (
+            "LIVE over an archive older than the live window",
+            serde_json::json!({ "StreamName": STREAM, "PlaybackMode": "LIVE" }),
+            404,
+        ),
+        (
+            "LIVE over a freshly ingested archive",
+            serde_json::json!({ "StreamName": LIVE_STREAM, "PlaybackMode": "LIVE" }),
+            200,
+        ),
+        (
+            "ON_DEMAND over a range before the archive",
+            serde_json::json!({
+                "StreamName": STREAM,
+                "PlaybackMode": "ON_DEMAND",
+                "DASHFragmentSelector": {
+                    "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                    "TimestampRange": {
+                        "StartTimestamp": T0_SECS - 1000,
+                        "EndTimestamp": T0_SECS - 1,
+                    },
+                },
+            }),
+            404,
+        ),
+        (
+            "ON_DEMAND over a range after the archive",
+            serde_json::json!({
+                "StreamName": STREAM,
+                "PlaybackMode": "ON_DEMAND",
+                "DASHFragmentSelector": {
+                    "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                    "TimestampRange": {
+                        "StartTimestamp": T0_SECS + 100_000,
+                        "EndTimestamp": T0_SECS + 200_000,
+                    },
+                },
+            }),
+            404,
+        ),
+        (
+            "LIVE_REPLAY over a range the server timestamps miss",
+            serde_json::json!({
+                "StreamName": STREAM,
+                "PlaybackMode": "LIVE_REPLAY",
+                "DASHFragmentSelector": {
+                    "FragmentSelectorType": "SERVER_TIMESTAMP",
+                    "TimestampRange": {
+                        "StartTimestamp": T0_SECS - 1000,
+                        "EndTimestamp": T0_SECS - 1,
+                    },
+                },
+            }),
+            404,
+        ),
+        (
+            "LIVE_REPLAY over the same range the producer timestamps hit",
+            serde_json::json!({
+                "StreamName": STREAM,
+                "PlaybackMode": "LIVE_REPLAY",
+                "DASHFragmentSelector": {
+                    "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                    "TimestampRange": {
+                        "StartTimestamp": T0_SECS,
+                        "EndTimestamp": T0_SECS + 1000,
+                    },
+                },
+            }),
+            200,
+        ),
+    ];
+
+    for (case, body, status) in rows {
+        let harness = seeded();
+        let response = harness.post(PATH, &body).await;
+        assert_eq!(
+            response.status().as_u16(),
+            status,
+            "case {case}: expected HTTP {status}, got {} with body {:?}",
+            response.status(),
+            String::from_utf8_lossy(response.body())
+        );
+        if status == 404 {
+            let code = error_code(&response);
+            assert_eq!(
+                code, "ResourceNotFoundException",
+                "case {case}: expected ResourceNotFoundException, got {code:?}"
+            );
+            let message = error_message(&response);
+            assert_eq!(
+                message, NO_FRAGMENTS,
+                "case {case}: expected {NO_FRAGMENTS:?}, got {message:?}"
+            );
+            let state = service_state(&*harness.engine).expect("the service store");
+            let state = state.lock();
+            assert!(
+                state.sessions.is_empty(),
+                "case {case}: a session that serves nothing must not be recorded, held {:?}",
+                state.sessions.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+/// RULE: "Data retention must be greater than 0" — a stream whose
+/// `DataRetentionInHours` is 0 cannot have a streaming session, in any playback
+/// mode, and the refusal is `NoDataRetentionException` (400).
+#[tokio::test]
+async fn a_stream_that_retains_no_data_has_no_session() {
+    let harness = seeded();
+    // (case, the mode-specific members the request carries)
+    let rows: Vec<(&str, serde_json::Value)> = vec![
+        ("LIVE", serde_json::json!({ "PlaybackMode": "LIVE" })),
+        (
+            "ON_DEMAND",
+            serde_json::json!({
+                "PlaybackMode": "ON_DEMAND",
+                "DASHFragmentSelector": {
+                    "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                    "TimestampRange": { "StartTimestamp": T0_SECS, "EndTimestamp": T0_SECS + 1000 },
+                },
+            }),
+        ),
+        (
+            "LIVE_REPLAY",
+            serde_json::json!({
+                "PlaybackMode": "LIVE_REPLAY",
+                "DASHFragmentSelector": {
+                    "FragmentSelectorType": "SERVER_TIMESTAMP",
+                    "TimestampRange": { "StartTimestamp": T0_SECS },
+                },
+            }),
+        ),
+    ];
+
+    for (case, extra) in rows {
+        let mut body = serde_json::json!({ "StreamName": NO_RETENTION_STREAM });
+        for (key, value) in extra.as_object().expect("an object of members") {
+            body[key.clone()] = value.clone();
+        }
+        let response = harness.post(PATH, &body).await;
+        assert_eq!(
+            response.status().as_u16(),
+            400,
+            "case {case}: expected HTTP 400, got {} with body {:?}",
+            response.status(),
+            String::from_utf8_lossy(response.body())
+        );
+        let code = error_code(&response);
+        assert_eq!(
+            code, "NoDataRetentionException",
+            "case {case}: expected NoDataRetentionException, got {code:?}"
+        );
+    }
+}
+
+/// RULE: every call MINTS a session — the operation's own documentation says
+/// "Kinesis Video Streams creates an MPEG-DASH streaming session" — so two
+/// calls with the same parameters answer two different URLs and both sessions
+/// are recorded, each with its own token and its own snapshot.
+#[tokio::test]
+async fn each_call_mints_a_distinct_session() {
+    let harness = seeded();
+    let body = serde_json::json!({
+        "StreamName": STREAM,
+        "PlaybackMode": "ON_DEMAND",
+        "DASHFragmentSelector": {
+            "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+            "TimestampRange": { "StartTimestamp": T0_SECS, "EndTimestamp": T0_SECS + 1000 },
+        },
+    });
+
+    let mut urls = Vec::new();
+    for call in 0..3 {
+        let response = harness.post(PATH, &body).await;
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "case call {call}: expected HTTP 200, got {} with body {:?}",
+            response.status(),
+            String::from_utf8_lossy(response.body())
+        );
+        urls.push(session_url(&response));
+    }
+
+    for (call, url) in urls.iter().enumerate() {
+        let session = recorded_session(&harness, url);
+        assert_eq!(
+            session.protocol,
+            SessionProtocol::Dash,
+            "case call {call}: expected an MPEG-DASH session, got {session:?}"
+        );
+    }
+    let distinct: std::collections::BTreeSet<&String> = urls.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        urls.len(),
+        "case three calls: each call must mint its own session, got {urls:?}"
+    );
+
+    let state = service_state(&*harness.engine).expect("the service store");
+    let state = state.lock();
+    assert_eq!(
+        state.sessions.len(),
+        urls.len(),
+        "case three calls: every minted session must be recorded, held {:?}",
+        state.sessions.keys().collect::<Vec<_>>()
+    );
+}
+
+/// RULE: a stream the control plane does not hold has no session —
+/// `ResourceNotFoundException` (404) — and a request that names neither or both
+/// identifiers is `InvalidArgumentException` (400). The LIVE mode reaches the
+/// same stream-resolution rule as the modes that carry a selector.
+#[tokio::test]
+async fn the_stream_is_resolved_by_the_same_rule_in_every_mode() {
+    let harness = seeded();
+    // (case, the stream-addressing members, the status expected, the error code)
+    let rows: Vec<(&str, serde_json::Value, u16, &str)> = vec![
+        (
+            "neither identifier",
+            serde_json::json!({}),
+            400,
+            "InvalidArgumentException",
+        ),
+        (
+            "both identifiers",
+            serde_json::json!({ "StreamName": STREAM, "StreamARN": harness.arn.clone() }),
+            400,
+            "InvalidArgumentException",
+        ),
+        (
+            "a name no stream answers to",
+            serde_json::json!({ "StreamName": "absent-stream" }),
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "an ARN no stream answers to",
+            serde_json::json!({
+                "StreamARN": "arn:aws:kinesisvideo:us-east-1:000000000000:stream/absent/1761000000",
+            }),
+            404,
+            "ResourceNotFoundException",
+        ),
+    ];
+
+    for (case, stream, status, code) in rows {
+        for mode in ["LIVE", "ON_DEMAND"] {
+            let mut body = serde_json::json!({ "PlaybackMode": mode });
+            if mode == "ON_DEMAND" {
+                body["DASHFragmentSelector"] = serde_json::json!({
+                    "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                    "TimestampRange": { "StartTimestamp": T0_SECS, "EndTimestamp": T0_SECS + 1000 },
+                });
+            }
+            for (key, value) in stream.as_object().expect("an object of members") {
+                body[key.clone()] = value.clone();
+            }
+            let response = harness.post(PATH, &body).await;
+            assert_eq!(
+                response.status().as_u16(),
+                status,
+                "case {case} in {mode}: expected HTTP {status}, got {} with body {:?}",
+                response.status(),
+                String::from_utf8_lossy(response.body())
+            );
+            let reported = error_code(&response);
+            assert_eq!(
+                reported, code,
+                "case {case} in {mode}: expected {code}, got {reported:?}"
+            );
+        }
+    }
+}
