@@ -212,6 +212,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         store.record_token(input.client_token, fingerprint, None, now);
 
+        // Deleting an account CHANGES the directory, and its domain controllers audit
+        // every such change in their security log — so a directory whose log subscription
+        // forwards that log forwards this record too. The store's guard is released first:
+        // the emitter takes the control plane's store and then CloudWatch Logs'.
+        drop(store);
+        crate::state::security_log::record(
+            &*self.engine,
+            &input.directory_id,
+            crate::state::security_log::USER_ACCOUNT_DELETED,
+            &input.sam_account_name,
+            now,
+        );
+
         Ok(DeleteUserOutput {})
     }
 }

@@ -24,6 +24,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The Directory Service CONTROL plane's store, for the log subscription that forwards a
+# directory's domain controller security logs (`state::security_log`): a write to a
+# directory's objects is an act those controllers audit, so it is forwarded to the
+# subscribed CloudWatch Logs group through that plane's own emitter.
+service-com-amazonaws-directoryservice-directoryservice-20150416 = { workspace = true }
 # Digests a `ClientToken`'s request so an idempotency replay is compared without the
 # ledger holding a copy of the (sensitive) values themselves.
 sha2 = { workspace = true }

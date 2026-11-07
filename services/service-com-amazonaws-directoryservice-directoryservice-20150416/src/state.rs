@@ -50,10 +50,16 @@
 //!   — so no handler can answer a refusal without the correlation handle a client logs it
 //!   by. [`invalid_resource_id`] and [`invalid_next_token`] are the two diagnostics a
 //!   whole family of operations shares, worded once here beside [`no_such_directory`].
+//! * [`security_log`], what a directory's audited acts DELIVER to the CloudWatch Logs log
+//!   group its log subscription names — the forwarding half of
+//!   `CreateLogSubscription`, reached by this service's own writes and by the Directory
+//!   Service DATA plane's.
 //!
 //! The administrator `Password` `CreateDirectory` is called with is deliberately NOT a
 //! field here: the model marks it `@sensitive`, no operation reports it back, and state
 //! this emulator does not need is state it must not hold.
+
+pub mod security_log;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};

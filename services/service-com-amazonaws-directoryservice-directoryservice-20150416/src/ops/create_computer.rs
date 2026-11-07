@@ -308,8 +308,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .computers
             .get(&key)
             .ok_or_else(crate::state::state_unavailable)?;
+        let computer = stored.to_computer();
+        let created_name = stored.computer_name.clone();
+
+        // Creating a computer object CHANGES the directory, and a domain controller audits
+        // every such change in its security log — so a directory whose log subscription
+        // forwards that log forwards this record too. The store's guard is released first:
+        // the delivery holds the destination's store alone.
+        drop(store);
+        crate::state::security_log::record(
+            &*self.engine,
+            &input.directory_id,
+            crate::state::security_log::COMPUTER_ACCOUNT_CREATED,
+            &created_name,
+            now,
+        );
+
         Ok(CreateComputerOutput {
-            computer: Some(stored.to_computer()),
+            computer: Some(computer),
         })
     }
 }

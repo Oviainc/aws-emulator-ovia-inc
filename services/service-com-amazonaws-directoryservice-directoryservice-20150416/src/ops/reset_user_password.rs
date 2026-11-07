@@ -249,6 +249,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the reset changes about the account: its password was last set now. The
         // password itself is dropped with the request.
         user.password_last_set = now;
+        let account_name = user.user_name.clone();
+
+        // Resetting an account's password CHANGES the directory, and a domain controller
+        // audits every such change in its security log — so a directory whose log
+        // subscription forwards that log forwards this record too. The store's guard is
+        // released first: the delivery holds the destination's store alone.
+        drop(store);
+        crate::state::security_log::record(
+            &*self.engine,
+            &input.directory_id,
+            crate::state::security_log::USER_PASSWORD_RESET,
+            &account_name,
+            now,
+        );
 
         Ok(ResetUserPasswordOutput {})
     }

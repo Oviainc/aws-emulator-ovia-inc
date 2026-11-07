@@ -22,6 +22,10 @@ mod cloudformation_fifo_resource_generated_names;
 // their line to.
 #[path = "all/directory_data_plane_authorization.rs"]
 mod directory_data_plane_authorization;
+// Declared here, beside the suite above it shares its two services with: what a subscribed
+// directory FORWARDS of the writes that plane makes.
+#[path = "all/ds_log_subscription_forwarding.rs"]
+mod ds_log_subscription_forwarding;
 // appended tail and the sorted `k…` span are both regions concurrently landing suites add
 // their line to.
 #[path = "all/kinesisvideo_discovered_data_plane.rs"]

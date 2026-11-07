@@ -261,6 +261,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         store.record_token(input.client_token, fingerprint, None, now);
 
+        // A membership CHANGES the group, and the directory's domain controllers audit
+        // every such change in their security log — so a directory whose log subscription
+        // forwards that log forwards this record too. The store's guard is released first:
+        // the emitter takes the control plane's store and then CloudWatch Logs'.
+        drop(store);
+        crate::state::security_log::record_membership(
+            &*self.engine,
+            &input.directory_id,
+            crate::state::security_log::GROUP_MEMBER_REMOVED,
+            &input.group_name,
+            &input.member_name,
+            now,
+        );
+
         Ok(RemoveGroupMemberOutput {})
     }
 }

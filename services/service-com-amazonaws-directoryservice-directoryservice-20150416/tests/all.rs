@@ -61,6 +61,8 @@ mod harness;
 mod ip_route_removal;
 #[path = "all/ldaps.rs"]
 mod ldaps;
+#[path = "all/log_subscription_forwarding.rs"]
+mod log_subscription_forwarding;
 #[path = "all/log_subscriptions.rs"]
 mod log_subscriptions;
 #[path = "all/microsoft_ad.rs"]

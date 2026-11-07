@@ -31,6 +31,11 @@ x509-cert = { version = "0.2", features = ["pem"] }
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # The IAM store, for the identity-based policy documents in force on that principal.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The CloudWatch Logs store a directory's log subscription forwards its domain controller
+# security logs INTO (`state::security_log`): the records go into that service's own store
+# in the shared engine, through its own record types, so what was forwarded is what
+# `logs:FilterLogEvents` reports.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # `iam_authorization`: the shared evaluation of those documents against an action on a
 # resource, `iam_role`: which IAM entity a principal ARN names, and `ad_directories`: the
 # shared inventory of the account's directories, which this control plane creates and
@@ -42,6 +47,11 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# The CloudWatch Logs service a directory's log subscription forwards into, so the
+# forwarding suite mounts it beside this one on the same engine and reads the delivered
+# records back through that service's own `FilterLogEvents` / `DescribeLogStreams`.
+# Already a dependency of `src/`; an integration test reaches it through this list.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # Builds the self-signed certificates the certificate suite registers, so each row's
 # common name and expiry come from a real certificate rather than a fixed blob.
 rcgen = "0.13"

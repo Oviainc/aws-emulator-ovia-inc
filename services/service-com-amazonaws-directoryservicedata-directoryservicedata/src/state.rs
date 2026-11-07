@@ -23,6 +23,13 @@
 //!   empty.
 //! * [`Membership`] — a group's members, plus the reverse index that answers "which
 //!   groups is this member in" without walking every group.
+//!
+//! What a write to one of those objects also does is produce the DOMAIN CONTROLLER
+//! SECURITY LOG record the directory's controllers audit it with: a directory whose `ds`
+//! log subscription forwards that log forwards this write to the subscribed CloudWatch
+//! Logs group. That subscription lives on the control plane's own directory record, so the
+//! emitter is that plane's ([`security_log`]), reached here through the shared engine
+//! rather than copied.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
@@ -1057,3 +1064,15 @@ pub fn ad_directory_inventory<Eng: Send + Sync + 'static>(
             >,
         )
 }
+
+/// The DOMAIN CONTROLLER SECURITY LOG a write to a directory's objects is audited in, and
+/// the forwarding of it the directory's `ds` log subscription performs.
+///
+/// Re-exported from the Directory Service CONTROL plane rather than restated here: the log
+/// subscription that decides whether a record is forwarded, and the log group it names,
+/// live on that plane's directory record, and the records go into the CloudWatch Logs store
+/// of the same shared engine. A handler calls
+/// [`security_log::record`] / [`security_log::record_membership`] with its OWN store guard
+/// already released — that emitter takes the control plane's store and then CloudWatch
+/// Logs', so no request holds two of them at once.
+pub use ::service_com_amazonaws_directoryservice_directoryservice_20150416::state::security_log;
