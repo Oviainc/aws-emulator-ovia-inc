@@ -1090,6 +1090,26 @@ impl FunctionRecord {
             .fold(0i32, i32::saturating_add)
     }
 
+    /// Whether an invocation addressed to `qualifiers` is served by an execution
+    /// environment Lambda keeps INITIALISED: one of the qualifiers has a provisioned
+    /// concurrency allocation that is ready.
+    ///
+    /// "AWS_LAMBDA_INITIALIZATION_TYPE – The initialization type of the execution
+    /// environment … `provisioned-concurrency`", which is what a handler reads to tell a
+    /// pre-warmed environment from one started for its own invocation. The status is read
+    /// as stored, which the resolution of the function has already brought up to whatever
+    /// the clock made due ([`crate::state::ProvisionedConcurrencyRecord::materialize`]).
+    #[must_use]
+    pub fn served_by_provisioned_concurrency(&self, qualifiers: &[&str]) -> bool {
+        qualifiers.iter().any(|qualifier| {
+            self.provisioned_concurrency_configs
+                .get(*qualifier)
+                .is_some_and(|config| {
+                    config.status == crate::state::PROVISIONED_CONCURRENCY_READY
+                })
+        })
+    }
+
     /// The `Concurrency` `GetFunction` reports, present only once reserved concurrency
     /// has been set on this function.
     #[must_use]

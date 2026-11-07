@@ -239,6 +239,8 @@ mod layer_version_permissions;
 mod layer_versions;
 #[path = "all/missing_policy_refusal.rs"]
 mod missing_policy_refusal;
+#[path = "all/node_initialization_type.rs"]
+mod node_initialization_type;
 #[path = "all/node_invoke_run.rs"]
 mod node_invoke_run;
 #[path = "all/node_runtime_environment.rs"]
