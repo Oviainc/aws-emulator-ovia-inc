@@ -182,16 +182,17 @@ pub(crate) fn primary_billing_view_arn() -> String {
     )
 }
 
-/// The read-back the service answers for a definition it was given: EVERY member of the
-/// wire shape, filled.
+/// The read-back the service answers for a definition it was given: every member of the
+/// wire shape the service holds a value for.
 ///
 /// Those the request named come back as supplied; those it left unset come back as the
 /// service resolved them — no additional artifacts is the empty list, an unstated refresh
 /// preference is on, an unstated versioning preference delivers a new version, and an
 /// unstated billing view is the account's primary one. The report's delivery status is the
 /// service's and not the caller's: nothing in this service delivers a report, so a report
-/// created through the API has never been delivered and both members of its status are
-/// empty. `ReportCreationDate` is a per-run instant, so [`read_back_of`] checks its form
+/// created through the API has never been delivered and its read-back states no
+/// `ReportStatus` at all — whatever the request put there.
+/// `ReportCreationDate` is a per-run instant, so [`read_back_of`] checks its form
 /// and drops it rather than this expectation carrying a value.
 pub(crate) fn expected_read_back(definition: &Value) -> Value {
     let mut expected = definition.clone();
@@ -210,10 +211,7 @@ pub(crate) fn expected_read_back(definition: &Value) -> Value {
     object
         .entry("BillingViewArn")
         .or_insert_with(|| json!(primary_billing_view_arn()));
-    object.insert(
-        "ReportStatus".to_string(),
-        json!({ "lastDelivery": "", "lastStatus": "" }),
-    );
+    object.remove("ReportStatus");
     expected
 }
 

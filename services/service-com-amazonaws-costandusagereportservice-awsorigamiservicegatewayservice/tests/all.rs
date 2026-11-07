@@ -19,6 +19,8 @@ mod refusal_envelope;
 mod refusal_message_text;
 #[path = "all/report_definition_lifecycle.rs"]
 mod report_definition_lifecycle;
+#[path = "all/reported_definition_round_trip.rs"]
+mod reported_definition_round_trip;
 #[path = "all/service_populated_read_back.rs"]
 mod service_populated_read_back;
 #[path = "all/state_roundtrip.rs"]

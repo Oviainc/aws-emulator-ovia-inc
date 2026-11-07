@@ -9,7 +9,7 @@
 //!    answers the stored definition PLUS every member the service itself populates: the
 //!    billing view the report is scoped to (the one the request named, or the account's
 //!    primary billing view when it named none), the status of the report's last delivery
-//!    (both members empty while nothing has delivered it) and the date the definition was
+//!    (absent while nothing has delivered it) and the date the definition was
 //!    created. Each comes from the stored record, so every read answers the same value and
 //!    none of them can be dictated by the caller.
 //! 2. **An optional output member the service does not populate is not serialized.**
@@ -42,12 +42,6 @@ use super::report_definition_lifecycle::{
     expected_read_back, is_report_timestamp, minimal_definition, primary_billing_view_arn,
     read_back_of, Cur,
 };
-
-/// The never-delivered status: the two-element dictionary the service answers for a report
-/// no delivery has been recorded against.
-fn never_delivered() -> Value {
-    json!({ "lastDelivery": "", "lastStatus": "" })
-}
 
 /// A stored report created at `created_at`, carrying `last_delivery`, so a test can pin
 /// what the projection makes of a record it could not reach through the API.
@@ -139,13 +133,11 @@ async fn a_read_back_carries_the_status_of_the_report_last_delivery() {
     // Rows differ in whether a delivery has been recorded against the report and in how
     // that delivery ended: every value of the modelled `LastStatus` enum
     // (`smithy_query(shape="LastStatus")`) is covered, beside the report nothing has
-    // delivered, which is the recorded case.
+    // delivered, whose read-back states no `ReportStatus` at all — the member is optional
+    // and neither of its values has a form the model admits for "never delivered".
     let delivered_at = at_epoch_seconds(1_700_000_000);
-    let mut table: Vec<(String, Option<ReportDelivery>, Value)> = vec![(
-        "no delivery recorded".to_string(),
-        None,
-        never_delivered(),
-    )];
+    let mut table: Vec<(String, Option<ReportDelivery>, Option<Value>)> =
+        vec![("no delivery recorded".to_string(), None, None)];
     for status in cur::ops::types::LAST_STATUS_VALUES {
         table.push((
             format!("a delivery that ended {status}"),
@@ -153,7 +145,7 @@ async fn a_read_back_carries_the_status_of_the_report_last_delivery() {
                 at: delivered_at,
                 status: (*status).to_string(),
             }),
-            json!({ "lastDelivery": "20231114T221320Z", "lastStatus": status }),
+            Some(json!({ "lastDelivery": "20231114T221320Z", "lastStatus": status })),
         ));
     }
 
@@ -168,7 +160,13 @@ async fn a_read_back_carries_the_status_of_the_report_last_delivery() {
         let listed = cur.describe_all().await;
         let first = listed.first().cloned().unwrap_or(Value::Null);
         assert_eq!(
-            first["ReportStatus"], expected,
+            first["ReportName"],
+            json!("delivered-report"),
+            "case {case:?}: expected the seeded report to be listed, got {listed:?}"
+        );
+        assert_eq!(
+            first.get("ReportStatus").cloned(),
+            expected,
             "case {case:?}: expected ReportStatus {expected:?}, got {first:?}"
         );
     }
@@ -288,10 +286,14 @@ async fn a_caller_cannot_dictate_the_members_the_service_populates() {
                 .cloned()
                 .unwrap_or(Value::Null);
             assert_eq!(
-                subject["ReportStatus"],
-                never_delivered(),
-                "case {case:?} via {operation}: nothing delivered this report, so its status \
-                 must be the never-delivered one, got {subject:?}"
+                subject["ReportName"],
+                json!(claimed_name),
+                "case {case:?} via {operation}: expected the report to be listed, got {listed:?}"
+            );
+            assert!(
+                subject.get("ReportStatus").is_none(),
+                "case {case:?} via {operation}: nothing delivered this report, so its read-back \
+                 must state no ReportStatus, got {subject:?}"
             );
             let created = subject["ReportCreationDate"].as_str().unwrap_or_default();
             assert!(

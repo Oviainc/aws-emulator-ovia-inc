@@ -190,7 +190,8 @@ pub struct TagLimitExceeded {
 /// What [`StoredReport::delivery_status`] reports as the modelled `ReportStatus`. Nothing
 /// in this service's modelled surface delivers a report — delivery is the billing
 /// pipeline's, not an API call's — so a report created through `PutReportDefinition`
-/// holds none until a delivery is recorded against it.
+/// holds none until a delivery is recorded against it, and a read of such a report states
+/// no `ReportStatus` at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportDelivery {
     /// The instant the report was delivered, reported through [`report_timestamp`].
@@ -234,7 +235,8 @@ impl StoredReport {
         Ok(stored)
     }
 
-    /// This report as the service reports it: every member of the wire shape, filled.
+    /// This report as the service reports it: every member of the wire shape the service
+    /// holds a value for.
     ///
     /// A read-back of a report definition is not the echo of the creation request. It
     /// states EVERY member: the ones the definition named, the value the service resolved
@@ -243,8 +245,9 @@ impl StoredReport {
     /// versioning preference is [`DEFAULT_REPORT_VERSIONING`], and an unstated billing view
     /// is the account's primary one ([`primary_billing_view_arn`]) — and the service's own
     /// facts about the report: the status of its last delivery
-    /// ([`Self::delivery_status`]) and the date it was created, which is the STORED instant
-    /// and so the same on every read rather than the moment of the read.
+    /// ([`Self::delivery_status`], stated only once a delivery has been recorded against
+    /// the report) and the date it was created, which is the STORED instant and so the
+    /// same on every read rather than the moment of the read.
     pub fn wire_definition(&self) -> ReportDefinition {
         ReportDefinition {
             additional_artifacts: Some(
@@ -270,7 +273,7 @@ impl StoredReport {
                     .clone()
                     .unwrap_or_else(primary_billing_view_arn),
             ),
-            report_status: Some(self.delivery_status()),
+            report_status: self.delivery_status(),
             report_creation_date: Some(report_timestamp(self.created_at)),
             ..self.definition.clone()
         }
@@ -280,21 +283,20 @@ impl StoredReport {
     /// delivered report for a particular report definition" (the modelled `ReportStatus`
     /// doc).
     ///
-    /// A report with no delivery recorded against it reports BOTH members empty rather
-    /// than absent — the two-element dictionary the service answers with for a report that
-    /// has never been delivered — so a client reading `lastStatus` to find out whether a
-    /// report has ever been delivered always has a value to read.
-    pub fn delivery_status(&self) -> ReportStatus {
-        match &self.last_delivery {
-            Some(delivery) => ReportStatus {
-                last_delivery: Some(report_timestamp(delivery.at)),
-                last_status: Some(delivery.status.clone()),
-            },
-            None => ReportStatus {
-                last_delivery: Some(String::new()),
-                last_status: Some(String::new()),
-            },
-        }
+    /// `None` for a report no delivery has been recorded against: there is no delivery
+    /// date and no delivery outcome to state, and both members are constrained — the
+    /// `lastDelivery` to length 16..20 and the pattern
+    /// `^[0-9]{8}[T][0-9]{6}([Z]|[+-][0-9]{4})$`, the `lastStatus` to the `LastStatus`
+    /// catalog (`smithy_query(shape="LastDelivery,LastStatus")`) — so the optional member
+    /// is left out of the read-back rather than filled with a stand-in those constraints
+    /// reject. That is what keeps the definition this service reports a definition it also
+    /// accepts back, which is the read-modify-write `ModifyReportDefinition` is built on.
+    pub fn delivery_status(&self) -> Option<ReportStatus> {
+        let delivery = self.last_delivery.as_ref()?;
+        Some(ReportStatus {
+            last_delivery: Some(report_timestamp(delivery.at)),
+            last_status: Some(delivery.status.clone()),
+        })
     }
 
     /// Merge `tags` onto this report: a key already present takes the new value, a key
