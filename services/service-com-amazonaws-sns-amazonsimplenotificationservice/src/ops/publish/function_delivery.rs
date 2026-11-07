@@ -23,7 +23,9 @@
 
 use crate::state::{self, PublishedMessage};
 
-use super::{QueueDelivery, QueueLocation};
+use super::{
+    answered_status, refusal_of, retry_waits, HandOver, QueueDelivery, QueueLocation, RetryBudget,
+};
 
 /// The subscription protocol whose endpoint is a Lambda function: "lambda – delivery of
 /// JSON-encoded message to an Lambda function" (`SubscribeInput$Protocol`).
@@ -223,15 +225,46 @@ impl<'ctx, 'op> Functions<'ctx, 'op> {
     /// Invoke the function `delivery` names with the event it carries, and report whether the
     /// invocation was accepted.
     ///
+    /// An invocation the function could not take YET is retried along the phases the delivery
+    /// policy publishes ([`super::retry_waits`]), within what `waiting` leaves the request — a
+    /// function inside the activation window its own `State` reports is exactly that, "During
+    /// this time, you can't invoke or modify the function" (`CreateFunction`) — while one it
+    /// will not take is not retried at all, because another attempt earns the same answer.
+    ///
     /// `false` is every way the event did not reach the function: a function whose own policy
     /// does not grant this service the invocation, a policy that could not be read, and an
     /// invocation the function's service refused — the client errors a redrive exists to make
     /// visible.
-    pub(super) async fn invoke(&mut self, delivery: &FunctionDelivery) -> bool {
+    pub(super) async fn invoke(
+        &mut self,
+        delivery: &FunctionDelivery,
+        waiting: &mut RetryBudget,
+    ) -> bool {
+        let mut waits = retry_waits();
+        loop {
+            match self.attempt_invoke(delivery).await {
+                HandOver::Taken => return true,
+                HandOver::Refused => return false,
+                HandOver::NotYet => {}
+            }
+            let Some(wait) = waits.next() else {
+                return false;
+            };
+            if !wait.is_zero() && !waiting.charge(wait) {
+                return false;
+            }
+            if !wait.is_zero() {
+                ::tokio::time::sleep(wait).await;
+            }
+        }
+    }
+
+    /// ONE attempt at invoking the function `delivery` names with the event it carries.
+    async fn attempt_invoke(&mut self, delivery: &FunctionDelivery) -> HandOver {
         let client = self.client(&delivery.target.region);
         let policy = match self.policy(&client, &delivery.target.function_arn).await {
             FunctionPolicy::Stated(policy) => policy,
-            FunctionPolicy::Unreadable => return false,
+            FunctionPolicy::Unreadable => return HandOver::Refused,
         };
         if !super::resource_policy_allows(
             policy.as_deref(),
@@ -245,7 +278,7 @@ impl<'ctx, 'op> Functions<'ctx, 'op> {
                 "the subscribed function's resource-based policy does not allow this service \
                  to invoke it, so the notification is withheld"
             );
-            return false;
+            return HandOver::Refused;
         }
         let answered = client
             .invoke()
@@ -260,15 +293,16 @@ impl<'ctx, 'op> Functions<'ctx, 'op> {
             .send()
             .await;
         if let Err(error) = answered {
+            let status = answered_status(&error);
             ::tracing::warn!(
                 subscription = %delivery.subscription_arn,
                 function = %delivery.target.function_arn,
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                 "a subscribed function could not be invoked"
             );
-            return false;
+            return refusal_of(status);
         }
-        true
+        HandOver::Taken
     }
 }
 

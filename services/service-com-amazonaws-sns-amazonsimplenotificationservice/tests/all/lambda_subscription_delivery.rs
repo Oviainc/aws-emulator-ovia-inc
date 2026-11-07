@@ -42,20 +42,20 @@ use crate::topics_subscriptions_publish::percent_encode;
 const REGION: &str = "us-east-1";
 
 /// The subscription protocol whose endpoint is a function.
-const LAMBDA_PROTOCOL: &str = "lambda";
+pub(crate) const LAMBDA_PROTOCOL: &str = "lambda";
 
 /// The IAM action an invocation of a function performs, which a grant has to name.
-const INVOKE_ACTION: &str = "lambda:InvokeFunction";
+pub(crate) const INVOKE_ACTION: &str = "lambda:InvokeFunction";
 
 /// The service principal SNS performs a delivery as.
-const SNS_PRINCIPAL: &str = "sns.amazonaws.com";
+pub(crate) const SNS_PRINCIPAL: &str = "sns.amazonaws.com";
 
 /// A well-formed Lambda execution role ARN, satisfying that model's `RoleArn` pattern.
-const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
+pub(crate) const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
 
 /// A deployment package's bytes, base64-encoded as `FunctionCode$ZipFile` carries them.
 /// Nothing here runs it: what this suite asserts is the event SNS handed the function.
-const ZIP_FILE: &str = "UEsDBAoAAAAAAAAAAAA=";
+pub(crate) const ZIP_FILE: &str = "UEsDBAoAAAAAAAAAAAA=";
 
 /// How long a wait for an invocation lasts before giving up. An invocation is made as soon as
 /// the publish that owes it is answered, so this is many deliveries' worth of slack and not a
@@ -70,12 +70,12 @@ const LOOK_INTERVAL: Duration = Duration::from_millis(25);
 
 /// SNS, Lambda and Amazon SQS over ONE shared engine: a subscription's endpoint is a function,
 /// and the invocation is asserted on the function.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
-fn emulator() -> Emulator {
+pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -104,7 +104,7 @@ fn authorization(signing_name: &str) -> String {
 }
 
 /// One awsQuery form call against SNS that must SUCCEED, as its body text.
-async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> String {
+pub(crate) async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> String {
     let mut body = format!("Action={action}&Version=2010-03-31");
     for (name, value) in params {
         body.push('&');
@@ -131,7 +131,12 @@ async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> Stri
 }
 
 /// One `restJson1` call against Lambda, with whatever status it answered.
-async fn lambda(emulator: &Emulator, method: &str, uri: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn lambda(
+    emulator: &Emulator,
+    method: &str,
+    uri: &str,
+    body: Value,
+) -> (u16, Value) {
     let payload = if body.is_null() {
         bytes::Bytes::new()
     } else {
@@ -156,7 +161,7 @@ async fn lambda(emulator: &Emulator, method: &str, uri: &str, body: Value) -> (u
 }
 
 /// One `awsJson1_0` call against SQS that must SUCCEED.
-async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> Value {
+pub(crate) async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> Value {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -183,7 +188,7 @@ async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> Value {
 /// A function called `name`, brought to `Active` — the state an invocation needs — by moving
 /// the activation instant the store holds into the past, which is what waiting would do. Its
 /// ARN, which is what a subscription names it by.
-async fn given_function(emulator: &Emulator, name: &str) -> String {
+pub(crate) async fn given_function(emulator: &Emulator, name: &str) -> String {
     let (status, created) = lambda(
         emulator,
         "POST",
@@ -220,7 +225,7 @@ async fn given_function(emulator: &Emulator, name: &str) -> String {
 
 /// Add one statement to the function's resource-based policy, through the call a client (or a
 /// CloudFormation `AWS::Lambda::Permission`) adds it with.
-async fn grant(
+pub(crate) async fn grant(
     emulator: &Emulator,
     function: &str,
     statement_id: &str,
@@ -250,7 +255,12 @@ async fn grant(
 }
 
 /// Subscribe `endpoint` to `topic` over `protocol`, and report the subscription's ARN.
-async fn subscribe(emulator: &Emulator, topic: &str, protocol: &str, endpoint: &str) -> String {
+pub(crate) async fn subscribe(
+    emulator: &Emulator,
+    topic: &str,
+    protocol: &str,
+    endpoint: &str,
+) -> String {
     let subscribed = sns(
         emulator,
         "Subscribe",
@@ -266,7 +276,7 @@ async fn subscribe(emulator: &Emulator, topic: &str, protocol: &str, endpoint: &
 }
 
 /// Publish `message` to `topic`, and report the `MessageId` the publish answered with.
-async fn publish(emulator: &Emulator, topic: &str, params: &[(&str, &str)]) -> String {
+pub(crate) async fn publish(emulator: &Emulator, topic: &str, params: &[(&str, &str)]) -> String {
     let mut all: Vec<(&str, &str)> = vec![("TopicArn", topic)];
     all.extend_from_slice(params);
     let published = sns(emulator, "Publish", &all).await;
@@ -301,7 +311,7 @@ fn events_of(emulator: &Emulator, function: &str) -> Vec<Value> {
 }
 
 /// Wait until Lambda holds `expected` events for `function`, and report them.
-async fn invoked(emulator: &Emulator, function: &str, expected: usize) -> Vec<Value> {
+pub(crate) async fn invoked(emulator: &Emulator, function: &str, expected: usize) -> Vec<Value> {
     let deadline = Instant::now() + DELIVERY_BUDGET;
     loop {
         let held = events_of(emulator, function);
@@ -317,7 +327,7 @@ async fn invoked(emulator: &Emulator, function: &str, expected: usize) -> Vec<Va
 
 /// Wait out [`QUIET_BUDGET`] and report every event Lambda holds for `function` — nothing, for
 /// a function nothing was allowed to invoke.
-async fn quiet(emulator: &Emulator, function: &str) -> Vec<Value> {
+pub(crate) async fn quiet(emulator: &Emulator, function: &str) -> Vec<Value> {
     let deadline = Instant::now() + QUIET_BUDGET;
     while Instant::now() < deadline {
         let held = events_of(emulator, function);

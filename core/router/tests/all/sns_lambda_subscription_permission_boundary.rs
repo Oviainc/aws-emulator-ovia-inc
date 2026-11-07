@@ -37,28 +37,28 @@ use crate::query_wire::{element, form_encode, outputs_of};
 const REGION: &str = "us-east-1";
 
 /// The account id every ARN this emulator mints carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The stack statuses this suite waits for.
-const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+pub(crate) const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
 
 /// The execution role the declared function is created with, provisioned in IAM before the
 /// stack so the template names a role that service really holds.
-const ROLE_NAME: &str = "sns-lambda-boundary-exec";
+pub(crate) const ROLE_NAME: &str = "sns-lambda-boundary-exec";
 
 /// How long an observation of a delivery waits before giving up on it.
-const DELIVERY_BUDGET: Duration = Duration::from_secs(20);
+pub(crate) const DELIVERY_BUDGET: Duration = Duration::from_secs(20);
 
 /// How long the half that must observe NOTHING waits before concluding nothing came.
 const QUIET_BUDGET: Duration = Duration::from_secs(3);
 
 /// How often either look.
-const LOOK_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const LOOK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// CloudFormation, SNS, Lambda, Amazon SQS and IAM over ONE engine, as
 /// `core/router/src/lib.rs` mounts them.
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -123,7 +123,7 @@ async fn query(
 }
 
 /// One CloudFormation call that must answer 200.
-async fn cloudformation(
+pub(crate) async fn cloudformation(
     router: &MultiServiceRouter,
     action: &str,
     members: &[(&str, &str)],
@@ -145,7 +145,11 @@ async fn cloudformation(
 }
 
 /// One SNS call that must answer 200.
-async fn sns(router: &MultiServiceRouter, action: &str, members: &[(&str, &str)]) -> String {
+pub(crate) async fn sns(
+    router: &MultiServiceRouter,
+    action: &str,
+    members: &[(&str, &str)],
+) -> String {
     let (status, body) = query(
         router,
         "sns",
@@ -163,7 +167,11 @@ async fn sns(router: &MultiServiceRouter, action: &str, members: &[(&str, &str)]
 }
 
 /// One IAM call that must answer 200.
-async fn iam(router: &MultiServiceRouter, action: &str, members: &[(&str, &str)]) -> String {
+pub(crate) async fn iam(
+    router: &MultiServiceRouter,
+    action: &str,
+    members: &[(&str, &str)],
+) -> String {
     let (status, body) = query(
         router,
         "iam",
@@ -181,7 +189,7 @@ async fn iam(router: &MultiServiceRouter, action: &str, members: &[(&str, &str)]
 }
 
 /// One Amazon SQS call (`awsJson1_0`) that must answer 200.
-async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -202,7 +210,7 @@ async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> Valu
 }
 
 /// The trust policy an execution role has to carry for Lambda to be handed it.
-fn trust_policy() -> String {
+pub(crate) fn trust_policy() -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -236,7 +244,7 @@ def lambda_handler(event, context):
 /// The template the stack is deployed with: a topic, a sink queue, a function subscribed to
 /// the topic over the `lambda` protocol and — when `with_permission` — the
 /// `AWS::Lambda::Permission` that grants Amazon SNS the invocation.
-fn template(stack: &str, with_permission: bool) -> String {
+pub(crate) fn template(stack: &str, with_permission: bool) -> String {
     let sink = format!("{stack}-sink");
     let mut resources = json!({
         "Sink": {
@@ -290,7 +298,7 @@ fn template(stack: &str, with_permission: bool) -> String {
 }
 
 /// Every message body waiting on the queue at `url`.
-async fn drain(router: &MultiServiceRouter, url: &str) -> Vec<String> {
+pub(crate) async fn drain(router: &MultiServiceRouter, url: &str) -> Vec<String> {
     let received = sqs(
         router,
         "ReceiveMessage",

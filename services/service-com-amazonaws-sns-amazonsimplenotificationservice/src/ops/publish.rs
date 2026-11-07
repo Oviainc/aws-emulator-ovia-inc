@@ -344,7 +344,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // The store's lock is held for the publish only, and released before the queues
+        // The store's lock is held for the publish only, and released before the endpoints
         // subscribed to the topic are delivered to: a delivery is an in-process call into
         // another service, which must not run under this store's lock.
         let (output, deliveries) = {
@@ -472,8 +472,8 @@ fn publish_into_store(
     ))
 }
 
-/// The ARN namespace of Amazon SQS, whose queues are the subscription endpoint kind this
-/// operation delivers to.
+/// The ARN namespace of Amazon SQS, whose queues are one of the subscription endpoint kinds
+/// this operation delivers to.
 pub(crate) const SQS_ARN_NAMESPACE: &str = "sqs";
 
 /// The subscription protocol whose endpoint is an SQS queue: "sqs – delivery of JSON-encoded
@@ -514,7 +514,7 @@ impl Deliveries {
 /// delivery is not part of the answer, so it is carried out of the store as this record and
 /// performed with the store's lock released.
 ///
-/// The body is rendered per SUBSCRIPTION, because the enveloped form carries the receiving
+/// The body is rendered per SUBSCRIPTION, because the enveloped forms carry the receiving
 /// subscription's own unsubscribe link; the raw form carries nothing subscription-specific,
 /// so every raw subscriber of one published message shares one body.
 #[derive(Debug, Clone)]
@@ -548,7 +548,7 @@ pub struct QueueDelivery {
 /// One SQS queue a message is handed to, however it was addressed — as a subscription's
 /// endpoint or as its dead-letter target.
 #[derive(Debug, Clone)]
-struct QueueLocation {
+pub(super) struct QueueLocation {
     /// The url the queue is reached at.
     queue_url: String,
     /// The queue's own ARN: the RESOURCE its policy is asked about before a message is
@@ -899,8 +899,11 @@ struct QueueTarget {
 }
 
 impl QueueTarget {
-    /// The queue `subscription` addresses, or `None` when it is not one this operation
-    /// delivers to.
+    /// The queue `subscription` addresses, or `None` when its endpoint names no queue.
+    ///
+    /// The PROTOCOL is the caller's dispatch ([`subscription_deliveries`]), which is what
+    /// says a subscription's endpoint is a queue at all; this reads the endpoint itself, so a
+    /// subscription whose endpoint is no queue ARN is delivered to nothing.
     fn of(subscription: &state::SubscriptionRecord) -> Option<Self> {
         if subscription.protocol != SQS_PROTOCOL {
             // Another protocol's endpoint is not a queue, and is delivered to by the path
@@ -956,28 +959,31 @@ pub(crate) async fn deliver_to_subscribers(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     deliveries: &Deliveries,
 ) {
+    // ONE waiting budget for the whole request, for the reason [`RetryBudget`] gives: the
+    // per-delivery schedule is bounded, their PRODUCT with the fan-out is not.
+    let mut waiting = RetryBudget::new();
     let mut queues = Queues::new(ctx);
     for delivery in &deliveries.queues {
-        if queues.hand_over(&delivery.target, delivery).await {
+        if queues.hand_over(&delivery.target, delivery, &mut waiting).await {
             continue;
         }
         let Some(dead_letter) = delivery.dead_letter.as_ref() else {
             continue;
         };
-        park_in_dead_letter(&mut queues, dead_letter, delivery).await;
+        park_in_dead_letter(&mut queues, dead_letter, delivery, &mut waiting).await;
     }
     if deliveries.functions.is_empty() {
         return;
     }
     let mut functions = function_delivery::Functions::new(ctx);
     for delivery in &deliveries.functions {
-        if functions.invoke(delivery).await {
+        if functions.invoke(delivery, &mut waiting).await {
             continue;
         }
         let Some(parked) = delivery.dead_letter_copy() else {
             continue;
         };
-        park_in_dead_letter(&mut queues, &parked.target, &parked).await;
+        park_in_dead_letter(&mut queues, &parked.target, &parked, &mut waiting).await;
     }
 }
 
@@ -987,8 +993,9 @@ async fn park_in_dead_letter(
     queues: &mut Queues<'_, '_>,
     dead_letter: &QueueLocation,
     parked: &QueueDelivery,
+    waiting: &mut RetryBudget,
 ) {
-    if queues.hand_over(dead_letter, parked).await {
+    if queues.hand_over(dead_letter, parked, waiting).await {
         ::tracing::info!(
             subscription = %parked.subscription_arn,
             queue = %dead_letter.queue_url,
@@ -1005,13 +1012,96 @@ async fn park_in_dead_letter(
     }
 }
 
+/// The retry phases ONE delivery that could not be made YET goes through.
+///
+/// "Amazon SNS defines a delivery policy for each delivery protocol. The delivery policy
+/// defines how Amazon SNS retries the delivery of messages when server-side errors occur":
+/// for the endpoint kinds SNS delivers to itself, the published policy opens with an
+/// immediate retry phase of three retries with no delay, followed by a pre-backoff phase of
+/// two retries one second apart. Those two phases are what [`retry_waits`] schedules, so one
+/// delivery costs at most six in-process calls and at most two seconds of waiting; the
+/// exponential and post-backoff phases that follow them in that policy span days, which no
+/// request can hold open, so a delivery still failing after these is parked in the
+/// subscription's dead-letter queue instead — where those phases end too.
+const IMMEDIATE_RETRIES: usize = 3;
+const PRE_BACKOFF_RETRIES: usize = 2;
+const PRE_BACKOFF_DELAY: ::std::time::Duration = ::std::time::Duration::from_secs(1);
+
+/// The wait before each retry of one delivery, in order.
+///
+/// The schedule is shared by every endpoint kind, because the delivery policy is about the
+/// SUBSCRIPTION rather than about the endpoint's service: each hand-over drives this
+/// schedule over its own call ([`Queues::hand_over`],
+/// [`function_delivery::Functions::invoke`]), within what [`RetryBudget`] leaves the request.
+pub(super) fn retry_waits() -> impl Iterator<Item = ::std::time::Duration> {
+    ::std::iter::repeat_n(::std::time::Duration::ZERO, IMMEDIATE_RETRIES)
+        .chain(::std::iter::repeat_n(PRE_BACKOFF_DELAY, PRE_BACKOFF_RETRIES))
+}
+
+/// How long ONE publishing request may spend WAITING for the endpoints it delivers to, across
+/// every delivery it owes.
+///
+/// The per-delivery schedule is bounded, but its PRODUCT with the fan-out is not: a request
+/// owing [`MAX_DELIVERIES_PER_REQUEST`] deliveries whose endpoints all fault would otherwise
+/// hold its own answer open for minutes. So the waits are charged against this one budget as
+/// well, which is set to outlast several deliveries' retries and nothing like the whole
+/// fan-out's.
+const MAX_RETRY_WAIT_PER_REQUEST: ::std::time::Duration = ::std::time::Duration::from_secs(5);
+
+/// What one publishing request has left to spend WAITING between the attempts of its
+/// deliveries.
+///
+/// ONE budget for the whole request, spent across every delivery: a delivery that cannot be
+/// taken yet once the budget is spent is treated as one that will not be taken — it is parked
+/// in the subscription's dead-letter queue — rather than waiting longer, which is where the
+/// phases this emulator does not perform end too.
+#[derive(Debug)]
+pub(super) struct RetryBudget {
+    left: ::std::time::Duration,
+}
+
+impl RetryBudget {
+    fn new() -> Self {
+        Self {
+            left: MAX_RETRY_WAIT_PER_REQUEST,
+        }
+    }
+
+    /// Charge `wait` to the request: `false` when it has no waiting left, in which case
+    /// nothing is charged and nothing must wait.
+    pub(super) fn charge(&mut self, wait: ::std::time::Duration) -> bool {
+        match self.left.checked_sub(wait) {
+            Some(left) => {
+                self.left = left;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// What came of ONE attempt at handing a delivery to its endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HandOver {
+    /// The endpoint took the message.
+    Taken,
+    /// The endpoint could not take it YET: a fault another attempt may not meet — the
+    /// endpoint's own service faulted, throttled the call, or reported the resource as unable
+    /// to take it at this time (a function still inside the activation window its `State`
+    /// reports, "During this time, you can't invoke or modify the function").
+    NotYet,
+    /// The endpoint will not take it: nothing grants the delivery, the endpoint is not there,
+    /// or it refused the message itself — each an answer another attempt earns again.
+    Refused,
+}
+
 /// The SQS queues ONE publishing request hands its messages to.
 ///
 /// It remembers what each queue of the fan-out answered — the client its Region is reached
 /// through and the `Policy` the queue itself reports — so a request that owes several
 /// messages to one queue reads that queue once. Both tables are bounded by the same
 /// [`MAX_DELIVERIES_PER_REQUEST`] the deliveries are.
-struct Queues<'ctx, 'op> {
+pub(super) struct Queues<'ctx, 'op> {
     ctx: &'ctx smithy_server_runtime::OperationContext<'op>,
     /// One client per Region: every queue of one Region is reached through the same endpoint,
     /// and a publish rarely fans out across Regions.
@@ -1031,7 +1121,7 @@ enum QueuePolicy {
 }
 
 impl<'ctx, 'op> Queues<'ctx, 'op> {
-    fn new(ctx: &'ctx smithy_server_runtime::OperationContext<'op>) -> Self {
+    pub(super) fn new(ctx: &'ctx smithy_server_runtime::OperationContext<'op>) -> Self {
         Self {
             ctx,
             clients: Vec::new(),
@@ -1064,10 +1154,44 @@ impl<'ctx, 'op> Queues<'ctx, 'op> {
 
     /// Hand `delivery`'s message to `queue`, and report whether the queue took it.
     ///
-    /// `false` is every way the message did not reach the queue: a queue that does not
-    /// answer, a queue whose own policy does not grant this service the send, and a send the
-    /// queue refused — the client errors a redrive exists to make visible.
-    async fn hand_over(&mut self, queue: &QueueLocation, delivery: &QueueDelivery) -> bool {
+    /// A hand-over the queue could not take YET is retried along the phases the delivery
+    /// policy publishes ([`retry_waits`]), within what `waiting` leaves the request; one it
+    /// will not take is not retried at all, because another attempt earns the same answer.
+    /// `false` is every way the message did not reach the queue — the client errors a redrive
+    /// exists to make visible.
+    pub(super) async fn hand_over(
+        &mut self,
+        queue: &QueueLocation,
+        delivery: &QueueDelivery,
+        waiting: &mut RetryBudget,
+    ) -> bool {
+        let mut waits = retry_waits();
+        loop {
+            match self.attempt_hand_over(queue, delivery).await {
+                HandOver::Taken => return true,
+                HandOver::Refused => return false,
+                HandOver::NotYet => {}
+            }
+            let Some(wait) = waits.next() else {
+                return false;
+            };
+            if !wait.is_zero() && !waiting.charge(wait) {
+                return false;
+            }
+            if !wait.is_zero() {
+                ::tokio::time::sleep(wait).await;
+            }
+        }
+    }
+
+    /// ONE attempt at handing `delivery`'s message to `queue`: a queue that does not answer,
+    /// a queue whose own policy does not grant this service the send, and a send the queue
+    /// refused are each a way the message did not reach it.
+    async fn attempt_hand_over(
+        &mut self,
+        queue: &QueueLocation,
+        delivery: &QueueDelivery,
+    ) -> HandOver {
         let client = self.client(&queue.region);
         let policy = match self.policy(&client, &queue.queue_url).await {
             QueuePolicy::Stated(policy) => policy,
@@ -1078,7 +1202,7 @@ impl<'ctx, 'op> Queues<'ctx, 'op> {
                     "the subscribed queue does not answer, so the notification cannot be \
                      delivered to it"
                 );
-                return false;
+                return HandOver::Refused;
             }
         };
         if !delivery_is_authorized(policy.as_deref(), &queue.queue_arn, &delivery.topic_arn) {
@@ -1088,7 +1212,7 @@ impl<'ctx, 'op> Queues<'ctx, 'op> {
                 "the subscribed queue's policy does not allow this service to send it a \
                  message, so the notification is withheld"
             );
-            return false;
+            return HandOver::Refused;
         }
         let mut request = client
             .send_message()
@@ -1129,15 +1253,16 @@ impl<'ctx, 'op> Queues<'ctx, 'op> {
             }
         }
         if let Err(error) = request.send().await {
+            let answered = answered_status(&error);
             ::tracing::warn!(
                 subscription = %delivery.subscription_arn,
                 queue = %queue.queue_url,
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                 "a subscribed queue could not be delivered to"
             );
-            return false;
+            return refusal_of(answered);
         }
-        true
+        HandOver::Taken
     }
 }
 
@@ -1258,6 +1383,48 @@ async fn queue_policy(client: &::aws_sdk_sqs::Client, queue_url: &str) -> QueueP
     }
 }
 
+/// The HTTP status an endpoint's service answered a failed hand-over with, or `None` when the
+/// call reached no answer at all.
+pub(super) fn answered_status<E>(
+    error: &::aws_smithy_runtime_api::client::result::SdkError<
+        E,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> Option<u16> {
+    error
+        .raw_response()
+        .map(|answered| answered.status().as_u16())
+}
+
+/// The HTTP status at and above which an answer reports a FAULT of the service rather than a
+/// refusal of the request.
+const SERVER_FAULT_STATUS: u16 = 500;
+
+/// The status a throttled call is answered with.
+const THROTTLED_STATUS: u16 = 429;
+
+/// The status a resource that cannot take the call AT THIS TIME is answered with — what AWS
+/// Lambda answers an invocation of a function that is still provisioning: "The operation
+/// cannot be performed at this time" (`ResourceConflictException`, httpError 409).
+const CONFLICT_STATUS: u16 = 409;
+
+/// Which kind of failure the status `answered` reports.
+///
+/// Read off the ANSWER rather than the error's own type, so one reading serves every endpoint
+/// kind: a server fault, a throttled call and a resource reporting it cannot take the call at
+/// this time are conditions that PASS, so the delivery is retried ([`retry_waits`]); every
+/// other refusal is one the next attempt earns again. A call that reached no answer at all
+/// reached no verdict either, which is a fault too.
+pub(super) fn refusal_of(answered: Option<u16>) -> HandOver {
+    let Some(status) = answered else {
+        return HandOver::NotYet;
+    };
+    if status >= SERVER_FAULT_STATUS || status == THROTTLED_STATUS || status == CONFLICT_STATUS {
+        return HandOver::NotYet;
+    }
+    HandOver::Refused
+}
+
 /// An SQS client over the in-process callback into this same emulator.
 fn sqs_client(
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -1288,14 +1455,9 @@ fn sqs_client(
 /// otherwise created for Amazon SNS metadata."
 /// (`GetSubscriptionAttributesResponse$Attributes`, `RawMessageDelivery`).
 ///
-/// The envelope carries the metadata the message was published with — its type, id, topic,
-/// subject, body, attributes and the instant it was published — and the link that cancels THE
-/// SUBSCRIPTION IT IS DELIVERED TO, so it is rendered per subscriber rather than once per
-/// publish. The `body` it wraps is the message the SUBSCRIBER's protocol receives, which is
-/// the whole published message unless it was published as a structure of per-protocol
-/// branches. It carries NO signature members (`Signature`, `SigningCertURL`): nothing signs a
-/// message in this emulator, and a member that looked like a signature would be one a
-/// subscriber could not verify.
+/// The envelope carries the metadata the message was published with and the link that cancels
+/// THE SUBSCRIPTION IT IS DELIVERED TO, so it is rendered per subscriber rather than once per
+/// publish.
 fn notification_envelope(
     published: &PublishedMessage,
     body: &str,
