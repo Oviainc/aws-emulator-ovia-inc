@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
+//! Merges the tags a request carries into the stored tags of a web function — this is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A merge, not a replacement: a key the request names takes the value it carries and
+//! every other stored key is left alone. The whole key set is held to the reserved
+//! namespace rule ([`crate::state::tag_map_violation`]) and to the stored-map bound
+//! BEFORE anything is written, so a refused request applies no tags at all. The tags
+//! live in the function's own record (`crate::state::WebFunction::tags`), so
+//! `ListTags`, `UntagResource`, `CreateWebFunction` and the function's own delete all
+//! see ONE copy of them.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +186,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // The reserved key namespace, checked over the WHOLE key set before the
+        // store is touched: a request carrying one reserved key among valid ones
+        // applies none of them.
+        if let Some(message) =
+            crate::state::tag_map_violation("tags", input.tags.keys().map(String::as_str))
+        {
+            return Err(
+                TagResourceErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        let akid = ::engine::extract_akid(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the web function store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+        state.materialise_due_transitions(::std::time::SystemTime::now());
+
+        // The `resource` names the web function the tags hang off; the store keys
+        // that function by name, exactly as every other reader resolves it.
+        let name = crate::state::resolve_function_name(&input.resource).to_string();
+        let Some(merged) = state.tag_count_after_merge(&name, input.tags.keys().map(String::as_str))
+        else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("The web function {} doesn't exist.", input.resource),
+                    resource_id: Some(input.resource.clone()),
+                    resource_type: Some("WebFunction".to_string()),
+                },
+            )
+            .into());
+        };
+        if merged > crate::state::MAX_TAGS_PER_FUNCTION {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The request would exceed the maximum number of tags ({}) for this web function",
+                        crate::state::MAX_TAGS_PER_FUNCTION
+                    ),
+                    resource_id: Some(input.resource.clone()),
+                    resource_type: Some("WebFunction".to_string()),
+                    service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
+                    quota_code: None,
+                },
+            )
+            .into());
+        }
+
+        // How many keys the request applies, read before the map is moved into the
+        // store below.
+        let applied = input.tags.len();
+        let stored = state.merge_tags(&name, input.tags).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the web function store is unavailable".to_string()),
+            })
+        })?;
+
+        // The audit record for the state change: who, what, outcome. The keys are
+        // counted rather than listed — a tag's key and value are the caller's own
+        // data, and the stored set is what `ListTags` reports.
+        ::tracing::info!(
+            operation = "TagResource",
+            akid = %akid,
+            resource = %input.resource,
+            applied = applied,
+            stored = stored,
+            outcome = "tagged",
+            "tags were merged into a web function"
+        );
+
+        Ok(TagResourceOutput)
     }
 }

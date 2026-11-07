@@ -201,6 +201,16 @@ pub(crate) fn expected_arn(region: &str, name: &str) -> String {
     )
 }
 
+/// One value as ONE URI segment: every character outside RFC 3986's unreserved set
+/// travels percent-encoded, which is what an SDK does to an ARN it puts in a path
+/// label and to a tag key it puts in a query value — without it the request
+/// addresses a different route, or the key arrives split. The encoding is the
+/// maintained `percent-encoding` crate's; shared with the sibling suites of this
+/// test crate, which address a resource by its ARN.
+pub(crate) fn percent_encoded(value: &str) -> String {
+    ::percent_encoding::utf8_percent_encode(value, ::percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
 /// A minimal, valid `buildConfig`: `codeConfig.s3Object` plus `runtimeConfig`
 /// (both `@required`, model: `shape=BuildConfig`). `runtime` must match
 /// `^[a-z][a-z0-9]*(\.[a-z0-9]+)*$`.

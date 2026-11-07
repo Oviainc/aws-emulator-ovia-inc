@@ -197,6 +197,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // A tag key in the reserved namespace is not the caller's to write, on a
+        // create any more than on `TagResource`, and the check runs before
+        // anything is stored so a refused create creates nothing at all.
+        if let Some(tags) = &input.tags {
+            if let Some(message) =
+                crate::state::tag_map_violation("tags", tags.keys().map(String::as_str))
+            {
+                return Err(CreateWebFunctionErrorModeled::ValidationException(
+                    ValidationException { message },
+                )
+                .into());
+            }
+        }
+
         // The ARN names the region the call was signed for and the emulator's
         // canonical account, never anything the request body supplied. It is also
         // the endpoint's HOME region: the Region "where you created the web

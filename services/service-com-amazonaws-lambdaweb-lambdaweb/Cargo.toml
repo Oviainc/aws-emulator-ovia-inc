@@ -31,6 +31,10 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }
+# RFC 3986 percent-encoding, so a test can put a whole ARN in the single path
+# segment the tag and resource-policy routes bind, and a tag key carrying a space,
+# a `:` or a `+` in the `tagKeys` query string, the way a client does.
+percent-encoding = "2.3"
 
 [lints]
 workspace = true

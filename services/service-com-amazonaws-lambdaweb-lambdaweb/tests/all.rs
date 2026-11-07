@@ -15,6 +15,8 @@
 mod resource_policy;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tags.rs"]
+mod tags;
 #[path = "all/web_account_settings.rs"]
 mod web_account_settings;
 #[path = "all/web_function_endpoint.rs"]

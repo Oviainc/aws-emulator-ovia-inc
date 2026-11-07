@@ -16,7 +16,7 @@
 
 use serde_json::{json, Value};
 
-use super::web_function_lifecycle::{build_config, role_arn, Emulator, Reply};
+use super::web_function_lifecycle::{build_config, percent_encoded, role_arn, Emulator, Reply};
 
 /// The region every test signs with: the Region the function, and therefore its
 /// ARN, is created in.
@@ -39,10 +39,10 @@ const POLICY_NOT_FOUND_MESSAGE: &str = "The function does not have a policy.";
 /// with: fixed text, with none of the document in it.
 const POLICY_SYNTAX_MESSAGE: &str = "Policy has syntax errors.";
 
-/// An ARN as ONE URI path segment: its `:` and `/` travel as `%3A` and `%2F`, the
-/// way an SDK sends them, or the request addresses a different route.
+/// An ARN as ONE URI path segment: its `:` and `/` travel percent-encoded, the way
+/// an SDK sends them, or the request addresses a different route.
 fn encode(arn: &str) -> String {
-    arn.replace(':', "%3A").replace('/', "%2F")
+    percent_encoded(arn)
 }
 
 /// Whether `value` satisfies the model's `PolicyRevisionId` pattern

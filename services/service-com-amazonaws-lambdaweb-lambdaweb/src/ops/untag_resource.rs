@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the named tag keys from a web function — this is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `@idempotent`, as the model declares it: a key the function does not carry is passed
+//! over rather than refused, so repeating the call, or naming a key that was never set,
+//! leaves the same stored map. The key set is held to the reserved namespace rule
+//! ([`crate::state::tag_key_list_violation`]) BEFORE anything is removed, so a refused request
+//! removes nothing. The tags live in the function's own record
+//! (`crate::state::WebFunction::tags`), so `TagResource` and `ListTags` see ONE copy of
+//! them.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +180,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // The reserved namespace is not the caller's to delete from either, and the
+        // whole key set is checked before anything is removed.
+        if let Some(message) = crate::state::tag_key_list_violation("tagKeys", &input.tag_keys) {
+            return Err(
+                UntagResourceErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        let akid = ::engine::extract_akid(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the web function store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+        state.materialise_due_transitions(::std::time::SystemTime::now());
+
+        // The `resource` names the web function the tags hang off; the store keys
+        // that function by name, exactly as every other reader resolves it.
+        let name = crate::state::resolve_function_name(&input.resource).to_string();
+        let Some(removed) = state.remove_tags(&name, input.tag_keys.iter().map(String::as_str))
+        else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("The web function {} doesn't exist.", input.resource),
+                    resource_id: Some(input.resource.clone()),
+                    resource_type: Some("WebFunction".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The audit record for the state change: who, what, outcome. How many keys
+        // were asked for and how many were actually there — a key that was never
+        // set is removed from nothing, and that is the difference.
+        ::tracing::info!(
+            operation = "UntagResource",
+            akid = %akid,
+            resource = %input.resource,
+            requested = input.tag_keys.len(),
+            removed = removed,
+            outcome = "untagged",
+            "tag keys were removed from a web function"
+        );
+
+        Ok(UntagResourceOutput)
     }
 }

@@ -10,8 +10,8 @@
 //! region, the documented resource-name rule, the record-to-modelled-shape
 //! projections, the clock-driven `Pending -> Active` transition and the opaque list
 //! cursor codec — are shared by those handlers rather than duplicated per
-//! operation. The endpoint slice lives in [`endpoints`] and the resource-policy
-//! slice in [`resource_policies`].
+//! operation. The endpoint slice lives in [`endpoints`], the resource-policy
+//! slice in [`resource_policies`] and the tag slice in [`tags`].
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
@@ -37,6 +37,11 @@ pub use endpoints::*;
 /// operations apply.
 mod resource_policies;
 pub use resource_policies::*;
+
+/// The tag slice: the tags a web function carries, and the rules the tag
+/// operations hold a key set to.
+mod tags;
+pub use tags::*;
 
 /// The region an emulated request is treated as having been made in when its
 /// SigV4 credential scope does not name one (an unsigned or anonymous request).
@@ -271,12 +276,7 @@ impl WebFunction {
         if self.tags.is_empty() {
             return None;
         }
-        Some(
-            self.tags
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-        )
+        Some(modeled_tag_map(&self.tags))
     }
 
     /// The revision this function's `latestRevisionId` names, if it still has one.

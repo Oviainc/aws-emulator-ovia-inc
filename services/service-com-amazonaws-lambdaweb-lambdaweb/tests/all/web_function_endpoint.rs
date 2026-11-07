@@ -21,7 +21,9 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_lambdaweb_lambdaweb::state::PROVISIONING_DELAY;
 
-use super::web_function_lifecycle::{build_config, expected_arn, role_arn, Emulator, Reply};
+use super::web_function_lifecycle::{
+    build_config, expected_arn, percent_encoded, role_arn, Emulator, Reply,
+};
 
 /// The region every test signs with: the endpoint's HOME Region, "the Region where
 /// you created the web function".
@@ -438,7 +440,7 @@ async fn an_endpoint_can_be_named_by_name_or_by_arn_and_an_unknown_one_is_404() 
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let encode = |value: &str| value.replace(':', "%3A").replace('/', "%2F");
+    let encode = percent_encoded;
 
     for spelling in ["prod".to_string(), encode(&endpoint_arn)] {
         let fetched = get_endpoint(&emulator, function_name, &spelling).await;
