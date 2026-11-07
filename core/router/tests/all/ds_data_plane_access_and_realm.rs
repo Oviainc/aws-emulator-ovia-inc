@@ -82,7 +82,7 @@ async fn directory_serving_its_data_plane(emulator: &Emulator, name: &str) -> St
 }
 
 /// The `DC=` form of a domain name: `corp.example.com` -> `DC=corp,DC=example,DC=com`.
-fn domain_components(realm: &str) -> String {
+pub(super) fn domain_components(realm: &str) -> String {
     realm
         .trim_end_matches('.')
         .split('.')

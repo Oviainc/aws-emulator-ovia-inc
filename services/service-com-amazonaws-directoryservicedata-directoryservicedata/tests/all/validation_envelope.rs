@@ -114,8 +114,9 @@ pub(super) fn emulator() -> MultiServiceRouter {
 }
 
 /// Record that the account holds `directories` with their DS Data feature ON, as the AWS
-/// Directory Service CONTROL plane records a directory it creates and then
-/// `EnableDirectoryDataAccess` turns the feature on for.
+/// Directory Service CONTROL plane records a directory it creates — each id with the domain
+/// name that create was given — and then `EnableDirectoryDataAccess` turns the feature on
+/// for.
 ///
 /// The data plane under test creates no directory — `CreateDirectory` / `CreateMicrosoftAD`
 /// belong to the control plane, as does the switch that makes this API usable at all — so a
@@ -127,7 +128,9 @@ pub(super) fn emulator() -> MultiServiceRouter {
 /// is the data-access gate's own case; both are suites of their own.
 ///
 /// The registration names no DOMAIN, so these suites read the realm this plane falls back to
-/// when the control plane recorded none — which is the realm every case here asserts.
+/// when the control plane recorded none — which is the realm every case here asserts. The
+/// suite that is about the DERIVATION of a realm registers a domain of its own
+/// ([`hold_directory_in_domain`]).
 pub(super) fn hold_directories(engine: &engine::InMemoryEngine, directories: &[&str]) {
     let inventory = service_com_amazonaws_directoryservicedata_directoryservicedata::state::
         ad_directory_inventory(engine)
@@ -140,6 +143,38 @@ pub(super) fn hold_directories(engine: &engine::InMemoryEngine, directories: &[&
         // plane's, and these suites are about what a served directory answers.
         held.enable_data_access(directory, now, now);
     }
+}
+
+/// [`hold_directories`] for ONE directory, with the DOMAIN the control plane created it in:
+/// the `Name` its create was called with, which this plane reports as the realm of every
+/// object inside it.
+pub(super) fn hold_directory_in_domain(
+    engine: &engine::InMemoryEngine,
+    directory: &str,
+    domain_name: &str,
+) {
+    let inventory = service_com_amazonaws_directoryservicedata_directoryservicedata::state::
+        ad_directory_inventory(engine)
+        .expect("the shared engine holds the AD directory inventory");
+    let mut held = inventory.lock();
+    held.register_in_domain(directory, domain_name);
+    let now = SystemTime::now();
+    held.enable_data_access(directory, now, now);
+}
+
+/// The `DC=` form of a domain name: `corp.example.com` → `DC=corp,DC=example,DC=com`.
+///
+/// Derived from the domain name an answer reports, so what a case pins is the derivation
+/// rule — a distinguished name names its object inside its own domain — and not whichever
+/// domain name the directory under test carries. A name may be written with the root's
+/// trailing dot, which names no label of its own.
+pub(super) fn domain_components(domain: &str) -> String {
+    domain
+        .trim_end_matches('.')
+        .split('.')
+        .map(|label| format!("DC={label}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// What the emulator answered: the status, the `x-amzn-errortype` header and the body.

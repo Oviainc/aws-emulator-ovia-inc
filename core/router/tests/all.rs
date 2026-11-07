@@ -33,6 +33,11 @@ mod rds_s3_snapshot_export_flow;
 // appended tail and the sorted `d…` span are both regions concurrently landing suites add
 #[path = "all/directory_data_plane_authorization.rs"]
 mod directory_data_plane_authorization;
+// Declared here, beside the suite above it shares its two services with: which DOMAIN the
+// data plane answers for, which is the control plane's record of the name it was created
+// with.
+#[path = "all/directory_realm_follows_its_create.rs"]
+mod directory_realm_follows_its_create;
 // Declared here, in this same head region, for the reason the entries above record.
 #[path = "all/directory_data_access_cycle.rs"]
 mod directory_data_access_cycle;

@@ -1060,7 +1060,6 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// password are knowable here only from that plane's own record. It is ONE record under one
 /// shared type
 /// ([`::service_common::ad_directories::AdDirectoryInventory`]) rather than a copy inside
-/// ([`::service_common::ad_directories::AdDirectoryInventory`]) rather than a copy inside
 /// [`ComAmazonawsDirectoryservicedataDirectoryservicedataState`]: the engine keys state by
 /// TYPE, so a copy of its own here would be invisible to the plane that writes it.
 ///

@@ -593,6 +593,12 @@ mod tests {
                 && inventory.holds(&directory(1)),
             "case one past the ceiling: expected the newest and the next-oldest to be held"
         );
+        assert_eq!(
+            inventory.domain_name(&directory(MAX_RECORDED_DIRECTORIES)),
+            Some(domain(MAX_RECORDED_DIRECTORIES).as_str()),
+            "case one past the ceiling: expected the newest registration's own domain, got {:?}",
+            inventory.domain_name(&directory(MAX_RECORDED_DIRECTORIES))
+        );
 
         let id = directory(MAX_RECORDED_DIRECTORIES);
         for index in 0..=MAX_RECORDED_ACCOUNTS_PER_DIRECTORY {

@@ -19,6 +19,9 @@ mod data_access_gate;
 #[path = "all/directory_authorization.rs"]
 mod directory_authorization;
 
+#[path = "all/directory_realm.rs"]
+mod directory_realm;
+
 #[path = "all/group_inventory.rs"]
 mod group_inventory;
 
