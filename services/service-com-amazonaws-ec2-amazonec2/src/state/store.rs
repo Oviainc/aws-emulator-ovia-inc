@@ -1758,6 +1758,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`MAX_REMEMBERED_VERIFIED_ACCESS_TRUST_PROVIDER_DELETIONS`] of them.
     pub verified_access_trust_provider_deletions:
         VecDeque<(String, crate::ops::types::VerifiedAccessTrustProvider)>,
+    /// An `AttachVerifiedAccessTrustProvider` or `DetachVerifiedAccessTrustProvider`
+    /// `ClientToken` and the request it carried, so a repeat of one of those calls changes
+    /// nothing further and the same token carrying a different one is refused instead of
+    /// moving a second attachment. Separate from
+    /// [`Self::verified_access_trust_provider_client_tokens`] for the reason the modify of an
+    /// instance keeps its own map: a token names the request it was given with, so an attach
+    /// carrying the token some create was given is an attach, not a replay of that create.
+    pub verified_access_trust_provider_attachment_client_tokens:
+        HashMap<String, VerifiedAccessTrustProviderAttachmentRequest>,
     /// Every Verified Access instance the account holds, by `VerifiedAccessInstanceId`, as
     /// the modelled [`crate::ops::types::VerifiedAccessInstance`] shape itself — see the
     /// module docs. Ordered by id, the order a describe of the instances reports and pages
@@ -3122,6 +3131,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             verified_access_trust_providers: BTreeMap::new(),
             verified_access_trust_provider_client_tokens: HashMap::new(),
             verified_access_trust_provider_deletions: VecDeque::new(),
+            verified_access_trust_provider_attachment_client_tokens: HashMap::new(),
             // A fresh account has created no Verified Access instance, no group on one and
             // no endpoint on a group.
             verified_access_instances: BTreeMap::new(),

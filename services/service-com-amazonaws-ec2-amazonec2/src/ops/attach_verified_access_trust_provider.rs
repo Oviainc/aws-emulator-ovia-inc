@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachVerifiedAccessTrustProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AttachVerifiedAccessTrustProvider`'s real behaviour. Implement it here — this is
+//! Implemented: puts the Verified Access trust provider the request names onto the Verified
+//! Access instance it names and answers with both records as that leaves them, so a later
+//! `DescribeVerifiedAccessInstances` reports the trust provider on that instance — this is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AttachVerifiedAccessTrustProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +138,163 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AttachVerifiedAccessTrustProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AttachVerifiedAccessTrustProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AttachVerifiedAccessTrustProvider"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            idempotent_parameter_mismatch, invalid_verified_access_instance_id_not_found,
+            invalid_verified_access_trust_provider_id_not_found, require_service_state,
+            resource_already_associated, verified_access_instance_limit_exceeded,
+            verified_access_trust_provider_attachment_payload_bytes,
+            VerifiedAccessTrustProviderAttachmentRequest, MAX_CLIENT_TOKEN_CHARS, MAX_STORED_BYTES,
+        };
+
+        // Both resources are named by id and neither modelled shape carries a Region or an
+        // ARN, so nothing here reads the request's metadata; the store is reached through the
+        // engine held on `self`.
+        let _ = ctx;
+
+        // "A unique, case-sensitive token that you provide to ensure idempotency of your
+        // modification request" (`$ClientToken`): the token is retained for the process's
+        // lifetime, so its length is held to the bound every client token in this crate is.
+        if input
+            .client_token
+            .as_deref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        // The change this request asks for: the pair it named and the direction an ATTACH
+        // moves it in. The same record a detach of the same pair builds, so one token cannot
+        // answer for both calls.
+        let request = VerifiedAccessTrustProviderAttachmentRequest {
+            verified_access_instance_id: input.verified_access_instance_id.clone(),
+            verified_access_trust_provider_id: input.verified_access_trust_provider_id.clone(),
+            attach: true,
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // "Attaches the specified Amazon Web Services Verified Access trust provider to the
+        // specified Amazon Web Services Verified Access instance": an id that names no
+        // resource of the account attaches nothing and is refused, whatever the id looks like.
+        if !store
+            .verified_access_instances
+            .contains_key(&request.verified_access_instance_id)
+        {
+            return Err(invalid_verified_access_instance_id_not_found(
+                &request.verified_access_instance_id,
+            ));
+        }
+        let Some(provider) = store
+            .verified_access_trust_providers
+            .get(&request.verified_access_trust_provider_id)
+            .cloned()
+        else {
+            return Err(invalid_verified_access_trust_provider_id_not_found(
+                &request.verified_access_trust_provider_id,
+            ));
+        };
+
+        // Idempotency: a repeat of ONE attach attaches nothing further and reports the pair as
+        // it stands, while the same token carrying a DIFFERENT request — another pair, or the
+        // detach of this one — is the mismatch EC2 refuses rather than a second change. Read
+        // here, answered below the DryRun check, because a replay writes nothing and so passes
+        // the budget a fresh attach has to clear.
+        let replayed = match input.client_token.as_deref() {
+            None => false,
+            Some(token) => match store.verified_access_trust_provider_attachment_for_token(token) {
+                None => false,
+                Some(recorded) if recorded == &request => true,
+                Some(_) => return Err(idempotent_parameter_mismatch()),
+            },
+        };
+
+        // An instance reports each trust provider attached to it ONCE
+        // (`VerifiedAccessInstance$VerifiedAccessTrustProviders`), so a pair that is already
+        // attached has no attachment left to establish and is refused rather than reported as
+        // a second one. A replay is the one pair allowed to be attached already, because this
+        // very token is what attached it.
+        if !replayed
+            && store.verified_access_trust_provider_is_attached(
+                &request.verified_access_instance_id,
+                &request.verified_access_trust_provider_id,
+            )
+        {
+            return Err(resource_already_associated(format!(
+                "VerifiedAccessTrustProvider {} is already attached to VerifiedAccessInstance {}",
+                request.verified_access_trust_provider_id, request.verified_access_instance_id
+            )));
+        }
+
+        // What this attach RETAINS: the copy of the trust provider's description the
+        // instance's condensed entry carries, and the token it is recorded under — asked about
+        // on the path that writes, through the crate's one definition of that charge.
+        if !replayed {
+            let charge = verified_access_trust_provider_attachment_payload_bytes(
+                &request,
+                &provider,
+                input.client_token.as_deref(),
+            );
+            if store.would_exceed_stored_bytes(charge) {
+                return Err(verified_access_instance_limit_exceeded(format!(
+                    "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                     caller-supplied data, so it cannot store this attachment's {charge} bytes",
+                    store.stored_bytes()
+                )));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and both resources resolved, and
+        // BEFORE the first write: the flag asks whether the request WOULD have worked, so one
+        // that would have been refused is refused with that reason instead, and one that would
+        // have succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // A replay attaches nothing — not even a second `LastUpdatedTime` — and reports the
+        // instance as it stands, which is what the first call left behind.
+        let (verified_access_instance, verified_access_trust_provider) = if replayed {
+            let instance = store
+                .verified_access_instances
+                .get(&request.verified_access_instance_id)
+                .cloned()
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "the Verified Access instance '{}' checked a moment ago could not be \
+                         read back",
+                        request.verified_access_instance_id
+                    ))
+                })?;
+            (instance, provider)
+        } else {
+            // Written through the store's ONE writer of an attachment, so what this answers is
+            // the stored record a later describe of the same instance reports.
+            store
+                .set_verified_access_trust_provider_attachment(
+                    &request,
+                    input.client_token.as_deref(),
+                    ::std::time::SystemTime::now(),
+                )
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "the Verified Access instance '{}' could not be read back after \
+                         attaching trust provider '{}'",
+                        request.verified_access_instance_id,
+                        request.verified_access_trust_provider_id
+                    ))
+                })?
+        };
+
+        // "Details about the Verified Access instance" and "Details about the Verified Access
+        // trust provider" (`AttachVerifiedAccessTrustProviderResult`): both records as this
+        // call leaves them, read out of the store rather than rebuilt here.
+        Ok(AttachVerifiedAccessTrustProviderOutput {
+            verified_access_instance: Some(verified_access_instance),
+            verified_access_trust_provider: Some(verified_access_trust_provider),
+        })
     }
 }

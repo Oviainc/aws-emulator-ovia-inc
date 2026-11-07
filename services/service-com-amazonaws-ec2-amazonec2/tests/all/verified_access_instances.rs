@@ -1154,8 +1154,9 @@ async fn the_describe_narrows_by_id_and_by_every_answered_filter() {
 /// carrying that id and no other.
 ///
 /// The attachments are seeded through the store's own insert seam — the writer the create uses
-/// — because `AttachVerifiedAccessTrustProvider` is still a scaffold stub
-/// (`services/service-com-amazonaws-ec2-amazonec2/src/ops/attach_verified_access_trust_provider.rs`).
+/// — so this case drives the filter over trust provider ids no create of a trust provider has
+/// to mint first; what `AttachVerifiedAccessTrustProvider` itself writes is covered by
+/// [`super::verified_access_trust_provider_attachment`].
 #[tokio::test]
 async fn the_describe_selects_on_the_attached_trust_provider_ids() {
     let (router, engine) = emulator();

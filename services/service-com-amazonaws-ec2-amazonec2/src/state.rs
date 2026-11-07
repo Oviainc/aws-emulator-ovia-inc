@@ -366,7 +366,21 @@
 //! ([`ComAmazonawsEc2Amazonec2State::verified_access_trust_provider_deletion`]) so a
 //! retried delete answers with what the first one answered. That history is bounded by
 //! entry count and drops its oldest entry to make room, because a delete frees the live
-//! record's slot and so leaves no ceiling that would bound it.
+//! record's slot and so leaves no ceiling that would bound it. It also brings every instance
+//! that had the trust provider ATTACHED back in step with that store
+//! ([`ComAmazonawsEc2Amazonec2State::resync_verified_access_trust_provider_attachments`]), so
+//! no instance is left reporting an id the account holds no trust provider for.
+//!
+//! Which trust providers an instance has attached is the instance's own
+//! `VerifiedAccessTrustProviders` set, so there is one place an attachment is read from — the
+//! set `DescribeVerifiedAccessInstances` reports —
+//! and [`ComAmazonawsEc2Amazonec2State::set_verified_access_trust_provider_attachment`] is
+//! the one way it CHANGES: `AttachVerifiedAccessTrustProvider` adds the entry,
+//! `DetachVerifiedAccessTrustProvider` takes it away, both stamp the instance's
+//! `LastUpdatedTime`, and each entry is
+//! [`verified_access_trust_provider_condensed`] of the STORED trust provider rather than of a
+//! request, so an instance cannot report a trust provider the trust provider store describes
+//! differently.
 //!
 //! ## Verified Access instances, groups and endpoints
 //!
@@ -2256,6 +2270,12 @@ mod resource_dependencies_and_conversion_tasks;
 mod security_group_rules_and_page_tokens;
 mod images_and_zone_facts;
 mod import_image_tasks_and_verified_access;
+/// Which Verified Access trust providers each Verified Access instance has attached: the one
+/// writer of that attachment, the one reading of it, and the tokens the two calls that change
+/// it were given — in a file of its own rather than as more lines here. Everything it declares
+/// is re-exported below, so a handler reaches it as
+/// `crate::state::verified_access_trust_provider_condensed` like any helper of this module.
+mod verified_access_trust_provider_attachments;
 mod volumes;
 mod local_gateways_and_filter_patterns;
 pub mod outpost_lags;
@@ -2273,6 +2293,7 @@ pub use outpost_lags::*;
 pub use service_link_virtual_interfaces::*;
 pub use volumes::*;
 pub use import_image_tasks_and_verified_access::*;
+pub use verified_access_trust_provider_attachments::*;
 pub use images_and_zone_facts::*;
 pub use security_group_rules_and_page_tokens::*;
 pub use resource_dependencies_and_conversion_tasks::*;

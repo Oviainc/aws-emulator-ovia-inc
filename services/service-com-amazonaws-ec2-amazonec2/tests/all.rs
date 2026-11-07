@@ -1543,3 +1543,10 @@ mod delete_network_insights_access_scope_analysis;
 // this file, which is where every new ec2 suite inserts its lines.
 #[path = "all/deprovision_ipam_pool_cidr.rs"]
 mod deprovision_ipam_pool_cidr;
+// What `AttachVerifiedAccessTrustProvider` and `DetachVerifiedAccessTrustProvider` change: the
+// trust providers one Verified Access instance reports as attached, read back through
+// `DescribeVerifiedAccessInstances`, the pairs and ids they refuse, how one `ClientToken`
+// bounds each of them to one change, and the attachments a deleted trust provider leaves
+// behind. Declared at the tail of this file, which is where every new ec2 suite inserts its
+#[path = "all/verified_access_trust_provider_attachment.rs"]
+mod verified_access_trust_provider_attachment;

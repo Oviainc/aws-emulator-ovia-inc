@@ -1374,6 +1374,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// [`MAX_REMEMBERED_VERIFIED_ACCESS_TRUST_PROVIDER_DELETIONS`] entries, the oldest
     /// dropped (and its bytes given back) to make room, so a create-and-delete loop cannot
     /// grow it; a delete that names no token frees the record outright.
+    ///
+    /// An instance that had this trust provider ATTACHED loses that attachment here
+    /// ([`Self::resync_verified_access_trust_provider_attachments`]): the attachment is a
+    /// reference to a trust provider, so it cannot outlive the trust provider it names.
     pub fn remove_verified_access_trust_provider(
         &mut self,
         trust_provider_id: &str,
@@ -1416,6 +1420,10 @@ impl ComAmazonawsEc2Amazonec2State {
                 self.forget_verified_access_trust_provider_deletion(0);
             }
         }
+        self.resync_verified_access_trust_provider_attachments(
+            trust_provider_id,
+            SystemTime::now(),
+        );
         Some(provider)
     }
 
@@ -1733,9 +1741,11 @@ pub fn verified_access_group_payload_bytes(
 }
 
 /// The caller-chosen bytes one stored Verified Access instance holds for the process's
-/// lifetime: its tags, its description, the custom subdomain it was given and the client
-/// token the token map keeps. The id and the timestamps are the service's own, so they are
-/// bounded already and not counted here.
+/// lifetime: its tags, its description, the custom subdomain it was given, the description of
+/// each trust provider attached to it (the condensed entry carries a copy of it) and the
+/// client token the token map keeps. The id, the timestamps and the trust provider kinds are
+/// the service's own or come from a modelled enum, so they are bounded already and not counted
+/// here.
 ///
 /// ONE definition of the charge, computed identically by the create's ceiling pre-check and
 /// by [`ComAmazonawsEc2Amazonec2State::insert_verified_access_instance`], so a writer cannot
@@ -1752,6 +1762,14 @@ pub fn verified_access_instance_payload_bytes(
                 .cidr_endpoints_custom_sub_domain
                 .as_ref()
                 .map_or(0, |subdomain| text(&subdomain.sub_domain)),
+        )
+        .saturating_add(
+            instance
+                .verified_access_trust_providers
+                .iter()
+                .flatten()
+                .map(|attached| text(&attached.description))
+                .fold(0usize, |total, bytes| total.saturating_add(bytes)),
         )
         .saturating_add(client_token.map_or(0, str::len))
 }
