@@ -59,6 +59,8 @@ mod lifecycle_phase_observability;
 mod not_found_refusals;
 #[path = "all/noun_phrase_key_phrases.rs"]
 mod noun_phrase_key_phrases;
+#[path = "all/person_name_typing.rs"]
+mod person_name_typing;
 #[path = "all/phone_number_forms.rs"]
 mod phone_number_forms;
 #[path = "all/pii_detection.rs"]
@@ -67,6 +69,8 @@ mod pii_detection;
 mod pii_entities;
 #[path = "all/pii_entities_jobs.rs"]
 mod pii_entities_jobs;
+#[path = "all/pii_labelled_values.rs"]
+mod pii_labelled_values;
 #[path = "all/realtime_text_quotas.rs"]
 mod realtime_text_quotas;
 #[path = "all/request_validation.rs"]
@@ -89,6 +93,8 @@ mod syntax;
 mod targeted_sentiment;
 #[path = "all/toxic_content.rs"]
 mod toxic_content;
+#[path = "all/toxic_content_conduct.rs"]
+mod toxic_content_conduct;
 // Declared beside the suites it backs rather than under `b`: `zz_scratch` holds the
 // documents written from scratch for the four `BatchDetect*` analysers and the
 // whole-document baseline they must keep answering, which

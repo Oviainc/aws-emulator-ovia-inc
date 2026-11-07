@@ -80,7 +80,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -276,12 +276,18 @@ fn rules() -> &'static [Rule] {
                 0,
                 Some(is_social_security_number),
             ),
+            // The same number where the text itself says what it is. The issuance
+            // check is NOT applied here: what admits the value is the label beside
+            // it, and the SSA's issuance ranges say which numbers the SSA has
+            // allocated, not which numbers a document calls a social security
+            // number — so re-deriving the type from the digits would overrule the
+            // document about its own value.
             rule(
                 "SSN",
                 Evidence::Context,
                 r"(?i)\b(?:ssn|social security(?: number| no\.?| #)?|n[úu]mero de seguro social)\s*(?:#|no\.?|number|:|=|is)?\s*(\d{9}|\d{3}-\d{2}-\d{4})\b",
                 1,
-                Some(is_social_security_number),
+                None,
             ),
             // IRS: an ITIN starts with 9 and its middle pair is in a published range.
             rule(
@@ -594,9 +600,11 @@ struct ByteSpan {
 ///
 /// Spans are returned in document order and never overlap: where two rules claim
 /// overlapping text the one with the stronger evidence wins, then the longer span,
-/// then the earlier one — so a payment card number confirmed by its Luhn digit is
-/// never also reported as the bank account number a nearby keyword would have made
-/// it.
+/// then the earlier one — so an e-mail address is never also reported as the URL its
+/// host alone would have made it. The one reading that outranks evidence strength is
+/// the document's own: a value the surrounding text LABELS keeps the type the label
+/// names, against a rule that claimed exactly the same characters on their form or
+/// issuance range alone.
 ///
 /// The cost is linear in the document plus `k log k` in the number of matches, and
 /// each rule collects at most [`MAX_MATCHES_PER_RULE`] of them, so the work one
@@ -638,6 +646,29 @@ pub fn detect_pii_spans(text: &str) -> Vec<PiiSpan> {
             });
         }
     }
+
+    // A value the document itself NAMES is of the type the document names: where a
+    // contextual rule (one admitted by the label beside the value) and a rule that
+    // read the value's form or issuance range alone claim exactly the same
+    // characters and disagree about the type, the labelled reading is the one kept.
+    // The surrounding label is evidence about THIS value; a form or a range is
+    // evidence about values of a kind, and cannot overrule a document that says what
+    // its own value is. Rules that AGREE with the label are left alone, so a value
+    // that is both labelled and structurally confirmed keeps the stronger evidence's
+    // score.
+    let mut labelled: BTreeMap<(usize, usize), BTreeSet<&'static str>> = BTreeMap::new();
+    for span in matched.iter().filter(|span| span.evidence == Evidence::Context) {
+        labelled
+            .entry((span.begin, span.end))
+            .or_default()
+            .insert(span.entity_type);
+    }
+    matched.retain(|span| {
+        span.evidence == Evidence::Context
+            || labelled
+                .get(&(span.begin, span.end))
+                .is_none_or(|types| types.contains(span.entity_type))
+    });
 
     // Strongest evidence first, then the longest span, then document order: the
     // order the overlap sweep below resolves a conflict in.

@@ -2,11 +2,15 @@
 
 //! @op DetectToxicContent
 //!
-//! IMPLEMENTED. Toxicity analysis runs in-process through the `rustrict` English
-//! profanity/abuse engine, so every score is computed from the submitted segment
-//! rather than matched out of the request. One `ToxicLabels` entry is produced per
-//! input segment, in input order, and a `LanguageCode` the engine has no lexicon
-//! for is answered with the modelled `UnsupportedLanguageException`.
+//! IMPLEMENTED. Toxicity analysis runs in-process: the English profanity/abuse
+//! engine `rustrict` classifies the four modelled content types that are about the
+//! LANGUAGE a segment uses, and a rule recognizer over the forms each of the
+//! remaining three is published as covering places the ones about CONDUCT — a
+//! threat of harm, abuse directed at the recipient, a gruesome depiction — so every
+//! modelled `ToxicContentType` has a detector and every score is computed from the
+//! submitted segment rather than matched out of the request. One `ToxicLabels` entry
+//! is produced per input segment, in input order, and a `LanguageCode` the engine has
+//! no lexicon for is answered with the modelled `UnsupportedLanguageException`.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +85,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::sync::OnceLock;
+
+use regex::Regex;
 use rustrict::{Censor, Type};
 
 /// The largest single `TextSegment$Text` this operation accepts, in UTF-8 bytes:
@@ -111,37 +118,221 @@ const MAX_SEGMENTS: usize = 10;
 /// `UnsupportedLanguageException` rather than with scores no analysis produced.
 const ANALYSABLE_LANGUAGES: &[&str] = &["en"];
 
-/// The confidence reported for a category the engine placed at each of the three
-/// severity levels it distinguishes.
+/// The confidence ONE placement of toxic content carries, by how strongly the
+/// analyser placed it.
 ///
 /// `ToxicContent$Score` and `ToxicLabels$Toxicity` are modelled as "zero to one,
-/// where one is the highest confidence", and the engine's verdict per category is
-/// one of three ordered severity levels rather than a continuous number — so each
-/// level is reported as the midpoint of its third of that range: mild (0, 1/3],
-/// moderate (1/3, 2/3], severe (2/3, 1].
+/// where one is the highest confidence". A single placement is weighed on that range
+/// in thirds — weakly placed (0, 1/3], placed (1/3, 2/3], strongly placed (2/3, 1] —
+/// and reported as the midpoint of its third. These are the weights of ONE piece of
+/// evidence, not the values the operation can answer: a reported `Score` combines
+/// every placement of its type ([`combined_confidence`]), and `Toxicity` combines
+/// every placement of every type, so both rise with how much toxic content the
+/// segment actually carries rather than snapping to one of three rungs.
 const MILD_SCORE: f32 = 1.0 / 6.0;
 const MODERATE_SCORE: f32 = 0.5;
 const SEVERE_SCORE: f32 = 5.0 / 6.0;
 
-/// The modelled `ToxicContentType` values this emulator's engine can place, each
-/// paired with the engine category that detects it.
+/// The modelled `ToxicContentType` values the profanity/abuse engine classifies,
+/// each paired with the engine category that detects it.
 ///
 /// The engine classifies a string as profane, offensive (slurs and discriminatory
-/// language), sexual and mean (demeaning, insulting); those are reported as
-/// `PROFANITY`, `HATE_SPEECH`, `SEXUAL` and `INSULT`. The three remaining modelled
-/// types — `GRAPHIC`, `HARASSMENT_OR_ABUSE` and `VIOLENCE_OR_THREAT` — have no
-/// detector in this engine, so no label for them is ever reported: a score for a
-/// category nothing analysed would be invented. Listed in the modelled enum's own
-/// order (`TOXIC_CONTENT_TYPE_VALUES`), so the reported `Labels` order is stable.
-const DETECTABLE_CATEGORIES: [(&str, Type); 4] = [
+/// language), sexual and mean (demeaning, insulting); those are the four modelled
+/// types that are about the LANGUAGE a segment uses. The three remaining modelled
+/// types are about the CONDUCT a segment threatens, directs at its recipient or
+/// depicts, which no profanity class describes, so they are placed by
+/// [`conduct_rules`] instead — every modelled `ToxicContentType` is read by one of
+/// the two.
+const ENGINE_CATEGORIES: [(&str, Type); 4] = [
     ("HATE_SPEECH", Type::OFFENSIVE),
     ("INSULT", Type::MEAN),
     ("PROFANITY", Type::PROFANE),
     ("SEXUAL", Type::SEXUAL),
 ];
 
-/// The confidence the analysis places in `category`, or `None` when the engine
-/// placed no content of that category in the string.
+/// How much text one rule allows between two parts of the same sentence.
+///
+/// A rule reads ONE sentence, so its parts are joined by this rather than by `.*`:
+/// the match cannot cross a sentence boundary and is bounded, which keeps a rule from
+/// joining two unrelated sentences and keeps its cost linear in the segment.
+const WITHIN_SENTENCE: &str = r"[^.!?\n]{0,40}?";
+
+/// The forms a speaker states an intention in.
+///
+/// Source: the English modal and periphrastic future forms.
+const STATED_INTENT: &str =
+    r"(?:will|'ll|am going to|going to|gonna|am about to|intend to|plan to|want to|would)";
+
+/// Who the content is aimed at, where a rule needs the act to have a target.
+///
+/// The speaker is deliberately not one of them: content aimed at the speaker reads as
+/// a report of someone else's conduct as often as content carrying it.
+const TARGET: &str =
+    r"(?:you|your|yourself|him|his|her|hers|them|their|themselves|everyone|anyone|someone|somebody)";
+
+/// Acts of physical pain, hurt or injury.
+///
+/// Source: the English verbs of physical harm, which is what a threat of violence is
+/// stated with.
+const VIOLENT_ACT: &str = r"(?:kill|murder|shoot|stab|strangle|choke|behead|lynch|assault|maim|mutilate|torture|hurt|harm|injure|beat|bash|punch|slap|attack|bomb|blow up|burn down|massacre|break)";
+
+/// The acts above whose plain reading is physical harm whatever sentence they sit in,
+/// so a rule may read one aimed at a person on its own. The ones left out — `attack`,
+/// `beat`, `break`, `hurt`, `harm` — have an everyday reading too, and are read only
+/// by a rule that also reads the stated intention or the part of the body the act is
+/// aimed at.
+const UNAMBIGUOUS_VIOLENT_ACT: &str =
+    r"(?:kill|murder|shoot|stab|strangle|choke|behead|lynch|assault|maim|mutilate|torture|beat up|punch)";
+
+/// Words that demean the person they are applied to: what abuse directed at a
+/// recipient is written with.
+///
+/// Source: the English epithets of worthlessness, incompetence and disgust.
+const DEMEANING: &str = r"(?:worthless|pathetic|disgusting|revolting|useless|stupid|idiot|idiots|moron|morons|imbecile|dumb|loser|losers|trash|garbage|scum|filth|vermin|freak|creep|waste of (?:space|air|oxygen|time)|piece of (?:garbage|trash|shit)|nobody|incompetent|clueless|brainless)";
+
+/// Vividly bodily imagery: the material a graphic depiction is written with.
+///
+/// Source: the English anatomical and gore vocabulary.
+const GORE: &str = r"(?:blood|bleeding|guts|entrails|intestines|brains|corpse|corpses|flesh|skull|bones|vomit|pus|maggots)";
+
+/// How a rule established that a segment carries what its category covers, and so how
+/// much one match of it weighs on the scale above.
+#[derive(Clone, Copy, Debug)]
+enum RuleEvidence {
+    /// The segment states the content outright: a threat with its act and its
+    /// target, abuse addressed to the recipient, a depiction with its imagery.
+    Stated,
+    /// The segment only alludes to it: it wishes the content on someone, celebrates
+    /// it, or names its material with no act of the speaker's own.
+    Alluded,
+}
+
+/// One rule of the conduct recognizer: a pattern over one segment, the modelled
+/// `ToxicContentType` a match places, and the confidence one match of it carries.
+struct CategoryRule {
+    category: &'static str,
+    confidence: f32,
+    pattern: Regex,
+}
+
+/// Every conduct rule, compiled once: compiling the patterns costs far more than
+/// matching a segment with them, and the set is immutable afterwards.
+///
+/// The CATEGORIES are the three modelled `ToxicContentType` values the profanity
+/// engine has no class for; the FORMS are what each of them covers — speech
+/// threatening, inciting or glorifying physical harm (`VIOLENCE_OR_THREAT`), speech
+/// directed at a person to humiliate, degrade or intimidate them
+/// (`HARASSMENT_OR_ABUSE`), and visually detailed, unpleasantly vivid depiction
+/// (`GRAPHIC`), as the Comprehend Developer Guide's toxicity-detection categories
+/// describe them — each stated as the forms a segment carries that conduct in.
+fn conduct_rules() -> &'static [CategoryRule] {
+    static RULES: OnceLock<Vec<CategoryRule>> = OnceLock::new();
+    RULES.get_or_init(|| {
+        let rule = |category: &'static str, evidence: RuleEvidence, pattern: String| CategoryRule {
+            category,
+            confidence: match evidence {
+                RuleEvidence::Stated => SEVERE_SCORE,
+                RuleEvidence::Alluded => MODERATE_SCORE,
+            },
+            pattern: Regex::new(&pattern).expect("a conduct rule is a valid regex"),
+        };
+        vec![
+            // A stated intention to inflict harm on someone: the threat form.
+            rule(
+                "VIOLENCE_OR_THREAT",
+                RuleEvidence::Stated,
+                format!(r"(?i)\b(?:i|we|he|she|they)\b{WITHIN_SENTENCE}\b{STATED_INTENT}\b{WITHIN_SENTENCE}\b{VIOLENT_ACT}\b{WITHIN_SENTENCE}\b{TARGET}\b"),
+            ),
+            // An imperative, or an act aimed at a person with no other framing.
+            rule(
+                "VIOLENCE_OR_THREAT",
+                RuleEvidence::Stated,
+                format!(r"(?i)\b{UNAMBIGUOUS_VIOLENT_ACT}\s+{TARGET}\b"),
+            ),
+            // Harm aimed at a part of someone's body.
+            rule(
+                "VIOLENCE_OR_THREAT",
+                RuleEvidence::Stated,
+                format!(r"(?i)\b(?:break|breaking|snap|smash|crush|cut off|rip off|burn)\b{WITHIN_SENTENCE}\b(?:your|his|her|their|the)\s+(?:legs?|arms?|kneecaps?|bones?|neck|jaw|face|ribs?|skull|fingers?|teeth)\b"),
+            ),
+            // Intimidation with no act named: the segment says the recipient is
+            // coming to harm.
+            rule(
+                "VIOLENCE_OR_THREAT",
+                RuleEvidence::Stated,
+                format!(r"(?i)\b(?:you(?:'re| are) (?:dead|finished)|watch your back|i know where you (?:live|work)|sleep with one eye open|come (?:after|for) {TARGET}|pain coming your way)\b"),
+            ),
+            // Wishing harm on someone, or celebrating it, with no act of the
+            // speaker's own.
+            rule(
+                "VIOLENCE_OR_THREAT",
+                RuleEvidence::Alluded,
+                format!(r"(?i)\b(?:deserved?s? (?:to (?:die|suffer|be (?:killed|shot|beaten|hurt))|every bit of (?:pain|suffering))|should (?:be (?:killed|shot|beaten|executed|lynched)|die)|hope {TARGET} (?:dies?|gets? hurt|gets? shot|suffers?)|glad (?:he|she|they) (?:died|got shot|was killed|were killed))\b"),
+            ),
+            // A demeaning epithet addressed to the recipient: abuse rather than an
+            // insult in the abstract, which is what makes it this category.
+            rule(
+                "HARASSMENT_OR_ABUSE",
+                RuleEvidence::Stated,
+                format!(r"(?i)\byou\b(?:'re|r| are| were| look| sound| little)?{WITHIN_SENTENCE}\b{DEMEANING}\b"),
+            ),
+            rule(
+                "HARASSMENT_OR_ABUSE",
+                RuleEvidence::Stated,
+                format!(r"(?i)\b{DEMEANING}\b{WITHIN_SENTENCE}\byou\b"),
+            ),
+            // Speech that silences, dismisses or tells the recipient to remove
+            // themselves.
+            rule(
+                "HARASSMENT_OR_ABUSE",
+                RuleEvidence::Stated,
+                r"(?i)\b(?:shut (?:the fuck )?up|get lost|kill yourself|kys|nobody (?:likes|wants|cares about) you|no one (?:likes|wants|cares about) you|you should (?:just )?(?:leave|quit|disappear)|go away and (?:die|rot))\b".to_string(),
+            ),
+            // Persistent unwanted attention, or a threat to expose the recipient.
+            rule(
+                "HARASSMENT_OR_ABUSE",
+                RuleEvidence::Alluded,
+                r"(?i)\b(?:i(?:'ll| will)? keep (?:messaging|calling|emailing|following|finding) you|you can(?:'t|not) (?:hide|escape)|everyone will (?:know|see) (?:what you|about you)|i(?:'ll| will) make (?:your life|this) (?:hell|miserable))\b".to_string(),
+            ),
+            // Bodily imagery with the vivid predicate that makes a depiction of it
+            // graphic.
+            rule(
+                "GRAPHIC",
+                RuleEvidence::Stated,
+                format!(r"(?i)\b{GORE}\b{WITHIN_SENTENCE}\b(?:everywhere|all over|splattered|spilling|pouring|dripping|oozing|rotting)\b"),
+            ),
+            rule(
+                "GRAPHIC",
+                RuleEvidence::Stated,
+                format!(r"(?i)\b(?:splattered|spilling|pouring|dripping|oozing|rotting|soaked in)\b{WITHIN_SENTENCE}\b{GORE}\b"),
+            ),
+            // An act of harm described with the body it is done to.
+            rule(
+                "GRAPHIC",
+                RuleEvidence::Stated,
+                format!(r"(?i)\b{VIOLENT_ACT}\b{WITHIN_SENTENCE}\b{GORE}\b"),
+            ),
+            // Terms whose only reading is a gruesome depiction, with nothing else in
+            // the sentence needed to place them.
+            rule(
+                "GRAPHIC",
+                RuleEvidence::Alluded,
+                r"(?i)\b(?:dismembered|decapitated|disemboweled|disembowelled|eviscerated|mutilated|entrails|maggots|charred remains)\b".to_string(),
+            ),
+        ]
+    })
+}
+
+/// One piece of toxic content an analyser placed in a segment: the modelled
+/// `ToxicContentType` it belongs to, and the confidence THAT placement carries.
+#[derive(Debug)]
+struct Placement {
+    name: &'static str,
+    confidence: f32,
+}
+
+/// The confidence the engine's verdict places on `category`, or `None` when it placed
+/// no content of that category.
 fn category_score(analysis: Type, category: Type) -> Option<f32> {
     if analysis.is(category & Type::SEVERE) {
         Some(SEVERE_SCORE)
@@ -154,35 +345,110 @@ fn category_score(analysis: Type, category: Type) -> Option<f32> {
     }
 }
 
+/// Every piece of toxic content the two analysers place in `text`.
+///
+/// The profanity/abuse engine is asked about the whole segment, which is what decides
+/// WHETHER one of its categories is present at all, and then about each word of it:
+/// a word the engine places that category in is one more piece of that category in
+/// the segment, so a segment carrying several of them is read with more confidence
+/// than one carrying a single word. A category the whole-segment verdict does not
+/// place is not reported at all, whatever a word reads as out of its context. The
+/// conduct recognizer contributes one placement per match of each of its rules.
+///
+/// Both passes are bounded by the per-string byte quota the operation refuses an
+/// oversized segment with before any analysis: every rule pattern is compiled once
+/// rather than per request and matches inside a single sentence, and the per-word
+/// pass is linear in the segment.
+fn placements(text: &str) -> Vec<Placement> {
+    let analysis = Censor::from_str(text).analyze();
+    let word_analyses: Vec<Type> = text
+        .split_whitespace()
+        .map(|word| Censor::from_str(word).analyze())
+        .collect();
+
+    let mut placements: Vec<Placement> = Vec::new();
+    for (name, category) in ENGINE_CATEGORIES {
+        let Some(segment_score) = category_score(analysis, category) else {
+            continue;
+        };
+        let before = placements.len();
+        for word in &word_analyses {
+            if let Some(score) = category_score(*word, category) {
+                placements.push(Placement {
+                    name,
+                    confidence: score,
+                });
+            }
+        }
+        if placements.len() == before {
+            // The engine read the category across words rather than in any single
+            // one of them, so the segment's own verdict is the one placement.
+            placements.push(Placement {
+                name,
+                confidence: segment_score,
+            });
+        }
+    }
+
+    for rule in conduct_rules() {
+        for _ in rule.pattern.find_iter(text) {
+            placements.push(Placement {
+                name: rule.category,
+                confidence: rule.confidence,
+            });
+        }
+    }
+    placements
+}
+
+/// The confidence a set of independent placements adds up to, or `None` when there
+/// are none.
+///
+/// Each placement is its own evidence that the content is present, so the combined
+/// confidence is the complement of the product of their complements: it is at least
+/// as large as the strongest single placement and rises with every further one, which
+/// is what makes a reported score a continuous confidence rather than one of the
+/// rungs a single placement weighs.
+fn combined_confidence(confidences: impl Iterator<Item = f32>) -> Option<f32> {
+    let mut not_present = 1.0f32;
+    let mut any = false;
+    for confidence in confidences {
+        not_present *= 1.0 - confidence;
+        any = true;
+    }
+    any.then(|| (1.0 - not_present).clamp(0.0, 1.0))
+}
+
 /// Analyse one text segment into the modelled per-string result.
 ///
-/// `Labels` carries one entry per modelled content type the engine placed in the
-/// string, with the confidence of that placement. `Toxicity` is the overall
-/// confidence that the string carries toxic content of ANY type: the per-type
-/// confidences are independent pieces of evidence, so it is the complement of the
-/// product of their complements. That makes it at least as large as the strongest
-/// single confidence, larger when several types are placed, and exactly zero for a
-/// string the engine placed nothing in — which comes back with no labels, rather
-/// than with an invented floor.
+/// `Labels` carries one entry per modelled content type the analysers placed in the
+/// string, in the modelled enum's own order, with the confidence everything they
+/// placed of that type adds up to. `Toxicity` is the overall confidence that the
+/// string carries toxic content of ANY type: the same combination over every type's
+/// confidence. That makes it at least as large as the strongest single type, larger
+/// when several types are placed, and exactly zero for a string nothing was placed in
+/// — which comes back with no labels, rather than with an invented floor.
 fn analyse_segment(text: &str) -> ToxicLabels {
-    let analysis = Censor::from_str(text).analyze();
+    let placed = placements(text);
 
-    let labels: Vec<ToxicContent> = DETECTABLE_CATEGORIES
-        .into_iter()
-        .filter_map(|(name, category)| {
-            category_score(analysis, category).map(|score| ToxicContent {
-                name: Some(name.to_string()),
+    let labels: Vec<ToxicContent> = TOXIC_CONTENT_TYPE_VALUES
+        .iter()
+        .filter_map(|name| {
+            combined_confidence(
+                placed
+                    .iter()
+                    .filter(|placement| placement.name == *name)
+                    .map(|placement| placement.confidence),
+            )
+            .map(|score| ToxicContent {
+                name: Some((*name).to_string()),
                 score: Some(score),
             })
         })
         .collect();
 
-    let not_toxic: f32 = labels
-        .iter()
-        .filter_map(|label| label.score)
-        .map(|score| 1.0 - score)
-        .product();
-    let toxicity = (1.0 - not_toxic).clamp(0.0, 1.0);
+    let toxicity =
+        combined_confidence(labels.iter().filter_map(|label| label.score)).unwrap_or(0.0);
 
     ToxicLabels {
         labels: Some(labels),

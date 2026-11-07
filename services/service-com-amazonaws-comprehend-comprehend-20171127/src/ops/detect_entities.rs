@@ -239,6 +239,16 @@ const EVIDENCE_PER_LEXICON_TOKEN: f64 = 9.0;
 /// honorific in front of it, a thoroughfare type after it. Cues that agree add up.
 const EVIDENCE_PER_CUE_TOKEN: f64 = 6.0;
 
+/// Evidence the SHAPE of a personal name holds, taken with the syntactic position
+/// that confirms it: a run of capitalized tokens joined only by the particles a name
+/// carries, standing where English puts a person
+/// ([`person_bearing_position`]). It accounts for the whole span, as a lexicon entry
+/// naming every token does, but says less than one — a lexicon entry names WHO the
+/// span is, while the shape and the position only say what KIND of name it is — so it
+/// weighs below [`EVIDENCE_PER_LEXICON_TOKEN`] and below the honorific cue that
+/// announces a person outright.
+const EVIDENCE_PER_NAME_SHAPE: f64 = 5.0;
+
 /// Evidence the orthography of one capitalized token holds: in running English text a
 /// capital marks a name, which is weak on its own and corroborates every rule above.
 const EVIDENCE_PER_CAPITALIZED_TOKEN: f64 = 1.5;
@@ -339,6 +349,17 @@ const ABBREVIATIONS: &[&str] = &[
     "jr", "sr", "st", "mt", "ave", "blvd", "rd",
 ];
 
+/// Determiners. A personal name in English is not written with one in front of it,
+/// so a capitalized span a determiner introduces names something else (`the Zorblax
+/// Initiative`, `our Oslo office`).
+///
+/// Source: the English determiners — the articles, the demonstratives, the possessive
+/// determiners and the quantifiers.
+const DETERMINERS: &[&str] = &[
+    "the", "a", "an", "this", "that", "these", "those", "my", "your", "his", "her", "its",
+    "our", "their", "every", "each", "any", "some", "no", "another", "both", "either",
+];
+
 /// Honorifics and offices that mark the capitalized phrase after them as a person.
 ///
 /// Source: English honorifics (`Mr.`, `Mrs.`, `Ms.`, `Dr.`, …) and the offices and
@@ -353,6 +374,38 @@ const PERSON_TITLES: &[&str] = &[
     "princess", "duke", "duchess", "pope", "cardinal", "bishop", "minister", "secretary",
     "ambassador", "attorney", "coach", "detective", "inspector", "sheriff",
 ];
+
+/// Verbs English fills the human argument of: a capitalized name standing in the
+/// SUBJECT position of one of them, or in the participant position its preposition
+/// marks, is a name of a person.
+///
+/// Source: the English verb classes whose arguments are human — the verbs of saying
+/// and of thinking, the verbs of social interaction, and the verbs of office and
+/// employment — written out in the inflections running text uses. A verb an
+/// institution fills as readily as a person (`published`, `announced`, `filed`,
+/// `delivered`, `reported`) is deliberately NOT one of them: it is no evidence about
+/// what the name beside it names.
+const PERSON_PREDICATES: &[&str] = &[
+    "said", "says", "say", "saying", "told", "tells", "tell", "asked", "asks", "ask",
+    "replied", "replies", "reply", "wrote", "writes", "write", "written", "spoke", "speaks",
+    "speak", "spoken", "testified", "testifies", "testify", "argued", "insisted", "admitted",
+    "recalled", "believes", "believed", "thinks", "thought", "knows", "knew", "remembers",
+    "founded", "founds", "found", "co-founded", "led", "leads", "lead", "met", "meets", "meet",
+    "married", "marries", "marry", "hired", "hires", "hire", "appointed", "appoints", "appoint",
+    "promoted", "fired", "resigned", "resigns", "resign", "retired", "retires", "retire",
+    "interviewed", "interviews", "interview", "nominated", "elected", "succeeded", "replaced",
+    "joined", "joins", "join", "taught", "teaches", "teach", "studied", "studies", "graduated",
+    "signed", "signs", "sign", "reviewed", "reviews", "review", "thanked", "praised",
+    "criticised", "criticized", "emailed", "phoned", "invited", "visited", "sued", "painted",
+    "composed", "directed", "designed", "invented", "discovered",
+];
+
+/// The prepositions that mark the HUMAN participant of such a verb: the agent of a
+/// passive (`founded by`), the addressee (`spoke to`) and the co-participant (`met
+/// with`).
+///
+/// Source: the English prepositions that realise those argument roles.
+const PERSON_ROLE_MARKERS: &[&str] = &["by", "to", "with"];
 
 /// Legal-form and institution words: a capitalized phrase carrying one of these
 /// names an organization.
@@ -911,6 +964,26 @@ fn function_words() -> &'static HashSet<&'static str> {
     SET.get_or_init(|| lexicon(FUNCTION_WORDS))
 }
 
+fn name_particles() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| lexicon(NAME_PARTICLES))
+}
+
+fn determiners() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| lexicon(DETERMINERS))
+}
+
+fn person_predicates() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| lexicon(PERSON_PREDICATES))
+}
+
+fn person_role_markers() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| lexicon(PERSON_ROLE_MARKERS))
+}
+
 fn name_connectors() -> &'static HashSet<&'static str> {
     static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
     SET.get_or_init(|| {
@@ -1401,6 +1474,80 @@ fn capitalized_tokens(tokens: &[Token], phrase: Range<usize>) -> usize {
         .max(1)
 }
 
+/// Whether the span is written the way English writes a personal name: two or more
+/// tokens, the first and the last capitalized, every token either capitalized
+/// (a given name, a middle initial, a surname) or one of the particles a name
+/// carries ([`NAME_PARTICLES`], as in `Vincent van Gogh`), and no determiner in front
+/// of it ([`DETERMINERS`]).
+///
+/// This is SHAPE evidence — it says the characters are written like a name, not
+/// whose name they are — so it never types a span on its own: the caller pairs it
+/// with the syntactic position below.
+fn person_name_shape(text: &str, tokens: &[Token], phrase: Range<usize>) -> bool {
+    let span = &tokens[phrase.clone()];
+    let Some((first, last)) = span.first().zip(span.last()) else {
+        return false;
+    };
+    if span.len() < 2 || !first.capitalized || !last.capitalized {
+        return false;
+    }
+    let introduced_by_determiner = phrase
+        .start
+        .checked_sub(1)
+        .and_then(|previous| tokens.get(previous))
+        .is_some_and(|previous| {
+            determiners().contains(previous.lower.as_str())
+                && text[previous.end..first.start]
+                    .chars()
+                    .all(char::is_whitespace)
+        });
+    !introduced_by_determiner
+        && span.iter().filter(|token| token.capitalized).count() >= 2
+        && span
+            .iter()
+            .all(|token| token.capitalized || name_particles().contains(token.lower.as_str()))
+}
+
+/// Whether the span stands where English puts a person: in the subject position of a
+/// verb whose subject is human, or in the participant position such a verb marks with
+/// a preposition ([`PERSON_PREDICATES`], [`PERSON_ROLE_MARKERS`]).
+///
+/// Only a token the span is adjacent to inside one sentence counts — the characters
+/// between the two must be whitespace — so a verb across a clause or sentence
+/// boundary is no evidence about this span.
+fn person_bearing_position(text: &str, tokens: &[Token], phrase: Range<usize>) -> bool {
+    let adjacent = |left: usize, right: usize| {
+        text[tokens[left].end..tokens[right].start]
+            .chars()
+            .all(char::is_whitespace)
+    };
+    // The verb after the span: `Jeff Bezos said`.
+    if phrase.end < tokens.len()
+        && adjacent(phrase.end - 1, phrase.end)
+        && person_predicates().contains(tokens[phrase.end].lower.as_str())
+    {
+        return true;
+    }
+    let Some(before) = phrase.start.checked_sub(1) else {
+        return false;
+    };
+    if !adjacent(before, phrase.start) {
+        return false;
+    }
+    // The verb in front of the span: `hired Jane Doe`.
+    if person_predicates().contains(tokens[before].lower.as_str()) {
+        return true;
+    }
+    // The role the verb's preposition marks: `founded by Jeff Bezos`.
+    person_role_markers().contains(tokens[before].lower.as_str())
+        && before
+            .checked_sub(1)
+            .is_some_and(|verb| {
+                adjacent(verb, before)
+                    && person_predicates().contains(tokens[verb].lower.as_str())
+            })
+}
+
 /// Type one capitalized phrase from the evidence around and inside it, in order of
 /// the evidence's precision. A phrase no rule places is reported as `OTHER` — unless
 /// it is a lone word opening a sentence, where the capital is orthography rather than
@@ -1437,6 +1584,9 @@ fn classify_phrase(text: &str, tokens: &[Token], phrase: Range<usize>) -> Option
     }
     let mut phrase = phrase;
     let mut title_cue = false;
+    // Whether the name is written with an article in front of it, which a personal
+    // name in English never is (`The Zorblax Initiative` names a body, not a person).
+    let mut article = false;
     // An honorific or an article in front of the name is not part of it.
     while phrase.len() > 1 {
         let leading = tokens[phrase.start].lower.as_str();
@@ -1446,6 +1596,7 @@ fn classify_phrase(text: &str, tokens: &[Token], phrase: Range<usize>) -> Option
             continue;
         }
         if function_words().contains(leading) {
+            article = true;
             phrase.start += 1;
             continue;
         }
@@ -1520,6 +1671,16 @@ fn classify_phrase(text: &str, tokens: &[Token], phrase: Range<usize>) -> Option
     }
     if given_names().contains(normalised[0].as_str()) {
         return typed(TYPE_PERSON, EVIDENCE_PER_CUE_TOKEN, 1);
+    }
+    // A span written like a personal name, standing where English puts a person, is
+    // a PERSON however the name is spelled: the evidence is the SHAPE of the name
+    // together with its syntactic position, so a name no lexicon carries is typed
+    // from the document's own structure rather than left to the catch-all.
+    if !article
+        && person_name_shape(text, tokens, phrase.clone())
+        && person_bearing_position(text, tokens, phrase.clone())
+    {
+        return typed(TYPE_PERSON, EVIDENCE_PER_NAME_SHAPE, span_tokens);
     }
     if let Some((length, entity_type)) = lexicon_hit {
         return typed(

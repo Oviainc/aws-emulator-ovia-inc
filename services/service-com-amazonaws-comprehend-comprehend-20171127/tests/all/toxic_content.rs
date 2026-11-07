@@ -17,11 +17,11 @@ use service_com_amazonaws_comprehend_comprehend_20171127::ops::types::{
 
 use crate::comprehend_client::{error_code, error_message, expected_text_size_message, Comprehend};
 
-/// The modelled `ToxicContentType` values this emulator's engine has no detector
-/// for, so no result may ever name them (the handler documents the same set at
-/// `DETECTABLE_CATEGORIES`): reporting a score for a category nothing analysed
-/// would be inventing one.
-const UNDETECTABLE_TYPES: &[&str] = &["GRAPHIC", "HARASSMENT_OR_ABUSE", "VIOLENCE_OR_THREAT"];
+// Every modelled `ToxicContentType` has a detector in this service (the four about
+// the language a segment uses in the handler's `ENGINE_CATEGORIES`, the three about
+// the conduct it carries in its `conduct_rules`), and which forms place which type
+// is asserted in `toxic_content_conduct.rs`. What this suite asserts about a
+// reported name is only that it is a value of the modelled enum.
 
 /// One row of the table: a string, whether the toxicity engine must place any
 /// toxic content in it, and — where the mapping from the engine's own category is
@@ -169,11 +169,6 @@ async fn every_result_entry_is_a_well_formed_toxicity_verdict_for_its_string() {
             assert!(
                 TOXIC_CONTENT_TYPE_VALUES.contains(&name.as_str()),
                 "case {case:?}: {name:?} is not a modelled ToxicContentType value"
-            );
-            assert!(
-                !UNDETECTABLE_TYPES.contains(&name.as_str()),
-                "case {case:?}: {name:?} has no detector in this engine, so no result \
-                 may name it, got {labels:?}"
             );
             assert!(
                 !seen.contains(&name.as_str()),
