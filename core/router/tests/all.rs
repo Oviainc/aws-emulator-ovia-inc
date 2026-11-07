@@ -42,6 +42,9 @@ mod cloudformation_sam_function_writes_its_table;
 // the rule every cross-service suite that stages an S3 object addresses its setup calls by.
 #[path = "all/s3_address_forms.rs"]
 mod s3_address_forms;
+// Declared here, in this same head region, for the reason the entry above records.
+#[path = "all/sns_lambda_subscription_pipeline.rs"]
+mod sns_lambda_subscription_pipeline;
 #[path = "all/cloudformation_refuses_s3vectors_vector_buckets.rs"]
 mod cloudformation_refuses_s3vectors_vector_buckets;
 // Declared here, in this same head region, for the reason the entries above record.
