@@ -69,6 +69,8 @@ mod memory_lifecycle;
 mod memory_mutation;
 #[path = "all/memory_namespace_key_reference_wording.rs"]
 mod memory_namespace_key_reference_wording;
+#[path = "all/memory_read_reflects_last_mutation.rs"]
+mod memory_read_reflects_last_mutation;
 #[path = "all/memory_update_and_read_projection.rs"]
 mod memory_update_and_read_projection;
 #[path = "all/registry_lifecycle.rs"]
