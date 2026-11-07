@@ -11,9 +11,14 @@
 //! through the ARN of an integration LEG, so a record this call writes against a replicated
 //! table's own ARN — a value the create takes — is not readable through that ARN.
 //!
-//! A `SourceTableConfig` stating a member the service does not process yet
-//! ([`crate::state::states_unsupported_source_table_properties`]) is refused rather than
-//! stored.
+//! Every rule decided on the REQUEST BODY alone — the two sides being exclusive, a
+//! `SourceTableConfig` member the service does not process yet
+//! ([`crate::state::states_unsupported_source_table_properties`]), and a target table name
+//! that is not a table identifier
+//! ([`crate::service::integration_properties::is_target_table_identifier`]) — is answered
+//! BEFORE the request's `ResourceArn` is read, so a client whose payload is wrong is told
+//! about the payload. A `ResourceArn` this operation can interpret as no resource at all is
+//! then the modelled `ValidationException` naming that value.
 //!
 //! ## Shape of an operation
 //!
@@ -215,17 +220,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The name the replicated table is created under on the target has to be a table
+        // identifier. Decided on the request alone, like the two rules above and before the
+        // `ResourceArn` is resolved, so nothing is stored for a name no target table could
+        // carry.
+        if input
+            .target_table_config
+            .as_ref()
+            .and_then(|config| config.target_table_name.as_deref())
+            .is_some_and(|name| {
+                !crate::service::integration_properties::is_target_table_identifier(name)
+            })
+        {
+            return Err(
+                CreateIntegrationTablePropertiesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::service::integration_properties::TARGET_TABLE_NAME_INVALID_CHARACTERS
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // The properties belong to the resource the ARN names — the Glue connection of the
         // source, the Glue database of the target, or the replicated table itself — so a
-        // value that names none of them addresses nothing this call could configure.
-        let resource = match crate::state::integration_table_reference(&input.resource_arn) {
+        // value that names none of them is a value this operation cannot interpret, which
+        // every operation of this family reports as the validation failure naming it.
+        let resource = match crate::service::integration_properties::table_property_target(
+            &input.resource_arn,
+        ) {
             Ok(resource) => resource,
             Err(message) => {
                 return Err(
-                    CreateIntegrationTablePropertiesErrorModeled::InvalidInputException(
-                        InvalidInputException {
+                    CreateIntegrationTablePropertiesErrorModeled::ValidationException(
+                        ValidationException {
                             message: Some(message),
-                            from_federation_source: None,
                         },
                     )
                     .into(),

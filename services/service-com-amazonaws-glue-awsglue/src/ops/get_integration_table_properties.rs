@@ -7,6 +7,12 @@
 //! record `CreateIntegrationTableProperties` writes. Reporting only: it writes nothing, so
 //! what a later caller sees is unchanged by a read.
 //!
+//! A `ResourceArn` this operation can interpret as no resource at all
+//! ([`crate::service::integration_properties::table_property_target`]) is refused with the
+//! modelled `ValidationException` naming that value — the write and the delete of the same
+//! member answer the same way — while a pair it holds no record for is the modelled
+//! `EntityNotFoundException` naming that pair.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -176,17 +182,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // The same resolution of `ResourceArn` the create goes through, so a value that
-        // names no resource at all is answered as a bad parameter here too rather than as a
-        // record this account happens not to hold.
-        let resource = match crate::state::integration_table_reference(&input.resource_arn) {
+        // The same reading of `ResourceArn` the whole family goes through: a value that names
+        // no resource at all is one this operation cannot interpret, reported as the
+        // validation failure naming that value rather than as a record this account happens
+        // not to hold.
+        let resource = match crate::service::integration_properties::table_property_target(
+            &input.resource_arn,
+        ) {
             Ok(resource) => resource,
             Err(message) => {
                 return Err(
-                    GetIntegrationTablePropertiesErrorModeled::InvalidInputException(
-                        InvalidInputException {
+                    GetIntegrationTablePropertiesErrorModeled::ValidationException(
+                        ValidationException {
                             message: Some(message),
-                            from_federation_source: None,
                         },
                     )
                     .into(),
@@ -209,13 +217,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetIntegrationTablePropertiesErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
-                        // The miss of a pair and the miss of a resource carrying no
-                        // integration table properties at all are reported differently, and
-                        // the store is what tells them apart.
-                        message: Some(store.integration_table_properties_miss(
-                            &input.resource_arn,
-                            &input.table_name,
-                        )),
+                        // The lookup is by the PAIR the request named, so what is missing is
+                        // that pair's record: the miss names the two members it was addressed
+                        // by and reports nothing about the resource's own existence, which
+                        // this read never resolves.
+                        message: Some(
+                            crate::state::messages::integration_table_properties_not_found(
+                                &input.resource_arn,
+                                &input.table_name,
+                            ),
+                        ),
                         from_federation_source: None,
                     },
                 )

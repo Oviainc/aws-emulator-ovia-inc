@@ -11,9 +11,12 @@
 //! request's `ResourceArn` carried — so a caller holding that ARN can derive the record's.
 //! `GetIntegrationResourceProperty` reads the record back.
 //!
-//! A create that states NEITHER side — no `SourceProcessingProperties` and no
-//! `TargetProcessingProperties` — carries no property to write, so it is refused with the
-//! operation's modelled `ValidationException` and persists nothing.
+//! One call states ONE side of the integration, so the two sides are mutually exclusive: a
+//! create stating BOTH `SourceProcessingProperties` and `TargetProcessingProperties`, and a
+//! create stating NEITHER, are both refused with the operation's modelled
+//! `ValidationException` and persist nothing. Both rules are decided on the request body
+//! alone, so they are answered BEFORE the request's `ResourceArn` is resolved: a client
+//! whose payload is wrong is told about the payload, not about the resource.
 //!
 //! ## Shape of an operation
 //!
@@ -189,11 +192,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
 
         // What this call writes is a side of the integration: the source's processing
-        // properties or the target's. The model marks each side optional on its own, so a
-        // request that states NEITHER is refused here as the service's own requirement —
-        // it asks for no property at all. Decided on the request alone, before anything it
-        // addresses is resolved and before any write, so nothing is persisted for it and a
-        // later read of that resource still reports no record.
+        // properties or the target's, never both — the two sides belong to two different
+        // resources and are written by two calls, so a request stating BOTH addresses two
+        // resources at once and no `ResourceArn` can be the resource of both.
+        if input.source_processing_properties.is_some()
+            && input.target_processing_properties.is_some()
+        {
+            return Err(
+                CreateIntegrationResourcePropertyErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::service::integration_properties::PROCESSING_PROPERTIES_SIDES_EXCLUSIVE
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The model marks each side optional on its own, so a request that states NEITHER is
+        // refused here as the service's own requirement — it asks for no property at all.
+        // Decided on the request alone, like the rule above, before anything it addresses is
+        // resolved and before any write, so nothing is persisted for it and a later read of
+        // that resource still reports no record.
         if input.source_processing_properties.is_none()
             && input.target_processing_properties.is_none()
         {
@@ -211,13 +233,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The connection ARN of the source, or the database ARN of the target": a value
-        // that is neither names no resource whose properties this call could set.
-        let resource = match crate::state::integration_resource_reference(&input.resource_arn) {
+        // that is neither names no resource whose properties this call could set. Read the
+        // way every operation of this family reads that member, so each class of value earns
+        // the same error class here as it does from the read and the delete.
+        let resource = match crate::service::integration_properties::resource_property_target(
+            &input.resource_arn,
+        ) {
             Ok(resource) => resource,
-            Err(message) => {
+            Err(crate::service::integration_properties::ResourceArnRefusal::NotInterpretable(
+                message,
+            )) => {
                 return Err(
-                    CreateIntegrationResourcePropertyErrorModeled::InvalidInputException(
-                        InvalidInputException {
+                    CreateIntegrationResourcePropertyErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            Err(crate::service::integration_properties::ResourceArnRefusal::NoSuchTarget(
+                message,
+            )) => {
+                return Err(
+                    CreateIntegrationResourcePropertyErrorModeled::EntityNotFoundException(
+                        EntityNotFoundException {
                             message: Some(message),
                             from_federation_source: None,
                         },

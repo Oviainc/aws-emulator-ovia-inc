@@ -4,8 +4,15 @@
 //! Reports the integration resource property record stored for one resource's ARN
 //! ([`crate::state::ComAmazonawsGlueAwsglueState::integration_resource_properties`]):
 //! purely reporting, writing nothing, so what it answers is what the last
-//! `CreateIntegrationResourceProperty` for that resource stored. An ARN this account holds
-//! no record for earns the modelled `EntityNotFoundException`.
+//! `CreateIntegrationResourceProperty` for that resource stored.
+//!
+//! The read does NOT resolve the resource itself — it looks the record up in the per-resource
+//! namespace this surface keeps, by the ARN the create stored it under — so what it refuses a
+//! `ResourceArn` with is decided by that value alone
+//! ([`crate::service::integration_properties`]): a value outside Glue's own namespace is the
+//! modelled `ValidationException`, and a value it holds no record for is the modelled
+//! `EntityNotFoundException` naming the source's missing record or the missing target
+//! resource.
 //!
 //! ## Shape of an operation
 //!
@@ -167,15 +174,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
 
-        // The same resolution of `ResourceArn` the create goes through, so a value that
-        // addresses no resource at all is answered as a bad parameter here too rather than
-        // as a record this account happens not to hold.
-        if let Err(message) = crate::state::integration_resource_reference(&input.resource_arn) {
+        // The record is keyed by the ARN the create stored it under, so the lookup is by
+        // `ResourceArn` alone: only a value outside Glue's own namespace is refused ahead of
+        // it, with the modelled `ValidationException` naming the resource ARN it was asked to
+        // read.
+        if !crate::service::integration_properties::names_a_glue_resource(&input.resource_arn) {
             return Err(
-                GetIntegrationResourcePropertyErrorModeled::InvalidInputException(
-                    InvalidInputException {
-                        message: Some(message),
-                        from_federation_source: None,
+                GetIntegrationResourcePropertyErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::service::integration_properties::read_resource_arn_invalid(
+                                &input.resource_arn,
+                            ),
+                        ),
                     },
                 )
                 .into(),
@@ -186,11 +197,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // sees is unchanged by this read.
         let store = state.lock();
         let Some(stored) = store.integration_resource_property(&input.resource_arn) else {
+            // The miss this family words for the leg the ARN names: the source's record, or
+            // the target resource.
             return Err(
                 GetIntegrationResourcePropertyErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
                         message: Some(
-                            crate::state::messages::target_resource_not_found(
+                            crate::service::integration_properties::read_resource_property_miss(
                                 &input.resource_arn,
                             ),
                         ),

@@ -18,12 +18,14 @@
 //!   replicated table's own ARN is accepted and that record is not readable through it;
 //! * a delete resolves the record the same way and removes that ONE record, so a later read
 //!   of the pair misses and every other pair is left as stored;
-//! * a read or a delete that reaches no record reports the resource as not found while that
-//!   resource carries no integration table properties at all, and otherwise names the pair
-//!   the request addressed;
+//! * a read or a delete that reaches no record names the PAIR it was asked for, whatever the
+//!   resource carries;
+//! * a `ResourceArn` none of the three can interpret is refused with the modelled
+//!   `ValidationException` naming that value;
 //! * one call carries the configuration of the one leg its `ResourceArn` names, so a call
 //!   stating both sides is refused;
-//! * a `SourceTableConfig` member the service does not process yet is refused.
+//! * a `SourceTableConfig` member the service does not process yet is refused, and so is a
+//!   `TargetTableName` that is no table identifier.
 //!
 //! The round-trip suite is a table whose rows differ along which side of the integration
 //! the configuration belongs to, which resource kind the ARN names, how many members the
@@ -155,21 +157,16 @@ async fn delete_properties(
     .await
 }
 
-/// The refusal wording a read or a delete of ONE record carries when it reaches none: the
-/// pair the request addressed while `carries_properties` (the resource carries integration
-/// table properties of some table), and the resource itself while it carries none.
+/// The refusal wording a read or a delete of ONE record carries when it reaches none.
 ///
-/// Recorded in the Glue integration table property lifecycle: a read and a repeated delete of
-/// a pair whose resource was left carrying nothing report the resource as not found.
-fn miss_message(resource_arn: &str, table: &str, carries_properties: bool) -> String {
-    if carries_properties {
-        format!(
-            "Failed to find the sourceTableProperties with sourceArn {resource_arn} and tableName \
-             {table}"
-        )
-    } else {
-        format!("The target resource {resource_arn} is not found.")
-    }
+/// RECORDED template, and ONE sentence whatever the resource carries: the lookup is by the
+/// PAIR the request named, so what the refusal names is that pair's record — the two members
+/// it was addressed by — and not the resource, whose own existence neither call resolves.
+fn miss_message(resource_arn: &str, table: &str) -> String {
+    format!(
+        "Failed to find the sourceTableProperties with sourceArn {resource_arn} and tableName \
+         {table}"
+    )
 }
 
 /// A string of exactly `length` characters starting with `prefix`, for the rows that sit on
@@ -249,7 +246,7 @@ async fn created_integration_table_properties_are_read_back_from_the_store() {
             false,
             padded("long-", MAX_NAME_LENGTH),
             json!({
-                "TargetTableConfig": { "TargetTableName": padded("long-target-", MAX_NAME_LENGTH) },
+                "TargetTableConfig": { "TargetTableName": padded("long_target_", MAX_NAME_LENGTH) },
             }),
         ),
         (
@@ -422,10 +419,10 @@ async fn a_second_create_for_one_pair_writes_the_record_it_already_has() {
         ),
         (
             "the other side added leaves the first side stored",
-            target("kept-target"),
+            target("kept_target"),
             source("added-key"),
             json!({
-                "TargetTableConfig": { "TargetTableName": "kept-target" },
+                "TargetTableConfig": { "TargetTableName": "kept_target" },
                 "SourceTableConfig": { "PrimaryKey": ["added-key"] },
             }),
         ),
@@ -633,10 +630,10 @@ async fn a_source_config_stating_an_unsupported_member_is_refused() {
     );
 }
 
-/// A `ResourceArn` that can name no Glue resource these properties could belong to is a bad
-/// parameter: the write is refused with the modelled `InvalidInputException` and stores
-/// nothing, and a read of the same value is refused the same way. The rows differ along how
-/// the value misses.
+/// A `ResourceArn` this operation can interpret as no resource these properties could belong
+/// to is refused with the modelled `ValidationException` naming that value, and stores
+/// nothing; the read and the delete of the same value answer the same sentence, because the
+/// three read that member the one way. The rows differ along how the value misses.
 #[tokio::test]
 async fn a_resource_arn_naming_no_glue_resource_is_refused() {
     let router = emulator();
@@ -646,6 +643,11 @@ async fn a_resource_arn_naming_no_glue_resource_is_refused() {
         (
             "another service's namespace",
             "arn:aws:s3:::bucket/key".to_string(),
+        ),
+        (
+            // The recorded case: the zero-ETL target lives in another service.
+            "a Redshift Serverless namespace ARN",
+            format!("arn:aws:redshift-serverless:{REGION}:{ACCOUNT_ID}:namespace/warehouse"),
         ),
         (
             "a Glue crawler ARN",
@@ -668,6 +670,7 @@ async fn a_resource_arn_naming_no_glue_resource_is_refused() {
             format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:table/sales"),
         ),
     ] {
+        let expected = format!("Encountered invalid resource arn {resource_arn}");
         let (status, body) = call(
             &router,
             "CreateIntegrationTableProperties",
@@ -683,23 +686,44 @@ async fn a_resource_arn_naming_no_glue_resource_is_refused() {
             "case {case}: expected 400 for {resource_arn:?}, got {status} with {body}"
         );
         assert!(
-            error_code(&body).contains("InvalidInputException"),
-            "case {case}: expected InvalidInputException for {resource_arn:?}, got {body}"
+            error_code(&body).ends_with("ValidationException"),
+            "case {case}: expected ValidationException for {resource_arn:?}, got {}",
+            error_code(&body)
         );
-        assert!(
-            error_message(&body).contains("ResourceArn"),
-            "case {case}: the refusal must name the member it read, got {body}"
+        assert_eq!(
+            error_message(&body),
+            expected,
+            "case {case}: expected {expected:?}, got {:?}",
+            error_message(&body)
         );
 
-        let (status, body) = read(&router, &resource_arn, "orders").await;
-        assert_eq!(
-            status, 400,
-            "case {case}: a read of {resource_arn:?} must be refused too, got {status} with {body}"
-        );
-        assert!(
-            error_code(&body).contains("InvalidInputException"),
-            "case {case}: expected InvalidInputException from the read, got {body}"
-        );
+        for (attempt, operation) in [
+            ("a read", "GetIntegrationTableProperties"),
+            ("a delete", "DeleteIntegrationTableProperties"),
+        ] {
+            let (status, body) = call(
+                &router,
+                operation,
+                &json!({ "ResourceArn": resource_arn, "TableName": "orders" }),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {case}: {attempt} of {resource_arn:?} must be refused too, got {status} \
+                 with {body}"
+            );
+            assert!(
+                error_code(&body).ends_with("ValidationException"),
+                "case {case}: expected ValidationException from {attempt}, got {}",
+                error_code(&body)
+            );
+            assert_eq!(
+                error_message(&body),
+                expected,
+                "case {case}: expected {expected:?} from {attempt}, got {:?}",
+                error_message(&body)
+            );
+        }
     }
 }
 
@@ -822,8 +846,9 @@ async fn a_record_is_read_back_only_through_an_integration_leg() {
         }),
     )
     .await;
-    // One leg carrying properties of ANOTHER table, so the two misses below differ only in
-    // whether the addressed resource carries any properties at all.
+    // One leg carrying properties of ANOTHER table, so the misses below differ along whether
+    // the addressed resource carries any properties at all — which the refusal does not
+    // depend on.
     create_properties(
         &router,
         &json!({
@@ -834,37 +859,32 @@ async fn a_record_is_read_back_only_through_an_integration_leg() {
     )
     .await;
 
-    // (case, the ARN, the table name, whether that ARN carries properties of some table)
-    for (case, resource_arn, table, carries_properties) in [
+    // (case, the ARN, the table name)
+    for (case, resource_arn, table) in [
         (
             "a record written against the table's own ARN",
             table_arn("orphans", "orders"),
             "sap-orders".to_string(),
-            true,
         ),
         (
             "a leg with no record for this table",
             database_arn("orphans"),
             "sap-invoices".to_string(),
-            true,
         ),
         (
             "a leg carrying only another table's record",
             connection_arn("orphans-written-source"),
             "sap-orders".to_string(),
-            true,
         ),
         (
             "a leg that was never written to",
             connection_arn("orphans-source"),
             "sap-orders".to_string(),
-            false,
         ),
         (
             "a table name differing only in case from the stored one",
             database_arn("orphans"),
             "SAP-ORDERS".to_string(),
-            true,
         ),
     ] {
         let (status, body) = read(&router, &resource_arn, &table).await;
@@ -879,8 +899,8 @@ async fn a_record_is_read_back_only_through_an_integration_leg() {
         );
         assert_eq!(
             error_message(&body),
-            miss_message(&resource_arn, &table, carries_properties),
-            "case {case}: expected the wording this resource's miss earns, got {body}"
+            miss_message(&resource_arn, &table),
+            "case {case}: expected the wording this miss earns, got {body}"
         );
     }
 
@@ -1106,9 +1126,8 @@ async fn deleting_integration_table_properties_removes_only_the_pair_it_addresse
              {after}"
         );
 
-        // Whether that resource still carries properties of another table is what decides
-        // the wording the miss of this pair now earns.
-        let carries_properties = remaining.iter().any(|(_, arn, _, _)| arn == &resource_arn);
+        // The miss of this pair now reports the record the lookup no longer finds, whether or
+        // not that resource still carries properties of another table.
         let (status, miss) = read(&router, &resource_arn, &table).await;
         assert_eq!(
             status, 400,
@@ -1120,8 +1139,8 @@ async fn deleting_integration_table_properties_removes_only_the_pair_it_addresse
         );
         assert_eq!(
             error_message(&miss),
-            miss_message(&resource_arn, &table, carries_properties),
-            "case {case}: expected the wording this resource's miss earns, got {miss}"
+            miss_message(&resource_arn, &table),
+            "case {case}: expected the wording this miss earns, got {miss}"
         );
 
         // The delete of a pair that is already gone is refused the same way and removes
@@ -1137,8 +1156,8 @@ async fn deleting_integration_table_properties_removes_only_the_pair_it_addresse
         );
         assert_eq!(
             error_message(&again),
-            miss_message(&resource_arn, &table, carries_properties),
-            "case {case}: expected the wording this resource's miss earns, got {again}"
+            miss_message(&resource_arn, &table),
+            "case {case}: expected the wording this miss earns, got {again}"
         );
         assert_eq!(
             held(),
@@ -1167,7 +1186,7 @@ async fn deleting_integration_table_properties_removes_only_the_pair_it_addresse
 }
 
 /// A delete that reaches no record is refused with the modelled `EntityNotFoundException`,
-/// carrying the wording its resource earns, and removes nothing. The rows differ along how
+/// naming the pair it was asked for, and removes nothing. The rows differ along how
 /// the record misses: another table under a written leg, a leg carrying nothing, a resource
 /// this account does not hold, a record written against a replicated table's OWN ARN (which
 /// is not reachable through that ARN) and a table name differing only in case.
@@ -1201,43 +1220,37 @@ async fn a_delete_reaching_no_record_is_refused_and_removes_nothing() {
     };
     let before = held();
 
-    // (case, the ARN, the table name, whether that ARN carries properties of some table)
-    for (case, resource_arn, table, carries_properties) in [
+    // (case, the ARN, the table name)
+    for (case, resource_arn, table) in [
         (
             "a leg with no record for this table",
             database_arn("undeleted"),
             "sap-invoices".to_string(),
-            true,
         ),
         (
             "a table name differing only in case from the stored one",
             database_arn("undeleted"),
             "SAP-ORDERS".to_string(),
-            true,
         ),
         (
             "a record written against the table's own ARN",
             table_arn("undeleted", "orders"),
             "sap-orders".to_string(),
-            true,
         ),
         (
             "a leg that was never written to",
             connection_arn("undeleted-source"),
             "sap-orders".to_string(),
-            false,
         ),
         (
             "a database this account does not hold",
             database_arn("absent"),
             "sap-orders".to_string(),
-            false,
         ),
         (
             "a connection this account does not hold",
             connection_arn("absent"),
             "sap-orders".to_string(),
-            false,
         ),
     ] {
         let (status, body) = delete_properties(&router, &resource_arn, &table).await;
@@ -1252,8 +1265,8 @@ async fn a_delete_reaching_no_record_is_refused_and_removes_nothing() {
         );
         assert_eq!(
             error_message(&body),
-            miss_message(&resource_arn, &table, carries_properties),
-            "case {case}: expected the wording this resource's miss earns, got {body}"
+            miss_message(&resource_arn, &table),
+            "case {case}: expected the wording this miss earns, got {body}"
         );
         let left = held();
         assert_eq!(
@@ -1282,8 +1295,8 @@ async fn a_delete_reaching_no_record_is_refused_and_removes_nothing() {
 }
 
 /// A `ResourceArn` that can name no Glue resource integration table properties could belong
-/// to is a bad parameter for the delete too: it is refused with the modelled
-/// `InvalidInputException` naming the member it read, and removes nothing. The rows differ
+/// to is refused for the delete too, with the modelled `ValidationException` naming that
+/// value, and removes nothing. The rows differ
 /// along how the value misses.
 #[tokio::test]
 async fn a_delete_whose_resource_arn_names_no_glue_resource_is_refused() {
@@ -1340,12 +1353,16 @@ async fn a_delete_whose_resource_arn_names_no_glue_resource_is_refused() {
             "case {case}: expected 400 for {resource_arn:?}, got {status} with {body}"
         );
         assert!(
-            error_code(&body).contains("InvalidInputException"),
-            "case {case}: expected InvalidInputException for {resource_arn:?}, got {body}"
+            error_code(&body).ends_with("ValidationException"),
+            "case {case}: expected ValidationException for {resource_arn:?}, got {}",
+            error_code(&body)
         );
-        assert!(
-            error_message(&body).contains("ResourceArn"),
-            "case {case}: the refusal must name the member it read, got {body}"
+        let expected = format!("Encountered invalid resource arn {resource_arn}");
+        assert_eq!(
+            error_message(&body),
+            expected,
+            "case {case}: expected {expected:?}, got {:?}",
+            error_message(&body)
         );
         let left = held();
         assert_eq!(

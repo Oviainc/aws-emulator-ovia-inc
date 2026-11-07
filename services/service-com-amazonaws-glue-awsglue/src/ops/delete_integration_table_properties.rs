@@ -8,6 +8,12 @@
 //! reads back. It removes that ONE record: every other pair, and the resource the
 //! properties belonged to, are left as they were.
 //!
+//! `ResourceArn` is read the way the whole family reads it
+//! ([`crate::service::integration_properties::table_property_target`]), so a value this
+//! operation can interpret as no resource at all is the modelled `ValidationException`
+//! naming that value, and a pair it holds no record for is the modelled
+//! `EntityNotFoundException` naming that pair — the refusal the read answers for it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -161,17 +167,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // The same resolution of `ResourceArn` the create and the read go through, so a
-        // value that names no Glue resource at all is answered as a bad parameter here too
-        // rather than as a record this account happens not to hold.
-        let resource = match crate::state::integration_table_reference(&input.resource_arn) {
+        // The same reading of `ResourceArn` the create and the read go through: a value that
+        // names no resource at all is one this operation cannot interpret, reported as the
+        // validation failure naming that value rather than as a record this account happens
+        // not to hold.
+        let resource = match crate::service::integration_properties::table_property_target(
+            &input.resource_arn,
+        ) {
             Ok(resource) => resource,
             Err(message) => {
                 return Err(
-                    DeleteIntegrationTablePropertiesErrorModeled::InvalidInputException(
-                        InvalidInputException {
+                    DeleteIntegrationTablePropertiesErrorModeled::ValidationException(
+                        ValidationException {
                             message: Some(message),
-                            from_federation_source: None,
                         },
                     )
                     .into(),
@@ -188,10 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // removed and the caller is told so, rather than being answered as though a delete
         // had happened.
         //
-        // The miss is reported as the store's one reading of that rule: a resource carrying
-        // no integration table properties at all is reported as the resource not being
-        // found, and a resource carrying properties of other tables answers with the miss of
-        // the pair the request addressed.
+        // The miss is reported as the read reports it: the lookup is by the PAIR the request
+        // named, so what is missing is that pair's record — named by the two members it was
+        // addressed by, and saying nothing about the resource's own existence, which neither
+        // call resolves.
         let removed = resource
             .is_integration_leg()
             .then(|| {
@@ -204,10 +212,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteIntegrationTablePropertiesErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
-                        message: Some(store.integration_table_properties_miss(
-                            &input.resource_arn,
-                            &input.table_name,
-                        )),
+                        message: Some(
+                            crate::state::messages::integration_table_properties_not_found(
+                                &input.resource_arn,
+                                &input.table_name,
+                            ),
+                        ),
                         from_federation_source: None,
                     },
                 )

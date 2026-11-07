@@ -65,6 +65,15 @@ use std::sync::Arc;
 #[path = "state/partition_indexes.rs"]
 pub mod partition_indexes;
 
+/// The rules the zero-ETL integration PROPERTY operations share: how each of them reads its
+/// `ResourceArn`, and the sentences they refuse one with. Six operations address a record by
+/// that member, so the reading and the wording live in one file rather than in six.
+///
+/// Declared from here for the same reason [`partition_indexes`] is, and its source file sits
+/// with the rest of this service's state.
+#[path = "state/integration_properties.rs"]
+pub mod integration_properties;
+
 /// The `com-amazonaws-glue-awsglue` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///

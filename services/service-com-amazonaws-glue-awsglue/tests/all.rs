@@ -187,6 +187,8 @@ mod glossary_term_listing;
 mod glossary_terms;
 #[path = "all/glossary_updates.rs"]
 mod glossary_updates;
+#[path = "all/integration_property_validation.rs"]
+mod integration_property_validation;
 #[path = "all/integration_resource_properties.rs"]
 mod integration_resource_properties;
 #[path = "all/integration_table_properties.rs"]

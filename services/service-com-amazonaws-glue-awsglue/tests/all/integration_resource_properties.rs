@@ -11,7 +11,9 @@
 //! it carries, and there is ONE record per resource — so a create for a resource that
 //! already has one writes that record (each stated member replacing the stored one, each
 //! unstated member left alone) under the one `ResourcePropertyArn` that resource derives,
-//! rather than minting a second record or refusing the write. The round-trip suite is a
+//! rather than minting a second record or refusing the write. One call states ONE side of
+//! the integration, so a create stating both sides and a create stating neither are both
+//! refused on the request body alone. The round-trip suite is a
 //! table whose rows differ along which side of the integration the properties belong to,
 //! which resource kind the ARN names, how many members the side carries, their length, and
 //! whether the create carried tags.
@@ -176,16 +178,13 @@ async fn created_integration_resource_properties_are_read_back_from_the_store() 
             }),
         ),
         (
-            "both sides stated in one call",
-            true,
+            // Each side is written by its own call, so a request stating BOTH is refused
+            // ([`a_create_stating_neither_or_both_processing_sides_is_refused`]) and the
+            // sides of one resource are built up by successive writes instead.
+            "a target stating its network connection alone",
+            false,
             json!({
-                "SourceProcessingProperties": {
-                    "RoleArn": format!("arn:aws:iam::{ACCOUNT_ID}:role/glue-both-source"),
-                },
-                "TargetProcessingProperties": {
-                    "RoleArn": format!("arn:aws:iam::{ACCOUNT_ID}:role/glue-both-target"),
-                    "ConnectionName": "both-sides-connection",
-                },
+                "TargetProcessingProperties": { "ConnectionName": "vpc-network-connection" },
             }),
         ),
         (
@@ -322,7 +321,6 @@ async fn a_second_create_for_one_resource_writes_the_record_it_already_has() {
         (
             "a member of a stated side replaces only that side",
             json!({
-                "SourceProcessingProperties": { "RoleArn": "arn:aws:iam::000000000000:role/src" },
                 "TargetProcessingProperties": {
                     "RoleArn": "arn:aws:iam::000000000000:role/tgt",
                     "ConnectionName": "first-network",
@@ -335,7 +333,6 @@ async fn a_second_create_for_one_resource_writes_the_record_it_already_has() {
                 },
             }),
             json!({
-                "SourceProcessingProperties": { "RoleArn": "arn:aws:iam::000000000000:role/src" },
                 "TargetProcessingProperties": {
                     "RoleArn": "arn:aws:iam::000000000000:role/tgt",
                     "ConnectionName": "second-network",
@@ -420,55 +417,60 @@ async fn a_second_create_for_one_resource_writes_the_record_it_already_has() {
 const NEITHER_SIDE_MESSAGE: &str = "Either source processing properties or target \
      processing properties must be provided in the request.";
 
-/// What a create writes is a side of the integration, so a request stating NEITHER
-/// `SourceProcessingProperties` nor `TargetProcessingProperties` is refused with the
-/// modelled `ValidationException` and persists nothing — whichever resource kind it
-/// addresses, whatever else it carries, and whether or not that resource already has a
-/// record — while a request stating either side, or both, is served. The rows differ along
-/// which sides the request states, how many members those sides carry, and what the request
-/// carries beside them.
+/// The sentence a create that states BOTH processing sides is refused with — the two sides
+/// belong to two different resources and are written by two calls — again fixed text naming
+/// the two sides in prose.
+const BOTH_SIDES_MESSAGE: &str = "Both source processing properties and target processing \
+     properties cannot be provided in the same request.";
+
+/// The sentence a read answers for a resource this account holds no record for, which this
+/// surface words by the LEG the ARN names: a Glue connection is the integration's SOURCE and
+/// its miss names the record the lookup did not find, while every other value is read as the
+/// integration's TARGET and its miss names that target resource.
+fn read_miss_message(resource_arn: &str, names_the_source: bool) -> String {
+    if names_the_source {
+        format!("Failed to find the resource property with arn {resource_arn} in the table")
+    } else {
+        format!("The target resource {resource_arn} is not found.")
+    }
+}
+
+/// One call states ONE side of the integration, so a request stating NEITHER
+/// `SourceProcessingProperties` nor `TargetProcessingProperties` and a request stating BOTH
+/// are each refused with the modelled `ValidationException` and persist nothing — whichever
+/// resource kind they address, whatever else they carry, and whether or not that resource
+/// already has a record — while a request stating exactly one side is served. The rows differ
+/// along which sides the request states, how many members those sides carry, and what the
+/// request carries beside them.
 #[tokio::test]
-async fn a_create_stating_neither_processing_side_is_refused() {
+async fn a_create_stating_neither_or_both_processing_sides_is_refused() {
     let router = emulator();
 
-    // (case, whether the ARN names a connection, the members beside `ResourceArn`, whether
-    // the create must be served)
-    let cases: Vec<(&str, bool, Value, bool)> = vec![
+    // (case, whether the ARN names a connection, the members beside `ResourceArn`, the
+    // sentence the refusal must carry, or `None` when the create must be served)
+    let cases: Vec<(&str, bool, Value, Option<&str>)> = vec![
         (
             // The recorded case: a database ARN and nothing else.
             "neither side, on a database",
             false,
             json!({}),
-            false,
+            Some(NEITHER_SIDE_MESSAGE),
         ),
-        ("neither side, on a connection", true, json!({}), false),
+        (
+            "neither side, on a connection",
+            true,
+            json!({}),
+            Some(NEITHER_SIDE_MESSAGE),
+        ),
         (
             "neither side, with tags alone",
             false,
             json!({ "Tags": [{ "key": "owner", "value": "data-platform" }] }),
-            false,
+            Some(NEITHER_SIDE_MESSAGE),
         ),
         (
-            "the source side alone",
-            true,
-            json!({
-                "SourceProcessingProperties": {
-                    "RoleArn": format!("arn:aws:iam::{ACCOUNT_ID}:role/glue-source"),
-                },
-            }),
-            true,
-        ),
-        (
-            "the target side alone",
-            false,
-            json!({
-                "TargetProcessingProperties": {
-                    "RoleArn": format!("arn:aws:iam::{ACCOUNT_ID}:role/glue-target"),
-                },
-            }),
-            true,
-        ),
-        (
+            // The recorded case: both sides in one request, on the connection the source
+            // leg is addressed by.
             "both sides at once",
             true,
             json!({
@@ -480,7 +482,46 @@ async fn a_create_stating_neither_processing_side_is_refused() {
                     "ConnectionName": "both-sides-connection",
                 },
             }),
+            Some(BOTH_SIDES_MESSAGE),
+        ),
+        (
+            "both sides at once, each carrying nothing",
+            false,
+            json!({
+                "SourceProcessingProperties": {},
+                "TargetProcessingProperties": {},
+            }),
+            Some(BOTH_SIDES_MESSAGE),
+        ),
+        (
+            "both sides at once, beside tags",
+            false,
+            json!({
+                "SourceProcessingProperties": { "RoleArn": "arn:aws:iam::000000000000:role/s" },
+                "TargetProcessingProperties": { "KmsArn": "arn:aws:kms:us-east-1:000000000000:key/k" },
+                "Tags": [{ "key": "tier", "value": "gold" }],
+            }),
+            Some(BOTH_SIDES_MESSAGE),
+        ),
+        (
+            "the source side alone",
             true,
+            json!({
+                "SourceProcessingProperties": {
+                    "RoleArn": format!("arn:aws:iam::{ACCOUNT_ID}:role/glue-source"),
+                },
+            }),
+            None,
+        ),
+        (
+            "the target side alone",
+            false,
+            json!({
+                "TargetProcessingProperties": {
+                    "RoleArn": format!("arn:aws:iam::{ACCOUNT_ID}:role/glue-target"),
+                },
+            }),
+            None,
         ),
         (
             "a side stated beside tags",
@@ -491,11 +532,11 @@ async fn a_create_stating_neither_processing_side_is_refused() {
                 },
                 "Tags": [{ "key": "tier", "value": "gold" }],
             }),
-            true,
+            None,
         ),
     ];
 
-    for (index, (case, is_connection, members, served)) in cases.iter().enumerate() {
+    for (index, (case, is_connection, members, refusal)) in cases.iter().enumerate() {
         let name = format!("side-required-{index}");
         let resource_arn = if *is_connection {
             create_connection(&router, &name).await;
@@ -508,17 +549,18 @@ async fn a_create_stating_neither_processing_side_is_refused() {
         let mut request = members.clone();
         request["ResourceArn"] = json!(resource_arn);
         let (status, body) = call(&router, "CreateIntegrationResourceProperty", &request).await;
-        if *served {
+        let Some(expected) = refusal else {
             assert_eq!(
                 status, 200,
-                "case {case:?}: a create stating a side must be served, got {status} with {body}"
+                "case {case:?}: a create stating one side must be served, got {status} with {body}"
             );
             continue;
-        }
+        };
 
         assert_eq!(
             status, 400,
-            "case {case:?}: a create stating neither side is refused, got {status} with {body}"
+            "case {case:?}: a create stating neither side or both sides is refused, got {status} \
+             with {body}"
         );
         assert!(
             error_code(&body).ends_with("ValidationException"),
@@ -527,7 +569,7 @@ async fn a_create_stating_neither_processing_side_is_refused() {
         );
         assert_eq!(
             error_message(&body),
-            NEITHER_SIDE_MESSAGE,
+            *expected,
             "case {case:?}: expected the fixed refusal sentence, got {:?}",
             error_message(&body)
         );
@@ -551,9 +593,8 @@ async fn a_create_stating_neither_processing_side_is_refused() {
         );
         assert_eq!(
             error_message(&read_body),
-            format!("The target resource {resource_arn} is not found."),
-            "case {case:?}: expected the record miss to name the resource it was asked for, got \
-             {:?}",
+            read_miss_message(&resource_arn, *is_connection),
+            "case {case:?}: expected the miss this resource's leg earns, got {:?}",
             error_message(&read_body)
         );
     }
@@ -607,79 +648,132 @@ async fn a_create_stating_neither_processing_side_is_refused() {
     );
 }
 
-/// A `ResourceArn` that cannot name a Glue connection or a Glue database is a bad
-/// parameter: the write is refused with the modelled `InvalidInputException` and stores
-/// nothing, and a read of the same value is refused the same way. The rows differ along how
-/// the value misses: no ARN at all, another service's namespace, a Glue ARN of another
-/// resource kind, and a Glue ARN carrying no resource name.
+/// A `ResourceArn` that names no Glue connection and no Glue database is refused by every
+/// operation of this family, and each one classifies it by WHAT the value is rather than by
+/// what the operation is doing: a value outside Glue's own namespace is a validation failure
+/// naming that value, while a Glue ARN of another kind reaches each operation's own lookup and
+/// is the modelled `EntityNotFoundException`. The three operations WORD the validation failure
+/// differently — the create states the target it writes against, the read the resource it was
+/// asked for, the delete this service's general reading of the member — so each sentence is
+/// asserted per operation. The rows differ along how the value misses: no ARN at all, another
+/// service's namespace, three Glue ARNs of other resource kinds, a Glue ARN with no resource
+/// type, and a Glue ARN carrying no resource name.
 #[tokio::test]
 async fn a_resource_arn_naming_no_connection_or_database_is_refused() {
     let router = emulator();
 
-    for (case, resource_arn) in [
-        ("not an ARN at all", "my-connection".to_string()),
+    // (case, the value sent in `ResourceArn`, whether it is an ARN in Glue's own namespace)
+    for (case, resource_arn, in_glue_namespace) in [
+        ("not an ARN at all", "my-connection".to_string(), false),
         (
             "another service's namespace",
             "arn:aws:s3:::bucket/key".to_string(),
+            false,
+        ),
+        (
+            // The recorded case: the zero-ETL target lives in another service.
+            "a Redshift Serverless namespace ARN",
+            format!("arn:aws:redshift-serverless:{REGION}:{ACCOUNT_ID}:namespace/warehouse"),
+            false,
         ),
         (
             "a Glue crawler ARN",
             format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:crawler/nightly"),
+            true,
         ),
         (
             "a Glue job ARN",
             format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:job/etl"),
+            true,
         ),
         (
+            // The recorded case: a catalog table is neither leg of an integration.
             "a Glue table ARN",
             format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:table/sales/orders"),
+            true,
         ),
         (
             "the Data Catalog's own ARN",
             format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:catalog"),
+            true,
         ),
         (
             "a connection ARN carrying no name",
             format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:connection/"),
+            true,
         ),
     ] {
-        let (status, body) = call(
-            &router,
-            "CreateIntegrationResourceProperty",
-            &json!({
-                "ResourceArn": resource_arn,
-                "SourceProcessingProperties": { "RoleArn": "arn:aws:iam::000000000000:role/r" },
-            }),
-        )
-        .await;
-        assert_eq!(
-            status, 400,
-            "case {case}: expected 400 for {resource_arn:?}, got {status} with {body}"
-        );
-        assert!(
-            error_code(&body).contains("InvalidInputException"),
-            "case {case}: expected InvalidInputException for {resource_arn:?}, got {body}"
-        );
-        assert!(
-            error_message(&body).contains("ResourceArn"),
-            "case {case}: the refusal must name the member it read, got {body}"
-        );
+        // (the operation, the error the model names, the sentence it carries)
+        let expected: [(&str, &str, String); 3] = [
+            (
+                "CreateIntegrationResourceProperty",
+                if in_glue_namespace {
+                    "EntityNotFoundException"
+                } else {
+                    "ValidationException"
+                },
+                if in_glue_namespace {
+                    format!("The target resource {resource_arn} is not found.")
+                } else {
+                    format!("The glue target ARN {resource_arn} is invalid.")
+                },
+            ),
+            (
+                "GetIntegrationResourceProperty",
+                if in_glue_namespace {
+                    "EntityNotFoundException"
+                } else {
+                    "ValidationException"
+                },
+                if in_glue_namespace {
+                    // None of these values names the source's connection, so each is read
+                    // as the integration's target.
+                    read_miss_message(&resource_arn, false)
+                } else {
+                    format!("The glue resource ARN {resource_arn} is invalid.")
+                },
+            ),
+            (
+                "DeleteIntegrationResourceProperty",
+                if in_glue_namespace {
+                    "EntityNotFoundException"
+                } else {
+                    "ValidationException"
+                },
+                if in_glue_namespace {
+                    format!(
+                        "Failed to find the resource property with arn {resource_arn} in the table"
+                    )
+                } else {
+                    format!("Encountered invalid resource arn {resource_arn}")
+                },
+            ),
+        ];
 
-        let (status, body) = call(
-            &router,
-            "GetIntegrationResourceProperty",
-            &json!({ "ResourceArn": resource_arn }),
-        )
-        .await;
-        assert_eq!(
-            status, 400,
-            "case {case}: a read of {resource_arn:?} must be refused too, got {status} with \
-             {body}"
-        );
-        assert!(
-            error_code(&body).contains("InvalidInputException"),
-            "case {case}: expected InvalidInputException from the read, got {body}"
-        );
+        for (operation, expected_code, expected_message) in expected {
+            let mut request = json!({ "ResourceArn": &resource_arn });
+            if operation.starts_with("Create") {
+                request["SourceProcessingProperties"] =
+                    json!({ "RoleArn": "arn:aws:iam::000000000000:role/r" });
+            }
+            let (status, body) = call(&router, operation, &request).await;
+            assert_eq!(
+                status, 400,
+                "case {case} ({operation}): expected 400 for {resource_arn:?}, got {status} with \
+                 {body}"
+            );
+            assert!(
+                error_code(&body).ends_with(expected_code),
+                "case {case} ({operation}): expected {expected_code} for {resource_arn:?}, got {}",
+                error_code(&body)
+            );
+            assert_eq!(
+                error_message(&body),
+                expected_message,
+                "case {case} ({operation}): expected {expected_message:?}, got {:?}",
+                error_message(&body)
+            );
+        }
     }
 }
 
@@ -905,9 +999,8 @@ async fn a_create_past_the_integration_resource_property_ceiling_is_refused() {
 /// `DeleteIntegrationResourceProperty` removes the record of the resource its `ResourceArn`
 /// names and nothing else: the read of that resource then misses, a second delete is that
 /// same miss, every other resource's record still reads back, and a create after the delete
-/// stores the record afresh under the ARN its resource derives. A `ResourceArn` that
-/// addresses neither leg of an integration is the bad parameter the create and the read
-/// answer for it.
+/// stores the record afresh under the ARN its resource derives. A `ResourceArn` this family
+/// can address no record under is refused as this delete words that refusal.
 ///
 /// The rows differ along which resource kind the record belongs to and which side of the
 /// integration its properties state.
@@ -984,14 +1077,22 @@ async fn deleting_an_integration_resource_property_removes_only_the_record_it_na
         );
     }
 
-    // A value that addresses neither leg of an integration is a bad parameter, as it is for
-    // the create and the read.
-    for (case, resource_arn) in [
+    // A value this family can address no record under is refused as each operation words it:
+    // a Glue ARN of another kind reaches the delete's own lookup and misses, while a value
+    // outside Glue's namespace is the validation failure this delete words.
+    for (case, resource_arn, expected_code, expected_message) in [
         (
             "a catalog table's ARN",
             format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:table/deleted_database/orders"),
+            "EntityNotFoundException",
+            None,
         ),
-        ("a value that is no ARN at all", "deleted-connection".to_string()),
+        (
+            "a value that is no ARN at all",
+            "deleted-connection".to_string(),
+            "ValidationException",
+            Some("Encountered invalid resource arn"),
+        ),
     ] {
         let (status, body) = call(
             &router,
@@ -1004,8 +1105,21 @@ async fn deleting_an_integration_resource_property_removes_only_the_record_it_na
             "case {case}: expected 400 for {resource_arn:?}, got {status} with {body}"
         );
         assert!(
-            error_code(&body).contains("InvalidInputException"),
-            "case {case}: expected InvalidInputException for {resource_arn:?}, got {body}"
+            error_code(&body).ends_with(expected_code),
+            "case {case}: expected {expected_code} for {resource_arn:?}, got {}",
+            error_code(&body)
+        );
+        let expected = match expected_message {
+            Some(prefix) => format!("{prefix} {resource_arn}"),
+            None => {
+                format!("Failed to find the resource property with arn {resource_arn} in the table")
+            }
+        };
+        assert_eq!(
+            error_message(&body),
+            expected,
+            "case {case}: expected {expected:?}, got {:?}",
+            error_message(&body)
         );
     }
 

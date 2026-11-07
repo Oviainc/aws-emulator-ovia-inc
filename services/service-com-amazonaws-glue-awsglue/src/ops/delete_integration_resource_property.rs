@@ -8,11 +8,11 @@
 //! `CreateIntegrationResourceProperty` wrote for the Glue connection or Glue database its
 //! `ResourceArn` names — from
 //! [`crate::state::ComAmazonawsGlueAwsglueState::integration_resource_properties`], so a
-//! later `GetIntegrationResourceProperty` of that resource misses. `ResourceArn` resolves
-//! the way the create and the read resolve it
-//! ([`crate::state::integration_resource_reference`]): a value that addresses neither leg
-//! of an integration is a bad parameter, and a resource this account holds no record for is
-//! the read's own `EntityNotFoundException`.
+//! later `GetIntegrationResourceProperty` of that resource misses. `ResourceArn` is read the
+//! way the whole family reads it ([`crate::service::integration_properties`]), so the delete
+//! refuses a value outside Glue's own namespace with the modelled `ValidationException`; an
+//! ARN this account holds no record for is the modelled `EntityNotFoundException` naming the
+//! record the delete was asked to remove.
 //!
 //! ## Shape of an operation
 //!
@@ -163,15 +163,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // The same resolution of `ResourceArn` the create and the read go through, so a
-        // value that addresses no resource at all is a bad parameter here too rather than a
-        // record this account happens not to hold.
-        if let Err(message) = crate::state::integration_resource_reference(&input.resource_arn) {
+        // The record is keyed by the ARN the create stored it under, exactly as the read
+        // looks it up, so only a value outside Glue's own namespace is refused ahead of the
+        // lookup — with the modelled `ValidationException` naming that value.
+        if !crate::service::integration_properties::names_a_glue_resource(&input.resource_arn) {
             return Err(
-                DeleteIntegrationResourcePropertyErrorModeled::InvalidInputException(
-                    InvalidInputException {
-                        message: Some(message),
-                        from_federation_source: None,
+                DeleteIntegrationResourcePropertyErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::service::integration_properties::invalid_resource_arn(
+                                &input.resource_arn,
+                            ),
+                        ),
                     },
                 )
                 .into(),
@@ -186,14 +189,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove(&input.resource_arn)
             .is_none()
         {
-            // A resource with no record is the miss the read of that resource answers,
-            // worded the one way this surface words it.
+            // A resource with no record is the miss this delete words for the record it was
+            // asked to remove.
             return Err(
                 DeleteIntegrationResourcePropertyErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
-                        message: Some(crate::state::messages::target_resource_not_found(
-                            &input.resource_arn,
-                        )),
+                        message: Some(
+                            crate::service::integration_properties::removed_resource_property_miss(
+                                &input.resource_arn,
+                            ),
+                        ),
                         from_federation_source: None,
                     },
                 )
