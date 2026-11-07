@@ -10,6 +10,10 @@
 //! seam a test or a fixture loader seeds through — and every response is computed
 //! from it.
 
+/// Whether IAM lets a request perform the action it asks for: the decision every
+/// discovery read takes before it resolves the registry the request names.
+pub mod authorization;
+
 use std::collections::BTreeMap;
 
 use crate::ops::types::{

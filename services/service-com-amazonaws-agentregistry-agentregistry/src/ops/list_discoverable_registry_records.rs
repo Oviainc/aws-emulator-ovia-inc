@@ -154,26 +154,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(ListDiscoverableRegistryRecordsErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: Some("the Agent Registry store is unavailable".to_string()),
-                },
-            )
-            .into());
-        };
-        let state = state.lock();
-
-        let Some(registry) = state.registry(&input.registry_id) else {
-            return Err(
-                ListDiscoverableRegistryRecordsErrorModeled::ResourceNotFoundException(
-                    crate::state::registry_not_found(&input.registry_id),
-                )
-                .into(),
-            );
-        };
-
         let filters = input.filters.unwrap_or_default();
         if filters.len() > MAX_FILTERS {
             return Err(field_validation(
@@ -197,6 +177,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        let max_results = match input.max_results {
+            Some(requested) => {
+                if !(MIN_MAX_RESULTS..=MAX_MAX_RESULTS).contains(&requested) {
+                    return Err(field_validation(
+                        "maxResults",
+                        &format!(
+                            "{requested} is outside the valid range {MIN_MAX_RESULTS} through {MAX_MAX_RESULTS}."
+                        ),
+                    ));
+                }
+                usize::try_from(requested).unwrap_or(DEFAULT_MAX_RESULTS)
+            }
+            None => DEFAULT_MAX_RESULTS,
+        };
+
+        // Whether IAM lets this caller list this registry's discoverable records is
+        // decided BEFORE the registry is resolved, so an unauthorized caller is told
+        // nothing about it — not even whether it exists. The registry the request NAMES is
+        // the resource the decision is made against, resolved to its ARN from whichever
+        // form `RegistryIdentifier` carried.
+        crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::resolved_registry_resource(ctx, &input.registry_id),
+        )
+        .map_err(ListDiscoverableRegistryRecordsErrorModeled::AccessDeniedException)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDiscoverableRegistryRecordsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Agent Registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        let Some(registry) = state.registry(&input.registry_id) else {
+            return Err(
+                ListDiscoverableRegistryRecordsErrorModeled::ResourceNotFoundException(
+                    crate::state::registry_not_found(&input.registry_id),
+                )
+                .into(),
+            );
+        };
+
         // Resume exactly after the record the previous page stopped on, so no record
         // is repeated or skipped. A token minted for another registry is refused.
         let start_after = match input.next_token.as_deref() {
@@ -214,21 +241,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             },
             None => None,
-        };
-
-        let max_results = match input.max_results {
-            Some(requested) => {
-                if !(MIN_MAX_RESULTS..=MAX_MAX_RESULTS).contains(&requested) {
-                    return Err(field_validation(
-                        "maxResults",
-                        &format!(
-                            "{requested} is outside the valid range {MIN_MAX_RESULTS} through {MAX_MAX_RESULTS}."
-                        ),
-                    ));
-                }
-                usize::try_from(requested).unwrap_or(DEFAULT_MAX_RESULTS)
-            }
-            None => DEFAULT_MAX_RESULTS,
         };
 
         let mut matching = registry

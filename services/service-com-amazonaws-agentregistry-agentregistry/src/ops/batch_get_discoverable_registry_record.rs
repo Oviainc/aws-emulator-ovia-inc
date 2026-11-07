@@ -147,17 +147,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(
-                BatchGetDiscoverableRegistryRecordErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: Some("the Agent Registry store is unavailable".to_string()),
-                    },
-                )
-                .into(),
-            );
-        };
-        let state = state.lock();
 
         // The bounds the model puts on this request, enforced here so the work this
         // handler does is explicitly limited by the request's own modelled limits
@@ -189,6 +178,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .map(|entry| entry.record_ids.len())
             .sum();
+
+        // Whether IAM lets this caller read an entry's registry is decided BEFORE that
+        // registry is resolved, so an unauthorized caller is told nothing about it — not
+        // even whether it exists. Both of this read's recorded departures from the two
+        // registry-scoped reads — which entries it decides for, and the sentence it words
+        // a refusal with — live in the one gate it calls.
+        for entry in &input.entries {
+            crate::state::authorization::authorize_batch_entry(
+                &*self.engine,
+                ctx,
+                Self::NAME,
+                &entry.registry_id,
+            )
+            .map_err(BatchGetDiscoverableRegistryRecordErrorModeled::AccessDeniedException)?;
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchGetDiscoverableRegistryRecordErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the Agent Registry store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let state = state.lock();
+
         let mut registry_records = Vec::with_capacity(requested_total);
         let mut errors = Vec::new();
 

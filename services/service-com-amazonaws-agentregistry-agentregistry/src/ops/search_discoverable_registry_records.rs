@@ -157,19 +157,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(
-                SearchDiscoverableRegistryRecordsErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: Some("the Agent Registry store is unavailable".to_string()),
-                    },
-                )
-                .into(),
-            );
-        };
-        let state = state.lock();
-
         // The bounds the model puts on this request, enforced here so the work this
         // handler does is explicitly limited by the request's own modelled limits
         // (the boundary validator refuses a violation before `handle` runs; these
@@ -213,6 +200,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(filters) = filter_expression(input.filters.as_ref()) {
             validate_filter(filters).map_err(filter_validation)?;
         }
+
+        // Whether IAM lets this caller search a registry's discoverable records is
+        // decided BEFORE that registry is resolved, so an unauthorized caller is told
+        // nothing about it — not even whether it exists. Each registry the request NAMES is
+        // a resource of its own, resolved to its ARN from whichever form
+        // `RegistryIdentifier` carried.
+        for registry_id in &input.registry_ids {
+            crate::state::authorization::authorize(
+                &*self.engine,
+                ctx,
+                Self::NAME,
+                &crate::state::authorization::resolved_registry_resource(ctx, registry_id),
+            )
+            .map_err(SearchDiscoverableRegistryRecordsErrorModeled::AccessDeniedException)?;
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                SearchDiscoverableRegistryRecordsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the Agent Registry store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let state = state.lock();
 
         let mut ranked: Vec<(usize, RegistryRecordSummary)> = Vec::new();
         for registry_id in &input.registry_ids {
