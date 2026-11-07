@@ -218,6 +218,12 @@ pub(crate) struct Answer {
     pub(crate) content_type: String,
     pub(crate) text: String,
     pub(crate) body: Value,
+    /// Every response header, for a case that asserts on a field a BACKEND set
+    /// (`http_api_backend_dispatch`), including one the answer carries more than once.
+    pub(crate) headers: http::HeaderMap,
+    /// The body as the BYTES it arrived as, for a payload that is not text
+    /// (`http_api_backend_dispatch`).
+    pub(crate) bytes: bytes::Bytes,
 }
 
 impl Answer {
@@ -234,6 +240,24 @@ impl Answer {
             "{} {body} ({:?}, x-amzn-errortype: {:?})",
             self.status, self.content_type, self.error_type
         )
+    }
+
+    /// The first value the answer carries for `name`, or `None` for a field it does not
+    /// carry.
+    pub(crate) fn header(&self, name: &str) -> Option<String> {
+        self.headers
+            .get(name)
+            .map(|value| String::from_utf8_lossy(value.as_bytes()).to_string())
+    }
+
+    /// EVERY value the answer carries for `name`, in order: a field a backend set more than
+    /// once (`set-cookie`) is sent once per value.
+    pub(crate) fn all_headers(&self, name: &str) -> Vec<String> {
+        self.headers
+            .get_all(name)
+            .iter()
+            .map(|value| String::from_utf8_lossy(value.as_bytes()).to_string())
+            .collect()
     }
 }
 
@@ -282,6 +306,7 @@ pub(crate) async fn send_with_body(
     let accept = header("sec-websocket-accept");
     let location = header("location");
     let content_type = header("content-type").unwrap_or_default();
+    let headers = response.headers().clone();
     let bytes = response.into_body();
     let text = String::from_utf8_lossy(&bytes).to_string();
     let body = if bytes.is_empty() {
@@ -297,6 +322,8 @@ pub(crate) async fn send_with_body(
         content_type,
         text,
         body,
+        headers,
+        bytes,
     }
 }
 

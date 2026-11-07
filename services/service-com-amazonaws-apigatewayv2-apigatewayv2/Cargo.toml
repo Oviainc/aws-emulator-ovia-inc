@@ -32,6 +32,14 @@ tracing = { workspace = true }
 # account has rather than deciding it here. Only the generated client is needed — the
 # emulator supplies the transport.
 aws-sdk-ec2 = { version = "1", default-features = false }
+# The AWS SDK for Lambda, driven over the same in-process callback: an `AWS_PROXY` route
+# and a `REQUEST` authorizer are answered by the function they name, which lives in the
+# Lambda service, so `src/service/invoke/` asks Lambda to run it rather than deciding the
+# answer here.
+aws-sdk-lambda = { version = "1", default-features = false }
+# Base64, for the one encoding an HTTP api's proxy event states a payload in when it is not
+# text (`isBase64Encoded`), in both directions.
+base64 = "0.22"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -44,6 +52,12 @@ sha2 = { workspace = true }
 # crate outside its tests.
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 aws-sdk-ec2 = { version = "1", default-features = false }
+# The AWS Lambda service, mounted beside this one in the test harness: an `AWS_PROXY`
+# route's answer is the answer of a function that service holds and runs, so the data plane
+# is driven end to end with the owner of functions on the same engine. DEV-ONLY.
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# Writes the .zip deployment package the test uploads, the way a caller uploads one.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true

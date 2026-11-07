@@ -59,6 +59,9 @@
 //!    adjusts). A body past it is refused by the GATEWAY — `413`, before step 7 runs at
 //!    all, so the integration observes no invocation for it — and a body of exactly the
 //!    quota is passed on to step 7 like any other ([`payload_refusal`]);
+//! 6b. the serving stage's `RouteSettings` for that route admit the request: a route the
+//!    stage throttles is refused `429` ([`crate::state::route_throttle`]) and its
+//!    integration is not reached, while a twin route of the same stage is served;
 //! 7. the route's integration decides the response.
 //!
 //! On top of those, the api's own `CorsConfiguration` decorates whatever is answered for it
@@ -83,72 +86,80 @@
 //! neither the model nor the recorded behaviour of a configured api admits a spelling the
 //! collection does not hold.
 //!
-//! # What it does not do, and what it answers instead
+//! # How step 7 is performed, and what each fault answers
 //!
-//! Step 7 is the one step this emulator cannot perform as AWS does. Every integration type
-//! an HTTP api admits names a backend outside this process: `AWS_PROXY` invokes a Lambda
-//! function, and Lambda's own `Invoke` answers `501` for `RequestResponse` and `Event`
-//! because there is no in-process runtime for a deployment package
-//! (`services/service-com-amazonaws-lambda-awsgirapiservice/src/ops/invoke.rs`), so no
-//! function response exists to map; `HTTP_PROXY` addresses an endpoint over the network,
-//! and this emulator makes no outbound connection. `MOCK` — the one type that answers
-//! without a backend — "is not permitted for APIs with a protocol type of HTTP"
-//! ([`crate::state::WEBSOCKET_ONLY_INTEGRATION_TYPES`]), so it cannot be configured here.
+//! The backend is REACHED, in process, over the transport `OperationContext::callback`
+//! hands a handler ([`dispatch`]), so what a client receives is what that backend answered:
 //!
-//! Neither is faked: a body, a status or a header invented for a backend that never ran
-//! would be indistinguishable from a real one. An `HTTP_PROXY` upstream is a URI the CALLER
-//! can reach, so the caller is sent there — `307 Temporary Redirect` to the stored
-//! `IntegrationUri`, the redirect that preserves the request's method and body — rather
-//! than the gateway opening a connection of its own. An `AWS_PROXY` integration has no such
-//! answer, because an invocation is not a URI a client can fetch: it is answered the way
-//! API Gateway answers an integration that produced no response, `500`
-//! `{"message":"Internal Server Error"}`, with the reason logged.
+//! * an `AWS_PROXY` route naming a Lambda FUNCTION invokes it with the event its
+//!   `PayloadFormatVersion` defines ([`proxy_event`]) and answers with the response that
+//!   version defines ([`proxy_response`]);
+//! * an `HTTP_PROXY` route's endpoint is a URI the CALLER can reach, and this emulator
+//!   forwards no request to a destination its own configuration names: the caller is sent
+//!   there instead, `307 Temporary Redirect` to the upstream the integration resolved, which
+//!   preserves the request's method and body, so the client makes exactly the request the
+//!   gateway would have forwarded and nothing about the upstream's answer is invented;
+//! * `MOCK` — the one type that answers without a backend — "is not permitted for APIs with
+//!   a protocol type of HTTP" ([`crate::state::WEBSOCKET_ONLY_INTEGRATION_TYPES`]), so it
+//!   cannot be configured here, and the two non-proxy types (`AWS`, `HTTP`) take the request
+//!   and response templates a WebSocket api's integration carries.
 //!
-//! That `500` is this data plane's mapping for the whole class "the integration produced no
-//! response", which is the class every backend fault an HTTP api can meet falls into — a
-//! handler that raised, a function the gateway may not invoke, a proxy response the gateway
-//! cannot map — and it is NOT the `502` the REST data plane answers for a malformed proxy
+//! Nothing is faked: a body, a status or a header invented for a backend that never ran
+//! would be indistinguishable from a real one. So `500`
+//! `{"message":"Internal Server Error"}` is this data plane's mapping for the whole class
+//! "the integration produced no response" — a handler that raised, a function the gateway
+//! could not invoke, an answer the payload format cannot be read as, a route with nothing
+//! behind it — and it is NOT the `502` the REST data plane answers for a malformed proxy
 //! response, nor the scaffold channel's `501`
 //! (`tests/all/http_api_integration_fault_status.rs` pins the mapping across the
 //! configurations and fault classes it holds for). The one class that maps elsewhere is an
 //! integration that RAN and did not answer within its `TimeoutInMillis`, which an HTTP api
-//! answers `503`: it needs a backend that actually ran, so it becomes reachable only once a
-//! deployment package can execute
-//! (`20261024T055421Z-lambda-opensearch-s3-lambda-invoke-cannot-execute-a-deployment-package-so.md`
-//! and `20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md`
-//! own the runtime, and
-//! `20261025T030504Z-apigatewayv2-lambda-an-aws-proxy-route-cannot-answer-200-until-a.md`
-//! the dispatch that maps a function's answer back onto the response). Nothing here times a
-//! call that was never made.
+//! answers `503`: the deadline is applied to the run itself, so nothing here times a call
+//! that was never made.
 //!
-//! Nor is a `REQUEST` authorizer's own ALLOW/DENY decision computed: that decision is the
-//! answer of the Lambda function its `AuthorizerUri` names, and no deployment package runs
-//! here, so a policy document invented in this module would be indistinguishable from the
-//! function's. What step 5 applies for such an authorizer is the part of the authorization
-//! that is the SERVICE's own and is computed from stored records — the identity-source
-//! precondition the authorizer is only invoked past, and a route whose authorizer the api
-//! does not hold. A JWT authorizer is different in kind, and is why this module exists: its
-//! decision is a function of the token and of the api's own `JWTConfiguration`, both of
-//! which are here, so it is computed in full ([`super::jwt`]).
+//! A `REQUEST` authorizer's ALLOW/DENY decision is likewise the answer of the Lambda
+//! function its `AuthorizerUri` names, and is obtained the same way
+//! ([`request_authorizer`]), kept for the TTL the authorizer declared and keyed by the
+//! identity sources it was decided from. What step 5 still decides from stored records
+//! alone is the part that is the SERVICE's own: the identity-source precondition the
+//! authorizer is only invoked past, and a route whose authorizer the api does not hold. A
+//! JWT authorizer is different in kind: its decision is a function of the token and of the
+//! api's own `JWTConfiguration`, both of which are here, so it is computed in full
+//! ([`super::jwt`]).
+//!
+//! One seam of the front door is what the two serving entry points below are about. The
+//! router hands an `OperationContext` — the only in-process transport an invocation of the
+//! route's function can be made over — only to a request it NAMES AN OPERATION for, and it
+//! refuses a named operation whose browser-set headers say a browser sent it from another
+//! site. So an invoke carrying such a header is served from the seam that answers an unnamed
+//! request instead ([`serve_without_transport`]), where every step up to the integration is
+//! the same and the integration itself is reported as the class it falls into.
+//! `crate::service`'s own docs state that rule.
+
+mod dispatch;
+mod lambda;
+mod proxy_event;
+mod proxy_response;
+mod request_authorizer;
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
-use smithy_server_runtime::http;
+use smithy_server_runtime::{http, OperationContext};
 
 use super::data_plane::{
     addresses_connections, api_id_of_host, authority_of, first_segment, forbidden, header_of,
-    identity_source_value, json_response, path_of, path_segments, presents_identity_source,
-    query_of, query_parameters, resolve_stage_variables, service_named_by_host,
+    host_name, identity_source_value, joined_query_parameters, json_response, path_of,
+    path_segments, presents_identity_source, query_of, query_parameters, service_named_by_host,
     split_first_segment, EXECUTE_API_LABEL, LOCAL_ENDPOINT_PREFIX, NOT_FOUND_MESSAGE,
     NOT_FOUND_STATUS, UNAUTHORIZED_MESSAGE, UNAUTHORIZED_STATUS, UNPLACEABLE_STATUS,
 };
 use super::jwt;
 use crate::state::{
-    Api, ComAmazonawsApigatewayv2Apigatewayv2State, DeployedConfiguration, Integration, Route,
-    Stage,
+    Api, Authorizer, ComAmazonawsApigatewayv2Apigatewayv2State, DeployedConfiguration, Integration,
+    Route, Stage,
 };
 
 /// The `RouteKey` that catches what no other route matches. AWS documents `$default` as
@@ -518,37 +529,96 @@ pub fn carries_sigv4_credential(req: &RtRequest) -> bool {
 }
 
 /// Serve one request addressed to a deployed HTTP api stage, from this service's own
-/// records.
+/// records and from the backend the matched route fronts.
 ///
-/// Free-standing and reached with the ONE shared engine, the way the WebSocket data plane's
-/// `serve` is, so the claim above and this answer read the same store.
-pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtResponse {
+/// `ctx` is the in-process transport the route's integration is performed over
+/// ([`dispatch`]). The store's guard is held for the RESOLUTION only and released before the
+/// backend is reached, so one caller's backend cannot stall another caller's request.
+pub async fn serve<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    req: &RtRequest,
+    ctx: &OperationContext<'_>,
+) -> RtResponse {
+    match resolved(engine, req) {
+        Err(answered) => *answered,
+        Ok((decoration, Answer::Now(response))) => decorated(*response, &decoration),
+        Ok((decoration, Answer::Dispatch(dispatch))) => {
+            decorated(dispatch::perform(engine, ctx, *dispatch).await, &decoration)
+        }
+    }
+}
+
+/// [`serve`] from a seam that carries NO in-process transport, so the route's integration
+/// cannot be performed from it: every step up to the integration is the same, and the
+/// integration itself is reported as the class it falls into
+/// ([`dispatch::unperformable`]).
+///
+/// `crate::service`'s module docs state which requests are served here and why.
+pub fn serve_without_transport<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    req: &RtRequest,
+) -> RtResponse {
+    match resolved(engine, req) {
+        Err(answered) => *answered,
+        Ok((decoration, Answer::Now(response))) => decorated(*response, &decoration),
+        Ok((decoration, Answer::Dispatch(dispatch))) => {
+            decorated(dispatch::unperformable(engine, &dispatch), &decoration)
+        }
+    }
+}
+
+/// Everything decided from the STORE for one invoke: the api's CORS decoration, and either
+/// the gateway's own answer or the integration left to perform.
+///
+/// `Err` is an answer that carries no decoration at all — an api this endpoint does not
+/// serve, which has no CORS configuration to decorate with. It is boxed, like
+/// [`Answer::Now`], because a rendered response is a large value to move through a return.
+#[allow(clippy::type_complexity)]
+fn resolved<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    req: &RtRequest,
+) -> Result<(Vec<(&'static str, String)>, Answer), Box<RtResponse>> {
     let addressed = Addressed::of_request(req);
     let Some(state) = crate::state::service_state(engine) else {
-        return json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None);
+        return Err(Box::new(json_response(
+            UNPLACEABLE_STATUS,
+            INTERNAL_MESSAGE,
+            None,
+        )));
     };
     let store = state.lock();
     // Unreachable through the claim, which resolves the same api from the same store; the
     // api can still have been deleted between the claim and now, which is an api this
     // endpoint no longer serves.
     let Some(resolved) = resolve(&store, &addressed) else {
-        return forbidden();
+        return Err(Box::new(forbidden()));
     };
-    let api = resolved.api;
     // The api's own CORS configuration decides the decoration of WHATEVER is answered
     // below, so it is computed once, from the api and the request alone, before the stage
     // and the route are resolved; see [`cors_decoration`].
-    let decoration = cors_decoration(api, req);
-    decorated(serve_resolved(&resolved, &addressed, req), &decoration)
+    let decoration = cors_decoration(resolved.api, req);
+    Ok((decoration, resolve_answer(&resolved, &addressed, req)))
+}
+
+/// What the resolution under the store's guard came to: the answer itself, or the
+/// integration still to be performed once the guard is released.
+///
+/// Both arms are BOXED, because both a rendered response and a whole dispatch are large
+/// values to move through every return of the walk below.
+enum Answer {
+    /// The gateway's own answer — a refusal, or a status it decided without a backend.
+    Now(Box<RtResponse>),
+    /// Everything the route's backend needs, read out of the store.
+    Dispatch(Box<dispatch::Dispatch>),
 }
 
 /// The answer for a request whose api this data plane HAS resolved: the stage, the
 /// deployment released to it, the route and its authorization, then the integration.
-fn serve_resolved(
+fn resolve_answer(
     resolved: &Resolved<'_, '_>,
     addressed: &Addressed<'_>,
     req: &RtRequest,
-) -> RtResponse {
+) -> Answer {
     let api = resolved.api;
     // The stage: the path's first segment when it names one, and otherwise the stage that
     // serves the api's root. A path that names neither is an endpoint that serves nothing.
@@ -558,7 +628,7 @@ fn serve_resolved(
             path = %resolved.invoke_path,
             "the request names no stage of this api"
         );
-        return forbidden();
+        return Answer::Now(Box::new(forbidden()));
     };
     // The deployment the stage serves: "A Deployment must be associated with a Stage for
     // it to be callable over the internet" (the `Deployment` shape's own doc), and what it
@@ -574,7 +644,7 @@ fn serve_resolved(
             stage = %stage.stage_name,
             "the request names a stage with no deployment released to it"
         );
-        return forbidden();
+        return Answer::Now(Box::new(forbidden()));
     };
     let Some(route) = matching_route(&deployment.configuration.routes, addressed.method, &route_path)
     else {
@@ -585,20 +655,36 @@ fn serve_resolved(
             path = %route_path,
             "no route of this api matches the request"
         );
-        return json_response(NOT_FOUND_STATUS, NOT_FOUND_MESSAGE, None);
+        return Answer::Now(Box::new(json_response(
+            NOT_FOUND_STATUS,
+            NOT_FOUND_MESSAGE,
+            None,
+        )));
     };
     // The route's authorization is applied BEFORE anything the route fronts: a request
-    // refused here never reaches the integration below, which is what makes a JWT
-    // authorizer's gate observable.
-    if let Some(refusal) = authorization_refusal(api, stage, route, req) {
-        return refusal;
-    }
+    // refused here never reaches the integration below, which is what makes an authorizer's
+    // gate observable. A Lambda authorizer's own decision is the one part of it that needs
+    // the backend, so it travels with the dispatch below.
+    let authorizer = match authorization(api, stage, route, req) {
+        Authorization::Refused(refusal) => return Answer::Now(Box::new(refusal)),
+        Authorization::Admitted => None,
+        Authorization::DecidedByFunction(authorizer, identity) => Some((authorizer, identity)),
+    };
     // And the payload quota, ahead of the dispatch below: a body past it is the gateway's
     // own refusal, so the integration is never reached for it.
     if let Some(refusal) = payload_refusal(api, stage, route, req) {
-        return refusal;
+        return Answer::Now(Box::new(refusal));
     }
-    serve_integration(api, stage, &deployment.configuration, route)
+    Answer::Dispatch(Box::new(dispatch(
+        api,
+        stage,
+        &deployment.configuration,
+        route,
+        &route_path,
+        resolved.invoke_path,
+        req,
+        authorizer,
+    )))
 }
 
 /// The refusal the request's PAYLOAD SIZE owes it, or `None` for a payload this endpoint
@@ -917,8 +1003,20 @@ fn path_variable(segment: &str) -> Option<&str> {
     segment.strip_prefix('{')?.strip_suffix('}')
 }
 
-/// The refusal the route's `AuthorizationType` owes this request, or `None` when the
-/// request may proceed to the integration.
+/// What the route's `AuthorizationType` decided about this request.
+enum Authorization {
+    /// The request may proceed to the integration.
+    Admitted,
+    /// The request is refused, with the answer the caller receives.
+    Refused(RtResponse),
+    /// The decision is the authorizer FUNCTION's, which is made once the store's guard is
+    /// released ([`request_authorizer`]). Carries the authorizer and the identity-source
+    /// values its decision is about and is cached under.
+    DecidedByFunction(Authorizer, Vec<String>),
+}
+
+/// What the route's `AuthorizationType` owes this request: the refusal it earns, admission
+/// to the integration, or the decision its authorizer's function still has to make.
 ///
 /// `NONE` admits every request — "NONE for open access" (`Route$AuthorizationType`).
 ///
@@ -938,33 +1036,32 @@ fn path_variable(segment: &str) -> Option<&str> {
 /// not authorized" (`Route$AuthorizationScopes`).
 ///
 /// `CUSTOM` names a Lambda authorizer, whose decision is that function's answer. The part
-/// that is settled BEFORE the function is called is applied: every identity source must be
-/// "present in the request, not null, and non-empty", and "only when this is true does the
-/// authorizer invoke the authorizer Lambda function. Otherwise, it returns a 401
+/// that is settled BEFORE the function is called is applied here: every identity source must
+/// be "present in the request, not null, and non-empty", and "only when this is true does
+/// the authorizer invoke the authorizer Lambda function. Otherwise, it returns a 401
 /// Unauthorized response without calling the Lambda function"
-/// (`Authorizer$IdentitySource`). Past that precondition the decision needs the function,
-/// which cannot run here, so the request is refused as a configuration this endpoint could
-/// not evaluate (`500`) rather than allowed — an allow would be a decision no authorizer
-/// made.
+/// (`Authorizer$IdentitySource`). Past that precondition the decision is the function's, so
+/// it travels with the dispatch and is obtained once the store's guard is released
+/// ([`request_authorizer`]).
 ///
 /// A route whose authorizer-backed type names no authorizer of this api cannot be
 /// authorized at all, which is a fault of the api's configuration and not of the caller:
 /// `500`. The writers of a route refuse that association
 /// ([`crate::state::UNRESOLVED_AUTHORIZER_MESSAGE`]), so this is a store that lost the
 /// authorizer some other way and not a route a caller can create.
-fn authorization_refusal(
+fn authorization(
     api: &Api,
     stage: &Stage,
     route: &Route,
     req: &RtRequest,
-) -> Option<RtResponse> {
+) -> Authorization {
     let authorization_type = route.authorization_type.as_str();
     if authorization_type == AUTHORIZATION_NONE {
-        return None;
+        return Authorization::Admitted;
     }
     if authorization_type == AUTHORIZATION_AWS_IAM {
         if carries_sigv4_credential(req) {
-            return None;
+            return Authorization::Admitted;
         }
         tracing::info!(
             api_id = %api.api_id,
@@ -972,7 +1069,7 @@ fn authorization_refusal(
             route_key = %route.route_key,
             "refusing an invoke of an AWS_IAM route that presented no credential"
         );
-        return Some(forbidden());
+        return Authorization::Refused(forbidden());
     }
     let Some(authorizer) = route
         .authorizer_id
@@ -986,13 +1083,17 @@ fn authorization_refusal(
             authorizer_id = ?route.authorizer_id,
             "the matched route is authorized by an authorizer this api does not hold"
         );
-        return Some(json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None));
+        return Authorization::Refused(json_response(
+            UNPLACEABLE_STATUS,
+            INTERNAL_MESSAGE,
+            None,
+        ));
     };
     let query_parameters = query_parameters(req.uri());
     let header = |name: &str| req.headers().get(name).map(str::to_string);
     if authorization_type != AUTHORIZATION_JWT {
-        // A `CUSTOM` (Lambda) authorizer: the identity-source precondition, then the
-        // decision this emulator cannot obtain. See this function's docs.
+        // A `CUSTOM` (Lambda) authorizer: the identity-source precondition, and then the
+        // function's own decision. See this function's docs.
         let absent: Vec<&str> = authorizer
             .identity_source
             .iter()
@@ -1015,21 +1116,29 @@ fn authorization_refusal(
                 "refusing an invoke: an identity source of the route's authorizer is \
                  absent, so the authorizer is not invoked"
             );
-            return Some(json_response(
+            return Authorization::Refused(json_response(
                 UNAUTHORIZED_STATUS,
                 UNAUTHORIZED_MESSAGE,
                 None,
             ));
         }
-        tracing::warn!(
-            api_id = %api.api_id,
-            stage = %stage.stage_name,
-            authorizer_id = %authorizer.authorizer_id,
-            authorizer_uri = ?authorizer.authorizer_uri,
-            "refusing an invoke: deciding this route's Lambda authorizer would require \
-             invoking its function, which this emulator cannot run"
-        );
-        return Some(json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None));
+        // Every identity source is there, so the authorizer's function decides: the
+        // identity-source VALUES are what the decision is about and what it is cached
+        // under ("API Gateway uses the identity sources as the cache key"), so they travel
+        // with the dispatch.
+        let identity = authorizer
+            .identity_source
+            .iter()
+            .map(|identity_source| {
+                presented_identity(
+                    identity_source,
+                    header,
+                    &query_parameters,
+                    &stage.stage_variables,
+                )
+            })
+            .collect();
+        return Authorization::DecidedByFunction(authorizer.clone(), identity);
     }
     let Some(configuration) = authorizer.jwt_configuration.as_ref() else {
         tracing::warn!(
@@ -1038,7 +1147,11 @@ fn authorization_refusal(
             authorizer_id = %authorizer.authorizer_id,
             "the route's JWT authorizer holds no JwtConfiguration to evaluate a token against"
         );
-        return Some(json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None));
+        return Authorization::Refused(json_response(
+            UNPLACEABLE_STATUS,
+            INTERNAL_MESSAGE,
+            None,
+        ));
     };
     let audience = configuration.audience.as_deref().unwrap_or_default();
     let identity_source = authorizer
@@ -1058,7 +1171,7 @@ fn authorization_refusal(
         now_unix_seconds(),
     );
     match decision {
-        jwt::Decision::Allow => None,
+        jwt::Decision::Allow => Authorization::Admitted,
         jwt::Decision::Unauthorized(reason) => {
             tracing::info!(
                 api_id = %api.api_id,
@@ -1069,7 +1182,7 @@ fn authorization_refusal(
                 presented = ?jwt::described(presented.as_deref()),
                 "refusing an invoke: the JWT authorizer did not accept the presented token"
             );
-            Some(json_response(
+            Authorization::Refused(json_response(
                 UNAUTHORIZED_STATUS,
                 UNAUTHORIZED_MESSAGE,
                 None,
@@ -1085,103 +1198,159 @@ fn authorization_refusal(
                 "refusing an invoke: the presented token claims none of the route's \
                  authorization scopes"
             );
-            Some(forbidden())
+            Authorization::Refused(forbidden())
         }
     }
 }
 
-/// The answer the route's integration gives, for a request its authorization admitted.
+/// The VALUE the request presents for one identity source, as the cache key and the event's
+/// `identitySource` carry it.
 ///
-/// Two answers, by what the integration's backend IS:
-///
-/// * an `HTTP_PROXY` upstream is a URI the CALLER can reach, and this emulator opens no
-///   outbound connection of its own, so the caller is sent there: `307 Temporary Redirect`
-///   with the stored `IntegrationUri` — with this STAGE's variables interpolated into it,
-///   which is what lets one api reach a different backend per stage — in `Location`. A `307`
-///   is the redirect that preserves
-///   the request's method and body (RFC 7231 §6.4.7), so the client repeats exactly the
-///   request the gateway would have forwarded. Nothing about the upstream is invented —
-///   the caller is told where the backend is instead of being handed a body no upstream
-///   produced;
-/// * an `AWS_PROXY` integration invokes a Lambda function, which cannot run here (Lambda's
-///   own `Invoke` has no in-process runtime for a deployment package), and no redirect can
-///   stand in for it: an invocation is not a URI a client can fetch. It is answered the way
-///   API Gateway answers an integration that produced no response, `500`
-///   `{"message":"Internal Server Error"}` — the status an HTTP api maps every integration
-///   fault to except an integration that overran its `TimeoutInMillis` — and the reason is
-///   logged so a developer reading the emulator's output learns which backend was not
-///   called. See the module docs for the whole mapping and for what the `503` class needs.
+/// The three request-bound spellings are read — a header, a query string parameter and a
+/// stage variable, the parts `Authorizer$IdentitySource` names — and anything else presents
+/// the empty value, which is what the precondition above already admitted it as (a context
+/// parameter, which every call has).
+fn presented_identity(
+    identity_source: &str,
+    header: impl Fn(&str) -> Option<String>,
+    query_parameters: &BTreeMap<String, String>,
+    stage_variables: &BTreeMap<String, String>,
+) -> String {
+    if let Some(value) = identity_source_value(identity_source, header, query_parameters) {
+        return value;
+    }
+    super::data_plane::parameter_name(
+        identity_source.trim(),
+        super::data_plane::STAGE_VARIABLE_IDENTITY_SOURCES,
+    )
+    .and_then(|name| stage_variables.get(name).cloned())
+    .unwrap_or_default()
+}
+
+/// Everything the route's integration needs, read out of the store while it is locked: the
+/// request as the backend will see it, the facts of this invocation, the integration the
+/// route targets, and the authorizer whose decision is still owed.
 ///
 /// A route that targets no integration, or one whose target names none the deployment
-/// froze, is the same `500` for a different reason: a route with nothing behind it cannot
-/// answer at all.
-fn serve_integration(
+/// froze, carries `None`: a route with nothing behind it cannot answer at all, which
+/// [`dispatch::perform`] reports as the "produced no response" class.
+#[allow(clippy::too_many_arguments)]
+fn dispatch(
     api: &Api,
     stage: &Stage,
     deployed: &DeployedConfiguration,
     route: &Route,
-) -> RtResponse {
-    let integration: Option<&Integration> = route
+    route_path: &str,
+    invoke_path: &str,
+    req: &RtRequest,
+    authorizer: Option<(Authorizer, Vec<String>)>,
+) -> dispatch::Dispatch {
+    let integration: Option<Integration> = route
         .target
         .as_deref()
         .and_then(crate::state::target_integration_id)
-        .and_then(|integration_id| deployed.integrations.get(integration_id));
-    let Some(integration) = integration else {
-        tracing::warn!(
-            api_id = %api.api_id,
-            stage = %stage.stage_name,
-            route_key = %route.route_key,
-            target = ?route.target,
-            "the matched route targets no integration of this api, so it has nothing to call"
-        );
-        return json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None);
-    };
-    if integration.integration_type == crate::state::HTTP_PROXY_INTEGRATION_TYPE {
-        if let Some(upstream) = integration
-            .integration_uri
-            .as_deref()
-            .map(str::trim)
-            .filter(|upstream| !upstream.is_empty())
-        {
-            // The upstream a stage reaches is the integration's URI WITH this stage's own
-            // variables interpolated: "you can use API Gateway stage variables … as part of
-            // an HTTP integration URL", which is how one api serves a different backend per
-            // stage. A reference this stage carries no variable for, and a result past the
-            // length the URI's own member may hold, name no backend at all, so both are
-            // answered as an integration that produced no response rather than by sending
-            // the caller to a URI carrying an unresolved reference.
-            let Some(upstream) = resolve_stage_variables(upstream, &stage.stage_variables) else {
-                tracing::warn!(
-                    api_id = %api.api_id,
-                    stage = %stage.stage_name,
-                    route_key = %route.route_key,
-                    integration_uri = %upstream,
-                    "this route's HTTP_PROXY upstream names a stage variable this stage does \
-                     not carry, or resolves past the length its member may hold, so it \
-                     resolves to no backend"
-                );
-                return json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None);
-            };
-            tracing::info!(
-                api_id = %api.api_id,
-                stage = %stage.stage_name,
-                route_key = %route.route_key,
-                "redirecting the caller to this route's HTTP_PROXY upstream rather than \
-                 connecting to it"
-            );
-            return redirect(&upstream);
-        }
+        .and_then(|integration_id| deployed.integrations.get(integration_id))
+        .cloned();
+    let region = api_region(api);
+    dispatch::Dispatch {
+        request: proxy_event::ProxyRequest {
+            method: req.method().to_string(),
+            // The path AWS's own event reports is the one within the API — the stage
+            // segment included, because the invoke URL carries it — whichever of the three
+            // addressings a local client reached this emulator by.
+            raw_path: normalised_path(invoke_path),
+            route_path: route_path.to_string(),
+            raw_query_string: query_of(req.uri()).unwrap_or_default().to_string(),
+            headers: request_headers(req),
+            query_parameters: joined_query_parameters(req.uri()),
+            body: req
+                .body()
+                .bytes()
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default(),
+            route_key: route.route_key.clone(),
+            api_id: api.api_id.clone(),
+            stage_name: stage.stage_name.clone(),
+            stage_variables: stage.stage_variables.clone(),
+            region: region.clone(),
+            // The host an event reports is the api's OWN endpoint, the one
+            // `Api$ApiEndpoint` announced, rather than the address a local client had to
+            // reach this emulator at: that is the domain the request was made to as far as
+            // the api is concerned.
+            domain_name: endpoint_host(api).to_string(),
+        },
+        invocation: proxy_event::Invocation {
+            account_id: ::engine::emulator_account_id().to_string(),
+            request_id: proxy_event::mint_request_id(),
+            received: SystemTime::now(),
+            authorizer_context: None,
+            authorizer_principal: None,
+        },
+        integration,
+        authorizer,
+        throttle: route_throttle(stage, &route.route_key),
+        route_key: route.route_key.clone(),
     }
-    tracing::warn!(
-        api_id = %api.api_id,
-        stage = %stage.stage_name,
-        route_key = %route.route_key,
-        integration_type = %integration.integration_type,
-        integration_uri = ?integration.integration_uri,
-        "the route's integration names a backend this emulator cannot call, so the \
-         request is answered as an integration that produced no response"
-    );
-    json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None)
+}
+
+/// The throttle the serving stage meters this route with: the `RouteSettings` it states for
+/// that route key, and otherwise its `DefaultRouteSettings` — "the default route settings
+/// for the stage", which is what a route the stage states none of its own for is metered by.
+/// `None` for a route neither states a limit for, which is not metered.
+fn route_throttle(stage: &Stage, route_key: &str) -> Option<crate::state::route_throttle::Limits> {
+    let settings = stage
+        .route_settings
+        .get(route_key)
+        .or(stage.default_route_settings.as_ref())?;
+    crate::state::route_throttle::limits_of(
+        settings.throttling_rate_limit,
+        settings.throttling_burst_limit,
+    )
+}
+
+/// Every header of the request, by lowercased name, with a header that appeared more than
+/// once joined into the one comma-separated value a field list is (RFC 9110 §5.3).
+fn request_headers(req: &RtRequest) -> BTreeMap<String, String> {
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    for (name, value) in req.headers().iter() {
+        let name = name.to_ascii_lowercase();
+        headers
+            .entry(name)
+            .and_modify(|held| {
+                held.push(',');
+                held.push_str(value);
+            })
+            .or_insert_with(|| value.to_string());
+    }
+    headers
+}
+
+/// The host of the api's own announced endpoint, which is the `domainName` an event reports
+/// and the first label of which is its `domainPrefix`.
+fn endpoint_host(api: &Api) -> &str {
+    authority_of(&api.api_endpoint).unwrap_or(&api.api_endpoint)
+}
+
+/// The Region this api is reached in, read off the endpoint it announced
+/// (`{api-id}.execute-api.{region}.amazonaws.com`) — the Region whose Lambda endpoint an
+/// `AWS_PROXY` integration's invocation is addressed to when the function's own ARN names
+/// none.
+///
+/// An endpoint this cannot read names no Region, and the account's default
+/// ([`crate::state::DEFAULT_REGION`]) is used: the Region only selects which endpoint an
+/// in-process call is addressed to.
+fn api_region(api: &Api) -> String {
+    let host = host_name(endpoint_host(api));
+    let mut labels = host.split('.');
+    let (Some(_api_id), Some(endpoint), Some(region)) =
+        (labels.next(), labels.next(), labels.next())
+    else {
+        return crate::state::DEFAULT_REGION.to_string();
+    };
+    if !endpoint.starts_with(EXECUTE_API_LABEL) {
+        return crate::state::DEFAULT_REGION.to_string();
+    }
+    region.to_string()
 }
 
 /// `307 Temporary Redirect` to `location`, with no body of its own: the answer for an

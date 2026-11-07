@@ -346,6 +346,32 @@ pub fn query_parameters(uri: &str) -> BTreeMap<String, String> {
     parameters
 }
 
+/// The query parameters of a request URI with a name the query REPEATS keeping every one of
+/// its values, joined into the one comma-separated value a field list is (RFC 9110 §5.3).
+///
+/// That is the form a proxy event's `queryStringParameters` states them in — "the query
+/// string parameters, with a repeated parameter's values comma-separated" — so the event
+/// reports a repeated parameter as the list it was sent as rather than as whichever value a
+/// reader met first. The same decoder as [`query_parameters`] reads the grammar, so the two
+/// readings cannot disagree about what a pair says.
+pub fn joined_query_parameters(uri: &str) -> BTreeMap<String, String> {
+    let mut parameters: BTreeMap<String, String> = BTreeMap::new();
+    let Some(query) = query_of(uri) else {
+        return parameters;
+    };
+    for (name, value) in ::aws_smithy_schema_server::query::parse_form_urlencoded(query.as_bytes())
+    {
+        parameters
+            .entry(name)
+            .and_modify(|held| {
+                held.push(',');
+                held.push_str(&value);
+            })
+            .or_insert(value);
+    }
+    parameters
+}
+
 /// The parameter name `source` carries after whichever of `prefixes` it begins with, or
 /// `None` when it begins with none of them or names an empty parameter.
 ///

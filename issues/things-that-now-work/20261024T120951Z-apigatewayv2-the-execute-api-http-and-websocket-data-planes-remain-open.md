@@ -41,6 +41,49 @@ Issue-Commit: 6b8dcd825499bdd91675cbbb3bc6eaac525bf5b8
 
 # apigatewayv2: the two execute-api data planes still cannot complete a request — an HTTP route's integration never answers and the RFC 6455 upgrade has no seam to be served from (2 causes)
 
+> _RESOLVED for CAUSE 1, which this report was filed for: an HTTP api's route now has its
+> INTEGRATION performed. A Lambda proxy integration (`AWS_PROXY` naming no
+> `IntegrationSubtype`) invokes the function it names through Lambda's own modelled `Invoke`
+> over the in-process transport `OperationContext::callback` hands a handler, with the event
+> its `PayloadFormatVersion` defines, and answers with the response that version defines — so
+> a client receives the function's own status, headers and body. The `REQUEST` authorizer's
+> own decision is obtained the same way, cached for the TTL it declares and keyed by its
+> identity sources, which is what `ResetAuthorizersCache` now empties. An integration that
+> overruns its own `TimeoutInMillis` is `503`, a route the serving stage's `RouteSettings`
+> throttle is `429`, and everything else that produced no response stays the gateway's `500`.
+> See `services/service-com-amazonaws-apigatewayv2-apigatewayv2/src/service/invoke/` and
+> `tests/all/http_api_backend_dispatch.rs`._
+>
+> _An `HTTP_PROXY` route still answers `307` to the upstream the integration resolved, and
+> deliberately so: the project's own forwarding rule is that a destination a request or a
+> configuration chooses must not become a request this process makes, and that the caller's
+> credential must never travel to one. The upstream is a URI the caller can reach, so it is
+> told where the backend is. `apigatewayv2.invoke-http-api-httpproxy` and
+> `apigatewayv2.parameter-mapping-rewrites-a-real-request-and-response` therefore stay
+> unserved._
+>
+> _CAUSE 2 (the RFC 6455 upgrade) is NOT fixed and is not fixable from inside this emulator:
+> `vendor/server/src/listener_guard.rs:126` + `vendor/server/src/listeners.rs:588` refuse every
+> WebSocket upgrade with `501` before a service is reached,
+> `vendor/smithy-server-runtime/src/service.rs:390` offers no seam that hands a service the
+> connection, and `vendor/smithy-server-runtime/src/multi_service_router.rs:590-593` strips a
+> `101`'s own hop-by-hop fields. It stays OPEN under the two reports that own it —
+> `20261104T160000Z-apigatewayv2-websocket-execute-api-upgrade-remains-unservable.md` and
+> `20261023T124140Z-apigatewayv2-websocket-duplex-data-plane-is-not-served.md` — and one core
+> seam closes all three. The six `client-initiated-close-invokes-disconnect-route`,
+> `websocket-*` replay keys below belong to that cause and to those reports._
+>
+> _Two further behaviours those checks also need are NOT in this fix and have no report of
+> their own yet: the Lambda resource-policy gate that refuses an invoke of a function API
+> Gateway may not call (`...stage-variable-target-without-invoke-permission-rejected`), and
+> the three CORS checks, whose requests carry an `Origin` header: the router refuses a request
+> it names an operation for when the browser-set headers say a browser sent it from another
+> site (`vendor/smithy-server-runtime/src/multi_service_router.rs:362`), and hands an
+> `OperationContext` to no request it does not name one for, so such an invoke is served from
+> the seam that carries no transport and its integration is reported as the class it falls
+> into rather than performed. Closing those three needs a core seam that lets a named
+> data-plane operation supply (or opt out of) that browser verdict._
+
 > _Split out of `issues/things-that-now-work/20261024T120951Z-apigatewayv2-the-execute-api-data-plane-never-serves.md`, whose causes 3 to 8 are fixed or already served (`CreateVpcLink` now resolves its `SubnetIds` against EC2 and requires one VPC, `ResetAuthorizersCache` is implemented, `CreateDomainName` refuses an empty `DomainNameConfigurations`, `GetRoutes` refuses a `NextToken` it never issued, a stage variable inside the documented character set is accepted, and a completed stack's `Outputs` carry an `OutputValue`). This report carries the replay keys of that report's causes 1 and 2, which do NOT pass, re-filed here so they are not recorded as working. Everything below is what that fix established about them; a later fixer starts from here rather than from scratch._
 >
 > _One further check of the parent, `apigatewayv2.http-proxy-stage-variable-selects-backend-host`, now gets past its own `CreateStage` assertion (the parent's cause 6, pinned by `services/service-com-amazonaws-apigatewayv2-apigatewayv2/tests/all/stage_variable_values.rs`) and cannot complete for cause 1 below; its replay key (`apigatewayv2|CreateStage|BadRequestException`) stays with the parent._

@@ -167,6 +167,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+        // And the DATA-PLANE state its stages accumulated goes with it: the decisions its
+        // authorizers cached and the throttle buckets its routes were metered with belong to
+        // an api that no longer exists, and an api later minted the same id must not inherit
+        // them.
+        store.authorizer_cache.clear_api(&input.api_id);
+        store.route_throttles.clear_api(&input.api_id);
 
         Ok(DeleteApiOutput)
     }

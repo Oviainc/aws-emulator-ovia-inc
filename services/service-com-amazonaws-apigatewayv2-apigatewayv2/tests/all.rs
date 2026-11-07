@@ -79,6 +79,8 @@ mod domain_name_lifecycle;
 mod domain_name_pagination;
 #[path = "all/empty_answer_framing.rs"]
 mod empty_answer_framing;
+#[path = "all/http_api_backend_dispatch.rs"]
+mod http_api_backend_dispatch;
 #[path = "all/http_api_cors_data_plane.rs"]
 mod http_api_cors_data_plane;
 #[path = "all/http_api_integration_fault_status.rs"]

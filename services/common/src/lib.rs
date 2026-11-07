@@ -450,6 +450,9 @@ pub mod shared_path;
 /// The ONE list of SQL functions caller SQL may call, for every data plane that runs it on
 /// the in-process SQLite engine.
 pub mod sqlite_confinement;
+/// The ONE token bucket an emulated service meters a caller-driven request rate with, for
+/// every service whose model publishes a rate-and-burst pair.
+pub mod token_bucket;
 pub mod validation;
 pub mod validation_message;
 /// The web identity tokens this emulator itself issued: the registry a redeemer of one

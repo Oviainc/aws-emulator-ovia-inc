@@ -408,7 +408,12 @@ fn a_cognito_jwt_authorizer_gates_a_deployed_http_api_route() {
         .name("apigatewayv2-cognito-jwt".to_string())
         .stack_size(BOOT_STACK_SIZE)
         .spawn(|| {
+            // Timers ENABLED, which is what the emulator's own boot path builds
+            // (`core/router/src/main.rs` builds its runtime with `enable_all`): the HTTP
+            // api's data plane gives the route's integration the deadline the integration's
+            // own `TimeoutInMillis` states, and a runtime with no timer cannot hold one.
             let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
                 .build()
                 .expect("build a current-thread runtime");
             runtime.block_on(async {

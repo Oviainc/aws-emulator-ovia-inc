@@ -9,22 +9,16 @@
 //! "Resets all authorizer cache entries on a stage" — a cache entry is a decision an
 //! authorizer in front of a route ALREADY returned for some identity, kept for its
 //! `AuthorizerResultTtlInSeconds`, so the entries a stage holds are exactly the decisions
-//! this emulator has obtained for it. It obtains none: the data plane cannot invoke a
-//! `REQUEST` authorizer's function at all (`crate::service::invoke`'s
-//! `authorization_refusal`, which answers the gateway's 500 for one), and a `JWT`
-//! authorizer's token is evaluated per request and never cached — AWS caches no JWT result
-//! either, since `AuthorizerResultTtlInSeconds` is a `REQUEST` authorizer's member. So
-//! there is no entry to remove, the postcondition this call asks for already holds, and
-//! the answer is the modelled 204 rather than work reported for something nothing did.
-//! Nothing is written: this call changes no resource a later reader sees.
+//! the data plane has obtained for it (`crate::state::authorizer_cache`, filled by
+//! `crate::service::invoke`'s `REQUEST` authorizer dispatch). Every one of THIS stage's is
+//! removed, so the next request to a route of it is decided by the authorizer's function
+//! again rather than by what that function answered before — which is the whole observable
+//! effect of the call, and is why the entries are keyed by the stage they were decided for.
 //!
-//! That is true only while the crate caches no authorizer decision. The moment the data
-//! plane can invoke a `REQUEST` authorizer and keep its result for
-//! `AuthorizerResultTtlInSeconds` — the open reports
-//! `20261029T070719Z-apigatewayv2-lambda-a-request-authorizer-gated-route-never-serves.md` and
-//! `20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md` own
-//! the runtime that gap needs — this handler is where that store is emptied, and the checks
-//! that watch a reset change what an invoke answers cannot pass before then.
+//! A `JWT` authorizer's token is evaluated per request and never cached, here or at AWS:
+//! `AuthorizerResultTtlInSeconds` is a `REQUEST` authorizer's member, so a reset changes
+//! nothing about a JWT-gated route. The call is idempotent — a second reset finds the
+//! entries already gone and answers the same 204.
 //!
 //! What IS computed from persisted state is the refusal: the `ApiId` and the `StageName`
 //! address a stage of an api, and a label that resolves to nothing is the modelled
@@ -209,11 +203,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "ResetAuthorizersCache",
             ));
         };
-        // A stage holds no cached authorizer decision in this emulator (see the module
-        // docs), so the reset removes nothing and this reads the store without writing to
-        // it: what the call still has to compute from persisted state is whether the stage
-        // it addresses exists.
-        let store = state.lock();
+        // The reset TAKES AWAY what the stage's authorizers have already decided, which is
+        // the resource this call addresses, so the store is taken for writing. Which stage
+        // the entries belong to is resolved first: a call that names no stage removes
+        // nothing.
+        let mut store = state.lock();
 
         // Each label of the path is resolved in turn, and a level that names nothing is the
         // modelled 404, reported the way every other reader and writer of that level
@@ -239,9 +233,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(NO_AUTHORIZERS_CACHE_MESSAGE.to_string()));
         }
 
-        // The stage exists and holds no cache entry, which is the state this call asks
-        // for: the modelled empty output at 204, and idempotent — a second call answers
-        // the same.
+        // The stage exists, so every decision its authorizers have cached is taken away:
+        // "Resets all authorizer cache entries on a stage", after which the next request to
+        // a route of this stage is decided by its authorizer's function again rather than
+        // by what that function answered before. The modelled empty output at 204, and
+        // idempotent — a second call removes nothing and answers the same.
+        let removed = store
+            .authorizer_cache
+            .clear_stage(&input.api_id, &input.stage_name);
+        ::tracing::debug!(
+            api_id = %input.api_id,
+            stage = %input.stage_name,
+            removed,
+            "reset the authorizer cache entries of this stage"
+        );
         Ok(ResetAuthorizersCacheOutput)
     }
 }

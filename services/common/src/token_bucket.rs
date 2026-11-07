@@ -1,0 +1,150 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The ONE token bucket an emulated service meters a caller-driven request rate with.
+//!
+//! Several AWS services publish a request rate as a PAIR — a steady-state rate and a burst —
+//! and document the pair as the token bucket that admits requests: API Gateway's usage-plan
+//! `ThrottleSettings` ("`rateLimit` … the API request steady-state rate limit", "`burstLimit`
+//! … the API request burst limit", "provided by the token bucket algorithm") and API Gateway
+//! v2's per-route `RouteSettings` (`ThrottlingRateLimit` / `ThrottlingBurstLimit`) are the
+//! same reading of the same algorithm. Two services asked whether a request is admitted must
+//! not answer differently, and a second hand-written copy of the arithmetic is also a second
+//! chance to get the refill or the cap wrong, so the bucket lives here once.
+//!
+//! What stays with the service is everything ABOUT ITS OWN MODEL: which members declare the
+//! pair, what an absent or non-positive member means for that resource, and what the thing
+//! being metered is keyed by. This module owns only the bucket: how much capacity is left,
+//! how it refills, and whether one request may be admitted.
+//!
+//! Nothing here sleeps or waits: the capacity is computed from how much time has passed
+//! since the last admitted request, so a caller that was idle finds its whole burst again
+//! and a caller that was not finds what the rate refilled.
+//!
+//! Two services still carry their own copy of this arithmetic, each pinned by its own
+//! suites and each to be MIGRATED onto this module in the change that owns that service
+//! rather than copied again:
+//! `service-com-amazonaws-apigateway-backplanecontrolservice/src/state.rs` (`ThrottleLimits`
+//! + `ThrottleBucket`, metering a usage plan's `ThrottleSettings`) and
+//! `service-com-amazonaws-xray-awsxray/src/state.rs` (`RateLimiter`, whose `burst` /
+//! `per_second` / `last_refill` are the same bucket over a per-account request budget).
+
+/// The request rate one metered thing is admitted at, as the bucket reads it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Limits {
+    /// The requests per second the bucket refills at.
+    pub rate: f64,
+    /// The most requests admissible at once — the bucket's capacity.
+    pub burst: f64,
+}
+
+/// The capacity one metered thing has left, and the instant that was last computed at.
+#[derive(Debug, Clone, Copy)]
+pub struct Bucket {
+    tokens: f64,
+    at: ::std::time::Instant,
+}
+
+/// The capacity one request takes out of a bucket.
+const ONE_REQUEST: f64 = 1.0;
+
+impl Bucket {
+    /// A bucket holding `limits.burst` requests as of `now`: a caller that has sent nothing
+    /// may burst up to the capacity.
+    #[must_use]
+    pub fn full(limits: Limits, now: ::std::time::Instant) -> Self {
+        Self {
+            tokens: limits.burst,
+            at: now,
+        }
+    }
+
+    /// Admit one request and record it, or report that `limits` admit none at `now`.
+    ///
+    /// The refill is the time since the last request times the rate, capped at the burst:
+    /// the bucket never holds more than the capacity however long the caller has been idle,
+    /// which is what makes the steady-state rate the rate. The limits are passed per call
+    /// rather than held, so limits a resource is UPDATED to take effect on the next request
+    /// instead of on a bucket frozen at the old ones.
+    pub fn admits(&mut self, limits: Limits, now: ::std::time::Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * limits.rate).min(limits.burst);
+        self.at = now;
+        if self.tokens < ONE_REQUEST {
+            return false;
+        }
+        self.tokens -= ONE_REQUEST;
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_bucket_admits_its_burst_and_then_what_the_rate_refilled() {
+        let start = Instant::now();
+        let limits = Limits {
+            rate: 2.0,
+            burst: 2.0,
+        };
+        let mut bucket = Bucket::full(limits, start);
+        // Rows differ along WHEN the request arrives: inside the burst, past it, and after
+        // enough time for the rate to refill one request's capacity.
+        let cases: [(&str, Duration, bool); 5] = [
+            ("the first request of the burst", Duration::ZERO, true),
+            ("the second request of the burst", Duration::ZERO, true),
+            ("one past the burst", Duration::ZERO, false),
+            ("still past it a moment later", Duration::from_millis(100), false),
+            ("once the rate refilled a request", Duration::from_millis(600), true),
+        ];
+        for (case, elapsed, expected) in cases {
+            let actual = bucket.admits(limits, start + elapsed);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected admitted {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bucket_never_holds_more_than_its_burst_and_one_with_none_admits_nothing() {
+        let start = Instant::now();
+        // However long a caller has been idle, the capacity is the burst: three requests
+        // after an hour of silence, where the burst is two, is one too many.
+        let limits = Limits {
+            rate: 1_000.0,
+            burst: 2.0,
+        };
+        let mut bucket = Bucket::full(limits, start);
+        let idle = start + Duration::from_secs(3_600);
+        let admitted = [
+            bucket.admits(limits, idle),
+            bucket.admits(limits, idle),
+            bucket.admits(limits, idle),
+        ];
+        assert_eq!(
+            admitted,
+            [true, true, false],
+            "case {:?}: expected the burst and no more, got {admitted:?}",
+            "three requests after an hour of silence"
+        );
+        // A bucket with no capacity admits nothing, however long it is left.
+        let empty = Limits {
+            rate: 0.0,
+            burst: 0.0,
+        };
+        let mut none = Bucket::full(empty, start);
+        for (case, elapsed) in [
+            ("the first request", Duration::ZERO),
+            ("a request a minute later", Duration::from_secs(60)),
+        ] {
+            let actual = none.admits(empty, start + elapsed);
+            assert!(
+                !actual,
+                "case {case:?}: a bucket with no capacity must admit nothing, got {actual}"
+            );
+        }
+    }
+}

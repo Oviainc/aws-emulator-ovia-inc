@@ -55,20 +55,33 @@
 //!   with: which handshakes this service claims ([`websocket::claims_parts`]) and what each
 //!   is answered with ([`websocket::serve`], reached from [`Service::override_routing_error`]);
 //! - [`invoke`] — an ordinary HTTP request to a route of a deployed HTTP api stage: the
-//!   claim ([`invoke::claims_parts`]), and the serving ([`invoke::serve`]) from the ONE
-//!   serving seam — [`Service::override_routing_error`], which the router reaches BEFORE
-//!   authentication, for every invoke whatever credential it carries.
+//!   claim ([`invoke::claims_parts`]), and the serving ([`invoke::serve`]) as an OPERATION
+//!   of this service's own ([`Service::override_operation`]), which is how the router hands
+//!   it the `OperationContext` carrying the in-process transport the matched route's
+//!   integration is performed over. It declares no auth scheme, so the router serves it
+//!   whatever credential it carries, and it names no modelled operation, so the generated
+//!   routing table is untouched.
 //!
-//! An invoke is not named as an OPERATION, which is how a service asks the router to verify
-//! a credential before anything is served, because the router verifies a named operation's
-//! SigV4 credential against the signing name of the service that CLAIMED the request, and
-//! this service's is its control plane's (`apigateway`). An invoke of a deployed stage is
-//! signed under the data plane's own signing name instead — the `execute-api` service AWS
-//! publishes the invoke endpoint and the `execute-api:Invoke` action under — so a correctly
-//! signed invoke never matches that name and is refused before the stage is reached,
-//! whatever the api's records say. What a route's `AuthorizationType` requires of the
-//! request is unchanged: `AWS_IAM` still admits only a request that CARRIES a SigV4
-//! credential ([`invoke::carries_sigv4_credential`]), and refuses one that carries none.
+//! An invoke is not named as one of the MODELLED operations, which is how a service asks the
+//! router to verify a credential before anything is served, because the router verifies a
+//! named operation's SigV4 credential against the signing name of the service that CLAIMED
+//! the request, and this service's is its control plane's (`apigateway`). An invoke of a
+//! deployed stage is signed under the data plane's own signing name instead — the
+//! `execute-api` service AWS publishes the invoke endpoint and the `execute-api:Invoke`
+//! action under — so a correctly signed invoke never matches that name and would be refused
+//! before the stage is reached, whatever the api's records say. What a route's
+//! `AuthorizationType` requires of the request is unchanged: `AWS_IAM` still admits only a
+//! request that CARRIES a SigV4 credential ([`invoke::carries_sigv4_credential`]), and
+//! refuses one that carries none.
+//!
+//! One invoke is served from the ROUTING-ERROR seam instead, and
+//! [`front_door_refuses_as_cross_site`] states why: the router refuses a request it names an
+//! operation for when the browser-set headers say a browser sent it from another site, and
+//! it applies that check to no request it does not name one for. So an invoke carrying such
+//! a header is left unnamed and answered there, where every step up to the integration is
+//! the same and the integration is reported as the class it falls into
+//! ([`invoke::serve_without_transport`]) — rather than refused by the front door before this
+//! service sees it.
 //!
 //! Beside those two there is a THIRD data plane, addressed on the domain every portal this
 //! service mints reports (`EndpointConfigurationResponse$PortalDefaultDomainName`):
@@ -113,7 +126,9 @@ mod websocket;
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::{ProtocolError, ServerProtocol, Violation, ViolationKind};
-use smithy_server_runtime::{http, Refusal, Refused, Service};
+use smithy_server_runtime::{
+    http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,
+};
 use std::sync::Arc;
 
 /// The status whose answer carries NO content, whatever a serializer rendered for it, and
@@ -238,6 +253,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// [`invoke`]) are decided and served from seams the generated entry does not reach: a
     /// claim and a routing-error answer, both of which read this service's own records.
     engine: Arc<Eng>,
+    /// The HTTP api's `execute-api` data plane as an operation, which is how the router
+    /// hands it the [`OperationContext`] its integration hop goes over. See
+    /// [`HttpApiDataPlane`].
+    data_plane: HttpApiDataPlane<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -247,9 +266,83 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            data_plane: HttpApiDataPlane {
+                engine: Arc::clone(&engine),
+            },
             engine,
         }
     }
+}
+
+/// The HTTP `execute-api` data plane as an [`ErasedOperation`], so the router hands it the
+/// [`OperationContext`] carrying the in-process transport the matched route's integration
+/// is performed over ([`invoke`]).
+///
+/// It holds the SAME shared engine the generated entry threads into every operation, so the
+/// data plane reads the one store the control-plane operations write.
+struct HttpApiDataPlane<Eng> {
+    engine: Arc<Eng>,
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for HttpApiDataPlane<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            if invoke::claims_request(&*self.engine, req) {
+                return invoke::serve(&*self.engine, req, ctx).await;
+            }
+            // Unreachable: `override_operation` names this only for a request the data
+            // plane claims.
+            svc.definition().routing_error_response(req)
+        })
+    }
+
+    /// NO auth scheme, which is what the router reads as "served unsigned".
+    ///
+    /// An invoke of a deployed stage is not a modelled operation of this service, and the
+    /// credential it carries is not this service's to verify: the router verifies a named
+    /// operation's SigV4 credential against the signing name of the service that CLAIMED
+    /// the request, and this service's is its control plane's (`apigateway`), while an
+    /// invoke is signed under the data plane's own (`execute-api`). Declaring no scheme is
+    /// what lets the stage answer a correctly signed invoke at all, and it leaves the
+    /// modelled operations untouched: the router reads the schemes off the MODELLED
+    /// operation first, and every control-plane request resolves one.
+    ///
+    /// What a route's `AuthorizationType` requires of the request is unchanged — `AWS_IAM`
+    /// still admits only a request that CARRIES a SigV4 credential
+    /// ([`invoke::carries_sigv4_credential`]), and refuses one that carries none.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+}
+
+/// Whether the FRONT DOOR refuses this request before a named operation of this service is
+/// reached, because its browser-set headers say a browser sent it from another site.
+///
+/// The router applies that check to every request it NAMES AN OPERATION for, and to no
+/// request it does not, with the same reading this calls
+/// (`emulator_server::classify_browser_request` over same-origin-only). So an invoke
+/// carrying such a header is left unnamed and answered through
+/// [`Service::override_routing_error`] below — the one seam that still answers it — where
+/// the api's own `CorsConfiguration` still decorates the answer and every refusal the
+/// gateway owes it is still computed. What it cannot do from there is PERFORM the route's
+/// integration, because that seam carries no transport to perform it over
+/// ([`invoke::serve_without_transport`]).
+fn front_door_refuses_as_cross_site(req: &RtRequest) -> bool {
+    let header = |name: &str| req.headers().get(name);
+    matches!(
+        ::emulator_server::classify_browser_request(
+            header("origin"),
+            header("sec-fetch-site"),
+            &::emulator_server::RemoteOrigins::SameOriginOnly,
+            false,
+        ),
+        ::emulator_server::BrowserVerdict::Forbid(_)
+    )
 }
 
 /// The protocol this service answers modelled requests in: the model's own, with the one
@@ -344,13 +437,13 @@ impl<Eng: Send + Sync + 'static> std::fmt::Debug for EmulatedService<Eng> {
     }
 }
 
-// `Service::override_operation` is deliberately NOT overridden here: this service names no
-// operation of its own, so the generated routing table resolves every request it serves,
-// and an invoke of a deployed stage is left unnamed. Naming an operation is how a service
-// asks the router to verify a credential, and the router verifies it against THIS service's
-// own signing name, which is its control plane's, while an invoke is signed under the data
-// plane's own — so such an invoke is answered by `override_routing_error` below, which the
-// router reaches before authentication. The module docs state the whole rule.
+// `Service::override_operation` below names ONE operation of this service's own: the HTTP
+// `execute-api` data plane, which is how the router hands an invoke the
+// `OperationContext` the matched route's integration is performed over. Every modelled
+// request still resolves through the generated routing table, which this override is asked
+// ahead of and declines. An invoke the front door would refuse before a named operation is
+// reached is left unnamed and answered by `override_routing_error` below; the module docs
+// state the whole rule.
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
@@ -392,6 +485,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         websocket::claims_parts(&*self.engine, parts)
             || invoke::claims_parts(&*self.engine, parts)
             || portal::claims_parts(&*self.engine, parts)
+    }
+
+    fn override_operation(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
+        // An invoke of a deployed HTTP api stage is named as an operation so the router
+        // hands it the `OperationContext`: the route's integration is a hop to another
+        // emulated service, and that context carries the only in-process transport it can
+        // be made over. It names no MODELLED operation by construction (its path is a
+        // stage's, not a `/v2/…` route's), so this takes nothing away from the generated
+        // routing table, and it declares no auth scheme, so the router serves it whatever
+        // credential it carries.
+        //
+        // Except where the front door would refuse it first: see
+        // [`front_door_refuses_as_cross_site`].
+        if front_door_refuses_as_cross_site(req) {
+            return None;
+        }
+        invoke::claims_request(&*self.engine, req)
+            .then_some(&self.data_plane as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -457,7 +568,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             return Some(websocket::serve(&*self.engine, req));
         }
         if invoke::claims_request(&*self.engine, req) {
-            return Some(invoke::serve(&*self.engine, req));
+            return Some(invoke::serve_without_transport(&*self.engine, req));
         }
         // And a visit to the website a published portal serves on its own domain, which
         // likewise names no modelled operation and carries no AWS credential.

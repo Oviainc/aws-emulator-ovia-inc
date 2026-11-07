@@ -22,9 +22,11 @@
 //! VPC link is placed in are Amazon EC2's resources, so they are resolved against the
 //! service that owns them in [`ec2_subnets`].
 
+pub mod authorizer_cache;
 pub mod ec2_subnets;
 mod network;
 pub mod paging;
+pub mod route_throttle;
 pub mod selection_expression;
 pub mod wire_status;
 
@@ -861,9 +863,23 @@ pub fn default_integration_method(
     integration_type: &str,
     integration_subtype: Option<&str>,
 ) -> Option<&'static str> {
-    let is_lambda_proxy =
-        integration_type == AWS_PROXY_INTEGRATION_TYPE && integration_subtype.is_none();
-    is_lambda_proxy.then_some(LAMBDA_INVOKE_INTEGRATION_METHOD)
+    is_lambda_proxy_integration(integration_type, integration_subtype)
+        .then_some(LAMBDA_INVOKE_INTEGRATION_METHOD)
+}
+
+/// Whether this type and subtype name the LAMBDA PROXY integration: `AWS_PROXY` naming no
+/// `IntegrationSubtype`.
+///
+/// The one reading of that pair, because three rules turn on it — the method the service
+/// supplies ([`default_integration_method`]), the payload format versions the integration
+/// admits ([`validate_payload_format_version`]), and whether the data plane serves the route
+/// by invoking a function (`crate::service::invoke`) — and they must not disagree about
+/// which integrations are Lambda proxy ones.
+pub fn is_lambda_proxy_integration(
+    integration_type: &str,
+    integration_subtype: Option<&str>,
+) -> bool {
+    integration_type == AWS_PROXY_INTEGRATION_TYPE && integration_subtype.is_none()
 }
 
 /// The `TimeoutInMillis` an integration of an HTTP API gets when the request names
@@ -986,6 +1002,18 @@ pub struct ComAmazonawsApigatewayv2Apigatewayv2State {
     /// Drives [`ComAmazonawsApigatewayv2Apigatewayv2State::mint_domain_name_id`]; see
     /// [`mint_id`] for how an id is derived from it.
     pub domain_name_id_seed: u64,
+    /// The decisions this account's Lambda authorizers have already made, while they are
+    /// live: "API Gateway caches authorizer responses" for the TTL the authorizer declares
+    /// (`Authorizer$AuthorizerResultTtlInSeconds`). It lives beside the apis rather than
+    /// inside one because it is DATA-PLANE state — what has been decided, not what was
+    /// configured — and `ResetAuthorizersCache` takes away the entries of one stage
+    /// ([`authorizer_cache::AuthorizerCache::clear_stage`]).
+    pub authorizer_cache: authorizer_cache::AuthorizerCache,
+    /// How much of each metered route's throttle the requests already served have taken:
+    /// the token bucket a stage's `RouteSettings` meter a route with
+    /// (`ThrottlingRateLimit` / `ThrottlingBurstLimit`). Data-plane state, like
+    /// [`Self::authorizer_cache`], so it lives beside the apis rather than inside one.
+    pub route_throttles: route_throttle::RouteThrottles,
 }
 
 impl ComAmazonawsApigatewayv2Apigatewayv2State {
@@ -1993,9 +2021,7 @@ pub fn validate_payload_format_version(
     let Some(version) = payload_format_version else {
         return Ok(());
     };
-    let is_lambda_proxy =
-        integration_type == AWS_PROXY_INTEGRATION_TYPE && integration_subtype.is_none();
-    let supported = if is_lambda_proxy {
+    let supported = if is_lambda_proxy_integration(integration_type, integration_subtype) {
         LAMBDA_PROXY_PAYLOAD_FORMAT_VERSIONS
     } else {
         &[ONLY_PAYLOAD_FORMAT_VERSION]

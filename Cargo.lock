@@ -7549,18 +7549,22 @@ dependencies = [
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
  "aws-sdk-ec2",
+ "aws-sdk-lambda",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
+ "base64 0.22.1",
  "bytes",
  "hex",
  "http",
  "serde_json",
  "service-com-amazonaws-ec2-amazonec2",
+ "service-com-amazonaws-lambda-awsgirapiservice",
  "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
+ "zip",
 ]
 
 [[package]]
