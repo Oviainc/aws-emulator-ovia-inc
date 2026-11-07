@@ -344,12 +344,13 @@ async fn the_data_flow_members_decide_what_a_state_reads_and_writes() {
             ),
         },
         RunCase {
-            // `States.Hash` names MD5 and SHA-1 among its algorithms, which this
-            // emulator does not take a dependency on; like any name the intrinsic
-            // allow-list does not carry, it is reported rather than approximated.
-            case: "an intrinsic this emulator declines is not faked",
-            definition: r#"{"StartAt":"A","States":{"A":{"Type":"Pass","Parameters":{"digest.$":"States.Hash($.text, 'SHA-256')"},"End":true}}}"#,
-            input: r#"{"text":"abc"}"#,
+            // Every intrinsic the language documents is evaluated (the digests
+            // `States.Hash` computes are `tests/all/intrinsic_functions.rs`); a name
+            // the language does not define is not one, and is reported rather than
+            // approximated.
+            case: "an intrinsic name the language does not define is not faked",
+            definition: r#"{"StartAt":"A","States":{"A":{"Type":"Pass","Parameters":{"product.$":"States.MathMultiply($.n, 2)"},"End":true}}}"#,
+            input: r#"{"n":3}"#,
             expected: Expected::Failure("States.Runtime"),
         },
         RunCase {

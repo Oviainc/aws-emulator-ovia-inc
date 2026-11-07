@@ -51,6 +51,13 @@ aws-sigv4 = { version = "1", features = ["http1"] }
 # The identity (access key pair) that signer signs with, and the provider the
 # emulator's own callback hands out.
 aws-credential-types = "1"
+# `States.Hash` returns the hex digest of its input under one of the algorithms the
+# Amazon States Language names (MD5, SHA-1, SHA-256, SHA-384, SHA-512), each computed
+# by the maintained implementation of it rather than written here.
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = { workspace = true }
+hex = { workspace = true }
 # JSONPath: the query language every Amazon States Language `*Path` member is
 # written in, evaluated by this maintained RFC 9535 implementation rather than a
 # hand-written subset.
@@ -79,8 +86,6 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 # The service a `Task` state's integration call is made to in `tests/all/task_integrations.rs`:
 # mounted beside Step Functions on the one engine the test router builds, the same shape
 # `core/router/src/lib.rs` mounts them in, so the call a task makes is served for real.

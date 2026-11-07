@@ -11,7 +11,7 @@
 //! name is retried and caught exactly as the state declares.
 //!
 //! The table spans the constructs that raise `States.Runtime` — an intrinsic
-//! invocation that cannot be evaluated, an intrinsic name the service does not carry,
+//! invocation that cannot be evaluated, an intrinsic name the language does not define,
 //! a transition to a state the definition does not declare, a path the service does
 //! not follow, an item source that is not an array — against the controls in the same
 //! shape, whose errors ARE retriable and catchable: a `Fail` state's own error name
@@ -77,15 +77,15 @@ fn cases() -> Vec<FailureCase> {
             caught_error: "",
         },
         FailureCase {
-            case: "an intrinsic name this service does not carry",
+            case: "an intrinsic name the language does not define",
             failing: json!({
                 "Type": "Pass",
-                "Parameters": { "v.$": "States.Hash($.text, 'SHA-256')" },
+                "Parameters": { "v.$": "States.MathMultiply($.num, 2)" },
                 "Next": "Boom",
             }),
-            input: r#"{"text":"abc"}"#,
+            input: r#"{"num":3}"#,
             terminal_error: Some("States.Runtime"),
-            cause_names: "States.Hash",
+            cause_names: "States.MathMultiply",
             caught_error: "",
         },
         FailureCase {

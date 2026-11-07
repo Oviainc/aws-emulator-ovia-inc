@@ -78,11 +78,7 @@
 //!
 //! Reaching one of those ends the execution in the service's own failure state:
 //! `FAILED`, with the ASL-documented [`RUNTIME_ERROR`] name and a cause that says
-//! exactly what was not run. Nothing is synthesised to look as though it ran. One
-//! documented intrinsic, `States.Hash`, is DECLINED for a different reason: the
-//! algorithms it names include MD5 and SHA-1, and this emulator does not take a
-//! dependency on broken hash functions to evaluate a payload template; it answers
-//! [`RUNTIME_ERROR`], as any unknown intrinsic does.
+//! exactly what was not run. Nothing is synthesised to look as though it ran.
 //!
 //! ## What is validated
 //!
@@ -460,12 +456,13 @@ pub const MAX_INTERPRET_DURATION: Duration = Duration::from_secs(2);
 /// client, or an EventBridge rule firing on its own schedule) is answered inside it.
 pub const MAX_CALL_WAIT_DURATION: Duration = Duration::from_secs(30);
 
-/// The most values `States.ArrayRange` builds.
+/// The most values `States.ArrayRange` builds: its published limit of "1000 items",
+/// past which the function fails rather than returning an oversized array.
 ///
-/// Emulator bound: the array is built from three numbers, so its length is not
-/// bounded by the size of anything the caller sent. Each value is a number, so this
-/// keeps the array inside what a state's output may carry.
-pub const MAX_ARRAY_RANGE_VALUES: usize = 10_000;
+/// Each value is a number, so this also keeps the array inside what a state's output
+/// may carry — which matters because the array is built from three numbers, so its
+/// length is not bounded by the size of anything the caller sent.
+pub const MAX_ARRAY_RANGE_VALUES: usize = 1_000;
 
 /// The most items an array an intrinsic function walks may carry.
 ///
@@ -487,6 +484,10 @@ pub const MAX_DEFINITION_DEPTH: usize = 128;
 /// The most characters `States.Base64Encode`/`States.Base64Decode` accept: "You can
 /// encode input data up to 10,000 characters."
 pub const MAX_BASE64_CHARS: usize = 10_000;
+
+/// The most characters `States.Hash` hashes: its published maximum input size of
+/// 10,000 characters.
+pub const MAX_HASH_CHARS: usize = 10_000;
 
 /// The most bytes a `Fail` state's `Error` and `Cause` may carry: the maxima of the
 /// modelled `SensitiveError` (0..256) and `SensitiveCause` (0..32768) shapes

@@ -71,8 +71,8 @@ pub(super) fn invoke_intrinsic(
         }
         values.push(value);
     }
-    let result =
-        apply_intrinsic(name, &values).map_err(|why| runtime(format!("'{text}': {why}")))?;
+    let result = apply_intrinsic(name, &values, &arguments)
+        .map_err(|why| runtime(format!("'{text}': {why}")))?;
     // And what it built is bounded too, because a function may expand what it was
     // given.
     measure_payload(&result, "an intrinsic function")?;
@@ -140,7 +140,7 @@ pub(super) fn argument_value(
     if text.starts_with('$') {
         return select(text, input, context);
     }
-    if let Some(quoted) = text.strip_prefix('\'').and_then(|rest| rest.strip_suffix('\'')) {
+    if let Some(quoted) = quoted_literal(text) {
         // "escape ... the following characters: ' { } \" with a backslash.
         let mut unescaped = String::with_capacity(quoted.len());
         let mut characters = quoted.chars();
@@ -162,14 +162,57 @@ pub(super) fn argument_value(
     })
 }
 
+/// The inside of an intrinsic argument written as a single-quoted string LITERAL,
+/// with its backslash escapes still in place; `None` for an argument that is a path,
+/// a nested invocation or a JSON literal.
+pub(super) fn quoted_literal(text: &str) -> Option<&str> {
+    text.trim()
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+}
+
+/// The hashing algorithms `States.Hash` names — "MD5, SHA-1, SHA-256, SHA-384 and
+/// SHA-512" — each computed by the maintained implementation of it.
+///
+/// The list is the function's own: an algorithm is in it because the language's
+/// `States.Hash` documents it, so a definition asking for one gets the digest the
+/// real service would return. The digest is a DATA TRANSFORMATION a payload template
+/// asked for and nothing else — nothing in this emulator decides anything on one, so
+/// MD5 and SHA-1 are here as members of a published catalog rather than as a choice
+/// of cryptography.
+pub(super) const HASH_ALGORITHMS: &[&str] = &["MD5", "SHA-1", "SHA-256", "SHA-384", "SHA-512"];
+
+/// `data` hashed with one of [`HASH_ALGORITHMS`], as the lowercase hex digest
+/// `States.Hash` returns; `None` for a name that is not one of them.
+fn hash_hex(algorithm: &str, data: &[u8]) -> Option<String> {
+    // One `Digest` trait, implemented by each of the three crates below.
+    use ::sha2::Digest as _;
+    Some(match algorithm {
+        "MD5" => ::hex::encode(::md5::Md5::digest(data)),
+        "SHA-1" => ::hex::encode(::sha1::Sha1::digest(data)),
+        "SHA-256" => ::hex::encode(::sha2::Sha256::digest(data)),
+        "SHA-384" => ::hex::encode(::sha2::Sha384::digest(data)),
+        "SHA-512" => ::hex::encode(::sha2::Sha512::digest(data)),
+        _ => return None,
+    })
+}
+
 /// Apply one intrinsic function to its evaluated arguments.
 ///
-/// The set below is every documented intrinsic except `States.Hash`, which is
-/// DECLINED: the algorithms it names include MD5 and SHA-1, and this emulator does
-/// not take a dependency on broken hash functions to evaluate a state's payload
-/// template. Like any other name this closed allow-list does not carry, it is
-/// reported with [`RUNTIME_ERROR`] rather than approximated.
-pub(super) fn apply_intrinsic(name: &str, arguments: &[Value]) -> Result<Value, String> {
+/// `raw` carries each argument's own TEXT, as the invocation wrote it, because the
+/// backslash escaping of `'`, `{`, `}` and `\` is syntax of that text rather than of
+/// the value it denotes: `States.Format` therefore scans its template from the
+/// literal the invocation carries, where a brace an escape made literal is data and
+/// consumes no argument.
+///
+/// The set below is every documented intrinsic. Like any other name this closed
+/// allow-list does not carry, one outside it is reported with [`RUNTIME_ERROR`]
+/// rather than approximated.
+pub(super) fn apply_intrinsic(
+    name: &str,
+    arguments: &[Value],
+    raw: &[String],
+) -> Result<Value, String> {
     let argument = |index: usize| -> Result<&Value, String> {
         arguments
             .get(index)
@@ -207,13 +250,22 @@ pub(super) fn apply_intrinsic(name: &str, arguments: &[Value]) -> Result<Value, 
 
     match name {
         "States.Format" => {
-            let template = string(0)?;
+            // A brace pair is a placeholder only where the invocation wrote it BARE:
+            // inside a quoted literal a backslash makes the character after it data,
+            // so `\{`, `\}`, `\'` and `\\` stand for themselves and consume no
+            // argument. The escapes are therefore applied HERE, over the literal's
+            // own text, and not a second time over the value it denotes. A template
+            // that came from a path or a nested invocation is not invocation text, so
+            // a backslash in it is data of its own.
+            let selected = string(0)?;
+            let literal = raw.first().and_then(|text| quoted_literal(text));
+            let template = literal.unwrap_or(selected.as_str());
             let mut rendered = String::with_capacity(template.len());
             let mut next = 1usize;
             let mut characters = template.chars().peekable();
             while let Some(character) = characters.next() {
                 match character {
-                    '\\' => {
+                    '\\' if literal.is_some() => {
                         if let Some(escaped) = characters.next() {
                             rendered.push(escaped);
                         }
@@ -312,7 +364,11 @@ pub(super) fn apply_intrinsic(name: &str, arguments: &[Value]) -> Result<Value, 
                 .ok_or_else(|| format!("argument 2 of '{name}' must be a JSON object"))?;
             let deep = argument(2)?.as_bool().unwrap_or(false);
             if deep {
-                return Err("a deep merge is not one this service performs".to_string());
+                // "Currently, Step Functions only supports the shallow merging mode;
+                // therefore, you must specify the Boolean value as false."
+                return Err(format!(
+                    "'{name}' performs a shallow merge, so argument 3 must be false"
+                ));
             }
             for (key, value) in second {
                 merged.insert(key.clone(), value.clone());
@@ -329,10 +385,14 @@ pub(super) fn apply_intrinsic(name: &str, arguments: &[Value]) -> Result<Value, 
                 Some(seed) => seed as u64,
                 None => super::super::now_nanos(),
             };
+            // The draw is in `[start, end)`: the end of the range is EXCLUSIVE, so
+            // the span is the DISTANCE between the bounds rather than one more than
+            // it, and a range whose bounds meet carries only its start.
+            //
             // Both bounds are caller-chosen finite numbers, so every step of this is
-            // saturating: a float-to-integer cast saturates, and the two additions
-            // would otherwise overflow for a range near the integer maxima.
-            let span = ((end - start) as u64).saturating_add(1);
+            // saturating: a float-to-integer cast saturates, and the addition would
+            // otherwise overflow for a range near the integer maxima.
+            let span = (end - start) as u64;
             let drawn = super::super::splitmix64(&mut seed) % span.max(1);
             let drawn = i64::try_from(drawn).unwrap_or(i64::MAX);
             Ok(json!((start as i64).saturating_add(drawn)))
@@ -375,6 +435,28 @@ pub(super) fn apply_intrinsic(name: &str, arguments: &[Value]) -> Result<Value, 
                 .map(|part| Value::String(part.to_string()))
                 .collect();
             Ok(Value::Array(parts))
+        }
+        // "States.Hash(data, algorithm) ... calculate the hash value of a given
+        // input", returned as the hex digest of one of the algorithms the language
+        // names, with a documented 10,000-character input limit.
+        "States.Hash" => {
+            let data = string(0)?;
+            let characters = data.chars().count();
+            if characters > MAX_HASH_CHARS {
+                return Err(format!(
+                    "the input is {characters} characters, more than the {MAX_HASH_CHARS} this \
+                     function hashes"
+                ));
+            }
+            let algorithm = string(1)?;
+            hash_hex(&algorithm, data.as_bytes())
+                .map(Value::String)
+                .ok_or_else(|| {
+                    format!(
+                        "argument 2 of '{name}' must be one of {}, not {algorithm:?}",
+                        HASH_ALGORITHMS.join(", ")
+                    )
+                })
         }
         "States.UUID" => {
             let mut seed = super::super::now_nanos();

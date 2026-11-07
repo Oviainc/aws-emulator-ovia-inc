@@ -97,6 +97,8 @@ mod history_event_provenance;
 mod integration_failure_error_names;
 #[path = "all/integration_member_names.rs"]
 mod integration_member_names;
+#[path = "all/intrinsic_functions.rs"]
+mod intrinsic_functions;
 #[path = "all/json_parse_diagnostics.rs"]
 mod json_parse_diagnostics;
 #[path = "all/jsonata_states.rs"]
