@@ -118,6 +118,10 @@ hex = { workspace = true }
 # own engine beside this one.
 service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
+# The group a served proxy integration's RUN logs to lives in the CloudWatch Logs emulator's
+# store, and `tests/all/stage_proxy_run_logs.rs` reads the delivery back through that
+# service's own `FilterLogEvents`, so it is mounted on that suite's engine too.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # The .zip deployment package such a function is created from, written in memory the way a
 # caller uploads one — the same reader/writer the Lambda crate's own invoke suites use.
 zip = { version = "9", default-features = false, features = ["deflate"] }

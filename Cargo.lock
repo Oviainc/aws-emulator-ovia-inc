@@ -7603,6 +7603,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice",
  "service-com-amazonaws-dynamodb-dynamodb-20120810",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
