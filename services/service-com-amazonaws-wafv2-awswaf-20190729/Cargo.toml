@@ -40,6 +40,12 @@ percent-encoding = "2"
 # The `BASE64_DECODE` text transformation, through the maintained coder every other
 # service in this tree decodes base64 with (ec2, lambda, secretsmanager).
 base64 = "0.22"
+# The authenticated encryption an `APIKey` value is: the key WAFv2 answers is an
+# encrypted token over the key's own definition, sealed with the maintained AEAD
+# implementation rather than a hand-rolled one (`state::api_keys`). Only the cipher
+# and the allocating interface, so the crate pulls in no random-number backend of its
+# own — the key and the nonce come from this crate's own entropy source.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 # The `HTML_ENTITY_DECODE` text transformation: the maintained decoder for HTML character
 # references, so a named, decimal or hexadecimal reference is decoded the way a browser
 # decodes it rather than by a hand-written table.

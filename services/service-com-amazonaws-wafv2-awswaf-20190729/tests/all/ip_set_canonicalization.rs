@@ -10,13 +10,17 @@
 //! its value, with the prefix length it was given — so two notations of one block are
 //! ONE entry, resubmitting the canonical list round-trips it unchanged, and a set's
 //! membership does not depend on the notation a request happened to use. An `IPV4`
-//! address has a single notation, so an `IPV4` set's entries are reported exactly as
-//! submitted.
+//! address has a single notation, so an `IPV4` set's entries are reported with the
+//! characters they were submitted with.
 //!
 //! Each suite asserts that over a TABLE spanning the class: an elided zero run at the
 //! front, in the middle and at the end, a value written out in full, upper-case
 //! digits, the all-zero and the loopback addresses, an IPv4-mapped value, every
 //! prefix length at the published bounds, and both scopes.
+//!
+//! The ORDER a read reports a whole list in is the set's own, not the submitted one;
+//! `crate::ip_set_address_order` spans that rule, so a multi-entry list is compared
+//! here as the set it names — and read-to-read, where the order must not move.
 
 use serde_json::{json, Value};
 
@@ -188,8 +192,10 @@ async fn an_ip_set_stores_every_address_in_its_familys_notation() {
     }
 }
 
-/// A whole list keeps every entry and its order, and an `UpdateIPSet` replacing it
-/// canonicalizes the replacement the same way a create does.
+/// A whole list keeps every entry, each in its family's notation, and an
+/// `UpdateIPSet` replacing it canonicalizes the replacement the same way a create
+/// does — then resubmitting what the read reported round-trips it unchanged, order
+/// included, because the stored list is a fixed point of the normalization.
 #[tokio::test]
 async fn a_whole_address_list_is_canonicalized_entry_by_entry() {
     let waf = Waf::new();
@@ -213,8 +219,8 @@ async fn a_whole_address_list_is_canonicalized_entry_by_entry() {
     .await;
     let after_create = stored_addresses(&get_ip_set(&waf, "REGIONAL", "canon-list", &id).await, case);
     assert_eq!(
-        after_create,
-        expected[..2].to_vec(),
+        as_set(&after_create),
+        as_set(&expected[..2]),
         "case {case:?}: a create must canonicalize every entry it stores, got \
          {after_create:?}"
     );
@@ -232,10 +238,44 @@ async fn a_whole_address_list_is_canonicalized_entry_by_entry() {
     .await;
     let after_update = stored_addresses(&get_ip_set(&waf, "REGIONAL", "canon-list", &id).await, case);
     assert_eq!(
-        after_update, expected,
-        "case {case:?}: an update must canonicalize every entry it stores, in the \
-         submitted order, got {after_update:?}"
+        as_set(&after_update),
+        as_set(&expected),
+        "case {case:?}: an update must canonicalize every entry it stores, got \
+         {after_update:?}"
     );
+
+    // The fixed point: an update resubmitting exactly what the read reported stores
+    // exactly that, entry for entry and in the same positions.
+    let lock = get_ip_set(&waf, "REGIONAL", "canon-list", &id).await["LockToken"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    waf.ok(
+        "UpdateIPSet",
+        json!({
+            "Name": "canon-list",
+            "Scope": "REGIONAL",
+            "Id": &id,
+            "LockToken": &lock,
+            "Addresses": &after_update,
+        }),
+    )
+    .await;
+    let round_tripped =
+        stored_addresses(&get_ip_set(&waf, "REGIONAL", "canon-list", &id).await, case);
+    assert_eq!(
+        round_tripped, after_update,
+        "case {case:?}: resubmitting the stored list must round-trip it unchanged, \
+         got {round_tripped:?}"
+    );
+}
+
+/// `entries` as the set they name, in one order, so two lists of the same entries
+/// compare equal whatever order each reports them in.
+fn as_set(entries: &[String]) -> Vec<String> {
+    let mut members = entries.to_vec();
+    members.sort();
+    members
 }
 
 /// Canonicalization is what makes the set's membership well defined: two notations of
@@ -290,13 +330,14 @@ async fn two_notations_of_one_block_are_one_entry() {
             create_ip_set(&waf, "REGIONAL", &name, "IPV6", &submitted, None).await;
         let reported = stored_addresses(&get_ip_set(&waf, "REGIONAL", &name, &id).await, case);
         assert_eq!(
-            reported,
-            expected
-                .iter()
-                .map(|address| (*address).to_string())
-                .collect::<Vec<String>>(),
-            "case {case:?}: expected one entry per block, in the order each first \
-             appeared, got {reported:?}"
+            as_set(&reported),
+            as_set(
+                &expected
+                    .iter()
+                    .map(|address| (*address).to_string())
+                    .collect::<Vec<String>>()
+            ),
+            "case {case:?}: expected one entry per block, got {reported:?}"
         );
     }
 }

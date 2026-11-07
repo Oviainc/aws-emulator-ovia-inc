@@ -2,7 +2,8 @@
 
 //! @op UpdateIPSet
 //! Replaces the mutable specification of the IPSet named by `(Scope, Name, Id)`
-//! wholesale — `Addresses` as submitted, and `Description` cleared when the call
+//! wholesale — the `Addresses` submitted become the set's whole membership, and
+//! `Description` is cleared when the call
 //! omits it — and answers the rotated `NextLockToken`. A stale `LockToken` is
 //! `WAFOptimisticLockException`, an unknown triple `WAFNonexistentItemException`,
 //! an address that is not CIDR of the set's own family
@@ -296,9 +297,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // "This operation completely replaces the mutable specifications that you
         // already have for the IP set with the ones that you provide to this call":
-        // `Addresses` becomes exactly the submitted list, in the submitted order —
-        // with each IPv6 entry in the one canonical notation of its value, as a
-        // create stores it (`crate::state::canonical_ip_set_addresses`) — and
+        // `Addresses` becomes exactly the membership the request names — each IPv6
+        // entry in the one canonical notation of its value, duplicates collapsed,
+        // in the order the set holds them, as a create stores it
+        // (`crate::state::canonical_ip_set_addresses`) — and
         // `Description` — which the request may omit — is CLEARED rather than kept,
         // because an update is a whole-resource overwrite and not a merge.
         // `Name`, `Id`, `ARN` and `IPAddressVersion` are immutable.

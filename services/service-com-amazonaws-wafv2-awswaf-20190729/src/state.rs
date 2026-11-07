@@ -35,17 +35,24 @@ use crate::ops::types::{
     WAFUnsupportedAggregateKeyTypeException, WebACL, BLOCKCHAIN_CHAIN_VALUES,
     CURRENCY_MODE_VALUES, CURRENCY_VALUES, PLATFORM_VALUES, SETTLEMENT_STATUS_VALUES,
 };
+/// The API-key value itself — the encrypted token a key IS — and the CAPTCHA
+/// application integration URL a client loads the script from.
+mod api_keys;
 /// What one rule list costs to run, in web ACL capacity units.
 mod capacity;
 /// The managed rule groups this service publishes.
 mod catalog;
+/// The notation and the order an IP set holds its `Addresses` in.
+mod ip_set_addresses;
 /// The caller-supplied regular expressions a save carries, and the refusal one that
 /// is not something that matches draws.
 mod patterns;
 /// The `Scope` every resource is namespaced by.
 mod scope;
+pub use api_keys::*;
 pub use capacity::*;
 pub use catalog::*;
+pub use ip_set_addresses::*;
 pub use patterns::*;
 pub use scope::*;
 
@@ -603,47 +610,6 @@ pub fn api_key_cursor(sequence: u64) -> String {
     listing_cursor(sequence)
 }
 
-/// How many characters a well-formed API key value carries: the 256 bits of the
-/// digest [`new_api_key`] renders, two hex characters per byte.
-const API_KEY_RENDERED_LENGTH: usize = 64;
-
-/// A fresh API key value for a key defined in `scope` over `token_domains`.
-///
-/// `CreateAPIKey` answers "the generated, encrypted API key", an `APIKey`
-/// (`@length(1..2048)`, `@pattern(\S)` —
-/// `smithy_query(query="shape",shape="APIKey")`), and the model gives the value no
-/// further form: a client never parses it, it copies it into its JavaScript
-/// CAPTCHA integration and hands it back to this service. So the value this
-/// service mints is opaque — a 256-bit payload rendered in hex (the `hex` crate,
-/// as [`new_uuid`] renders its own bytes), [`API_KEY_RENDERED_LENGTH`]
-/// characters, every one of them non-whitespace.
-///
-/// The bytes are a SHA-256 digest (the `sha2` crate, as [`new_uuid`] uses it) over
-/// a fresh [`new_uuid`] and the key's own definition, so the value of a key this
-/// mints is unpredictable and no two definitions collide. A key is MINTED only for
-/// a definition the scope does not already hold one for — a definition is the scope
-/// and the key's token-domain set, which
-/// [`ComAmazonawsWafv2Awswaf20190729State::api_key_for_token_domains`] resolves — so
-/// the scope holds one key per domain set however often a mint is called for it.
-/// What the key DECRYPTS to is never recovered from the value — the token domains
-/// and the creation instant are read back out of the store
-/// ([`ComAmazonawsWafv2Awswaf20190729State::api_key`]), which is the only place
-/// they are kept.
-pub fn new_api_key(scope: &str, token_domains: &[String]) -> String {
-    use ::sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(new_uuid().as_bytes());
-    hasher.update(scope.as_bytes());
-    for domain in token_domains {
-        // A separator no `TokenDomain` can contain (`^[\w\.\-/]+$`), so two
-        // different domain lists cannot hash the same bytes.
-        hasher.update([0_u8]);
-        hasher.update(domain.as_bytes());
-    }
-    ::hex::encode(hasher.finalize())
-}
-
 /// The `Version` a key WAF minted carries.
 ///
 /// `APIKeySummary$Version` is "internal value used by WAF to manage the key"
@@ -667,20 +633,6 @@ pub fn normalized_token_domains(token_domains: &[String]) -> Vec<String> {
     normalized.sort_unstable();
     normalized.dedup();
     normalized
-}
-
-/// `true` when `value` has the form this service mints an API key in:
-/// [`API_KEY_RENDERED_LENGTH`] lowercase hex characters.
-///
-/// A key is "the generated, encrypted API key", so a value that does not even
-/// decode to a payload of the right size is not a key WAF could decrypt, whatever
-/// the store holds — which is the difference between a key that is not valid and a
-/// well-formed key naming nothing stored.
-pub fn is_api_key_shaped(value: &str) -> bool {
-    value.len() == API_KEY_RENDERED_LENGTH
-        && value
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// One request a web ACL evaluated, as WAF's bot visibility recorded it: the URI
@@ -2661,21 +2613,14 @@ pub fn now_millis() -> i64 {
         })
 }
 
-/// A fresh lowercase, hyphenated UUIDv4 — the form every `EntityId` and
-/// `LockToken` in this model takes
-/// (`^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$`, from
-/// `smithy_query(query="shape",shape="LockToken")`).
+/// 256 fresh bits, for a value that must be unpredictable per call.
 ///
-/// The 128 bits come from three sources hashed together with SHA-256 (the `sha2`
-/// crate) and hex-encoded (the `hex` crate), the way this repo's other services
-/// mint a UUID-shaped id (see
+/// Three sources hashed together with SHA-256 (the `sha2` crate), the way this
+/// repo's other services draw the bits behind a minted id (see
 /// `services/service-com-amazonaws-batch-awsbatchv20160810/src/state.rs`): the
 /// OS-seeded randomness a `RandomState` draws, the system clock in nanoseconds,
 /// and a process-wide counter, so two calls in the same nanosecond cannot collide.
-/// The version nibble and the variant bits RFC 4122 §4.4 fixes are then set, so
-/// the value is a well-formed version-4 UUID. An id or a lock token names a
-/// resource; a credential would come from `ctx.credential_store()`, never here.
-pub fn new_uuid() -> String {
+pub(crate) fn fresh_entropy() -> [u8; 32] {
     use ::sha2::{Digest, Sha256};
     use ::std::collections::hash_map::RandomState;
     use ::std::hash::BuildHasher;
@@ -2689,7 +2634,20 @@ pub fn new_uuid() -> String {
     hasher.update(RandomState::new().hash_one(sequence).to_le_bytes());
     hasher.update(nanos.to_le_bytes());
     hasher.update(sequence.to_le_bytes());
-    let digest = hasher.finalize();
+    hasher.finalize().into()
+}
+
+/// A fresh lowercase, hyphenated UUIDv4 — the form every `EntityId` and
+/// `LockToken` in this model takes
+/// (`^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$`, from
+/// `smithy_query(query="shape",shape="LockToken")`).
+///
+/// The 128 bits come from [`fresh_entropy`] and are hex-encoded (the `hex` crate).
+/// The version nibble and the variant bits RFC 4122 §4.4 fixes are then set, so
+/// the value is a well-formed version-4 UUID. An id or a lock token names a
+/// resource; a credential would come from `ctx.credential_store()`, never here.
+pub fn new_uuid() -> String {
+    let digest = fresh_entropy();
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     // RFC 4122 §4.4: the version nibble is 4, and the variant's two top bits are
@@ -3012,57 +2970,6 @@ pub fn validate_cidr(address: &str, ip_address_version: &str) -> Result<(), Stri
         ));
     }
     Ok(())
-}
-
-/// The form an IP set's `Addresses` are STORED in, for the family the set
-/// declares.
-///
-/// `IPSet$Addresses` are CIDR blocks of the set's `IPAddressVersion`, and an IPv6
-/// address has many notations for one value — `::` elides zero groups and a group's
-/// leading zeros may be dropped — so the notation a request happens to use is not
-/// the address. WAF stores an IPv6 entry in the one fully expanded, zero-padded,
-/// lowercase notation of its value, with the prefix length it was given, so the
-/// set's membership is well defined: two notations of one block are ONE entry, and
-/// a later read reports the canonical form rather than whichever notation was
-/// submitted.
-///
-/// An IPv4 address has a single notation, so an `IPV4` set's entries are preserved
-/// exactly as submitted, in their submitted order, and nothing here rewrites them.
-///
-/// Order is preserved: an entry keeps the position of its first appearance in the
-/// request, and only a LATER entry canonicalizing to one already in the list is
-/// dropped. An entry this does not recognize as an address of the family (which
-/// [`validate_cidr`] refuses on ingress) is kept verbatim rather than silently
-/// changed.
-pub fn canonical_ip_set_addresses(ip_address_version: &str, addresses: &[String]) -> Vec<String> {
-    if ip_address_version != "IPV6" {
-        return addresses.to_vec();
-    }
-    let mut stored: Vec<String> = Vec::with_capacity(addresses.len());
-    let mut seen: ::std::collections::HashSet<String> =
-        ::std::collections::HashSet::with_capacity(addresses.len());
-    for address in addresses {
-        let canonical = canonical_ipv6_cidr(address).unwrap_or_else(|| address.clone());
-        if seen.insert(canonical.clone()) {
-            stored.push(canonical);
-        }
-    }
-    stored
-}
-
-/// One IPv6 CIDR block in the fully expanded, zero-padded, lowercase notation of
-/// its value, with its prefix length; `None` when `address` is not an IPv6 CIDR
-/// block. See [`canonical_ip_set_addresses`].
-fn canonical_ipv6_cidr(address: &str) -> Option<String> {
-    let (literal, prefix) = address.split_once('/')?;
-    let parsed = literal.parse::<::std::net::Ipv6Addr>().ok()?;
-    let prefix_len = prefix.parse::<u32>().ok()?;
-    let groups: Vec<String> = parsed
-        .segments()
-        .iter()
-        .map(|group| format!("{group:04x}"))
-        .collect();
-    Some(format!("{}/{prefix_len}", groups.join(":")))
 }
 
 /// The `Description` a WAFv2 entity reports when the save that created it supplied

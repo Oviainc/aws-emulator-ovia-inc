@@ -50,10 +50,14 @@ const MAX_API_KEY_LENGTH: usize = 2048;
 const MAX_TOKEN_DOMAIN_LENGTH: usize = 253;
 
 /// A value carrying the form a minted key takes, so it is well formed, but that no
-/// mint ever answered: the all-zero payload. Checked against [`is_api_key_shaped`]
-/// wherever it is used, so the case cannot silently become a malformed one.
-fn well_formed_unknown_key() -> String {
-    "0".repeat(64)
+/// mint ever answered: an envelope of the smallest size a key is rendered at, with
+/// every byte of it zero, so nothing this service sealed can be behind it. Checked
+/// against [`is_api_key_shaped`] wherever it is used, so the case cannot silently
+/// become a malformed one.
+pub(crate) fn well_formed_unknown_key() -> String {
+    use base64::Engine as _;
+
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0_u8; 128])
 }
 
 /// The awsJson error code of a refusal, as its `__type` carries it.
@@ -494,8 +498,9 @@ async fn decrypting_a_key_the_service_did_not_mint_is_refused() {
     )
     .await;
 
-    // Not the form a minted key takes — the wrong alphabet, the wrong length, or the
-    // right alphabet at the wrong length — so no key WAF could decode.
+    // Not the form a minted key takes — the wrong alphabet, a length no envelope is
+    // rendered at, an envelope too small to carry a key, or such a value as long as
+    // the model allows a key to be — so no key WAF could decode.
     for value in [
         "not-a-key",
         "k",
@@ -503,7 +508,7 @@ async fn decrypting_a_key_the_service_did_not_mint_is_refused() {
         "abcdef0123456789",
         "key_with_underscores",
         &"0".repeat(63),
-        &"k".repeat(MAX_API_KEY_LENGTH),
+        &"k".repeat(MAX_API_KEY_LENGTH - 3),
     ] {
         let case = format!("APIKey={value:.32?}");
         assert!(

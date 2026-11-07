@@ -263,7 +263,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        let api_key = crate::state::new_api_key(&input.scope, &token_domains);
+        let Some(api_key) =
+            crate::state::new_api_key(&input.scope, &token_domains, created_at_millis)
+        else {
+            // The token could not be sealed, so there is no key to answer: the
+            // mint failed inside the service, which is the system problem WAF
+            // reports rather than a key a client could not decrypt.
+            crate::state::audit(Self::NAME, &input.scope, "", "", "WAFInternalErrorException");
+            return Err(CreateAPIKeyErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the API key could not be generated".to_string()),
+                },
+            )
+            .into());
+        };
 
         // The store refuses a key past the per-scope bound, which is the quota
         // refusal this operation models; everything else about the record — its

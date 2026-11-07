@@ -4,6 +4,15 @@
 //! Reports the tags the resource its `ResourceARN` names carries, one page at a
 //! time. This is the ONLY file to touch for this operation.
 //!
+//! The tagging listing answers a continuation marker only when tags remain beyond
+//! the page it returned — `NextMarker` is returned "if the number of objects that
+//! are still available for retrieval exceeds the limit" — so a complete listing
+//! hands back the empty marker a paginator stops on, rather than a position inside
+//! the page it just served. (The ENTITY listings of this service answer the last
+//! summary's own key on every non-empty page, which is what their recorded
+//! responses carry; this one is the tagging surface and carries what its recorded
+//! responses do.)
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -218,13 +227,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(marker) = input.next_marker.as_deref() {
             page.retain(|tag| tag.key.as_str() > marker);
         }
+        // What this page leaves behind, which is what decides whether there is a
+        // continuation at all.
+        let remaining = page.len().saturating_sub(page_size);
         page.truncate(page_size);
 
-        // WAF answers every non-empty page with a `NextMarker` — the key of the LAST
-        // tag on the page even when the page is not full, so a client resumes from it
-        // and learns it reached the end from the empty page that follows. A page with
-        // no last key carries no marker, which is also what ends a paginator's loop.
-        let next_marker = page.last().map(|tag| tag.key.clone());
+        // A continuation value only when tags remain beyond this page: `NextMarker`
+        // is returned "if the number of objects that are still available for
+        // retrieval exceeds the limit" (the member's own doc), so a listing that
+        // handed back the whole collection hands back no position to resume from —
+        // the empty marker the recorded tagging responses carry — and a paginator
+        // that loops on it terminates. A page that does leave tags behind names the
+        // key of its LAST tag, the position the next call resumes after.
+        let next_marker = Some(if remaining > 0 {
+            page.last().map_or_else(String::new, |tag| tag.key.clone())
+        } else {
+            String::new()
+        });
         let tag_list: Vec<Tag> = page.into_iter().cloned().collect();
 
         Ok(ListTagsForResourceOutput {

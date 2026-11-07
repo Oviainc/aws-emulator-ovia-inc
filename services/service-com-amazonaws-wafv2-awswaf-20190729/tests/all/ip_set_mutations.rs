@@ -8,8 +8,11 @@
 //!
 //! * `UpdateIPSet` "completely replaces the mutable specifications that you already
 //!   have for the IP set with the ones that you provide to this call", so after a
-//!   successful update `GetIPSet` answers EXACTLY the submitted `Addresses`, in the
-//!   submitted order, and a `Description` the call omitted is gone;
+//!   successful update `GetIPSet` answers EXACTLY the membership the call submitted
+//!   — every block it named and no other — and a `Description` the call omitted is
+//!   gone. The ORDER a read reports that membership in is the set's own, which
+//!   `crate::ip_set_address_order` spans; here a read is compared against the
+//!   membership, and against the previous read when nothing was meant to change.
 //! * `DeleteIPSet` "deletes the specified IPSet", so after a successful delete
 //!   `GetIPSet` for the same `(Scope, Name, Id)` is refused with
 //!   `WAFNonexistentItemException` (HTTP 400) and the name is free again;
@@ -67,6 +70,41 @@ pub(crate) async fn get_ip_set(waf: &Waf, scope: &str, name: &str, id: &str) -> 
     .await
 }
 
+/// The `Addresses` a `GetIPSet` answer reports, in the order it reported them.
+///
+/// Shared with the sibling suites that read an address list back
+/// (`crate::ip_set_canonicalization`, `crate::ip_set_address_order`).
+pub(crate) fn addresses(got: &Value) -> Vec<String> {
+    got["IPSet"]["Addresses"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .map(|address| address.as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// The MEMBERSHIP a `GetIPSet` answer reports: its addresses as the set they name,
+/// in one order so two sets of the same blocks compare equal.
+pub(crate) fn membership(got: &Value) -> Vec<String> {
+    let mut members = addresses(got);
+    members.sort();
+    members
+}
+
+/// `entries` as a set, the form [`membership`] compares against.
+pub(crate) fn sorted(entries: &[&str]) -> Vec<String> {
+    let mut sorted: Vec<String> = entries.iter().map(|entry| (*entry).to_string()).collect();
+    sorted.sort();
+    sorted
+}
+
+/// An address list as the set it names, for comparing one read against another.
+pub(crate) fn membership_of(entries: &[String]) -> Vec<String> {
+    let mut members = entries.to_vec();
+    members.sort();
+    members
+}
+
 /// One whole-replacement case: what the set held, and what the update submits.
 struct Replacement {
     /// What the case is called in an assertion.
@@ -79,8 +117,8 @@ struct Replacement {
     description_before: Option<&'static str>,
     /// The addresses the update submits.
     after: &'static [&'static str],
-    /// The notation a read reports those addresses in: the submitted list for the
-    /// single-notation IPv4 family, and the canonical one for IPv6.
+    /// The membership a read must report, as a set: the submitted entries for the
+    /// single-notation IPv4 family, and their canonical notation for IPv6.
     stored_after: &'static [&'static str],
     /// The description the update submits, or `None` when it omits the member.
     description_after: Option<&'static str>,
@@ -116,7 +154,7 @@ async fn update_ip_set_replaces_the_whole_specification() {
             description_after: Some("two ranges"),
         },
         Replacement {
-            case: "the same two addresses in the opposite order",
+            case: "the same two addresses, submitted in the opposite order",
             version: "IPV4",
             before: &["10.0.0.0/24", "10.0.1.0/24"],
             description_before: Some("ordered"),
@@ -210,11 +248,12 @@ async fn update_ip_set_replaces_the_whole_specification() {
 
         let got = get_ip_set(&waf, scope, &name, &id).await;
         assert_eq!(
-            got["IPSet"]["Addresses"],
-            json!(stored_after),
-            "case {case:?}: expected exactly the submitted addresses in the \
-             submitted order, got {got}"
+            membership(&got),
+            sorted(stored_after),
+            "case {case:?}: expected exactly the submitted addresses as the set they \
+             name, got {got}"
         );
+        let stored_order = addresses(&got);
         assert_eq!(
             got["IPSet"]["Description"],
             json!(description_after.unwrap_or_default()),
@@ -255,8 +294,8 @@ async fn update_ip_set_replaces_the_whole_specification() {
         .await;
         let again = get_ip_set(&waf, scope, &name, &id).await;
         assert_eq!(
-            again["IPSet"]["Addresses"],
-            json!(stored_after),
+            addresses(&again),
+            stored_order,
             "case {case:?}: a refused update must change nothing, got {again}"
         );
     }
@@ -285,6 +324,15 @@ async fn a_refused_update_leaves_the_stored_ip_set_untouched() {
     .await;
     let stale = "11111111-2222-3333-4444-555555555555";
     let absent_id = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+    // The set as the store holds it, order included: what every read below must
+    // still answer.
+    let stored = addresses(&get_ip_set(&waf, "REGIONAL", "refused-ips", &id).await);
+    assert_eq!(
+        membership_of(&stored),
+        sorted(before),
+        "the set under test must hold exactly the blocks it was created with, got \
+         {stored:?}"
+    );
 
     let cases: Vec<(&str, Value, &str)> = vec![
         (
@@ -381,8 +429,8 @@ async fn a_refused_update_leaves_the_stored_ip_set_untouched() {
         waf.refused("UpdateIPSet", request, code, case).await;
         let got = get_ip_set(&waf, "REGIONAL", "refused-ips", &id).await;
         assert_eq!(
-            got["IPSet"]["Addresses"],
-            json!(before),
+            addresses(&got),
+            stored,
             "case {case:?}: a refused update must not replace the addresses, got \
              {got}"
         );

@@ -292,9 +292,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: arn.clone(),
             description: crate::state::stored_description(input.description.clone()),
             ip_address_version: input.ip_address_version.clone(),
-            // An IPv6 entry is stored in the one canonical notation of its value, so
-            // the set's membership does not depend on which notation was submitted;
-            // see `crate::state::canonical_ip_set_addresses`.
+            // The addresses are stored as the SET they name: each IPv6 entry in the
+            // one canonical notation of its value, a block named twice named once,
+            // in the order the set holds them — see
+            // `crate::state::canonical_ip_set_addresses`.
             addresses: crate::state::canonical_ip_set_addresses(
                 &input.ip_address_version,
                 &input.addresses,

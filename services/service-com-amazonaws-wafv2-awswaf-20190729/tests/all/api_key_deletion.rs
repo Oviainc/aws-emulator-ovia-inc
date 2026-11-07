@@ -275,9 +275,9 @@ async fn deleting_a_key_the_service_did_not_mint_is_refused() {
     .await;
     let before = listed_keys(&waf, SCOPE_REGIONAL).await;
 
-    // Not the form a minted key takes — the wrong alphabet, the wrong length, the
-    // right alphabet at the wrong length, or the longest value the model allows — so
-    // no key WAF could decode.
+    // Not the form a minted key takes — the wrong alphabet, a length no envelope is
+    // rendered at, an envelope too small to carry a key, or such a value as long as
+    // the model allows a key to be — so no key WAF could decode.
     for value in [
         "sim2real-never-issued-api-key-token-000000000000",
         "not-a-key",
@@ -286,7 +286,7 @@ async fn deleting_a_key_the_service_did_not_mint_is_refused() {
         "key_with_underscores",
         &"0".repeat(63),
         &"0".repeat(65),
-        &"k".repeat(MAX_API_KEY_LENGTH),
+        &"k".repeat(MAX_API_KEY_LENGTH - 3),
     ] {
         let case = format!("APIKey={value:.32?}");
         assert!(
@@ -324,7 +324,7 @@ async fn deleting_a_key_the_service_did_not_mint_is_refused() {
     }
 
     // Well formed, and no key: the store holds nothing under it, in either scope.
-    let unknown = "0".repeat(64);
+    let unknown = crate::api_key_minting::well_formed_unknown_key();
     assert!(
         is_api_key_shaped(&unknown),
         "the unknown-key case must be WELL FORMED, got {unknown:?}"

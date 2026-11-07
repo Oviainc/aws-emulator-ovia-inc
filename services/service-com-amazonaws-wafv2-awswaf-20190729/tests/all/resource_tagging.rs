@@ -447,9 +447,11 @@ async fn a_resource_holds_at_most_the_documented_number_of_tags() {
     );
 }
 
-/// `ListTagsForResource` pages the collection: a `Limit` hands back that many tags
-/// and a marker, the marker resumes after the last key of the page, and the pages
-/// together are the whole collection in the listing's own order.
+/// `ListTagsForResource` pages the collection: a `Limit` hands back that many tags,
+/// a marker while tags remain resumes after the last key of the page, and the pages
+/// together are the whole collection in the listing's own order. A listing that has
+/// handed back everything carries no position to resume from, which is what ends the
+/// loop.
 #[tokio::test]
 async fn a_tag_listing_pages_the_collection() {
     let waf = Waf::new();
@@ -487,25 +489,32 @@ async fn a_tag_listing_pages_the_collection() {
                 listed.len() <= limit,
                 "case {case:?}: a page must hold at most the limit, got {page}"
             );
-            if listed.is_empty() {
-                assert!(
-                    page["NextMarker"].is_null(),
-                    "case {case:?}: the terminal page must carry no marker, got {page}"
-                );
-                break;
-            }
             walked.extend(listed.iter().map(|tag| {
                 (
                     tag["Key"].as_str().unwrap_or_default().to_string(),
                     tag["Value"].as_str().unwrap_or_default().to_string(),
                 )
             }));
-            marker = Some(
-                page["NextMarker"]
-                    .as_str()
-                    .expect("a non-empty page carries a marker")
-                    .to_string(),
+            // A marker only while tags remain: an empty one (or none at all) is the
+            // end of the collection, and every tag must already have been walked by
+            // then.
+            let answered = page["NextMarker"].as_str().unwrap_or_default().to_string();
+            if answered.is_empty() {
+                assert_eq!(
+                    walked.len(),
+                    whole.len(),
+                    "case {case:?}: the listing may only stop handing back a marker \
+                     once it has handed back every tag, got {walked:?}"
+                );
+                break;
+            }
+            assert_eq!(
+                Some(answered.as_str()),
+                walked.last().map(|(key, _value)| key.as_str()),
+                "case {case:?}: a page that leaves tags behind must name its last \
+                 key, got {page}"
             );
+            marker = Some(answered);
         }
         assert_eq!(
             walked, whole,

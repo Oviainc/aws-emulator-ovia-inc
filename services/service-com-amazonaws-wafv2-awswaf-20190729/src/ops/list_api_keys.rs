@@ -15,6 +15,12 @@
 //! `length 1..256` while an `APIKey` is up to 2048 characters, so the key value itself
 //! cannot be a marker.
 //!
+//! Beside the summaries the answer carries the account's CAPTCHA
+//! `ApplicationIntegrationURL` ([`crate::state::application_integration_url`]),
+//! which is a property of the account and the endpoint region rather than of the
+//! keys — a client reads it HERE to learn where to load the integration script
+//! from, so it is answered whether or not this scope holds a key.
+//!
 //! A listing REPORTS: nothing here writes to the store.
 //!
 //! ## Shape of an operation
@@ -194,6 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let region = crate::service::requests::request_region(ctx.parts());
         let state = state.lock();
 
         // Only this scope's keys, in creation order — the order a marker names a
@@ -234,10 +241,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(ListAPIKeysOutput {
             next_marker,
             api_key_summaries: Some(api_key_summaries),
-            // WAF answers an application integration URL for the CAPTCHA JavaScript
-            // integration it hosts, which this emulator does not host — the same
-            // stance `GetWebACL` takes on the member.
-            application_integration_url: None,
+            // "The CAPTCHA application integration URL, for use in your JavaScript
+            // implementation": WAF hosts that integration per account and per
+            // region and answers its URL on every listing — a client reads it here
+            // to learn where to load the script from, before it has a key to use
+            // with it — so it is reported whatever keys this scope holds, from the
+            // account and the endpoint region alone
+            // (`crate::state::application_integration_url`).
+            application_integration_url: Some(crate::state::application_integration_url(&region)),
         })
     }
 }
