@@ -4,8 +4,14 @@
 //!
 //! Registers a DQDL ruleset in this account's per-account data quality ruleset namespace
 //! ([`crate::state::ComAmazonawsGlueAwsglueState::data_quality_rulesets`]): the whole
-//! definition comes from the request, the name must be free, and the create answers with
-//! the name it stored. `GetDataQualityRuleset` reads the record back.
+//! definition comes from the request, the name must be free, and the create answers with the
+//! record it stored — the name, the identifier it assigned the ruleset, the definition, the
+//! table it targets and both of its instants. `GetDataQualityRuleset` reads the record back
+//! and reports that same identifier, as does `UpdateDataQualityRuleset`.
+//!
+//! That projection is wider than the one member the modelled response below binds, which is
+//! why the response shape is hand-declared — see
+//! [`crate::ops::types::CreateDataQualityRulesetOutput`].
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +130,27 @@ impl From<CreateDataQualityRulesetErrorModeled> for CreateDataQualityRulesetErro
     }
 }
 
+/// The answer for a stored ruleset: the record's own identity — the identifier the create
+/// assigned it and both of its instants — beside the definition and the target table it was
+/// registered with.
+///
+/// Every member is read off the stored record, so the create's answer, a later
+/// `GetDataQualityRuleset` and a later `UpdateDataQualityRuleset` all report the same
+/// identifier for one ruleset and a client can chain the value from whichever answer it
+/// holds. `Description` is not a member of this answer: the create reports the record's
+/// identity and definition, and the description is read back through
+/// `GetDataQualityRuleset`.
+fn projection(entry: &crate::state::DataQualityRulesetEntry) -> CreateDataQualityRulesetOutput {
+    CreateDataQualityRulesetOutput {
+        name: Some(entry.name.clone()),
+        identifier: Some(entry.identifier.clone()),
+        ruleset: Some(entry.ruleset.clone()),
+        target_table: entry.target_table.clone(),
+        created_on: Some(crate::state::to_date_time(entry.created_on)),
+        last_modified_on: Some(crate::state::to_date_time(entry.last_modified_on)),
+    }
+}
+
 /// The `CreateDataQualityRuleset` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -191,9 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 && stored.client_token == input.client_token
                 && stored.matches_create_input(&input)
             {
-                return Ok(CreateDataQualityRulesetOutput {
-                    name: Some(stored.name.clone()),
-                });
+                return Ok(projection(stored));
             }
             return Err(
                 CreateDataQualityRulesetErrorModeled::AlreadyExistsException(
@@ -225,20 +250,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        store.data_quality_rulesets.insert(
-            input.name.clone(),
-            crate::state::DataQualityRulesetEntry::from_create_input(&input, now),
-        );
+        let stored = crate::state::DataQualityRulesetEntry::from_create_input(&input, now);
+        // Projected BEFORE the record is handed to the store, from the very same record, so
+        // the answer and what a later read of this name reports cannot disagree.
+        let answer = projection(&stored);
+        store.data_quality_rulesets.insert(input.name.clone(), stored);
         ::tracing::info!(
             operation = "CreateDataQualityRuleset",
             ruleset = %input.name,
             "created a Glue data quality ruleset"
         );
 
-        // "A unique name for the data quality ruleset" — the name the record is now stored
-        // under, which is what a later read addresses it by.
-        Ok(CreateDataQualityRulesetOutput {
-            name: Some(input.name),
-        })
+        // The record as it was just stored, identifier and all — so the caller can address
+        // the ruleset it created from this answer alone.
+        Ok(answer)
     }
 }

@@ -7,6 +7,10 @@
 //! `CreateDataQualityRuleset` stored. READ-ONLY: every member is projected out of the
 //! stored record and nothing is written, so two reads of one ruleset agree.
 //!
+//! That projection is one member wider than the modelled response below binds: the read also
+//! reports the identifier the create assigned the ruleset, which is why the response shape is
+//! hand-declared — see [`crate::ops::types::GetDataQualityRulesetOutput`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -189,11 +193,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every member comes from the store, so a ruleset created with no description
         // reports none rather than an empty string, and one no recommendation run created
-        // reports no run id.
+        // reports no run id. The identifier is the one the create assigned the record, which
+        // is why a client can chain it from the create's or an update's answer into a read of
+        // the same ruleset and back.
         Ok(GetDataQualityRulesetOutput {
             name: Some(entry.name.clone()),
             description: entry.description.clone(),
             ruleset: Some(entry.ruleset.clone()),
+            identifier: Some(entry.identifier.clone()),
             target_table: entry.target_table.clone(),
             created_on: Some(crate::state::to_date_time(entry.created_on)),
             last_modified_on: Some(crate::state::to_date_time(entry.last_modified_on)),

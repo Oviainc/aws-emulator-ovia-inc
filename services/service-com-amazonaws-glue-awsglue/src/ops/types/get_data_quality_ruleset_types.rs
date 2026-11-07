@@ -17,12 +17,24 @@ pub struct GetDataQualityRulesetInput {
     pub name: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#GetDataQualityRulesetResponse")]
+/// `GetDataQualityRulesetResponse`: the stored ruleset as a read reports it.
+///
+/// Hand-declared rather than generated from the shape by
+/// `#[smithy_macros::smithy(shape = ...)]`, because the published shape binds every member
+/// below EXCEPT `Identifier`, which the service reports beside them: the identifier it
+/// assigned the record at create, so a read of a ruleset reports the same identity the create
+/// and an update of it report and a client can chain the value from any one of them. Every
+/// published member keeps the target the model gives it, and the identifier carries
+/// `HashString`'s string, as every other id this service hands a data quality resource does.
+///
+/// Only the SERIALIZE direction is implemented: an operation's output shape is written by
+/// this server and never read back by it, so there is no `DeserializableStruct` here.
 #[derive(Debug, Clone, Default)]
 pub struct GetDataQualityRulesetOutput {
     pub name: Option<String>,
     pub description: Option<String>,
     pub ruleset: Option<String>,
+    pub identifier: Option<String>,
     pub target_table: Option<DataQualityTargetTable>,
     pub created_on: Option<::aws_smithy_types::DateTime>,
     pub last_modified_on: Option<::aws_smithy_types::DateTime>,
@@ -30,3 +42,168 @@ pub struct GetDataQualityRulesetOutput {
     pub data_quality_security_configuration: Option<String>,
 }
 
+#[allow(non_upper_case_globals)]
+impl GetDataQualityRulesetOutput {
+    const M_NAME: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.glue#GetDataQualityRulesetResponse$Name",
+            "com.amazonaws.glue",
+            "Name",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Name",
+        0,
+    );
+
+    const M_DESCRIPTION: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.glue#GetDataQualityRulesetResponse$Description",
+            "com.amazonaws.glue",
+            "Description",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Description",
+        1,
+    );
+
+    const M_RULESET: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.glue#GetDataQualityRulesetResponse$Ruleset",
+            "com.amazonaws.glue",
+            "Ruleset",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Ruleset",
+        2,
+    );
+
+    const M_IDENTIFIER: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.glue#GetDataQualityRulesetResponse$Identifier",
+            "com.amazonaws.glue",
+            "Identifier",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Identifier",
+        3,
+    );
+
+    const M_TARGET_TABLE: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.glue#GetDataQualityRulesetResponse$TargetTable",
+            "com.amazonaws.glue",
+            "TargetTable",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        "TargetTable",
+        4,
+    );
+
+    const M_CREATED_ON: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.glue#GetDataQualityRulesetResponse$CreatedOn",
+            "com.amazonaws.glue",
+            "CreatedOn",
+        ),
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        "CreatedOn",
+        5,
+    );
+
+    const M_LAST_MODIFIED_ON: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.glue#GetDataQualityRulesetResponse$LastModifiedOn",
+                "com.amazonaws.glue",
+                "LastModifiedOn",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "LastModifiedOn",
+            6,
+        );
+
+    const M_RECOMMENDATION_RUN_ID: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.glue#GetDataQualityRulesetResponse$RecommendationRunId",
+                "com.amazonaws.glue",
+                "RecommendationRunId",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "RecommendationRunId",
+            7,
+        );
+
+    const M_DATA_QUALITY_SECURITY_CONFIGURATION: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.glue#GetDataQualityRulesetResponse$DataQualitySecurityConfiguration",
+                "com.amazonaws.glue",
+                "DataQualitySecurityConfiguration",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "DataQualitySecurityConfiguration",
+            8,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.glue#GetDataQualityRulesetResponse",
+            "com.amazonaws.glue",
+            "GetDataQualityRulesetResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_NAME,
+            &Self::M_DESCRIPTION,
+            &Self::M_RULESET,
+            &Self::M_IDENTIFIER,
+            &Self::M_TARGET_TABLE,
+            &Self::M_CREATED_ON,
+            &Self::M_LAST_MODIFIED_ON,
+            &Self::M_RECOMMENDATION_RUN_ID,
+            &Self::M_DATA_QUALITY_SECURITY_CONFIGURATION,
+        ],
+    );
+}
+
+pub static GET_DATA_QUALITY_RULESET_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetDataQualityRulesetOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetDataQualityRulesetOutput {
+    fn serialize_members(
+        &self,
+        __s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // A member this record carries no value for is omitted, exactly as the generated
+        // serializers omit an absent optional member.
+        if let Some(__v) = self.name.as_ref() {
+            __s.write_string(&Self::M_NAME, __v.as_str())?;
+        }
+        if let Some(__v) = self.description.as_ref() {
+            __s.write_string(&Self::M_DESCRIPTION, __v.as_str())?;
+        }
+        if let Some(__v) = self.ruleset.as_ref() {
+            __s.write_string(&Self::M_RULESET, __v.as_str())?;
+        }
+        if let Some(__v) = self.identifier.as_ref() {
+            __s.write_string(&Self::M_IDENTIFIER, __v.as_str())?;
+        }
+        if let Some(__v) = self.target_table.as_ref() {
+            __s.write_struct(&Self::M_TARGET_TABLE, __v)?;
+        }
+        if let Some(__v) = self.created_on.as_ref() {
+            __s.write_timestamp(&Self::M_CREATED_ON, __v)?;
+        }
+        if let Some(__v) = self.last_modified_on.as_ref() {
+            __s.write_timestamp(&Self::M_LAST_MODIFIED_ON, __v)?;
+        }
+        if let Some(__v) = self.recommendation_run_id.as_ref() {
+            __s.write_string(&Self::M_RECOMMENDATION_RUN_ID, __v.as_str())?;
+        }
+        if let Some(__v) = self.data_quality_security_configuration.as_ref() {
+            __s.write_string(&Self::M_DATA_QUALITY_SECURITY_CONFIGURATION, __v.as_str())?;
+        }
+        Ok(())
+    }
+}

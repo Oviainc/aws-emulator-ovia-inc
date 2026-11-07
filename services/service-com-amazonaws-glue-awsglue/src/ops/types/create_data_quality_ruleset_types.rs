@@ -23,9 +23,148 @@ pub struct CreateDataQualityRulesetInput {
     pub client_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#CreateDataQualityRulesetResponse")]
+/// `CreateDataQualityRulesetResponse`: the ruleset as the create stored it.
+///
+/// Hand-declared rather than generated from the shape by
+/// `#[smithy_macros::smithy(shape = ...)]`, because the published shape binds only `Name`
+/// while the service answers a create with the stored projection of the ruleset — the
+/// identifier it assigned the record, the definition it registered, the table it targets and
+/// both of its timestamps as well. That identifier is what a client chains into the later
+/// answers about the same ruleset, which is why the create has to report it at all. The shape
+/// id, the member names and the member types below are the wire ones: `Name` keeps the target
+/// the model gives it (`NameString`), the definition and the association keep the ones
+/// `GetDataQualityRulesetResponse` gives the same facts (`Ruleset`: `DataQualityRulesetString`,
+/// `TargetTable`: `DataQualityTargetTable`, `CreatedOn`/`LastModifiedOn`: `Timestamp`), and the
+/// identifier carries `HashString`'s string, as every other id this service hands a data
+/// quality resource does.
+///
+/// Only the SERIALIZE direction is implemented: an operation's output shape is written by
+/// this server and never read back by it, so there is no `DeserializableStruct` here.
 #[derive(Debug, Clone, Default)]
 pub struct CreateDataQualityRulesetOutput {
     pub name: Option<String>,
+    pub identifier: Option<String>,
+    pub ruleset: Option<String>,
+    pub target_table: Option<DataQualityTargetTable>,
+    pub created_on: Option<::aws_smithy_types::DateTime>,
+    pub last_modified_on: Option<::aws_smithy_types::DateTime>,
 }
 
+#[allow(non_upper_case_globals)]
+impl CreateDataQualityRulesetOutput {
+    const M_NAME: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.glue#CreateDataQualityRulesetResponse$Name",
+            "com.amazonaws.glue",
+            "Name",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Name",
+        0,
+    );
+
+    const M_IDENTIFIER: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.glue#CreateDataQualityRulesetResponse$Identifier",
+            "com.amazonaws.glue",
+            "Identifier",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Identifier",
+        1,
+    );
+
+    const M_RULESET: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.glue#CreateDataQualityRulesetResponse$Ruleset",
+            "com.amazonaws.glue",
+            "Ruleset",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Ruleset",
+        2,
+    );
+
+    const M_TARGET_TABLE: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.glue#CreateDataQualityRulesetResponse$TargetTable",
+            "com.amazonaws.glue",
+            "TargetTable",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        "TargetTable",
+        3,
+    );
+
+    const M_CREATED_ON: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.glue#CreateDataQualityRulesetResponse$CreatedOn",
+            "com.amazonaws.glue",
+            "CreatedOn",
+        ),
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        "CreatedOn",
+        4,
+    );
+
+    const M_LAST_MODIFIED_ON: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.glue#CreateDataQualityRulesetResponse$LastModifiedOn",
+                "com.amazonaws.glue",
+                "LastModifiedOn",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "LastModifiedOn",
+            5,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.glue#CreateDataQualityRulesetResponse",
+            "com.amazonaws.glue",
+            "CreateDataQualityRulesetResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_NAME,
+            &Self::M_IDENTIFIER,
+            &Self::M_RULESET,
+            &Self::M_TARGET_TABLE,
+            &Self::M_CREATED_ON,
+            &Self::M_LAST_MODIFIED_ON,
+        ],
+    );
+}
+
+pub static CREATE_DATA_QUALITY_RULESET_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &CreateDataQualityRulesetOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for CreateDataQualityRulesetOutput {
+    fn serialize_members(
+        &self,
+        __s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // A member this record carries no value for is omitted, exactly as the generated
+        // serializers omit an absent optional member.
+        if let Some(__v) = self.name.as_ref() {
+            __s.write_string(&Self::M_NAME, __v.as_str())?;
+        }
+        if let Some(__v) = self.identifier.as_ref() {
+            __s.write_string(&Self::M_IDENTIFIER, __v.as_str())?;
+        }
+        if let Some(__v) = self.ruleset.as_ref() {
+            __s.write_string(&Self::M_RULESET, __v.as_str())?;
+        }
+        if let Some(__v) = self.target_table.as_ref() {
+            __s.write_struct(&Self::M_TARGET_TABLE, __v)?;
+        }
+        if let Some(__v) = self.created_on.as_ref() {
+            __s.write_timestamp(&Self::M_CREATED_ON, __v)?;
+        }
+        if let Some(__v) = self.last_modified_on.as_ref() {
+            __s.write_timestamp(&Self::M_LAST_MODIFIED_ON, __v)?;
+        }
+        Ok(())
+    }
+}

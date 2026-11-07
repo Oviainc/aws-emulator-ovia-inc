@@ -129,6 +129,8 @@ mod data_quality_rule_recommendation_runs;
 mod data_quality_ruleset_deletion;
 #[path = "all/data_quality_ruleset_evaluation_runs.rs"]
 mod data_quality_ruleset_evaluation_runs;
+#[path = "all/data_quality_ruleset_identity.rs"]
+mod data_quality_ruleset_identity;
 #[path = "all/data_quality_ruleset_listing.rs"]
 mod data_quality_ruleset_listing;
 #[path = "all/data_quality_ruleset_updates.rs"]
