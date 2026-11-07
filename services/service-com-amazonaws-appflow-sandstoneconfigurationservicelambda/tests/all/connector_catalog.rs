@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::ops::types::ConnectorDetail;
 use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::state::{
     encode_cursor, service_state, CONNECTOR_TYPE_CUSTOM, DEFAULT_CONNECTOR_PAGE_SIZE, FLOW_CURSOR,
-    OPERATORS, SCHEDULE_FREQUENCIES, VENDED_CONNECTORS,
+    SCHEDULE_FREQUENCIES, VENDED_CONNECTORS,
 };
 
 use super::flow_lifecycle::{appflow, appflow_with_engine, call, Answer};
@@ -218,10 +218,6 @@ async fn every_connector_reports_the_capabilities_a_flow_may_use_it_with() {
         .iter()
         .map(|frequency| (*frequency).to_string())
         .collect();
-    let operators: Vec<String> = OPERATORS
-        .iter()
-        .map(|operator| (*operator).to_string())
-        .collect();
 
     for case in CAPABILITIES {
         let Some(configuration) = reported.get(case.connector_type) else {
@@ -256,8 +252,8 @@ async fn every_connector_reports_the_capabilities_a_flow_may_use_it_with() {
         );
 
         // A flow is driven by the connector it reads FROM, so only a source reports the
-        // trigger types that can run it, the frequencies a schedule may use and the
-        // operators its tasks may apply — in the order the model declares each enum.
+        // trigger types that can run it and the frequencies a schedule may use — in the
+        // order the model declares each enum.
         let mut expected_triggers: Vec<String> = Vec::new();
         if case.can_use_as_source {
             expected_triggers.push("Scheduled".to_string());
@@ -282,25 +278,7 @@ async fn every_connector_reports_the_capabilities_a_flow_may_use_it_with() {
             "case {case:?}: supportedSchedulingFrequencies is {:?}",
             list(configuration, "supportedSchedulingFrequencies")
         );
-        assert_eq!(
-            list(configuration, "supportedOperators"),
-            if case.can_use_as_source {
-                operators.clone()
-            } else {
-                Vec::new()
-            },
-            "case {case:?}: supportedOperators is {:?}",
-            list(configuration, "supportedOperators")
-        );
-
-        // Only a destination accepts a write operation, and only a source offers
-        // destinations to send records to.
-        assert_eq!(
-            !list(configuration, "supportedWriteOperations").is_empty(),
-            case.can_use_as_destination,
-            "case {case:?}: supportedWriteOperations is {:?}",
-            list(configuration, "supportedWriteOperations")
-        );
+        // Only a source offers destinations to send records to.
         assert_eq!(
             !list(configuration, "supportedDestinationConnectors").is_empty(),
             case.can_use_as_source,
@@ -308,15 +286,19 @@ async fn every_connector_reports_the_capabilities_a_flow_may_use_it_with() {
             list(configuration, "supportedDestinationConnectors")
         );
 
-        // Every connector moves something, and only `RECORD` and `FILE` exist.
-        let transfer_types = list(configuration, "supportedDataTransferTypes");
-        assert!(
-            !transfer_types.is_empty()
-                && transfer_types
-                    .iter()
-                    .all(|kind| kind == "RECORD" || kind == "FILE"),
-            "case {case:?}: supportedDataTransferTypes is {transfer_types:?}"
-        );
+        // The capabilities a connector DECLARES to AppFlow belong to a registration, and
+        // nobody registered a connector AppFlow vends, so its configuration carries none
+        // of them.
+        for declared in [
+            "supportedOperators",
+            "supportedWriteOperations",
+            "supportedDataTransferTypes",
+        ] {
+            assert!(
+                configuration.get(declared).is_none(),
+                "case {case:?}: a vended connector declares no {declared}, got {configuration:?}"
+            );
+        }
     }
 }
 
@@ -354,16 +336,28 @@ async fn a_destination_a_source_offers_can_itself_be_a_destination() {
     offered.sort();
     offered.dedup();
 
-    let offered_types: Vec<&str> = offered.iter().map(String::as_str).collect();
+    // A flow can write to a connector an ACCOUNT registered as well as to one AppFlow
+    // vends, so the custom-connector type is offered too — and it is the one type the
+    // vended catalog has no entry for, so it is not asked back here: a registration is
+    // identified by its label, and `connectorConfigurations` is keyed by type.
+    assert!(
+        offered.iter().any(|offered| offered == CONNECTOR_TYPE_CUSTOM),
+        "a flow can write to a registered connector, but the offered destinations are {offered:?}"
+    );
+    let offered_types: Vec<&str> = offered
+        .iter()
+        .filter(|offered| *offered != CONNECTOR_TYPE_CUSTOM)
+        .map(String::as_str)
+        .collect();
     let answer = describe(&router, &offered_types).await;
     assert!(
         answer.is_ok(),
         "case {offered_types:?}: expected HTTP 200, got {answer:?}"
     );
     let reported = configurations(&answer);
-    for destination in &offered {
+    for destination in &offered_types {
         let configuration = reported
-            .get(destination)
+            .get(*destination)
             .unwrap_or_else(|| panic!("case {destination}: expected a configuration, got none"));
         assert!(
             flag(configuration, "canUseAsDestination"),

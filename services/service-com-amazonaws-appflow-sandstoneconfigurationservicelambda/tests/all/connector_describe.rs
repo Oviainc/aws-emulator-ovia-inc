@@ -271,30 +271,22 @@ async fn a_vended_connector_is_described_with_the_capabilities_a_flow_may_use_it
             list(&reported, "supportedTriggerTypes")
         );
         assert_eq!(
-            !list(&reported, "supportedWriteOperations").is_empty(),
-            case.can_use_as_destination,
-            "case {case:?}: supportedWriteOperations is {:?}",
-            list(&reported, "supportedWriteOperations")
-        );
-        assert_eq!(
             !list(&reported, "supportedDestinationConnectors").is_empty(),
             case.can_use_as_source,
             "case {case:?}: supportedDestinationConnectors is {:?}",
             list(&reported, "supportedDestinationConnectors")
         );
 
-        // Every connector moves something, and only `RECORD` and `FILE` exist.
-        let transfer_types = list(&reported, "supportedDataTransferTypes");
-        assert!(
-            !transfer_types.is_empty()
-                && transfer_types
-                    .iter()
-                    .all(|kind| kind == "RECORD" || kind == "FILE"),
-            "case {case:?}: supportedDataTransferTypes is {transfer_types:?}"
-        );
-
-        // Nobody registered a connector AppFlow vends, so it carries no registration.
-        for registration_member in ["connectorLabel", "connectorArn", "registeredAt"] {
+        // Nobody registered a connector AppFlow vends, so it carries neither the
+        // registration members nor the capabilities a registration declares.
+        for registration_member in [
+            "connectorLabel",
+            "connectorArn",
+            "registeredAt",
+            "supportedOperators",
+            "supportedWriteOperations",
+            "supportedDataTransferTypes",
+        ] {
             assert!(
                 reported.get(registration_member).is_none(),
                 "case {case:?}: a vended connector carries no {registration_member}, got {reported:?}"

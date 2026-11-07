@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/connector_catalog.rs"]
 mod connector_catalog;
+#[path = "all/connector_configuration.rs"]
+mod connector_configuration;
 #[path = "all/connector_describe.rs"]
 mod connector_describe;
 #[path = "all/flow_execution_cancellation.rs"]
