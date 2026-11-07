@@ -510,15 +510,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // stream) names no chunk.
                 "CONTINUATION_TOKEN" => {
                     let token = selector.continuation_token.as_deref().unwrap_or_default();
-                    let resumed = store
+                    store
                         .continuation(token, &stream.arn, fragments.len())
                         .ok_or_else(|| {
                             invalid_argument(format!(
                                 "Continuation token {token} does not resolve to a position on stream {}.",
                                 stream.name
                             ))
-                        })?;
-                    resumed.next_fragment_index
+                        })?
                 }
                 // Every modelled selector type is handled above, and an unmodelled one
                 // was already refused.

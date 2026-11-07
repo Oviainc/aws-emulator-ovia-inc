@@ -25,6 +25,16 @@ tracing = { workspace = true }
 # the streams this data plane reads, so a stream's existence and its ARN are read from
 # that state in the shared engine rather than registered a second time here.
 service-com-amazonaws-kinesisvideo-kinesisvideo-20170930 = { workspace = true }
+# The archive read plane's own store: a fragment the ingest plane takes is readable both
+# as a chunk of the live stream (`GetMedia`, this crate) and as an archived fragment
+# (`ListFragments`, `GetMediaForFragmentList`), so one ingest writes both views of it.
+service-com-amazonaws-kinesisvideoarchivedmedia-awsacuityreader = { workspace = true }
+# `request_path` / `nth_path_segment`: the shared readers of a request URI's path, which
+# the ingest plane's claim is made on.
+service-common = { path = "../common" }
+# Reads the Matroska container a producer submits to the ingest plane: its EBML element
+# tree, the Clusters that become fragments and the frames each one carries.
+webm-iterable = "0.7"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

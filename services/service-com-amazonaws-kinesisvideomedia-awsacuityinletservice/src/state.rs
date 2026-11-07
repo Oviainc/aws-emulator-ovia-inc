@@ -19,16 +19,23 @@
 //! one a missing resource, and a stream created again under a removed one's name a
 //! stream with no media of its own.
 //!
-//! The producer side of the media itself (`PutMedia`) is not modelled by any crate in
-//! this emulator yet, so today the only writer of this log is
-//! [`ComAmazonawsKinesisvideomediaAwsacuityinletserviceState::put_fragment`] — the one
-//! entry point a producer path (or a test seeding a stream) calls. `GetMedia` itself
+//! The producer side of the media is this service's ingest plane
+//! ([`crate::service::put_media`], `POST /putMedia`), and it writes through
+//! [`ComAmazonawsKinesisvideomediaAwsacuityinletserviceState::ingest_fragment`] — the
+//! one entry point of a produced fragment. That entry point records the fragment on
+//! BOTH read planes of the stream: this service's media log, which `GetMedia` streams,
+//! and the Kinesis Video Archived Media archive, which `ListFragments` /
+//! `GetMediaForFragmentList` report; one write, one fragment number and one set of
+//! timestamps, so the two planes cannot disagree about what was ingested.
+//! [`ComAmazonawsKinesisvideomediaAwsacuityinletserviceState::put_fragment`] is the
+//! media-log half of it, which a test seeding only this plane calls. `GetMedia` itself
 //! never appends a fragment and never creates a stream.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
 
 use ::service_com_amazonaws_kinesisvideo_kinesisvideo_20170930::state as control_plane;
+use ::service_com_amazonaws_kinesisvideoarchivedmedia_awsacuityreader::state as archive;
 
 /// The content type a Kinesis video stream reports when nothing else is known about
 /// its media: Kinesis Video Streams stores producer fragments as Matroska, and
@@ -62,8 +69,8 @@ pub struct MediaStream {
     pub name: String,
     /// The content type `GetMedia` reports for this stream's media.
     pub content_type: String,
-    /// Every fragment ever written, oldest first. `GetMedia` emits a contiguous run of
-    /// these, so the index of a fragment in this vector IS the stream cursor.
+    /// The fragments this log still holds, oldest first. `GetMedia` emits a contiguous
+    /// run of these, so the index of a fragment in this vector IS the stream cursor.
     pub fragments: Vec<Fragment>,
     /// The number the next fragment written to this stream gets.
     pub next_fragment_number: u64,
@@ -71,17 +78,61 @@ pub struct MediaStream {
     /// NAME cannot be used for that: a name is up to 256 characters while a
     /// `ContinuationToken` is at most 128.
     pub id: u64,
+    /// How many fragments this log has dropped off its oldest end
+    /// ([`ComAmazonawsKinesisvideomediaAwsacuityinletserviceState::ingest_fragment`]
+    /// bounds what one stream holds). It is what makes a cursor OUTLIVE a drop: a
+    /// position in this log is `dropped` plus an index into [`Self::fragments`], and
+    /// that absolute position is what a continuation token is minted from, so a token
+    /// still names the fragment it was minted for after older ones have gone.
+    pub dropped: u64,
 }
 
-/// Where a continuation token resumes: the stream it was minted for, and the index of
+/// The most fragments one stream's media log holds.
+///
+/// A ceiling on the STORE, not an AWS limit: this emulator holds a stream's media in the
+/// process's memory, and a producer may keep ingesting for as long as the emulator runs,
+/// so a log that only ever grew would consume the host. It is the same count one ingest
+/// request may submit ([`crate::service::matroska::MAX_CLUSTERS_PER_REQUEST`]), so a
+/// stream always holds at least a whole session's worth of media.
+pub const MAX_STORED_FRAGMENTS_PER_STREAM: usize = 1024;
+
+/// The most media bytes one stream's media log holds, for the same reason.
+///
+/// One second of the media rate `GetMedia`'s documentation states ("up to 25 megabytes
+/// per second"), which is also what bounds one read session and one ingest request — so
+/// a stream's whole retained log can still be read back in one session.
+pub const MAX_STORED_MEDIA_BYTES_PER_STREAM: usize = 25_000_000;
+
+/// One fragment as a producer submitted it: the bytes and the facts an ingest records
+/// about them, which the two read planes then report.
+///
+/// Carried as one value because a fragment's bytes and its timestamps are one fact about
+/// one fragment: splitting them across an argument list is how a plane ends up recording
+/// media under another fragment's instant.
+#[derive(Debug, Clone)]
+pub struct ProducedFragment {
+    /// The media bytes of the fragment, exactly as the producer wrote them.
+    pub chunk: Vec<u8>,
+    /// When the producer says the fragment was captured.
+    pub producer_timestamp: SystemTime,
+    /// When this service accepted the fragment.
+    pub server_timestamp: SystemTime,
+    /// The playback span the fragment covers, which only the archive read plane reports
+    /// (`Fragment$FragmentLengthInMilliseconds`).
+    pub duration_millis: u64,
+}
+
+/// Where a continuation token resumes: the stream it was minted for, and the position of
 /// the first fragment the next call must emit.
 #[derive(Debug, Clone)]
 pub struct Continuation {
     /// The `StreamARN` of the stream the token was minted for. A token presented
     /// against another stream does not resolve.
     pub stream_arn: String,
-    /// Index into [`MediaStream::fragments`] of the first fragment still to deliver.
-    pub next_fragment_index: usize,
+    /// The ABSOLUTE position in the stream's log of the first fragment still to deliver:
+    /// counted from the first fragment ever written, so it survives the dropping of
+    /// older fragments ([`MediaStream::dropped`]).
+    pub next_fragment_position: u64,
 }
 
 /// Per-service state for com-amazonaws-kinesisvideomedia-awsacuityinletservice. A handler reaches it through [`service_state`].
@@ -129,17 +180,22 @@ impl ComAmazonawsKinesisvideomediaAwsacuityinletserviceState {
                 fragments: Vec::new(),
                 next_fragment_number: 1,
                 id: fresh_id,
+                dropped: 0,
             })
     }
 
     /// Append `chunk` to the media log of the stream `stream_name`/`stream_arn` names,
     /// and answer the fragment number it was stored under.
     ///
-    /// This is the producer-side entry point: the writer of the fragment log. The
-    /// stream it addresses is resolved in the control-plane registry exactly as a read
-    /// resolves it, so media is only ever written to a stream that EXISTS, under the
-    /// identity that stream is registered with. `None` when the registry holds no such
-    /// stream — the producer side of `ResourceNotFoundException`.
+    /// The media-log half of a produced fragment: the writer of the chunk run `GetMedia`
+    /// streams. The stream it addresses is resolved in the control-plane registry
+    /// exactly as a read resolves it, so media is only ever written to a stream that
+    /// EXISTS, under the identity that stream is registered with. `None` when the
+    /// registry holds no such stream — the producer side of `ResourceNotFoundException`.
+    ///
+    /// The ingest plane writes through
+    /// [`ingest_fragment`](Self::ingest_fragment) instead, which records the same
+    /// fragment on the archive read plane as well.
     pub fn put_fragment<Eng: Send + Sync + 'static>(
         &mut self,
         engine: &Eng,
@@ -160,6 +216,84 @@ impl ComAmazonawsKinesisvideomediaAwsacuityinletserviceState {
             chunk,
         });
         Some(fragment_number)
+    }
+
+    /// Record one produced fragment on every read plane of the stream
+    /// `stream_name`/`stream_arn` names, and answer the fragment number it was stored
+    /// under.
+    ///
+    /// This is the ingest plane's one write. A fragment a producer submits is readable
+    /// two ways — as a chunk of the live stream (`GetMedia`, this service's own log) and
+    /// as an archived fragment (`ListFragments`, `GetMediaForFragmentList`, the Kinesis
+    /// Video Archived Media archive) — and those are two VIEWS of one ingested fragment,
+    /// not two fragments: both are written here, from the same bytes, under the same
+    /// minted fragment number and the same producer and server timestamps. A read plane
+    /// that reported a fragment the other did not would be reporting media nothing
+    /// produced.
+    ///
+    /// The fragment number the ingest minted, or `None` when the control-plane registry
+    /// holds no such stream — the producer side of `ResourceNotFoundException`.
+    ///
+    /// What one stream HOLDS is bounded here, at the one site that grows it: this
+    /// emulator keeps a stream's media in memory and a producer may ingest for as long as
+    /// the emulator runs, so once a log is at
+    /// [`MAX_STORED_FRAGMENTS_PER_STREAM`] or [`MAX_STORED_MEDIA_BYTES_PER_STREAM`] the
+    /// oldest fragments are dropped to make room for the newest. The two read planes then
+    /// report the fragments the stream still holds, which is what they already do for a
+    /// stream nothing has been produced to; a cursor a reader holds survives the drop
+    /// ([`MediaStream::dropped`]).
+    pub fn ingest_fragment<Eng: Send + Sync + 'static>(
+        &mut self,
+        engine: &Eng,
+        stream_name: Option<&str>,
+        stream_arn: Option<&str>,
+        produced: ProducedFragment,
+    ) -> Option<String> {
+        let registered = registered_stream_record(engine, stream_name, stream_arn)?;
+        let stream = self.log_mut(&registered.arn, &registered.name);
+        let fragment_number = stream.next_fragment_number.to_string();
+        stream.next_fragment_number += 1;
+        stream.fragments.push(Fragment {
+            fragment_number: fragment_number.clone(),
+            producer_timestamp: produced.producer_timestamp,
+            server_timestamp: produced.server_timestamp,
+            chunk: produced.chunk.clone(),
+        });
+        drop_oldest_beyond_the_ceiling(stream);
+        // The cursors that named the fragments which just went are dropped with them: a
+        // continuation store that outlived the media would be the one piece of
+        // per-fragment bookkeeping this ceiling did not bound.
+        self.forget_cursors_behind_the_log(&registered.arn);
+        archive_fragment(
+            engine,
+            &registered,
+            archive::StoredFragment::new(
+                fragment_number.clone(),
+                produced.producer_timestamp,
+                produced.server_timestamp,
+                produced.duration_millis,
+                produced.chunk,
+            ),
+        );
+        Some(fragment_number)
+    }
+
+    /// Forget every continuation token of the stream `stream_arn` names whose fragment
+    /// has been dropped off the log's oldest end.
+    ///
+    /// Called wherever the log drops fragments, so the continuation store is bounded by
+    /// the same ceiling the media is: what is left is at most one cursor per fragment the
+    /// stream still holds, plus the one that resumes at its end. A token this removes
+    /// named a fragment that is gone, so the session it would have resumed can no longer
+    /// be served from where it stopped, and the next call is answered as the
+    /// bad-argument a token that resolves to no position earns.
+    fn forget_cursors_behind_the_log(&mut self, stream_arn: &str) {
+        let Some(dropped) = self.streams.get(stream_arn).map(|stream| stream.dropped) else {
+            return;
+        };
+        self.continuations.retain(|_, held| {
+            held.stream_arn != stream_arn || held.next_fragment_position >= dropped
+        });
     }
 
     /// The media log held for the stream `arn` identifies, or `None` when nothing has
@@ -214,6 +348,10 @@ impl ComAmazonawsKinesisvideomediaAwsacuityinletserviceState {
     /// re-reading the same fragments answers the same token instead of growing the map
     /// on every call. The text satisfies the modelled `ContinuationToken`
     /// (`^[a-zA-Z0-9_\.\-]+$`, 1..128).
+    ///
+    /// `next_fragment_index` is an index into the log AS IT IS NOW; what is recorded (and
+    /// what the token text carries) is the ABSOLUTE position that index names, so the
+    /// token keeps naming the same fragment after older ones are dropped.
     pub fn record_continuation(
         &mut self,
         stream_arn: &str,
@@ -226,41 +364,49 @@ impl ComAmazonawsKinesisvideomediaAwsacuityinletserviceState {
         // this store holds no log for cannot be clamped against, and a cursor recorded
         // for one is caught instead when the token is resolved (see
         // [`continuation`](Self::continuation)).
-        let next_fragment_index = self
-            .streams
-            .get(stream_arn)
-            .map_or(next_fragment_index, |stream| {
-                next_fragment_index.min(stream.fragments.len())
-            });
-        let token = format!("kvm-{stream_id}-{next_fragment_index}");
+        let held = self.streams.get(stream_arn);
+        let next_fragment_index = held.map_or(next_fragment_index, |stream| {
+            next_fragment_index.min(stream.fragments.len())
+        });
+        let next_fragment_position = held
+            .map_or(0, |stream| stream.dropped)
+            .saturating_add(next_fragment_index as u64);
+        let token = format!("kvm-{stream_id}-{next_fragment_position}");
         self.continuations
             .entry(token.clone())
             .or_insert_with(|| Continuation {
                 stream_arn: stream_arn.to_string(),
-                next_fragment_index,
+                next_fragment_position,
             });
         token
     }
 
-    /// The cursor a previously minted token resumes at ON the stream `stream_arn`
-    /// identifies, whose log holds `fragment_count` fragments.
+    /// The INDEX a previously minted token resumes at in the log of the stream
+    /// `stream_arn` identifies, which holds `fragment_count` fragments now.
     ///
     /// `None` when the token was never minted here, was minted for another stream, or
-    /// names a position outside that stream's log: a cursor is an index into one
+    /// names a position past that stream's log: a cursor names a position in one
     /// stream's fragment log, so both bindings are enforced here rather than left to
     /// each caller. A cursor exactly at the end of the log is live — it is where the
     /// next fragment will land, so it resumes with an empty payload.
+    ///
+    /// A token whose own fragment has since been DROPPED off the log's oldest end is no
+    /// longer held at all ([`forget_cursors_behind_the_log`](Self::forget_cursors_behind_the_log)),
+    /// so it resolves to nothing rather than silently resuming somewhere else.
     pub fn continuation(
         &self,
         token: &str,
         stream_arn: &str,
         fragment_count: usize,
-    ) -> Option<&Continuation> {
+    ) -> Option<usize> {
         let continuation = self.continuations.get(token)?;
         if continuation.stream_arn != stream_arn {
             return None;
         }
-        (continuation.next_fragment_index <= fragment_count).then_some(continuation)
+        let dropped = self.streams.get(stream_arn).map_or(0, |stream| stream.dropped);
+        let index = usize::try_from(continuation.next_fragment_position.saturating_sub(dropped))
+            .unwrap_or(usize::MAX);
+        (index <= fragment_count).then_some(index)
     }
 }
 
@@ -309,11 +455,121 @@ fn registered_stream<Eng: Send + Sync + 'static>(
     stream_name: Option<&str>,
     stream_arn: Option<&str>,
 ) -> Option<(String, String)> {
+    let stream = registered_stream_record(engine, stream_name, stream_arn)?;
+    Some((stream.name, stream.arn))
+}
+
+/// What the Kinesis Video Streams control plane holds for one stream: its identity, and
+/// the two configured values a read plane reports about the stream itself rather than
+/// about its media.
+///
+/// Read on every call, never cached, for the reason [`registered_stream`] gives.
+#[derive(Debug, Clone)]
+struct RegisteredStream {
+    /// The registered `StreamName`.
+    name: String,
+    /// The registered `StreamARN`.
+    arn: String,
+    /// The stream's `MediaType`, empty when the stream was created without one.
+    media_type: String,
+    /// The stream's retention AS OF THIS CALL, in hours.
+    data_retention_in_hours: u32,
+}
+
+/// The stream the control-plane registry holds for this identifier pair, or `None` when
+/// it holds none. The one resolver behind every read and every write here — see
+/// [`registered_stream`] for why the registry, and not a copy of it, decides.
+fn registered_stream_record<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    stream_name: Option<&str>,
+    stream_arn: Option<&str>,
+) -> Option<RegisteredStream> {
     let registry = control_plane::service_state(engine)?;
     let mut registry = registry.lock();
     registry.settle_clock();
     let stream = registry.resolve(stream_name, stream_arn).ok()?;
-    Some((stream.stream_name.clone(), stream.stream_arn.clone()))
+    Some(RegisteredStream {
+        name: stream.stream_name.clone(),
+        arn: stream.stream_arn.clone(),
+        media_type: stream.media_type.clone().unwrap_or_default(),
+        data_retention_in_hours: u32::try_from(stream.data_retention_in_hours).unwrap_or_default(),
+    })
+}
+
+/// Record one ingested fragment in the Kinesis Video Archived Media archive of
+/// `registered`, so the archive read plane reports the fragment this service's media log
+/// just took.
+///
+/// The archive entry is created on first ingest and re-created whenever the stream's
+/// registered ARN has changed, because an ARN carries the stream's creation instant: a
+/// stream deleted and created again under one name is a different stream and must not
+/// inherit the previous incarnation's fragments. The stream's `MediaType` and retention
+/// are re-read from the registry on every ingest, so the archive reports what the
+/// control plane holds now.
+///
+/// The archive store is locked while this service's own store is already locked (the
+/// caller holds that guard); the archive read plane never reads this service's state, so
+/// there is no cycle between the two. A missing archive store is not an error here: the
+/// fragment is still on this service's own log, and an emulator assembled without the
+/// archive plane has no reader for it.
+///
+/// What the archive HOLDS is bounded by the archive crate itself, inside its
+/// `append_fragment` — the one site that grows it — so the two planes' ceilings are each
+/// stated by the store they bound rather than by this writer.
+fn archive_fragment<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    registered: &RegisteredStream,
+    fragment: archive::StoredFragment,
+) {
+    let Some(store) = archive::service_state(engine) else {
+        return;
+    };
+    let mut store = store.lock();
+    let held = store
+        .streams
+        .get(&registered.name)
+        .is_some_and(|held| held.arn == registered.arn);
+    if held {
+        if let Some(stream) = store.streams.get_mut(&registered.name) {
+            stream.media_type = registered.media_type.clone();
+            stream.data_retention_in_hours = registered.data_retention_in_hours;
+        }
+    } else {
+        store.put_stream(archive::ArchivedStream {
+            name: registered.name.clone(),
+            arn: registered.arn.clone(),
+            data_retention_in_hours: registered.data_retention_in_hours,
+            media_type: registered.media_type.clone(),
+            archive_content_type: archive::ARCHIVE_CONTENT_TYPE.to_string(),
+            codec_private_data: None,
+            fragments: Vec::new(),
+        });
+    }
+    store.append_fragment(&registered.name, fragment);
+}
+
+/// Drop the oldest fragments of `stream` until the log is inside the ceilings
+/// [`MAX_STORED_FRAGMENTS_PER_STREAM`] and [`MAX_STORED_MEDIA_BYTES_PER_STREAM`] set,
+/// counting what went in [`MediaStream::dropped`] so a cursor still names the fragment it
+/// was minted for.
+///
+/// The NEWEST fragment is never dropped, however large it is: a stream that holds nothing
+/// a producer just wrote would report media it never took. One fragment of its own is
+/// therefore the floor, and the per-request ceiling
+/// ([`crate::service::matroska::MAX_INGESTED_BYTES_PER_REQUEST`]) is what bounds that one.
+fn drop_oldest_beyond_the_ceiling(stream: &mut MediaStream) {
+    let mut bytes: usize = stream
+        .fragments
+        .iter()
+        .map(|fragment| fragment.chunk.len())
+        .sum();
+    while stream.fragments.len() > MAX_STORED_FRAGMENTS_PER_STREAM
+        || (bytes > MAX_STORED_MEDIA_BYTES_PER_STREAM && stream.fragments.len() > 1)
+    {
+        let dropped = stream.fragments.remove(0);
+        bytes = bytes.saturating_sub(dropped.chunk.len());
+        stream.dropped = stream.dropped.saturating_add(1);
+    }
 }
 
 /// `t` as milliseconds since the Unix epoch (negative before it), the unit Kinesis

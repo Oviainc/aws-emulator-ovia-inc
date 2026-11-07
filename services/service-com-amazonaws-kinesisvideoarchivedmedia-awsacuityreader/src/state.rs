@@ -212,6 +212,24 @@ pub const ARCHIVE_CONTENT_TYPE: &str = "video/webm";
 /// a round "100 MB" with no unit base, so one is chosen here and named.
 pub const MAX_PAYLOAD_BYTES: usize = 100 * 1024 * 1024;
 
+/// The most fragments one stream's archive HOLDS.
+///
+/// A ceiling on the STORE, not an AWS limit: this emulator keeps archived media
+/// in the process's memory, and an ingest plane may keep writing to a stream for
+/// as long as the emulator runs, so an archive that only ever grew would consume
+/// the host. [`ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState::append_fragment`]
+/// is the one site that grows it and the one that enforces this.
+pub const MAX_ARCHIVED_FRAGMENTS_PER_STREAM: usize = 1024;
+
+/// The most media bytes one stream's archive HOLDS, for the same reason.
+///
+/// It bounds the PRODUCT rather than the count, because a count ceiling alone
+/// would admit that many of the largest fragment a producer can write. The
+/// figure is one second of the media rate Kinesis Video Streams states for a
+/// media session ("up to 25 megabytes per second", `GetMedia`), so a stream's
+/// whole retained archive still fits inside one [`MAX_PAYLOAD_BYTES`] response.
+pub const MAX_ARCHIVED_MEDIA_BYTES_PER_STREAM: usize = 25_000_000;
+
 /// The refusal every archived-media operation that models
 /// `NoDataRetentionException` carries: the error is raised for "a stream that
 /// does not retain data (that is, has a `DataRetentionInHours` of 0)", and the
@@ -587,6 +605,17 @@ impl ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState {
     ///
     /// The archive is already ordered, so the insertion point is found by
     /// binary search rather than by re-sorting the whole archive per ingest.
+    ///
+    /// What one stream's archive HOLDS is bounded here, at the one site that
+    /// grows it: this emulator keeps archived media in the process's memory and
+    /// an ingest plane may keep writing for as long as the emulator runs, so
+    /// once an archive is at [`MAX_ARCHIVED_FRAGMENTS_PER_STREAM`] or
+    /// [`MAX_ARCHIVED_MEDIA_BYTES_PER_STREAM`] its OLDEST fragments are dropped
+    /// to make room for the newest. The reads then report the fragments the
+    /// stream still holds, which is what they already do for a window that holds
+    /// none. A `NextToken` minted before a drop counts from the start of the
+    /// result list, so a page taken across one may skip a fragment — the same
+    /// artifact a real archive's retention produces mid-pagination.
     pub fn append_fragment(&mut self, stream_name: &str, fragment: StoredFragment) -> bool {
         let Some(stream) = self.streams.get_mut(stream_name) else {
             return false;
@@ -598,6 +627,20 @@ impl ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState {
             })
             .unwrap_or_else(|insertion_point| insertion_point);
         stream.fragments.insert(at, fragment);
+        // The newest fragment is never dropped, however large it is: an archive
+        // that held nothing a producer just wrote would report media it never
+        // took.
+        let mut bytes: usize = stream
+            .fragments
+            .iter()
+            .map(|held| held.media.len())
+            .sum();
+        while stream.fragments.len() > MAX_ARCHIVED_FRAGMENTS_PER_STREAM
+            || (bytes > MAX_ARCHIVED_MEDIA_BYTES_PER_STREAM && stream.fragments.len() > 1)
+        {
+            let dropped = stream.fragments.remove(0);
+            bytes = bytes.saturating_sub(dropped.media.len());
+        }
         true
     }
 

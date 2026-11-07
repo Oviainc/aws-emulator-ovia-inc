@@ -39,6 +39,27 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The ingest plane
+//!
+//! This service's model binds one route, `POST /getMedia`. Beside it, a Kinesis video
+//! stream has a PRODUCER half — `POST /putMedia`, served at the write data endpoint
+//! `GetDataEndpoint(APIName=PUT_MEDIA)` hands a producer — which no model binds at all,
+//! so the generated routing table can name no request to it. Two seams carry it, and
+//! [`put_media`] owns what it answers:
+//!
+//! - [`Service::can_handle`] also claims a `POST` whose first path segment is
+//!   `putMedia` ([`put_media::claims_parts`]), under the same routing key the modelled
+//!   route is claimed under. Without that claim the emulator answers
+//!   `404 UnknownService` for the endpoint `GetDataEndpoint` handed out.
+//! - [`Service::override_operation`] serves it as an [`ErasedOperation`]
+//!   ([`put_media::PutMediaIngest`]) which declares SigV4, so the emulator verifies the
+//!   producer's signature before any media is taken.
+//!
+//! The Matroska container a producer submits is read by [`matroska`].
+
+pub mod matroska;
+pub mod put_media;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -90,6 +111,11 @@ fn can_handle_parts(parts: &http::request::Parts) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// Serves the ingest plane — `POST /putMedia`, the producer half of a stream. Held
+    /// on the service because [`Service::override_operation`] hands the router a BORROW
+    /// of one of its own operations, and it owns the shared engine so a fragment it
+    /// takes lands in the same store `GetMedia` reads.
+    ingest: put_media::PutMediaIngest<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -98,6 +124,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
+            ingest: put_media::PutMediaIngest::new(Arc::clone(&engine)),
             entry: crate::ServiceDefinition::new(engine),
         }
     }
@@ -119,7 +146,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Matching on the signing name alone would have five services claim every
         // `kinesisvideo` request, which the router answers with 500 `AmbiguousService`
         // instead of serving any of them.
-        can_handle_parts(parts)
+        if can_handle_parts(parts) {
+            return true;
+        }
+        // And the INGEST plane beside it: `POST /putMedia` is this service's producer
+        // half (see the module docs), a route no Kinesis Video model binds and none of
+        // the four peers claims, so without this the emulator answers
+        // `404 UnknownService` for the write data endpoint it hands producers.
+        smithy_server_runtime::resolve_route_key(parts)
+            .is_some_and(|key| key == self.entry.identity().signing_name())
+            && put_media::claims_parts(parts)
     }
 
     fn override_operation(
@@ -130,7 +166,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        //
+        // `POST /putMedia` is that case: the ingest plane carries no `X-Amz-Target` and
+        // no modelled URI names it, so it is named here — which is also what has the
+        // router verify the producer's SigV4 signature before the operation runs.
+        if put_media::claims_request(req) {
+            return Some(&self.ingest as &dyn ErasedOperation);
+        }
         None
     }
 

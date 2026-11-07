@@ -15,6 +15,8 @@
 mod control_plane_stream_reads;
 #[path = "all/get_media.rs"]
 mod get_media;
+#[path = "all/put_media_ingest.rs"]
+mod put_media_ingest;
 #[path = "all/route_claim.rs"]
 mod route_claim;
 #[path = "all/route_claims.rs"]
