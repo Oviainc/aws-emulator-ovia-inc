@@ -4,8 +4,9 @@
 //!
 //! An EC2 instance is EC2's resource, not this service's — this service models no operation
 //! that launches, stops or terminates one — so whether an instance exists, which
-//! Availability Zone it was launched in, what lifecycle state it is in and which instance
-//! type it runs is EC2's answer to give. Both pushes therefore ASK EC2, over the AWS SDK
+//! Availability Zone it was launched in, what lifecycle state it is in, which instance
+//! type it runs and which tags it carries is EC2's answer to give. Both pushes therefore ASK
+//! EC2, over the AWS SDK
 //! driven on the in-process callback
 //! ([`smithy_server_runtime::OperationContext::callback`]), which routes inside this
 //! emulator: no socket is opened, no name is resolved, nothing leaves the process, and this
@@ -71,9 +72,9 @@ fn client(
 /// Ask EC2 about `instance_id` and answer what it said.
 ///
 /// The record is built from the members EC2 reports for the instance — its state
-/// (`Instance$State`), its Availability Zone (`Instance$Placement`) and its instance type
-/// (`Instance$InstanceType`) — plus whether that type runs on the Nitro System, which is a
-/// second question only EC2's instance-type catalog can answer
+/// (`Instance$State`), its Availability Zone (`Instance$Placement`), its instance type
+/// (`Instance$InstanceType`) and its tags (`Instance$Tags`) — plus whether that type runs on
+/// the Nitro System, which is a second question only EC2's instance-type catalog can answer
 /// ([`instance_type_is_nitro`]).
 pub async fn instance(
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -142,6 +143,19 @@ pub async fn instance(
         .await
         .unwrap_or(false);
 
+    // The instance's tags are EC2's too (`Instance$Tags`), and a key push is authorized over
+    // them, so the whole set EC2 reported is carried back. A tag EC2 reports without a key or
+    // without a value is not a `(key, value)` pair an authorization clause can be decided
+    // against, so it is left out rather than filled in with an empty string.
+    let tags = reported
+        .tags()
+        .iter()
+        .filter_map(|tag| {
+            let (key, value) = (tag.key()?, tag.value()?);
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect();
+
     InstanceLookup::Owned(Instance {
         instance_id: instance_id.to_string(),
         availability_zone: reported
@@ -152,6 +166,7 @@ pub async fn instance(
         instance_type,
         state,
         serial_console_supported,
+        tags,
     })
 }
 

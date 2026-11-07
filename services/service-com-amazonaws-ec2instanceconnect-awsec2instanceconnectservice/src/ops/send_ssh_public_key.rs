@@ -14,14 +14,19 @@
 //!
 //! 1. `InstanceOSUser` satisfies the `@pattern` the model declares for it — the one
 //!    constraint the framework cannot evaluate — else `InvalidArgsException`;
-//! 2. EC2 holds the instance ([`crate::state::ec2`], this service's own registry only when
+//! 2. the caller's IAM identity-based policies allow
+//!    `ec2-instance-connect:SendSSHPublicKey` on the instance's ARN, else
+//!    `AccessDeniedException` (HTTP 403) — the decision is taken BEFORE the instance is
+//!    resolved, so a caller holding no grant learns nothing about what the account holds
+//!    ([`crate::state::authorization`]);
+//! 3. EC2 holds the instance ([`crate::state::ec2`], this service's own registry only when
 //!    no EC2 can be asked), else `EC2InstanceNotFoundException`;
-//! 3. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
+//! 4. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
 //!    still launching) or `EC2InstanceStateInvalidException` (going down, stopped or
 //!    terminated);
-//! 4. the `AvailabilityZone` the caller named, when it names one, is the instance's, else
+//! 5. the `AvailabilityZone` the caller named, when it names one, is the instance's, else
 //!    `InvalidArgsException`;
-//! 5. the key is stored against (instance id, OS user), replacing whatever was there and
+//! 6. the key is stored against (instance id, OS user), replacing whatever was there and
 //!    restarting the 60-second lifetime, and `Success: true` comes back with a fresh
 //!    `RequestId`.
 //!
@@ -31,7 +36,9 @@
 //!
 //! Every client error above is served with HTTP 400 whatever `@httpError` the shape
 //! carries — see [`crate::scaffolded::client_error_status`], which owns that mapping for
-//! the whole service.
+//! the whole service. The authorization refusal is not one of them: it is AWS's own
+//! authorization answer rather than a modelled failure of this service, and it keeps the 403
+//! that layer gives it.
 //!
 //! ## Shape of an operation
 //!
@@ -203,12 +210,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let owner_says = crate::state::ec2::instance(ctx, &region, &input.instance_id).await;
 
-        let mut state = store.lock();
-
-        // One instant for the whole call, so the record's `pushed_at`, its expiry and the
-        // pruning cutoff cannot disagree with each other.
-        let now = ::std::time::Instant::now();
-
         // The one modelled constraint the framework's boundary validator cannot enforce:
         // `InstanceOSUser`'s `@pattern`, whose lookahead the `regex` crate cannot compile
         // (see `crate::state::INSTANCE_OS_USER_PATTERN`). Enforced BEFORE any state is read
@@ -228,16 +229,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The instance must exist: `EC2InstanceNotFoundException`. What EC2 — the service
-        // that owns instances — answered about the id decides that, and this service's own
-        // registry is read only when no EC2 could be asked at all.
+        // The instance, as the service that OWNS instances reports it: what EC2 answered
+        // about the id decides the push, and this service's own registry is read only when no
+        // EC2 could be asked at all. Resolved before the decision below, because the
+        // instance's tags are part of the request's condition context.
         let found = match owner_says {
             crate::state::ec2::InstanceLookup::Owned(instance) => Some(instance),
             crate::state::ec2::InstanceLookup::Absent => None,
             crate::state::ec2::InstanceLookup::Unanswered => {
-                state.instance(&input.instance_id).cloned()
+                store.lock().instance(&input.instance_id).cloned()
             }
         };
+
+        // Whether the caller may push a key at that instance at all is IAM's decision, and it
+        // is taken BEFORE anything about the instance is reported: a caller holding no grant is
+        // told it is not authorized rather than told what the account holds, and the decision
+        // is taken with no store guard of this service held.
+        let resource = crate::state::authorization::instance_resource(&region, &input.instance_id);
+        let conditions = crate::state::authorization::Conditions::new(
+            Some(&input.instance_os_user),
+            found.as_ref().map(|instance| &instance.tags),
+        );
+        if let Some(refusal) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &resource,
+            &conditions,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(refusal));
+        }
+
+        let mut state = store.lock();
+
+        // One instant for the whole call, so the record's `pushed_at`, its expiry and the
+        // pruning cutoff cannot disagree with each other.
+        let now = ::std::time::Instant::now();
+
+        // The instance must exist: `EC2InstanceNotFoundException`, for an id its owner holds
+        // no instance under.
         let instance = found.ok_or_else(|| {
             SendSSHPublicKeyErrorModeled::EC2InstanceNotFoundException(
                 EC2InstanceNotFoundException {

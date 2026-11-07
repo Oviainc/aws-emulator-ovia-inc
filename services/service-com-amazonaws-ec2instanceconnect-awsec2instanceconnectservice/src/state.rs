@@ -22,14 +22,18 @@
 //! It also owns the one modelled input constraint the framework's boundary validator
 //! cannot enforce — `InstanceOSUser`'s `@pattern` — because both the handler that enforces
 //! it and `service.rs`, which words the boundary's own refusals, state it the same way.
+//!
+//! Whether the caller may push at all is [`authorization`]: the IAM decision both operations
+//! take before they resolve anything.
 
 use std::collections::hash_map::RandomState;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{BuildHasher, Hasher};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aws_smithy_schema_server::constraints::{path, Violation, ViolationKind};
 
+pub mod authorization;
 pub mod ec2;
 
 /// The Region a hop into another service is made in when the request carries no SigV4
@@ -345,6 +349,16 @@ pub struct Instance {
     /// Whether this instance type supports the EC2 serial console ("Only Nitro instance
     /// types are currently supported", per `EC2InstanceTypeInvalidException`).
     pub serial_console_supported: bool,
+    /// The instance's tags, as EC2 reports them (`Instance$Tags`), keyed by tag key.
+    ///
+    /// Kept because an authorization decision about the instance is made over them: an
+    /// identity policy may condition a key push on the tags of the instance it names
+    /// ([`authorization::Conditions`]), and the tag set is the instance's own, so it is read
+    /// from whoever answered for the instance rather than invented here. A record whose tags
+    /// nothing reported carries none, which is not the same as an instance with no tags —
+    /// see [`authorization::Conditions::new`], which only publishes the tag condition keys
+    /// for a tag set that IS known.
+    pub tags: BTreeMap<String, String>,
 }
 
 impl Instance {
@@ -362,12 +376,25 @@ impl Instance {
             instance_type: instance_type.into(),
             state,
             serial_console_supported,
+            tags: BTreeMap::new(),
         }
     }
 
     /// The same entry in another lifecycle state (a stop, a start, a termination).
     pub fn in_state(mut self, state: InstanceState) -> Self {
         self.state = state;
+        self
+    }
+
+    /// The same entry carrying `tags`, the tags the owner of the instance reports for it.
+    pub fn with_tags<K: Into<String>, V: Into<String>>(
+        mut self,
+        tags: impl IntoIterator<Item = (K, V)>,
+    ) -> Self {
+        self.tags = tags
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
         self
     }
 }

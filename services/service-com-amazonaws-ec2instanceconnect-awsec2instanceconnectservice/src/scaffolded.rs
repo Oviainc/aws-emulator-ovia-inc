@@ -205,6 +205,72 @@ pub fn client_error_status(modeled_status: u16) -> u16 {
     }
 }
 
+/// The `message` member of the synthetic `AccessDeniedException` error shape.
+static ACCESS_DENIED_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#AccessDeniedException$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `AccessDeniedException` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`: AWS answers a
+/// call the caller's IAM policies do not allow with this error code on both of this service's
+/// operations, whose model declares no error for an authorization refusal at all (the
+/// modelled `AuthException` is the one AWS states for a credential that is not valid), so
+/// there is no modeled shape to use and the synthetic one must not collide with a modeled
+/// name.
+pub static ACCESS_DENIED_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#AccessDeniedException",
+        "smithy.framework",
+        "AccessDeniedException",
+    ),
+    ShapeType::Structure,
+    &[&ACCESS_DENIED_MESSAGE],
+);
+
+/// The payload of an `AccessDeniedException`: who was refused, what they asked for, and why
+/// the request was not permitted.
+#[derive(Debug, Clone)]
+pub struct AccessDenied {
+    pub message: String,
+}
+
+impl AccessDenied {
+    /// An `AccessDeniedException` carrying `message`.
+    ///
+    /// The text is built from the request — the calling principal, the action and the resource
+    /// — because that is what makes the refusal actionable: the caller has to tell from it
+    /// which permission is missing. See `crate::state::authorization`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AccessDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AccessDeniedException: {}", self.message)
+    }
+}
+
+impl std::error::Error for AccessDenied {}
+
+impl SerializableStruct for AccessDenied {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&ACCESS_DENIED_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -214,6 +280,13 @@ pub enum Scaffolded<E> {
     /// A modeled error the operation declares. Renders with the status
     /// [`client_error_status`] gives it.
     Modeled(E),
+    /// The calling principal's IAM policies do not permit this call. Renders as HTTP 403 with
+    /// the error code `AccessDeniedException`.
+    ///
+    /// It cannot be a modeled variant: neither operation's model declares a client error for
+    /// an authorization refusal, yet AWS refuses both this way when the caller's
+    /// identity-based policies do not allow the action (see `crate::state::authorization`).
+    AccessDenied(AccessDenied),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -231,6 +304,15 @@ impl<E> Scaffolded<E> {
     /// The scaffold signal for `operation`.
     pub fn not_implemented(operation: &str) -> Self {
         Self::NotImplemented(NotImplemented::new(operation))
+    }
+
+    /// Refuse the request because the caller's IAM policies do not allow it, with HTTP 403
+    /// `AccessDeniedException` and `message` as the refusal's wording.
+    ///
+    /// The decision and the wording both live in `crate::state::authorization`; this is only
+    /// the channel that carries them.
+    pub fn access_denied(message: impl Into<String>) -> Self {
+        Self::AccessDenied(AccessDenied::new(message))
     }
 
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.
@@ -257,6 +339,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::AccessDenied(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -269,6 +352,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::AccessDenied(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -283,6 +367,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::AccessDenied(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -291,6 +376,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            Self::AccessDenied(_) => &ACCESS_DENIED_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -303,6 +389,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            Self::AccessDenied(_) => "AccessDeniedException",
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -315,10 +402,15 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     ///
     /// A MODELED error goes through [`client_error_status`], which is where EC2 Instance
     /// Connect's own status mapping lives.
+    ///
+    /// An authorization refusal does NOT: it is AWS's own authorization answer rather than one
+    /// of this service's modelled failures, and that layer answers 403 whatever status the
+    /// service puts on its own client errors.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => client_error_status(e.http_status()),
+            Self::AccessDenied(_) => 403,
             Self::ValidationException(_) => 400,
         }
     }
@@ -330,8 +422,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
-            // Same reason: the synthetic shape carries no `awsQueryError` trait.
-            Self::ValidationException(_) => None,
+            // Same reason: both synthetic shapes carry no `awsQueryError` trait — and this
+            // service speaks awsJson1_1 only, so no query envelope renders either of them.
+            Self::AccessDenied(_) | Self::ValidationException(_) => None,
         }
     }
 }

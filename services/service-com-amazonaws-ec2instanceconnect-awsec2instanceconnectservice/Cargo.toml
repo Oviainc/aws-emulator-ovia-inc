@@ -31,12 +31,24 @@ hex = { workspace = true }
 # and instance type it has, rather than deciding that from records kept here. Only the
 # generated client is needed — the emulator supplies the transport.
 aws-sdk-ec2 = { version = "1", default-features = false }
+# `iam_authorization`: the shared evaluation of IAM policy documents against
+# (action, resource), which both key pushes are decided by, plus `iam_role`'s readings of a
+# principal ARN. See `src/state/authorization.rs`.
+service-common = { path = "../common" }
+# The IAM store holds the identity-based policies of the principal a request speaks for,
+# and the STS store resolves which principal that is: this service reads both services' OWN
+# state accessors rather than keeping a second copy of either fact.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [dev-dependencies]
-# The EC2 service, mounted beside this one in tests/all/ec2_owned_instances.rs: a push at an
-# instance EC2 launched can only be driven end to end with the owner of the instance on the
-# same engine. DEV-ONLY: this crate depends on no other service's crate outside its tests.
+# The EC2 service, mounted beside this one in tests/all/ec2_owned_instances.rs and
+# tests/all/identity_policy_authorization.rs: a push at an instance EC2 launched can only be
+# driven end to end with the owner of the instance on the same engine.
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# RFC 3986 percent-encoding, so tests/all/identity_policy_authorization.rs can put a whole
+# IAM policy document in an `application/x-www-form-urlencoded` component.
+percent-encoding = "2.3"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

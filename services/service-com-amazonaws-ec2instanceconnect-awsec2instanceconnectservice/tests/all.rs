@@ -15,6 +15,8 @@
 mod ec2_owned_instances;
 #[path = "all/error_status_and_input_constraints.rs"]
 mod error_status_and_input_constraints;
+#[path = "all/identity_policy_authorization.rs"]
+mod identity_policy_authorization;
 #[path = "all/instance_connect_key_push.rs"]
 mod instance_connect_key_push;
 #[path = "all/state_roundtrip.rs"]

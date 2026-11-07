@@ -9,14 +9,18 @@
 //!
 //! ## Decision order
 //!
-//! 1. the account has serial-console access, else `SerialConsoleAccessDisabledException`;
-//! 2. EC2 holds the instance ([`crate::state::ec2`], this service's own registry only when
+//! 1. the caller's IAM identity-based policies allow
+//!    `ec2-instance-connect:SendSerialConsoleSSHPublicKey` on the instance's ARN, else
+//!    `AccessDeniedException` (HTTP 403) — the decision is taken BEFORE anything about the
+//!    account or the instance is reported ([`crate::state::authorization`]);
+//! 2. the account has serial-console access, else `SerialConsoleAccessDisabledException`;
+//! 3. EC2 holds the instance ([`crate::state::ec2`], this service's own registry only when
 //!    no EC2 can be asked), else `EC2InstanceNotFoundException`;
-//! 3. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
+//! 4. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
 //!    still launching) or `EC2InstanceStateInvalidException` (going down, stopped or
 //!    terminated);
-//! 4. its instance type supports the serial console, else `EC2InstanceTypeInvalidException`;
-//! 5. the key is stored against (instance id, serial port), replacing whatever was there and
+//! 5. its instance type supports the serial console, else `EC2InstanceTypeInvalidException`;
+//! 6. the key is stored against (instance id, serial port), replacing whatever was there and
 //!    restarting the 60-second lifetime, and `Success: true` comes back with a fresh
 //!    `RequestId`.
 //!
@@ -27,7 +31,9 @@
 //!
 //! Every client error above is served with HTTP 400 whatever `@httpError` the shape
 //! carries — see [`crate::scaffolded::client_error_status`], which owns that mapping for
-//! the whole service.
+//! the whole service. The authorization refusal is not one of them: it is AWS's own
+//! authorization answer rather than a modelled failure of this service, and it keeps the 403
+//! that layer gives it.
 //!
 //! `SerialConsoleSessionLimitExceededException`, `SerialConsoleSessionUnavailableException`
 //! and `SerialConsoleSessionUnsupportedException` report facts about an SSH serial-console
@@ -223,6 +229,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let owner_access = crate::state::ec2::serial_console_access_enabled(ctx, &region).await;
         let owner_says = crate::state::ec2::instance(ctx, &region, &input.instance_id).await;
 
+        // The instance, as the service that owns instances reports it: this service's own
+        // registry is read only when no EC2 could be asked at all. Resolved before the
+        // decision below, because the instance's tags are part of the request's condition
+        // context.
+        let found = match owner_says {
+            crate::state::ec2::InstanceLookup::Owned(instance) => Some(instance),
+            crate::state::ec2::InstanceLookup::Absent => None,
+            crate::state::ec2::InstanceLookup::Unanswered => {
+                store.lock().instance(&input.instance_id).cloned()
+            }
+        };
+
+        // Whether the caller may push a serial-console key at that instance at all is IAM's
+        // decision, taken before anything about the account or the instance is reported, and
+        // with no store guard of this service held. A serial-console push names no OS user, so
+        // it publishes no value for that condition key. Same rule, and the same gate, as
+        // `SendSSHPublicKey`.
+        let resource = crate::state::authorization::instance_resource(&region, &input.instance_id);
+        let conditions = crate::state::authorization::Conditions::new(
+            None,
+            found.as_ref().map(|instance| &instance.tags),
+        );
+        if let Some(refusal) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &resource,
+            &conditions,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(refusal));
+        }
+
         let mut state = store.lock();
 
         // One instant for the whole call, so the record's `pushed_at`, its expiry and the
@@ -254,13 +292,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The instance must exist: `EC2InstanceNotFoundException`. Same rule, and the same
         // hop into the owner of the instance, as `SendSSHPublicKey`.
-        let found = match owner_says {
-            crate::state::ec2::InstanceLookup::Owned(instance) => Some(instance),
-            crate::state::ec2::InstanceLookup::Absent => None,
-            crate::state::ec2::InstanceLookup::Unanswered => {
-                state.instance(&input.instance_id).cloned()
-            }
-        };
         let instance = found.ok_or_else(|| {
             SendSerialConsoleSSHPublicKeyErrorModeled::EC2InstanceNotFoundException(
                 EC2InstanceNotFoundException {
