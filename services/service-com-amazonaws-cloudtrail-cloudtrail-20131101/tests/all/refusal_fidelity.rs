@@ -105,13 +105,21 @@ fn selectors_with_data_resources(count: usize) -> Value {
     json!([{ "IncludeManagementEvents": false, "DataResources": resources }])
 }
 
-/// One advanced event selector whose single field selector carries `count` condition
-/// values.
+/// One advanced event selector whose field selectors carry `count` condition values in
+/// total.
+///
+/// The mandatory `eventCategory` field selector is one of them — every advanced event
+/// selector states which category of events it selects — so the rest of the count is
+/// spread over a `resources.ARN` condition.
 fn advanced_with_values(count: usize) -> Value {
-    let values: Vec<String> = (0..count)
+    let values: Vec<String> = (0..count.saturating_sub(1))
         .map(|index| format!("arn:aws:s3:::b{index}/"))
         .collect();
-    json!([{ "Name": "generated", "FieldSelectors": [{"Field": "resources.ARN", "StartsWith": values}] }])
+    let mut field_selectors = vec![json!({"Field": "eventCategory", "Equals": ["Data"]})];
+    if !values.is_empty() {
+        field_selectors.push(json!({"Field": "resources.ARN", "StartsWith": values}));
+    }
+    json!([{ "Name": "generated", "FieldSelectors": field_selectors }])
 }
 
 /// Every operation that resolves a trail identifier to ONE Region's trail, as a

@@ -53,8 +53,20 @@ uuid = { version = "1", features = ["v4"] }
 hex = { workspace = true }
 # The account's S3 BUCKETS: a trail delivers its log files into one, so `CreateTrail`
 # and `UpdateTrail` resolve the destination `S3BucketName` in the one object store
-# (`state::destination_bucket_exists`) rather than in a copy of it here.
+# (`state::destination_bucket_exists`) rather than in a copy of it here, and read that
+# bucket's POLICY there to decide whether CloudTrail may write the trail's log files
+# (`state::referenced_resources`).
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The account's SNS TOPICS: a trail notifies log-file delivery to one, so the topic's
+# access policy is read in the one Amazon SNS store (`state::referenced_resources`).
+service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
+# The account's KMS KEYS: a trail encrypts its log files under one, so a `KmsKeyId` is
+# resolved in the one KMS store (`state::referenced_resources`).
+service-com-amazonaws-kms-trentservice = { workspace = true }
+# The account's CloudWatch Logs LOG GROUPS: a trail may also deliver to one, so a
+# `CloudWatchLogsLogGroupArn` is resolved in the one CloudWatch Logs store
+# (`state::referenced_resources`).
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # Writes the DER PKCS#1 `RSAPublicKey` body a digest-signing public key is reported as
 # (`ListPublicKeys`, `PublicKey$Value`: "The DER encoded public key value in PKCS#1
 # format"), so that structure comes from an ASN.1 crate rather than from hand-written DER.

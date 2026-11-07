@@ -119,17 +119,137 @@ impl Emulator {
         }
     }
 
-    /// Record a bucket named `bucket` in `region` in the one object store — what a
-    /// client does with Amazon S3's `CreateBucket` before it points a trail at it.
+    /// Record a bucket named `bucket` in `region` in the one object store, carrying the
+    /// bucket policy that lets CloudTrail deliver a trail's log files into it — what a
+    /// client does with Amazon S3's `CreateBucket` and `PutBucketPolicy` before it points
+    /// a trail at it.
     ///
     /// A trail's log-delivery destination is resolved THERE by `CreateTrail` and
-    /// `UpdateTrail` (`state::destination_bucket_exists`), so a suite whose subject is
-    /// the trail registry rather than the destination needs the bucket its requests
-    /// name to exist. Recording the same name twice leaves the first bucket alone.
+    /// `UpdateTrail` (`state::referenced_resources`), so a suite whose subject is the
+    /// trail registry rather than the destination needs the bucket its requests name to
+    /// exist AND to permit the delivery. Recording the same name twice leaves the first
+    /// bucket alone and re-attaches the policy.
     pub fn provision_bucket(&self, bucket: &str, region: &str) {
+        self.provision_bucket_with_policy(bucket, region, Some(&cloudtrail_bucket_policy(bucket)));
+    }
+
+    /// [`Emulator::provision_bucket`], with the bucket policy a suite chooses — `None`
+    /// for a bucket created and never policied, which is the state `CreateBucket` leaves
+    /// a bucket in.
+    pub fn provision_bucket_with_policy(&self, bucket: &str, region: &str, policy: Option<&str>) {
         let state = service_com_amazonaws_s3_amazons3::state::service_state(&*self.engine)
             .expect("the in-memory engine carries the object store");
-        let _ = state.lock().create_bucket(bucket, region);
+        let mut store = state.lock();
+        let _ = store.create_bucket(bucket, region);
+        if let Some(held) = store.bucket_mut(bucket) {
+            held.policy = policy.map(str::to_string);
+        }
+    }
+
+    /// Record an Amazon SNS topic at `topic_arn` carrying the access policy that lets
+    /// CloudTrail publish a log-file-delivered notification to it — the `CreateTopic` plus
+    /// `SetTopicAttributes` a client makes before naming the topic on a trail.
+    pub fn provision_topic(&self, topic_arn: &str) {
+        self.provision_topic_with_policy(topic_arn, Some(&cloudtrail_topic_policy(topic_arn)));
+    }
+
+    /// [`Emulator::provision_topic`], with the access policy a suite chooses — `None` for
+    /// a topic carrying no policy of its own, which Amazon SNS reports under the default
+    /// policy it generates for one.
+    pub fn provision_topic_with_policy(&self, topic_arn: &str, policy: Option<&str>) {
+        let state = service_com_amazonaws_sns_amazonsimplenotificationservice::state::service_state(
+            &*self.engine,
+        )
+        .expect("the in-memory engine carries the Amazon SNS store");
+        let name = topic_arn.rsplit(':').next().unwrap_or(topic_arn).to_string();
+        let owner = engine::emulator_account_id().to_string();
+        let mut attributes = std::collections::HashMap::new();
+        if let Some(policy) = policy {
+            attributes.insert(
+                service_com_amazonaws_sns_amazonsimplenotificationservice::state::POLICY_ATTRIBUTE
+                    .to_string(),
+                policy.to_string(),
+            );
+        }
+        let record =
+            service_com_amazonaws_sns_amazonsimplenotificationservice::state::TopicRecord {
+                arn: topic_arn.to_string(),
+                name,
+                owner,
+                attributes,
+                tags: std::collections::HashMap::new(),
+                data_protection_policy: None,
+                is_fifo: false,
+                created_at: std::time::SystemTime::now(),
+                subscriptions_deleted: 0,
+                archive_enabled_at: None,
+            };
+        state.lock().topics.insert(topic_arn.to_string(), record);
+    }
+
+    /// Record a KMS key the identifier `key_id` resolves to in `region`, in every form
+    /// the `KmsKeyId` member accepts — the `CreateKey` (and `CreateAlias`) a client makes
+    /// before encrypting a trail's log files under it.
+    pub fn provision_kms_key(&self, key_id: &str, region: &str) {
+        use service_com_amazonaws_kms_trentservice::state as kms;
+
+        // The Region and the identifier an ARN form pins the key to; a bare id or alias
+        // names one in the Region the request was signed for.
+        let (scope, identifier) = match service_common::arn::parse(key_id) {
+            Some(arn) if arn.vendor == "kms" => (arn.region.to_string(), arn.resource.to_string()),
+            Some(_) => return,
+            None => (region.to_string(), key_id.to_string()),
+        };
+        let (alias, id) = match identifier.strip_prefix("alias/") {
+            Some(name) => (Some(format!("alias/{name}")), fixture_key_id(name)),
+            None => (
+                None,
+                identifier
+                    .strip_prefix("key/")
+                    .unwrap_or(&identifier)
+                    .to_string(),
+            ),
+        };
+        let state = kms::service_state(&*self.engine)
+            .expect("the in-memory engine carries the KMS store");
+        let mut store = state.lock();
+        store.insert_key(kms::Cmk::new(
+            id.clone(),
+            scope.clone(),
+            String::new(),
+            kms::KEY_USAGE_ENCRYPT_DECRYPT.to_string(),
+            kms::KEY_SPEC_SYMMETRIC_DEFAULT.to_string(),
+            kms::ORIGIN_AWS_KMS.to_string(),
+            false,
+            kms::default_key_policy(),
+            std::collections::BTreeMap::new(),
+            kms::KeyMaterial::Aes256([0x5a; kms::MATERIAL_LEN]),
+        ));
+        if let Some(alias) = alias {
+            store.insert_alias(kms::Alias::new(scope, alias, id));
+        }
+    }
+
+    /// Record the CloudWatch Logs log group a trail's `CloudWatchLogsLogGroupArn` names —
+    /// the `CreateLogGroup` a client makes before pointing a trail at it. A value that is
+    /// not a log-group ARN of this account names no group and records nothing.
+    pub fn provision_log_group(&self, log_group_arn: &str) {
+        use service_com_amazonaws_cloudwatchlogs_logs_20140328::state as logs;
+
+        let Some(parsed) = service_common::arn::parse(log_group_arn) else {
+            return;
+        };
+        if parsed.vendor != "logs" || parsed.resource_type() != "log-group" {
+            return;
+        }
+        let name = logs::log_group_name_from_identifier(log_group_arn).to_string();
+        if !service_common::cloudwatch_logs::is_log_group_name(&name) {
+            return;
+        }
+        let state =
+            logs::service_state(&*self.engine).expect("the in-memory engine carries the logs store");
+        let record = logs::LogGroupRecord::new(parsed.region, &name, 0);
+        state.lock().log_groups.insert(name, record);
     }
 
     /// This service's store in the shared engine — the SAME store every handler
@@ -162,20 +282,36 @@ impl Emulator {
     /// Call with a verbatim `X-Amz-Target`, for pinning how a target header is
     /// read.
     ///
-    /// An `S3BucketName` in the body names a trail's log-delivery destination, which
-    /// CloudTrail resolves in the one object store before it accepts the trail. Every
-    /// suite but the one about that destination is about the trail registry instead, so
-    /// the harness records the bucket first ([`Emulator::provision_bucket`]) — the
-    /// `CreateBucket` a client makes before pointing a trail anywhere — unless it was
-    /// built with [`Emulator::without_provisioned_destinations`].
+    /// A trail's settings name resources of OTHER services — the destination bucket, the
+    /// notification topic, the encryption key and the CloudWatch Logs destination — and
+    /// CloudTrail resolves every one of them before it accepts the trail. Every suite but
+    /// the ones about those references is about the trail registry instead, so the harness
+    /// records each resource the body names first, the way a client creates them before
+    /// pointing a trail anywhere — unless it was built with
+    /// [`Emulator::without_provisioned_destinations`].
     pub async fn call_with_target(&self, target: &str, region: &str, body: &Value) -> Reply {
         if self.provision_destinations {
-            if let Some(bucket) = body
-                .get("S3BucketName")
-                .and_then(Value::as_str)
-                .filter(|bucket| !bucket.is_empty())
-            {
-                self.provision_bucket(bucket, region);
+            let member = |name: &str| {
+                body.get(name)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            };
+            if let Some(bucket) = member("S3BucketName") {
+                self.provision_bucket(&bucket, region);
+            }
+            if let Some(topic) = member("SnsTopicName") {
+                // `SnsTopicName` is "the name or ARN of the Amazon SNS topic", and the
+                // trail keeps the ARN either form resolves to.
+                let topic_arn = service_com_amazonaws_cloudtrail_cloudtrail_20131101::state::
+                    sns_topic_arn(region, &topic);
+                self.provision_topic(&topic_arn);
+            }
+            if let Some(key_id) = member("KmsKeyId") {
+                self.provision_kms_key(&key_id, region);
+            }
+            if let Some(log_group_arn) = member("CloudWatchLogsLogGroupArn") {
+                self.provision_log_group(&log_group_arn);
             }
         }
         // The Region a request is served in comes from its SigV4 credential scope,
@@ -202,4 +338,62 @@ impl Emulator {
     pub async fn call(&self, operation: &str, body: &Value) -> Reply {
         self.call_in(operation, HOME_REGION, body).await
     }
+}
+
+/// The bucket policy a client attaches so CloudTrail may deliver a trail's log files
+/// into `bucket`: the ACL check on the bucket and the object write under it, granted to
+/// the CloudTrail service principal and scoped by the canned ACL the delivery carries —
+/// the policy CloudTrail's own documentation states, with the write granted over the
+/// WHOLE bucket so one fixture serves every `S3KeyPrefix` a suite points a trail at.
+pub fn cloudtrail_bucket_policy(bucket: &str) -> String {
+    serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AWSCloudTrailAclCheck",
+                "Effect": "Allow",
+                "Principal": {"Service": "cloudtrail.amazonaws.com"},
+                "Action": "s3:GetBucketAcl",
+                "Resource": format!("arn:aws:s3:::{bucket}"),
+            },
+            {
+                "Sid": "AWSCloudTrailWrite",
+                "Effect": "Allow",
+                "Principal": {"Service": "cloudtrail.amazonaws.com"},
+                "Action": "s3:PutObject",
+                "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                "Condition": {
+                    "StringEquals": {"s3:x-amz-acl": "bucket-owner-full-control"},
+                },
+            },
+        ],
+    })
+    .to_string()
+}
+
+/// The access policy a client attaches so CloudTrail may publish a trail's log-file
+/// notifications to the topic `topic_arn`.
+pub fn cloudtrail_topic_policy(topic_arn: &str) -> String {
+    serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "AWSCloudTrailSNSPolicy",
+            "Effect": "Allow",
+            "Principal": {"Service": "cloudtrail.amazonaws.com"},
+            "Action": "SNS:Publish",
+            "Resource": topic_arn,
+        }],
+    })
+    .to_string()
+}
+
+/// A 36-character KMS key id in the form the service mints (`^[0-9a-f-]+$`), derived
+/// from `seed` so the same alias always names the same key.
+fn fixture_key_id(seed: &str) -> String {
+    let digest = seed
+        .bytes()
+        .fold(0u64, |acc, byte| acc.wrapping_mul(0x0100_0193) ^ u64::from(byte));
+    let id = format!("{:08x}-0000-4000-8000-{:012x}", digest as u32, digest & 0xffff_ffff_ffff);
+    assert_eq!(id.len(), 36, "a KMS key id is 36 characters: {id:?}");
+    id
 }

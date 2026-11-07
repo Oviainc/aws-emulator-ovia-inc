@@ -208,7 +208,8 @@ impl Emulator {
     async fn call_signed_or_not(&self, target: &str, signed: bool, body: &Value) -> Reply {
         // A trail's log-delivery destination is a bucket of the account, resolved in the
         // one object store by `CreateTrail` and `UpdateTrail`, so the bucket a request
-        // names is recorded there first — the `CreateBucket` a client makes before it
+        // names is recorded there first, carrying the policy that lets CloudTrail deliver
+        // into it — the `CreateBucket` plus `PutBucketPolicy` a client makes before it
         // points a trail anywhere. This suite's subject is the target header, not the
         // destination.
         if let Some(bucket) = body
@@ -218,7 +219,11 @@ impl Emulator {
         {
             let objects = service_com_amazonaws_s3_amazons3::state::service_state(&*self.engine)
                 .expect("the in-memory engine carries the object store");
-            let _ = objects.lock().create_bucket(bucket, REGION);
+            let mut store = objects.lock();
+            let _ = store.create_bucket(bucket, REGION);
+            if let Some(held) = store.bucket_mut(bucket) {
+                held.policy = Some(super::emulator::cloudtrail_bucket_policy(bucket));
+            }
         }
         let mut request = http::Request::builder()
             .method("POST")

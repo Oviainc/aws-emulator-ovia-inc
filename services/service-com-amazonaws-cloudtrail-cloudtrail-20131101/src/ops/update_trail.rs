@@ -410,22 +410,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A request that REPLACES the trail's destination resolves the new bucket in
-        // the account's object store, exactly as `CreateTrail` resolves the
-        // destination it is created with: a trail must never be pointed at a
-        // destination it could not deliver a log file to. Every value the member
-        // carries is held to the same rule as `CreateTrail`'s, the empty string
-        // included — it names no bucket either, so it is the same malformed parameter
-        // here as there. It is resolved HERE, before the registry is reached, so no
-        // guard of this service's store is held across the object store's lock
-        // ([`crate::state::destination_bucket_exists`]); the refusal it feeds is
-        // raised only once the trail the call addresses has been located, because a
-        // trail that does not exist cannot be pointed anywhere.
-        let destination = input.s3_bucket_name.as_deref();
-        let destination_absent = destination.is_some_and(|bucket| {
-            crate::state::destination_bucket_exists(&*self.engine, bucket) == Some(false)
-        });
-
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateTrailErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
                 message: Some(
@@ -435,58 +419,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             })
         })?;
-        let mut store = state.lock();
 
-        // "UpdateTrail must be called from the Region in which the trail was created;
-        // otherwise, an InvalidHomeRegionException is thrown."
-        let located = store
-            .resolve_for_mutation(&input.name, &region)
-            .map_err(identifier_error)?;
-        let record = match located {
-            crate::state::TrailForMutation::Found(record) => record,
-            crate::state::TrailForMutation::AddressedInAnotherRegion { name, addressed } => {
-                return Err(UpdateTrailErrorModeled::InvalidHomeRegionException(
-                    InvalidHomeRegionException {
-                        message: Some(format!(
-                            "Trail {name} was addressed in {addressed}, but this request was \
-                             made in {region}: a trail is updated from the Region it was \
-                             created in"
-                        )),
-                    },
-                )
-                .into());
-            }
-            crate::state::TrailForMutation::HomedInAnotherRegion { name, home_region } => {
-                return Err(UpdateTrailErrorModeled::InvalidHomeRegionException(
-                    InvalidHomeRegionException {
-                        message: Some(format!(
-                            "Trail {name} was created in {home_region}, not in {region}: a \
-                             trail is updated from the Region it was created in"
-                        )),
-                    },
-                )
-                .into());
-            }
-            crate::state::TrailForMutation::Absent { name } => {
-                // `UpdateTrail` resolves the identifier to one Region's trail, so the
-                // refusal names that trail's ARN; the model says 404 for a not-found
-                // trail and CloudTrail answers 400 (see
-                // `crate::state::TRAIL_NOT_FOUND_STATUS`).
-                return Err(crate::scaffolded::Scaffolded::modeled_with_status(
-                    UpdateTrailErrorModeled::TrailNotFoundException(TrailNotFoundException {
-                        message: Some(crate::state::trail_not_found_arn_message(&region, &name)),
-                    }),
-                    crate::state::TRAIL_NOT_FOUND_STATUS,
-                ));
+        // The trail the call addresses is located FIRST, and the registry's lock is
+        // RELEASED again before any other service's store is read: a trail that does
+        // not exist cannot be pointed anywhere, and the resources the new settings
+        // reference are resolved with no guard of this service's store held — the lock
+        // order [`crate::state::referenced_resources`] documents. What the located
+        // trail contributes is the delivery it is configured with today, because a
+        // request that changes one half of it is judged against the other.
+        let held = {
+            let mut store = state.lock();
+            let record = locate(&mut store, &input.name, &region)?;
+            HeldDelivery {
+                trail_arn: record.trail_arn.clone(),
+                s3_bucket_name: record.s3_bucket_name.clone(),
+                s3_key_prefix: record.s3_key_prefix.clone(),
             }
         };
 
-        // The trail exists, so the destination the request names now decides whether it
-        // may be pointed there: a name Amazon S3 holds no bucket under is refused as the
-        // malformed parameter it is (the shared rule,
-        // [`service_common::s3_bucket_name`]), and a well-formed name the account holds
-        // no bucket under as a destination that does not exist.
-        if let Some(bucket) = destination {
+        // The trail exists, so the settings the request carries now decide whether it
+        // may be pointed where they say. A destination outside the Amazon S3 naming
+        // rules names no bucket anywhere — every value the member carries is held to
+        // the same rule as `CreateTrail`'s, the empty string included — and then every
+        // resource the resulting configuration references is resolved in the service
+        // that owns it.
+        if let Some(bucket) = input.s3_bucket_name.as_deref() {
             if !::service_common::s3_bucket_name::is_well_formed(bucket) {
                 return Err(UpdateTrailErrorModeled::InvalidS3BucketNameException(
                     InvalidS3BucketNameException {
@@ -496,17 +453,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
-        if destination_absent {
-            let bucket = destination.unwrap_or_default().to_string();
-            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
-                UpdateTrailErrorModeled::S3BucketDoesNotExistException(
-                    S3BucketDoesNotExistException {
-                        message: Some(crate::state::s3_bucket_does_not_exist_message(&bucket)),
-                    },
-                ),
-                crate::state::S3_BUCKET_DOES_NOT_EXIST_STATUS,
-            ));
+        if let Some(refusal) = self.resolve_referenced_resources(&input, &region, &held) {
+            return Err(refusal);
         }
+
+        let mut store = state.lock();
+        let record = locate(&mut store, &input.name, &region)?;
 
         // Each member the request carries replaces the stored value; each member it
         // leaves out keeps the one the trail already has. Neither the trail's name,
@@ -570,6 +522,196 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             is_organization_trail: Some(record.is_organization_trail),
             recursive_logging: Some(record.recursive_logging),
         })
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UpdateTrail<Eng> {
+    /// Resolve every resource the RESULTING trail configuration would reference, in the
+    /// service that owns each, and hand back the modelled refusal for the first one a
+    /// trail may not be pointed at — or `None` when every reference holds.
+    ///
+    /// A member the request leaves out keeps the value the trail already has, so the
+    /// settings judged here are the MERGED ones: a request that moves only the key
+    /// prefix is judged against the bucket the trail already delivers to, and one that
+    /// moves only the bucket against the prefix it already delivers under. Each
+    /// resolution takes only the OWNING service's lock, so this runs with no guard of
+    /// the trail registry held — the lock order
+    /// [`crate::state::referenced_resources`] documents.
+    fn resolve_referenced_resources(
+        &self,
+        input: &UpdateTrailInput,
+        region: &str,
+        held: &HeldDelivery,
+    ) -> Option<UpdateTrailError> {
+        use crate::state::referenced_resources as referenced;
+
+        // Where the trail would deliver after this request: the destination and the key
+        // prefix it would carry. Either member moving changes which keys the delivery
+        // writes, so either makes the destination's policy a question again.
+        if input.s3_bucket_name.is_some() || input.s3_key_prefix.is_some() {
+            let bucket = input
+                .s3_bucket_name
+                .as_deref()
+                .unwrap_or(&held.s3_bucket_name);
+            let prefix = match input.s3_key_prefix.as_deref() {
+                Some(given) => (!given.is_empty()).then_some(given),
+                None => held.s3_key_prefix.as_deref(),
+            };
+            match referenced::destination_verdict(
+                &*self.engine,
+                bucket,
+                prefix,
+                region,
+                &held.trail_arn,
+            ) {
+                referenced::DestinationVerdict::Accepted => {}
+                referenced::DestinationVerdict::NoSuchBucket => {
+                    return Some(crate::scaffolded::Scaffolded::modeled_with_status(
+                        UpdateTrailErrorModeled::S3BucketDoesNotExistException(
+                            S3BucketDoesNotExistException {
+                                message: Some(crate::state::s3_bucket_does_not_exist_message(
+                                    bucket,
+                                )),
+                            },
+                        ),
+                        crate::state::S3_BUCKET_DOES_NOT_EXIST_STATUS,
+                    ));
+                }
+                referenced::DestinationVerdict::PolicyInsufficient => {
+                    return Some(
+                        UpdateTrailErrorModeled::InsufficientS3BucketPolicyException(
+                            InsufficientS3BucketPolicyException {
+                                message: Some(referenced::insufficient_s3_bucket_policy_message(
+                                    bucket,
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        if let Some(topic) = input.sns_topic_name.as_deref().filter(|t| !t.is_empty()) {
+            let topic_arn = crate::state::sns_topic_arn(region, topic);
+            if referenced::notification_topic_verdict(&*self.engine, &topic_arn, &held.trail_arn)
+                == referenced::TopicVerdict::PolicyInsufficient
+            {
+                return Some(
+                    UpdateTrailErrorModeled::InsufficientSnsTopicPolicyException(
+                        InsufficientSnsTopicPolicyException {
+                            message: Some(referenced::insufficient_sns_topic_policy_message(
+                                &topic_arn,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        if let Some(key_id) = input.kms_key_id.as_deref().filter(|k| !k.is_empty()) {
+            match referenced::encryption_key_verdict(&*self.engine, region, key_id) {
+                referenced::EncryptionKeyVerdict::Accepted => {}
+                referenced::EncryptionKeyVerdict::NotFound => {
+                    return Some(
+                        UpdateTrailErrorModeled::KmsKeyNotFoundException(KmsKeyNotFoundException {
+                            message: Some(referenced::kms_key_not_found_message(key_id)),
+                        })
+                        .into(),
+                    );
+                }
+                referenced::EncryptionKeyVerdict::MalformedArn => {
+                    return Some(
+                        UpdateTrailErrorModeled::InvalidKmsKeyIdException(
+                            InvalidKmsKeyIdException {
+                                message: Some(referenced::invalid_kms_key_id_message(key_id)),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        if let Some(arn) = input
+            .cloud_watch_logs_log_group_arn
+            .as_deref()
+            .filter(|a| !a.is_empty())
+        {
+            if !referenced::log_group_is_valid(&*self.engine, region, arn) {
+                return Some(
+                    UpdateTrailErrorModeled::InvalidCloudWatchLogsLogGroupArnException(
+                        InvalidCloudWatchLogsLogGroupArnException {
+                            message: Some(referenced::invalid_log_group_arn_message(arn)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        None
+    }
+}
+
+/// The delivery settings the located trail carries TODAY: what a request that changes
+/// one half of them is judged against ([`UpdateTrail::resolve_referenced_resources`]).
+///
+/// Owned values, cloned out of the registry while its lock is held, so the referenced
+/// resources can be resolved after that lock is released.
+struct HeldDelivery {
+    trail_arn: String,
+    s3_bucket_name: String,
+    s3_key_prefix: Option<String>,
+}
+
+/// Locate the trail `identifier` addresses for a mutation, or the modelled refusal for
+/// an identifier that names none.
+///
+/// "UpdateTrail must be called from the Region in which the trail was created;
+/// otherwise, an InvalidHomeRegionException is thrown." Called twice per request — once
+/// to read the delivery the trail carries today and once to apply the update — so both
+/// passes refuse exactly alike.
+fn locate<'store>(
+    store: &'store mut crate::state::ComAmazonawsCloudtrailCloudtrail20131101State,
+    identifier: &str,
+    region: &str,
+) -> Result<&'store mut crate::state::TrailRecord, UpdateTrailError> {
+    let located = store
+        .resolve_for_mutation(identifier, region)
+        .map_err(identifier_error)?;
+    match located {
+        crate::state::TrailForMutation::Found(record) => Ok(record),
+        crate::state::TrailForMutation::AddressedInAnotherRegion { name, addressed } => Err(
+            UpdateTrailErrorModeled::InvalidHomeRegionException(InvalidHomeRegionException {
+                message: Some(format!(
+                    "Trail {name} was addressed in {addressed}, but this request was made in \
+                     {region}: a trail is updated from the Region it was created in"
+                )),
+            })
+            .into(),
+        ),
+        crate::state::TrailForMutation::HomedInAnotherRegion { name, home_region } => Err(
+            UpdateTrailErrorModeled::InvalidHomeRegionException(InvalidHomeRegionException {
+                message: Some(format!(
+                    "Trail {name} was created in {home_region}, not in {region}: a trail is \
+                     updated from the Region it was created in"
+                )),
+            })
+            .into(),
+        ),
+        crate::state::TrailForMutation::Absent { name } => {
+            // `UpdateTrail` resolves the identifier to one Region's trail, so the
+            // refusal names that trail's ARN; the model says 404 for a not-found trail
+            // and CloudTrail answers 400 (see `crate::state::TRAIL_NOT_FOUND_STATUS`).
+            Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                UpdateTrailErrorModeled::TrailNotFoundException(TrailNotFoundException {
+                    message: Some(crate::state::trail_not_found_arn_message(region, &name)),
+                }),
+                crate::state::TRAIL_NOT_FOUND_STATUS,
+            ))
+        }
     }
 }
 

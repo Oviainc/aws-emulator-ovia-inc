@@ -113,18 +113,21 @@ fn selectors_with_data_resources(selectors: usize, data_resources: usize) -> Val
 }
 
 /// One advanced event selector whose conditions carry `values` values in total, spread
-/// over `fields` field selectors.
+/// over `fields` field selectors beside the mandatory `eventCategory` one.
+///
+/// Every advanced event selector states which category of events it selects, so that
+/// field selector is always there and its one condition value is one of the `values`.
 fn advanced_selector_with_values(fields: usize, values: usize) -> Value {
-    let field_selectors: Vec<Value> = (0..fields)
-        .map(|field| {
-            let equals: Vec<String> = (0..values)
-                .filter(|value| value % fields == field)
-                .map(|value| format!("arn:aws:s3:::bucket-{value}/"))
-                .collect();
-            json!({"Field": "resources.ARN", "StartsWith": equals})
-        })
-        .collect();
-    json!([{"Name": "generated", "FieldSelectors": field_selectors}])
+    let spread = values.saturating_sub(1);
+    let mut field_selectors = vec![json!({"Field": "eventCategory", "Equals": ["Data"]})];
+    field_selectors.extend((0..fields).map(|field| {
+        let equals: Vec<String> = (0..spread)
+            .filter(|value| value % fields == field)
+            .map(|value| format!("arn:aws:s3:::bucket-{value}/"))
+            .collect();
+        json!({"Field": "resources.ARN", "StartsWith": equals})
+    }));
+    json!([{ "Name": "generated", "FieldSelectors": field_selectors }])
 }
 
 /// A trail nothing has configured reports the documented default selector, whichever

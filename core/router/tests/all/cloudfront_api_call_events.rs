@@ -199,7 +199,13 @@ async fn cloudfront(
     }
 }
 
-/// `PUT /<bucket>` — the bucket a trail delivers its log files into.
+/// `PUT /<bucket>` plus `PUT /<bucket>?policy` — the bucket a trail delivers its log
+/// files into, carrying the bucket policy that lets CloudTrail write into it.
+///
+/// CloudTrail resolves a trail's destination in the object store and reads that bucket's
+/// policy before it accepts the trail, so the policy is attached here exactly as a client
+/// attaches it: the CloudTrail service principal, the object write, and the canned ACL the
+/// delivery carries.
 async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
     let request = http::Request::builder()
         .method("PUT")
@@ -214,6 +220,36 @@ async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
         response.status().as_u16(),
         200,
         "setup: CreateBucket({bucket:?}) must succeed, got {} with {:?}",
+        response.status(),
+        String::from_utf8_lossy(response.body())
+    );
+
+    let policy = json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "AWSCloudTrailWrite",
+            "Effect": "Allow",
+            "Principal": { "Service": "cloudtrail.amazonaws.com" },
+            "Action": "s3:PutObject",
+            "Resource": format!("arn:aws:s3:::{bucket}/*"),
+            "Condition": {
+                "StringEquals": { "s3:x-amz-acl": "bucket-owner-full-control" },
+            },
+        }],
+    })
+    .to_string();
+    let request = http::Request::builder()
+        .method("PUT")
+        .uri(format!("/{bucket}?policy"))
+        .header("host", format!("s3.{REGION}.amazonaws.com"))
+        .header("content-type", "application/json")
+        .header("authorization", authorization("s3"))
+        .body(Bytes::from(policy))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    assert!(
+        (200..300).contains(&response.status().as_u16()),
+        "setup: PutBucketPolicy({bucket:?}) must succeed, got {} with {:?}",
         response.status(),
         String::from_utf8_lossy(response.body())
     );

@@ -193,6 +193,22 @@ pub const ADVANCED_SELECTOR_VALUES_PER_TRAIL_LIMIT: usize = 500;
 /// to five advanced event selectors for each event data store."
 pub const ADVANCED_SELECTORS_PER_EVENT_DATA_STORE_LIMIT: usize = 5;
 
+/// The one field every advanced event selector has to select on.
+///
+/// An advanced event selector says WHICH CATEGORY of events it selects before it says
+/// anything else about them — the field decides which other fields are even legal, and
+/// the model's own doc for `AdvancedFieldSelector$Equals` names it among the fields that
+/// accept only that operator. A selector set that never states it selects no category of
+/// event at all, which is the modelled `InvalidEventSelectorsException` ("the combination
+/// of event selectors or advanced event selectors and data resources is not valid").
+pub const EVENT_CATEGORY_SELECTOR_FIELD: &str = "eventCategory";
+
+/// The advanced-selector fields that accept the `Equals` operator and no other, from the
+/// model doc for `AdvancedFieldSelector$Equals`: "This is the only valid operator that
+/// you can use with the `readOnly`, `eventCategory`, and `resources.type` fields."
+pub const EQUALS_ONLY_SELECTOR_FIELDS: [&str; 3] =
+    ["readOnly", EVENT_CATEGORY_SELECTOR_FIELD, "resources.type"];
+
 /// How many trails one `ListTrails` page carries. `ListTrails` models no
 /// `MaxResults`, so the page size is the service's to choose; the remainder is
 /// reached through `NextToken`.
@@ -2029,6 +2045,12 @@ pub const MISSING_TRAIL_CONFIGURATION_MESSAGE: &str =
 /// the registry they resolve against, the way `src/service/rpc_target.rs` holds the
 /// target reading `src/service.rs` applies.
 pub mod channels;
+
+/// The resources a trail REFERENCES — its destination bucket, its notification topic,
+/// its encryption key and its CloudWatch Logs destination — resolved in the services
+/// that own them, with the refusal text each resolution feeds. In its own module for the
+/// same reason [`channels`] is: both operations that configure a trail apply it.
+pub mod referenced_resources;
 
 /// How a dashboard widget's `QueryStatement` is read, how many widgets one request may
 /// carry, and the sentence a statement CloudTrail Lake cannot run is refused with. In

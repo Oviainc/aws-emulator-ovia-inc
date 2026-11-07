@@ -676,17 +676,21 @@ async fn an_update_bounds_the_selector_list_it_stores() {
     let limit = service_com_amazonaws_cloudtrail_cloudtrail_20131101::state::
         ADVANCED_SELECTORS_PER_EVENT_DATA_STORE_LIMIT;
 
-    /// `count` selectors, each selecting one event category by equality.
+    /// `count` selectors, each selecting one event category by equality and scoping it
+    /// to one bucket.
     fn selectors(count: usize) -> Value {
         Value::Array(
             (0..count)
                 .map(|index| {
                     json!({
                         "Name": format!("selector-{index}"),
-                        "FieldSelectors": [{
-                            "Field": "resources.ARN",
-                            "StartsWith": [format!("arn:aws:s3:::bucket-{index}/")],
-                        }],
+                        "FieldSelectors": [
+                            {"Field": "eventCategory", "Equals": ["Data"]},
+                            {
+                                "Field": "resources.ARN",
+                                "StartsWith": [format!("arn:aws:s3:::bucket-{index}/")],
+                            },
+                        ],
                     })
                 })
                 .collect(),

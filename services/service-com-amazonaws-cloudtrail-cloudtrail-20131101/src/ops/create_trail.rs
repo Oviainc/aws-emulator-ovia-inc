@@ -345,7 +345,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> 
     /// so that every path out of here — the refusals included — is recorded the same way.
     fn create(
         &self,
-        input: CreateTrailInput,
+        mut input: CreateTrailInput,
         region: &str,
     ) -> Result<CreateTrailOutput, CreateTrailError> {
         let region = region.to_string();
@@ -391,7 +391,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> 
             .into());
         }
 
-        let tags = input.tags_list.unwrap_or_default();
+        let tags = input.tags_list.take().unwrap_or_default();
         if tags.len() > crate::state::TAGS_PER_RESOURCE_LIMIT {
             return Err(CreateTrailErrorModeled::TagsLimitExceededException(
                 TagsLimitExceededException {
@@ -413,11 +413,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> 
 
         // "Creates a trail that specifies the settings for delivery of log data to an
         // Amazon S3 bucket": the destination has to be a name Amazon S3 holds a bucket
-        // under at all, and then a bucket the account actually holds. Both are decided
-        // BEFORE the trail is persisted, so a trail that could never deliver a log file
-        // is never created. The name rule is the shared one
-        // ([`service_common::s3_bucket_name`]); the store is read with no guard of this
-        // service's own held ([`crate::state::destination_bucket_exists`]).
+        // under at all before anything is asked about the account's buckets. The name
+        // rule is the shared one ([`service_common::s3_bucket_name`]).
         if !::service_common::s3_bucket_name::is_well_formed(&input.s3_bucket_name) {
             return Err(CreateTrailErrorModeled::InvalidS3BucketNameException(
                 InvalidS3BucketNameException {
@@ -428,19 +425,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> 
             )
             .into());
         }
-        if crate::state::destination_bucket_exists(&*self.engine, &input.s3_bucket_name)
-            == Some(false)
-        {
-            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
-                CreateTrailErrorModeled::S3BucketDoesNotExistException(
-                    S3BucketDoesNotExistException {
-                        message: Some(crate::state::s3_bucket_does_not_exist_message(
-                            &input.s3_bucket_name,
-                        )),
-                    },
-                ),
-                crate::state::S3_BUCKET_DOES_NOT_EXIST_STATUS,
-            ));
+        // Every resource the trail REFERENCES is resolved in the service that owns it
+        // before the trail is persisted, each against the rule
+        // [`crate::state::referenced_resources`] states: a destination that exists and
+        // whose policy lets CloudTrail write this trail's log files, a notification topic
+        // whose policy lets CloudTrail publish to it, a `KmsKeyId` naming a key of this
+        // Region, and a `CloudWatchLogsLogGroupArn` naming a log group of this account.
+        // All of them read another service's store with NO guard of this service's own
+        // held, which is the lock order that module documents.
+        let trail_arn = crate::state::trail_arn(&region, &input.name);
+        let referenced = self.resolve_referenced_resources(
+            &input,
+            &region,
+            &trail_arn,
+            input.s3_key_prefix.as_deref(),
+        );
+        if let Some(refusal) = referenced {
+            return Err(refusal);
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -488,7 +489,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> 
         }
 
         let record = crate::state::TrailRecord {
-            trail_arn: crate::state::trail_arn(&region, &input.name),
+            trail_arn,
             name: input.name,
             s3_bucket_name: input.s3_bucket_name,
             s3_key_prefix: input.s3_key_prefix,
@@ -552,6 +553,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> 
 
         store.trails.insert(key, record);
         Ok(output)
+    }
+
+    /// Resolve every resource this request's settings REFERENCE, in the service that
+    /// owns each, and hand back the modelled refusal for the first one a trail may not
+    /// be pointed at — or `None` when every reference holds.
+    ///
+    /// Each resolution reads ANOTHER service's store and takes only that store's lock,
+    /// so this runs before the trail registry is reached: the lock order
+    /// [`crate::state::referenced_resources`] documents.
+    fn resolve_referenced_resources(
+        &self,
+        input: &CreateTrailInput,
+        region: &str,
+        trail_arn: &str,
+        s3_key_prefix: Option<&str>,
+    ) -> Option<CreateTrailError> {
+        use crate::state::referenced_resources as referenced;
+
+        match referenced::destination_verdict(
+            &*self.engine,
+            &input.s3_bucket_name,
+            s3_key_prefix,
+            region,
+            trail_arn,
+        ) {
+            referenced::DestinationVerdict::Accepted => {}
+            referenced::DestinationVerdict::NoSuchBucket => {
+                // The model says 404 for a destination that does not exist and
+                // CloudTrail answers 400 (`crate::state::S3_BUCKET_DOES_NOT_EXIST_STATUS`).
+                return Some(crate::scaffolded::Scaffolded::modeled_with_status(
+                    CreateTrailErrorModeled::S3BucketDoesNotExistException(
+                        S3BucketDoesNotExistException {
+                            message: Some(crate::state::s3_bucket_does_not_exist_message(
+                                &input.s3_bucket_name,
+                            )),
+                        },
+                    ),
+                    crate::state::S3_BUCKET_DOES_NOT_EXIST_STATUS,
+                ));
+            }
+            referenced::DestinationVerdict::PolicyInsufficient => {
+                return Some(
+                    CreateTrailErrorModeled::InsufficientS3BucketPolicyException(
+                        InsufficientS3BucketPolicyException {
+                            message: Some(referenced::insufficient_s3_bucket_policy_message(
+                                &input.s3_bucket_name,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        if let Some(topic) = input.sns_topic_name.as_deref().filter(|t| !t.is_empty()) {
+            // The trail keeps the topic's ARN, so the policy is read off the topic the
+            // request's name or ARN resolves to.
+            let topic_arn = crate::state::sns_topic_arn(region, topic);
+            if referenced::notification_topic_verdict(&*self.engine, &topic_arn, trail_arn)
+                == referenced::TopicVerdict::PolicyInsufficient
+            {
+                return Some(
+                    CreateTrailErrorModeled::InsufficientSnsTopicPolicyException(
+                        InsufficientSnsTopicPolicyException {
+                            message: Some(referenced::insufficient_sns_topic_policy_message(
+                                &topic_arn,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        if let Some(key_id) = input.kms_key_id.as_deref().filter(|k| !k.is_empty()) {
+            match referenced::encryption_key_verdict(&*self.engine, region, key_id) {
+                referenced::EncryptionKeyVerdict::Accepted => {}
+                referenced::EncryptionKeyVerdict::NotFound => {
+                    return Some(
+                        CreateTrailErrorModeled::KmsKeyNotFoundException(KmsKeyNotFoundException {
+                            message: Some(referenced::kms_key_not_found_message(key_id)),
+                        })
+                        .into(),
+                    );
+                }
+                referenced::EncryptionKeyVerdict::MalformedArn => {
+                    return Some(
+                        CreateTrailErrorModeled::InvalidKmsKeyIdException(
+                            InvalidKmsKeyIdException {
+                                message: Some(referenced::invalid_kms_key_id_message(key_id)),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        if let Some(arn) = input
+            .cloud_watch_logs_log_group_arn
+            .as_deref()
+            .filter(|a| !a.is_empty())
+        {
+            if !referenced::log_group_is_valid(&*self.engine, region, arn) {
+                return Some(
+                    CreateTrailErrorModeled::InvalidCloudWatchLogsLogGroupArnException(
+                        InvalidCloudWatchLogsLogGroupArnException {
+                            message: Some(referenced::invalid_log_group_arn_message(arn)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        None
     }
 }
 

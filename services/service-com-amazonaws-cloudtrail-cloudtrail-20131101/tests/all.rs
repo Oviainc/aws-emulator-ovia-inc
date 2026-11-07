@@ -197,3 +197,9 @@ mod request_validation;
 // marker the service never issued are refused.
 #[path = "all/digest_signing_public_keys.rs"]
 mod digest_signing_public_keys;
+// `referenced_resource_validation` pins the rule over every resource a trail's settings
+// REFERENCE — the destination bucket and its policy, the notification topic's policy, the
+// encryption key and the CloudWatch Logs destination — and the one every advanced event
+// selector has to state.
+#[path = "all/referenced_resource_validation.rs"]
+mod referenced_resource_validation;

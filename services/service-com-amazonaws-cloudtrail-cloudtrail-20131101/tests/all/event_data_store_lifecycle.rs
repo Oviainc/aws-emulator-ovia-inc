@@ -438,15 +438,26 @@ async fn a_created_store_bounds_the_lists_it_retains() {
         service_com_amazonaws_cloudtrail_cloudtrail_20131101::state::TAGS_PER_RESOURCE_LIMIT;
 
     /// `selectors` selectors, each carrying `values_each` condition values.
+    ///
+    /// The mandatory `eventCategory` field selector is one of them — every advanced
+    /// event selector states which category of events it selects — so the rest of the
+    /// count is spread over a `resources.ARN` condition.
     fn selectors(selectors: usize, values_each: usize) -> Value {
         Value::Array(
             (0..selectors)
                 .map(|index| {
-                    let values: Vec<String> =
-                        (0..values_each).map(|v| format!("arn:aws:s3:::b{v}/")).collect();
+                    let values: Vec<String> = (0..values_each.saturating_sub(1))
+                        .map(|v| format!("arn:aws:s3:::b{v}/"))
+                        .collect();
+                    let mut field_selectors =
+                        vec![json!({"Field": "eventCategory", "Equals": ["Data"]})];
+                    if !values.is_empty() {
+                        field_selectors
+                            .push(json!({"Field": "resources.ARN", "StartsWith": values}));
+                    }
                     json!({
                         "Name": format!("selector-{index}"),
-                        "FieldSelectors": [{"Field": "resources.ARN", "StartsWith": values}],
+                        "FieldSelectors": field_selectors,
                     })
                 })
                 .collect(),
