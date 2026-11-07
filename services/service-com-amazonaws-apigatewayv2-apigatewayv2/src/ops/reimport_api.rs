@@ -207,9 +207,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`ReimportApi$FailOnWarnings`): nothing is written before this point, so the
         // rollback is that the api still carries the configuration it had.
         if input.fail_on_warnings.unwrap_or(false) && !definition.warnings.is_empty() {
-            return Err(bad_request(format!(
-                "Errors found during import: {}",
-                definition.warnings.join("; ")
+            return Err(bad_request(super::import_api::warnings_found_message(
+                &definition.warnings,
             )));
         }
 

@@ -26,8 +26,9 @@
 //!
 //! The `Body` is read in its JSON spelling, through `serde_json`. API Gateway also accepts
 //! the YAML spelling of a definition; reading that needs a YAML parser this crate does not
-//! carry, so such a body is REFUSED with the modelled `BadRequestException` naming the
-//! spelling this emulator reads, never half-read or guessed at.
+//! carry, so such a body is REFUSED with the modelled `BadRequestException` a body whose
+//! OAS version cannot be determined carries ([`UNDETERMINABLE_OAS_VERSION`]), never
+//! half-read or guessed at.
 //!
 //! ## Shape of an operation
 //!
@@ -213,10 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`ImportApi$FailOnWarnings`): nothing is written before this point, so the
         // rollback is that no record exists at all.
         if input.fail_on_warnings.unwrap_or(false) && !definition.warnings.is_empty() {
-            return Err(bad_request(format!(
-                "Errors found during import: {}",
-                definition.warnings.join("; ")
-            )));
+            return Err(bad_request(warnings_found_message(&definition.warnings)));
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -407,9 +405,13 @@ const UNSUPPORTED_OPERATION_KEYS: &[&str] = &["trace", "connect"];
 /// The extension an OpenAPI operation carries its API Gateway integration in.
 const INTEGRATION_EXTENSION: &str = "x-amazon-apigateway-integration";
 
-/// Why an integration extension that names no `type` cannot be created, as API Gateway
-/// words it: `IntegrationType` is the modelled member the extension's `type` names, and
-/// the sentence is the reason the warning for such a path carries.
+/// Why an integration extension that names no `IntegrationType` cannot be created, as API
+/// Gateway words it: `IntegrationType` is the modelled member the extension's `type` names,
+/// and the sentence is the reason the warning for such a path carries.
+///
+/// An extension whose `type` is outside the modelled catalog names no `IntegrationType`
+/// either, so it is reported with this same reason: the integration is missing the required
+/// member, which is the rule, rather than carrying a value that was rejected.
 const INTEGRATION_TYPE_REQUIRED: &str =
     "IntegrationType is a required parameter for creating integration.";
 
@@ -437,10 +439,33 @@ const INTEGRATION_EXTENSION_KEYS: &[&str] = &[
     "tlsConfig",
 ];
 
+/// The keys an integration extension declares that an HTTP api's integration has no member
+/// for, in the order an import REPORTS them.
+///
+/// Every one of them configures a REST api's integration, and the report follows the order
+/// that integration declares its members in — the request mapping (`requestTemplates`),
+/// then the passthrough behaviour, then the content handling, then the cache members, and
+/// finally the integration response map (`responses`) — rather than the order the submitted
+/// document happens to write them in.
+const IGNORED_INTEGRATION_KEY_ORDER: &[&str] = &[
+    "requestTemplates",
+    "passthroughBehavior",
+    "contentHandling",
+    "cacheNamespace",
+    "cacheKeyParameters",
+    "responses",
+];
+
+/// How API Gateway refuses a `Body` it cannot build an importer from because the
+/// document's OpenAPI (OAS) version cannot be determined: a body that is not a document
+/// this reader can read at all, and a document that declares neither `openapi` nor
+/// `swagger`. Fixed text, carried by the operation's `BadRequestException`.
+const UNDETERMINABLE_OAS_VERSION: &str =
+    "Unable to build importer with provided input. Unable to determine OAS version";
+
 /// The document-level extension an OpenAPI definition carries an HTTP api's CORS
 /// configuration in — the `CorsConfiguration` member's counterpart in a definition.
 const CORS_EXTENSION: &str = "x-amazon-apigateway-cors";
-
 /// The document-level extension an OpenAPI definition carries an api's endpoint
 /// configuration in; its `disableExecuteApiEndpoint` member is the
 /// `DisableExecuteApiEndpoint` member's counterpart in a definition.
@@ -873,9 +898,8 @@ pub struct ImportedApi {
 /// [`MAX_BASE_PATH_CHARS`] on the prefix every route's path carries, and by this
 /// service's own route quota, so the read cannot amplify what the body carries. A body in
 /// any OTHER spelling (the YAML one API Gateway also accepts) is REFUSED rather than guessed at:
-/// reading it needs a YAML parser this crate does not carry, and a refusal naming the
-/// spelling is the honest answer — never a partial import a caller would have to
-/// second-guess.
+/// reading it needs a YAML parser this crate does not carry, and a refusal is the honest
+/// answer — never a partial import a caller would have to second-guess.
 ///
 /// `Err` carries the message for a body that is not a definition this service can import:
 /// the caller has to fix the definition from this text alone.
@@ -886,31 +910,26 @@ pub fn parse_definition(body: &str, basepath: BasePathMode) -> Result<ImportedAp
             body.len()
         ));
     }
+    // A body this reader cannot read at all carries no version to read, so it is refused
+    // for the one reason API Gateway refuses it: the importer cannot be built because the
+    // document's OAS version cannot be determined.
     let document = ::serde_json::from_str::<::serde_json::Value>(body)
         .map(Node::from)
-        .map_err(|error| {
-            format!(
-                "Unable to parse API definition: the Body must be an OpenAPI definition in \
-                 JSON, which is the spelling this emulator reads ({error})"
-            )
-        })?;
+        .map_err(|_| UNDETERMINABLE_OAS_VERSION.to_string())?;
     read_definition(&document, basepath)
 }
 
 /// What an import takes out of a parsed definition document.
 fn read_definition(document: &Node, basepath: BasePathMode) -> Result<ImportedApi, String> {
+    // A body that is a scalar or a list declares no member, so no version either.
     if document.entries().is_none() {
-        return Err(
-            "Unable to parse API definition: the definition must be a JSON object".to_string(),
-        );
+        return Err(UNDETERMINABLE_OAS_VERSION.to_string());
     }
     // Every OpenAPI document declares its version — `openapi` from 3.0 on, `swagger`
-    // before it — so a body carrying neither is not an API definition at all.
+    // before it — so a document carrying neither is one whose version cannot be
+    // determined, which is the same refusal.
     if document.member("openapi").is_none() && document.member("swagger").is_none() {
-        return Err(
-            "Unable to parse API definition: no 'openapi' or 'swagger' version is declared"
-                .to_string(),
-        );
+        return Err(UNDETERMINABLE_OAS_VERSION.to_string());
     }
 
     // The `info` object is where an OpenAPI document carries the api's name, description
@@ -1089,6 +1108,21 @@ fn report(messages: &mut Vec<String>, message: String) {
     }
 }
 
+/// The refusal `FailOnWarnings` turns an import's warnings into, as API Gateway words it:
+/// the fixed sentence, then every warning the import reported, each on its own line and
+/// indented.
+///
+/// The ONE owner of this wording for both `ImportApi` and `ReimportApi`: the two share the
+/// member, the reader that produces the warnings and therefore the refusal they carry.
+pub fn warnings_found_message(warnings: &[String]) -> String {
+    let mut message = String::from("Warnings found during import:");
+    for warning in warnings {
+        message.push_str("\n\t");
+        message.push_str(warning);
+    }
+    message
+}
+
 /// The warning an import reports for an integration it could not create, leaving the route
 /// the integration belonged to without a target.
 ///
@@ -1111,16 +1145,38 @@ fn ignored_key_message(location: &str, key: &str) -> String {
 }
 
 /// The keys an integration extension declares that an HTTP api's integration has no member
-/// for ([`INTEGRATION_EXTENSION_KEYS`] is the set it does), in the order the parsed
-/// document carries them.
+/// for ([`INTEGRATION_EXTENSION_KEYS`] is the set it does), in the order they are REPORTED:
+/// [`IGNORED_INTEGRATION_KEY_ORDER`].
+///
+/// What an import reports for an extension is a function of the SET of keys it declares,
+/// not of the order the submitted document writes them in: the same keys, laid out
+/// differently, report the same `ImportInfo` entries in the same order. That also keeps the
+/// report independent of how the JSON reader this crate is built with carries a mapping
+/// (key order, or the document's order under `serde_json`'s `preserve_order` feature).
 fn ignored_integration_keys(extension: &Node) -> Vec<&str> {
-    extension
+    let declared: Vec<&str> = extension
         .entries()
         .unwrap_or_default()
         .iter()
         .map(|(key, _)| key.as_str())
         .filter(|key| !INTEGRATION_EXTENSION_KEYS.contains(key))
-        .collect()
+        .collect();
+    let mut reported: Vec<&str> = IGNORED_INTEGRATION_KEY_ORDER
+        .iter()
+        .copied()
+        .filter(|key| declared.contains(key))
+        .collect();
+    // A key that configures no integration of either api kind — a vendor extension of the
+    // document's own, or a misspelling — has no place in that order, so it is reported
+    // after the keys that do, in its own key order rather than the document's.
+    let mut rest: Vec<&str> = declared
+        .iter()
+        .copied()
+        .filter(|key| !IGNORED_INTEGRATION_KEY_ORDER.contains(key))
+        .collect();
+    rest.sort_unstable();
+    reported.extend(rest);
+    reported
 }
 
 /// Refuse a value longer than the member's modelled length, naming the member and the
@@ -1190,17 +1246,15 @@ fn read_integration(extension: &Node) -> Result<ImportedIntegration, String> {
         return Err(format!("'{INTEGRATION_EXTENSION}' must be an object"));
     }
     // The extension spells the type in lower case (`http_proxy`), while the modelled
-    // `IntegrationType` is upper case; they are the same catalog.
+    // `IntegrationType` is upper case; they are the same catalog. A `type` that catalog
+    // does NOT carry names no `IntegrationType` at all, so such an extension is read
+    // exactly as one naming no type is — the integration has no type to be created with,
+    // which is the reason reported, never the unrecognized value itself.
     let integration_type = extension
         .string_member("type")
         .map(|value| value.to_ascii_uppercase())
+        .filter(|value| INTEGRATION_TYPE_VALUES.contains(&value.as_str()))
         .ok_or_else(|| INTEGRATION_TYPE_REQUIRED.to_string())?;
-    if !INTEGRATION_TYPE_VALUES.contains(&integration_type.as_str()) {
-        return Err(format!(
-            "invalid integration type '{integration_type}'. Valid values are: {}.",
-            INTEGRATION_TYPE_VALUES.join(", ")
-        ));
-    }
     // An imported api speaks HTTP, and three of the five integration types are
     // documented as supported only for WebSocket APIs, so an integration of one of
     // those types is refused here exactly as `CreateIntegration` refuses it, through the

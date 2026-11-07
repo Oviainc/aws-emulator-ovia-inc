@@ -44,7 +44,9 @@ fn unable_to_create(method: &str, path: &str, reason: &str) -> String {
     format!("Unable to create integration for resource at path '{method} {path}': {reason}. Ignoring.")
 }
 
-/// The reason API Gateway gives for an integration whose extension names no `type`.
+/// The reason API Gateway gives for an integration whose extension names no
+/// `IntegrationType` — one that writes no `type`, and one whose `type` is outside the
+/// modelled catalog, which names no `IntegrationType` either.
 const INTEGRATION_TYPE_REQUIRED: &str =
     "IntegrationType is a required parameter for creating integration.";
 
@@ -118,9 +120,7 @@ fn rows() -> Vec<Row> {
             route_method: "DELETE",
             path: "/sidecar",
             integration: json!({ "type": "sidecar", "uri": "https://sidecar.example.com" }),
-            reason: "invalid integration type 'SIDECAR'. Valid values are: AWS, AWS_PROXY, \
-                     HTTP, HTTP_PROXY, MOCK."
-                .to_string(),
+            reason: INTEGRATION_TYPE_REQUIRED.to_string(),
         },
         Row {
             case: "an HTTP_PROXY integration naming no endpoint",

@@ -21,8 +21,12 @@ mod access_log_settings_deletion;
 mod api_endpoint_scheme;
 #[path = "all/api_import.rs"]
 mod api_import;
+#[path = "all/api_import_advisory_report.rs"]
+mod api_import_advisory_report;
 #[path = "all/api_import_integration_warnings.rs"]
 mod api_import_integration_warnings;
+#[path = "all/api_import_oas_version_refusal.rs"]
+mod api_import_oas_version_refusal;
 #[path = "all/api_lifecycle.rs"]
 mod api_lifecycle;
 #[path = "all/api_mapping_key_claim_race.rs"]
