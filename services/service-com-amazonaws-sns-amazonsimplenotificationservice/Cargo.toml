@@ -33,7 +33,7 @@ hex = { workspace = true }
 service-common = { path = "../common" }
 # The AWS SDK for SQS, driven over the in-process callback
 # (`OperationContext::callback`): `Publish` delivers a message to the queues subscribed to
-# the topic with `SendMessage` (`ops::publish::deliver_to_queues`). Only the generated
+# the topic with `SendMessage` (`ops::publish::deliver_to_endpoints`). Only the generated
 # client is needed — the emulator supplies the transport, so the SDK's own HTTPS stack and
 # runtime are left out.
 aws-sdk-sqs = { version = "1", default-features = false }
@@ -57,9 +57,10 @@ emulator-core-build-support = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # Lambda is mounted beside SNS on one engine in the lambda-subscription delivery tests,
 # because a `lambda` subscription's endpoint is a function and an invocation is observed
-# where that service holds it: on the function's asynchronous queue.
+# where that service holds it: on the function's asynchronous queue, and in what the
+# function's own handler did.
 service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
-# A deployment package the delivery test uploads is a .zip archive it writes in memory, as
+# A deployment package the delivery tests upload is a .zip archive they write in memory, as
 # `FunctionCode$ZipFile` carries it: base64 of a .zip.
 zip = { version = "9", default-features = false, features = ["deflate"] }
 base64 = "0.22"

@@ -356,7 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Record the publish in the store, and report the deliveries it owes to the endpoints
+/// Record the publish in the store, and report the deliveries it owes to the SQS queues
 /// subscribed to the topic.
 ///
 /// The whole store-touching half of the operation, so the one place that holds the store's
@@ -903,9 +903,8 @@ impl QueueTarget {
     /// delivers to.
     fn of(subscription: &state::SubscriptionRecord) -> Option<Self> {
         if subscription.protocol != SQS_PROTOCOL {
-            // Every other protocol (`http`, `lambda`, `email`, `firehose`, …) needs its own
-            // delivery path, which is not implemented here. The message is still RECORDED
-            // against the subscription, so nothing claims a delivery that did not happen.
+            // Another protocol's endpoint is not a queue, and is delivered to by the path
+            // that protocol owns ([`function_delivery`] for `lambda`) or not at all.
             return None;
         }
         let endpoint = subscription.endpoint.as_deref()?;

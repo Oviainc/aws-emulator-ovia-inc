@@ -62,6 +62,9 @@ mod invalid_next_token_sentence;
 #[path = "all/lambda_subscription_delivery.rs"]
 mod lambda_subscription_delivery;
 
+#[path = "all/lambda_subscription_grants.rs"]
+mod lambda_subscription_grants;
+
 #[path = "all/list_subscriptions.rs"]
 mod list_subscriptions;
 
