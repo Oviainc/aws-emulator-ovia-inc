@@ -203,6 +203,8 @@ mod sign_up_client_secret;
 mod state_roundtrip;
 #[path = "all/stored_state_normalization.rs"]
 mod stored_state_normalization;
+#[path = "all/terms_branding_and_passkey_refusal_wire.rs"]
+mod terms_branding_and_passkey_refusal_wire;
 #[path = "all/terms_documents.rs"]
 mod terms_documents;
 #[path = "all/terms_not_found_message.rs"]
