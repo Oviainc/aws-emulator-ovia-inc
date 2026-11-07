@@ -32,8 +32,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::certificates::{
-    assert_certificate_id, certificate_pem, describe, directory_in_service, register,
-    STATE_REGISTERED, STATE_REGISTERING, TYPE_CLIENT_CERT_AUTH, TYPE_CLIENT_LDAPS,
+    assert_certificate_id, certificate_pem, connector_in_service, describe,
+    directory_in_service, register, STATE_REGISTERED, STATE_REGISTERING, TYPE_CLIENT_CERT_AUTH,
+    TYPE_CLIENT_LDAPS,
 };
 use crate::directory_lifecycle::{
     call, create_directory, minimal_create, ok, refused, service, PAST_ONE_SPAN,
@@ -204,17 +205,21 @@ async fn a_deregister_deletes_exactly_the_named_registration_from_the_system() {
 
     // Every row gets its own directory, and they are all created before anything waits:
     // the stage transition each create owes falls due on the clock, so one wait covers
-    // the whole table.
+    // the whole table. A row whose certificate performs client authentication gets a
+    // directory of the type that function is offered for.
     let mut ids: Vec<String> = Vec::new();
     for (row, case) in cases.iter().enumerate() {
-        ids.push(
-            create_directory(
+        let name = format!("deregister-{row}.example.com");
+        ids.push(if case.certificate_type == Some(TYPE_CLIENT_CERT_AUTH) {
+            crate::ad_connector::connect_directory(
                 &router,
-                minimal_create(&format!("deregister-{row}.example.com")),
+                crate::ad_connector::minimal_connect(&name),
                 case.name,
             )
-            .await,
-        );
+            .await
+        } else {
+            create_microsoft_ad(&router, minimal_microsoft_ad(&name), case.name).await
+        });
     }
     tokio::time::sleep(PAST_ONE_SPAN).await;
 
@@ -337,14 +342,10 @@ async fn a_deregister_deletes_exactly_the_named_registration_from_the_system() {
 async fn a_certificate_securing_live_ldap_calls_cannot_be_deregistered() {
     let router = service();
     // LDAP secure calls can only be activated for a directory type that serves an LDAPS
-    // endpoint, so the switch is exercised on a Managed Microsoft AD directory.
-    let directory_id = create_microsoft_ad(
-        &router,
-        minimal_microsoft_ad("ldaps.corp.example.com"),
-        "in use",
-    )
-    .await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    // endpoint, and this case also registers a certificate performing client
+    // authentication — so the switch is exercised on an AD Connector directory, the type
+    // both functions are offered for.
+    let directory_id = connector_in_service(&router, "ldaps.corp.example.com", "in use").await;
 
     let (securing, _) = register_one(
         &router,

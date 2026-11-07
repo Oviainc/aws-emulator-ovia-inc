@@ -125,6 +125,9 @@ pub(super) fn emulator() -> MultiServiceRouter {
 /// which is exactly what a create plus an enable would have left there. An id NOT registered
 /// here is an id the account does not hold, and a registered directory with the feature off
 /// is the data-access gate's own case; both are suites of their own.
+///
+/// The registration names no DOMAIN, so these suites read the realm this plane falls back to
+/// when the control plane recorded none — which is the realm every case here asserts.
 pub(super) fn hold_directories(engine: &engine::InMemoryEngine, directories: &[&str]) {
     let inventory = service_com_amazonaws_directoryservicedata_directoryservicedata::state::
         ad_directory_inventory(engine)

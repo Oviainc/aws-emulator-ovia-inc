@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // certificate PEM that was provided has incorrect encoding."
         let parsed = crate::state::parse_certificate(&input.certificate_data).ok_or_else(|| {
             RegisterCertificateErrorModeled::InvalidCertificateException(crate::state::refusal(
-                "CertificateData could not be read as a PEM-encoded X.509 certificate",
+                crate::state::CERTIFICATE_ENCODING_INVALID,
             ))
         })?;
 
@@ -209,34 +209,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // A directory registers a given certificate once. The comparison is on the DER
-        // the PEM decoded to, so what a directory holds at most one of is the
-        // CERTIFICATE rather than the text that carried it.
-        if let Some(existing) = directory
-            .certificates
-            .values()
-            .find(|candidate| candidate.der == parsed.der)
-        {
+        // What a certificate PERFORMS decides which directories it can be registered
+        // with: the function has to be one the directory's own type offers — client-side
+        // LDAPS for the types `EnableLDAPS` serves, and client (smart card)
+        // authentication for the types that offer it — so a request asking for a function
+        // this directory type does not have asks for something it does not support, which
+        // is the modelled refusal for exactly that. Decided before anything is stored, so
+        // the certificate inventory gains no entry. Each half states its own fixed
+        // sentence, which names the directory type rather than quoting it.
+        let offered_for = crate::state::certificate_function_directory_types(&certificate_type);
+        if !offered_for.contains(&directory.directory_type.as_str()) {
+            let message = if certificate_type == crate::state::CERTIFICATE_TYPE_CLIENT_CERT_AUTH {
+                crate::state::CLIENT_AUTHENTICATION_UNSUPPORTED
+            } else {
+                crate::state::LDAPS_UNSUPPORTED
+            };
             return Err(
-                RegisterCertificateErrorModeled::CertificateAlreadyExistsException(
-                    crate::state::refusal(format!(
-                        "The certificate is already registered with directory {id} as {existing_id}",
-                        id = input.directory_id,
-                        existing_id = existing.certificate_id
-                    )),
+                RegisterCertificateErrorModeled::UnsupportedOperationException(
+                    crate::state::refusal(message),
                 )
                 .into(),
             );
         }
 
-        // Checked BEFORE the insert below, so a refused call stores nothing.
+        // A directory registers a given certificate once. The comparison is on the DER
+        // the PEM decoded to, so what a directory holds at most one of is the
+        // CERTIFICATE rather than the text that carried it. The refusal is this error
+        // class's own sentence, which states the fact and interpolates nothing.
+        if directory
+            .certificates
+            .values()
+            .any(|candidate| candidate.der == parsed.der)
+        {
+            return Err(
+                RegisterCertificateErrorModeled::CertificateAlreadyExistsException(
+                    crate::state::refusal(crate::state::CERTIFICATE_ALREADY_REGISTERED),
+                )
+                .into(),
+            );
+        }
+
+        // Checked BEFORE the insert below, so a refused call stores nothing. The refusal
+        // is this error class's own sentence; the bound itself is
+        // `MAX_CERTIFICATES_PER_DIRECTORY`.
         if directory.certificates.len() >= crate::state::MAX_CERTIFICATES_PER_DIRECTORY {
             return Err(
                 RegisterCertificateErrorModeled::CertificateLimitExceededException(
-                    crate::state::refusal(format!(
-                        "This emulator registers at most {max} certificates with one directory",
-                        max = crate::state::MAX_CERTIFICATES_PER_DIRECTORY
-                    )),
+                    crate::state::refusal(crate::state::CERTIFICATE_LIMIT_REACHED),
                 )
                 .into(),
             );

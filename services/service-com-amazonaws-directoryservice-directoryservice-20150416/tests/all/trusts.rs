@@ -74,6 +74,10 @@ const TRUST_STATE_VERIFIED: &str = "Verified";
 /// the enum's `Deleting` value.
 const TRUST_STATE_DELETING: &str = "Deleting";
 
+/// The `TrustState` a torn-down trust settles on before it leaves the service: the enum's
+/// `Deleted` value.
+const TRUST_STATE_DELETED: &str = "Deleted";
+
 /// This emulator's documented per-directory trust guard
 /// (`state::MAX_TRUSTS_PER_DIRECTORY`).
 const TRUST_GUARD: usize = 50;
@@ -982,8 +986,30 @@ async fn deleting_a_trust_tears_it_down_and_takes_the_asked_for_forwarder() {
         deleted.push((case, trust_id, domain));
     }
 
-    // Once the teardown has fallen due, the relationship is gone from this service: it is
-    // in no listing, and resolving it by id reports that it does not exist.
+    // Once the teardown has fallen due, the relationship carries the settled `Deleted`
+    // state of the modelled enum — still reported, so a caller polling the teardown sees
+    // how it ended — and one span later it is gone from this service altogether: in no
+    // listing, and resolving it by id reports that it does not exist.
+    tokio::time::sleep(PAST_ONE_SPAN).await;
+    let torn_down = describe(&router, json!({}), "after the teardowns fell due").await;
+    for (case, trust_id, _) in &deleted {
+        let reported = torn_down
+            .iter()
+            .find(|trust| trust["TrustId"] == json!(trust_id))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected the torn-down trust to still be reported, got \
+                     {torn_down:?}"
+                )
+            });
+        assert_eq!(
+            reported["TrustState"],
+            json!(TRUST_STATE_DELETED),
+            "case {case:?}: expected the settled Deleted state once the teardown fell due, \
+             got {reported}"
+        );
+    }
+
     tokio::time::sleep(PAST_ONE_SPAN).await;
     let left = describe(&router, json!({}), "after the teardowns fell due").await;
     assert!(

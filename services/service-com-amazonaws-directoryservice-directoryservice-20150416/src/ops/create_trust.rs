@@ -297,9 +297,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .selective_auth
                     .unwrap_or_else(|| crate::state::SELECTIVE_AUTH_DISABLED.to_string()),
                 // The create "initiates the creation" of the relationship, so it answers
-                // while the trust is still being established and the move to `Created` is
-                // owed by the clock.
+                // while the trust is still being established and the move out of
+                // `Creating` is owed by the clock — onto `Created` when the remote domain
+                // can be resolved and onto `Failed`, with the reason that state carries,
+                // when it cannot.
                 trust_state: crate::state::TRUST_STATE_CREATING.to_string(),
+                // Nothing has explained the state yet: the state the relationship is in
+                // is the one the create asked for.
+                trust_state_reason: None,
                 trust_state_due_at: Some(now + crate::state::TRANSITION_SPAN),
                 created_at: now,
                 last_updated: now,

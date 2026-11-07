@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::directory_lifecycle::{
-    call, create_directory, minimal_create, ok, refused, service, string, PAST_ONE_SPAN,
+    call, ok, refused, service, string, PAST_ONE_SPAN,
 };
 use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
 
@@ -114,14 +114,39 @@ fn epoch_seconds(at: SystemTime) -> f64 {
         .as_secs_f64()
 }
 
-/// A directory that is past the stage transition its create owes, so it is in service
-/// for the registrations the cases make.
+/// A Managed Microsoft AD directory past the stage transition its create owes, so it is
+/// in service for the registrations the cases make.
+///
+/// Managed Microsoft AD is one of the directory types client-side LDAPS is offered for
+/// (`state::LDAPS_SUPPORTED_DIRECTORY_TYPES`), which is the function a `ClientLDAPS`
+/// certificate performs, so it is the directory those registrations are made with.
 pub(crate) async fn directory_in_service(
     router: &MultiServiceRouter,
     name: &str,
     case: &str,
 ) -> String {
-    let id = create_directory(router, minimal_create(name), case).await;
+    let id = create_microsoft_ad(router, minimal_microsoft_ad(name), case).await;
+    tokio::time::sleep(PAST_ONE_SPAN).await;
+    id
+}
+
+/// An AD CONNECTOR directory past that same transition.
+///
+/// Client authentication — what a `ClientCertAuth` certificate performs — is offered for
+/// this directory type and no other (`state::CLIENT_AUTHENTICATION_DIRECTORY_TYPES`), so
+/// every row that registers such a certificate is made against one of these, while the
+/// rows about a certificate securing LDAP calls use [`directory_in_service`].
+pub(crate) async fn connector_in_service(
+    router: &MultiServiceRouter,
+    name: &str,
+    case: &str,
+) -> String {
+    let id = crate::ad_connector::connect_directory(
+        router,
+        crate::ad_connector::minimal_connect(name),
+        case,
+    )
+    .await;
     tokio::time::sleep(PAST_ONE_SPAN).await;
     id
 }
@@ -146,6 +171,9 @@ struct CertificateCase {
 async fn a_registered_certificate_reports_the_certificates_own_values() {
     let router = service();
     let directory_id = directory_in_service(&router, "ldaps.example.com", "registration").await;
+    // Client authentication is offered for AD Connector alone, so the rows that register a
+    // certificate performing it are made against a directory of that type.
+    let connector_id = connector_in_service(&router, "smartcard.example.com", "registration").await;
 
     // The rows differ along everything a registration varies in: the common name the
     // certificate states (several forms, and one certificate with no common name at
@@ -196,12 +224,19 @@ async fn a_registered_certificate_reports_the_certificates_own_values() {
     ];
 
     let mut minted: BTreeSet<String> = BTreeSet::new();
-    let mut registered: Vec<(&CertificateCase, String, i64)> = Vec::new();
+    let mut registered: Vec<(&CertificateCase, String, String, i64)> = Vec::new();
 
     for row in &cases {
         let case = row.case;
+        // The directory a row is registered with is the one its certificate's function is
+        // offered for.
+        let target = if row.expected_type == TYPE_CLIENT_CERT_AUTH {
+            &connector_id
+        } else {
+            &directory_id
+        };
         let (pem, expires_at) = certificate_pem(row.common_name, row.not_after);
-        let mut request = json!({ "DirectoryId": &directory_id, "CertificateData": pem });
+        let mut request = json!({ "DirectoryId": target, "CertificateData": pem });
         if let Some(wanted) = row.requested_type {
             request["Type"] = json!(wanted);
         }
@@ -218,7 +253,7 @@ async fn a_registered_certificate_reports_the_certificates_own_values() {
              {certificate_id:?}"
         );
 
-        let reported = describe(&router, &directory_id, &certificate_id, case).await;
+        let reported = describe(&router, target, &certificate_id, case).await;
         assert_eq!(
             reported["CertificateId"],
             json!(&certificate_id),
@@ -263,22 +298,22 @@ async fn a_registered_certificate_reports_the_certificates_own_values() {
         );
 
         // A read does not change what the next caller sees.
-        let again = describe(&router, &directory_id, &certificate_id, case).await;
+        let again = describe(&router, target, &certificate_id, case).await;
         assert_eq!(
             again, reported,
             "case {case:?}: expected a repeated DescribeCertificate to report the same \
              registration, got {again}"
         );
 
-        registered.push((row, certificate_id, expires_at));
+        registered.push((row, target.clone(), certificate_id, expires_at));
     }
 
     // The transition the register owed has fallen due: every registration has settled,
     // and nothing else about it moved.
     tokio::time::sleep(PAST_ONE_SPAN).await;
-    for (row, certificate_id, expires_at) in &registered {
+    for (row, target, certificate_id, expires_at) in &registered {
         let case = row.case;
-        let settled = describe(&router, &directory_id, certificate_id, case).await;
+        let settled = describe(&router, target, certificate_id, case).await;
         assert_eq!(
             settled["State"],
             json!(STATE_REGISTERED),
@@ -418,11 +453,11 @@ async fn a_directory_registers_one_certificate_once() {
             json!({ "DirectoryId": &first, "CertificateData": &certificate }),
         ),
         (
-            "the same certificate again, for the other function",
+            "the same certificate again, with the function it performs named",
             json!({
                 "DirectoryId": &first,
                 "CertificateData": &certificate,
-                "Type": TYPE_CLIENT_CERT_AUTH
+                "Type": TYPE_CLIENT_LDAPS
             }),
         ),
     ] {
@@ -497,11 +532,13 @@ async fn a_registration_needs_a_directory_that_is_in_service() {
     let (certificate, _) = certificate_pem(Some("early.example.com"), (2032, 7, 7));
 
     // Both creates leave the directory in the transient stage its create owes a
-    // transition out of, so both rows exercise the window before it falls due.
-    let simple = create_directory(
+    // transition out of, so both rows exercise the window before it falls due. The two
+    // types are the ones client-side LDAPS — the function this certificate performs — is
+    // offered for, so the stage is the only thing that can refuse the call.
+    let connector = crate::ad_connector::connect_directory(
         &router,
-        minimal_create("pending.example.com"),
-        "a Simple AD directory still being built",
+        crate::ad_connector::minimal_connect("pending.example.com"),
+        "an AD Connector directory still being built",
     )
     .await;
     let managed = create_microsoft_ad(
@@ -512,7 +549,7 @@ async fn a_registration_needs_a_directory_that_is_in_service() {
     .await;
 
     let rows = [
-        ("a Simple AD directory still being built", &simple),
+        ("an AD Connector directory still being built", &connector),
         (
             "a Managed Microsoft AD directory still being built",
             &managed,

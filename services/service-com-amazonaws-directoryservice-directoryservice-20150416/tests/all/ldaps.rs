@@ -20,7 +20,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::certificates::{certificate_pem, register, TYPE_CLIENT_CERT_AUTH, TYPE_CLIENT_LDAPS};
+use crate::certificates::{
+    certificate_pem, connector_in_service, register, TYPE_CLIENT_CERT_AUTH, TYPE_CLIENT_LDAPS,
+};
 use crate::directory_lifecycle::{
     call, create_directory, minimal_create, ok, refused, service, PAST_ONE_SPAN,
 };
@@ -189,7 +191,18 @@ async fn an_activation_records_the_transient_status_the_clock_settles() {
         .flat_map(|row| LDAPS_TYPE_CATALOG.iter().map(move |kind| (row, *kind)))
     {
         let case = row.case;
-        let directory_id = directory_in_service(&router, "activation.example.com", case).await;
+        // Client authentication is offered for AD Connector alone, so a row whose
+        // inventory includes a certificate performing it is made against one of those;
+        // LDAP security is served by both that type and Managed Microsoft AD.
+        let client_authentication = row
+            .certificates
+            .iter()
+            .any(|(_, certificate_type)| *certificate_type == TYPE_CLIENT_CERT_AUTH);
+        let directory_id = if client_authentication {
+            connector_in_service(&router, "activation.example.com", case).await
+        } else {
+            directory_in_service(&router, "activation.example.com", case).await
+        };
         for (common_name, certificate_type) in &row.certificates {
             certificate_in_service(
                 &router,
@@ -300,7 +313,7 @@ async fn an_activation_needs_a_certificate_in_service_securing_ldap_calls() {
         let bare = directory_in_service(&router, "bare.example.com", "no certificate").await;
 
         let other_function =
-            directory_in_service(&router, "other.example.com", "another function").await;
+            connector_in_service(&router, "other.example.com", "another function").await;
         certificate_in_service(
             &router,
             &other_function,
@@ -310,7 +323,7 @@ async fn an_activation_needs_a_certificate_in_service_securing_ldap_calls() {
         )
         .await;
 
-        let many = directory_in_service(&router, "many.example.com", "several of those").await;
+        let many = connector_in_service(&router, "many.example.com", "several of those").await;
         for index in 0..3 {
             certificate_in_service(
                 &router,

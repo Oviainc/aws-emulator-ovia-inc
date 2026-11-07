@@ -157,10 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.certificate_id)
             .ok_or_else(|| {
                 DeregisterCertificateErrorModeled::CertificateDoesNotExistException(
-                    crate::state::refusal(crate::state::no_such_certificate(
-                        &input.certificate_id,
-                        &input.directory_id,
-                    )),
+                    crate::state::refusal(crate::state::CERTIFICATE_NOT_PRESENT),
                 )
             })?;
 
@@ -173,13 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             && directory.ldaps_security_in_force()
         {
             return Err(DeregisterCertificateErrorModeled::CertificateInUseException(
-                crate::state::refusal(format!(
-                    "Certificate {certificate_id} is being used for the LDAP security \
-                     connection of directory {directory_id} and cannot be removed without \
-                     disabling LDAP security",
-                    certificate_id = input.certificate_id,
-                    directory_id = input.directory_id
-                )),
+                crate::state::refusal(crate::state::CERTIFICATE_IN_USE),
             )
             .into());
         }

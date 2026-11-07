@@ -254,8 +254,10 @@ async fn a_created_microsoft_ad_directory_is_reported_from_persisted_state() {
             "case {:?}: expected single sign-on off on a fresh directory, got {described}",
             case.name
         );
-        // "If no alias exists, the alias is the directory identifier", and "The access
-        // URL for the directory, such as http://<alias>.awsapps.com".
+        // "If no alias exists, the alias is the directory identifier", and `AccessUrl` is
+        // the HOST that alias names in the `awsapps.com` domain: the member's documented
+        // example shows a scheme, but the value the service reports is the bare host, so a
+        // client can use it as one.
         assert_eq!(
             described["Alias"],
             json!(id),
@@ -264,7 +266,7 @@ async fn a_created_microsoft_ad_directory_is_reported_from_persisted_state() {
         );
         assert_eq!(
             described["AccessUrl"],
-            json!(format!("http://{id}.awsapps.com")),
+            json!(format!("{id}.awsapps.com")),
             "case {:?}: expected AccessUrl derived from the alias, got {described}",
             case.name
         );

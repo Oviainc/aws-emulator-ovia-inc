@@ -17,6 +17,8 @@ mod ad_assessment;
 mod ad_connector;
 #[path = "all/certificate_deregistration.rs"]
 mod certificate_deregistration;
+#[path = "all/certificate_functions.rs"]
+mod certificate_functions;
 #[path = "all/certificate_listing.rs"]
 mod certificate_listing;
 #[path = "all/certificates.rs"]
@@ -83,6 +85,8 @@ mod schema_extension_cancellation;
 mod schema_extensions;
 #[path = "all/shared_directories.rs"]
 mod shared_directories;
+#[path = "all/sharing_and_tagging_guards.rs"]
+mod sharing_and_tagging_guards;
 #[path = "all/single_sign_on.rs"]
 mod single_sign_on;
 #[path = "all/snapshot_deletion.rs"]
@@ -93,6 +97,8 @@ mod snapshots;
 mod state_roundtrip;
 #[path = "all/trust_conflict_message.rs"]
 mod trust_conflict_message;
+#[path = "all/trust_outcomes.rs"]
+mod trust_outcomes;
 #[path = "all/trusts.rs"]
 mod trusts;
 #[path = "all/user_passwords.rs"]

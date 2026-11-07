@@ -211,6 +211,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A directory is shared FROM the owner account WITH another one, so the owner's
+        // own account is not a target it can be shared with: the consumer's shared
+        // directory is the handle another account gets on this one, and the owner already
+        // has the directory itself. The modelled refusal for a target that is not a valid
+        // one is exactly this, and it is decided before the store is reached so nothing
+        // is recorded for a share AWS would never create.
+        if consumer_account_id == ::engine::emulator_account_id() {
+            return Err(ShareDirectoryErrorModeled::InvalidTargetException(
+                crate::state::refusal(crate::state::share_target_is_the_owner(
+                    &consumer_account_id,
+                )),
+            )
+            .into());
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.advance_clock(now);

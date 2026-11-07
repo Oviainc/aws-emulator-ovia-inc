@@ -63,13 +63,24 @@ fn connect_settings(subnet_ids: &[&str]) -> Value {
 }
 
 /// A well-formed `ConnectDirectory` body for `name` with `size` and `subnet_ids`.
-fn connect_body(name: &str, size: &str, subnet_ids: &[&str]) -> Value {
+pub(crate) fn connect_body(name: &str, size: &str, subnet_ids: &[&str]) -> Value {
     json!({
         "Name": name,
         "Password": CONNECT_PASSWORD,
         "Size": size,
         "ConnectSettings": connect_settings(subnet_ids),
     })
+}
+
+/// The smallest well-formed `ConnectDirectory` body for `name`: the required members at
+/// the first `DirectorySize` the model declares, placed across two distinct subnets.
+///
+/// Shared with the suites that need a directory of this TYPE rather than a connector of
+/// their own — client authentication is offered for AD Connector
+/// (`state::CLIENT_AUTHENTICATION_DIRECTORY_TYPES`), so the certificate suites register a
+/// `ClientCertAuth` certificate with one.
+pub(crate) fn minimal_connect(name: &str) -> Value {
+    connect_body(name, SIZE_CATALOG[0], &["subnet-0a1b2c3d", "subnet-1a2b3c4d"])
 }
 
 /// `ConnectDirectory` with `body`, asserting it was accepted and returning the id.

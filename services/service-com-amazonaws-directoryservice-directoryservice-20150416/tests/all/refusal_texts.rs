@@ -35,7 +35,9 @@
 
 use serde_json::{json, Value};
 
-use crate::certificates::{certificate_pem, TYPE_CLIENT_CERT_AUTH, TYPE_CLIENT_LDAPS};
+use crate::certificates::{
+    certificate_pem, connector_in_service, TYPE_CLIENT_CERT_AUTH, TYPE_CLIENT_LDAPS,
+};
 use crate::directory_lifecycle::{
     call, create_directory, minimal_create, ok, service, string, PAST_ONE_SPAN,
 };
@@ -376,10 +378,12 @@ async fn the_no_certificate_refusal_states_one_fixed_sentence() {
 
     // The rows differ along WHY no certificate secures the LDAP calls: the directory holds
     // none at all, it holds one of the other modelled certificate function, and it holds a
-    // registration the clock has not put in service yet.
+    // registration the clock has not put in service yet. The middle row's directory is an
+    // AD CONNECTOR, the type client authentication is offered for, since that is the
+    // function its certificate performs; LDAP security is served by that type too.
     let bare = microsoft_ad_in_service(&router, "bare.example.com", "no certificate").await;
     let other_function =
-        microsoft_ad_in_service(&router, "other.example.com", "another function").await;
+        connector_in_service(&router, "other.example.com", "another function").await;
     let registering =
         microsoft_ad_in_service(&router, "fresh.example.com", "still registering").await;
 

@@ -184,6 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // What the control plane recorded about this directory: which of its accounts have
+        // been given a password, which is what makes an account active.
+        let access =
+            crate::state::DirectoryDataAccess::resolve(&*self.engine, &input.directory_id);
+
         // A read NEVER materialises a directory: a `DirectoryId` nothing has written
         // to holds no objects, so the user it asks about is not found.
         let store = state.lock();
@@ -220,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             email_address: user.email_address.clone(),
             given_name: user.given_name.clone(),
             surname: user.surname.clone(),
-            enabled: Some(user.enabled),
+            enabled: Some(access.is_enabled(&user.sam_account_name)),
             // "The attribute values that you want returned": only what was asked for.
             other_attributes: user.projected_attributes(input.other_attributes.as_deref()),
         })

@@ -919,6 +919,10 @@ mod apigatewayv2_vpc_link_subnets_resolve_in_ec2;
 // API Gateway account may write its logs under.
 #[path = "all/apigateway_account_cloudwatch_role.rs"]
 mod apigateway_account_cloudwatch_role;
+// Declared here, in this quiet span rather than in the contended tail: the Directory
+// Service control plane and its data plane over one engine.
+#[path = "all/ds_data_plane_access_and_realm.rs"]
+mod ds_data_plane_access_and_realm;
 #[path = "all/zz_probe_whole_emulator.rs"]
 mod zz_probe_whole_emulator;
 #[path = "all/cloudformation_provisions_cognito_identity_pools.rs"]

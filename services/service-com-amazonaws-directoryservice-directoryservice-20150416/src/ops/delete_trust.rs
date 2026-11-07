@@ -161,14 +161,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The delete answers while the Amazon Web Services side is still being torn down,
         // so the relationship is recorded in the modelled transient `Deleting` state and
         // the clock is what finishes the job: a caller reading straight afterwards still
-        // sees the teardown, and once it falls due the trust is gone from this service.
-        // A repeat of the delete is therefore not a refusal: it names a relationship that
-        // is still being deleted, and reports the same id.
+        // sees the teardown, then the settled `Deleted` state, and once that has been
+        // readable for a span the trust is gone from this service. A repeat of the delete
+        // is therefore not a refusal: it names a relationship that is already torn down,
+        // and reports the same id.
         let trust_id = trust.trust_id.clone();
         let directory_id = trust.directory_id.clone();
         let remote_domain_name = trust.remote_domain_name.clone();
-        if trust.trust_state != crate::state::TRUST_STATE_DELETING {
+        if !crate::state::TORN_DOWN_TRUST_STATES.contains(&trust.trust_state.as_str()) {
             trust.trust_state = crate::state::TRUST_STATE_DELETING.to_string();
+            // The teardown is the state the relationship is in now, and nothing but this
+            // call put it there, so whatever explained the state before no longer
+            // describes it.
+            trust.trust_state_reason = None;
             trust.trust_state_due_at = Some(now + crate::state::TRANSITION_SPAN);
             trust.state_last_updated = now;
             trust.last_updated = now;

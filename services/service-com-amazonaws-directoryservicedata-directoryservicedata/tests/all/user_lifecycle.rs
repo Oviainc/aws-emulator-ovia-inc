@@ -416,10 +416,14 @@ async fn a_created_user_is_described_from_its_stored_record() {
              got {:?}",
             described.body
         );
+        // `CreateUser` models no password member, so a created account has no credential
+        // and Active Directory leaves it INACTIVE: the control plane's
+        // `ResetUserPassword` is what gives it one and so what makes it active.
         assert_eq!(
             described.body["Enabled"],
-            json!(true),
-            "case {case:?}: a created account is active, got {:?}",
+            json!(false),
+            "case {case:?}: a created account has no password, so it must be inactive, \
+             got {:?}",
             described.body
         );
         for member in ["EmailAddress", "GivenName", "Surname"] {
@@ -709,8 +713,16 @@ async fn list_users_pages_through_the_stored_users_in_order() {
         );
         assert_eq!(
             user["Enabled"],
-            json!(true),
-            "user {name:?}: the summary must report the stored state, got {user:?}"
+            described.body["Enabled"],
+            "user {name:?}: the summary must report the state the describe reports, got {user:?}"
+        );
+        // `CreateUser` carries no password, so the account has no credential and is
+        // INACTIVE until a password reset on the control plane gives it one.
+        assert_eq!(
+            user["Enabled"],
+            json!(false),
+            "user {name:?}: a created account has no password, so it must be reported \
+             inactive, got {user:?}"
         );
     }
 }

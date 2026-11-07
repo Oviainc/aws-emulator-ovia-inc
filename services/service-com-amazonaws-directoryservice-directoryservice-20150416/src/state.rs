@@ -18,7 +18,8 @@
 //!   materialises the status transitions the clock has already made due (a directory
 //!   leaving `Requested`, a snapshot leaving `Creating`, an IP route leaving `Adding`
 //!   (and a removed one leaving the store), a
-//!   trust leaving `Creating` or `Verifying` (and a deleted one leaving the store), an
+//!   trust leaving `Creating` or `Verifying` (and a torn-down one settling on `Deleted`
+//!   and then leaving the store), an
 //!   assessment leaving `IN_PROGRESS`, a directory's data access leaving `Enabling`, a
 //!   directory's LDAP security leaving `Enabling`, a
 //!   registered certificate leaving `Registering`, an organization directory share
@@ -321,6 +322,9 @@ pub const TYPE_AD_CONNECTOR: &str = "ADConnector";
 /// The DNS suffix a directory's access URL is built on, from the `AccessUrl` member's
 /// documentation: "The access URL for the directory, such as
 /// `http://<alias>.awsapps.com`".
+///
+/// The member's documented EXAMPLE carries a scheme; the value Directory Service reports
+/// is the bare host it is built on, which is what [`Directory::access_url`] composes.
 const ACCESS_URL_SUFFIX: &str = ".awsapps.com";
 
 /// The network types a Simple AD directory may be created with.
@@ -675,6 +679,25 @@ pub const LDAPS_SUPPORTED_DIRECTORY_TYPES: [&str; 2] = [TYPE_MICROSOFT_AD, TYPE_
 /// been reached") then refuses.
 pub const MAX_CERTIFICATES_PER_DIRECTORY: usize = 10;
 
+/// The directory types the function a certificate performs is offered for, by
+/// `CertificateType`.
+///
+/// Which certificates a directory can register follows from what the certificate DOES:
+/// client-side LDAPS, which a [`CERTIFICATE_TYPE_CLIENT_LDAPS`] certificate secures, is
+/// offered for the types in [`LDAPS_SUPPORTED_DIRECTORY_TYPES`] — the same set
+/// `EnableLDAPS` serves — while client authentication, which a
+/// [`CERTIFICATE_TYPE_CLIENT_CERT_AUTH`] certificate configures, is offered for the types
+/// in [`CLIENT_AUTHENTICATION_DIRECTORY_TYPES`]. A registration asking for a function the
+/// directory's own type does not offer is refused with the modelled
+/// `UnsupportedOperationException`.
+pub fn certificate_function_directory_types(certificate_type: &str) -> &'static [&'static str] {
+    if certificate_type == CERTIFICATE_TYPE_CLIENT_CERT_AUTH {
+        &CLIENT_AUTHENTICATION_DIRECTORY_TYPES
+    } else {
+        &LDAPS_SUPPORTED_DIRECTORY_TYPES
+    }
+}
+
 /// The `TrustState` a trust relationship carries between `CreateTrust` and
 /// [`TRANSITION_SPAN`]: the first value of the modelled `TrustState` enum
 /// (`smithy_query(query="shape",shape="TrustState")`).
@@ -703,6 +726,49 @@ pub const TRUST_STATE_VERIFYING: &str = "Verifying";
 /// enum.
 pub const TRUST_STATE_VERIFIED: &str = "Verified";
 
+/// The `TrustState` a trust relationship whose establishment did not succeed settles on:
+/// the `Failed` value of the modelled `TrustState` enum.
+///
+/// The Amazon Web Services side of a trust can only be established against a peer the
+/// remote domain actually has, so a create naming a domain that cannot be resolved
+/// settles here instead of on [`TRUST_STATE_CREATED`] — see [`remote_domain_resolvable`]
+/// and [`TRUST_CREATE_FAILURE_REASON`].
+pub const TRUST_STATE_FAILED: &str = "Failed";
+
+/// The `TrustStateReason` ("The reason for the TrustState") a trust that settled on
+/// [`TRUST_STATE_FAILED`] carries: the sentence Directory Service states for a trust
+/// whose creation did not complete. FIXED text with no interpolated values.
+pub const TRUST_CREATE_FAILURE_REASON: &str =
+    "An internal service error has been encountered while creating the trust. Please retry \
+     the operation.";
+
+/// The top-level domains the IETF reserves as names that are NEVER installed in the
+/// global DNS, so a domain under one of them has no peer anything can reach: `invalid`,
+/// `test` and `localhost` are the special-use names RFC 6761 reserves for exactly that,
+/// and `example` is the TLD RFC 2606 reserves for documentation (the delegated
+/// `example.com`, `example.net` and `example.org` are ordinary resolvable names and are
+/// NOT in this set).
+///
+/// This is what [`remote_domain_resolvable`] decides an external domain's reachability
+/// by: this emulator resolves no name off this process, so the names DNS itself
+/// guarantees do not exist are the ones a trust cannot be established with.
+pub const NON_RESOLVABLE_TOP_LEVEL_DOMAINS: [&str; 4] =
+    ["invalid", "test", "localhost", "example"];
+
+/// Whether `remote_domain_name` is a domain the global DNS can resolve — whether a trust
+/// to it can reach a peer at all.
+///
+/// A name whose top-level domain is one of [`NON_RESOLVABLE_TOP_LEVEL_DOMAINS`] is
+/// guaranteed by the IETF not to exist in the global DNS, so nothing answers for it; any
+/// other name is one a resolver can follow. The comparison is on the name's last label,
+/// case-insensitively and without the trailing root dot, the way [`domain_key`] compares
+/// one domain name with another.
+pub fn remote_domain_resolvable(remote_domain_name: &str) -> bool {
+    let key = domain_key(remote_domain_name);
+    let top_level = key.rsplit('.').next().unwrap_or_default();
+    !NON_RESOLVABLE_TOP_LEVEL_DOMAINS.contains(&top_level)
+}
+
 /// The `TrustState` a trust relationship carries between `DeleteTrust` and
 /// [`TRANSITION_SPAN`], after which the relationship is gone: the `Deleting` value of the
 /// modelled `TrustState` enum.
@@ -711,6 +777,59 @@ pub const TRUST_STATE_VERIFIED: &str = "Verified";
 /// caller acting straight after it still sees the trust in this state, and the removal is
 /// owed by the clock rather than by any later call.
 pub const TRUST_STATE_DELETING: &str = "Deleting";
+
+/// The `TrustState` a torn-down trust relationship settles on before it leaves this
+/// service: the `Deleted` value of the modelled `TrustState` enum.
+///
+/// The teardown `DeleteTrust` starts has a settled state of its own — the enum carries
+/// `Deleted` beside the transient `Deleting` — so a trust reports it once the teardown has
+/// fallen due, and the record leaves the store one span later, because a relationship the
+/// service no longer holds is not one `DescribeTrusts` reports. A trust in either of these
+/// two states is already torn down, so it is not one
+/// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::trust_of`] resolves: the
+/// directory can establish a trust with that remote domain again.
+pub const TRUST_STATE_DELETED: &str = "Deleted";
+
+/// The `TrustState` values of a relationship that is being, or has been, torn down —
+/// [`TRUST_STATE_DELETING`] and [`TRUST_STATE_DELETED`].
+///
+/// A trust in one of them is still reported while the clock works through the teardown,
+/// but it is no longer the relationship the directory has with that remote domain.
+pub const TORN_DOWN_TRUST_STATES: [&str; 2] = [TRUST_STATE_DELETING, TRUST_STATE_DELETED];
+
+/// The `TrustState` values of a relationship the directory no longer HOLDS: the teardown
+/// states ([`TORN_DOWN_TRUST_STATES`]) and [`TRUST_STATE_FAILED`], where nothing was
+/// established at all.
+///
+/// Such a trust is still reported, and still counted against the per-directory trust
+/// quota while the store holds it
+/// ([`ComAmazonawsDirectoryserviceDirectoryservice20150416State::trust_count`]), but it is
+/// not the relationship the directory HAS with that remote domain — so it is not what a
+/// second `CreateTrust` for that domain collides with
+/// ([`ComAmazonawsDirectoryserviceDirectoryservice20150416State::trust_of`]).
+pub const TRUST_STATES_NOT_HELD: [&str; 3] = [
+    TRUST_STATE_DELETING,
+    TRUST_STATE_DELETED,
+    TRUST_STATE_FAILED,
+];
+
+/// The `TrustState` values a trust relationship can be verified from: the states in
+/// which the relationship EXISTS and nothing has failed or torn it down.
+///
+/// `VerifyTrust` "verifies a trust relationship between your Managed Microsoft AD
+/// directory and an external domain", so it needs a relationship there is something to
+/// verify about. The remaining values of the modelled `TrustState` enum are the failures
+/// ([`TRUST_STATE_FAILED`], `VerifyFailed`, `UpdateFailed`) and the teardown
+/// ([`TRUST_STATE_DELETING`], [`TRUST_STATE_DELETED`]), and a verification asked for from
+/// one of those is refused with [`cannot_verify_trust`].
+pub const VERIFIABLE_TRUST_STATES: [&str; 6] = [
+    TRUST_STATE_CREATING,
+    TRUST_STATE_CREATED,
+    TRUST_STATE_VERIFYING,
+    TRUST_STATE_VERIFIED,
+    "Updating",
+    "Updated",
+];
 
 /// The `TrustType` a request that names none gets: the `Forest` value of the modelled
 /// `TrustType` enum, from `CreateTrustRequest$TrustType`'s own documentation — "The trust
@@ -1886,12 +2005,12 @@ impl Directory {
     ///
     /// From the `AccessUrl` member's documentation: "The access URL for the directory,
     /// such as `http://<alias>.awsapps.com`. If no alias exists, `<alias>` is the
-    /// directory identifier".
+    /// directory identifier". The documented example shows a scheme, but the value the
+    /// service reports is the HOST alone — the alias in the
+    /// [`ACCESS_URL_SUFFIX`] domain and nothing else — which is what a client uses as a
+    /// host name, so no scheme and no path are composed into it.
     pub fn access_url(&self) -> String {
-        format!(
-            "http://{alias}{ACCESS_URL_SUFFIX}",
-            alias = self.effective_alias()
-        )
+        format!("{alias}{ACCESS_URL_SUFFIX}", alias = self.effective_alias())
     }
 
     /// The DNS server that answers for this directory, as this emulator can name it.
@@ -2528,6 +2647,10 @@ pub struct TrustRecord {
     pub selective_auth: String,
     /// One of the modelled `TrustState` values.
     pub trust_state: String,
+    /// The modelled `TrustStateReason`, "the reason for the TrustState": the sentence a
+    /// state the relationship did not reach on its own carries, and `None` for a state
+    /// that needs no explanation.
+    pub trust_state_reason: Option<String>,
     /// When the state transition the create owes falls due; `None` once there is no
     /// transition left to make. See [`TRANSITION_SPAN`].
     pub trust_state_due_at: Option<SystemTime>,
@@ -2550,9 +2673,9 @@ impl TrustRecord {
     /// This trust as the modelled `Trust` structure.
     ///
     /// The one place a stored trust is rendered, so every operation that reports one
-    /// reports exactly what was persisted. `TrustStateReason` ("the reason for the
-    /// TrustState") stays absent: it explains a state this emulator never records, and a
-    /// trust that is being created or is created has no reason to give.
+    /// reports exactly what was persisted — `TrustStateReason` ("the reason for the
+    /// TrustState") included, which is what explains a relationship that did not settle
+    /// the way the create asked for.
     pub fn to_trust(&self) -> Trust {
         Trust {
             directory_id: Some(self.directory_id.clone()),
@@ -2564,7 +2687,7 @@ impl TrustRecord {
             created_date_time: Some(as_timestamp(self.created_at)),
             last_updated_date_time: Some(as_timestamp(self.last_updated)),
             state_last_updated_date_time: Some(as_timestamp(self.state_last_updated)),
-            trust_state_reason: None,
+            trust_state_reason: self.trust_state_reason.clone(),
             selective_auth: Some(self.selective_auth.clone()),
         }
     }
@@ -3083,11 +3206,16 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
             }
         }
         // The state transitions the trust writes owe: the transient `Creating` a create
-        // answers in settles on `Created`, the `Verifying` a verify answers in settles on
-        // `Verified`, and a trust whose delete has fallen due is gone — a deleted
-        // relationship is not one `DescribeTrusts` reports. The transition `UpdateTrust`
-        // owes belongs to that handler, which is still scaffolded, so it lands with it
-        // rather than as a branch nothing can reach.
+        // answers in settles on `Created` when the external domain the trust points at
+        // can be resolved and on `Failed` when it cannot — establishing the Amazon Web
+        // Services side needs a peer at that domain, and a domain DNS guarantees does not
+        // exist has none, which is the state reason the failed trust then carries. The
+        // `Verifying` a verify answers in settles on `Verified`, and the `Deleting` a
+        // delete answers in settles on `Deleted` — after which the relationship leaves
+        // the store one span later, because a trust this service no longer holds is not
+        // one `DescribeTrusts` reports. The transition `UpdateTrust` owes belongs to that
+        // handler, which is still scaffolded, so it lands with it rather than as a branch
+        // nothing can reach.
         for trust in self.trusts.values_mut() {
             let Some(due) = trust.trust_state_due_at else {
                 continue;
@@ -3095,20 +3223,39 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
             if now < due {
                 continue;
             }
-            let settled = match trust.trust_state.as_str() {
-                TRUST_STATE_CREATING => TRUST_STATE_CREATED,
-                TRUST_STATE_VERIFYING => TRUST_STATE_VERIFIED,
-                // A trust being deleted has no settled state to move to: it is removed
-                // below, so its due instant is left in place for that pass to find.
+            let (settled, reason) = match trust.trust_state.as_str() {
+                TRUST_STATE_CREATING => {
+                    if remote_domain_resolvable(&trust.remote_domain_name) {
+                        (TRUST_STATE_CREATED, None)
+                    } else {
+                        (
+                            TRUST_STATE_FAILED,
+                            Some(TRUST_CREATE_FAILURE_REASON.to_string()),
+                        )
+                    }
+                }
+                TRUST_STATE_VERIFYING => (TRUST_STATE_VERIFIED, None),
+                TRUST_STATE_DELETING => (TRUST_STATE_DELETED, None),
+                // A trust that has reached `Deleted`, or whose failure has been on record
+                // for as long as this service keeps one, has no further state to move to:
+                // it leaves the store below, so its due instant is left in place for that
+                // pass to find.
                 _ => continue,
             };
             trust.trust_state = settled.to_string();
+            trust.trust_state_reason = reason;
             trust.state_last_updated = due;
             trust.last_updated = due;
-            trust.trust_state_due_at = None;
+            // A trust that has just been torn down is held for one more span, so the
+            // settled `Deleted` state is one a caller can read before the record goes.
+            trust.trust_state_due_at = if settled == TRUST_STATE_DELETED {
+                Some(due + TRANSITION_SPAN)
+            } else {
+                None
+            };
         }
         self.trusts.retain(|_, trust| {
-            trust.trust_state != TRUST_STATE_DELETING
+            trust.trust_state != TRUST_STATE_DELETED
                 || trust.trust_state_due_at.is_some_and(|due| now < due)
         });
         // The status transition an organization share owes: `ShareDirectory` answers
@@ -3197,10 +3344,17 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// The trust `directory_id` already holds with `remote_domain_name`, if any: a
     /// directory is one side of at most one trust with a given external domain, so this is
     /// what a second `CreateTrust` for it resolves as the entity that already exists.
+    ///
+    /// A relationship that is being or has been torn down, or whose establishment failed
+    /// ([`TRUST_STATES_NOT_HELD`]), is not one the directory holds any more, even while
+    /// the clock is still working through what it owes, so the directory can establish a
+    /// trust with that domain again.
     pub fn trust_of(&self, directory_id: &str, remote_domain_name: &str) -> Option<&TrustRecord> {
         let key = domain_key(remote_domain_name);
         self.trusts.values().find(|trust| {
-            trust.directory_id == directory_id && domain_key(&trust.remote_domain_name) == key
+            trust.directory_id == directory_id
+                && domain_key(&trust.remote_domain_name) == key
+                && !TRUST_STATES_NOT_HELD.contains(&trust.trust_state.as_str())
         })
     }
 
@@ -3250,11 +3404,21 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     }
 
     /// How many trust relationships `directory_id` currently holds — the count
-    /// [`MAX_TRUSTS_PER_DIRECTORY`] bounds.
+    /// [`MAX_TRUSTS_PER_DIRECTORY`] bounds, and so the bound on what the trust store can
+    /// hold for one directory.
+    ///
+    /// A relationship whose teardown the clock is still working through
+    /// ([`TORN_DOWN_TRUST_STATES`]) is on its way out of the store, so it is not counted.
+    /// Every other record is — a relationship that FAILED included: it stays on record
+    /// until the directory is deleted, so the quota has to see it, or a caller naming one
+    /// non-resolvable domain after another could grow the store without end.
     pub fn trust_count(&self, directory_id: &str) -> usize {
         self.trusts
             .values()
-            .filter(|trust| trust.directory_id == directory_id)
+            .filter(|trust| {
+                trust.directory_id == directory_id
+                    && !TORN_DOWN_TRUST_STATES.contains(&trust.trust_state.as_str())
+            })
             .count()
     }
 
@@ -3949,25 +4113,19 @@ pub const PASSWORD_CHARACTER_CLASSES: usize = 3;
 /// Why `password` does not meet the password policy of a directory of this service, or
 /// `None` when it does.
 ///
-/// The diagnostic leads with the sentence the modelled `InvalidPasswordException`
-/// documents — "The new password provided by the user does not meet the password
-/// complexity requirements defined in your directory." — and then states which half of
-/// that policy was broken, so a caller can fix the request from the message alone.
+/// The diagnostic is [`PASSWORD_COMPLEXITY_REFUSED`], the sentence Directory Service
+/// states for this refusal — FIXED text, which is why both halves of the policy report
+/// it unchanged and the password itself, `@sensitive`, appears nowhere in it.
 ///
 /// The rule is the one `CreateDirectoryRequest$Password`'s documentation states for the
 /// administrator password, which is the directory's own policy and so the policy every
 /// later password of that directory is set under: between [`MIN_PASSWORD_CHARS`] and
 /// [`MAX_PASSWORD_CHARS`] characters, drawn from at least [`PASSWORD_CHARACTER_CLASSES`]
-/// of Active Directory's four character classes. The password ITSELF never appears in the
-/// message: it is `@sensitive`, so the diagnostic states the rule that was broken and
-/// quotes no value.
-pub fn password_policy_defect(password: &str) -> Option<String> {
+/// of Active Directory's four character classes.
+pub fn password_policy_defect(password: &str) -> Option<&'static str> {
     let characters = password.chars().count();
     if !(MIN_PASSWORD_CHARS..=MAX_PASSWORD_CHARS).contains(&characters) {
-        return Some(format!(
-            "{PASSWORD_COMPLEXITY_REQUIREMENTS} The password must be between \
-             {MIN_PASSWORD_CHARS} and {MAX_PASSWORD_CHARS} characters long."
-        ));
+        return Some(PASSWORD_COMPLEXITY_REFUSED);
     }
     let classes = [
         password.chars().any(char::is_numeric),
@@ -3981,22 +4139,20 @@ pub fn password_policy_defect(password: &str) -> Option<String> {
     .filter(|present| *present)
     .count();
     if classes < PASSWORD_CHARACTER_CLASSES {
-        return Some(format!(
-            "{PASSWORD_COMPLEXITY_REQUIREMENTS} The password must contain characters from \
-             at least {PASSWORD_CHARACTER_CLASSES} of the following four classes: \
-             numbers, upper case letters, lower case letters and special characters."
-        ));
+        return Some(PASSWORD_COMPLEXITY_REFUSED);
     }
     None
 }
 
-/// The sentence the modelled `InvalidPasswordException` states this refusal with: "The new
-/// password provided by the user does not meet the password complexity requirements
-/// defined in your directory." It is the error class's own text, so every refusal of this
-/// family leads with it and then names the half of the policy the password broke.
-const PASSWORD_COMPLEXITY_REQUIREMENTS: &str = "The new password provided by the user does \
-                                                not meet the password complexity \
-                                                requirements defined in your directory.";
+/// The sentence Directory Service refuses a password its directory's policy does not
+/// accept with: "Could not reset user password, because the password does not meet the
+/// complexity requirements."
+///
+/// FIXED text with no variable part — the password is `@sensitive` and the policy is the
+/// directory's, so neither appears in it. [`refusal`] appends the request id, once.
+pub const PASSWORD_COMPLEXITY_REFUSED: &str =
+    "Could not reset user password, because the password does not meet the complexity \
+     requirements.";
 
 /// The sentence the modelled `DirectoryAlreadyInRegionException` states this refusal
 /// with: "The Region you specified is the same Region where the Managed Microsoft AD
@@ -4008,6 +4164,17 @@ const PASSWORD_COMPLEXITY_REQUIREMENTS: &str = "The new password provided by the
 pub const DIRECTORY_ALREADY_IN_REGION: &str =
     "The Region you specified is the same Region where the Managed Microsoft AD directory \
      was created. Specify a different Region and try again.";
+
+/// The sentence `AddRegion` refuses a request naming the directory's OWN home Region
+/// with.
+///
+/// The primary Region is not a replication at all, so this is refused as an operation
+/// that is not supported rather than as a Region the directory is already in — and
+/// Directory Service words that refusal with this sentence, FIXED text with no variable
+/// part. [`refusal`] appends the request id, once.
+pub const REGION_IS_THE_PRIMARY_REGION: &str =
+    "The region you specified is the same region where the AWS Managed Microsoft AD \
+     directory was created. Specify a different region and try again.";
 
 /// The most Regions this emulator replicates one directory to beside its primary one.
 ///
@@ -4033,12 +4200,13 @@ pub fn no_such_snapshot(snapshot_id: &str) -> String {
 /// relationship. Shared so every operation that resolves a trust says the same thing
 /// about the same failure.
 ///
-/// It quotes the id the request asked for and says it does not exist, the way the
-/// directory-lookup family's wording does ([`no_such_directory`]), so the message is built
-/// from the request and names what the caller has to fix. [`refusal`] appends the request
-/// id.
+/// Directory Service words this one as the kind of entity, a colon, the id the request
+/// asked for — UNQUOTED — and "does not exist", with no full stop closing the sentence:
+/// the recorded bodies for this error class read `Trust: <trust id> does not exist`
+/// before [`refusal`] appends the request id. So the message is built from the request
+/// and names what the caller has to fix, and nothing else.
 pub fn no_such_trust(trust_id: &str) -> String {
-    format!("Trust: '{trust_id}' does not exist.")
+    format!("Trust: {trust_id} does not exist")
 }
 
 /// The `EntityDoesNotExistException` message for an id that names no domain controller of
@@ -4057,20 +4225,43 @@ pub fn no_such_domain_controller(domain_controller_id: &str) -> String {
 /// resolves a registration (`DescribeCertificate`, `DeregisterCertificate`) says the
 /// same thing about the same failure.
 ///
-/// A certificate is registered FOR a directory, so the message names both ids the
-/// request sent — the error shape's own documentation is "The certificate is not present
-/// in the system for describe or deregister activities" — and nothing else.
-/// [`refusal`] appends the request id.
-pub fn no_such_certificate(certificate_id: &str, directory_id: &str) -> String {
-    format!("Certificate {certificate_id} does not exist for directory {directory_id}")
-}
+/// The error shape's OWN sentence — "The certificate is not present in the system for
+/// describe or deregister activities." — which is how Directory Service words this
+/// refusal: FIXED text, with neither id interpolated, since the ids the call was made
+/// with are what the caller already has. [`refusal`] appends the request id, once.
+pub const CERTIFICATE_NOT_PRESENT: &str =
+    "The certificate is not present in the system for describe or deregister activities.";
+
+/// The `CertificateAlreadyExistsException` message for a certificate a directory already
+/// holds: that error shape's own sentence, FIXED text with no interpolated value.
+pub const CERTIFICATE_ALREADY_REGISTERED: &str =
+    "The certificate has already been registered into the system.";
+
+/// The `CertificateInUseException` message for a registration the directory's live LDAP
+/// security rests on: that error shape's own sentence, FIXED text with no interpolated
+/// value.
+pub const CERTIFICATE_IN_USE: &str =
+    "The certificate is being used for the LDAP security connection and cannot be removed \
+     without disabling LDAP security.";
+
+/// The `CertificateLimitExceededException` message for a registration past
+/// [`MAX_CERTIFICATES_PER_DIRECTORY`]: that error shape's own sentence, FIXED text with no
+/// interpolated value.
+pub const CERTIFICATE_LIMIT_REACHED: &str =
+    "The certificate could not be added because the certificate limit has been reached.";
+
+/// The `InvalidCertificateException` message for `CertificateData` this service cannot
+/// read as a certificate: that error shape's own sentence, FIXED text with no interpolated
+/// value — the data itself is the caller's and is not echoed.
+pub const CERTIFICATE_ENCODING_INVALID: &str =
+    "The certificate PEM that was provided has incorrect encoding.";
 
 /// The `EntityDoesNotExistException` message for an id that names no schema extension of
 /// the directory the request asked about.
 ///
-/// A schema extension is an extension OF a directory, so — like
-/// [`no_such_certificate`] — the message names both ids the request sent and nothing
-/// else, so the caller can tell which id was rejected. [`refusal`] appends the request
+/// A schema extension is an extension OF a directory, so the message names both ids the
+/// request sent and nothing else, so the caller can tell which id was rejected.
+/// [`refusal`] appends the request
 /// id.
 pub fn no_such_schema_extension(schema_extension_id: &str, directory_id: &str) -> String {
     format!(
@@ -4121,6 +4312,13 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// inside [`ComAmazonawsDirectoryserviceDirectoryservice20150416State`]: the engine keys
 /// state by TYPE, so a copy of its own here would be invisible to the plane that reads it.
 ///
+/// Three more of that plane's answers are facts only THIS service holds — whether a
+/// directory's data access has been enabled, the domain name the directory was created
+/// with, and whether an account's password has been set — so they are part of the same
+/// record: that is how the data plane can refuse a directory whose data access was never
+/// enabled, report the directory's own realm, and report an account as inactive until
+/// `ResetUserPassword` has given it a password.
+///
 /// LOCK ORDER: a handler takes [`service_state`] first and this inventory second, which is
 /// the order every writer of it keeps.
 pub fn ad_directory_inventory<Eng: Send + Sync + 'static>(
@@ -4133,4 +4331,102 @@ pub fn ad_directory_inventory<Eng: Send + Sync + 'static>(
                 ::service_common::ad_directories::AdDirectoryInventory,
             >,
         )
+}
+
+/// The `UnsupportedOperationException` message for a client-authentication request made
+/// against a directory whose type does not offer client authentication.
+///
+/// FIXED text, as Directory Service words this refusal: the directory type it is not
+/// supported for is the one the request named, which the caller already has, so the
+/// sentence carries no variable part. [`refusal`] appends the request id, once.
+pub const CLIENT_AUTHENTICATION_UNSUPPORTED: &str =
+    "Client authentication operations are not supported for this Directory Type.";
+
+/// The `UnsupportedOperationException` message for an LDAP-security request made against a
+/// directory whose type does not serve an LDAPS endpoint.
+///
+/// FIXED text, worded as this error class's sentence for the client-authentication half
+/// ([`CLIENT_AUTHENTICATION_UNSUPPORTED`]) is: the directory type it is not supported for
+/// is the one the request named, which the caller already has, so the sentence carries no
+/// variable part. [`refusal`] appends the request id, once.
+pub const LDAPS_UNSUPPORTED: &str = "LDAPS operations are not supported for this Directory Type.";
+
+/// The directory types client authentication — the certificate-based (smart card)
+/// authentication a [`CERTIFICATE_TYPE_CLIENT_CERT_AUTH`] registration configures — is
+/// offered for.
+///
+/// Directory Service offers client authentication with smart cards for AD Connector: the
+/// mutual-TLS client authentication an AD Connector presents its users' certificates to
+/// the self-managed directory through, which is what `ClientCertAuthSettings` ("the OCSP
+/// responder" the certificates are checked against) configures. A request asking for it
+/// on a directory of another type is refused with
+/// [`CLIENT_AUTHENTICATION_UNSUPPORTED`].
+pub const CLIENT_AUTHENTICATION_DIRECTORY_TYPES: [&str; 1] = [TYPE_AD_CONNECTOR];
+
+/// The `CertificateType` a certificate that performs client authentication carries: the
+/// `ClientCertAuth` value of the modelled `CertificateType` enum.
+pub const CERTIFICATE_TYPE_CLIENT_CERT_AUTH: &str = "ClientCertAuth";
+
+/// The `InvalidTargetException` message for a share whose target account is the directory
+/// owner's own account.
+///
+/// Directory Service words it as the target the request named and why it cannot be that
+/// one: the variable part is the account id the request sent, and the rest is the error
+/// class's own sentence. [`refusal`] appends the request id, once.
+pub fn share_target_is_the_owner(account_id: &str) -> String {
+    format!(
+        "The Target AWS account ID {account_id} you specified cannot be the same as the \
+         directory owner AWS account ID."
+    )
+}
+
+/// The sentence the modelled `DirectoryAlreadySharedException` states this refusal with:
+/// "The specified directory has already been shared with this Amazon Web Services
+/// account." FIXED text, with no variable part. [`refusal`] appends the request id, once.
+pub const DIRECTORY_ALREADY_SHARED: &str =
+    "The specified directory has already been shared with this Amazon Web Services account.";
+
+/// The sentence the modelled `InvalidParameterException` states a refusal with when the
+/// parameter itself is what the call cannot be served for: "One or more parameters are not
+/// valid." FIXED text, the error class's own, for the paths that have nothing to add to
+/// it. [`refusal`] appends the request id, once.
+pub const INVALID_PARAMETER: &str = "One or more parameters are not valid.";
+
+/// The reserved prefix of a tag key AWS itself owns, which no caller may add or remove.
+///
+/// From AWS's own tagging rules: a tag key beginning with `aws:` is a system tag, and the
+/// tagging APIs refuse to add or remove one. Compared case-insensitively, the way AWS
+/// treats the reserved prefix.
+pub const SYSTEM_TAG_KEY_PREFIX: &str = "aws:";
+
+/// The `InvalidParameterException` message a tagging call naming a system tag key is
+/// refused with.
+///
+/// FIXED text, as AWS words it for this refusal, and the same sentence whether the call
+/// ADDS or REMOVES the key. [`refusal`] appends the request id, once.
+pub const SYSTEM_TAG_KEY_REFUSED: &str =
+    "Adding or removing system tags (with prefix aws:) is not supported.";
+
+/// Whether any of `tag_keys` names the AWS-reserved tag namespace, which is what
+/// [`SYSTEM_TAG_KEY_REFUSED`] refuses the call for.
+///
+/// One function, so `AddTagsToResource` and `RemoveTagsFromResource` cannot disagree
+/// about which keys belong to AWS. The prefix is read through a TOTAL operation, so a key
+/// whose fourth byte sits inside a multi-byte character — which the modelled `TagKey`
+/// admits, since it allows any Unicode letter — is simply not in that namespace rather
+/// than a refused slice.
+pub fn names_system_tag_key<'a>(tag_keys: impl IntoIterator<Item = &'a str>) -> bool {
+    tag_keys.into_iter().any(|key| {
+        key.get(..SYSTEM_TAG_KEY_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(SYSTEM_TAG_KEY_PREFIX))
+    })
+}
+
+/// The `InvalidParameterException` message for a verification asked for from a
+/// `TrustState` a trust cannot be verified from ([`VERIFIABLE_TRUST_STATES`]).
+///
+/// Directory Service words it as the state it refused from: the variable part is the
+/// state the stored trust is in. [`refusal`] appends the request id, once.
+pub fn cannot_verify_trust(trust_state: &str) -> String {
+    format!("Cannot verify trust in state: {trust_state}")
 }

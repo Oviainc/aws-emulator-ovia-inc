@@ -182,6 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let group_key = crate::state::fold(&input.group_name);
         let member_key = crate::state::fold(&input.member_name);
+        let now = ::std::time::SystemTime::now();
         // What this call IS, for the `@idempotencyToken` ledger: the same token with
         // these inputs replays, the same token with different ones conflicts.
         let fingerprint = crate::state::fingerprint(&[
@@ -196,7 +197,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .to_ascii_lowercase(),
         ]);
 
-        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         match store.claim_token(input.client_token.as_deref(), &fingerprint, now) {

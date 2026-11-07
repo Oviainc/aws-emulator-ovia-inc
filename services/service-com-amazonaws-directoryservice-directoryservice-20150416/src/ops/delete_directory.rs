@@ -186,7 +186,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The account no longer holds this directory, so the shared inventory the DATA
         // plane reads must not keep claiming it does: the objects inside a directory that
         // is gone are not reachable, and a later create/delete cycle must not resolve
-        // against a record this delete left behind.
+        // against a record this delete left behind. The record goes whole — the
+        // directory's domain name, its data-access switch and its accounts describe
+        // nothing any more.
         if let Some(inventory) = crate::state::ad_directory_inventory(&*self.engine) {
             inventory.lock().forget(&removed.directory_id);
         }

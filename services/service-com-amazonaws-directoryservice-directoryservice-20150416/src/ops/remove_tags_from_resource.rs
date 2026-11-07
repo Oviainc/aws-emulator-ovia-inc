@@ -153,6 +153,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The `aws:` prefix is AWS's own tag namespace: a key in it is a system tag, and
+        // no caller may take one away any more than it may add one. Refused before the
+        // store is reached, so no other key the same call named is removed either.
+        if crate::state::names_system_tag_key(input.tag_keys.iter().map(String::as_str)) {
+            return Err(RemoveTagsFromResourceErrorModeled::InvalidParameterException(
+                crate::state::refusal(crate::state::SYSTEM_TAG_KEY_REFUSED),
+            )
+            .into());
+        }
+
         let mut store = state.lock();
         store.advance_clock(::std::time::SystemTime::now());
 

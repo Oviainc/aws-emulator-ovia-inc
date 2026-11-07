@@ -189,13 +189,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let page_size = crate::state::page_size(input.max_results);
 
+        // What the control plane recorded about this directory: the domain its objects live
+        // in, which is the realm this search reports.
+        let access =
+            crate::state::DirectoryDataAccess::resolve(&*self.engine, &input.directory_id);
+
         // A search is a read: a `DirectoryId` nothing has written to holds no groups,
         // and reading one NEVER materialises it.
         let store = state.lock();
         let directory = store.directories.get(&input.directory_id);
         let realm = crate::state::resolved_realm(
             input.realm.as_deref(),
-            directory.map_or(crate::state::DEFAULT_REALM, |held| held.realm.as_str()),
+            directory.map_or(access.realm(), |held| held.realm.as_str()),
         );
 
         // The cursor is stamped with what decides which records are walked — here the

@@ -173,12 +173,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let key = crate::state::fold(&input.sam_account_name);
+        let now = ::std::time::SystemTime::now();
         // What this call IS, for the `@idempotencyToken` ledger: the same token with
         // these inputs replays, the same token with different ones conflicts.
         let fingerprint =
             crate::state::fingerprint(&[Self::NAME, &input.directory_id, &key]);
 
-        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         match store.claim_token(input.client_token.as_deref(), &fingerprint, now) {
@@ -211,12 +211,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         store.record_token(input.client_token, fingerprint, None, now);
+        drop(store);
+
+        // The account is gone, so the shared link the control plane resolves an account
+        // through holds nothing for it either: a password reset naming it has no account
+        // to set one on.
+        crate::state::link_deleted_account(
+            &*self.engine,
+            &input.directory_id,
+            &input.sam_account_name,
+        );
 
         // Deleting an account CHANGES the directory, and its domain controllers audit
         // every such change in their security log — so a directory whose log subscription
-        // forwards that log forwards this record too. The store's guard is released first:
-        // the emitter takes the control plane's store and then CloudWatch Logs'.
-        drop(store);
+        // forwards that log forwards this record too. The store's guard was released
+        // above: the emitter takes the control plane's store and then CloudWatch Logs'.
         crate::state::security_log::record(
             &*self.engine,
             &input.directory_id,

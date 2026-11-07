@@ -105,9 +105,12 @@
 //!   cannot read the caller's store and cannot read the principal off a credential every
 //!   in-process call shares;
 //! * [`ad_directories`], the inventory of which Active Directory directories the account
-//!   holds — written by the AWS Directory Service control plane, which creates and deletes
-//!   them, and read by the Directory Service DATA plane, whose own API creates no directory
-//!   and so cannot tell a directory of this account from one that is not.
+//!   holds and what the control plane knows about each — written by the AWS Directory
+//!   Service control plane, which creates and deletes them, names their domains, switches
+//!   their data access on and off and sets their accounts' passwords, and read by the
+//!   Directory Service DATA plane, whose own API creates no directory and so can tell
+//!   neither a directory of this account from one that is not, nor the realm its objects
+//!   live in, nor which of its accounts hold a password.
 //!
 //! # Why a shared rule
 //!

@@ -243,15 +243,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The Region the directory was created in is the one it already lives in, so
         // there is no replication to add to it. Recorded behaviour refuses this as an
         // operation that is not supported rather than as a Region the directory is
-        // already in: the primary Region is not a replication at all.
+        // already in: the primary Region is not a replication at all, and the sentence it
+        // is refused with is that error class's own fixed text.
         if directory.primary_region == input.region_name {
             return Err(AddRegionErrorModeled::UnsupportedOperationException(
-                crate::state::refusal(format!(
-                    "Region {region} is the primary Region of directory {id}; specify a \
-                     different Region and try again",
-                    region = input.region_name,
-                    id = input.directory_id
-                )),
+                crate::state::refusal(crate::state::REGION_IS_THE_PRIMARY_REGION),
             )
             .into());
         }

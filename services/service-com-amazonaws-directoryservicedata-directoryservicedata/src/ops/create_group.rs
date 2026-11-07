@@ -187,6 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let key = crate::state::fold(&input.sam_account_name);
+        // What the control plane recorded about this directory: the domain its objects
+        // live in, which is the realm this group is created under.
+        let access =
+            crate::state::DirectoryDataAccess::resolve(&*self.engine, &input.directory_id);
         let group_type = input
             .group_type
             .unwrap_or_else(|| crate::state::DEFAULT_GROUP_TYPE.to_string());
@@ -230,7 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A create is a write, so it is what materialises the directory record: the
         // `ds` control plane that creates a directory is not part of this API.
-        let directory = store.directory_for_write(&input.directory_id);
+        let directory = store.directory_for_write(&input.directory_id, access.realm());
         if directory.holds_object(&key) {
             return Err(CreateGroupErrorModeled::ConflictException(
                 crate::state::group_already_exists(&input.directory_id),

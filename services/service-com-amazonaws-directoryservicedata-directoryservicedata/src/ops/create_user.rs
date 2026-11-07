@@ -188,6 +188,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let key = crate::state::fold(&input.sam_account_name);
+        // What the control plane recorded about this directory: the domain its objects
+        // live in, which is the realm this account is created under.
+        let access =
+            crate::state::DirectoryDataAccess::resolve(&*self.engine, &input.directory_id);
         // What this call IS, for the `@idempotencyToken` ledger: the same token with
         // these inputs replays, the same token with different ones conflicts.
         let fingerprint = crate::state::fingerprint(&[
@@ -224,8 +228,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A create is a write, so it is what materialises the directory record: the
-        // `ds` control plane that creates a directory is not part of this API.
-        let directory = store.directory_for_write(&input.directory_id);
+        // `ds` control plane that creates a directory is not part of this API, and the
+        // domain that plane created it in is what the record's realm is.
+        let directory = store.directory_for_write(&input.directory_id, access.realm());
         if directory.holds_object(&key) {
             return Err(CreateUserErrorModeled::ConflictException(
                 crate::state::user_already_exists(&input.directory_id),
@@ -242,10 +247,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             email_address: input.email_address,
             given_name: input.given_name,
             surname: input.surname,
-            // A created account is active: `DisableUser` is what "deactivates an
-            // active user account", and this request carries nothing asking for an
-            // inactive one.
-            enabled: true,
             other_attributes: crate::state::stored_attributes(input.other_attributes),
             created_at: now,
         };
@@ -256,12 +257,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         directory.join_primary_group(&input.sam_account_name);
 
         store.record_token(input.client_token, fingerprint, Some(sid.clone()), now);
+        drop(store);
+
+        // This request carries no password — `CreateUser` models none — so the account
+        // has no credential and Active Directory leaves it INACTIVE until one is set.
+        // The password is the control plane's to set (`ResetUserPassword`), so the
+        // account is recorded in the shared link that plane resolves an account through,
+        // which is what then reports it active.
+        crate::state::link_created_account(
+            &*self.engine,
+            &input.directory_id,
+            &input.sam_account_name,
+        );
 
         // Creating an account CHANGES the directory, and its domain controllers audit
         // every such change in their security log — so a directory whose log subscription
-        // forwards that log forwards this record too. The store's guard is released first:
-        // the emitter takes the control plane's store and then CloudWatch Logs'.
-        drop(store);
+        // forwards that log forwards this record too. The store's guard was released
+        // above: the emitter takes the control plane's store and then CloudWatch Logs'.
         crate::state::security_log::record(
             &*self.engine,
             &input.directory_id,

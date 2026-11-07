@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcceptSharedDirectory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AcceptSharedDirectory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AcceptSharedDirectory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Accepts a directory sharing request the owner account sent: the share the consumer
+//! account was offered leaves `PendingAcceptance` for the `Sharing` the clock settles on
+//! `Shared`, and the accepted share is reported back (and by
+//! `DescribeSharedDirectories`) from the stored record. Implemented here — this is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +142,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AcceptSharedDirectory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AcceptSharedDirectoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AcceptSharedDirectory"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        // `SharedDirectoryId` is "the identifier of the shared directory in the directory
+        // consumer account", which `ShareDirectory` minted for the sharing request: an id
+        // no sharing request created names no shared directory, which is the modelled
+        // "specified entity could not be found", worded the way this service words a
+        // directory id that resolves to nothing.
+        let Some(share) = store.shared_directories.get_mut(&input.shared_directory_id) else {
+            return Err(
+                AcceptSharedDirectoryErrorModeled::EntityDoesNotExistException(
+                    crate::state::refusal(crate::state::no_such_directory(
+                        &input.shared_directory_id,
+                    )),
+                )
+                .into(),
+            );
+        };
+
+        // Only a share WAITING for the consumer account's answer can be accepted: one
+        // already in service, or on its way there, has been accepted — the modelled "has
+        // already been shared with this Amazon Web Services account" — and any other
+        // status is one this answer does not apply to. Each refusal states its own error
+        // class's sentence, which carries no variable part.
+        if share.share_status != crate::state::SHARE_STATUS_PENDING_ACCEPTANCE {
+            let already_shared = share.share_status == crate::state::SHARE_STATUS_SHARING
+                || share.share_status == crate::state::SHARE_STATUS_SHARED;
+            return Err(if already_shared {
+                AcceptSharedDirectoryErrorModeled::DirectoryAlreadySharedException(
+                    crate::state::refusal(crate::state::DIRECTORY_ALREADY_SHARED),
+                )
+            } else {
+                AcceptSharedDirectoryErrorModeled::InvalidParameterException(
+                    crate::state::refusal(crate::state::INVALID_PARAMETER),
+                )
+            }
+            .into());
+        }
+
+        // The acceptance answers while the consumer account's shared directory is still
+        // being put in service — the modelled `ShareStatus` enum carries the transient
+        // `Sharing` beside the settled `Shared` — so the transient status is recorded here
+        // and the move to `Shared` is owed by the clock, exactly as it is for an
+        // organization share, which needs no acceptance at all.
+        share.share_status = crate::state::SHARE_STATUS_SHARING.to_string();
+        share.share_status_due_at = Some(now + crate::state::TRANSITION_SPAN);
+        share.last_updated = now;
+
+        // The answer is the stored record, so it cannot report a share the store does not
+        // hold: "the shared directory in the directory consumer account".
+        Ok(AcceptSharedDirectoryOutput {
+            shared_directory: Some(share.to_shared_directory()),
+        })
     }
 }

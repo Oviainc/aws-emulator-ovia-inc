@@ -25,8 +25,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::certificates::{
-    certificate_pem, describe, directory_in_service, register, CERTIFICATE_GUARD,
-    STATE_REGISTERED, STATE_REGISTERING, TYPE_CLIENT_CERT_AUTH, TYPE_CLIENT_LDAPS,
+    certificate_pem, connector_in_service, describe, directory_in_service, register,
+    CERTIFICATE_GUARD, STATE_REGISTERED, STATE_REGISTERING, TYPE_CLIENT_CERT_AUTH,
+    TYPE_CLIENT_LDAPS,
 };
 use crate::directory_lifecycle::{
     call, create_directory, minimal_create, ok, refused, service, string, PAST_ONE_SPAN,
@@ -138,8 +139,11 @@ struct ListedCase {
 #[tokio::test]
 async fn the_listing_reports_the_registrations_of_the_directory_it_names() {
     let router = service();
-    let directory_id = directory_in_service(&router, "ldaps.example.com", "listing").await;
-    let other_id = directory_in_service(&router, "other.example.net", "listing").await;
+    // The rows span both modelled `CertificateType` values, and client authentication is
+    // offered for AD Connector alone, so the directories these registrations are made
+    // with are of that type.
+    let directory_id = connector_in_service(&router, "ldaps.example.com", "listing").await;
+    let other_id = connector_in_service(&router, "other.example.net", "listing").await;
 
     // A directory nothing was registered with lists NOTHING: an empty page, not a
     // refusal, and no token.

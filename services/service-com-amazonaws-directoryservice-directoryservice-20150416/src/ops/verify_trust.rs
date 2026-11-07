@@ -157,16 +157,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A relationship whose delete is already under way is not one a verification can
-        // be started on: the modelled `TrustState` it is in is a teardown, not a trust the
-        // caller can act on.
-        if trust.trust_state == crate::state::TRUST_STATE_DELETING {
+        // A relationship can only be verified from a state in which it EXISTS and nothing
+        // has failed or torn it down: a trust whose establishment failed has nothing to
+        // verify, and one whose delete is already under way is a teardown rather than a
+        // trust the caller can act on. Directory Service refuses both by naming the state
+        // it refused from.
+        if !crate::state::VERIFIABLE_TRUST_STATES.contains(&trust.trust_state.as_str()) {
             return Err(VerifyTrustErrorModeled::InvalidParameterException(
-                crate::state::refusal(format!(
-                    "TrustId {id} is in state {state} and cannot be verified",
-                    id = trust.trust_id,
-                    state = trust.trust_state
-                )),
+                crate::state::refusal(crate::state::cannot_verify_trust(&trust.trust_state)),
             )
             .into());
         }
@@ -177,6 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // settled one to the clock, which is why a caller reading straight afterwards still
         // sees the verification under way.
         trust.trust_state = crate::state::TRUST_STATE_VERIFYING.to_string();
+        // The state the verification moves the trust into is one it asked for, so
+        // whatever explained the state before no longer describes it.
+        trust.trust_state_reason = None;
         trust.trust_state_due_at = Some(now + crate::state::TRANSITION_SPAN);
         trust.state_last_updated = now;
         trust.last_updated = now;

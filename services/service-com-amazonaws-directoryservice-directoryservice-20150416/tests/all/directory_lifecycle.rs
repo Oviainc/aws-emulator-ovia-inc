@@ -360,8 +360,8 @@ async fn a_created_directory_is_reported_from_persisted_state() {
         }
         // Every description names the directory it was read back by, and derives its
         // alias and access URL from it: "If no alias exists, the alias is the directory
-        // identifier" and "The access URL for the directory, such as
-        // http://<alias>.awsapps.com".
+        // identifier", and the access URL is the HOST that alias names in the
+        // `awsapps.com` domain — a bare host, with no scheme for a client to trip over.
         assert_eq!(
             described["DirectoryId"],
             json!(id),
@@ -376,7 +376,7 @@ async fn a_created_directory_is_reported_from_persisted_state() {
         );
         assert_eq!(
             described["AccessUrl"],
-            json!(format!("http://{id}.awsapps.com")),
+            json!(format!("{id}.awsapps.com")),
             "case {:?}: expected the access URL derived from the alias, got {described}",
             case.name
         );
@@ -504,7 +504,7 @@ async fn an_alias_drives_the_access_url_and_is_assigned_once() {
         );
         assert_eq!(
             described["AccessUrl"],
-            json!(format!("http://{alias}.awsapps.com")),
+            json!(format!("{alias}.awsapps.com")),
             "case {case:?}: expected the access URL derived from the stored alias, got {described}"
         );
 
@@ -1136,7 +1136,7 @@ async fn a_deleted_directory_is_gone_and_its_alias_stays_reserved() {
     let renamed = describe_one(&router, &survivor, case).await;
     assert_eq!(
         renamed["AccessUrl"],
-        json!("http://fresh-alias.awsapps.com"),
+        json!("fresh-alias.awsapps.com"),
         "case {case:?}: expected the assigned alias to drive the access URL, got {renamed}"
     );
 }

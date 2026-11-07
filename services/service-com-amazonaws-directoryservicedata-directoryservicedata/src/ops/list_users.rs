@@ -176,13 +176,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let page_size = crate::state::page_size(input.max_results);
 
+        // What the control plane recorded about this directory: the domain its objects live
+        // in, and which of its accounts have been given a password.
+        let access =
+            crate::state::DirectoryDataAccess::resolve(&*self.engine, &input.directory_id);
+
         // A read NEVER materialises a directory: a `DirectoryId` nothing has written
         // to holds no users.
         let store = state.lock();
         let directory = store.directories.get(&input.directory_id);
         let realm = crate::state::resolved_realm(
             input.realm.as_deref(),
-            directory.map_or(crate::state::DEFAULT_REALM, |held| held.realm.as_str()),
+            directory.map_or(access.realm(), |held| held.realm.as_str()),
         );
 
         // The cursor is stamped with what decides which records are walked, so a token
@@ -213,7 +218,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(held) => crate::state::page_of(&held.users, page_size, after.as_deref()),
             None => crate::state::Page::empty(),
         };
-        let users = page.records.iter().map(|user| user.to_summary()).collect();
+        let users = page
+            .records
+            .iter()
+            .map(|user| user.to_summary(access.is_enabled(&user.sam_account_name)))
+            .collect();
         let next_token = page
             .resume_after
             .map(|key| crate::state::encode_cursor(crate::state::USERS_PAGE, &scope, &key));

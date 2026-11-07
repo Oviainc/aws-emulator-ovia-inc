@@ -237,25 +237,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let user = directory
+        // Whether the account is one THIS store holds. The accounts of the directory's
+        // domain are not all this service's own: the Directory Service Data plane creates
+        // user objects in the same domain, and a password reset is how such an account
+        // gets the password Active Directory leaves it without.
+        let account_name = match directory
             .users
             .get_mut(&crate::state::Directory::user_key(&input.user_name))
-            .ok_or_else(|| {
-                ResetUserPasswordErrorModeled::UserDoesNotExistException(crate::state::refusal(
-                    crate::state::no_such_user(&input.user_name),
-                ))
-            })?;
-
-        // What the reset changes about the account: its password was last set now. The
-        // password itself is dropped with the request.
-        user.password_last_set = now;
-        let account_name = user.user_name.clone();
+        {
+            // What the reset changes about the account: its password was last set now.
+            // The password itself is dropped with the request.
+            Some(user) => {
+                user.password_last_set = now;
+                let account_name = user.user_name.clone();
+                drop(store);
+                account_name
+            }
+            // An account this store does not hold is resolved in the shared inventory the
+            // data plane records its accounts in, and the reset is refused only when
+            // neither holds it. This store's guard is released FIRST, so no request ever
+            // holds two stores at once.
+            None => {
+                drop(store);
+                let reset = crate::state::ad_directory_inventory(&*self.engine).is_some_and(
+                    |inventory| {
+                        inventory
+                            .lock()
+                            .record_password_set(&input.directory_id, &input.user_name)
+                    },
+                );
+                if !reset {
+                    return Err(ResetUserPasswordErrorModeled::UserDoesNotExistException(
+                        crate::state::refusal(crate::state::no_such_user(&input.user_name)),
+                    )
+                    .into());
+                }
+                input.user_name.clone()
+            }
+        };
 
         // Resetting an account's password CHANGES the directory, and a domain controller
         // audits every such change in its security log — so a directory whose log
-        // subscription forwards that log forwards this record too. The store's guard is
-        // released first: the delivery holds the destination's store alone.
-        drop(store);
+        // subscription forwards that log forwards this record too, whichever plane holds
+        // the account. The store's guard is released first: the delivery holds the
+        // destination's store alone.
         crate::state::security_log::record(
             &*self.engine,
             &input.directory_id,

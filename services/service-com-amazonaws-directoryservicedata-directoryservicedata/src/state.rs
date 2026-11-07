@@ -43,12 +43,15 @@ use crate::ops::types::{
     AttributeValue, ConflictException, Member, ResourceNotFoundException, ValidationException,
 };
 
-/// The Kerberos realm (AD domain name) the emulator's directories are created in.
+/// The Kerberos realm (AD domain name) this plane reports a directory in when the
+/// control plane says nothing about its domain.
 ///
 /// A directory's domain name is chosen when the `ds` control plane creates the
-/// directory; this data-plane API has no operation that carries one, so the emulator
-/// states it once here. Every realm-valued member answers from this, and it satisfies
-/// `Realm`'s `^([a-zA-Z0-9]+[\\.-])+([a-zA-Z0-9])+[.]?$`.
+/// directory, and this data-plane API has no operation that carries one, so it is read
+/// from the shared link that plane writes ([`DirectoryDataAccess::realm`]). This is what
+/// stands in for a `DirectoryId` that plane holds no record of — a directory nothing
+/// created in this process — and it satisfies `Realm`'s
+/// `^([a-zA-Z0-9]+[\\.-])+([a-zA-Z0-9])+[.]?$`.
 pub const DEFAULT_REALM: &str = "corp.example.com";
 
 /// The `GroupType` a group gets when `CreateGroup` names none.
@@ -182,8 +185,6 @@ pub struct User {
     pub email_address: Option<String>,
     pub given_name: Option<String>,
     pub surname: Option<String>,
-    /// Whether the account is active. `DisableUser` is what clears it.
-    pub enabled: bool,
     /// The `OtherAttributes` the create stored, keyed by the attribute's
     /// `LdapDisplayName` as given — AD attribute names are case insensitive, so a
     /// projection matches them case insensitively.
@@ -227,13 +228,15 @@ impl User {
         })
     }
 
-    /// The `User` object `SearchUsers` serves for a user the search matched.
+    /// The `User` object `SearchUsers` serves for a user the search matched, reported as
+    /// active or not by `enabled` — see [`crate::state::DirectoryDataAccess::is_enabled`],
+    /// which is where an account's activity is decided.
     ///
     /// A search answers with the record a listing reports for that user — the
     /// [`Self::to_summary`] members — widened by the attributes the search NAMED: the
     /// projection is the directory's, not the client's, so an attribute nobody asked
     /// about is carried by no member of the answer.
-    pub fn to_searched_user(&self, names: &[String]) -> crate::ops::types::User {
+    pub fn to_searched_user(&self, names: &[String], enabled: bool) -> crate::ops::types::User {
         crate::ops::types::User {
             // What every search result carries, named or not: the same projection
             // `ListUsers` serves.
@@ -241,7 +244,7 @@ impl User {
             sam_account_name: self.sam_account_name.clone(),
             given_name: self.given_name.clone(),
             surname: self.surname.clone(),
-            enabled: Some(self.enabled),
+            enabled: Some(enabled),
             // What widens it: the attributes this search asked about.
             distinguished_name: names_include(names, DISTINGUISHED_NAME_ATTRIBUTES)
                 .then(|| self.distinguished_name.clone()),
@@ -254,14 +257,15 @@ impl User {
         }
     }
 
-    /// The `UserSummary` projection `ListUsers` serves.
-    pub fn to_summary(&self) -> crate::ops::types::UserSummary {
+    /// The `UserSummary` projection `ListUsers` serves, reported as active or not by
+    /// `enabled` — see [`DirectoryDataAccess::is_enabled`].
+    pub fn to_summary(&self, enabled: bool) -> crate::ops::types::UserSummary {
         crate::ops::types::UserSummary {
             sid: self.sid.clone(),
             sam_account_name: self.sam_account_name.clone(),
             given_name: self.given_name.clone(),
             surname: self.surname.clone(),
-            enabled: self.enabled,
+            enabled,
         }
     }
 
@@ -438,8 +442,9 @@ pub struct Membership {
 /// One directory's objects, as this emulator persists them.
 #[derive(Debug)]
 pub struct Directory {
-    /// The AD domain name of this directory. Every realm-valued member answers from
-    /// it, and a request naming another realm is asking about a domain this
+    /// The AD domain name of this directory, as the control plane that created the
+    /// directory named it ([`DirectoryDataAccess::realm`]). Every realm-valued member
+    /// answers from it, and a request naming another realm is asking about a domain this
     /// directory holds no objects for.
     pub realm: String,
     /// `S-1-5-21-<three sub-authorities>`: the SID of this directory's domain, which
@@ -457,12 +462,12 @@ pub struct Directory {
 }
 
 impl Directory {
-    /// A directory with no objects yet, whose SID authority is derived from
-    /// `directory_id` so it is stable for that directory and distinct across
+    /// A directory with no objects yet, in the domain `realm`, whose SID authority is
+    /// derived from `directory_id` so it is stable for that directory and distinct across
     /// directories.
-    fn new(directory_id: &str) -> Self {
+    fn new(directory_id: &str, realm: &str) -> Self {
         let mut directory = Self {
-            realm: DEFAULT_REALM.to_string(),
+            realm: realm.to_string(),
             domain_sid: domain_sid(directory_id),
             next_rid: FIRST_RID,
             users: BTreeMap::new(),
@@ -673,17 +678,17 @@ pub struct ComAmazonawsDirectoryservicedataDirectoryservicedataState {
 }
 
 impl ComAmazonawsDirectoryservicedataDirectoryservicedataState {
-    /// The directory `directory_id` names, creating the record if this is the first
-    /// write to it. Only a MUTATING operation may call this: a read uses
-    /// [`Self::directories`] directly, so reporting never materialises a directory.
+    /// The directory `directory_id` names, creating the record — in the domain `realm` —
+    /// if this is the first write to it. Only a MUTATING operation may call this: a read
+    /// uses [`Self::directories`] directly, so reporting never materialises a directory.
     ///
     /// One call materialises at most one directory, and a new record holds a fixed
     /// set of objects — the domain's built-in groups, a catalogue fixed at compile
     /// time — so nothing in a request decides how much a materialisation allocates.
-    pub fn directory_for_write(&mut self, directory_id: &str) -> &mut Directory {
+    pub fn directory_for_write(&mut self, directory_id: &str, realm: &str) -> &mut Directory {
         self.directories
             .entry(directory_id.to_string())
-            .or_insert_with(|| Directory::new(directory_id))
+            .or_insert_with(|| Directory::new(directory_id, realm))
     }
 
     /// What `token` says about a call whose inputs fingerprint to `fingerprint`.
@@ -1019,9 +1024,13 @@ fn object_already_exists(object_class: &str, directory_id: &str) -> ConflictExce
 
 /// The `ValidationException` payload for a `NextToken` this service did not issue for
 /// the listing it was spent on.
+///
+/// The message is the sentence Directory Service Data states for an invalid parameter —
+/// the member it refused, named — and the `Reason` is the modelled
+/// [`INVALID_NEXT_TOKEN`] value.
 pub fn invalid_next_token() -> ValidationException {
     ValidationException {
-        message: Some("NextToken is not a token this operation issued".to_string()),
+        message: Some("Invalid parameter: NextToken.".to_string()),
         reason: Some(INVALID_NEXT_TOKEN.to_string()),
     }
 }
@@ -1038,22 +1047,28 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 }
 
 /// The SHARED AD directory inventory in the shared engine: which directories the account
-/// holds, as the control plane that creates and deletes them recorded it, and whether that
-/// plane has each directory's DS Data feature on. Call it with a handler's `&*self.engine`.
+/// holds, as the control plane that creates and deletes them recorded it, whether that
+/// plane has each directory's DS Data feature on, the domain each was created with, and
+/// which of its accounts have been given a password. Call it with a handler's
+/// `&*self.engine`.
 ///
 /// This API creates no directory — `CreateDirectory` / `CreateMicrosoftAD` /
 /// `DeleteDirectory` belong to the Directory Service control plane, as do
-/// `EnableDirectoryDataAccess` / `DisableDirectoryDataAccess` — so whether a `DirectoryId`
-/// names a directory of this account, and whether this whole API is in service for it, is
-/// knowable here only from that plane's own record. It is ONE record under one shared type
+/// `EnableDirectoryDataAccess` / `DisableDirectoryDataAccess` and `ResetUserPassword` — so
+/// whether a `DirectoryId` names a directory of this account, whether this whole API is in
+/// service for it, the realm its objects live in and whether one of its accounts holds a
+/// password are knowable here only from that plane's own record. It is ONE record under one
+/// shared type
+/// ([`::service_common::ad_directories::AdDirectoryInventory`]) rather than a copy inside
 /// ([`::service_common::ad_directories::AdDirectoryInventory`]) rather than a copy inside
 /// [`ComAmazonawsDirectoryservicedataDirectoryservicedataState`]: the engine keys state by
 /// TYPE, so a copy of its own here would be invisible to the plane that writes it.
 ///
 /// LOCK ORDER: this inventory is taken and RELEASED before [`service_state`] is locked (the
-/// authorization gate in `crate::service::authorization` is its only reader here), so a
-/// request never holds both at once and the writer's order — its own store first, this one
-/// second — cannot invert against it.
+/// authorization gate in `crate::service::authorization` and
+/// [`DirectoryDataAccess::resolve`] are its readers here), so a request never holds both at
+/// once and the writer's order — its own store first, this one second — cannot invert
+/// against it.
 pub fn ad_directory_inventory<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<::service_common::ad_directories::AdDirectoryInventory>> {
@@ -1064,6 +1079,110 @@ pub fn ad_directory_inventory<Eng: Send + Sync + 'static>(
                 ::service_common::ad_directories::AdDirectoryInventory,
             >,
         )
+}
+
+/// Record an account this plane just created in the shared [`ad_directory_inventory`], so
+/// the control plane's `ResetUserPassword` can resolve it and give it a password.
+///
+/// A no-op for a directory the control plane holds no record of: the inventory holds the
+/// accounts of the directories that plane created, and this one creates no directory
+/// record of its own.
+pub fn link_created_account<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    directory_id: &str,
+    sam_account_name: &str,
+) {
+    if let Some(inventory) = ad_directory_inventory(engine) {
+        inventory
+            .lock()
+            .record_account(directory_id, sam_account_name);
+    }
+}
+
+/// Record that an account this plane deleted is gone, so the shared
+/// [`ad_directory_inventory`] holds nothing for a name the directory no longer has an
+/// object under.
+pub fn link_deleted_account<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    directory_id: &str,
+    sam_account_name: &str,
+) {
+    if let Some(inventory) = ad_directory_inventory(engine) {
+        inventory
+            .lock()
+            .forget_account(directory_id, sam_account_name);
+    }
+}
+
+/// What the control plane says about the directory a call names: the realm its objects are
+/// reported in, and which of its accounts have a password.
+///
+/// WHETHER this plane may answer for the directory at all is not here: that is the
+/// authorization gate's question (`crate::service::authorization`), which reads the same
+/// inventory ahead of every handler and refuses a directory the account does not hold or
+/// whose DS Data feature the control plane has off. By the time a handler resolves this,
+/// the directory is one this API serves.
+///
+/// Resolved ONCE per call, before this service's own store is reached, so a handler holds
+/// the shared inventory no longer than it takes to copy these out of it.
+#[derive(Debug)]
+pub struct DirectoryDataAccess {
+    /// The domain name the directory was created with, or [`DEFAULT_REALM`] for a
+    /// directory the control plane recorded none for.
+    realm: String,
+    /// The directory's accounts whose password the control plane has set, by folded name.
+    accounts_with_password: BTreeSet<String>,
+}
+
+impl Default for DirectoryDataAccess {
+    /// What this plane answers from when the control plane says nothing about the
+    /// directory: its own records, in its own default realm, and no account holding a
+    /// password.
+    fn default() -> Self {
+        Self {
+            realm: DEFAULT_REALM.to_string(),
+            accounts_with_password: BTreeSet::new(),
+        }
+    }
+}
+
+impl DirectoryDataAccess {
+    /// What the control plane recorded about `directory_id`: the domain it created the
+    /// directory in and the accounts of it whose password it has set.
+    ///
+    /// The defaults stand for a directory that plane recorded nothing of the kind for —
+    /// this plane's own fallback realm, and no account holding a password — so a handler
+    /// always has an answer to report from.
+    pub fn resolve<Eng: Send + Sync + 'static>(engine: &Eng, directory_id: &str) -> Self {
+        let Some(inventory) = ad_directory_inventory(engine) else {
+            return Self::default();
+        };
+        let inventory = inventory.lock();
+        Self {
+            realm: inventory
+                .domain_name(directory_id)
+                .unwrap_or(DEFAULT_REALM)
+                .to_string(),
+            accounts_with_password: inventory.accounts_with_password(directory_id),
+        }
+    }
+
+    /// The realm this directory's objects are reported in: the domain name the control
+    /// plane created it with.
+    pub fn realm(&self) -> &str {
+        &self.realm
+    }
+
+    /// Whether the account `sam_account_name` names is ACTIVE.
+    ///
+    /// `CreateUser` carries no password member, so an account created through this API
+    /// has none — and Active Directory leaves an account without a password inactive. A
+    /// `ResetUserPassword` on the control plane is what gives it one, which is what makes
+    /// the account active.
+    pub fn is_enabled(&self, sam_account_name: &str) -> bool {
+        self.accounts_with_password
+            .contains(&sam_account_name.to_lowercase())
+    }
 }
 
 /// The DOMAIN CONTROLLER SECURITY LOG a write to a directory's objects is audited in, and
