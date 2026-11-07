@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateKeysAndCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateKeysAndCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateKeysAndCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Issues a REAL 2048-bit RSA key pair and an X.509 certificate over its public key
+//! ([`crate::state::mint_keys_and_certificate`]), records the certificate under its
+//! `certificateId` in this service's certificate store
+//! ([`crate::state::ComAmazonawsIotAwsiotserviceState::certificates`]), and hands the
+//! caller the certificate, its ARN and id, and the key pair. `DescribeCertificate`
+//! reads that record back.
+//!
+//! The private half of the key pair is returned and recorded NOWHERE: "This is the only
+//! time IoT issues the private key for this certificate, so it is important to keep it
+//! in a secure location".
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +155,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateKeysAndCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateKeysAndCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateKeysAndCertificate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateKeysAndCertificateErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // The emulator holds every certificate in memory, so it stops issuing them at
+        // its own ceiling instead of growing without bound on request. The ceiling is
+        // read BEFORE the key pair is generated, so a request past it costs no CPU
+        // either; AWS IoT models no limit error on this operation, so the refusal is
+        // reported with the error the model has for a request it cannot complete.
+        if state.lock().certificates.len() >= crate::state::MAX_CERTIFICATES {
+            return Err(CreateKeysAndCertificateErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some(format!(
+                        "this emulator stores at most {} certificates",
+                        crate::state::MAX_CERTIFICATES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Generating the key pair and signing the certificate is hundreds of
+        // milliseconds of CPU, so it runs on the blocking pool with the state lock
+        // RELEASED: `spawn_blocking(..).await` is a real await point, so one key pair
+        // cannot starve the worker that serves health checks and every other request,
+        // and no other request waits on the store while it runs.
+        let set_as_active = input.set_as_active;
+        let minted = ::tokio::task::spawn_blocking(move || {
+            crate::state::mint_keys_and_certificate(
+                &region,
+                ::engine::emulator_account_id(),
+                set_as_active,
+                ::std::time::SystemTime::now(),
+            )
+        })
+        .await;
+        let minted = match minted {
+            Ok(Some(minted)) => minted,
+            Ok(None) => {
+                return Err(CreateKeysAndCertificateErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some(
+                            "the key pair and certificate could not be issued".to_string(),
+                        ),
+                    },
+                )
+                .into())
+            }
+            // A panic or a cancellation on the pool says nothing about the request, so
+            // it is reported as the server fault it is rather than as a certificate
+            // nothing issued.
+            Err(error) => {
+                ::tracing::error!(
+                    operation = Self::NAME,
+                    error = %error,
+                    "the key pair and certificate did not complete"
+                );
+                return Err(CreateKeysAndCertificateErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some(
+                            "the key pair and certificate could not be issued".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // The response is built from the record that is about to be persisted, so what
+        // this call reports and what the next `DescribeCertificate` reads are one value,
+        // not two that could drift. The key pair is the one member that is NOT
+        // persisted: this call is the only place it exists.
+        let output = CreateKeysAndCertificateOutput {
+            certificate_arn: Some(minted.certificate.certificate_arn.clone()),
+            certificate_id: Some(minted.certificate.certificate_id.clone()),
+            certificate_pem: Some(minted.certificate.certificate_pem.clone()),
+            key_pair: Some(minted.key_pair),
+        };
+
+        let mut store = state.lock();
+        // Re-read under the write lock: another request may have filled the store while
+        // this one was generating its key pair.
+        if store.certificates.len() >= crate::state::MAX_CERTIFICATES {
+            return Err(CreateKeysAndCertificateErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some(format!(
+                        "this emulator stores at most {} certificates",
+                        crate::state::MAX_CERTIFICATES
+                    )),
+                },
+            )
+            .into());
+        }
+        store
+            .certificates
+            .insert(minted.certificate.certificate_id.clone(), minted.certificate);
+        Ok(output)
     }
 }

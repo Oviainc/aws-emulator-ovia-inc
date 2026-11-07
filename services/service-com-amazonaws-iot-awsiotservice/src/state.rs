@@ -821,6 +821,22 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// [`thing_registration::MAX_THING_REGISTRATION_TASKS`] is the ceiling
     /// `StartThingRegistrationTask` refuses past.
     pub thing_registration_tasks: BTreeMap<String, ThingRegistrationTask>,
+    /// Every X.509 device certificate that exists, keyed by `certificateId`.
+    ///
+    /// The id is the certificate's identity — the model binds it as the `@httpLabel` of
+    /// `/certificates/{certificateId}` on every single-certificate operation — so a
+    /// `BTreeMap` keyed by id is the certificate store itself. `BTreeMap` (not
+    /// `HashMap`) because `ListCertificates` is `@paginated` and a page boundary is only
+    /// meaningful over a stable order.
+    ///
+    /// A record holds the certificate and never the private key: "This is the only time
+    /// IoT issues the private key for this certificate"
+    /// (`CreateKeysAndCertificate`), so the private half is handed to the caller of the
+    /// create and kept nowhere.
+    ///
+    /// A caller grows this store, so it is bounded: [`MAX_CERTIFICATES`] is the ceiling
+    /// `CreateKeysAndCertificate` refuses past.
+    pub certificates: BTreeMap<String, RegisteredCertificate>,
 }
 
 impl ComAmazonawsIotAwsiotserviceState {
@@ -2641,6 +2657,18 @@ pub use thing_registration::ThingRegistrationTask;
 // `crate::state::<name>`.
 pub mod thing_update;
 pub use thing_update::{AttributeUpdate, ThingUpdate, ThingUpdateRefusal};
+
+// What an X.509 DEVICE CERTIFICATE is — the record one holds, and the real RSA key pair
+// and certificate `CreateKeysAndCertificate` issues — lives in `state/certificates.rs`,
+// beside the store accessor for the same reason the rules engine does. Its names are
+// re-exported here so a handler reaches them as `crate::state::<name>`.
+pub mod certificates;
+pub use certificates::{
+    certificate_arn, certificate_id, mint_keys_and_certificate, missing_certificate_message,
+    MintedKeysAndCertificate, RegisteredCertificate, CERTIFICATE_MODE_DEFAULT,
+    CERTIFICATE_STATUS_ACTIVE, CERTIFICATE_STATUS_INACTIVE, FIRST_CERTIFICATE_CUSTOMER_VERSION,
+    MAX_CERTIFICATES,
+};
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

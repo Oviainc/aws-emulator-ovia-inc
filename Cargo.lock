@@ -12342,6 +12342,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-lc-rs",
  "aws-sdk-kinesis",
  "aws-sdk-s3",
  "aws-smithy-runtime-api",
@@ -12350,6 +12351,8 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "pkcs1",
+ "pkcs8 0.10.2",
  "serde_json",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-iotdataplane-iotmoonrakerservice",
@@ -12360,6 +12363,7 @@ dependencies = [
  "sqlparser",
  "tokio",
  "tracing",
+ "x509-cert",
 ]
 
 [[package]]

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the certificate recorded under `certificateId` in this service's certificate
+//! store ([`crate::state::ComAmazonawsIotAwsiotserviceState::certificates`]) as the
+//! modelled `CertificateDescription`, which is what `CreateKeysAndCertificate`
+//! persisted. A pure read: an id the store does not hold is refused
+//! `ResourceNotFoundException` (404) rather than answered with a hollow 200.
+//!
+//! The description carries no private key, because the store holds none: the private
+//! half of a certificate's key pair is issued once, by the create.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +147,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCertificate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeCertificateErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        // A pure read: the record is cloned out as the modelled
+        // `CertificateDescription`, and an id the store holds no certificate under is
+        // the modelled `ResourceNotFoundException` ("The specified resource does not
+        // exist", HTTP 404).
+        let store = state.lock();
+        let certificate = store
+            .certificates
+            .get(&input.certificate_id)
+            .ok_or_else(|| {
+                DescribeCertificateErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_certificate_message(
+                            &input.certificate_id,
+                        )),
+                    },
+                )
+            })?;
+
+        Ok(DescribeCertificateOutput {
+            certificate_description: Some(certificate.description()),
+        })
     }
 }

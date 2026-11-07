@@ -59,6 +59,18 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
     "behavior-version-latest",
 ] }
 
+# `CreateKeysAndCertificate` issues a REAL 2048-bit RSA key pair, and the certificate
+# over it is signed with that key (`state::certificates`): the key generation and the
+# RSASSA-PKCS1-v1_5 SHA-256 signature are this library's, computed in process.
+aws-lc-rs = "1"
+# Writes the DER/PEM X.509 certificate this service issues for that key pair.
+x509-cert = "0.2"
+# Reads the PKCS#8 structure `aws-lc-rs` encodes a private key as, to take the PKCS#1
+# RSA private key out of it.
+pkcs8 = "0.10"
+# Writes that PKCS#1 RSA private key as the PEM block `KeyPair$PrivateKey` carries.
+pkcs1 = { version = "0.7", features = ["pem"] }
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
