@@ -52,7 +52,10 @@ use crate::db_instances::{
 
 /// The canonical account id every generated emulator presents, which every ARN this suite
 /// reads is scoped to.
-const ACCOUNT: &str = "000000000000";
+///
+/// `pub(crate)` so the sibling suite that drives the same managed-secret path reads the
+/// same account rather than writing a second copy of it.
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// A router carrying the RDS service plus the two services its managed-secret path calls
 /// over the in-process callback — Secrets Manager, which holds the secret, and KMS, which
@@ -81,15 +84,23 @@ pub(crate) fn emulator() -> MultiServiceRouter {
     router
 }
 
-/// A Secrets Manager client over this emulator's own in-process callback — the same seam
-/// the RDS handlers create the secret over. `pub(crate)` for the same reason as
-/// [`emulator`].
+/// A Secrets Manager client over this emulator's own in-process callback, for [`REGION`].
 pub(crate) fn secrets_manager(router: &MultiServiceRouter) -> aws_sdk_secretsmanager::Client {
+    secrets_manager_in(router, REGION)
+}
+
+/// A Secrets Manager client over this emulator's own in-process callback — the same seam
+/// the RDS handlers create the secret over — addressing `region`, where the secret of a
+/// resource in that region lives. `pub(crate)` for the same reason as [`emulator`].
+pub(crate) fn secrets_manager_in(
+    router: &MultiServiceRouter,
+    region: &str,
+) -> aws_sdk_secretsmanager::Client {
     let callback = smithy_server_runtime::EmbeddedEmulator::from_router(router.clone());
     let config = aws_sdk_secretsmanager::Config::builder()
         .behavior_version(aws_sdk_secretsmanager::config::BehaviorVersion::latest())
-        .region(aws_sdk_secretsmanager::config::Region::new(REGION))
-        .endpoint_url(format!("https://secretsmanager.{REGION}.amazonaws.com"))
+        .region(aws_sdk_secretsmanager::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://secretsmanager.{region}.amazonaws.com"))
         .credentials_provider(callback.aws_credentials_provider())
         .http_client(callback.http_client())
         .retry_config(aws_sdk_secretsmanager::config::retry::RetryConfig::disabled())
@@ -102,13 +113,20 @@ pub(crate) fn secrets_manager(router: &MultiServiceRouter) -> aws_sdk_secretsman
     aws_sdk_secretsmanager::Client::from_conf(config)
 }
 
-/// A KMS client over the same callback, for the row that names a key of its own.
-fn kms(router: &MultiServiceRouter) -> aws_sdk_kms::Client {
+/// A KMS client over the same callback, for [`REGION`].
+pub(crate) fn kms(router: &MultiServiceRouter) -> aws_sdk_kms::Client {
+    kms_in(router, REGION)
+}
+
+/// A KMS client over the same callback, addressing `region` — where the key encrypting the
+/// secret of a resource in that region lives. `pub(crate)` for the same reason as
+/// [`emulator`].
+pub(crate) fn kms_in(router: &MultiServiceRouter, region: &str) -> aws_sdk_kms::Client {
     let callback = smithy_server_runtime::EmbeddedEmulator::from_router(router.clone());
     let config = aws_sdk_kms::Config::builder()
         .behavior_version(aws_sdk_kms::config::BehaviorVersion::latest())
-        .region(aws_sdk_kms::config::Region::new(REGION))
-        .endpoint_url(format!("https://kms.{REGION}.amazonaws.com"))
+        .region(aws_sdk_kms::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://kms.{region}.amazonaws.com"))
         .credentials_provider(callback.aws_credentials_provider())
         .http_client(callback.http_client())
         .retry_config(aws_sdk_kms::config::retry::RetryConfig::disabled())
@@ -120,18 +138,29 @@ fn kms(router: &MultiServiceRouter) -> aws_sdk_kms::Client {
 }
 
 /// The credentials a managed secret holds, read back out of Secrets Manager.
-struct HeldCredentials {
-    username: Option<String>,
-    password: String,
+pub(crate) struct HeldCredentials {
+    pub(crate) username: Option<String>,
+    pub(crate) password: String,
 }
 
-/// Read the secret `arn` holds through Secrets Manager's own `GetSecretValue`.
-async fn held_credentials(
+/// Read the secret `arn` holds, for a secret in [`REGION`].
+pub(crate) async fn held_credentials(
     case: &str,
     router: &MultiServiceRouter,
     arn: &str,
 ) -> HeldCredentials {
-    let answer = secrets_manager(router)
+    held_credentials_in(case, router, REGION, arn).await
+}
+
+/// Read the secret `arn` holds in `region`, through Secrets Manager's own
+/// `GetSecretValue`.
+pub(crate) async fn held_credentials_in(
+    case: &str,
+    router: &MultiServiceRouter,
+    region: &str,
+    arn: &str,
+) -> HeldCredentials {
+    let answer = secrets_manager_in(router, region)
         .get_secret_value()
         .secret_id(arn)
         .send()
@@ -175,7 +204,7 @@ pub(crate) fn master_user_secret(case: &str, xml: &str) -> Option<String> {
 }
 
 /// The one resource subtree (`DBCluster`, `DBInstance`) of `xml`.
-fn the_resource(case: &str, xml: &str, element: &str) -> String {
+pub(crate) fn the_resource(case: &str, xml: &str, element: &str) -> String {
     let found = subtrees(xml, element);
     assert_eq!(
         found.len(),

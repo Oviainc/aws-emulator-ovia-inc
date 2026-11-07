@@ -159,6 +159,8 @@ mod integration_deletion;
 mod lifecycle_poll_loops;
 #[path = "all/maintenance_action_resource_guard.rs"]
 mod maintenance_action_resource_guard;
+#[path = "all/managed_master_secret_cluster_creation.rs"]
+mod managed_master_secret_cluster_creation;
 #[path = "all/managed_master_user_credentials.rs"]
 mod managed_master_user_credentials;
 #[path = "all/managed_master_secret_key_bound.rs"]
