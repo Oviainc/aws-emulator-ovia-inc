@@ -434,3 +434,8 @@ mod minted_identifier_widths;
 // Lambda and DynamoDB on one engine.
 #[path = "all/lambda_proxy_integration.rs"]
 mod lambda_proxy_integration;
+// Appended for the reason the note above gives: an `AWS_PROXY` integration whose `uri`
+// carries a QUALIFIER — an alias or a published version — and the code that qualifier
+// resolves to.
+#[path = "all/proxy_integration_qualified_function.rs"]
+mod proxy_integration_qualified_function;
