@@ -243,12 +243,22 @@ fn evaluate(request: &Run<'_>, capture: &Arc<Mutex<Capture>>, bounds: &Arc<Bound
             "the interpreter's native modules could not be narrowed to the allow-list".to_string(),
         );
     }
-    interpreter.enter(|vm| {
+    let completion = interpreter.enter(|vm| {
         match prepare(vm, request, capture, bounds).and_then(|()| drive(vm, &input, bounds)) {
             Ok(result) => result,
             Err(exception) => Completion::Internal(formatted_exception(vm, &exception)),
         }
-    })
+    });
+    // The interpreter is FINALIZED once the run is over, which is what releases the objects
+    // it built: an interpreter that is only dropped leaves its own reference cycles — the
+    // module table, the code objects, the exception types — uncollected, so each invocation
+    // would hold its interpreter's memory for the life of this process however short the run
+    // was. Finalizing it is also what the language itself does at the end of a program, so a
+    // handler's `atexit` callback runs the way it runs on the real runtime, and it runs
+    // against the SAME bounds the handler did (the step hook is still installed and its stop
+    // is latched), so nothing of the run outlasts the run's budget.
+    interpreter.finalize(None);
+    completion
 }
 
 /// The interpreter itself: the frozen standard library and the ALLOW-LISTED native

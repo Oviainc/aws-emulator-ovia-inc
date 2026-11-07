@@ -32,8 +32,6 @@
 //! role carrying an attachment whose document this account does not hold all show nothing
 //! about the role and let the configuration through.
 
-use ::service_common::iam_authorization::{self as iam, Decision};
-
 use super::event_source_authorization::{iam_state, IamState};
 use crate::ops::types::VpcConfig;
 
@@ -111,42 +109,19 @@ fn attaches(vpc_config: &VpcConfig) -> bool {
 /// account's network interfaces, or `None` when it may perform all of them — or when nothing
 /// of the kind can be shown.
 fn withheld_action(iam: &IamState, region: &str, role_arn: &str) -> Option<&'static str> {
-    // The role itself first: a value this account's IAM holds no role under says nothing
-    // about what that role may do.
-    iam.roles.values().find(|role| role.arn == role_arn)?;
-    // The documents in force on the role, read ONCE: the calls below are asked over the same
-    // documents, and the collection is bounded by IAM's own quotas on how many policies one
-    // role carries.
-    let policies = iam.principal_policies(role_arn)?;
-    let documents = iam::prepare_documents(&policies.documents);
-    // "A permissions boundary sets the maximum permissions that an identity-based policy can
-    // grant to an entity": the boundary CAPS what those policies grant and grants nothing
-    // itself. A role carrying none — or one whose document is not held, a ceiling this
-    // emulator cannot read — is capped by nothing.
-    let boundary = iam
-        .permissions_boundary_document(role_arn)
-        .map(|document| iam::prepare_documents(::std::slice::from_ref(&document)));
-    let resource = network_interface_resource(region);
-    NETWORK_INTERFACE_ACTIONS.into_iter().find(|name| {
-        let action = format!("{EC2_NAMESPACE}:{name}");
-        let request = iam::Request::new(&action, &resource, &[]);
-        let stated = iam::identity_decision_prepared(&documents, &request);
-        // An attachment whose document this account does not hold is a grant this emulator
-        // cannot read, so it cannot be the basis of a refusal — but it cannot overturn one
-        // either: an explicit `Deny` in a document that IS held wins over every grant.
-        let granted = stated == Decision::Allowed
-            || (stated != Decision::Denied && !policies.uncarried.is_empty());
-        // A call an identity-based policy explicitly DENIES is already withheld on that deny,
-        // so no ceiling is read for it.
-        let capped = if stated == Decision::Denied {
-            Decision::Allowed
-        } else {
-            boundary.as_ref().map_or(Decision::Allowed, |boundary| {
-                iam::identity_decision_prepared(boundary, &request)
-            })
-        };
-        !granted || capped != Decision::Allowed
-    })
+    // Each call as both the IAM action string under EC2's namespace and the name the refusal
+    // sentence calls it; the decision over them is the one this crate states
+    // ([`super::role_actions`]).
+    let asked: Vec<(String, &'static str)> = NETWORK_INTERFACE_ACTIONS
+        .into_iter()
+        .map(|name| (format!("{EC2_NAMESPACE}:{name}"), name))
+        .collect();
+    super::role_actions::withheld_action(
+        iam,
+        role_arn,
+        &network_interface_resource(region),
+        &asked,
+    )
 }
 
 #[cfg(test)]

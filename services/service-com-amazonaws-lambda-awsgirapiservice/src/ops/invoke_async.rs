@@ -423,6 +423,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // emulator through, built from the callback the framework handed THIS
                 // request — the same seam a synchronous invocation's run gets.
                 aws: crate::state::AwsAccess::new(ctx.callback().clone(), &region),
+                // Where the run's log is delivered, and what the function's execution role
+                // may do there (`crate::state::execution::log_delivery`).
+                logs: Some(crate::state::log_target(
+                    &*self.engine,
+                    &region,
+                    &resolved_config,
+                )),
             };
             record.queue_async_invocation(&version, &request_id, input.invoke_args, now);
             Some(invocation)

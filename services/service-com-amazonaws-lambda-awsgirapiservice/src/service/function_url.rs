@@ -468,6 +468,14 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
             // The AWS SDK this runtime supplies the handler reaches the rest of this
             // emulator through the callback the framework handed THIS request.
             aws: crate::state::AwsAccess::new(ctx.callback().clone(), &record.region),
+            // Where the run's log is delivered, and what the function's execution role may
+            // do there (`crate::state::execution::log_delivery`): an invocation through a
+            // function URL is an invocation of the function, so it logs like one.
+            logs: Some(crate::state::log_target(
+                &*self.engine,
+                &record.region,
+                &resolved_config,
+            )),
         };
         Ok(Prepared {
             resource: crate::state::invoked_resource(&function_name, &version),

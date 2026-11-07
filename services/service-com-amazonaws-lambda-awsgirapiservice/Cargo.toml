@@ -163,6 +163,10 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # (`@eventPayload`), which the framework's event serializer does not express: that one
 # frame is written with the event-stream encoder itself.
 aws-smithy-eventstream = "0.60"
+# A running handler's SDK call to a `restJson1` service binds its input to a URI, so a label
+# or a query parameter's value is percent-encoded on the way into one
+# (`state::execution::rest_json`).
+percent-encoding = "2.3"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -179,6 +183,13 @@ tokio = { workspace = true, features = ["time"] }
 # reports for the function. A DynamoDB table's stream is two of them: the table the item
 # is written to, and the stream surface its records are read through.
 service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
+# An invocation's own log is delivered to CloudWatch Logs, so the tests that assert a run's
+# lines read them where a client reads them: through that service's own API, mounted beside
+# lambda on ONE engine.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+# A handler's SDK call to a REST-bound service is asserted against the service that answers
+# it, so Amazon API Gateway is mounted beside lambda on ONE engine for those tests.
+service-com-amazonaws-apigateway-backplanecontrolservice = { workspace = true }
 # The same table is the sink a handler's OWN outbound call writes to in the stream-driven
 # pipeline test, mounted on that same engine so the item is read back where a client reads
 # it.

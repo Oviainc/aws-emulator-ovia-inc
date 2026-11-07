@@ -68,8 +68,15 @@ mod bootstrap;
 pub mod aws_api;
 pub use aws_api::AwsAccess;
 
+/// Binding one of those calls to HTTP for a service whose protocol is `restJson1`.
+pub mod rest_json;
+
 /// The AWS SDK modules a Python handler imports, which that seam is reached through.
 mod aws_sdk_guest;
+
+/// Delivering one invocation's log to CloudWatch Logs, which is where a client reads it.
+pub mod log_delivery;
+pub use log_delivery::{log_target, LogEvent, LogGrants, LogTarget};
 
 /// The AWS SDK modules a node handler imports, reached through that same seam.
 mod node_sdk_guest;
@@ -282,6 +289,11 @@ pub struct Invocation {
     /// How the handler reaches the rest of this emulator through the AWS SDK this runtime
     /// supplies it ([`aws_api`]), or `None` where there is no seam to dispatch a call on.
     pub aws: Option<AwsAccess>,
+    /// Where this invocation's log is delivered and what the function's execution role may
+    /// do there ([`log_delivery`]), or `None` for a run whose caller resolved no target —
+    /// in which case the run's log is still its answer's log tail and simply reaches no log
+    /// group.
+    pub logs: Option<LogTarget>,
 }
 
 /// Why an invocation ran nothing at all.
@@ -317,6 +329,9 @@ pub struct Invoked {
     pub function_error: Option<String>,
     /// The whole log of the run.
     pub log: String,
+    /// That same log as the events CloudWatch Logs holds it as, one per line
+    /// ([`log_delivery`]).
+    pub log_events: Vec<LogEvent>,
     /// How long the run took.
     pub duration: Duration,
     /// The WRITES a response-streaming handler made, in order — empty for a handler that
@@ -512,7 +527,22 @@ pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnabl
         }
     };
 
-    Ok(answered(finished, &request_id, &reported, budget, engine))
+    let invoked = answered(finished, &request_id, &reported, budget, engine, started);
+    // The log an invocation wrote is not part of its answer: Lambda delivers it to the
+    // function's own log group, which is where a client reads it ([`log_delivery`]). The
+    // delivery is made as the function's execution role and before this invocation is
+    // answered, so a client reading the group straight after the call finds the run's lines.
+    if let (Some(aws), Some(target)) = (reported.aws.as_ref(), reported.logs.as_ref()) {
+        log_delivery::deliver(
+            aws,
+            target,
+            &reported.region,
+            &log_stream_name(&reported.executed_version, &reported.request_id, started),
+            &invoked.log_events,
+        )
+        .await;
+    }
+    Ok(invoked)
 }
 
 /// Marks a run's thread as FINISHED on every exit of that thread, including an unwind out
@@ -568,6 +598,7 @@ fn answered(
     invocation: &Invocation,
     budget: Budget,
     engine: Engine,
+    started: SystemTime,
 ) -> Invoked {
     let (payload, function_error) = match &finished.completion {
         Completion::Returned(payload) => (payload.clone().into_bytes(), None),
@@ -663,7 +694,8 @@ fn answered(
     Invoked {
         payload,
         function_error,
-        log,
+        log_events: log_delivery::events(&log.lines, log.opened, started, finished.elapsed),
+        log: log.text(),
         duration: finished.elapsed,
         chunks: match &finished.completion {
             Completion::Streamed(chunks) => {
@@ -751,20 +783,51 @@ fn error_document(
 ///
 /// Every number in it is measured: the duration is the run's own, and the memory is what
 /// the run was allowed to hold (see [`python`], [`node`]).
-fn run_log(request_id: &str, version: &str, memory_size: i32, finished: &Finished) -> String {
+///
+/// It is kept as its LINES because that is what CloudWatch Logs holds it as — one event per
+/// line ([`log_delivery`]) — and the whole text an invocation answers a log tail from is
+/// those same lines.
+#[derive(Debug)]
+struct RunLog {
+    /// Every line of the log, in order and without its line break.
+    lines: Vec<String>,
+    /// How many of those lines OPEN the log: the framing Lambda writes before the handler's
+    /// own output.
+    opened: usize,
+}
+
+impl RunLog {
+    /// The whole log as text, each line closed by its break.
+    fn text(&self) -> String {
+        let mut text = String::new();
+        for line in &self.lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+        text
+    }
+}
+
+fn run_log(request_id: &str, version: &str, memory_size: i32, finished: &Finished) -> RunLog {
     let duration_ms = finished.elapsed.as_secs_f64() * 1_000.0;
     let billed_ms = duration_ms.ceil().max(1.0);
-    let mut log = format!("START RequestId: {request_id} Version: {version}\n");
-    log.push_str(&finished.log);
-    if !finished.log.is_empty() && !finished.log.ends_with('\n') {
-        log.push('\n');
+    let mut lines = vec![format!("START RequestId: {request_id} Version: {version}")];
+    let opened = lines.len();
+    if !finished.log.is_empty() {
+        let mut written: Vec<&str> = finished.log.split('\n').collect();
+        // A log that ends on a line break closes its last line rather than opening an empty
+        // one, so the piece after that break is not a line of the log.
+        if written.last().is_some_and(|last| last.is_empty()) {
+            written.pop();
+        }
+        lines.extend(written.into_iter().map(str::to_string));
     }
-    log.push_str(&format!("END RequestId: {request_id}\n"));
-    log.push_str(&format!(
+    lines.push(format!("END RequestId: {request_id}"));
+    lines.push(format!(
         "REPORT RequestId: {request_id}\tDuration: {duration_ms:.2} ms\tBilled Duration: \
-         {billed_ms:.0} ms\tMemory Size: {memory_size} MB\n"
+         {billed_ms:.0} ms\tMemory Size: {memory_size} MB"
     ));
-    log
+    RunLog { lines, opened }
 }
 
 /// The event text the handler is called with, or `None` for an invocation that carried no
@@ -826,7 +889,10 @@ fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap
         ),
         (
             "AWS_LAMBDA_LOG_GROUP_NAME",
-            format!("/aws/lambda/{}", invocation.function_name),
+            invocation.logs.as_ref().map_or_else(
+                || super::default_log_group(&invocation.function_name),
+                |target| target.log_group.clone(),
+            ),
         ),
         (
             "AWS_LAMBDA_LOG_STREAM_NAME",
@@ -1075,6 +1141,7 @@ mod tests {
                 payload: Vec::new(),
                 function_error: None,
                 log: "L".repeat(size),
+                log_events: Vec::new(),
                 duration: Duration::ZERO,
                 chunks: Vec::new(),
             };
@@ -1119,6 +1186,7 @@ mod tests {
             request_id: "11111111-2222-3333-4444-555555555555".to_string(),
             initialization_type: crate::state::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,
             aws: None,
+            logs: None,
         };
         let environment = runtime_environment(&invocation, SystemTime::UNIX_EPOCH);
         let cases: &[(&str, &str)] = &[

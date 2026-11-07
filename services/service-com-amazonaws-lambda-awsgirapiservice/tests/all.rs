@@ -199,10 +199,14 @@ mod function_versions_by_capacity_provider;
 mod functions_by_code_signing_config;
 #[path = "all/handler_aws_sdk.rs"]
 mod handler_aws_sdk;
+#[path = "all/handler_rest_api_sdk.rs"]
+mod handler_rest_api_sdk;
 #[path = "all/invocation_concurrency.rs"]
 mod invocation_concurrency;
 #[path = "all/invocation_count_series.rs"]
 mod invocation_count_series;
+#[path = "all/invocation_log_delivery.rs"]
+mod invocation_log_delivery;
 #[path = "all/invocation_refusal_diagnostics.rs"]
 mod invocation_refusal_diagnostics;
 #[path = "all/invoke_addressed_function.rs"]

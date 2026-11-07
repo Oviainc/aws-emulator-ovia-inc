@@ -175,7 +175,22 @@ class LambdaContext:
         sys.stdout.write(message)
 
 
+def _report(error_type, error_message, stack_trace):
+    """Write the error report this runtime writes for an unhandled exception.
+
+    The runtime reports an exception on the invocation's stderr as well as answering the
+    error document, so the invocation's LOG carries what went wrong: the error's type and
+    message, then the handler's own traceback. That is what a client reads out of the
+    function's log group for a failed invocation.
+    """
+    sys.stderr.write("[ERROR] %s: %s\n" % (error_type, error_message))
+    sys.stderr.write("Traceback (most recent call last):\n")
+    for frame in stack_trace:
+        sys.stderr.write(frame if frame.endswith("\n") else frame + "\n")
+
+
 def _raised(error_type, error_message, stack_trace):
+    _report(error_type, error_message, stack_trace)
     return {
         "outcome": "raised",
         "errorType": error_type,

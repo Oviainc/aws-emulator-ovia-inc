@@ -447,6 +447,13 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
             // The AWS SDK this runtime supplies the handler reaches the rest of this
             // emulator through the callback the framework handed THIS request.
             aws: crate::state::AwsAccess::new(ctx.callback().clone(), &region),
+            // Where the run's log is delivered, and what the function's execution role may
+            // do there (`crate::state::execution::log_delivery`).
+            logs: Some(crate::state::log_target(
+                &*self.engine,
+                &region,
+                &resolved_config,
+            )),
         };
         let kms_key_arn = resolved_config.kms_key_arn.clone();
             (

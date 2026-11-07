@@ -262,6 +262,11 @@ pub use event_source_authorization::unreadable_event_source;
 pub mod vpc_attachment_authorization;
 pub use vpc_attachment_authorization::unattachable_vpc_config;
 
+/// Asking that question for the SET of calls one such thing takes — which of them the role
+/// may not make — lives in [`role_actions`], so the gates that each take several calls ask it
+/// the same way over the one decision above.
+pub(crate) mod role_actions;
+
 /// Whether IAM lets the principal an INVOCATION speaks for invoke the function it names — the
 /// decision every invoking operation takes before the function is reached — lives in
 /// [`invoke_authorization`], beside the two readings above. It is re-exported here for the
@@ -314,8 +319,9 @@ pub use recursion::{
 /// module.
 pub mod execution;
 pub use execution::{
-    engine_for, environment_key_fault, layer_archives, mint_request_id, run_invocation,
-    runs_handler, AwsAccess, Engine, EnvironmentKeyFault, Invocation, Invoked, Unrunnable,
+    engine_for, environment_key_fault, layer_archives, log_target, mint_request_id,
+    run_invocation, runs_handler, AwsAccess, Engine, EnvironmentKeyFault, Invocation, Invoked,
+    LogTarget, Unrunnable,
 };
 
 /// How large a stored .zip archive is once EXPANDED — the second size Lambda reports for a

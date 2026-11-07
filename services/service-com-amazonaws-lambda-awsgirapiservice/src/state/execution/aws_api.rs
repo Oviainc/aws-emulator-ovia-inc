@@ -79,12 +79,28 @@ pub struct Api {
     pub signing_name: &'static str,
     /// The leading label of its endpoint host (`awsService.endpointPrefix`).
     pub endpoint_prefix: &'static str,
-    /// The `X-Amz-Target` prefix a client names an operation of this service under: the
-    /// service shape's own name, as the model spells it.
-    pub target_prefix: &'static str,
-    /// The AWS JSON protocol version its model declares (`awsJson1_0` -> `1.0`), which
-    /// names the media type of the request body.
-    pub json_version: &'static str,
+    /// The protocol its model declares, which is what a request to it is bound by.
+    pub protocol: Protocol,
+}
+
+/// How a request to one service is bound to HTTP, which its model's protocol trait decides.
+#[derive(Debug)]
+pub enum Protocol {
+    /// An AWS JSON protocol (`awsJson1_0`, `awsJson1_1`): the operation is named in a
+    /// header and the input document IS the request body, so one code path serves every
+    /// operation and nothing per-operation is stated anywhere.
+    AwsJson {
+        /// The `X-Amz-Target` prefix a client names an operation under: the service shape's
+        /// own name, as the model spells it.
+        target_prefix: &'static str,
+        /// The protocol version (`awsJson1_0` -> `1.0`), which names the media type of the
+        /// request body.
+        json_version: &'static str,
+    },
+    /// `restJson1`: each operation binds its input to a method, a URI, a query, headers and
+    /// a body, member by member, so the request is built from the service's own model
+    /// ([`super::rest_json`]).
+    RestJson(&'static super::rest_json::RestApi),
 }
 
 impl Api {
@@ -93,25 +109,28 @@ impl Api {
         format!("{}.{region}.amazonaws.com", self.endpoint_prefix)
     }
 
-    /// The media type this service's protocol names for a request body.
+    /// The media type this service's protocol names for a JSON request body.
     fn content_type(&self) -> String {
-        format!("application/x-amz-json-{}", self.json_version)
+        match self.protocol {
+            Protocol::AwsJson { json_version, .. } => {
+                format!("application/x-amz-json-{json_version}")
+            }
+            Protocol::RestJson(_) => "application/json".to_string(),
+        }
     }
 }
 
 /// The services a running handler may call, and how a request to each is bound to HTTP.
 ///
-/// One entry per SERVICE, never per action: every one of these binds its requests with an
-/// AWS JSON protocol, where the request body IS the operation's input document and the
-/// operation is named in a header, so every operation each of them models is reachable
-/// through the one code path below and none is restated here.
+/// One entry per SERVICE, never per action: a service's protocol is what binds its requests,
+/// and each protocol here is bound once for every operation the service models — an AWS JSON
+/// one through the target header and the input document, a `restJson1` one through that
+/// service's own model ([`super::rest_json`]) — so no operation is described here.
 ///
 /// It is a LIST rather than a rule because each entry's wire facts are that service's own
-/// model's, which this crate cannot read, and because a service whose protocol is NOT an
-/// AWS JSON one binds its input to a path, a query, headers and a payload per operation —
-/// which this seam does not describe. A token with no entry is one no call is made for, and
-/// [`AwsAccess::call`] says exactly that rather than sending a request whose shape it is
-/// guessing at.
+/// model's: which protocol it speaks, what it signs as, and where it answers. A token with no
+/// entry is one no call is made for, and [`AwsAccess::call`] says exactly that rather than
+/// sending a request whose shape it is guessing at.
 pub const APIS: &[Api] = &[
     // `services/service-com-amazonaws-sqs-amazonsqs/smithy-model/
     // com-amazonaws-sqs-amazonsqs.json`: awsJson1_0, sigv4Name `sqs`, endpointPrefix
@@ -120,8 +139,10 @@ pub const APIS: &[Api] = &[
         sdk_token: "sqs",
         signing_name: "sqs",
         endpoint_prefix: "sqs",
-        target_prefix: "AmazonSQS",
-        json_version: "1.0",
+        protocol: Protocol::AwsJson {
+            target_prefix: "AmazonSQS",
+            json_version: "1.0",
+        },
     },
     // `services/service-com-amazonaws-eventbridge-awsevents/smithy-model/
     // com-amazonaws-eventbridge-awsevents.json`: awsJson1_1, sigv4Name `events`,
@@ -130,8 +151,10 @@ pub const APIS: &[Api] = &[
         sdk_token: "events",
         signing_name: "events",
         endpoint_prefix: "events",
-        target_prefix: "AWSEvents",
-        json_version: "1.1",
+        protocol: Protocol::AwsJson {
+            target_prefix: "AWSEvents",
+            json_version: "1.1",
+        },
     },
     // The same service under the token its own SDK id gives it, which is the other name an
     // SDK client is built with (`boto3.client("eventbridge")`).
@@ -139,8 +162,10 @@ pub const APIS: &[Api] = &[
         sdk_token: "eventbridge",
         signing_name: "events",
         endpoint_prefix: "events",
-        target_prefix: "AWSEvents",
-        json_version: "1.1",
+        protocol: Protocol::AwsJson {
+            target_prefix: "AWSEvents",
+            json_version: "1.1",
+        },
     },
     // `services/service-com-amazonaws-dynamodb-dynamodb-20120810/smithy-model/
     // com-amazonaws-dynamodb-dynamodb-20120810.json`: awsJson1_0, sigv4Name `dynamodb`,
@@ -149,10 +174,63 @@ pub const APIS: &[Api] = &[
         sdk_token: "dynamodb",
         signing_name: "dynamodb",
         endpoint_prefix: "dynamodb",
-        target_prefix: "DynamoDB_20120810",
-        json_version: "1.0",
+        protocol: Protocol::AwsJson {
+            target_prefix: "DynamoDB_20120810",
+            json_version: "1.0",
+        },
+    },
+    // `services/service-com-amazonaws-cloudwatchlogs-logs-20140328/smithy-model/
+    // com-amazonaws-cloudwatchlogs-logs-20140328.json`: awsJson1_1, sigv4Name `logs`,
+    // endpointPrefix `logs`, sdkId `CloudWatch Logs`, service shape `Logs_20140328`. This is
+    // also the API the runtime itself delivers an invocation's own log over
+    // ([`super::log_delivery`]), so the host and the guest reach one service.
+    Api {
+        sdk_token: "logs",
+        signing_name: "logs",
+        endpoint_prefix: "logs",
+        protocol: Protocol::AwsJson {
+            target_prefix: "Logs_20140328",
+            json_version: "1.1",
+        },
+    },
+    // The same service under the token its own SDK id gives it, as EventBridge is above.
+    Api {
+        sdk_token: "cloudwatchlogs",
+        signing_name: "logs",
+        endpoint_prefix: "logs",
+        protocol: Protocol::AwsJson {
+            target_prefix: "Logs_20140328",
+            json_version: "1.1",
+        },
+    },
+    // `services/service-com-amazonaws-apigateway-backplanecontrolservice/smithy-model/
+    // com-amazonaws-apigateway-backplanecontrolservice.json`: restJson1, sigv4Name
+    // `apigateway`, endpointPrefix `apigateway`, sdkId `API Gateway`. Its requests are bound
+    // per operation out of that same model ([`APIGATEWAY`]).
+    Api {
+        sdk_token: "apigateway",
+        signing_name: "apigateway",
+        endpoint_prefix: "apigateway",
+        protocol: Protocol::RestJson(&APIGATEWAY),
     },
 ];
+
+/// Amazon API Gateway's own model, which a call to it is bound by.
+///
+/// The model is the one the API Gateway emulator's own crate is generated from, embedded
+/// here: the wire facts of 124 operations — a method, a URI, which member is a label, a query
+/// parameter, a header or a body member, and what the wire calls each one — are that model's,
+/// so this seam states none of them and none can drift from the surface the service serves.
+/// The include is a COMPILE-TIME read of that file: a model that moves fails this crate's
+/// build rather than changing what a call does.
+static APIGATEWAY: super::rest_json::RestApi = super::rest_json::RestApi {
+    model: include_str!(
+        "../../../../service-com-amazonaws-apigateway-backplanecontrolservice/smithy-model/\
+         com-amazonaws-apigateway-backplanecontrolservice.json"
+    ),
+    namespace: "com.amazonaws.apigateway",
+    parsed: ::std::sync::OnceLock::new(),
+};
 
 /// Every service token a call may name, in the order [`APIS`] lists them — what the guest
 /// is told when it names one that is not there.
@@ -213,6 +291,22 @@ impl AwsAccess {
         body: &str,
         within: Duration,
     ) -> Result<Answer, Refusal> {
+        self.runtime
+            .block_on(self.call_within(service, operation, region, body, within))
+    }
+
+    /// The SAME call, for a caller that is already on the async runtime — the runtime itself
+    /// delivering an invocation's log ([`super::log_delivery`]) rather than a guest making an
+    /// SDK call from its own thread. Blocking that thread on the handle, which is what
+    /// [`call`](Self::call) does, is not open to a caller already running on it.
+    pub async fn call_within(
+        &self,
+        service: &str,
+        operation: &str,
+        region: &str,
+        body: &str,
+        within: Duration,
+    ) -> Result<Answer, Refusal> {
         let Some(api) = APIS.iter().find(|api| api.sdk_token == service) else {
             return Err(Refusal::UnknownService);
         };
@@ -227,11 +321,9 @@ impl AwsAccess {
         } else {
             &self.region
         };
-        let answered = self.runtime.block_on(async {
-            ::tokio::time::timeout(within, dispatch(&self.callback, api, region, operation, body))
-                .await
-        });
-        match answered {
+        match ::tokio::time::timeout(within, dispatch(&self.callback, api, region, operation, body))
+            .await
+        {
             Ok(answer) => answer,
             Err(_elapsed) => Err(Refusal::TimedOut),
         }
@@ -303,13 +395,37 @@ async fn sent(
     operation: &str,
     body: &str,
 ) -> Result<Answer, Sent> {
-    let mut request = ::http::Request::builder()
-        .method("POST")
-        .uri(format!("https://{}/", api.host(region)))
-        .header("host", api.host(region))
-        .header("content-type", api.content_type())
-        .header(TARGET_HEADER, format!("{}.{operation}", api.target_prefix))
-        .body(body.as_bytes().to_vec())
+    let host = api.host(region);
+    let mut builder = ::http::Request::builder().header("host", host.clone());
+    let sent_body = match &api.protocol {
+        Protocol::AwsJson { target_prefix, .. } => {
+            builder = builder
+                .method("POST")
+                .uri(format!("https://{host}/"))
+                .header("content-type", api.content_type())
+                .header(TARGET_HEADER, format!("{target_prefix}.{operation}"));
+            body.as_bytes().to_vec()
+        }
+        Protocol::RestJson(rest) => {
+            // The input document the guest sent is keyed by the operation's own member
+            // names; where each belongs on the wire is that service's model's to say.
+            let input = ::serde_json::from_str::<::serde_json::Value>(body)
+                .unwrap_or(::serde_json::Value::Null);
+            let bound = super::rest_json::bind(rest, operation, &input).map_err(Sent::NotMade)?;
+            builder = builder
+                .method(bound.method.as_str())
+                .uri(format!("https://{host}{}", bound.target));
+            if bound.json_body {
+                builder = builder.header("content-type", api.content_type());
+            }
+            for (name, value) in bound.headers {
+                builder = builder.header(name, value);
+            }
+            bound.body.into_bytes()
+        }
+    };
+    let mut request = builder
+        .body(sent_body)
         .map_err(|error| Sent::NotMade(error.to_string()))?;
     ::service_common::in_process_sigv4::sign_callback_request(
         &mut request,
@@ -342,12 +458,50 @@ async fn sent(
     if payload.len() > MAX_RESPONSE_BYTES {
         return Err(Sent::TooLarge);
     }
+    let answered = String::from_utf8_lossy(payload).into_owned();
+    // A REST-bound answer carries its output members where that operation's own model says,
+    // so what the guest reads back is the output document keyed by those members' own names.
+    // A REFUSAL is left exactly as the service worded it: its code and message are the
+    // service's own, and the SDK raises them as they are.
+    let body = match (&api.protocol, status) {
+        (Protocol::RestJson(rest), 200..=299) => super::rest_json::read(
+            rest,
+            operation,
+            status,
+            &Answered(response.headers()),
+            &answered,
+        ),
+        _ => answered,
+    };
     Ok(Answer {
         status,
-        body: String::from_utf8_lossy(payload).into_owned(),
+        body,
         error_type,
         request_id,
     })
+}
+
+/// The headers of one answer, as the REST reading above reads them.
+struct Answered<'a>(&'a ::aws_smithy_runtime_api::http::Headers);
+
+impl super::rest_json::HeaderSource for Answered<'_> {
+    fn header(&self, name: &str) -> Option<String> {
+        self.0.get(name).map(str::to_string)
+    }
+
+    fn headers_with(&self, prefix: &str) -> Vec<(String, String)> {
+        // A header name arrives lower-cased whatever case the model's prefix is written in,
+        // so the prefix is matched the way HTTP compares a header name.
+        let prefix = prefix.to_ascii_lowercase();
+        self.0
+            .iter()
+            .filter_map(|(name, value)| {
+                name.to_ascii_lowercase()
+                    .strip_prefix(prefix.as_str())
+                    .map(|rest| (rest.to_string(), value.to_string()))
+            })
+            .collect()
+    }
 }
 
 /// The longest operation name a call may address.
@@ -398,17 +552,39 @@ mod tests {
             assert!(
                 !api.sdk_token.is_empty()
                     && !api.signing_name.is_empty()
-                    && !api.endpoint_prefix.is_empty()
-                    && !api.target_prefix.is_empty(),
+                    && !api.endpoint_prefix.is_empty(),
                 "case {:?}: every wire fact of a reachable service is stated",
                 api.sdk_token
             );
-            assert!(
-                api.json_version == "1.0" || api.json_version == "1.1",
-                "case {:?}: expected an AWS JSON protocol version, got {:?}",
-                api.sdk_token,
-                api.json_version
-            );
+            match &api.protocol {
+                super::Protocol::AwsJson {
+                    target_prefix,
+                    json_version,
+                } => assert!(
+                    !target_prefix.is_empty()
+                        && (*json_version == "1.0" || *json_version == "1.1"),
+                    "case {:?}: expected an AWS JSON target prefix and version, got {:?} {:?}",
+                    api.sdk_token,
+                    target_prefix,
+                    json_version
+                ),
+                // A REST-bound service states no operation of its own here: the model it
+                // carries is what every one of its requests is bound by, so the one fact to
+                // hold is that the model parsed and binds operations at all.
+                super::Protocol::RestJson(rest) => {
+                    let bound = super::super::rest_json::bind(
+                        rest,
+                        "GetRestApis",
+                        &::serde_json::json!({}),
+                    );
+                    assert!(
+                        bound.is_ok(),
+                        "case {:?}: expected the embedded model to bind its operations, got \
+                         {bound:?}",
+                        api.sdk_token
+                    );
+                }
+            }
         }
         let tokens = reachable_services();
         let mut sorted = tokens.clone();
