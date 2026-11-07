@@ -326,6 +326,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             platform_id: profile.platform_id,
             platform_display_name: profile.platform_display_name,
             signing_material: profile.signing_material,
+            // The period the signature this job produces is valid for, taken
+            // from the profile version the job signs with: a later write to the
+            // same profile cannot move the expiry of a signature already made.
+            signature_validity_period: profile.signature_validity_period,
             signing_parameters: profile.signing_parameters,
             overrides: profile.overrides,
             source: input.source,

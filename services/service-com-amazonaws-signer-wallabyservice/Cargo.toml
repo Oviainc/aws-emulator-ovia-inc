@@ -7,6 +7,10 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+# Calendar arithmetic for a signature's expiry: a `signatureValidityPeriod` is a
+# count of days, months or years, which months of unequal length rule out doing
+# in seconds.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

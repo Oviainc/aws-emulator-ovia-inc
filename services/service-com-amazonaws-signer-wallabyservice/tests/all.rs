@@ -98,6 +98,9 @@ mod revocation_survives_a_reput;
 #[path = "all/revocation_writer_not_found_wording.rs"]
 mod revocation_writer_not_found_wording;
 
+#[path = "all/signature_expiry.rs"]
+mod signature_expiry;
+
 #[path = "all/signature_revocation.rs"]
 mod signature_revocation;
 

@@ -227,10 +227,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             signing_parameters: job.signing_parameter_map(),
             created_at: Some(crate::state::to_timestamp(job.created_at)),
             completed_at: job.completed_at.map(crate::state::to_timestamp),
-            // A signature expiry is the signing certificate's, counted off in the
-            // profile's `signatureValidityPeriod`; this emulator issues no
-            // certificate, so it reports no expiry rather than inventing one.
-            signature_expires_at: None,
+            // The expiry of the signature this job produced: counted off in the
+            // `signatureValidityPeriod` of the profile version the job signed
+            // with, from the instant the signature exists at
+            // ([`crate::state::SigningJobRecord::signature_expires_at`], the one
+            // place that instant is taken from, so a listing bounded by an
+            // expiry judges the same value this reports).
+            signature_expires_at: job.signature_expires_at(),
             requested_by: job.requested_by.clone(),
             status: Some(job.status.clone()),
             status_reason: job.status_reason.clone(),

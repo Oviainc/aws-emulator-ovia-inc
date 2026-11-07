@@ -175,6 +175,50 @@ pub const TAG_KEY_MAX_LENGTH: usize = 128;
 /// [`crate::ops::types::VALIDITY_TYPE_VALUES`]).
 pub const VALIDITY_TYPE_MONTHS: &str = "MONTHS";
 
+/// The `ValidityType` unit of a period counted in calendar days, spelled as the
+/// model spells it (see [`crate::ops::types::VALIDITY_TYPE_VALUES`]).
+pub const VALIDITY_TYPE_DAYS: &str = "DAYS";
+
+/// The `ValidityType` unit of a period counted in calendar years, spelled as the
+/// model spells it (see [`crate::ops::types::VALIDITY_TYPE_VALUES`]).
+pub const VALIDITY_TYPE_YEARS: &str = "YEARS";
+
+/// How many [`VALIDITY_TYPE_MONTHS`] one [`VALIDITY_TYPE_YEARS`] counts, so a
+/// period stated in years is counted along the same calendar as one stated in
+/// months.
+const MONTHS_PER_YEAR: u32 = 12;
+
+/// The instant a signature made at `signed_at` under `period` expires, or `None`
+/// for a period that names no span at all.
+///
+/// A `SignatureValidityPeriod` is a COUNT of a calendar unit — `ValidityType` is
+/// `DAYS | MONTHS | YEARS`
+/// (`smithy_query(query="shape", shape="SignatureValidityPeriod")`) — so the
+/// expiry is that many calendar units on from the instant the signature was
+/// made. Calendar arithmetic, not a fixed span of seconds: months and years
+/// differ in length, and the day of the month maps to the last day of a shorter
+/// month, which is what `chrono`'s month arithmetic does.
+///
+/// A period carrying no `type` names no unit, one carrying a unit outside the
+/// modelled values names no calendar, and a negative count counts no span
+/// forward — none of the three fixes an instant anything expires at, so each
+/// answers `None` rather than an instant nothing stated.
+pub fn signature_expiry(
+    signed_at: SystemTime,
+    period: &SignatureValidityPeriod,
+) -> Option<SystemTime> {
+    let count = u32::try_from(period.value).ok()?;
+    let signed_at_utc = ::chrono::DateTime::<::chrono::Utc>::from(signed_at);
+    let expires_at = match period.r#type.as_deref()? {
+        VALIDITY_TYPE_DAYS => signed_at_utc.checked_add_days(::chrono::Days::new(count.into())),
+        VALIDITY_TYPE_MONTHS => signed_at_utc.checked_add_months(::chrono::Months::new(count)),
+        VALIDITY_TYPE_YEARS => signed_at_utc
+            .checked_add_months(::chrono::Months::new(count.checked_mul(MONTHS_PER_YEAR)?)),
+        _ => None,
+    }?;
+    Some(SystemTime::from(expires_at))
+}
+
 /// How many [`VALIDITY_TYPE_MONTHS`] a profile's signatures stay valid for when
 /// the `PutSigningProfile` that created it named no period.
 ///
@@ -476,6 +520,17 @@ pub struct SigningJobRecord {
     /// `InProgress`.
     pub completion_due: Option<SystemTime>,
     pub requested_by: Option<String>,
+    /// The `signatureValidityPeriod` of the profile version this job signs with,
+    /// SNAPSHOTTED when the job started — the period the signature this job
+    /// produces is valid for, and the one its expiry is counted off in (see
+    /// [`Self::signature_expires_at`]).
+    ///
+    /// Snapshotted for the reason the platform, the profile version and the
+    /// signing material are: a later `PutSigningProfile` on the same name mints
+    /// another version, which may state another period, and this job's signature
+    /// still expires when the period it was made under says. `None` only for a
+    /// job whose profile stated no period at all.
+    pub signature_validity_period: Option<SignatureValidityPeriod>,
     pub job_owner: String,
     /// The AWS account that invoked this job — the account whose credentials made
     /// the call that started it, which `jobInvoker` reports and the job listing's
@@ -552,13 +607,20 @@ impl SigningJobRecord {
     ///
     /// The ONE place that instant is taken from, so the member a read of a single
     /// job reports and the window a listing's expiry bounds judge can never
-    /// disagree. Nothing in this service records it on a job yet: a signature
-    /// expires with the certificate it was issued under, and no certificate is
-    /// issued here, so a read reports the member absent rather than an instant
-    /// nothing fixed — and a listing bounded by an expiry judges that same
-    /// absence instead of guessing one.
+    /// disagree.
+    ///
+    /// A signature is valid for the `signatureValidityPeriod` of the profile
+    /// version that made it ([`Self::signature_validity_period`], the period
+    /// snapshotted when the job started), counted from the instant the signature
+    /// exists at — which is when the job completed, the same instant the signed
+    /// object it covers is written at (see [`Self::settle`]). So a job that has
+    /// produced no signature yet reports no expiry, and once it has, every later
+    /// read reports the same instant: the completion instant is the one the clock
+    /// owed the job, not the one somebody looked at it.
     pub fn signature_expires_at(&self) -> Option<::aws_smithy_types::DateTime> {
-        None
+        let period = self.signature_validity_period.as_ref()?;
+        let signed_at = self.completed_at?;
+        signature_expiry(signed_at, period).map(to_timestamp)
     }
 
     /// The `SigningJob` summary `ListSigningJobs` returns.
