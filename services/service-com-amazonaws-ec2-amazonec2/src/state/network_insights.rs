@@ -334,14 +334,40 @@ pub fn invalid_network_insights_access_scope_id_value<E>(scope_id: &str) -> Scaf
 
 /// Refuse an analysis id a request named that the account holds no analysis under: HTTP 400
 /// [`INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_NOT_FOUND`].
+///
+/// The message is the id the REQUEST carried followed by the fixed text " does not exist",
+/// which is the one template this surface's reads word a value they cannot resolve with —
+/// the same one [`invalid_network_insights_access_scope_id_not_found`] answers for the scope
+/// — so a client reading the text sees which id it was and the two reads of this surface
+/// cannot word one condition two ways.
 pub fn invalid_network_insights_access_scope_analysis_id_not_found<E>(
     analysis_id: &str,
 ) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_NOT_FOUND,
         400,
-        format!("The Network Access Scope analysis ID '{analysis_id}' does not exist"),
+        format!("{analysis_id} does not exist"),
     )
+}
+
+/// Refuse an analysis id the operation ACTING on the one analysis it names cannot resolve:
+/// HTTP 400 `InvalidParameterValue`, naming the member that carried it and the value.
+///
+/// Which of the two refusals EC2 answers for an id it cannot resolve is a fact of the
+/// OPERATION rather than of the id — the split
+/// [`invalid_network_insights_access_scope_id_value`] records for the scope of this surface
+/// and [`invalid_network_insights_path_id_value`] for its path: the reads answer this
+/// resource's own [`INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_NOT_FOUND`], while the
+/// operation that acts on the one analysis it is given states that the
+/// `NetworkInsightsAccessScopeAnalysisId` it was given is not a valid one — one answer for
+/// every id it cannot resolve, whatever its form. This is the ONE place that second wording
+/// lives, so the operation and the suite that asserts it cannot drift apart.
+pub fn invalid_network_insights_access_scope_analysis_id_value<E>(
+    analysis_id: &str,
+) -> Scaffolded<E> {
+    invalid_parameter_value(format!(
+        "NetworkInsightsAccessScopeAnalysisId ({analysis_id}) is not valid"
+    ))
 }
 
 impl ComAmazonawsEc2Amazonec2State {
@@ -540,6 +566,42 @@ impl ComAmazonawsEc2Amazonec2State {
         self.network_insights_access_scope_analysis_client_tokens
             .insert(spec.client_token, analysis_id);
         Some(stored)
+    }
+
+    /// Take the Network Access Scope analysis `analysis_id` names OUT of the store, with the
+    /// client token that named it, and answer the analysis as it was last reported — or
+    /// `None` when the account holds no analysis of that id, nothing having been removed.
+    ///
+    /// The ONE way an analysis leaves the store, on the contract of
+    /// [`Self::remove_network_insights_access_scope`], so a deletion is observable through
+    /// every path that resolves an analysis id: `AnalysisStatus`
+    /// (`smithy_query(query="shape",shape="AnalysisStatus")`) has no member for a deleted
+    /// analysis, so there is no terminal state for one to be reported in and the id simply
+    /// stops resolving.
+    ///
+    /// The token that named this analysis stops naming it, so a later start carrying that
+    /// token begins a new analysis rather than reporting one nothing holds, and the bytes the
+    /// record held go back to the store's budget on exactly the terms the insert took them on
+    /// ([`network_insights_access_scope_analysis_payload_bytes`]).
+    pub fn remove_network_insights_access_scope_analysis(
+        &mut self,
+        analysis_id: &str,
+    ) -> Option<NetworkInsightsAccessScopeAnalysis> {
+        let record = self.network_insights_access_scope_analyses.remove(analysis_id)?;
+        let client_token = self
+            .network_insights_access_scope_analysis_client_tokens
+            .iter()
+            .find(|(_, named)| named.as_str() == analysis_id)
+            .map(|(token, _)| token.clone());
+        if let Some(token) = client_token.as_deref() {
+            self.network_insights_access_scope_analysis_client_tokens
+                .remove(token);
+        }
+        self.release_stored_bytes(network_insights_access_scope_analysis_payload_bytes(
+            record.view.tags.as_deref().unwrap_or_default(),
+            client_token.as_deref().unwrap_or_default(),
+        ));
+        Some(record.view)
     }
 }
 

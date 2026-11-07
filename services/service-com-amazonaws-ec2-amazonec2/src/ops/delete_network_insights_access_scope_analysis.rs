@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNetworkInsightsAccessScopeAnalysis
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteNetworkInsightsAccessScopeAnalysis`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteNetworkInsightsAccessScopeAnalysis::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the one Network Access Scope analysis the request names: the analysis leaves the
+//! store through the one removal path of that store, so the id stops resolving for every
+//! later reader of this surface, and the response names the analysis this call removed.
+//!
+//! An id this account holds no analysis under is refused with the wording the operations that
+//! ACT on the one resource they name answer — `InvalidParameterValue`, stating that the
+//! `NetworkInsightsAccessScopeAnalysisId` it was given is not a valid one
+//! ([`crate::state::invalid_network_insights_access_scope_analysis_id_value`]) — rather than
+//! with the `Invalid…Id.NotFound` code the reads of this surface answer; which of the two EC2
+//! answers is a fact of the operation, as the sibling deletes of this surface record.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +137,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteNetworkInsightsAccessScopeAnalysis` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteNetworkInsightsAccessScopeAnalysisErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteNetworkInsightsAccessScopeAnalysis"))
+        use crate::state;
+
+        // An analysis is named by id, and nothing this call answers is a fact of the Region
+        // the request was signed for, so none of the request metadata `ctx` carries is read.
+        let _ = ctx;
+
+        let analysis_id = input.network_insights_access_scope_analysis_id;
+
+        // "The ID of the Network Access Scope analysis"
+        // (`NetworkInsightsAccessScopeAnalysisId`) is `@required` but modelled
+        // `clientOptional`, so a request that left it out can reach this handler as an empty
+        // string rather than being refused at the boundary. A parameter the request did not
+        // carry is EC2's `MissingParameter`.
+        if analysis_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter networkInsightsAccessScopeAnalysisId",
+            ));
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this call reads it.
+        store.materialize_due_transitions();
+
+        // "Deletes the specified Network Access Scope analysis": an id that resolves to no
+        // analysis of the account is refused rather than answered as a delete that happened.
+        if !store
+            .network_insights_access_scope_analyses
+            .contains_key(&analysis_id)
+        {
+            return Err(state::invalid_network_insights_access_scope_analysis_id_value(
+                &analysis_id,
+            ));
+        }
+
+        // The request is one that would have succeeded, so the dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been removed yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The remove is what takes the analysis out of the store — the client token that
+        // named it and the bytes it held go with it — so the answer reports a removal that
+        // happened rather than one this handler assumed.
+        let Some(deleted) = store.remove_network_insights_access_scope_analysis(&analysis_id)
+        else {
+            return Err(state::internal_error(format!(
+                "the Network Access Scope analysis '{analysis_id}' resolved a moment ago is \
+                 not in the store any more"
+            )));
+        };
+
+        // "The ID of the Network Access Scope analysis"
+        // (`DeleteNetworkInsightsAccessScopeAnalysisResult$NetworkInsightsAccessScopeAnalysisId`),
+        // read off the record the removal took out of the store rather than off the request.
+        Ok(DeleteNetworkInsightsAccessScopeAnalysisOutput {
+            network_insights_access_scope_analysis_id: deleted
+                .network_insights_access_scope_analysis_id,
+        })
     }
 }

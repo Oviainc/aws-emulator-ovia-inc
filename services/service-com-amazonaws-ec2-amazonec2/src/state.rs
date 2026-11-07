@@ -841,6 +841,14 @@
 //! maps one start's `ClientToken` to the analysis it started, so a replay of the same
 //! request answers that analysis instead of starting a second one.
 //!
+//! `DeleteNetworkInsightsAccessScopeAnalysis` takes an analysis back out through the one
+//! removal path
+//! ([`ComAmazonawsEc2Amazonec2State::remove_network_insights_access_scope_analysis`]), which
+//! drops the client token with it and gives the bytes the record held back to the store's
+//! budget: `AnalysisStatus` has no member for a deleted analysis, so a deleted one has no
+//! terminal state to be reported in and its id simply stops resolving for every reader of
+//! this surface.
+//!
 //! ## Reachability Analyzer paths and the analyses started on them
 //!
 //! [`ComAmazonawsEc2Amazonec2State::network_insights_paths`] holds the account's paths as
