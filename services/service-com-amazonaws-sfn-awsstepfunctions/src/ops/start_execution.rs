@@ -556,109 +556,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Phase 3, under the lock again: admit it. Every check is re-made, because
         // the state machine could have been deleted and the name could have been
-        // taken while the walk ran.
-        let mut store = state.lock();
-        store.settle(started);
-        let Some(machine) = store.state_machines.get(&machine_arn) else {
-            return Err(StartExecutionErrorModeled::StateMachineDoesNotExist(
-                StateMachineDoesNotExist {
-                    message: Some(crate::state::resource_error_message(
-                        crate::state::STATE_MACHINE_DOES_NOT_EXIST,
-                        &machine_arn,
-                    )),
-                },
-            )
-            .into());
-        };
-        if machine.is_deleting() {
-            return Err(StartExecutionErrorModeled::StateMachineDeleting(
-                StateMachineDeleting {
-                    message: Some(crate::state::resource_error_message(
-                        crate::state::STATE_MACHINE_DELETING,
-                        &machine_arn,
-                    )),
-                },
-            )
-            .into());
-        }
-
-        // "StartExecution is idempotent for STANDARD workflows. [...] if you call
-        // StartExecution with the same name and input as a running execution, the call
-        // succeeds and return the same response as the original request. If the
-        // execution is closed or if the input is different, it returns a 400
-        // ExecutionAlreadyExists error." It "isn't idempotent for EXPRESS workflows".
-        //
-        // An execution record is keyed by its own ARN, which its name determines, so
-        // a name already in use names a STORED execution either way. For STANDARD the
-        // documented same-name-and-input hit answers the first response; for EXPRESS
-        // there is no such hit, and serving a second run under a reused name needs the
-        // Express execution ARN's own unique id, which this model does not describe —
-        // so rather than overwrite the stored execution, the reused name is refused
-        // with this operation's modelled error. The ONE reading of that is
-        // `state::started_already`, asked again here because the name could have been
-        // taken while the walk ran.
-        let standard = machine_type != crate::state::STATE_MACHINE_TYPE_EXPRESS;
-        if let Some(already) = store.started_already(&arn, standard, &execution_input) {
-            return already_started(already, &arn);
-        }
-
-        // The store's caps are in records AND in bytes: an execution retains its
-        // `input` (caller-sized up to the modelled 256 KiB), the outcome the walk
-        // computed and that run's history, so a record count alone would not bound
-        // the memory. A run that stopped at an activity task retains that task too,
-        // and a run whose Distributed Map states started Map Runs retains those, so
-        // it is admitted against every record together and the writes below cannot
-        // grow the store past what was admitted.
-        let waiting = planned.waiting;
-        let parked = planned.parked;
-        let task_bytes = waiting
-            .as_ref()
-            .map_or(0, crate::state::PlannedActivityTask::measure)
-            + parked.as_ref().map_or(0, crate::state::PlannedJob::measure);
-        let map_run_bytes = crate::state::planned_map_run_bytes(&planned.map_runs);
-        if let Some(why) = store.execution_rejection(
-            &machine_arn,
-            candidate.measure() + task_bytes + map_run_bytes,
-        ) {
-            return Err(
-                StartExecutionErrorModeled::ExecutionLimitExceeded(ExecutionLimitExceeded {
-                    message: Some(why),
-                })
-                .into(),
-            );
-        }
-
-        store.insert_execution(candidate);
-        // Every Distributed Map state the walk entered started a Map Run, which
-        // `ListMapRuns` reports for this execution and `DescribeMapRun` by its own ARN.
-        store.record_map_runs(
-            &arn,
-            &machine_arn,
-            &machine_name,
-            &region,
-            planned.map_runs,
-        );
-        // The walk reached an activity task: it is queued under its activity's ARN
-        // for a worker to claim with `GetActivityTask`, and the execution waits at
-        // that state until one answers it.
-        if let Some(waiting) = waiting {
-            store.schedule_activity_task(&arn, waiting);
-        }
-        // The walk PARKED at the job a run-a-job (`.sync`) task started: the task is
-        // not finished until that job is, so the job is recorded and polled through
-        // its own service's reporting call until it ends
-        // (`crate::state::run_a_job`). This call answers now, with the execution
-        // RUNNING, exactly as the service answers while such a task is parked.
-        let watching = match parked {
-            Some(parked) => {
-                store.park_job(&arn, parked, &region);
-                true
+        // taken while the walk ran. The lock is held for THIS block alone, because the
+        // publication below must not hold the store while it is in flight; the block
+        // answers whether the walk parked at a job of its own.
+        let watching = {
+            let mut store = state.lock();
+            store.settle(started);
+            let Some(machine) = store.state_machines.get(&machine_arn) else {
+                return Err(StartExecutionErrorModeled::StateMachineDoesNotExist(
+                    StateMachineDoesNotExist {
+                        message: Some(crate::state::resource_error_message(
+                            crate::state::STATE_MACHINE_DOES_NOT_EXIST,
+                            &machine_arn,
+                        )),
+                    },
+                )
+                .into());
+            };
+            if machine.is_deleting() {
+                return Err(StartExecutionErrorModeled::StateMachineDeleting(
+                    StateMachineDeleting {
+                        message: Some(crate::state::resource_error_message(
+                            crate::state::STATE_MACHINE_DELETING,
+                            &machine_arn,
+                        )),
+                    },
+                )
+                .into());
             }
-            None => false,
+
+            // "StartExecution is idempotent for STANDARD workflows. [...] if you call
+            // StartExecution with the same name and input as a running execution, the
+            // call succeeds and return the same response as the original request. If
+            // the execution is closed or if the input is different, it returns a 400
+            // ExecutionAlreadyExists error." It "isn't idempotent for EXPRESS
+            // workflows".
+            //
+            // An execution record is keyed by its own ARN, which its name determines,
+            // so a name already in use names a STORED execution either way. For
+            // STANDARD the documented same-name-and-input hit answers the first
+            // response; for EXPRESS there is no such hit, and serving a second run
+            // under a reused name needs the Express execution ARN's own unique id,
+            // which this model does not describe — so rather than overwrite the stored
+            // execution, the reused name is refused with this operation's modelled
+            // error. The ONE reading of that is `state::started_already`, asked again
+            // here because the name could have been taken while the walk ran.
+            let standard = machine_type != crate::state::STATE_MACHINE_TYPE_EXPRESS;
+            if let Some(already) = store.started_already(&arn, standard, &execution_input) {
+                return already_started(already, &arn);
+            }
+
+            // The store's caps are in records AND in bytes: an execution retains its
+            // `input` (caller-sized up to the modelled 256 KiB), the outcome the walk
+            // computed and that run's history, so a record count alone would not bound
+            // the memory. A run that stopped at an activity task retains that task too,
+            // and a run whose Distributed Map states started Map Runs retains those, so
+            // it is admitted against every record together and the writes below cannot
+            // grow the store past what was admitted.
+            let waiting = planned.waiting;
+            let parked = planned.parked;
+            let task_bytes = waiting
+                .as_ref()
+                .map_or(0, crate::state::PlannedActivityTask::measure)
+                + parked.as_ref().map_or(0, crate::state::PlannedJob::measure);
+            let map_run_bytes = crate::state::planned_map_run_bytes(&planned.map_runs);
+            if let Some(why) = store.execution_rejection(
+                &machine_arn,
+                candidate.measure() + task_bytes + map_run_bytes,
+            ) {
+                return Err(StartExecutionErrorModeled::ExecutionLimitExceeded(
+                    ExecutionLimitExceeded {
+                        message: Some(why),
+                    },
+                )
+                .into());
+            }
+
+            store.insert_execution(candidate);
+            // Every Distributed Map state the walk entered started a Map Run, which
+            // `ListMapRuns` reports for this execution and `DescribeMapRun` by its own
+            // ARN.
+            store.record_map_runs(
+                &arn,
+                &machine_arn,
+                &machine_name,
+                &region,
+                planned.map_runs,
+            );
+            // The walk reached an activity task: it is queued under its activity's ARN
+            // for a worker to claim with `GetActivityTask`, and the execution waits at
+            // that state until one answers it.
+            if let Some(waiting) = waiting {
+                store.schedule_activity_task(&arn, waiting);
+            }
+            // The walk PARKED at the job a run-a-job (`.sync`) task started: the task
+            // is not finished until that job is, so the job is recorded and polled
+            // through its own service's reporting call until it ends
+            // (`crate::state::run_a_job`). This call answers now, with the execution
+            // RUNNING, exactly as the service answers while such a task is parked.
+            let watching = parked.is_some();
+            if let Some(parked) = parked {
+                store.park_job(&arn, parked, &region);
+            }
+            watching
         };
-        // Every guard on this service's store is released here, which is what lets
-        // the two writes below reach another service's store.
-        drop(store);
+        // Every guard on this service's store is released with the block above, which
+        // is what lets the writes below reach another service's store.
         if watching {
             crate::state::run_a_job::watch(
                 std::sync::Arc::clone(&self.engine),
@@ -671,6 +674,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // published about itself: the `AWS/States` series the executions are counted
         // in, and the history events a logging configuration delivers.
         crate::state::observability::publish(&*self.engine);
+
+        // The execution is now RUNNING, which is a status it has MOVED INTO: Step
+        // Functions publishes one event per execution status change onto the account's
+        // default event bus, so the change this call made goes out before it answers —
+        // and the clock this starts is what publishes the terminal status the walk's
+        // outcome is owed at. Published with no store of this service locked, as every
+        // other call this operation makes is.
+        crate::state::events::publish(&*self.engine, ctx.callback()).await;
 
         Ok(StartExecutionOutput {
             execution_arn: arn,

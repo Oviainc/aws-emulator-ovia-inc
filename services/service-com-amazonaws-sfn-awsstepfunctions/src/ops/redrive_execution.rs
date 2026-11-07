@@ -382,97 +382,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Phase 3, under the lock again: record it. Every check is re-made, because
         // the execution could have been redriven or its state machine deleted while
-        // the walk ran.
-        let mut store = state.lock();
-        store.settle(now);
-        let Some(execution) = store.executions.get(&input.execution_arn) else {
-            return Err(RedriveExecutionErrorModeled::ExecutionDoesNotExist(
-                ExecutionDoesNotExist {
-                    message: Some(crate::state::resource_error_message(
-                        crate::state::EXECUTION_DOES_NOT_EXIST,
-                        &input.execution_arn,
-                    )),
-                },
-            )
-            .into());
-        };
-        if let Some(redrive_date) = input
-            .client_token
-            .as_deref()
-            .and_then(|token| execution.redrive_for_token(token, now))
-        {
-            return Ok(RedriveExecutionOutput {
-                redrive_date: crate::state::to_date_time(redrive_date),
-            });
-        }
-        if let Some(reason) = store.not_redrivable_reason(execution, now) {
-            return Err(RedriveExecutionErrorModeled::ExecutionNotRedrivable(
-                ExecutionNotRedrivable {
-                    message: Some(crate::state::not_redrivable_message(
-                        &input.execution_arn,
-                        reason,
-                    )),
-                },
-            )
-            .into());
-        }
-
-        let waiting = planned.waiting;
-        let parked = planned.parked;
-        let task_bytes = waiting
-            .as_ref()
-            .map_or(0, crate::state::PlannedActivityTask::measure)
-            + parked.as_ref().map_or(0, crate::state::PlannedJob::measure);
-        let map_runs = planned.map_runs;
-        let map_run_bytes = crate::state::planned_map_run_bytes(&map_runs);
-        match store.redrive_execution(
-            &input.execution_arn,
-            now,
-            input.client_token.as_deref(),
-            crate::state::RedrivenAttempt {
-                opening: planned.opening,
-                pending: planned.pending,
-                extra_bytes: task_bytes + map_run_bytes,
-                // The unsuccessful step THIS attempt stopped at, which the next
-                // redrive continues from.
-                stopped_at: planned.stopped_at,
-            },
-        ) {
-            Ok(redrive_date) => {
-                // The re-run reached an activity task: it is queued for a worker to
-                // claim exactly as a first attempt's is.
-                if let Some(waiting) = waiting {
-                    store.schedule_activity_task(&input.execution_arn, waiting);
-                }
-                // The re-run re-entered this execution's Distributed Map states, so
-                // each one's Map Run runs again: the record it already has moves,
-                // keeping the ARN a client may be holding.
-                store.record_map_runs(
-                    &input.execution_arn,
-                    &machine_arn,
-                    &machine_name,
-                    &crate::state::arn_region(&machine_arn),
-                    map_runs,
-                );
-                // The re-run started a run-a-job task's job again and PARKED at it,
-                // which is polled to its end exactly as a first attempt's is.
-                if let Some(parked) = parked {
-                    let region = crate::state::arn_region(&machine_arn);
-                    store.park_job(&input.execution_arn, parked, &region);
-                    drop(store);
-                    crate::state::run_a_job::watch(
-                        std::sync::Arc::clone(&self.engine),
-                        ctx.callback().clone(),
-                        crate::state::integration::chain_depth(ctx),
-                        input.execution_arn.clone(),
-                    );
-                }
-                Ok(RedriveExecutionOutput {
-                    redrive_date: crate::state::to_date_time(redrive_date),
-                })
-            }
-            Err(crate::state::RedriveRejection::NotFound) => {
-                Err(RedriveExecutionErrorModeled::ExecutionDoesNotExist(
+        // the walk ran. The lock is held for THIS block alone, because the publication
+        // below must not hold the store while it is in flight; the block answers the
+        // `redriveDate` the redrive reached and whether the re-run parked at a job.
+        let (redrive_date, watching) = {
+            let mut store = state.lock();
+            store.settle(now);
+            let Some(execution) = store.executions.get(&input.execution_arn) else {
+                return Err(RedriveExecutionErrorModeled::ExecutionDoesNotExist(
                     ExecutionDoesNotExist {
                         message: Some(crate::state::resource_error_message(
                             crate::state::EXECUTION_DOES_NOT_EXIST,
@@ -480,22 +397,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         )),
                     },
                 )
-                .into())
+                .into());
+            };
+            if let Some(redrive_date) = input
+                .client_token
+                .as_deref()
+                .and_then(|token| execution.redrive_for_token(token, now))
+            {
+                return Ok(RedriveExecutionOutput {
+                    redrive_date: crate::state::to_date_time(redrive_date),
+                });
             }
-            // The re-run's own history and outcome are what this record would grow
-            // by, so a redrive the store has no room for is refused rather than
-            // retained past its ceiling.
-            Err(crate::state::RedriveRejection::NoRoom) => Err(
-                RedriveExecutionErrorModeled::ExecutionLimitExceeded(ExecutionLimitExceeded {
-                    message: Some(format!(
-                        "redriving execution {} would take the store past the {} bytes this \
-                         emulator retains",
-                        input.execution_arn,
-                        crate::state::MAX_STORE_BYTES
-                    )),
-                })
-                .into(),
-            ),
+            if let Some(reason) = store.not_redrivable_reason(execution, now) {
+                return Err(RedriveExecutionErrorModeled::ExecutionNotRedrivable(
+                    ExecutionNotRedrivable {
+                        message: Some(crate::state::not_redrivable_message(
+                            &input.execution_arn,
+                            reason,
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            let waiting = planned.waiting;
+            let parked = planned.parked;
+            let task_bytes = waiting
+                .as_ref()
+                .map_or(0, crate::state::PlannedActivityTask::measure)
+                + parked.as_ref().map_or(0, crate::state::PlannedJob::measure);
+            let map_runs = planned.map_runs;
+            let map_run_bytes = crate::state::planned_map_run_bytes(&map_runs);
+            let redriven = store.redrive_execution(
+                &input.execution_arn,
+                now,
+                input.client_token.as_deref(),
+                crate::state::RedrivenAttempt {
+                    opening: planned.opening,
+                    pending: planned.pending,
+                    extra_bytes: task_bytes + map_run_bytes,
+                    // The unsuccessful step THIS attempt stopped at, which the next
+                    // redrive continues from.
+                    stopped_at: planned.stopped_at,
+                },
+            );
+            match redriven {
+                Ok(redrive_date) => {
+                    // The re-run reached an activity task: it is queued for a worker to
+                    // claim exactly as a first attempt's is.
+                    if let Some(waiting) = waiting {
+                        store.schedule_activity_task(&input.execution_arn, waiting);
+                    }
+                    // The re-run re-entered this execution's Distributed Map states, so
+                    // each one's Map Run runs again: the record it already has moves,
+                    // keeping the ARN a client may be holding.
+                    store.record_map_runs(
+                        &input.execution_arn,
+                        &machine_arn,
+                        &machine_name,
+                        &crate::state::arn_region(&machine_arn),
+                        map_runs,
+                    );
+                    // The re-run started a run-a-job task's job again and PARKED at it,
+                    // which is polled to its end exactly as a first attempt's is.
+                    let watching = parked.is_some();
+                    if let Some(parked) = parked {
+                        let region = crate::state::arn_region(&machine_arn);
+                        store.park_job(&input.execution_arn, parked, &region);
+                    }
+                    (redrive_date, watching)
+                }
+                Err(crate::state::RedriveRejection::NotFound) => {
+                    return Err(RedriveExecutionErrorModeled::ExecutionDoesNotExist(
+                        ExecutionDoesNotExist {
+                            message: Some(crate::state::resource_error_message(
+                                crate::state::EXECUTION_DOES_NOT_EXIST,
+                                &input.execution_arn,
+                            )),
+                        },
+                    )
+                    .into())
+                }
+                // The re-run's own history and outcome are what this record would grow
+                // by, so a redrive the store has no room for is refused rather than
+                // retained past its ceiling.
+                Err(crate::state::RedriveRejection::NoRoom) => {
+                    return Err(RedriveExecutionErrorModeled::ExecutionLimitExceeded(
+                        ExecutionLimitExceeded {
+                            message: Some(format!(
+                                "redriving execution {} would take the store past the {} bytes \
+                                 this emulator retains",
+                                input.execution_arn,
+                                crate::state::MAX_STORE_BYTES
+                            )),
+                        },
+                    )
+                    .into())
+                }
+            }
+        };
+        if watching {
+            crate::state::run_a_job::watch(
+                std::sync::Arc::clone(&self.engine),
+                ctx.callback().clone(),
+                crate::state::integration::chain_depth(ctx),
+                input.execution_arn.clone(),
+            );
         }
+        // The redrive moved the execution back into `RUNNING`, carrying the redrive
+        // accounting this attempt reached: that status change is published onto the
+        // account's default event bus, and the clock this starts publishes the re-run's
+        // own terminal status when it falls due.
+        crate::state::events::publish(&*self.engine, ctx.callback()).await;
+        Ok(RedriveExecutionOutput {
+            redrive_date: crate::state::to_date_time(redrive_date),
+        })
     }
 }

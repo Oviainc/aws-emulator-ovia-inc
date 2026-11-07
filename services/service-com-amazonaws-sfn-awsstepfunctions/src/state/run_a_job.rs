@@ -256,51 +256,58 @@ async fn resolve<Eng: Send + Sync + 'static>(
     integration::stop_abandoned(callback, &region, &planned.abandoned).await;
 
     // Phase 3, under the lock again: record it. Everything is re-read, because the
-    // execution could have been stopped while the walk ran.
-    let mut store = state.lock();
-    store.settle(now);
-    let waiting = planned.waiting;
-    let parked = planned.parked;
-    let extra_bytes = waiting
-        .as_ref()
-        .map_or(0, super::PlannedActivityTask::measure)
-        + parked.as_ref().map_or(0, super::PlannedJob::measure)
-        + super::planned_map_run_bytes(&planned.map_runs);
-    // The attempt STOPPED at the state that started the job when that job failed and
-    // no `Catch` of the state carried the execution on, which is the step a later
-    // `RedriveExecution` continues from.
-    let stopped_at_task = failed
-        && planned
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.status == super::EXECUTION_STATUS_FAILED);
-    let walked_stopped_at = planned.stopped_at.clone();
-    if store
-        .resolve_job_task(
-            execution_arn,
-            planned.opening,
-            planned.pending,
-            extra_bytes,
-            walked_stopped_at,
-            stopped_at_task,
-        )
-        .is_err()
+    // execution could have been stopped while the walk ran. The lock is held for THIS
+    // block alone, because the publication below must not hold the store.
     {
-        return;
+        let mut store = state.lock();
+        store.settle(now);
+        let waiting = planned.waiting;
+        let parked = planned.parked;
+        let extra_bytes = waiting
+            .as_ref()
+            .map_or(0, super::PlannedActivityTask::measure)
+            + parked.as_ref().map_or(0, super::PlannedJob::measure)
+            + super::planned_map_run_bytes(&planned.map_runs);
+        // The attempt STOPPED at the state that started the job when that job failed and
+        // no `Catch` of the state carried the execution on, which is the step a later
+        // `RedriveExecution` continues from.
+        let stopped_at_task = failed
+            && planned
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.status == super::EXECUTION_STATUS_FAILED);
+        let walked_stopped_at = planned.stopped_at.clone();
+        if store
+            .resolve_job_task(
+                execution_arn,
+                planned.opening,
+                planned.pending,
+                extra_bytes,
+                walked_stopped_at,
+                stopped_at_task,
+            )
+            .is_err()
+        {
+            return;
+        }
+        // The continuation reached an activity task, or parked at another job of its own:
+        // each is recorded exactly as the first one was.
+        if let Some(waiting) = waiting {
+            store.schedule_activity_task(execution_arn, waiting);
+        }
+        if let Some(parked) = parked {
+            store.park_job(execution_arn, parked, &region);
+        }
+        store.append_map_runs(
+            execution_arn,
+            &machine_arn,
+            &machine_name,
+            &region,
+            planned.map_runs,
+        );
     }
-    // The continuation reached an activity task, or parked at another job of its own:
-    // each is recorded exactly as the first one was.
-    if let Some(waiting) = waiting {
-        store.schedule_activity_task(execution_arn, waiting);
-    }
-    if let Some(parked) = parked {
-        store.park_job(execution_arn, parked, &region);
-    }
-    store.append_map_runs(
-        execution_arn,
-        &machine_arn,
-        &machine_name,
-        &region,
-        planned.map_runs,
-    );
+    // The job's outcome may have carried the execution to its terminal status, which
+    // is a status change this service publishes onto the account's default event bus.
+    // Published with no store of this service locked.
+    super::events::publish(&**engine, callback).await;
 }

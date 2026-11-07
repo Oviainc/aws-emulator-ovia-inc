@@ -85,6 +85,12 @@ hex = { workspace = true }
 # mounted beside Step Functions on the one engine the test router builds, the same shape
 # `core/router/src/lib.rs` mounts them in, so the call a task makes is served for real.
 service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
+# EventBridge and SQS are mounted beside Step Functions in
+# `tests/all/execution_status_change_events.rs`, because an execution's status changes are
+# published onto the default event bus and a rule on that bus delivers them to an SQS
+# queue target: without them mounted there is nothing for the publication to reach.
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # The same, for the service a `Task` state whose `Resource` names a Lambda FUNCTION
 # invokes (`tests/all/lambda_task_control_flow.rs`): the function really runs there, so
 # the control flow around the task is driven by what the run answered.

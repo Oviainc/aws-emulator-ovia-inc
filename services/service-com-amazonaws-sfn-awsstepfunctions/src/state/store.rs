@@ -126,6 +126,14 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             self.remove_state_machine(&arn);
         }
         self.deleting_state_machines = still_deleting;
+
+        // Every status the steps above materialised — an execution's terminal outcome
+        // coming due, an activity task that ran out of time failing the execution
+        // waiting at it — owes an EventBridge event, and so does every status a CALL
+        // wrote before it reached this point. Both are recorded here rather than at each
+        // of those sites, so none of them can forget; the events themselves are
+        // published with no lock held ([`events::publish`]).
+        events::record_status_changes(self, now);
     }
 
     // -----------------------------------------------------------------------

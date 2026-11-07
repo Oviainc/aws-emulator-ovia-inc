@@ -85,6 +85,8 @@ mod execution_observability;
 mod execution_redrive;
 #[path = "all/execution_role_assumption.rs"]
 mod execution_role_assumption;
+#[path = "all/execution_status_change_events.rs"]
+mod execution_status_change_events;
 #[path = "all/express_run_a_job_refusal.rs"]
 mod express_run_a_job_refusal;
 #[path = "all/form_protocol_integration.rs"]

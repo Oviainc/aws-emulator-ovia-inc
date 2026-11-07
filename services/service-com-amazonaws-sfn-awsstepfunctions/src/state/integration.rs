@@ -758,6 +758,7 @@ pub fn dataset_call(operation: &str) -> Option<Call> {
         callback: false,
         parsed_output: false,
         json_text: &[],
+        json_text_at: &[],
         sdk_envelope: false,
         epoch_millis: &[],
         targets: None,
@@ -796,6 +797,10 @@ pub struct Call {
     /// state built is carried as that document's JSON text
     /// ([`JSON_TEXT_MEMBERS`]). Empty for every call that converts nothing.
     pub json_text: &'static [&'static str],
+    /// The same conversion for a member NESTED inside the request rather than at its
+    /// top level, each named by the path to it through the request's objects and lists
+    /// ([`JSON_TEXT_AT_MEMBERS`]). Empty for every call that converts nothing.
+    pub json_text_at: &'static [&'static [&'static str]],
     /// Whether the task's result is the literal SDK response of this call, which
     /// carries the SDK's own response envelope beside the operation's members
     /// ([`with_sdk_envelope`]).
@@ -1224,6 +1229,31 @@ const JSON_TEXT_MEMBERS: &[(&str, &[&str])] = &[
     // (`smithy_query(query="operation",operation="StartExecution")` on this crate's
     // own model).
     ("states:startExecution", &["input"]),
+    // `arn:aws:states:::sqs:sendMessage` takes the message's body as the JSON document
+    // the message carries, while `SendMessage`'s own `MessageBody` member is a String
+    // (`smithy_query(query="operation",operation="SendMessage",model_path="services/
+    // service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`).
+    ("sqs:sendMessage", &["MessageBody"]),
+];
+
+/// The same conversion for a member the invoked operation types as a string that sits
+/// NESTED inside the request, named by the path to it: each segment is a member of the
+/// object reached so far, and a LIST on the way is walked element by element, because an
+/// integration that takes a list of entries documents each entry the same way.
+///
+/// Separate from [`JSON_TEXT_MEMBERS`] only in the shape of what it names; the rule is
+/// the one both state, that a member the invoked operation types as a STRING goes on the
+/// wire as the JSON text of the document the state built, wherever in the request that
+/// member sits.
+const JSON_TEXT_AT_MEMBERS: &[(&str, &[&[&str]])] = &[
+    // `arn:aws:states:::events:putEvents` takes each entry's event detail as the JSON
+    // document the event carries, while `PutEventsRequestEntry$Detail` is a String
+    // member documented as "a valid JSON object [...] may contain fields and nested
+    // sub-objects"
+    // (`smithy_query(query="shape",shape="PutEventsRequestEntry",model_path="services/
+    // service-com-amazonaws-eventbridge-awsevents/smithy-model/
+    // com-amazonaws-eventbridge-awsevents.json")`).
+    ("events:putEvents", &[&["Entries", "Detail"]]),
 ];
 
 /// The members of an integration's RESPONSE that carry an INSTANT, named by the
@@ -1695,6 +1725,11 @@ pub fn read(resource: &str) -> Result<Call, String> {
         true => &[][..],
         false => members_of(JSON_TEXT_MEMBERS, &integration),
     };
+    // The same for a member of this request that is nested inside it.
+    let json_text_at = match aws_sdk {
+        true => &[][..],
+        false => paths_of(JSON_TEXT_AT_MEMBERS, &integration),
+    };
     // The same for the instants its RESPONSE carries: the optimized family's result
     // is the SDK response, which renders a date as epoch milliseconds.
     let epoch_millis = match aws_sdk {
@@ -1726,6 +1761,7 @@ pub fn read(resource: &str) -> Result<Call, String> {
         callback,
         parsed_output,
         json_text,
+        json_text_at,
         // The OPTIMIZED family's result is the literal SDK response; the AWS SDK
         // family's is the invoked operation's own members.
         sdk_envelope: !aws_sdk,
@@ -1777,6 +1813,7 @@ fn direct_invocation(function: &str, shown: &str) -> Result<Call, String> {
         callback: false,
         parsed_output: false,
         json_text: &[],
+        json_text_at: &[],
         // The result of this form is the function's own payload, not the SDK response
         // the optimized integration reports ([`reported_result`]).
         sdk_envelope: false,
@@ -1798,6 +1835,18 @@ fn members_of(
         .iter()
         .find(|(named, _)| *named == integration)
         .map_or(&[][..], |(_, members)| *members)
+}
+
+/// The PATHS `table` names for `integration`, and none for one with no entry — the
+/// nested form of [`members_of`].
+fn paths_of(
+    table: &'static [(&'static str, &'static [&'static [&'static str]])],
+    integration: &str,
+) -> &'static [&'static [&'static str]] {
+    table
+        .iter()
+        .find(|(named, _)| *named == integration)
+        .map_or(&[][..], |(_, paths)| *paths)
 }
 
 /// The call that reports the job `job` started under `job_id`, and its request.
@@ -1854,11 +1903,13 @@ fn job_request(member: &str, identifier: Value, naming: &JobNaming) -> Value {
     Value::Object(request)
 }
 
-/// The call one of a run-a-job pattern's own calls is made as.
+/// The call one of a run-a-job pattern's own calls — or one this service makes for work
+/// of its own ([`own_call`]) — is made as.
 ///
 /// The job's REPORT and its STOP are READ, not reported as a task's own result, so
 /// neither parks at a job of its own, converts a member of its answer or carries the
-/// integration's response envelope.
+/// integration's response envelope; a call this service makes for itself reports its
+/// answer to nobody at all, so it carries none of them either.
 fn pattern_call(api: &'static Api, operation: &str) -> Call {
     Call {
         api,
@@ -1870,11 +1921,29 @@ fn pattern_call(api: &'static Api, operation: &str) -> Call {
         callback: false,
         parsed_output: false,
         json_text: &[],
+        json_text_at: &[],
         sdk_envelope: false,
         epoch_millis: &[],
         targets: None,
         invokes: None,
     }
+}
+
+/// The call this service makes to `operation` of the service whose ARN namespace is
+/// `namespace`, for work of its OWN rather than for a `Task` state.
+///
+/// Step Functions reaches another service on its own account too — it publishes an
+/// execution's status changes onto the account's event bus ([`super::events`]) — and such
+/// a call is the same in-process, signed request a task's call is, built from the same
+/// one table of wire facts ([`APIS`]). What differs is only that no `Resource` named it:
+/// there is no integration pattern, no result to convert and no response envelope to
+/// carry, because nothing reports the answer as a state's result.
+///
+/// `None` for a namespace [`APIS`] states no wire facts for, which is a service this
+/// crate makes no call to at all.
+pub fn own_call(namespace: &str, operation: &str) -> Option<Call> {
+    let api = APIS.iter().find(|api| api.namespace == namespace)?;
+    Some(pattern_call(api, operation))
 }
 
 /// The operation name an action names: an action is the operation's name in
@@ -2249,9 +2318,12 @@ pub fn reported_result(call: &Call, answer: &Value) -> Value {
 ///
 /// Only the TOP level is re-spelled. Below it a document carries a caller's DATA
 /// beside the operation's members — a DynamoDB attribute name is a map key, an
-/// EventBridge detail is a caller's own document — and data is never re-spelled.
-/// A value already a string is left as it is, so a member written as the text the
-/// operation types goes through untouched.
+/// EventBridge detail is a caller's own document — and data is never re-spelled. A
+/// member the operation types as a STRING is carried as JSON text wherever it sits,
+/// top level or nested ([`Call::json_text_at`]), because that is a fact of the invoked
+/// operation's own model rather than of the request's shape. A value already a string
+/// is left as it is, so a member written as the text the operation types goes through
+/// untouched.
 fn wire_request(call: &Call, request: &Value) -> Value {
     let Some(members) = request.as_object() else {
         return request.clone();
@@ -2265,7 +2337,40 @@ fn wire_request(call: &Call, request: &Value) -> Value {
         };
         wire.insert(member, value);
     }
-    Value::Object(wire)
+    let mut document = Value::Object(wire);
+    for path in call.json_text_at {
+        as_json_text(&mut document, path);
+    }
+    document
+}
+
+/// Replace the document the member `path` names in `document` with that document's JSON
+/// text, leaving `document` as it is where the path names nothing and leaving a value
+/// that is already text untouched.
+///
+/// The inverse of [`parse_in_place`], and the nested form of [`Call::json_text`]: a LIST
+/// on the way is walked element by element, so one path names the same member of every
+/// entry of a request that takes a list of them.
+fn as_json_text(document: &mut Value, path: &[&str]) {
+    if let Some(items) = document.as_array_mut() {
+        for item in items {
+            as_json_text(item, path);
+        }
+        return;
+    }
+    let Some((member, rest)) = path.split_first() else {
+        return;
+    };
+    let Some(node) = document.get_mut(*member) else {
+        return;
+    };
+    if !rest.is_empty() {
+        as_json_text(node, rest);
+        return;
+    }
+    if !node.is_string() {
+        *node = Value::String(node.to_string());
+    }
 }
 
 /// One request, built for the protocol the invoked service's model declares.

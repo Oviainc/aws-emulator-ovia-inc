@@ -2418,6 +2418,25 @@ pub struct ComAmazonawsSfnAwsstepfunctionsState {
     /// It only ever increases, so a sequence a deleted alias held is never handed out
     /// again and the aliases that remain keep their relative order.
     alias_sequence: u64,
+    /// The execution status last PUBLISHED to EventBridge for each execution, keyed by
+    /// that execution's ARN, against which the next diff is taken ([`events`]).
+    ///
+    /// Publication bookkeeping rather than a second copy of a record: it holds no fact
+    /// about the execution other than which of its statuses has already been reported,
+    /// and it is pruned to the executions the store still holds, so it does not grow
+    /// with the number of calls served.
+    published_execution_statuses: HashMap<String, String>,
+    /// The status changes waiting to be published, oldest first and bounded by
+    /// [`events::MAX_PENDING_EVENTS`]: the queue [`events::publish`] drains with no lock
+    /// held.
+    pending_execution_events: std::collections::VecDeque<events::StatusChange>,
+    /// Whether one in-process event clock holds the claim on this store
+    /// ([`events::publish`]): at most one runs at a time.
+    event_clock_running: bool,
+    /// Which claim that is, so a clock that stands down releases only its own.
+    event_clock_generation: u64,
+    /// The running clock's task, kept so a clock that replaces it can abort it.
+    event_clock: Option<::tokio::task::JoinHandle<()>>,
     /// What this store's executions have published about themselves and nothing has
     /// written out yet: the metric datapoints and the log deliveries
     /// [`observability::publish`] hands to CloudWatch and CloudWatch Logs once this
@@ -4283,6 +4302,7 @@ fn round_up_to(value: i64, increment: i64) -> i64 {
 
 pub mod asl;
 pub mod encryption;
+pub mod events;
 pub mod integration;
 pub mod item_batcher;
 pub mod item_reader;

@@ -447,74 +447,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .await;
 
         // Phase 3, under the lock again: record it. Every check is re-made, because
-        // the task could have been answered or closed while the walk ran.
-        let mut store = state.lock();
-        store.settle(now);
-        let waiting = planned.waiting;
-        let parked = planned.parked;
-        let task_bytes = waiting
-            .as_ref()
-            .map_or(0, crate::state::PlannedActivityTask::measure)
-            + parked.as_ref().map_or(0, crate::state::PlannedJob::measure);
-        let map_runs = planned.map_runs;
-        let map_run_bytes = crate::state::planned_map_run_bytes(&map_runs);
-        match store.answer_activity_task(
-            &input.task_token,
-            planned.opening,
-            planned.pending,
-            task_bytes + map_run_bytes,
-            // The unsuccessful step this continuation stopped at, if it stopped at
-            // one: what a later redrive continues the execution from.
-            planned.stopped_at,
-        ) {
-            Ok(()) => {
-                // The continuation reached ANOTHER activity task: it is queued for a
-                // worker to claim exactly as the first one was.
-                if let Some(waiting) = waiting {
-                    store.schedule_activity_task(&execution_arn, waiting);
-                }
-                // A Distributed Map state the continuation entered started a Map Run
-                // of its own, which `ListMapRuns` reports for this execution beside
-                // the ones its earlier states started.
-                store.append_map_runs(
-                    &execution_arn,
-                    &machine_arn,
-                    &machine_name,
-                    &crate::state::arn_region(&machine_arn),
-                    map_runs,
-                );
-                // The continuation PARKED at the job a run-a-job task started, which
-                // is polled to its end exactly as one a start parked at is.
-                if let Some(parked) = parked {
-                    let region = crate::state::arn_region(&machine_arn);
-                    store.park_job(&execution_arn, parked, &region);
-                    drop(store);
-                    crate::state::run_a_job::watch(
-                        std::sync::Arc::clone(&self.engine),
-                        ctx.callback().clone(),
-                        crate::state::integration::chain_depth(ctx),
-                        execution_arn.clone(),
+        // the task could have been answered or closed while the walk ran. The lock is
+        // held for THIS block alone, because the publication below must not hold the
+        // store while it is in flight; the block answers whether the continuation
+        // parked at a job of its own.
+        let watching = {
+            let mut store = state.lock();
+            store.settle(now);
+            let waiting = planned.waiting;
+            let parked = planned.parked;
+            let task_bytes = waiting
+                .as_ref()
+                .map_or(0, crate::state::PlannedActivityTask::measure)
+                + parked.as_ref().map_or(0, crate::state::PlannedJob::measure);
+            let map_runs = planned.map_runs;
+            let map_run_bytes = crate::state::planned_map_run_bytes(&map_runs);
+            let answered = store.answer_activity_task(
+                &input.task_token,
+                planned.opening,
+                planned.pending,
+                task_bytes + map_run_bytes,
+                // The unsuccessful step this continuation stopped at, if it stopped at
+                // one: what a later redrive continues the execution from.
+                planned.stopped_at,
+            );
+            match answered {
+                Ok(()) => {
+                    // The continuation reached ANOTHER activity task: it is queued for
+                    // a worker to claim exactly as the first one was.
+                    if let Some(waiting) = waiting {
+                        store.schedule_activity_task(&execution_arn, waiting);
+                    }
+                    // A Distributed Map state the continuation entered started a Map
+                    // Run of its own, which `ListMapRuns` reports for this execution
+                    // beside the ones its earlier states started.
+                    store.append_map_runs(
+                        &execution_arn,
+                        &machine_arn,
+                        &machine_name,
+                        &crate::state::arn_region(&machine_arn),
+                        map_runs,
                     );
+                    // The continuation PARKED at the job a run-a-job task started,
+                    // which is polled to its end exactly as one a start parked at is.
+                    let watching = parked.is_some();
+                    if let Some(parked) = parked {
+                        let region = crate::state::arn_region(&machine_arn);
+                        store.park_job(&execution_arn, parked, &region);
+                    }
+                    watching
                 }
-                Ok(SendTaskSuccessOutput {})
+                Err(crate::state::TaskReplyRejection::Gone) => {
+                    return Err(SendTaskSuccessErrorModeled::TaskTimedOut(TaskTimedOut {
+                        message: Some(crate::state::task_timed_out_message(&token_activity)),
+                    })
+                    .into())
+                }
+                // The continuation's own events and outcome are what the execution
+                // would grow by, so a reply the store has no room for is refused rather
+                // than retained past its ceiling. This operation models no limit error,
+                // so the refusal is the standard 400 validation envelope.
+                Err(crate::state::TaskReplyRejection::NoRoom) => {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "continuing execution {execution_arn} would take the store past the {} \
+                         bytes this emulator retains",
+                        crate::state::MAX_STORE_BYTES
+                    )))
+                }
             }
-            Err(crate::state::TaskReplyRejection::Gone) => {
-                Err(SendTaskSuccessErrorModeled::TaskTimedOut(TaskTimedOut {
-                    message: Some(crate::state::task_timed_out_message(&token_activity)),
-                })
-                .into())
-            }
-            // The continuation's own events and outcome are what the execution would
-            // grow by, so a reply the store has no room for is refused rather than
-            // retained past its ceiling. This operation models no limit error, so the
-            // refusal is the standard 400 validation envelope.
-            Err(crate::state::TaskReplyRejection::NoRoom) => {
-                Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "continuing execution {execution_arn} would take the store past the {} bytes \
-                     this emulator retains",
-                    crate::state::MAX_STORE_BYTES
-                )))
-            }
+        };
+        if watching {
+            crate::state::run_a_job::watch(
+                std::sync::Arc::clone(&self.engine),
+                ctx.callback().clone(),
+                crate::state::integration::chain_depth(ctx),
+                execution_arn.clone(),
+            );
         }
+        // The continuation may have carried the execution to its terminal status, which
+        // is a status change this service publishes onto the account's default event
+        // bus; the clock this starts publishes one the continuation left owed to a
+        // later instant.
+        crate::state::events::publish(&*self.engine, ctx.callback()).await;
+        Ok(SendTaskSuccessOutput {})
     }
 }
