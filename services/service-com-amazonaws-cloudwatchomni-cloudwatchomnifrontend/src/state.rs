@@ -192,6 +192,28 @@ pub const ALERT_EVALUATION_INTERVALS: &[i32] = &[30, 60, 120, 300, 600, 900, 180
 /// neither can grow without end.
 pub const ALERT_QUOTA: usize = 10_000;
 
+/// The resource type a view's ARN carries, in this service's ARN namespace.
+pub const VIEW_ARN_RESOURCE_TYPE: &str = "view";
+
+/// The resource type a refusal about a view names.
+pub const VIEW_RESOURCE_TYPE: &str = "View";
+
+/// `ViewType`'s value for a view created through this API.
+///
+/// `CreateView`'s model doc: "Only USER views can be created — MANAGED views are
+/// provisioned by AWS", and `ViewType`'s USER doc reads "A view created and owned by the
+/// customer."
+pub const VIEW_TYPE_USER: &str = "USER";
+
+/// How many views the store holds before `CreateView` refuses.
+///
+/// The emulator's OWN bound, for the same reason as [`DOMAIN_QUOTA`]: it bounds
+/// [`ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::views`] and, with it,
+/// `create_view_tokens` (one entry per live view), so neither can grow without end.
+/// `CreateView` declares no quota error, so the refusal past this bound is its modelled
+/// `ValidationException`.
+pub const VIEW_QUOTA: usize = 10_000;
+
 /// A dashboard as persisted. The wire `OmniDashboard` shape carries no parent id, so
 /// the space the dashboard lives in is kept beside it: a dashboard is addressed by its
 /// space AND its id.
@@ -276,6 +298,34 @@ pub struct StoredAlert {
     pub tags: HashMap<String, String>,
 }
 
+/// A view as persisted: a named, reusable SQL query of this account and region.
+///
+/// The model declares no single `View` structure — `CreateView`, `GetView` and
+/// `UpdateView` each answer with the same flat member set, and `ViewSummary` is that set
+/// without the definition — so the record holds those members once and each operation
+/// projects it.
+#[derive(Debug, Clone)]
+pub struct StoredView {
+    /// Creation order, so `ListViews`-style enumeration is stable.
+    pub seq: u64,
+    /// The view's name, which is its identity within the account and region.
+    pub name: String,
+    /// The view's ARN ([`view_arn`]).
+    pub arn: String,
+    /// The view's ownership category, a `ViewType` value.
+    pub r#type: String,
+    /// The SQL query that defines the view.
+    pub definition: String,
+    /// The view's description, when the request carried one.
+    pub description: Option<String>,
+    /// When the view was created.
+    pub created_at: ::aws_smithy_types::DateTime,
+    /// When the view was last updated; the creation instant until an update moves it.
+    pub updated_at: ::aws_smithy_types::DateTime,
+    /// The request's `tags`; no modelled operation reads them back yet.
+    pub tags: HashMap<String, String>,
+}
+
 /// Per-service state for com-amazonaws-cloudwatchomni-cloudwatchomnifrontend. A handler reaches it through [`service_state`].
 ///
 /// Every map here is BOUNDED: `domains` (and the two maps keyed one-to-one to a live
@@ -284,7 +334,8 @@ pub struct StoredAlert {
 /// [`ACCESS_PROFILE_QUOTA`], `access_grants` (and the token map keyed to a live grant)
 /// by [`ACCESS_GRANT_QUOTA`], `omni_dashboards` (and the token map keyed to a live
 /// dashboard) by [`OMNI_DASHBOARD_QUOTA`], `alerts` (and the token map keyed to a live
-/// alert) by [`ALERT_QUOTA`]. The creates refuse with the modelled
+/// alert) by [`ALERT_QUOTA`], `views` (and the token map keyed to a live view) by
+/// [`VIEW_QUOTA`]. The creates refuse with the modelled
 /// `ServiceQuotaExceededException` once the bound is reached, and the deletes release
 /// records and their tokens together, so nothing in the store grows without end.
 #[derive(Debug, Default)]
@@ -315,6 +366,12 @@ pub struct ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
     pub alerts: HashMap<String, StoredAlert>,
     /// `CreateAlert` `clientToken` -> the `alertId` that token created.
     pub create_alert_tokens: HashMap<String, String>,
+    /// Every persisted view, keyed by its name — which is a view's identity, since
+    /// `CreateView`'s doc reads "View names must be unique within the account and
+    /// region" and every view operation addresses one by name.
+    pub views: HashMap<String, StoredView>,
+    /// `CreateView` `clientToken` -> the view name that token created.
+    pub create_view_tokens: HashMap<String, String>,
     /// Hands out [`StoredDomain::seq`] / [`StoredSpace::seq`] / [`StoredAccessProfile::seq`]
     /// / [`StoredAccessGrant::seq`] / [`StoredOmniDashboard::seq`] / [`StoredAlert::seq`].
     next_seq: u64,
@@ -627,6 +684,18 @@ pub fn alert_arn(region: &str, alert_id: &str) -> String {
         ARN_NAMESPACE,
         region,
         &format!("{ALERT_ARN_RESOURCE_TYPE}/{alert_id}"),
+    )
+}
+
+/// The ARN of a view, in this service's ARN namespace.
+///
+/// A view is addressed by its name, which `CreateView` documents as unique within the
+/// account and region, so the name is the resource id its ARN carries.
+pub fn view_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{VIEW_ARN_RESOURCE_TYPE}/{name}"),
     )
 }
 
@@ -947,6 +1016,13 @@ pub fn notification_rules_rejection(rules: &[NotificationRule]) -> Option<String
 /// violated schema renders. It lives beside the store because several operations take a
 /// dashboard definition and all of them validate it the same way.
 mod dashboard_body;
+
+/// What a view's `definition` has to be, and the refusal text a definition that is not
+/// it renders. It lives beside the store because every operation that takes a view
+/// definition applies the same rule to it.
+mod view_definition;
+
+pub use view_definition::{view_definition_rejection, NOT_A_QUERY, NOT_A_QUERY_STATEMENT};
 
 pub use dashboard_body::{
     dashboard_body_rejection, dashboard_body_violations, DashboardBodyViolation,

@@ -24,6 +24,9 @@ tracing = { workspace = true }
 # Decodes the hex of a minted UUID, and encodes/decodes the opaque `nextToken`
 # pagination cursor ListSpaces hands back.
 hex = { workspace = true }
+# `sqlparser`: a view's `definition` is a SQL query, so it is PARSED with it rather than
+# inspected as text — see `state::view_definition`.
+sqlparser = "0.59"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
