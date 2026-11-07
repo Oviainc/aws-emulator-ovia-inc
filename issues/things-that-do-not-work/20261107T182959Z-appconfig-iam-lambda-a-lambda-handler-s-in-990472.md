@@ -1,0 +1,60 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: appconfig__iam__lambda.execution-role-without-appconfig-actions-denied-in-handler
+Issue-Key: appconfig__iam__lambda.execution-role-without-appconfig-actions-denied-in-handler|_invoke_until#25|Timeout|resp = lam.invoke(FunctionName=name, Payload=b'{"probe": "sim2real"}')
+Issue-Commit: c3a6f169c346304d6b4c388bf8378b1c143b9d70
+
+# appconfig__iam__lambda: a Lambda handler's in-process AppConfig read still never converges, so neither the granted-role success nor the AccessDeniedException for a role with no appconfig: action is ever produced
+
+> _Note: this issue was identified against the code base at commit `c3a6f169c346304d6b4c388bf8378b1c143b9d70`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+Invoke
+
+## Description
+One net-new root cause (one cause, Cause 1 of 1), grounded in a behavioral check that is killed at the harness cap without reaching any assertion.
+
+Failing check id: appconfig__iam__lambda.execution-role-without-appconfig-actions-denied-in-handler.
+
+PRIOR WORK, read first: open issue 20261106T144610Z-appconfig-iam-lambda-a-lambda-handler-s-in.md lists this check id, but it does NOT carry this replay's key for it and the report does not mark this check OWNED or ALREADY FILED (it owns only the two sibling checks appconfig__iam__lambda.handler-with-logical-id-identifiers-falls-back-to-default and appconfig__iam__lambda.in-place-identifier-fix-reaches-appconfig-only-once-all-three-are-real, which are excluded here). Also relevant and also not carrying it: 20261105T085348Z-appconfig-iam-lambda-the-in-process-lambda-python.md (filed against a handler faulting Runtime.ImportModuleError / no boto3 — the handler no longer reports FunctionError, it hangs instead) and 20261024T112615Z-appconfigdata-data-plane-deployed-configuration-never-served-sessions.md (the data-plane seam, which also notes "no authorization"). The identity leg described below is graded by no other open issue.
+
+AWS: appconfigdata models StartConfigurationSession (POST /configurationsessions, success 201, output InitialConfigurationToken, errors BadRequestException 400 / ResourceNotFoundException 404 / ThrottlingException 429 / InternalServerException 500) and GetLatestConfiguration (GET /configuration?configuration_token=..., success 200, Configuration as the @httpPayload blob, same error set); lambda Invoke answers StatusCode 200 with the handler's own payload and no X-Amz-Function-Error when the handler returns normally. Authorization of a function's execution role is not modelled — recorded behavior only, as the check's own comments state: (a) a handler under a role granting appconfig:StartConfigurationSession / appconfig:GetLatestConfiguration / appconfig:GetConfiguration, given the real application, environment and profile ids of a COMPLETE deployment, is served the deployed document byte-exactly, so its answer reports its 'appconfig' source and the deployed JSON; (b) the SAME handler and the SAME ids under a sibling execution role that grants NO appconfig: action is refused AccessDeniedException — NOT ResourceNotFoundException, which is what a wrong identifier gives, because the resources exist and are deployed — and falls back to its own hard-coded default; (c) the denial is the principal's, not the resource's, so an authorized caller outside Lambda is still served the same bytes by StartConfigurationSession+GetLatestConfiguration. Each leg is reachable within seconds of the deployment reaching COMPLETE.
+
+Emulator: "Error: Check timed out after 180.0s", verdict [mismatch] — no assertion in the check is reached. The two legs are each an invoke-until loop (240 s budget, 5 s between invocations) whose predicate is the handler's self-reported source: the positive leg waits for source == 'appconfig' and the identity-negative leg waits for source == 'default' before asserting the reported Error.Code is 'AccessDeniedException' and the config is the handler's default. Neither predicate ever holds, so none of the deployed-bytes answer, the AccessDeniedException classification, or the authorized-caller control is observable. Hypothesis: the handler's in-process appconfigdata read never yields the deployed configuration (so the positive-control predicate never holds and the loop burns its whole budget), and/or the emulator performs no IAM authorization on the appconfigdata data plane, so the under-privileged function is never denied anything and never reports 'default' either. The replay output shows only the timeout, so which leg stalls must be re-observed with the steps below.
+
+Why: this is the whole point of AppConfig for a serverless client. A function's flags silently stay at its compiled-in default, and the two faults an operator must be able to tell apart — a wrong identifier (ResourceNotFoundException) and a missing appconfig: grant (AccessDeniedException) — are indistinguishable and unobservable. Worse, if no authorization is performed at all, a function whose execution role grants nothing still reads production configuration here, so a least-privilege regression that AWS would catch passes against this emulator, and any caller polling in-process for the real value never returns.
+
+Fix: the lambda Invoke execution path's in-process AWS SDK environment together with the appconfigdata data-plane handlers it calls and the IAM authorization seam in front of them — a handler's StartConfigurationSession/GetLatestConfiguration against the emulator must return the deployed bytes for real ids under a granting role, and must be refused AccessDeniedException when the invoked function's execution role grants no appconfig: action, promptly enough for a synchronous invoke to answer, while an authorized caller outside Lambda keeps being served the bytes.
+
+Traces: appconfig__iam__lambda.execution-role-without-appconfig-actions-denied-in-handler. Generated role, function, application, environment and profile names/ids in that run are per-run values that only fill the templates; the requirements are the served bytes, the AccessDeniedException classification, and the handler falling back to its default.
+
+## Evidence
+Behavioral replay of suite simparity-behavioral-aws-v1 against the booted emulator: 205/240 passed (85.4%), 28 mismatched, 7 errored, 0 skipped; bootstrap_signal false (the emulator answered throughout, so this is not a bootstrap failure). Per-service appconfig__iam__lambda 2/6 (33%), 4 failed — the other three failures are marked OWNED by open issues (20261105T010503Z-... and 20261106T144610Z-...) and are excluded here.
+
+[mismatch] appconfig__iam__lambda.execution-role-without-appconfig-actions-denied-in-handler — Error: Check timed out after 180.0s. No assertion is reached, which is itself the finding: every wait the check contains is on something the emulator never produces.
+
+From the check source in the replay report (_INVOKE_TIMEOUT_S = 240, 5 s between invocations, each invocation also asserting StatusCode 200 and no FunctionError):
+  ok = _invoke_until(lam, permitted_fn, lambda a: a.get("source") == "appconfig", description="the permitted function reads AppConfig"); assert ok["config"] == json.loads(b'{"useNewBackend": true}')
+  bad = _invoke_until(lam, denied_fn, lambda a: a.get("source") == "default", description="the under-privileged function is denied"); assert bad["code"] == "AccessDeniedException" ('a role with no AppConfig actions must be denied AccessDeniedException — not ResourceNotFoundException, which is what a wrong identifier gives'); assert bad["config"] == {"useNewBackend": False}; assert bad["config"] != ok["config"]
+  assert _serve(acd, app_id, env_id, cp_id) == b'{"useNewBackend": true}' ('the configuration must still be servable to an authorized caller')
+The check first proves the two roles differ in exactly the three AppConfig statements by reading GetRolePolicy on each (the granted role's appconfig: actions must equal appconfig:StartConfigurationSession/GetLatestConfiguration/GetConfiguration, the sibling role's must be empty), so the only difference between the two functions is the execution role.
+
+Expected (AWS): the permitted function's invoke returns 200, no FunctionError, payload {"source": "appconfig", "config": {"useNewBackend": true}} (the deployed document, byte-exact through the data plane); the function under the role with no appconfig: action returns {"source": "default", "code": "AccessDeniedException", "config": {"useNewBackend": false}}; and StartConfigurationSession+GetLatestConfiguration from outside Lambda still serve b'{"useNewBackend": true}'.
+Actual (emulator): neither invoke-until predicate ever holds; the check is killed at the 180 s cap having produced none of those answers.
+
+Smithy consulted: appconfigdata StartConfigurationSession — POST /configurationsessions, code 201, errors BadRequestException/400, ResourceNotFoundException/404, ThrottlingException/429, InternalServerException/500; GetLatestConfiguration — GET /configuration (configuration_token query), code 200, Configuration @httpPayload blob, same error set. AccessDeniedException for an under-privileged principal is IAM authorization behavior and is not a modelled appconfigdata error — recorded behavior, as the check itself states.
+
+All constituent services are stood up in this checkout (appconfig, appconfigdata, iam, lambda), so this is a fidelity finding, not a bootstrap gap.
+
+## Steps to Reproduce
+Boot the emulator and point appconfig, appconfigdata, iam, lambda and logs clients at its data listener.
+1. CreateApplication, CreateEnvironment, CreateConfigurationProfile(LocationUri='hosted', Type='AWS.Freeform'); CreateHostedConfigurationVersion with Content b'{"useNewBackend": true}' and ContentType application/json.
+2. CreateDeploymentStrategy(DeploymentDurationInMinutes=0, GrowthFactor=100, GrowthType='LINEAR', FinalBakeTimeInMinutes=0, ReplicateTo='NONE') and StartDeployment of that version; poll GetDeployment until State == 'COMPLETE'.
+3. Control: StartConfigurationSession + GetLatestConfiguration from outside Lambda must return b'{"useNewBackend": true}'.
+4. Create role GRANTED: assumable by lambda, inline policy allowing logs:* plus appconfig:StartConfigurationSession, appconfig:GetLatestConfiguration, appconfig:GetConfiguration. Create role DENIED: identical except the appconfig: statement is absent. Verify with GetRolePolicy that GRANTED carries exactly those three appconfig: actions and DENIED carries none.
+5. Create two python functions from the SAME code under GRANTED and DENIED, each with env APP_CONFIG_APPLICATION/APP_CONFIG_ENVIRONMENT/APP_CONFIG_CONFIGURATION set to the REAL ids. The handler opens a configuration session, reads the configuration and returns {"source": "appconfig", "config": <parsed body>}; on any ClientError it returns {"source": "default", "code": <Error.Code>, "config": {"useNewBackend": false}}. Wait for both to become Active.
+6. Invoke the GRANTED function. EXPECTED: StatusCode 200, no FunctionError, payload {"source": "appconfig", "config": {"useNewBackend": true}}. OBSERVED: the scenario never reaches this answer — invoking every 5 s for up to 240 s never sees source 'appconfig'.
+7. Invoke the DENIED function. EXPECTED: StatusCode 200, no FunctionError, payload {"source": "default", "code": "AccessDeniedException", "config": {"useNewBackend": false}} — never ResourceNotFoundException (the ids are real and deployed), and never the deployed document.
+8. Repeat step 3: the bytes must still be served to an authorized caller, proving the denial is the principal's and not the resource's.
+Re-replay appconfig__iam__lambda.execution-role-without-appconfig-actions-denied-in-handler to confirm. If the 180 s per-check cap is still below what the setup needs (it creates two roles and two functions and waits for both to be active), also drive steps 6-8 directly.
