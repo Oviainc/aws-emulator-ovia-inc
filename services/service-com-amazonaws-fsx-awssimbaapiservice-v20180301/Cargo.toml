@@ -32,6 +32,11 @@ hex = { workspace = true }
 # than deciding it here. Only the generated client is needed — the emulator supplies the
 # transport.
 aws-sdk-ec2 = { version = "1", default-features = false }
+# The AWS SDK for Amazon S3, driven over the same in-process callback: the bucket a
+# `CreateDataRepositoryAssociation` links a file-system directory to is S3's resource, so
+# `src/state/s3_data_repository.rs` asks S3 whether it holds that bucket rather than assuming
+# it. Only the generated client is needed — the emulator supplies the transport.
+aws-sdk-s3 = { version = "1", default-features = false }
 # `arn::region_label`: the ONE reading of a caller-supplied Region as a Region LABEL,
 # which is what the endpoint the EC2 call above is made at is built from.
 service-common = { path = "../common" }
@@ -45,6 +50,11 @@ emulator-core-build-support = { workspace = true }
 # with the owner of subnets on the same engine. DEV-ONLY: this crate depends on no other
 # service's crate outside its tests.
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# The Amazon S3 service, mounted beside this one in the test harness for the same reason:
+# that a data repository association is accepted for a bucket the account holds and refused
+# for one it does not can only be driven end to end with the owner of buckets on the same
+# engine. DEV-ONLY.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

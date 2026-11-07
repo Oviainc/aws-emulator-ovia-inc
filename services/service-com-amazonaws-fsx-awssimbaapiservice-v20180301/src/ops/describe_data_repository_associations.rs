@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDataRepositoryAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDataRepositoryAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDataRepositoryAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored data repository associations: the ones
+//! `CreateDataRepositoryAssociation` wrote, selected by the ids the request names or by its
+//! `Filters` and paged over a stable order. Reporting only — it materialises nothing but the
+//! lifecycle transitions the clock had already made due. The ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -104,6 +100,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    data_repository_association_not_found_message, data_repository_associations_page_scope,
+    decode_page_token, page_size, unsupported_data_repository_association_filter_name_message,
+    DataRepositoryAssociationRecord, DATA_REPOSITORY_ASSOCIATION_FILTER_DATA_REPOSITORY_TYPE,
+    DATA_REPOSITORY_ASSOCIATION_FILTER_NAMES, DATA_REPOSITORY_TYPES,
+    MAX_DATA_REPOSITORY_ASSOCIATIONS_PER_PAGE,
+};
+use crate::state::unsupported_data_repository_type_message;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -177,17 +182,180 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDataRepositoryAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDataRepositoryAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDataRepositoryAssociations"))
+        // request metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeDataRepositoryAssociationsErrorModeled::InternalServerError(
+                    InternalServerError {
+                        message: Some(
+                            "the FSx data repository association store is unavailable".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // A reporting operation, so this only materialises transitions the clock had already
+        // made due at this instant.
+        store.settle_due_transitions();
+
+        let requested = input.association_ids.clone().unwrap_or_default();
+        let mut selected = requested.clone();
+        selected.sort();
+        selected.dedup();
+
+        // "if one or more AssociationIds values are provided in the request, or if filters
+        // are used in the request": the ids name the selection outright, so the filters take
+        // no part in it, nor in the page scope.
+        let filters = if requested.is_empty() {
+            normalised_filters(input.filters.as_deref())
+        } else {
+            Vec::new()
+        };
+
+        let keys: Vec<String> = if requested.is_empty() {
+            // Only the filter NAME is validated, and the one filter whose VALUES the model
+            // bounds: "use the data-repository-type filter with a value of S3 or NFS", so a
+            // value outside those two is the modelled `InvalidDataRepositoryType` ("you have
+            // filtered the response to a data repository type that is not supported"). Every
+            // other filter value is a selector, not an assertion that what it names exists:
+            // one naming no stored record matches nothing and leaves the page empty.
+            if let Some((unsupported, _)) = filters
+                .iter()
+                .find(|(name, _)| !DATA_REPOSITORY_ASSOCIATION_FILTER_NAMES.contains(&name.as_str()))
+            {
+                return Err(DescribeDataRepositoryAssociationsErrorModeled::BadRequest(
+                    BadRequest {
+                        message: Some(
+                            unsupported_data_repository_association_filter_name_message(
+                                unsupported,
+                            ),
+                        ),
+                    },
+                )
+                .into());
+            }
+            if let Some(unsupported) = filters
+                .iter()
+                .filter(|(name, _)| {
+                    name == DATA_REPOSITORY_ASSOCIATION_FILTER_DATA_REPOSITORY_TYPE
+                })
+                .flat_map(|(_, values)| values)
+                .find(|value| !DATA_REPOSITORY_TYPES.contains(&value.as_str()))
+            {
+                return Err(
+                    DescribeDataRepositoryAssociationsErrorModeled::InvalidDataRepositoryType(
+                        InvalidDataRepositoryType {
+                            message: Some(unsupported_data_repository_type_message(unsupported)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            store
+                .data_repository_associations
+                .iter()
+                .filter(|(_, record)| matches_filters(record, &filters))
+                .map(|(id, _)| id.clone())
+                .collect()
+        } else {
+            // An id the store holds no association for is the modelled
+            // `DataRepositoryAssociationNotFound` ("no data repository associations were
+            // found based upon the supplied parameters"), rather than a silently shorter
+            // list.
+            if let Some(missing) = requested
+                .iter()
+                .find(|id| !store.data_repository_associations.contains_key(*id))
+            {
+                return Err(
+                    DescribeDataRepositoryAssociationsErrorModeled::DataRepositoryAssociationNotFound(
+                        DataRepositoryAssociationNotFound {
+                            // Built from the id the caller asked about, so the response says
+                            // WHICH of the requested ids is missing.
+                            message: Some(data_repository_association_not_found_message(missing)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            selected.clone()
+        };
+
+        // The page token is scoped to the SELECTION it was minted for, so a token from an
+        // unfiltered listing is not accepted for a filtered one: a cursor only means
+        // anything over the same ordered set of keys.
+        let page_scope = data_repository_associations_page_scope(&selected, &filters);
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => match decode_page_token(&page_scope, token) {
+                Some(cursor) => Some(cursor),
+                // A token this service did not mint means nothing to it.
+                None => {
+                    return Err(DescribeDataRepositoryAssociationsErrorModeled::BadRequest(
+                        BadRequest {
+                            message: Some(
+                                "NextToken is not a token this service issued".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+            None => None,
+        };
+
+        let (page, next_token) = crate::state::paginate(
+            &page_scope,
+            &keys,
+            resume_after.as_deref(),
+            page_size(input.max_results, MAX_DATA_REPOSITORY_ASSOCIATIONS_PER_PAGE),
+        );
+
+        Ok(DescribeDataRepositoryAssociationsOutput {
+            associations: Some(
+                page.iter()
+                    .filter_map(|id| store.data_repository_associations.get(id))
+                    .map(DataRepositoryAssociationRecord::to_data_repository_association)
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The request's `Filters` as `(name, values)` pairs, in a normal form: each name's values
+/// sorted and deduplicated, and the pairs sorted by name.
+///
+/// So the same selection written in a different order is the same selection — which is what
+/// lets the page scope be built from it — and a filter that names nothing carries the empty
+/// name, which no supported name matches.
+fn normalised_filters(filters: Option<&[Filter]>) -> Vec<(String, Vec<String>)> {
+    let mut normalised: Vec<(String, Vec<String>)> = filters
+        .unwrap_or_default()
+        .iter()
+        .map(|filter| {
+            let mut values = filter.values.clone().unwrap_or_default();
+            values.sort();
+            values.dedup();
+            (filter.name.clone().unwrap_or_default(), values)
+        })
+        .collect();
+    normalised.sort();
+    normalised
+}
+
+/// Whether one stored association satisfies every filter: a value of each, which is how AWS
+/// documents a `Filter` — "you can use multiple filters to return results that meet all
+/// applied filter requirements", over "the values for any of the applied filters".
+fn matches_filters(
+    record: &DataRepositoryAssociationRecord,
+    filters: &[(String, Vec<String>)],
+) -> bool {
+    filters.iter().all(|(name, values)| {
+        record
+            .filtered_value(name)
+            .is_some_and(|stored| values.iter().any(|value| value == stored))
+    })
 }

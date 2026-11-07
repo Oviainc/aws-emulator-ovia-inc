@@ -428,6 +428,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .flatten()
                 .map(|tag| (tag.key.clone(), tag.value.clone()))
                 .collect::<BTreeMap<String, String>>(),
+            // Nothing has been asked of a file system that is only now being created, so
+            // there is no administrative action to report for it.
+            administrative_actions: Vec::new(),
             pending: Some(PendingTransition::due_now_plus_span(
                 TransitionTarget::Available,
             )),

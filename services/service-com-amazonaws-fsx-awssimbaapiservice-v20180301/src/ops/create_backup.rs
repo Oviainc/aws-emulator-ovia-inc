@@ -375,6 +375,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // clock: this copy is a record of the past, so it never transitions again.
             file_system: FileSystemRecord {
                 pending: None,
+                // A record of the past runs no administrative action either: the work the
+                // file system owes the clock belongs to the file system, not to its backup.
+                administrative_actions: Vec::new(),
                 ..file_system
             },
             // The volumes that file system has, likewise as they stand at this call: a

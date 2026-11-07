@@ -160,7 +160,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // type carries one tag map.
             ResourceLookup::FileSystem(id)
             | ResourceLookup::Backup(id)
-            | ResourceLookup::Volume(id) => id.clone(),
+            | ResourceLookup::Volume(id)
+            | ResourceLookup::DataRepositoryAssociation(id) => id.clone(),
             ResourceLookup::NotFound(resource_id) => {
                 return Err(UntagResourceErrorModeled::ResourceNotFound(ResourceNotFound {
                     resource_arn: input.resource_arn.clone(),

@@ -434,6 +434,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .flatten()
                 .map(|tag| (tag.key.clone(), tag.value.clone()))
                 .collect::<BTreeMap<String, String>>(),
+            // Nothing has been asked of the restored file system yet, so it reports no
+            // administrative action; the actions of the file system the backup was taken of
+            // belong to that file system.
+            administrative_actions: Vec::new(),
             // "The CreateFileSystemFromBackup call returns while the file system's
             // lifecycle state is still CREATING", so the clock owes it the way to
             // `AVAILABLE`.

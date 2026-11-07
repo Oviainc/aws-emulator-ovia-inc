@@ -438,10 +438,12 @@ async fn automatic_disk_iops_follows_the_file_systems_capacity() {
     .await;
     assert_eq!(
         disk_iops(&updated["FileSystem"], "OpenZFSConfiguration"),
-        // 3 * 256
-        Some((MODE_AUTOMATIC.to_string(), Some(768))),
-        "case \"OPENZFS grown to 256 GiB\": expected Mode {MODE_AUTOMATIC} with Iops 768, got \
-         {:?}",
+        // 3 * 64: the capacity the file system STILL has. Amazon FSx does not apply a
+        // capacity target in line — it records a FILE_SYSTEM_UPDATE administrative action —
+        // so the derived IOPS move only when that action completes.
+        Some((MODE_AUTOMATIC.to_string(), Some(192))),
+        "case \"OPENZFS asked to grow to 256 GiB\": expected Mode {MODE_AUTOMATIC} with the \
+         current Iops 192, got {:?}",
         updated["FileSystem"]["OpenZFSConfiguration"]
     );
     tokio::time::sleep(PAST_TRANSITION).await;

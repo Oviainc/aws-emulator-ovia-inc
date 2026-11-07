@@ -722,6 +722,10 @@ async fn update_mutates_the_stored_record_member_by_member() {
             "StorageType": "SSD",
             "FileSystemTypeVersion": "2.12",
             "NetworkType": "IPV4",
+            // A deployment type whose storage capacity CAN be increased: AWS documents that
+            // a `SCRATCH_1` file system's capacity cannot be, and a Lustre record that names
+            // no deployment type is read as that documented default.
+            "LustreConfiguration": { "DeploymentType": "SCRATCH_2" },
         }),
     )
     .await;
@@ -759,14 +763,25 @@ async fn update_mutates_the_stored_record_member_by_member() {
             &json!({ "FileSystemId": id, *member: value }),
         )
         .await;
+        // A storage-capacity target is carried out by a `FILE_SYSTEM_UPDATE` administrative
+        // action and Amazon FSx performs it in place, so the file system stays AVAILABLE
+        // while it runs; every other member is a customer-initiated update, which moves the
+        // lifecycle to UPDATING.
+        let capacity_target = *member == "StorageCapacity";
+        let in_flight_lifecycle = if capacity_target { "AVAILABLE" } else { "UPDATING" };
         assert_eq!(
-            response["FileSystem"]["Lifecycle"], json!("UPDATING"),
-            "case {case:?}: expected Lifecycle UPDATING while the update is in flight, got \
-             {:?}",
+            response["FileSystem"]["Lifecycle"], json!(in_flight_lifecycle),
+            "case {case:?}: expected Lifecycle {in_flight_lifecycle} while the update is in \
+             flight, got {:?}",
             response["FileSystem"]["Lifecycle"]
         );
         expected.insert((*member).to_string(), value.clone());
 
+        // A capacity target lands when the administrative action the clock owes completes,
+        // not on the call that asked for it.
+        if capacity_target {
+            tokio::time::sleep(PAST_TRANSITION).await;
+        }
         let described = describe_one(&router, &id).await;
         for (expected_member, expected_value) in &expected {
             assert_eq!(
@@ -837,11 +852,13 @@ async fn lifecycle_transitions_fall_due_after_the_call_that_starts_them() {
         "case after the transition span: expected Lifecycle AVAILABLE"
     );
 
-    // UPDATING, then back to AVAILABLE.
+    // UPDATING, then back to AVAILABLE. A property the update WRITES onto the record is what
+    // moves the lifecycle; a storage-capacity target is performed in place and leaves it
+    // AVAILABLE (see `tests/all/storage_capacity_update.rs`).
     ok(
         &router,
         "UpdateFileSystem",
-        &json!({ "FileSystemId": id, "StorageCapacity": 128 }),
+        &json!({ "FileSystemId": id, "NetworkType": "DUAL" }),
     )
     .await;
     assert_eq!(

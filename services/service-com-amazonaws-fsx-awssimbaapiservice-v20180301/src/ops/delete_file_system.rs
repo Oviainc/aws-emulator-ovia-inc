@@ -121,8 +121,7 @@
 use super::types::*;
 
 use crate::state::{
-    deleted_file_system_not_found_message, PendingTransition, TransitionTarget, LIFECYCLE_CREATING,
-    LIFECYCLE_DELETING,
+    deleted_file_system_not_found_message, PendingTransition, TransitionTarget, LIFECYCLE_DELETING,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -221,17 +220,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A file system that is still being created cannot be deleted yet.
-        if record.lifecycle == LIFECYCLE_CREATING {
-            return Err(DeleteFileSystemErrorModeled::BadRequest(BadRequest {
-                message: Some(format!(
-                    "file system {} cannot be deleted while it is {}",
-                    record.file_system_id, record.lifecycle
-                )),
-            })
-            .into());
-        }
-
+        // A delete is NOT gated on the file system's lifecycle. The only refusal this
+        // operation documents is a different one — "if a data repository task is in a
+        // `PENDING` or `EXECUTING` state, deleting an Amazon FSx for Lustre file system will
+        // fail with an HTTP status code 400 (Bad Request)" — and this slice stores no data
+        // repository tasks (`CreateDataRepositoryTask` is still 501), so no stored state can
+        // meet it. In particular a file system that is still coming up is deleted like any
+        // other: "the `DeleteFileSystem` operation returns while the file system has the
+        // `DELETING` status", which is the whole of what it reports.
+        //
         // `@idempotent`: a delete of a file system already on its way out reports the same
         // lifecycle again and does not restart the removal the clock already owes.
         if record.lifecycle != LIFECYCLE_DELETING {

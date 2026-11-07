@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataRepositoryAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataRepositoryAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataRepositoryAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Links a directory of an FSx for Lustre file system to an Amazon S3 bucket or prefix. The
+//! bucket is Amazon S3's resource, so it is resolved where S3 holds it
+//! (`crate::state::s3_data_repository`) before the association is stored; an accepted
+//! association is persisted in `CREATING` and read back by
+//! `DescribeDataRepositoryAssociations`. The ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -123,6 +119,19 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+use std::time::SystemTime;
+
+use crate::state::{
+    bucket_is_absent, data_repository_association_arn, data_repository_association_limit_message,
+    file_system_not_found_message, parse_s3_data_repository_path,
+    DataRepositoryAssociationRecord, PendingTransition, TransitionTarget,
+    DATA_REPOSITORY_LIFECYCLE_CREATING, DEFAULT_BATCH_IMPORT_META_DATA_ON_CREATE,
+    DEFAULT_IMPORTED_FILE_CHUNK_SIZE, DEFAULT_LUSTRE_DEPLOYMENT_TYPE, FILE_SYSTEM_TYPE_LUSTRE,
+    LUSTRE_DEPLOYMENT_SCRATCH_1, MALFORMED_S3_DATA_REPOSITORY_PATH_MESSAGE,
+    MAX_DATA_REPOSITORY_ASSOCIATIONS_PER_FILE_SYSTEM, UNVALIDATED_S3_BUCKET_MESSAGE,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -196,18 +205,277 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataRepositoryAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDataRepositoryAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataRepositoryAssociation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDataRepositoryAssociationErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the FSx file-system store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Every ARN this service mints is built for the region the caller signed for.
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let requested_tags: BTreeMap<String, String> = input
+            .tags
+            .iter()
+            .flatten()
+            .map(|tag| (tag.key.clone(), tag.value.clone()))
+            .collect();
+        let fingerprint = association_parameter_fingerprint(&input, &requested_tags);
+
+        {
+            let mut store = state.lock();
+            store.settle_due_transitions();
+
+            // `@idempotencyToken`, as AWS documents it: "(Optional) An idempotency token for
+            // resource creation". A token whose first call's parameters match replays that
+            // call's answer; one whose parameters differ is the modelled
+            // `IncompatibleParameterError`. A request carrying no token replays nothing.
+            if let Some(token) = input.client_request_token.as_deref() {
+                if let Some(previous) = store
+                    .data_repository_association_idempotency_tokens
+                    .get(token)
+                    .cloned()
+                {
+                    match store
+                        .data_repository_associations
+                        .get(&previous.association_id)
+                    {
+                        Some(_) if previous.fingerprint != fingerprint => {
+                            return Err(
+                                CreateDataRepositoryAssociationErrorModeled::IncompatibleParameterError(
+                                    IncompatibleParameterError {
+                                        parameter: "ClientRequestToken".to_string(),
+                                        message: Some(format!(
+                                            "the client request token {token} was already used to \
+                                             create {} with different parameters",
+                                            previous.association_id
+                                        )),
+                                    },
+                                )
+                                .into(),
+                            );
+                        }
+                        Some(record) => {
+                            return Ok(CreateDataRepositoryAssociationOutput {
+                                association: Some(record.to_data_repository_association()),
+                            });
+                        }
+                        // The association that token created is gone, so the token replays
+                        // nothing: drop it and create a new association below.
+                        None => {
+                            store.forget_data_repository_association_idempotency_token(token);
+                        }
+                    }
+                }
+            }
+
+            // An association is created ON a file system the account HAS.
+            let Some(file_system) = store.file_systems.get(&input.file_system_id) else {
+                return Err(CreateDataRepositoryAssociationErrorModeled::FileSystemNotFound(
+                    FileSystemNotFound {
+                        // Built from the id the caller asked about, so the response says
+                        // WHICH file system was missing.
+                        message: Some(file_system_not_found_message(&input.file_system_id)),
+                    },
+                )
+                .into());
+            };
+
+            // "Data repository associations are supported on all FSx for Lustre 2.12 and
+            // 2.15 file systems, excluding scratch_1 deployment type" — and on Amazon File
+            // Cache resources, which this service does not store. Any other file system can
+            // hold no association at all, which the model words as `UnsupportedOperation`
+            // ("the requested operation is not supported for this resource or API").
+            if let Some(refusal) = associations_unsupported(file_system) {
+                return Err(refusal);
+            }
+        }
+
+        // The data repository is Amazon S3's resource, not this service's: the path has to be
+        // the documented `s3://bucket-name/prefix/` form, and Amazon FSx validates its access
+        // to that bucket before it will accept the association. So the bucket is resolved
+        // where S3 holds it, with THIS service's guard released — nothing of this store is
+        // held while another service is asked.
+        let Some(path) = parse_s3_data_repository_path(&input.data_repository_path) else {
+            return Err(CreateDataRepositoryAssociationErrorModeled::BadRequest(BadRequest {
+                message: Some(MALFORMED_S3_DATA_REPOSITORY_PATH_MESSAGE.to_string()),
+            })
+            .into());
+        };
+        if bucket_is_absent(ctx, &region, &path.bucket).await {
+            return Err(CreateDataRepositoryAssociationErrorModeled::BadRequest(BadRequest {
+                message: Some(UNVALIDATED_S3_BUCKET_MESSAGE.to_string()),
+            })
+            .into());
+        }
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        // Re-read after the hop above: the file system may have been deleted while S3 was
+        // being asked, and an association of a file system that is gone would belong to
+        // nothing.
+        if !store.file_systems.contains_key(&input.file_system_id) {
+            return Err(CreateDataRepositoryAssociationErrorModeled::FileSystemNotFound(
+                FileSystemNotFound {
+                    message: Some(file_system_not_found_message(&input.file_system_id)),
+                },
+            )
+            .into());
+        }
+
+        // "Two data repository associations cannot have overlapping file system paths", and
+        // "this file system directory can be linked to only one Amazon S3 bucket, and no
+        // other S3 bucket can be linked to the directory": a directory that is already linked
+        // cannot be linked again, which the model gives no more specific error for than
+        // `BadRequest`.
+        let requested_path = input.file_system_path.clone().unwrap_or_default();
+        if let Some(existing) =
+            store.overlapping_data_repository_association(&input.file_system_id, &requested_path)
+        {
+            let message = format!(
+                "The file system path overlaps the path of the existing data repository \
+                 association {}.",
+                existing.association_id
+            );
+            return Err(CreateDataRepositoryAssociationErrorModeled::BadRequest(BadRequest {
+                message: Some(message),
+            })
+            .into());
+        }
+
+        // The record store is bounded by the service's own documented maximum per file
+        // system. Checked here, before an id is minted, and enforced again by
+        // `insert_data_repository_association` below, which is the one write path.
+        if store.data_repository_association_count_of_file_system(&input.file_system_id)
+            >= MAX_DATA_REPOSITORY_ASSOCIATIONS_PER_FILE_SYSTEM
+        {
+            return Err(association_limit_exceeded(
+                crate::state::DataRepositoryAssociationLimitReached::PerFileSystem,
+            ));
+        }
+
+        let association_id = store.mint_data_repository_association_id();
+        let record = DataRepositoryAssociationRecord {
+            resource_arn: data_repository_association_arn(&region, &association_id),
+            association_id: association_id.clone(),
+            file_system_id: input.file_system_id.clone(),
+            // "The same call against a bucket that does exist succeeds with an Association
+            // whose Lifecycle is CREATING": the association is not usable the instant it is
+            // asked for, and the clock owes it its way to `AVAILABLE`.
+            lifecycle: DATA_REPOSITORY_LIFECYCLE_CREATING.to_string(),
+            file_system_path: input.file_system_path.clone(),
+            data_repository_path: input.data_repository_path.clone(),
+            // The documented defaults are MATERIALISED rather than echoed, so a stored
+            // association reports the behaviour it really has.
+            batch_import_meta_data_on_create: input
+                .batch_import_meta_data_on_create
+                .unwrap_or(DEFAULT_BATCH_IMPORT_META_DATA_ON_CREATE),
+            imported_file_chunk_size: input
+                .imported_file_chunk_size
+                .unwrap_or(DEFAULT_IMPORTED_FILE_CHUNK_SIZE),
+            s3: input.s3.clone(),
+            creation_time: SystemTime::now(),
+            tags: requested_tags,
+            pending: Some(PendingTransition::due_now_plus_span(
+                TransitionTarget::Available,
+            )),
+        };
+        if let Err(limit) = store.insert_data_repository_association(record.clone()) {
+            return Err(association_limit_exceeded(limit));
+        }
+        if let Some(token) = input.client_request_token.clone() {
+            store.remember_idempotent_data_repository_association(
+                token,
+                crate::state::IdempotentDataRepositoryAssociation {
+                    association_id,
+                    fingerprint,
+                },
+            );
+        }
+
+        // The response is the STORED record, so a following
+        // `DescribeDataRepositoryAssociations` reports the very same values.
+        Ok(CreateDataRepositoryAssociationOutput {
+            association: Some(record.to_data_repository_association()),
+        })
     }
+}
+
+/// The modelled refusal for a file system that can hold no data repository association:
+/// `UnsupportedOperation`, naming what about the file system makes it unsupported.
+///
+/// From this operation's own documentation — "Data repository associations are supported on
+/// all FSx for Lustre 2.12 and 2.15 file systems, excluding scratch_1 deployment type" — over
+/// the modelled `FileSystemType` and `LustreDeploymentType` enumerations. The version half of
+/// that sentence is not decided here: `FileSystemTypeVersion` is a member a caller can update
+/// (`UpdateFileSystem` lists it), so refusing on it would refuse a file system that is one
+/// call away from being supported, while the type and the deployment type are fixed at
+/// creation.
+fn associations_unsupported(
+    file_system: &crate::state::FileSystemRecord,
+) -> Option<CreateDataRepositoryAssociationError> {
+    let unsupported = if file_system.file_system_type != FILE_SYSTEM_TYPE_LUSTRE {
+        format!(
+            "file systems of type {}",
+            file_system.file_system_type.clone()
+        )
+    } else {
+        let deployment_type = file_system
+            .lustre_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.deployment_type.as_deref())
+            .unwrap_or(DEFAULT_LUSTRE_DEPLOYMENT_TYPE);
+        if deployment_type != LUSTRE_DEPLOYMENT_SCRATCH_1 {
+            return None;
+        }
+        format!("FSx for Lustre file systems with the {deployment_type} deployment type")
+    };
+    Some(
+        CreateDataRepositoryAssociationErrorModeled::UnsupportedOperation(UnsupportedOperation {
+            message: Some(format!(
+                "Data repository associations are not supported for {unsupported}."
+            )),
+        })
+        .into(),
+    )
+}
+
+/// The modelled refusal for a create that would hold more associations than the service's own
+/// documented maximum, worded once beside the bounds themselves.
+fn association_limit_exceeded(
+    limit: crate::state::DataRepositoryAssociationLimitReached,
+) -> CreateDataRepositoryAssociationError {
+    CreateDataRepositoryAssociationErrorModeled::BadRequest(BadRequest {
+        message: Some(data_repository_association_limit_message(limit)),
+    })
+    .into()
+}
+
+/// A FIXED-SIZE digest of the parameters one create call states, for the
+/// `@idempotencyToken` comparison: a replay carrying the same token but different parameters
+/// is `IncompatibleParameterError`, and a digest is what makes remembering one token cost a
+/// bounded amount of memory however large the request was.
+///
+/// Every member that decides what the association IS takes part; the token itself does not,
+/// because it is the key the digest is remembered under.
+fn association_parameter_fingerprint(
+    input: &CreateDataRepositoryAssociationInput,
+    tags: &BTreeMap<String, String>,
+) -> String {
+    let rendered = format!(
+        "{}|{:?}|{}|{:?}|{:?}|{:?}|{:?}",
+        input.file_system_id,
+        input.file_system_path,
+        input.data_repository_path,
+        input.batch_import_meta_data_on_create,
+        input.imported_file_chunk_size,
+        input.s3.as_ref().map(|s3| format!("{s3:?}")),
+        tags,
+    );
+    ::hex::encode(<::sha2::Sha256 as ::sha2::Digest>::digest(
+        rendered.as_bytes(),
+    ))
 }

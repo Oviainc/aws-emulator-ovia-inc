@@ -3,7 +3,9 @@
 //! @op UpdateFileSystem
 //! Mutates the stored file-system record in place, so the response and every later
 //! `DescribeFileSystems` report the same values. Only the members the request carries
-//! change. The ONLY file to touch for this operation.
+//! change. The ONE exception is `StorageCapacity`, which AWS carries out asynchronously: an
+//! accepted target becomes a `FILE_SYSTEM_UPDATE` administrative action on the record and is
+//! reported only once that action completes. The ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -125,8 +127,10 @@ use super::types::*;
 
 use crate::state::{
     apply_lustre_update, apply_ontap_update, apply_open_zfs_update, apply_windows_update,
-    file_system_not_found_message, route_table_merge_fits, PendingTransition, TransitionTarget,
-    LIFECYCLE_AVAILABLE, LIFECYCLE_MISCONFIGURED, LIFECYCLE_UPDATING, MAX_ROUTE_TABLE_IDS,
+    file_system_not_found_message, route_table_merge_fits, storage_capacity_refusal,
+    storage_capacity_refusal_message, AdministrativeActionRecord, PendingTransition,
+    TransitionTarget, LIFECYCLE_AVAILABLE, LIFECYCLE_MISCONFIGURED, LIFECYCLE_UPDATING,
+    MAX_ROUTE_TABLE_IDS,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -270,11 +274,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(route_table_limit_exceeded());
         }
 
-        // Each member the request carries replaces the stored one; an absent member leaves
-        // the stored value alone.
-        if input.storage_capacity.is_some() {
-            record.storage_capacity = input.storage_capacity;
+        // Pre-flight, BEFORE anything is mutated: a storage-capacity target has to be one
+        // the file system can move to, by the rule AWS documents for its type on
+        // `UpdateFileSystemRequest$StorageCapacity` (see
+        // `crate::state::storage_capacity_refusal`). A target outside it is refused with the
+        // modelled `BadRequest` — "a generic error indicating a failure with a client
+        // request", the error this operation models for a value it cannot act on — and the
+        // record is left exactly as it was, so no administrative action is recorded for it
+        // either.
+        if let Some(requested) = input.storage_capacity {
+            if let Some(refusal) = storage_capacity_refusal(record, requested) {
+                return Err(UpdateFileSystemErrorModeled::BadRequest(BadRequest {
+                    message: Some(storage_capacity_refusal_message(&refusal)),
+                })
+                .into());
+            }
         }
+
+        // Each member the request carries replaces the stored one; an absent member leaves
+        // the stored value alone. `StorageCapacity` is the exception: AWS does not apply a
+        // capacity target in line, so it is recorded as an administrative action below
+        // instead of written onto the record here.
         if let Some(storage_type) = input.storage_type.clone() {
             record.storage_type = storage_type;
         }
@@ -332,18 +352,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `AUTOMATIC` IOPS count with it, and one that provisioned its own value keeps it.
         record.materialize_provisioned_disk_iops();
 
+        // An accepted capacity target is work Amazon FSx STARTS rather than a value it
+        // writes: the response still reports the capacity the file system has, and carries a
+        // `FILE_SYSTEM_UPDATE` administrative action whose `TargetFileSystemValues` name the
+        // target. The clock owes that action its `COMPLETED`, at which point the file system
+        // reports the new capacity (`crate::state::administrative_actions`).
+        if let Some(requested) = input.storage_capacity {
+            record.record_administrative_action(AdministrativeActionRecord::file_system_update(
+                requested,
+            ));
+        }
+
         // An update is a customer-initiated change, which the modelled lifecycle calls
         // `UPDATING` ("The file system is undergoing a customer-initiated update"); the
         // clock owes it the way back to `AVAILABLE`.
-        record.lifecycle = LIFECYCLE_UPDATING.to_string();
-        record.pending = Some(PendingTransition::due_now_plus_span(
-            TransitionTarget::Available,
-        ));
+        //
+        // A capacity target does NOT move the lifecycle: Amazon FSx performs a storage
+        // capacity change in place, so the file system stays available throughout it and the
+        // administrative action above is the whole of what a caller polls. So the lifecycle
+        // moves exactly when the request changed one of the members that ARE written onto the
+        // record.
+        if changes_the_record(&input) {
+            record.lifecycle = LIFECYCLE_UPDATING.to_string();
+            record.pending = Some(PendingTransition::due_now_plus_span(
+                TransitionTarget::Available,
+            ));
+        }
 
         Ok(UpdateFileSystemOutput {
             file_system: Some(record.to_file_system()),
         })
     }
+}
+
+/// Whether `input` carries a member this update WRITES onto the stored record — everything
+/// but `StorageCapacity`, which is carried out by an administrative action instead.
+///
+/// This is what decides whether the file system owes the clock a `UPDATING` -> `AVAILABLE`
+/// transition, so it is read off the request's members rather than from a comparison of
+/// values: AWS reports a customer-initiated update as `UPDATING` whether or not the value it
+/// states differs from the stored one.
+fn changes_the_record(input: &UpdateFileSystemInput) -> bool {
+    input.storage_type.is_some()
+        || input.file_system_type_version.is_some()
+        || input.network_type.is_some()
+        || input.windows_configuration.is_some()
+        || input.lustre_configuration.is_some()
+        || input.ontap_configuration.is_some()
+        || input.open_zfs_configuration.is_some()
 }
 
 /// The modelled refusal for a route-table merge that would exceed

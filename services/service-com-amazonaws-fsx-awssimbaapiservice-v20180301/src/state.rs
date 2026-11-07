@@ -214,6 +214,12 @@ pub struct FileSystemRecord {
     pub ontap_configuration: Option<OntapFileSystemConfiguration>,
     pub open_zfs_configuration: Option<OpenZFSFileSystemConfiguration>,
     pub tags: BTreeMap<String, String>,
+    /// The asynchronous work an `UpdateFileSystem` has STARTED on this file system, oldest
+    /// first, which `FileSystem$AdministrativeActions` reports. Written only through
+    /// [`FileSystemRecord::record_administrative_action`], which bounds it; settled by
+    /// [`FileSystemRecord::settle_due_administrative_actions`]. See
+    /// [`administrative_actions`].
+    pub administrative_actions: Vec<AdministrativeActionRecord>,
     pub pending: Option<PendingTransition>,
 }
 
@@ -239,10 +245,17 @@ impl FileSystemRecord {
             tags: tag_list(&self.tags),
             windows_configuration: self.windows_configuration.clone(),
             lustre_configuration: self.lustre_configuration.clone(),
-            // No administrative action is tracked by this slice: nothing runs
-            // asynchronously that a caller could watch, so reporting one would be a
-            // status for work that never happened.
-            administrative_actions: None,
+            // The work an `UpdateFileSystem` started and the clock either still owes or has
+            // completed, read off the stored actions: a storage-capacity target is carried
+            // out by one of these rather than applied in line, so this is what a caller
+            // polls. `None` rather than an empty list when there is none, so a file system
+            // nothing has been asked of reports no action at all.
+            administrative_actions: (!self.administrative_actions.is_empty()).then(|| {
+                self.administrative_actions
+                    .iter()
+                    .map(AdministrativeActionRecord::to_administrative_action)
+                    .collect()
+            }),
             ontap_configuration: self.ontap_configuration.clone(),
             file_system_type_version: self.file_system_type_version.clone(),
             open_zfs_configuration: self.open_zfs_configuration.clone(),
@@ -353,6 +366,26 @@ pub struct ComAmazonawsFsxAwssimbaapiserviceV20180301State {
     pub volumes: BTreeMap<String, VolumeRecord>,
     /// Source of minted `VolumeId`s.
     pub next_volume_id_counter: u64,
+    /// Stored data repository associations, keyed by `AssociationId`. A `BTreeMap` for the
+    /// same reason as `file_systems`: `DescribeDataRepositoryAssociations` pages over it, and
+    /// minted ids sort in creation order. See [`data_repository_associations`] for the record.
+    /// BOUNDED by [`MAX_DATA_REPOSITORY_ASSOCIATIONS`], and per file system by
+    /// [`MAX_DATA_REPOSITORY_ASSOCIATIONS_PER_FILE_SYSTEM`]; write it through
+    /// [`ComAmazonawsFsxAwssimbaapiserviceV20180301State::insert_data_repository_association`],
+    /// which enforces both.
+    pub data_repository_associations: BTreeMap<String, DataRepositoryAssociationRecord>,
+    /// Source of minted `AssociationId`s.
+    pub next_data_repository_association_id_counter: u64,
+    /// `ClientRequestToken` -> the replay it stands for, for the `@idempotencyToken`
+    /// behaviour on `CreateDataRepositoryAssociation`. Written only through
+    /// [`ComAmazonawsFsxAwssimbaapiserviceV20180301State::remember_idempotent_data_repository_association`],
+    /// which bounds it. Separate from the other token maps because a token is scoped to the
+    /// operation that minted it.
+    pub data_repository_association_idempotency_tokens:
+        HashMap<String, IdempotentDataRepositoryAssociation>,
+    /// Insertion order of `data_repository_association_idempotency_tokens`, oldest first —
+    /// what lets that map be bounded, exactly as `token_order` bounds the first one.
+    data_repository_association_token_order: VecDeque<String>,
 }
 
 /// What an FSx `ResourceARN` names, once resolved against the store.
@@ -364,6 +397,8 @@ pub enum ResourceLookup {
     Backup(String),
     /// A volume this service stores, by `VolumeId`.
     Volume(String),
+    /// A data repository association this service stores, by `AssociationId`.
+    DataRepositoryAssociation(String),
     /// An ARN naming a resource type FSx owns that holds no record here:
     /// `ResourceNotFound`. Carries the resource id from the request's ARN, because the
     /// error's `Message` is built from the identifier the caller sent (see
@@ -396,8 +431,13 @@ impl ComAmazonawsFsxAwssimbaapiserviceV20180301State {
         let now = Instant::now();
         self.settle_due_backup_transitions(now);
         self.settle_due_volume_transitions(now);
+        self.settle_due_data_repository_association_transitions(now);
         let mut removed: Vec<String> = Vec::new();
         for (id, record) in &mut self.file_systems {
+            // The asynchronous work the file system owes the clock, which is settled whatever
+            // its lifecycle: a storage-capacity increase runs while the file system stays
+            // `AVAILABLE`.
+            record.settle_due_administrative_actions(now);
             let Some(pending) = record.pending else {
                 continue;
             };
@@ -417,6 +457,9 @@ impl ComAmazonawsFsxAwssimbaapiserviceV20180301State {
             // A volume belongs to its file system, so the records go with it rather than
             // outliving the file system that had them.
             self.remove_volumes_of_file_system(&id);
+            // A data repository association belongs to its file system too, for the same
+            // reason.
+            self.remove_data_repository_associations_of_file_system(&id);
             // A token whose file system is gone replays nothing, so it is released with
             // the record rather than held for the life of the process.
             self.forget_tokens_for(&id);
@@ -492,6 +535,13 @@ impl ComAmazonawsFsxAwssimbaapiserviceV20180301State {
         {
             return ResourceLookup::Volume(arn.resource_id);
         }
+        if arn.resource_type == ASSOCIATION_RESOURCE_TYPE
+            && self
+                .data_repository_associations
+                .contains_key(&arn.resource_id)
+        {
+            return ResourceLookup::DataRepositoryAssociation(arn.resource_id);
+        }
         // An FSx resource type this slice does not store yet (a snapshot, an SVM) holds no
         // record either, because the operations that would create one are still 501 — so
         // there is genuinely no such resource. The id the ARN named travels with the
@@ -512,6 +562,10 @@ impl ComAmazonawsFsxAwssimbaapiserviceV20180301State {
             }
             ResourceLookup::Backup(id) => self.backups.get(id).map(|record| &record.tags),
             ResourceLookup::Volume(id) => self.volumes.get(id).map(|record| &record.tags),
+            ResourceLookup::DataRepositoryAssociation(id) => self
+                .data_repository_associations
+                .get(id)
+                .map(|record| &record.tags),
             ResourceLookup::NotFound(_) | ResourceLookup::NotFsxResource => None,
         }
     }
@@ -528,6 +582,10 @@ impl ComAmazonawsFsxAwssimbaapiserviceV20180301State {
             }
             ResourceLookup::Backup(id) => self.backups.get_mut(id).map(|record| &mut record.tags),
             ResourceLookup::Volume(id) => self.volumes.get_mut(id).map(|record| &mut record.tags),
+            ResourceLookup::DataRepositoryAssociation(id) => self
+                .data_repository_associations
+                .get_mut(id)
+                .map(|record| &mut record.tags),
             ResourceLookup::NotFound(_) | ResourceLookup::NotFsxResource => None,
         }
     }
@@ -663,6 +721,22 @@ pub use backups::*;
 /// through `crate::state` like everything else here.
 mod volumes;
 pub use volumes::*;
+
+/// The administrative-action slice: the asynchronous work an `UpdateFileSystem` starts, and
+/// the storage-capacity target rule that decides whether it may start. Re-exported, so a
+/// handler reaches it through `crate::state` like everything else here.
+mod administrative_actions;
+pub use administrative_actions::*;
+
+/// The data-repository-association slice: the links `CreateDataRepositoryAssociation` writes
+/// and `DescribeDataRepositoryAssociations` reads. Re-exported, as above.
+mod data_repository_associations;
+pub use data_repository_associations::*;
+
+/// Resolving the Amazon S3 bucket an association's `DataRepositoryPath` names against the
+/// service that OWNS buckets, which is not this one. Re-exported, as above.
+mod s3_data_repository;
+pub use s3_data_repository::*;
 
 /// Remember one `ClientRequestToken` replay in a bounded map, dropping the oldest once
 /// [`MAX_IDEMPOTENCY_TOKENS`] are held.

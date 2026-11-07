@@ -21,6 +21,8 @@ mod create_file_system_from_backup;
 mod create_file_system_resolves_ec2_subnets;
 #[path = "all/create_file_system_validation.rs"]
 mod create_file_system_validation;
+#[path = "all/data_repository_associations.rs"]
+mod data_repository_associations;
 #[path = "all/disk_iops_configuration.rs"]
 mod disk_iops_configuration;
 #[path = "all/describe_backups_filter_selection.rs"]
@@ -33,3 +35,5 @@ mod not_found_messages;
 mod open_zfs_root_volume;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/storage_capacity_update.rs"]
+mod storage_capacity_update;
