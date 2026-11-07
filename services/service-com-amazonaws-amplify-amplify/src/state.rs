@@ -1292,6 +1292,19 @@ impl ComAmazonawsAmplifyAmplifyState {
             .find_map(|app| app.webhooks.get(webhook_id))
     }
 
+    /// The webhook `webhook_id` names, whichever app holds it, to MUTATE.
+    ///
+    /// The same resolution as [`Self::webhook`], for the operation that writes the
+    /// record rather than reading it: a webhook is addressed by its id alone, so the
+    /// app holding it is found rather than named by the request. One lookup for both
+    /// sides keeps `UpdateWebhook` and `GetWebhook` from disagreeing about which
+    /// webhook an id resolves to.
+    pub fn webhook_mut(&mut self, webhook_id: &str) -> Option<&mut Webhook> {
+        self.apps
+            .values_mut()
+            .find_map(|app| app.webhooks.get_mut(webhook_id))
+    }
+
     /// The tag map of the resource `resource_arn` names, to READ.
     ///
     /// Answers the map the resource carries — the empty map when it carries none —

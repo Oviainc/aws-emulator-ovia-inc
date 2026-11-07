@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWebhook
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWebhook`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWebhook::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +138,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWebhook` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWebhookErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateWebhookErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the Amplify emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let updated_at = crate::state::now();
+        let mut store = state.lock();
+
+        // `UpdateWebhook` updates an EXISTING webhook, addressed by its id alone
+        // whichever app holds it: an id this store does not hold is the modelled 404
+        // rather than a webhook created on the way.
+        let webhook = store.webhook_mut(&input.webhook_id).ok_or_else(|| {
+            UpdateWebhookErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    crate::state::WEBHOOK_ENTITY,
+                    &input.webhook_id,
+                )),
+            })
+        })?;
+
+        // Every member the request CARRIES replaces the stored one; a member it omits
+        // is left as it was, so re-pointing a webhook at another branch does not clear
+        // its description.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWebhook"))
+        // Destructuring rather than reading `input.<member>` is deliberate: a member
+        // added to the model fails to compile here instead of being silently dropped.
+        let UpdateWebhookInput {
+            webhook_id: _,
+            branch_name,
+            description,
+        } = input;
+
+        // Both are @required members of `Webhook`, so a supplied value replaces the
+        // stored one and neither can become absent.
+        crate::state::apply(&mut webhook.branch_name, branch_name);
+        crate::state::apply(&mut webhook.description, description);
+
+        // An update does NOT re-mint the webhook's identity: `webhookId`, the ARN built
+        // from it and the URL carrying its trigger token stay as the create handed them
+        // out, so a trigger a caller already holds keeps working after the webhook is
+        // re-pointed. `createTime` likewise keeps the instant the webhook was created,
+        // while `updateTime` becomes the instant of THIS call.
+        webhook.update_time = updated_at;
+
+        // The answer is the record just written, so the read that follows sees exactly
+        // what the caller was handed.
+        Ok(UpdateWebhookOutput {
+            webhook: webhook.clone(),
+        })
     }
 }

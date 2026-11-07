@@ -222,6 +222,12 @@ impl Emulator {
             .await
     }
 
+    /// The webhook `webhook_id` names, updated — addressed by its own id, like the read.
+    pub(crate) async fn update_webhook(&self, webhook_id: &str, request: &Value) -> Reply {
+        self.call("POST", &format!("/webhooks/{webhook_id}"), Some(request))
+            .await
+    }
+
     /// One page of `app_id`'s webhooks; `query` is the raw query string (`""` for
     /// none), so a suite can drive `maxResults` and `nextToken` exactly as a client
     /// would.
