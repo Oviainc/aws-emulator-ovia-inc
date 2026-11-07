@@ -29,6 +29,9 @@ mod query_execution_identity;
 #[path = "all/query_execution_lifecycle.rs"]
 mod query_execution_lifecycle;
 
+#[path = "all/query_result_outputs.rs"]
+mod query_result_outputs;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

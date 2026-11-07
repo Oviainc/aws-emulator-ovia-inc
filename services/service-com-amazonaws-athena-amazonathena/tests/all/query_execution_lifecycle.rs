@@ -388,10 +388,19 @@ async fn a_started_query_is_persisted_and_read_back_with_the_rows_the_engine_com
              {found:?}",
             case.case
         );
+        // Once the query has run, the results location names the OBJECT the run wrote
+        // inside the configured directory: named after the execution, with the extension
+        // its statement's results take.
+        let suffix = if case.statement_type == query_engine::STATEMENT_TYPE_DML {
+            state::RESULT_OBJECT_ROWS_SUFFIX
+        } else {
+            state::RESULT_OBJECT_TEXT_SUFFIX
+        };
+        let object = format!("{OUTPUT_LOCATION}{id}{suffix}");
         assert_eq!(
             found["ResultConfiguration"]["OutputLocation"].as_str(),
-            Some(OUTPUT_LOCATION),
-            "case {:?}: the resolved results location must be reported, got {found:?}",
+            Some(object.as_str()),
+            "case {:?}: expected the result object {object}, got {found:?}",
             case.case
         );
         assert_eq!(

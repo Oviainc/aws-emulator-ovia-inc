@@ -155,6 +155,11 @@ pub struct Database {
     /// The engine connection. Private: every statement reaches it through [`run`], which
     /// is what installs the bounds one run is held to.
     connection: rusqlite::Connection,
+    /// Set while a run reads STORED data: the engine's own authorizer raises it when it
+    /// authorizes a read of a table, so whether a statement scanned anything is the
+    /// engine's answer and not a reader of the SQL text. Cleared by [`run`] before each
+    /// statement, which holds this database's lock for the whole run.
+    reads_stored_data: Arc<AtomicBool>,
 }
 
 /// A database as the state holds it, so two executions in the same database run one at a
@@ -218,9 +223,24 @@ impl Database {
 
         // Default-deny: every action a query legitimately needs is named, and anything
         // else — including an action a future engine version introduces — is refused.
-        connection.authorizer(Some(authorize));
+        // The authorizer also OBSERVES which actions a statement takes, so a read of
+        // stored data is noted on the way past; the decision itself is `authorize`'s and
+        // nothing here widens it.
+        let reads_stored_data = Arc::new(AtomicBool::new(false));
+        let observer = Arc::clone(&reads_stored_data);
+        connection.authorizer(Some(
+            move |context: rusqlite::hooks::AuthContext<'_>| -> rusqlite::hooks::Authorization {
+                if matches!(context.action, rusqlite::hooks::AuthAction::Read { .. }) {
+                    observer.store(true, Ordering::SeqCst);
+                }
+                authorize(context)
+            },
+        ));
 
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            reads_stored_data,
+        })
     }
 }
 
@@ -378,6 +398,15 @@ pub struct StoredResultSet {
     pub rows: Vec<Row>,
 }
 
+/// The result set of a statement whose result is the engine's TEXT output rather than
+/// rows — a statement Athena classifies as DDL or UTILITY produces no result set, and
+/// what a read reports for it is this one: no columns and no rows, present rather than
+/// absent.
+pub static TEXT_OUTPUT_RESULT_SET: StoredResultSet = StoredResultSet {
+    column_info: Vec::new(),
+    rows: Vec::new(),
+};
+
 /// What running one query produced.
 #[derive(Debug, Clone)]
 pub enum Outcome {
@@ -453,9 +482,11 @@ pub fn run(
 
     let started = Instant::now();
     guard.arm(MAX_QUERY_DEADLINE, step_budget());
+    database.reads_stored_data.store(false, Ordering::SeqCst);
     let produced = execute_once(&database.connection, sql, parameters);
     guard.disarm();
     let engine_time = started.elapsed();
+    let read_stored_data = database.reads_stored_data.load(Ordering::SeqCst);
 
     let outcome = match produced {
         Ok(Produced::Rows {
@@ -466,7 +497,10 @@ pub fn run(
             // Rows were returned rather than written, so there is no row count to
             // report: `UpdateCount` is "the number of rows inserted".
             update_count: None,
-            data_scanned_bytes,
+            // `DataScannedInBytes` is "the number of bytes in the data that was
+            // queried", so a statement that read no stored data at all scanned nothing,
+            // however many values it computed from literals and functions.
+            data_scanned_bytes: if read_stored_data { data_scanned_bytes } else { 0 },
         },
         Ok(Produced::Affected(rows)) => Outcome::Succeeded {
             result: StoredResultSet::default(),
@@ -947,6 +981,9 @@ pub struct Submitted {
     /// statement too, but the engine does not count the rows it writes, so it is not one
     /// of these.
     pub counts_rows: bool,
+    /// The `SubstatementType` of the single statement submitted, when its kind has one;
+    /// see [`substatement_type_of`].
+    pub substatement_type: Option<&'static str>,
 }
 
 /// Read `sql` as the statements it carries.
@@ -961,6 +998,7 @@ pub fn submitted(sql: &str) -> Submitted {
             statements: None,
             statement_type: None,
             counts_rows: false,
+            substatement_type: None,
         };
     };
     let single = match statements.as_slice() {
@@ -971,7 +1009,49 @@ pub fn submitted(sql: &str) -> Submitted {
         statements: Some(statements.len()),
         statement_type: single.map(statement_type_of),
         counts_rows: single.is_some_and(counts_rows),
+        substatement_type: single.and_then(substatement_type_of),
     }
+}
+
+/// The `SubstatementType` of one parsed statement.
+///
+/// `QueryExecution$SubstatementType` documents it as "The kind of query statement that
+/// was run" — a finer classification than the three `StatementType` classes, naming the
+/// statement's own kind in upper snake case. Read off the PARSE, like
+/// [`statement_type_of`], and `None` for a kind that has no such name here: a statement
+/// whose kind cannot be named reports none rather than a guess.
+fn substatement_type_of(statement: &::sqlparser::ast::Statement) -> Option<&'static str> {
+    use ::sqlparser::ast::{ObjectType, Statement};
+    Some(match statement {
+        // A `CREATE TABLE AS SELECT` is named after both halves of what it does; see
+        // `statement_type_of`, which classifies it with the statements that manipulate
+        // data for the same reason.
+        Statement::CreateTable(create) if create.query.is_some() => "CREATE_TABLE_AS_SELECT",
+        Statement::CreateTable(..) => "CREATE_TABLE",
+        Statement::Query(..) => "SELECT",
+        Statement::Insert(..) => "INSERT_INTO",
+        Statement::Update { .. } => "UPDATE",
+        Statement::Delete(..) => "DELETE",
+        Statement::Merge { .. } => "MERGE",
+        Statement::CreateView { .. } => "CREATE_VIEW",
+        // A schema and a database are the same object to Athena, whose catalogs hold
+        // databases.
+        Statement::CreateDatabase { .. } | Statement::CreateSchema { .. } => "CREATE_DATABASE",
+        Statement::AlterTable { .. } => "ALTER_TABLE",
+        Statement::Truncate { .. } => "TRUNCATE_TABLE",
+        Statement::Drop { object_type, .. } => match object_type {
+            ObjectType::Table => "DROP_TABLE",
+            ObjectType::View => "DROP_VIEW",
+            ObjectType::Schema | ObjectType::Database => "DROP_DATABASE",
+            _ => return None,
+        },
+        Statement::ShowTables { .. } => "SHOW_TABLES",
+        Statement::ShowDatabases { .. } | Statement::ShowSchemas { .. } => "SHOW_DATABASES",
+        Statement::ShowColumns { .. } => "SHOW_COLUMNS",
+        Statement::ShowCreate { .. } => "SHOW_CREATE_TABLE",
+        Statement::Explain { .. } | Statement::ExplainTable { .. } => "EXPLAIN",
+        _ => return None,
+    })
 }
 
 /// Whether the engine counts the rows this statement writes; see

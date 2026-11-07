@@ -294,6 +294,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 id: id.clone(),
                 query_string: query_string.clone(),
                 statement_type: submitted.statement_type.map(str::to_string),
+                substatement_type: submitted.substatement_type.map(str::to_string),
                 work_group,
                 context,
                 result_configuration,
@@ -311,6 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Written by this same call, once the engine has reported.
                 outcome: None,
                 engine_time: Duration::ZERO,
+                engine_reported_at: None,
                 cancelled_at: None,
             };
             store.record_query_execution(record, input.client_request_token);

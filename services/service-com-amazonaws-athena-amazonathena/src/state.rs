@@ -55,7 +55,8 @@ use ::service_com_amazonaws_glue_awsglue::state as glue_state;
 use crate::ops::types::{
     Column, DataCatalog, EngineVersion, QueryExecution, QueryExecutionContext,
     QueryExecutionStatistics, QueryExecutionStatus, ResultConfiguration, ResultReuseConfiguration,
-    TableMetadata, Tag, WorkGroup, WorkGroupConfiguration, CONNECTION_TYPE_VALUES,
+    ResultReuseInformation, TableMetadata, Tag, WorkGroup, WorkGroupConfiguration,
+    CONNECTION_TYPE_VALUES,
 };
 
 /// The `WorkGroupState` a freshly created workgroup is in. One of
@@ -865,6 +866,19 @@ const ERROR_CATEGORY_USER: i32 = 2;
 /// the list quoted on [`ERROR_CATEGORY_USER`].
 const ERROR_CATEGORY_OTHER: i32 = 3;
 
+/// The extension of the result object a statement whose results are ROWS writes.
+///
+/// Athena's own documentation states the rule for where a query's results are saved:
+/// "<query-result-location>/<QueryExecutionId>.csv" for a statement that produces a
+/// result set, so the result location a read reports names that object rather than the
+/// directory it sits in.
+pub const RESULT_OBJECT_ROWS_SUFFIX: &str = ".csv";
+
+/// The extension of the result object a statement whose result is the engine's TEXT
+/// output writes — the statements Athena classifies as DDL and UTILITY; see
+/// [`RESULT_OBJECT_ROWS_SUFFIX`].
+pub const RESULT_OBJECT_TEXT_SUFFIX: &str = ".txt";
+
 /// How many query executions this emulator retains.
 ///
 /// The EMULATOR's own bound, with no counterpart in the model: each retained execution
@@ -894,6 +908,10 @@ pub struct QueryExecutionRecord {
     /// The `StatementType` the submitted SQL parses as, or `None` when it does not
     /// parse at all — there is then no statement to classify.
     pub statement_type: Option<String>,
+    /// The `SubstatementType` the submitted SQL parses as — the kind of statement, a
+    /// finer classification than [`Self::statement_type`] — or `None` for a statement
+    /// whose kind has no such name.
+    pub substatement_type: Option<String>,
     /// The workgroup the query belongs to, [`DEFAULT_WORK_GROUP`] when it named none.
     pub work_group: String,
     /// The `QueryExecutionContext` the request carried, as it carried it: the database
@@ -921,6 +939,10 @@ pub struct QueryExecutionRecord {
     pub outcome: Option<query_engine::Outcome>,
     /// What the engine spent running it, reported as `EngineExecutionTimeInMillis`.
     pub engine_time: Duration,
+    /// When the engine reported on this run, or `None` while it has not. With
+    /// [`Self::engine_time`] behind it and [`Self::submitted_at`] in front of it, this is
+    /// what the service's own pre-processing and publishing spans are measured between.
+    pub engine_reported_at: Option<SystemTime>,
     /// When a `StopQueryExecution` call interrupted it, if one did. Only a query that
     /// had not reached a terminal state can carry this.
     pub cancelled_at: Option<SystemTime>,
@@ -992,10 +1014,113 @@ impl QueryExecutionRecord {
     }
 
     /// How many rows this query's statement wrote, for `UpdateCount`.
+    ///
+    /// A statement whose written rows the engine counted reports that count. One that
+    /// produced a RESULT SET returned its rows rather than writing any, so it reports a
+    /// count of zero rather than no count at all. A statement that produced no result set
+    /// either — one whose result is the engine's text output — reports none.
     pub fn update_count(&self) -> Option<i64> {
         match self.outcome.as_ref()? {
-            query_engine::Outcome::Succeeded { update_count, .. } => *update_count,
+            query_engine::Outcome::Succeeded {
+                update_count: Some(count),
+                ..
+            } => Some(*count),
+            query_engine::Outcome::Succeeded { result, .. } => {
+                (!result.column_info.is_empty()).then_some(0)
+            }
             query_engine::Outcome::Failed { .. } => None,
+        }
+    }
+
+    /// The result set a read of this execution's results reports at `now`, or `None` for
+    /// a query that has no output to read.
+    ///
+    /// A statement whose results are ROWS — one Athena classifies as DML — has them only
+    /// once it has SUCCEEDED. A statement whose result is the engine's TEXT output — one
+    /// Athena classifies as DDL or UTILITY — has that output as soon as the engine
+    /// reported on it, whether it reported the statement done or the statement in error,
+    /// and the result set that output carries is the empty one. A query still running,
+    /// one a caller cancelled and one this emulator stopped before the engine could
+    /// report produced no output at all, so there is nothing to read from any of them.
+    pub fn readable_result_at(&self, now: SystemTime) -> Option<&query_engine::StoredResultSet> {
+        match self.state_at(now) {
+            QUERY_STATE_SUCCEEDED => self.result_set_at(now),
+            QUERY_STATE_FAILED
+                if self.writes_text_output()
+                    && self.failure().is_some_and(|(_, cause)| {
+                        cause == query_engine::FailureCause::Sql
+                    }) =>
+            {
+                Some(&query_engine::TEXT_OUTPUT_RESULT_SET)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether this execution's statement writes its result as the engine's TEXT output:
+    /// the statements Athena classifies as DDL and UTILITY return no result set, and what
+    /// their run produces is the text the engine wrote about the task.
+    fn writes_text_output(&self) -> bool {
+        matches!(
+            self.statement_type.as_deref(),
+            Some(query_engine::STATEMENT_TYPE_DDL) | Some(query_engine::STATEMENT_TYPE_UTILITY)
+        )
+    }
+
+    /// The result object this execution's run wrote, as `OutputLocation` reports it from
+    /// the instant the query is terminal: the configured results DIRECTORY with the object
+    /// inside it, named after the execution and carrying the extension its statement's
+    /// results take ([`RESULT_OBJECT_ROWS_SUFFIX`], [`RESULT_OBJECT_TEXT_SUFFIX`]).
+    ///
+    /// `None` while the query has not run to a terminal state, for one a caller cancelled
+    /// and for text that parses as no statement at all: none of those wrote an object to
+    /// name, so the configured directory is what the record still reports.
+    fn result_object_at(&self, now: SystemTime) -> Option<String> {
+        if self.cancelled_at.is_some() || !self.is_terminal_at(now) {
+            return None;
+        }
+        let suffix = match self.statement_type.as_deref()? {
+            query_engine::STATEMENT_TYPE_DML => RESULT_OBJECT_ROWS_SUFFIX,
+            query_engine::STATEMENT_TYPE_DDL | query_engine::STATEMENT_TYPE_UTILITY => {
+                RESULT_OBJECT_TEXT_SUFFIX
+            }
+            _ => return None,
+        };
+        // The configured location names a directory, whether or not it was written with
+        // the trailing separator, so the object is joined under it by exactly one.
+        let directory = self
+            .result_configuration
+            .output_location
+            .as_deref()?
+            .trim_end_matches('/');
+        Some(format!("{directory}/{}{suffix}", self.id))
+    }
+
+    /// The `ResultConfiguration` a read of this execution reports at `now`: the one the
+    /// query ran under, with `OutputLocation` naming the result object once there is one
+    /// (see [`Self::result_object_at`]).
+    fn reported_result_configuration(&self, now: SystemTime) -> ResultConfiguration {
+        let mut configuration = self.result_configuration.clone();
+        if let Some(object) = self.result_object_at(now) {
+            configuration.output_location = Some(object);
+        }
+        configuration
+    }
+
+    /// The `ResultReuseConfiguration` this query ran under: the one its submission
+    /// carried, and otherwise result reuse turned OFF.
+    ///
+    /// `ResultReuseByAgeConfiguration$Enabled` is "True if previous query results can be
+    /// reused when the query is run; otherwise, false" — and a query whose submission
+    /// asked for no reuse ran the statement itself, which is that member as `false`.
+    fn effective_result_reuse_configuration(&self) -> ResultReuseConfiguration {
+        let by_age = self
+            .result_reuse_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.result_reuse_by_age_configuration.clone())
+            .unwrap_or_default();
+        ResultReuseConfiguration {
+            result_reuse_by_age_configuration: Some(by_age),
         }
     }
 
@@ -1036,8 +1161,8 @@ impl QueryExecutionRecord {
             // Athena fills this only for a workgroup with managed query results, which
             // this emulator does not store results through.
             managed_query_results_configuration: None,
-            result_configuration: Some(self.result_configuration.clone()),
-            result_reuse_configuration: self.result_reuse_configuration.clone(),
+            result_configuration: Some(self.reported_result_configuration(now)),
+            result_reuse_configuration: Some(self.effective_result_reuse_configuration()),
             query_execution_context: Some(self.context.clone()),
             status: Some(QueryExecutionStatus {
                 state: Some(state.to_string()),
@@ -1055,9 +1180,7 @@ impl QueryExecutionRecord {
             // none reports the member as absent rather than as an empty list.
             execution_parameters: (!self.execution_parameters.is_empty())
                 .then(|| self.execution_parameters.clone()),
-            // The substatement (`SELECT`, `CREATE_TABLE`) is a finer classification than
-            // the parse answers here, so none is reported.
-            substatement_type: None,
+            substatement_type: self.substatement_type.clone(),
             query_results_s3_access_grants_configuration: None,
         }
     }
@@ -1071,6 +1194,23 @@ impl QueryExecutionRecord {
         let terminal = self.is_terminal_at(now);
         let queue_until = now.min(self.running_due_at());
         let total_until = self.completion_at(now).unwrap_or(now);
+        // The service's own spans around the engine's, measured between the record's
+        // instants: everything before the engine started is what this service spent
+        // preprocessing the query, and everything from the engine's report to the
+        // completion is what it spent finalising and publishing the results \u2014 which is
+        // exactly when they become readable. Reported once the query is terminal, when
+        // both spans are over; a query whose run never reported has neither.
+        let engine_started_at = self
+            .engine_reported_at
+            .and_then(|reported| reported.checked_sub(self.engine_time));
+        let pre_processing = engine_started_at
+            .filter(|_| terminal)
+            .map(|started| millis_between(self.submitted_at, started));
+        let processing = self
+            .engine_reported_at
+            .filter(|_| terminal)
+            .zip(self.completion_at(now))
+            .map(|(reported, completed)| millis_between(reported, completed));
         let data_scanned = match (self.outcome.as_ref(), terminal) {
             (
                 Some(query_engine::Outcome::Succeeded {
@@ -1095,12 +1235,17 @@ impl QueryExecutionRecord {
             data_manifest_location: None,
             total_execution_time_in_millis: Some(millis_between(self.submitted_at, total_until)),
             query_queue_time_in_millis: Some(millis_between(self.submitted_at, queue_until)),
-            // Athena's own pre-processing, planning and publishing phases are not
-            // modelled here, so no time is reported for them rather than a made-up one.
-            service_pre_processing_time_in_millis: None,
+            service_pre_processing_time_in_millis: pre_processing,
+            // Athena reports the planning phase separately from the engine's own work.
+            // The engine here plans inside the run it reports one time for, so there is
+            // no planning span of its own to measure and none is reported.
             query_planning_time_in_millis: None,
-            service_processing_time_in_millis: None,
-            result_reuse_information: None,
+            service_processing_time_in_millis: processing,
+            // Every query here is RUN: no read of a result set is answered out of an
+            // earlier query's results, so no run reused a previous result.
+            result_reuse_information: Some(ResultReuseInformation {
+                reused_previous_result: false,
+            }),
             dpu_count: None,
         }
     }
@@ -1398,6 +1543,7 @@ impl ComAmazonawsAthenaAmazonathenaState {
         };
         record.completion_due_at = record.completion_due_at.max(now);
         record.engine_time = completion.engine_time;
+        record.engine_reported_at = Some(now);
         record.outcome = Some(completion.outcome);
     }
 

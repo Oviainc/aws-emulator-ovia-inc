@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetQueryResults
-//! IMPLEMENTED: pages the result set the named execution's run produced — the column
-//! labels first for a DML query, then the rows — and refuses an execution that has not
-//! finished successfully.
+//! IMPLEMENTED: pages the output the named execution's run wrote — the column labels
+//! first for a DML query, then the rows, and the empty result set of a statement whose
+//! result is the engine's text output — and refuses an execution that wrote no output at
+//! all.
 //!
 //! ## Shape of an operation
 //!
@@ -196,10 +197,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let state_name = record.state_at(now);
-        // There are results to read only from a query that completed without errors:
-        // one still running has not produced them yet, and one that failed or was
-        // cancelled never will.
-        let Some(result) = record.result_set_at(now) else {
+        // What a read of the results reports is the OUTPUT the run wrote: the rows of a
+        // statement whose results are rows, and the empty result set of one whose result
+        // is the engine's text output — which a statement Athena classifies as DDL or
+        // UTILITY writes whether its run reported the statement done or in error. A query
+        // that is still running, one a caller cancelled and one that produced no output at
+        // all has nothing to read.
+        //
+        // The text of that output is served by no member here: the modelled
+        // `GetQueryResultsOutput` declares `UpdateCount`, `ResultSet` and `NextToken` and
+        // nothing that carries it, so the empty result set is the whole of what this
+        // operation reports for it, and the diagnostic of a failed statement is read from
+        // the execution's `StateChangeReason` and `AthenaError`.
+        let Some(result) = record.readable_result_at(now) else {
             return Err(invalid_request(if record.is_terminal_at(now) {
                 crate::state::query_did_not_succeed(state_name)
             } else {
