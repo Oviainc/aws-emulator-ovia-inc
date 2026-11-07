@@ -45,9 +45,11 @@ use crate::support::{call, emulator, member, ok};
 const AGENT_SPACE_NOT_FOUND: &str = "The specified agent instance does not exist.";
 
 /// The sentence a refusal of an artifact the named agent space does not hold states:
-/// fixed text naming the resource class, as every other not-found sentence of this
-/// service does.
-const ARTIFACT_NOT_FOUND: &str = "The specified artifact does not exist.";
+/// the `artifactId` the request named is its ONLY variable part, so the refusal of an id
+/// names the id it refused.
+fn artifact_not_found(artifact_id: &str) -> String {
+    format!("No artifact was found for id: {artifact_id}")
+}
 
 /// One upload the service must refuse: what a caller sends, and the status and error
 /// code the refusal carries.
@@ -489,46 +491,50 @@ async fn an_artifact_is_reachable_only_through_the_space_that_holds_it() {
     // no upload minted (32 hex `f`s, a readable label, a name in another script, a
     // stored id with a suffix), the id of another space's artifact, an id whose space
     // was deleted, and the empty id of either member.
-    let rows: Vec<(&str, String, String, u16, &str, &str)> = vec![
+    let unknown_hex = "f".repeat(32);
+    let readable_label = "no-such-artifact".to_string();
+    let other_script = "неизвестно".to_string();
+    let suffixed = format!("{held}-suffix");
+    let rows: Vec<(&str, String, String, u16, &str, String)> = vec![
         (
             "the artifact of another agent space",
             holder.clone(),
             neighbours.clone(),
             404,
             "ResourceNotFoundException",
-            ARTIFACT_NOT_FOUND,
+            artifact_not_found(&neighbours),
         ),
         (
             "an artifactId of 32 hex f's",
             holder.clone(),
-            "f".repeat(32),
+            unknown_hex.clone(),
             404,
             "ResourceNotFoundException",
-            ARTIFACT_NOT_FOUND,
+            artifact_not_found(&unknown_hex),
         ),
         (
             "an artifactId that is a readable label",
             holder.clone(),
-            "no-such-artifact".to_string(),
+            readable_label.clone(),
             404,
             "ResourceNotFoundException",
-            ARTIFACT_NOT_FOUND,
+            artifact_not_found(&readable_label),
         ),
         (
             "an artifactId in another script",
             holder.clone(),
-            "неизвестно".to_string(),
+            other_script.clone(),
             404,
             "ResourceNotFoundException",
-            ARTIFACT_NOT_FOUND,
+            artifact_not_found(&other_script),
         ),
         (
             "a stored artifactId with a suffix",
             holder.clone(),
-            format!("{held}-suffix"),
+            suffixed.clone(),
             404,
             "ResourceNotFoundException",
-            ARTIFACT_NOT_FOUND,
+            artifact_not_found(&suffixed),
         ),
         (
             "an artifact whose agent space was deleted",
@@ -536,15 +542,15 @@ async fn an_artifact_is_reachable_only_through_the_space_that_holds_it() {
             orphaned.clone(),
             404,
             "ResourceNotFoundException",
-            AGENT_SPACE_NOT_FOUND,
+            AGENT_SPACE_NOT_FOUND.to_string(),
         ),
         (
             "an agentSpaceId no create minted",
-            "f".repeat(32),
+            unknown_hex.clone(),
             held.clone(),
             404,
             "ResourceNotFoundException",
-            AGENT_SPACE_NOT_FOUND,
+            AGENT_SPACE_NOT_FOUND.to_string(),
         ),
         (
             "the empty agentSpaceId",
@@ -553,7 +559,8 @@ async fn an_artifact_is_reachable_only_through_the_space_that_holds_it() {
             400,
             "ValidationException",
             "1 validation error detected: value for 'agentSpaceId' failed to satisfy \
-             constraint: member must not be empty",
+             constraint: member must not be empty"
+                .to_string(),
         ),
         (
             "the empty artifactId",
@@ -562,7 +569,8 @@ async fn an_artifact_is_reachable_only_through_the_space_that_holds_it() {
             400,
             "ValidationException",
             "1 validation error detected: value for 'artifactId' failed to satisfy \
-             constraint: member must not be empty",
+             constraint: member must not be empty"
+                .to_string(),
         ),
     ];
 
@@ -580,7 +588,7 @@ async fn an_artifact_is_reachable_only_through_the_space_that_holds_it() {
         );
         assert_eq!(
             member(&answer.body, "message").as_deref(),
-            Some(message),
+            Some(message.as_str()),
             "case {case:?}: expected the service's own sentence for the refusal, got {}",
             answer.body
         );

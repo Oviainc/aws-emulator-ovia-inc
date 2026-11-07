@@ -183,12 +183,18 @@ pub const MAX_AGENT_SPACE_TARGET_DOMAINS: usize = 100;
 /// value from the request, so a refusal never echoes a caller's own identifier back.
 pub const AGENT_SPACE_NOT_FOUND: &str = "The specified agent instance does not exist.";
 
-/// The sentence a refusal of an artifact the named agent space does not hold states.
+/// The sentence a refusal of an artifact the named agent space does not hold states,
+/// for the `artifactId` the request named.
 ///
-/// Fixed text naming the resource CLASS, the form every other not-found sentence of
-/// this service takes ([`AGENT_SPACE_NOT_FOUND`], [`TARGET_DOMAIN_NOT_FOUND`]), so a
-/// refusal carries no value the request sent back to the caller.
-pub const ARTIFACT_NOT_FOUND: &str = "The specified artifact does not exist.";
+/// The service does not take the fixed form its other not-found sentences take
+/// ([`AGENT_SPACE_NOT_FOUND`], [`TARGET_DOMAIN_NOT_FOUND`]): the recorded 404 for an
+/// `artifactId` that resolves to no artifact names the id that was asked for, which is
+/// the sentence's ONLY variable part — it is the caller's own input, echoed in the
+/// refusal of it. Stated here once, so every operation that fails to resolve an artifact
+/// answers the same sentence.
+pub fn artifact_not_found(artifact_id: &str) -> String {
+    format!("No artifact was found for id: {artifact_id}")
+}
 
 /// The most artifacts ONE agent space holds before `AddArtifact` answers the service's
 /// `ServiceQuotaExceededException`.
@@ -1205,6 +1211,22 @@ impl ComAmazonawsSecurityagentSecurityagentState {
         self.artifacts
             .get(artifact_id)
             .filter(|artifact| artifact.agent_space_id == agent_space_id)
+    }
+
+    /// Drop the artifact `artifact_id` of the agent space `agent_space_id` from the
+    /// store, answering the record that was removed, or `None` when that space holds no
+    /// such artifact — in which case NOTHING is removed.
+    ///
+    /// The pair resolves exactly as [`Self::artifact_in`] resolves it, so a delete that
+    /// names an artifact of ANOTHER agent space removes nothing, the same way a read of
+    /// it reports nothing.
+    pub fn remove_artifact_in(
+        &mut self,
+        agent_space_id: &str,
+        artifact_id: &str,
+    ) -> Option<ArtifactRecord> {
+        self.artifact_in(agent_space_id, artifact_id)?;
+        self.artifacts.remove(artifact_id)
     }
 }
 

@@ -201,13 +201,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The record the PAIR of ids names: an id the space does not hold — including
         // one that names an artifact of another agent space — resolves to nothing and is
-        // refused with the service's fixed sentence for an artifact it cannot resolve,
-        // never by serving another space's artifact.
+        // refused with the service's sentence for an artifact it cannot resolve, naming
+        // the id that was asked for, never by serving another space's artifact.
         let record = state
             .artifact_in(&input.agent_space_id, &input.artifact_id)
             .ok_or_else(|| {
                 GetArtifactErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: crate::state::ARTIFACT_NOT_FOUND.to_string(),
+                    message: crate::state::artifact_not_found(&input.artifact_id),
                 })
             })?;
 

@@ -36,8 +36,11 @@ use crate::support::{call, emulator, member, ok, Answer};
 /// an agent space and carrying nothing the request sent.
 const AGENT_SPACE_NOT_FOUND: &str = "The specified agent instance does not exist.";
 
-/// The sentence a refusal of an artifact the named agent space does not hold states.
-const ARTIFACT_NOT_FOUND: &str = "The specified artifact does not exist.";
+/// The sentence a refusal of an artifact the named agent space does not hold states:
+/// the `artifactId` the request named is its only variable part.
+fn artifact_not_found(artifact_id: &str) -> String {
+    format!("No artifact was found for id: {artifact_id}")
+}
 
 /// How many spaces each row of the cascade case stores, so a delete that removed more
 /// than the record it names shows up on the spaces beside it.
@@ -302,7 +305,7 @@ async fn a_delete_removes_the_named_space_and_only_what_it_held() {
             );
             assert_eq!(
                 member(&through_survivor.body, "message").as_deref(),
-                Some(ARTIFACT_NOT_FOUND),
+                Some(artifact_not_found(artifact).as_str()),
                 "case {case:?}: expected the artifact not-found sentence, got {}",
                 through_survivor.body
             );
