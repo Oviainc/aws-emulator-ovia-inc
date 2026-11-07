@@ -17,6 +17,9 @@
 // else appends to.
 #[path = "all/cloudformation_fifo_resource_generated_names.rs"]
 mod cloudformation_fifo_resource_generated_names;
+// Declared here, in this same head region, for the reason the entry above records.
+#[path = "all/cloudformation_rollback_triggers_revert_the_operation.rs"]
+mod cloudformation_rollback_triggers_revert_the_operation;
 // Declared here, in this same head region, for the reason the entry above records: the
 // appended tail and the sorted `r…` span are both regions concurrently landing suites add
 // their line to.

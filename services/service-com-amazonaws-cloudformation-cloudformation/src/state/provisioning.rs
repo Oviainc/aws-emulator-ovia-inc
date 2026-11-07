@@ -1255,6 +1255,11 @@ impl Owner {
 /// Only the stacks of the Region the request was signed for are advanced: that is the set
 /// the operation calling this reports on, and the Region is what the credential scope of
 /// every call made here names.
+///
+/// The other things an operation in flight can only learn by CALLING another service are
+/// driven from here for the same reason: the waits a `AWS::CloudFormation::WaitCondition`
+/// holds it at ([`settle_expired_waits`]) and the rollback its `RollbackConfiguration`'s
+/// triggers force ([`super::rollback_triggers::settle_triggered_rollbacks`]).
 pub async fn advance_stabilisations(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     state: &::engine::ServiceState<super::ComAmazonawsCloudformationCloudformationState>,
@@ -1262,6 +1267,10 @@ pub async fn advance_stabilisations(
     let region = super::request_region(ctx.parts());
     let region = region.as_str();
     settle_expired_waits(ctx, state, region).await;
+    // ...and the rollback the stack's own ROLLBACK TRIGGERS force: an alarm a monitored
+    // operation's configuration names, read in CloudWatch before this handler takes the lock,
+    // exactly as the waits below are ([`super::rollback_triggers`]).
+    super::rollback_triggers::settle_triggered_rollbacks(ctx, state, region).await;
     // Which resources are still waiting, read under a lock of its own: the readiness calls
     // below reach other services' handlers, which take those services' locks, so a client
     // reading THIS service must not be blocked behind them.

@@ -2676,3 +2676,9 @@ use platform_services::*;
 pub(crate) use application_services::*;
 use iam_identities::*;
 use data_and_storage::*;
+
+/// Amazon CloudWatch's wire identity, for the ROLLBACK TRIGGER monitoring beside this
+/// catalogue ([`super::rollback_triggers`]): that module reads a trigger alarm's state out of
+/// the same service this catalogue's `AWS::CloudWatch::*` arms write to, so the signing name
+/// and the target prefix are read in ONE place and the two cannot drift apart.
+pub(in crate::state) use data_and_storage::{CLOUDWATCH_SIGNING_NAME, CLOUDWATCH_TARGET_PREFIX};

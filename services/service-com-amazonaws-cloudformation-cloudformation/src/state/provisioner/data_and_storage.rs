@@ -734,8 +734,8 @@ pub(super) async fn call_kinesis(
 /// (`sigv4Name: monitoring`, service shape `GraniteServiceVersion20100801`), whose
 /// protocol list starts with `awsJson1_0` — the wire this call is written on, as the
 /// service's own suites drive it.
-pub(super) const CLOUDWATCH_SIGNING_NAME: &str = "monitoring";
-pub(super) const CLOUDWATCH_TARGET_PREFIX: &str = "GraniteServiceVersion20100801";
+pub(in crate::state) const CLOUDWATCH_SIGNING_NAME: &str = "monitoring";
+pub(in crate::state) const CLOUDWATCH_TARGET_PREFIX: &str = "GraniteServiceVersion20100801";
 
 /// Create — or update — the metric stream an `AWS::CloudWatch::MetricStream` declares.
 ///

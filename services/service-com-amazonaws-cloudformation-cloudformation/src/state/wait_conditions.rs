@@ -392,7 +392,9 @@ fn failed_status(in_progress: &str) -> &'static str {
 /// work no read of the store can do, since each item of it is a call to another service.
 ///
 /// Answered by [`super::StoredStack::fail_expired_wait`] to the caller that is in a position
-/// to make those calls ([`super::provisioning::advance_stabilisations`]).
+/// to make those calls ([`super::provisioning::advance_stabilisations`]). It is what ANY
+/// clock-driven failure of the same operation owes, so the rollback a stack's own triggers
+/// force answers with it too ([`super::StoredStack::fail_on_rollback_triggers`]).
 #[derive(Debug, Clone)]
 pub enum ExpiredWaitOwes {
     /// A failed CREATE: "ROLLBACK — Roll back the stack creation. This is the default", so
