@@ -17,7 +17,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_grafana_awsgrafanacontrolplane::state::API_KEY_QUOTA;
+use service_com_amazonaws_grafana_awsgrafanacontrolplane::state::{
+    API_KEY_QUOTA, LIFECYCLE_TRANSITION,
+};
 use service_com_amazonaws_grafana_awsgrafanacontrolplane::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -431,6 +433,9 @@ async fn keys_exist_only_on_a_workspace_that_exists() {
         202,
         "DeleteWorkspace must accept the deletion"
     );
+    // The delete is ACCEPTED, not finished: the workspace is removed from the store once
+    // the removal the clock owes it falls due, and only then does its id name nothing.
+    tokio::time::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(200)).await;
 
     let cases = [
         ("an id naming no workspace", "g-0123456789", "absent"),

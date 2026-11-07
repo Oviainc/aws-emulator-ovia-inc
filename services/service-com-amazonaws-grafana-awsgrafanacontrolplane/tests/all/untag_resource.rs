@@ -17,9 +17,11 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_grafana_awsgrafanacontrolplane::state::LIFECYCLE_TRANSITION;
 use service_com_amazonaws_grafana_awsgrafanacontrolplane::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -430,6 +432,9 @@ async fn an_arn_naming_no_stored_workspace_is_a_resource_not_found() {
         "DeleteWorkspace must succeed to set this case up, got {} with {:?}",
         deleted.status, deleted.body
     );
+    // The delete is ACCEPTED, not finished: the workspace is removed from the store once
+    // the removal the clock owes it falls due, and only then does its ARN name nothing.
+    tokio::time::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(200)).await;
 
     for (case, id) in [
         ("a workspace id that was never minted", "g-ffffffffff".to_string()),

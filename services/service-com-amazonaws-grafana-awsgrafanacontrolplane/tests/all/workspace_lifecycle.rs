@@ -143,6 +143,31 @@ async fn delete(router: &MultiServiceRouter, id: &str) -> Answer {
     call(router, "DELETE", &format!("/workspaces/{id}"), None).await
 }
 
+/// Wait out the span the clock owes a workspace its next state in: `ACTIVE` after a create
+/// or an update, and its REMOVAL from the store after an accepted delete.
+///
+/// A change to a workspace whose previous accepted change is still in flight is refused
+/// with `ConflictException`, so a case that is not about that gate lets the record settle
+/// first — exactly as a client driving two changes in a row has to. The transition is owed
+/// by the clock, not by a call: nothing is done here but wait.
+async fn settled() {
+    tokio::time::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(200)).await;
+}
+
+/// Create a workspace, wait for the clock to settle it, and answer its id: the fixture a
+/// case that is about something other than the transition span needs.
+async fn active_workspace(router: &MultiServiceRouter, request: Value) -> String {
+    let created = create(router, request).await;
+    assert_eq!(
+        created.status, 202,
+        "the fixture create must be accepted, got {} with {:?}",
+        created.status, created.body
+    );
+    let id = created.id();
+    settled().await;
+    id
+}
+
 /// The ids `ListWorkspaces` reported, in the order it reported them.
 fn listed_ids(answer: &Answer) -> Vec<String> {
     answer.body["workspaces"]
@@ -610,7 +635,7 @@ async fn update_workspace_mutates_only_the_members_the_request_carries() {
 
     let router = emulator();
     for (case, patch, pointer, expected) in cases {
-        let id = create(&router, baseline.clone()).await.id();
+        let id = active_workspace(&router, baseline.clone()).await;
         let before = describe(&router, &id).await.workspace().clone();
 
         let updated = update(&router, &id, patch.clone()).await;
@@ -674,7 +699,7 @@ async fn update_workspace_mutates_only_the_members_the_request_carries() {
             }),
         ),
     ] {
-        let id = create(&router, baseline.clone()).await.id();
+        let id = active_workspace(&router, baseline.clone()).await;
         let refused = update(&router, &id, patch).await;
         assert_eq!(
             refused.status, 400,
@@ -717,7 +742,7 @@ async fn update_workspace_mutates_only_the_members_the_request_carries() {
             .as_object_mut()
             .expect("the baseline is a JSON object")
             .remove("workspaceOrganizationalUnits");
-        let id = create(&router, unscoped).await.id();
+        let id = active_workspace(&router, unscoped).await;
         let before = describe(&router, &id).await.workspace().clone();
 
         let answer = update(&router, &id, patch).await;
@@ -773,7 +798,8 @@ async fn the_workspace_store_is_bounded_by_its_quota() {
         refused.body
     );
 
-    // Deleting one frees room for exactly one more.
+    // Deleting one frees room for exactly one more — once the removal the delete owes the
+    // store has fallen due, which is when the workspace stops occupying it.
     let first = listed_ids(&list(&router, "?maxResults=1").await)
         .first()
         .cloned()
@@ -783,6 +809,7 @@ async fn the_workspace_store_is_bounded_by_its_quota() {
         202,
         "the delete that frees quota must be accepted"
     );
+    settled().await;
     assert_eq!(
         create(&router, minimal_create()).await.status,
         202,
@@ -795,8 +822,10 @@ async fn the_workspace_store_is_bounded_by_its_quota() {
     );
 }
 
-/// `DeleteWorkspace` removes the record: it answers with the workspace it removed, the id
-/// then names nothing, and the workspaces beside it are untouched.
+/// `DeleteWorkspace` accepts the deletion and the removal follows: it answers with the
+/// workspace it is deleting, the record stays readable as `DELETING` for the span the
+/// clock owes the removal in, the id then names nothing, and the workspaces beside it are
+/// untouched throughout.
 #[tokio::test]
 async fn deleting_a_workspace_removes_it_and_leaves_the_others() {
     let router = emulator();
@@ -806,6 +835,7 @@ async fn deleting_a_workspace_removes_it_and_leaves_the_others() {
         request["workspaceName"] = json!(format!("delete-{index}"));
         ids.push(create(&router, request).await.id());
     }
+    settled().await;
 
     for (index, id) in ids.clone().into_iter().enumerate() {
         let deleted = delete(&router, &id).await;
@@ -817,7 +847,7 @@ async fn deleting_a_workspace_removes_it_and_leaves_the_others() {
         assert_eq!(
             deleted.id(),
             id,
-            "case {index}: DeleteWorkspace must answer with the workspace it removed"
+            "case {index}: DeleteWorkspace must answer with the workspace it is deleting"
         );
         assert_eq!(
             at(deleted.workspace(), "/status"),
@@ -826,6 +856,46 @@ async fn deleting_a_workspace_removes_it_and_leaves_the_others() {
             at(deleted.workspace(), "/status")
         );
 
+        // While the deletion is in flight the workspace is still there: a poller reads
+        // `DELETING`, the `@idempotent` delete is accepted again with the same record,
+        // and a change to it is refused as the conflict it is.
+        let polled = describe(&router, &id).await;
+        assert_eq!(
+            at(polled.workspace(), "/status"),
+            json!("DELETING"),
+            "case {index}: DescribeWorkspace must report DELETING while the deletion is in \
+             flight, got {} with {:?}",
+            polled.status, polled.body
+        );
+        let again = delete(&router, &id).await;
+        assert_eq!(
+            again.status, 202,
+            "case {index}: a repeated DeleteWorkspace must be accepted idempotently, got {} \
+             with {:?}",
+            again.status, again.body
+        );
+        assert_eq!(
+            (again.id(), at(again.workspace(), "/status")),
+            (id.clone(), json!("DELETING")),
+            "case {index}: the repeated delete must answer the same workspace, still DELETING"
+        );
+        let refused = update(&router, &id, json!({"workspaceName": "zombie"})).await;
+        assert_eq!(
+            (refused.status, refused.error_code()),
+            (409, "ConflictException"),
+            "case {index}: UpdateWorkspace on a DELETING workspace must answer 409 \
+             ConflictException, got {} with {:?}",
+            refused.status,
+            refused.body
+        );
+        assert_eq!(
+            listed_ids(&list(&router, "").await),
+            ids[index..].to_vec(),
+            "case {index}: ListWorkspaces must still carry the workspace being deleted"
+        );
+
+        // The removal is owed by the clock: once it falls due the id names nothing.
+        settled().await;
         for (operation, answer) in [
             ("DescribeWorkspace", describe(&router, &id).await),
             ("DeleteWorkspace", delete(&router, &id).await),
@@ -833,7 +903,7 @@ async fn deleting_a_workspace_removes_it_and_leaves_the_others() {
         ] {
             assert_eq!(
                 answer.status, 404,
-                "case {index}: {operation} on a deleted workspace must answer 404, got {} \
+                "case {index}: {operation} on a removed workspace must answer 404, got {} \
                  with {:?}",
                 answer.status, answer.body
             );

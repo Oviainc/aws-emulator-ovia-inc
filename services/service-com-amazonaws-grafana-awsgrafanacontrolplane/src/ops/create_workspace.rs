@@ -213,6 +213,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AWS takes the authorization decision at the IAM layer, ahead of the service
+        // reading anything, so a caller whose identity-based policies do not allow this
+        // action is refused and NO workspace is minted for the refused attempt. A create
+        // addresses no workspace yet — it is what mints one — so it is judged against
+        // the workspaces collection of the account.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::workspaces_arn(&crate::state::request_region(ctx.parts())),
+        )
+        .map_err(CreateWorkspaceErrorModeled::AccessDeniedException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateWorkspaceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -266,6 +279,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reached at (see `crate::state::ServingEndpoint`).
         let serving = crate::state::ServingEndpoint::from_request(ctx.parts());
         let mut store = state.lock();
+        // Release every workspace whose accepted deletion has fallen due: the instant it
+        // fell due is when that workspace stopped occupying the store, whether or not
+        // anybody called, so neither the client tokens below nor the quota count it.
+        store.release_deleted(now);
 
         // `@idempotencyToken`: the same token names the same workspace, so a
         // retried create reports the first one rather than minting a second.
@@ -316,10 +333,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             authentication_providers: input.authentication_providers,
             // A workspace is not usable the instant the create returns; the
             // clock owes it `ACTIVE` once the transition span has passed.
-            status: "CREATING".to_string(),
+            status: crate::state::WORKSPACE_CREATING.to_string(),
             pending: Some(crate::state::PendingTransition {
                 due: now + crate::state::LIFECYCLE_TRANSITION,
-                status: crate::state::WORKSPACE_ACTIVE.to_string(),
+                owed: crate::state::OwedChange::Status(
+                    crate::state::WORKSPACE_ACTIVE.to_string(),
+                ),
             }),
             grafana_version: input
                 .grafana_version

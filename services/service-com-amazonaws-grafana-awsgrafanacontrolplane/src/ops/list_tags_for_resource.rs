@@ -144,7 +144,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // AWS takes the authorization decision at the IAM layer, ahead of the service
+        // reading anything, so a caller whose identity-based policies do not allow this
+        // action is refused without being told anything about the resource it named. The
+        // resource is the ARN the request CARRIED, which is what IAM judges a tagging
+        // call against.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.resource_arn,
+        )
+        .map_err(ListTagsForResourceErrorModeled::AccessDeniedException)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -164,10 +175,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A plain read: the workspace's status is not reported here, so there is
-        // nothing for this call to settle and nothing for it to write.
-        let store = state.lock();
-        match store.workspaces.get(id) {
+        // A read, but whether the workspace EXISTS is decided by the clock: one whose
+        // accepted deletion has fallen due is gone whether or not anybody called, so
+        // that removal is materialised before the record is resolved.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        match store.settled_mut(id, now) {
             Some(workspace) => Ok(ListTagsForResourceOutput {
                 tags: Some(workspace.tag_map()),
             }),

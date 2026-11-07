@@ -689,13 +689,21 @@ async fn a_deployed_protection_publishes_identifiers_waf_resolves() {
         json!({"Name": "protection-set", "Scope": SCOPE, "Id": ip_set_id}),
     )
     .await;
-    let addresses: Vec<&str> = read
+    // `IPSet$Addresses` is the SET those strings name, and AWS WAF reports it in its own
+    // order rather than the order the array was written in — the rule that service
+    // implements in `state/ip_set_addresses.rs` (`canonical_ip_set_addresses`), where the
+    // order is a function of the membership. What the stack has to get right is therefore
+    // the MEMBERSHIP that reached AWS WAF, compared here independently of order.
+    let mut addresses: Vec<&str> = read
         .pointer("/IPSet/Addresses")
         .and_then(Value::as_array)
         .map(|listed| listed.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
+    addresses.sort_unstable();
+    let mut declared: Vec<&str> = LISTED_ADDRESSES.to_vec();
+    declared.sort_unstable();
     assert_eq!(
-        addresses, LISTED_ADDRESSES,
+        addresses, declared,
         "case {case:?}: expected GetIPSet to report the declared addresses, got {read}"
     );
 

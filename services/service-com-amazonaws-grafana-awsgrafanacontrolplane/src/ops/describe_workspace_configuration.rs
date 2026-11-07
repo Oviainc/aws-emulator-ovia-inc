@@ -145,7 +145,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // AWS takes the authorization decision at the IAM layer, ahead of the service
+        // reading anything, so a caller whose identity-based policies do not allow this
+        // action is refused without being told anything about the workspace it named.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::workspace_arn(
+                &crate::state::request_region(ctx.parts()),
+                &input.workspace_id,
+            ),
+        )
+        .map_err(DescribeWorkspaceConfigurationErrorModeled::AccessDeniedException)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 DescribeWorkspaceConfigurationErrorModeled::InternalServerException(
@@ -158,10 +170,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // A pure read: the answer carries no status, so there is nothing the clock
-        // owes this workspace that this call has to materialise.
-        let store = state.lock();
-        let Some(workspace) = store.workspaces.get(&input.workspace_id) else {
+        // A read, but one whose answer depends on whether the workspace still exists:
+        // a workspace whose accepted deletion has fallen due is gone whether or not
+        // anybody called, so the removal the clock owes the store is materialised
+        // before the record is resolved.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(workspace) = store.settled_mut(&input.workspace_id, now) else {
             return Err(
                 DescribeWorkspaceConfigurationErrorModeled::ResourceNotFoundException(
                     crate::state::workspace_not_found(&input.workspace_id),

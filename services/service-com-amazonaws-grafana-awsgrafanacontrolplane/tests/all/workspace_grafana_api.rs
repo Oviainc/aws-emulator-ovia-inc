@@ -724,10 +724,20 @@ async fn the_endpoint_answers_only_for_a_live_active_workspace() {
         202,
         "DeleteWorkspace must accept the deletion"
     );
+    // The deletion is ACCEPTED, not finished: a workspace in `DELETING` is no longer
+    // serving its Grafana API, and once the removal the clock owes the store falls due
+    // the endpoint names no workspace at all.
+    let deleting = native(&emulator, &endpoint, "/api/org", Some(&bearer(&key))).await;
+    assert_eq!(
+        deleting.status, 503,
+        "a workspace whose deletion is in flight serves no Grafana API, got {} with {:?}",
+        deleting.status, deleting.body
+    );
+    tokio::time::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(100)).await;
     let gone = native(&emulator, &endpoint, "/api/org", Some(&bearer(&key))).await;
     assert_eq!(
         gone.status, 404,
-        "a deleted workspace serves nothing at its endpoint, got {} with {:?}",
+        "a removed workspace serves nothing at its endpoint, got {} with {:?}",
         gone.status, gone.body
     );
 }

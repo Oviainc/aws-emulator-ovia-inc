@@ -181,12 +181,13 @@ pub fn serve(
     };
 
     // A workspace announces its endpoint from the moment it is created, but its
-    // Grafana server is running only once the workspace is ACTIVE.
+    // Grafana server is running only while the workspace is ACTIVE — not before it
+    // is up, and not once a deletion has been accepted for it.
     if workspace.status != ACTIVE {
         return json(
             503,
             &format!(
-                "workspace {} is {} and its Grafana HTTP API is not serving yet",
+                "workspace {} is {} and its Grafana HTTP API is not serving",
                 workspace.id, workspace.status
             ),
         );

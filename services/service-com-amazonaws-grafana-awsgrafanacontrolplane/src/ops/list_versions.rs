@@ -154,7 +154,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // AWS takes the authorization decision at the IAM layer, ahead of the service
+        // reading anything, so a caller whose identity-based policies do not allow this
+        // action is refused without being told anything about the catalogue or the
+        // workspace. The resource is the workspace the request NAMES, when it names one,
+        // and otherwise the workspaces collection of the account.
+        let region = crate::state::request_region(ctx.parts());
+        let resource = match input.workspace_id.as_deref() {
+            Some(id) => crate::state::workspace_arn(&region, id),
+            None => crate::state::workspaces_arn(&region),
+        };
+        crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME, &resource)
+            .map_err(ListVersionsErrorModeled::AccessDeniedException)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListVersionsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -169,15 +180,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // supported catalogue ("lists all versions of Grafana that are supported
         // for CreateWorkspace"); with one it is the versions that workspace "can
         // be upgraded" to, computed from the version the store persists for it.
-        // This operation is `@readonly`, so it only reads that record.
+        // Whether that workspace EXISTS is decided by the clock: one whose accepted
+        // deletion has fallen due is gone whether or not anybody called, so the
+        // removal is materialised before the record is resolved.
         let versions: Vec<String> = match input.workspace_id.as_deref() {
             None => crate::state::SUPPORTED_GRAFANA_VERSIONS
                 .iter()
                 .map(|version| (*version).to_string())
                 .collect(),
             Some(id) => {
-                let store = state.lock();
-                let Some(workspace) = store.workspaces.get(id) else {
+                let now = ::std::time::SystemTime::now();
+                let mut store = state.lock();
+                let Some(workspace) = store.settled_mut(id, now) else {
                     return Err(ListVersionsErrorModeled::ResourceNotFoundException(
                         crate::state::workspace_not_found(id),
                     )

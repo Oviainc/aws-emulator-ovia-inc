@@ -163,7 +163,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every member this report reads is modelled, and the tokens are stored on the
         // service account the request names, so nothing here depends on request
         // metadata.
-        let _ = ctx;
+        // AWS takes the authorization decision at the IAM layer, ahead of the service
+        // reading anything, so a caller whose identity-based policies do not allow this
+        // action is refused without being told anything about the workspace it named.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::workspace_arn(
+                &crate::state::request_region(ctx.parts()),
+                &input.workspace_id,
+            ),
+        )
+        .map_err(ListWorkspaceServiceAccountTokensErrorModeled::AccessDeniedException)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 ListWorkspaceServiceAccountTokensErrorModeled::InternalServerException(

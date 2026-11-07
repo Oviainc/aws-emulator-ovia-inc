@@ -151,7 +151,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // AWS takes the authorization decision at the IAM layer, ahead of the service
+        // reading anything, so a caller whose identity-based policies do not allow this
+        // action is refused without being told anything about the workspace it named.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::workspace_arn(
+                &crate::state::request_region(ctx.parts()),
+                &input.workspace_id,
+            ),
+        )
+        .map_err(DescribeWorkspaceAuthenticationErrorModeled::AccessDeniedException)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 DescribeWorkspaceAuthenticationErrorModeled::InternalServerException(
@@ -164,11 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // `@readonly`, and a plain read is enough: an `AuthenticationDescription`
-        // carries no lifecycle status, so nothing this operation reports depends
-        // on a status change the clock owes the workspace.
-        let store = state.lock();
-        match store.workspaces.get(&input.workspace_id) {
+        // `@readonly`, but whether the workspace EXISTS is decided by the clock: one
+        // whose accepted deletion has fallen due is gone whether or not anybody
+        // called, so that removal is materialised before the record is resolved.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        match store.settled_mut(&input.workspace_id, now) {
             Some(workspace) => Ok(DescribeWorkspaceAuthenticationOutput {
                 authentication: workspace.to_authentication_description(),
             }),

@@ -226,7 +226,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into()
         }
 
-        let _ = ctx;
+        // AWS takes the authorization decision at the IAM layer, ahead of the service
+        // reading anything, so a caller whose identity-based policies do not allow this
+        // action is refused without being told anything about the workspace it named,
+        // and nothing is written.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::workspace_arn(
+                &crate::state::request_region(ctx.parts()),
+                &input.workspace_id,
+            ),
+        )
+        .map_err(UpdateWorkspaceErrorModeled::AccessDeniedException)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateWorkspaceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -294,6 +307,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A change to a workspace whose previous accepted change is still in flight
+        // is refused rather than written on top of it: the workspace is in an
+        // inconsistent state until the clock settles it, which is the state
+        // `ConflictException` is modelled for. Judged after the request's own
+        // members, so a request that is invalid whatever the workspace's state is
+        // still answered as the validation failure it is, and before anything is
+        // written, so the refused call leaves the stored record untouched.
+        if let Some(conflict) = crate::state::workspace_in_flight(workspace) {
+            return Err(UpdateWorkspaceErrorModeled::ConflictException(conflict).into());
+        }
+
         if let Some(value) = input.workspace_name {
             workspace.name = Some(value);
         }
@@ -343,10 +367,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         workspace.modified = now;
         // The update is accepted, not finished: the workspace reports `UPDATING`
         // until the clock owes it `ACTIVE` again.
-        workspace.status = "UPDATING".to_string();
+        workspace.status = crate::state::WORKSPACE_UPDATING.to_string();
         workspace.pending = Some(crate::state::PendingTransition {
             due: now + crate::state::LIFECYCLE_TRANSITION,
-            status: crate::state::WORKSPACE_ACTIVE.to_string(),
+            owed: crate::state::OwedChange::Status(crate::state::WORKSPACE_ACTIVE.to_string()),
         });
 
         Ok(UpdateWorkspaceOutput {

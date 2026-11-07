@@ -50,6 +50,9 @@ mod workspace_api_keys;
 #[path = "all/workspace_authentication.rs"]
 mod workspace_authentication;
 
+#[path = "all/workspace_authorization.rs"]
+mod workspace_authorization;
+
 #[path = "all/workspace_configuration.rs"]
 mod workspace_configuration;
 
@@ -59,5 +62,11 @@ mod workspace_grafana_api;
 #[path = "all/workspace_lifecycle.rs"]
 mod workspace_lifecycle;
 
+#[path = "all/workspace_mutation_gating.rs"]
+mod workspace_mutation_gating;
+
 #[path = "all/workspace_native_api.rs"]
 mod workspace_native_api;
+
+#[path = "all/workspace_refusal_messages.rs"]
+mod workspace_refusal_messages;

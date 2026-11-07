@@ -147,6 +147,17 @@ fn create_request(extra: Value) -> Value {
     request
 }
 
+/// Wait out the span the clock owes a workspace its next status in, so the workspace has
+/// SETTLED (`ACTIVE`, or gone when a delete was accepted) before the next call.
+///
+/// A workspace whose accepted change is still in flight refuses another one with
+/// `ConflictException`, so a case that is not about that gate waits for the record to
+/// settle first — exactly as a client driving two changes in a row has to. The transition
+/// is owed by the clock, not by a call: nothing is done here but wait.
+async fn settled() {
+    tokio::time::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(200)).await;
+}
+
 /// Create a workspace and answer its id.
 async fn new_workspace(router: &MultiServiceRouter, extra: Value) -> String {
     let created = create(router, create_request(extra)).await;
@@ -155,10 +166,14 @@ async fn new_workspace(router: &MultiServiceRouter, extra: Value) -> String {
         "the fixture create must succeed, got {} with {:?}",
         created.status, created.body
     );
-    created.body["workspace"]["id"]
+    let id = created.body["workspace"]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("CreateWorkspace must answer an id: {:?}", created.body))
-        .to_string()
+        .to_string();
+    // A workspace is `CREATING` when the create returns, and a change to a workspace
+    // whose create is still in flight is refused: the fixture is handed over settled.
+    settled().await;
+    id
 }
 
 /// A JSON object document of exactly `len` bytes, for the length-bound cases.
@@ -502,6 +517,9 @@ async fn the_published_length_bounds_are_enforced() {
     ];
 
     for (case, document, accepted) in cases {
+        // Each accepted row leaves the workspace `UPDATING`, and the next change is
+        // refused until the clock settles it.
+        settled().await;
         let answer = update_configuration(&router, &id, json!({"configuration": document})).await;
         if accepted {
             assert_eq!(
@@ -545,6 +563,10 @@ async fn an_id_that_names_no_workspace_is_a_404() {
         "the fixture delete must succeed, got {} with {:?}",
         gone.status, gone.body
     );
+    // The delete is ACCEPTED, not finished: the workspace reports `DELETING` until the
+    // removal the clock owes the store falls due, and only from then on does its id name
+    // nothing.
+    settled().await;
 
     // Ids matching `WorkspaceId`'s `^g-[0-9a-f]{10}$` that no workspace carries.
     let cases: Vec<(&str, String)> = vec![

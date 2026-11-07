@@ -12,11 +12,13 @@
 //! refused with the modelled error.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_grafana_awsgrafanacontrolplane::state::{
-    service_state, ServiceAccount, SERVICE_ACCOUNT_MIN_GRAFANA_MAJOR, SERVICE_ACCOUNT_QUOTA,
+    service_state, ServiceAccount, LIFECYCLE_TRANSITION, SERVICE_ACCOUNT_MIN_GRAFANA_MAJOR,
+    SERVICE_ACCOUNT_QUOTA,
 };
 use service_com_amazonaws_grafana_awsgrafanacontrolplane::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -399,6 +401,9 @@ async fn a_create_against_no_workspace_is_refused() {
         202,
         "DeleteWorkspace must accept the delete this case needs"
     );
+    // The delete is ACCEPTED, not finished: the workspace is removed from the store once
+    // the removal the clock owes it falls due, and only then does its id name nothing.
+    tokio::time::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(200)).await;
 
     // (case, the workspaceId, expected status, expected wire error code)
     let cases: [(&str, &str, u16, &str); 5] = [

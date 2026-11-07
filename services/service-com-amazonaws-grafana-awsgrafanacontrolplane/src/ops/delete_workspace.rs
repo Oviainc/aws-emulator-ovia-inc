@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWorkspace
-//! Removes the workspace from [`crate::state`] and reports the record it removed, with
-//! the `DELETING` status the accepted deletion leaves it in. The id names nothing
-//! afterwards: a following describe, update or delete answers
+//! Accepts the deletion of the workspace in [`crate::state`]: the record is marked
+//! `DELETING` and the clock owes the store its removal, so a poller still observes the
+//! `DELETING` state the API promises and a repeated delete of a deletion already in
+//! flight is accepted again (`@idempotent`) with the same record. Once the removal falls
+//! due the id names nothing: a following describe, update or delete answers
 //! `ResourceNotFoundException`, and `ListWorkspaces` no longer carries it.
 //!
 //! ## Shape of an operation
@@ -147,7 +149,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // AWS takes the authorization decision at the IAM layer, ahead of the service
+        // reading anything, so a caller whose identity-based policies do not allow this
+        // action is refused without being told anything about the workspace it named.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::workspace_arn(
+                &crate::state::request_region(ctx.parts()),
+                &input.workspace_id,
+            ),
+        )
+        .map_err(DeleteWorkspaceErrorModeled::AccessDeniedException)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteWorkspaceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -160,27 +174,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        let Some(mut workspace) = store.workspaces.remove(&input.workspace_id) else {
+        let Some(workspace) = store.settled_mut(&input.workspace_id, now) else {
             return Err(DeleteWorkspaceErrorModeled::ResourceNotFoundException(
                 crate::state::workspace_not_found(&input.workspace_id),
             )
             .into());
         };
 
-        // Forget the client tokens that named it, so a replayed CreateWorkspace
-        // mints a new workspace instead of reporting one that no longer exists.
-        store
-            .idempotency_tokens
-            .retain(|_, id| id != &workspace.id);
-
-        // The deletion is accepted and the record is gone; the response reports
-        // the status the workspace was left in, and nothing is owed on it.
-        workspace.status = "DELETING".to_string();
-        workspace.pending = None;
-        workspace.modified = now;
+        // `DeleteWorkspace` is `@idempotent`: a delete of a workspace whose deletion
+        // is ALREADY in flight is accepted again and answers the same record, still
+        // `DELETING`, leaving the removal due at the instant the first accepted delete
+        // set it. Only the first one starts the deletion.
+        if !workspace.deletion_in_flight() {
+            // Accepted, not finished: the workspace reports `DELETING` and the clock
+            // owes the store its removal, after which the id names nothing.
+            workspace.status = crate::state::WORKSPACE_DELETING.to_string();
+            workspace.pending = Some(crate::state::PendingTransition {
+                due: now + crate::state::LIFECYCLE_TRANSITION,
+                owed: crate::state::OwedChange::Removal,
+            });
+            workspace.modified = now;
+        }
+        let description = workspace.to_description();
 
         Ok(DeleteWorkspaceOutput {
-            workspace: workspace.to_description(),
+            workspace: description,
         })
     }
 }

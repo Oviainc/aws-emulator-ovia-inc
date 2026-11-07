@@ -54,6 +54,7 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+pub mod authorization;
 pub mod workspace_api;
 
 /// The error code the service's request validator answers a request whose BODY
@@ -101,12 +102,33 @@ const URI_BOUND_MEMBERS: [&str; 10] = [
     "userType",
 ];
 
+/// How this service words the refusal of a URI-bound member whose value is outside
+/// the `@pattern` the model declares for it: `The <member> should satisfy the
+/// pattern <pattern>.`
+///
+/// Recorded behaviour: Amazon Managed Grafana states a pattern violation from the
+/// member's OWN constraint — it names the member and the pattern the model carries
+/// and does NOT echo the rejected value, where the framework's multi-service default
+/// quotes the value back. The code and the status stay the modelled
+/// `ValidationException` / 400, which is what this service raises for a member it
+/// reads out of the request URI.
+fn pattern_refusal(member: &str, pattern: &str) -> Refused {
+    Refused {
+        code: VALIDATION_CODE.to_string(),
+        message: format!("The {member} should satisfy the pattern {pattern}."),
+    }
+}
+
+/// The modelled error code a refusal of a URI-bound member keeps.
+const VALIDATION_CODE: &str = "ValidationException";
+
 /// How this service states a refusal of one violated member, or `None` to leave
 /// the framework's wording (and the modelled `ValidationException` code) in place.
 ///
 /// A violation of a member the request carries in its body is the request
 /// validator's, so it is answered with [`BAD_REQUEST_CODE`]; a violation of a
-/// URI-bound member is the service's own and keeps the modelled code. Absence is
+/// URI-bound member is the service's own and keeps the modelled code — with the
+/// service's own wording for a `@pattern` violation ([`pattern_refusal`]). Absence is
 /// not reworded: the recorded refusal is of a value that was PRESENT and outside a
 /// bound the model declares, so that is the class this answers for.
 fn refusal_for(violation: &Violation) -> Option<Refused> {
@@ -114,10 +136,18 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
     // (`samlConfiguration.idpMetadata`), and that member is the one the body
     // carries.
     let member = violation.path.split('.').next().unwrap_or_default();
-    if matches!(violation.kind, ViolationKind::MissingRequiredMember)
-        || URI_BOUND_MEMBERS.contains(&member)
-    {
+    if matches!(violation.kind, ViolationKind::MissingRequiredMember) {
         return None;
+    }
+    if URI_BOUND_MEMBERS.contains(&member) {
+        // Only a pattern violation is reworded: that is the constraint this service
+        // states in its own form. Every other bound on a URI-bound member keeps the
+        // framework's wording, which is the form this service has not been recorded
+        // stating differently.
+        return match &violation.kind {
+            ViolationKind::Pattern(pattern) => Some(pattern_refusal(&violation.path, pattern)),
+            _ => None,
+        };
     }
     Some(Refused {
         code: BAD_REQUEST_CODE.to_string(),

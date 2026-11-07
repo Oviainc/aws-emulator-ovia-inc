@@ -96,6 +96,35 @@ pub const WORKSPACE_RESOURCE_TYPE: &str = "Workspace";
 /// native Grafana HTTP API serves requests only from then on.
 pub const WORKSPACE_ACTIVE: &str = "ACTIVE";
 
+/// `WorkspaceStatus$DELETING`: the status a workspace carries from the moment a
+/// deletion is accepted until the record is gone.
+pub const WORKSPACE_DELETING: &str = "DELETING";
+
+/// `WorkspaceStatus$UPDATING`: the status a workspace carries while an accepted
+/// change to it is in flight.
+pub const WORKSPACE_UPDATING: &str = "UPDATING";
+
+/// `WorkspaceStatus$CREATING`: the status a workspace carries from the moment its
+/// create is accepted until it is up.
+pub const WORKSPACE_CREATING: &str = "CREATING";
+
+/// The `WorkspaceStatus` values naming work on a workspace that is still IN
+/// FLIGHT: the statuses a `202 Accepted` leaves the workspace in, each of which
+/// the clock owes a further change out of.
+///
+/// Source: `WorkspaceStatus`'s own value set
+/// (`smithy_query(query="shape",shape="WorkspaceStatus")`, mirrored by
+/// [`crate::ops::types::WORKSPACE_STATUS_VALUES`]) — these are its progressive
+/// values. Every other value is one the workspace RESTS in: `ACTIVE`, and the
+/// `DEGRADED` / `*_FAILED` outcomes a finished attempt leaves behind.
+pub const IN_FLIGHT_WORKSPACE_STATUSES: &[&str] = &[
+    WORKSPACE_CREATING,
+    WORKSPACE_DELETING,
+    WORKSPACE_UPDATING,
+    "UPGRADING",
+    "VERSION_UPDATING",
+];
+
 /// The `resourceType` a `ResourceNotFoundException` or a `ConflictException`
 /// reports for a workspace API key.
 pub const API_KEY_RESOURCE_TYPE: &str = "ApiKey";
@@ -195,6 +224,15 @@ pub const MAX_TAG_VALUE_LENGTH: usize = 256;
 /// `arn:aws:grafana:<region>:<account>:/workspaces/<workspace-id>`.
 pub const WORKSPACE_ARN_RESOURCE_TYPE: &str = "workspaces";
 
+/// This service's `arnNamespace` (`smithy_query(query="service_info")`): the
+/// service segment of every ARN it publishes, and the prefix of every IAM action
+/// it is authorized against.
+pub const GRAFANA_ARN_NAMESPACE: &str = "grafana";
+
+/// The region a request that names none is served in — the region a generated
+/// emulator defaults to. See [`request_region`].
+pub const DEFAULT_REGION: &str = "us-east-1";
+
 /// How many workspaces the store holds before `CreateWorkspace` refuses with the
 /// modelled `ServiceQuotaExceededException`.
 ///
@@ -242,12 +280,28 @@ pub struct ApiKey {
     pub token_digest: String,
 }
 
-/// A status change the clock owes a workspace: the instant it falls due, and the
-/// status the workspace carries from then on.
+/// A change the clock owes a workspace: the instant it falls due, and what it
+/// does to the workspace from then on.
 #[derive(Debug, Clone)]
 pub struct PendingTransition {
     pub due: SystemTime,
-    pub status: String,
+    pub owed: OwedChange,
+}
+
+/// What the clock owes a workspace at [`PendingTransition::due`].
+///
+/// Both are started by a call the service ACCEPTED (HTTP 202, "accepted, not
+/// finished") and materialised by whichever later call reads the record —
+/// nothing sleeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwedChange {
+    /// The workspace carries this `WorkspaceStatus` from the due instant on: the
+    /// `ACTIVE` a create or an update is owed.
+    Status(String),
+    /// The workspace is gone from the store from the due instant on: the removal
+    /// an accepted `DeleteWorkspace` is owed, which is what makes `DELETING` a
+    /// state a caller can observe at all.
+    Removal,
 }
 
 /// One Amazon Managed Grafana workspace, as this emulator persists it.
@@ -323,7 +377,13 @@ impl Workspace {
             .pending
             .as_ref()
             .filter(|pending| now >= pending.due)
-            .map(|pending| pending.status.clone());
+            .and_then(|pending| match &pending.owed {
+                OwedChange::Status(status) => Some(status.clone()),
+                // A removal is not this record's to carry out: the workspace is
+                // released by the store, which owns the map it lives in (see
+                // [`ComAmazonawsGrafanaAwsgrafanacontrolplaneState::release_deleted`]).
+                OwedChange::Removal => None,
+            });
         if let Some(status) = due {
             self.status = status;
             self.pending = None;
@@ -332,6 +392,30 @@ impl Workspace {
         // `secondsToLive` ran out is when it stopped being a key of this
         // workspace.
         self.api_keys.retain(|_, key| now < key.expires);
+    }
+
+    /// Whether this workspace's deletion has already been accepted and the
+    /// removal the clock owes it has not fallen due yet — the span the workspace
+    /// reports `DELETING` for.
+    ///
+    /// `DeleteWorkspace` is `@idempotent`, so this is what tells a repeated
+    /// delete of a workspace already being deleted from the first one: the
+    /// repeat reports the same record and leaves the removal due at the instant
+    /// the first delete set.
+    pub fn deletion_in_flight(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.owed == OwedChange::Removal)
+    }
+
+    /// Whether the removal an accepted deletion owes this workspace has fallen
+    /// due by `now`, so the record is gone from that instant on.
+    fn removal_due(&self, now: SystemTime) -> bool {
+        self.deletion_in_flight()
+            && self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| now >= pending.due)
     }
 
     /// Whether this workspace may hold service accounts at all.
@@ -700,6 +784,7 @@ impl ComAmazonawsGrafanaAwsgrafanacontrolplaneState {
     /// The workspace `id` names, with any status change the clock owes it
     /// already materialised.
     pub fn settled_mut(&mut self, id: &str, now: SystemTime) -> Option<&mut Workspace> {
+        self.release_deleted(now);
         let workspace = self.workspaces.get_mut(id)?;
         workspace.settle(now);
         Some(workspace)
@@ -708,8 +793,31 @@ impl ComAmazonawsGrafanaAwsgrafanacontrolplaneState {
     /// Materialise every status change the clock owes, for a caller that is
     /// about to report on all of them.
     pub fn settle_all(&mut self, now: SystemTime) {
+        self.release_deleted(now);
         for workspace in self.workspaces.values_mut() {
             workspace.settle(now);
+        }
+    }
+
+    /// Release every workspace whose accepted deletion has fallen due by `now`,
+    /// with the client tokens that named it.
+    ///
+    /// The removal is owed by the CLOCK: the instant it falls due is when the
+    /// workspace stopped existing, whether or not anybody called — so every read
+    /// of the store materialises it first, and from then on the id names nothing
+    /// (`ResourceNotFoundException`). Forgetting the tokens with the record is
+    /// what makes a replayed `CreateWorkspace` mint a new workspace rather than
+    /// report one that is gone.
+    pub fn release_deleted(&mut self, now: SystemTime) {
+        let released: Vec<String> = self
+            .workspaces
+            .values()
+            .filter(|workspace| workspace.removal_due(now))
+            .map(|workspace| workspace.id.clone())
+            .collect();
+        for id in released {
+            self.workspaces.remove(&id);
+            self.idempotency_tokens.retain(|_, held| held != &id);
         }
     }
 }
@@ -921,6 +1029,64 @@ pub fn service_account_name_taken(
         resource_id: existing_id.to_string(),
         resource_type: SERVICE_ACCOUNT_RESOURCE_TYPE.to_string(),
     }
+}
+
+/// The modelled `ConflictException` for a workspace whose previous accepted
+/// change is still in flight, or `None` when it rests in a status a further
+/// change is accepted in.
+///
+/// `ConflictException` documents "A resource was in an inconsistent state during
+/// an update or a deletion", which is exactly what a workspace is between the
+/// `202` that started a change and the status the clock owes it
+/// ([`IN_FLIGHT_WORKSPACE_STATUSES`]). The message names the status the
+/// workspace is in, because that is the part of the answer that tells the caller
+/// what it is waiting for; the status is read off the stored record.
+pub fn workspace_in_flight(workspace: &Workspace) -> Option<ConflictException> {
+    IN_FLIGHT_WORKSPACE_STATUSES
+        .contains(&workspace.status.as_str())
+        .then(|| ConflictException {
+            message: format!(
+                "Workspace operation failed. Workspace is currently in the {} state.",
+                workspace.status
+            ),
+            resource_id: workspace.id.clone(),
+            resource_type: WORKSPACE_RESOURCE_TYPE.to_string(),
+        })
+}
+
+/// The ARN of this account's WORKSPACES COLLECTION in `region`:
+/// `arn:aws:grafana:<region>:<account>:/workspaces`.
+///
+/// The resource section of an Amazon Managed Grafana ARN carries a LEADING `/`
+/// (the form this service's own `resourceArn` members take, see
+/// [`not_a_workspace_arn`]), and the collection is the resource an action that
+/// addresses no single workspace is about — a create, which is what mints one,
+/// and a listing.
+pub fn workspaces_arn(region: &str) -> String {
+    ::engine::emulator_arn(
+        GRAFANA_ARN_NAMESPACE,
+        region,
+        &format!("/{WORKSPACE_ARN_RESOURCE_TYPE}"),
+    )
+}
+
+/// The ARN of ONE workspace in `region`:
+/// `arn:aws:grafana:<region>:<account>:/workspaces/<workspace-id>` — the
+/// resource every operation that names a `workspaceId` is about.
+pub fn workspace_arn(region: &str, workspace_id: &str) -> String {
+    format!("{}/{workspace_id}", workspaces_arn(region))
+}
+
+/// The signing region of the request being served, which is the region the
+/// resource ARNs this service names belong to.
+///
+/// The region travels in the SigV4 credential scope. A request carrying no
+/// usable `Authorization` header is served in [`DEFAULT_REGION`], the region a
+/// generated emulator defaults to.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
 /// The `ResourceNotFoundException` payload for a workspace id that names no

@@ -15,11 +15,12 @@
 //! sees.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_grafana_awsgrafanacontrolplane::state::{
-    service_state, SERVICE_ACCOUNT_PAGE_LIMIT,
+    service_state, LIFECYCLE_TRANSITION, SERVICE_ACCOUNT_PAGE_LIMIT,
 };
 use service_com_amazonaws_grafana_awsgrafanacontrolplane::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -495,6 +496,9 @@ async fn a_list_is_scoped_to_the_workspace_it_names() {
         202,
         "DeleteWorkspace must accept the delete this case needs"
     );
+    // The delete is ACCEPTED, not finished: the workspace is removed from the store once
+    // the removal the clock owes it falls due, and only then does its id name nothing.
+    tokio::time::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(200)).await;
 
     for (case, workspace_id, names) in [
         ("the workspace holding two accounts", &first, vec!["shared-name", "only-in-first"]),
