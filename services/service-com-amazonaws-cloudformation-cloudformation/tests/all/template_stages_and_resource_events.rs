@@ -1737,13 +1737,16 @@ async fn an_update_whose_template_cannot_be_deployed_fails_and_acts_on_no_resour
     .await;
 
     // And the resource the first template deployed is still there: deploying a template
-    // that declares the same resource acts on nothing.
+    // that declares the same resource acts on nothing. The stack's update FAILED and was
+    // left standing, so this one asks for that state to go on being preserved — which is
+    // what such a stack takes an update from.
     let (status, body) = call(
         &router,
         "UpdateStack",
         &[
             member("StackName", "unknowable"),
             member("TemplateBody", DEPLOYED),
+            member("DisableRollback", "true"),
         ],
     )
     .await;

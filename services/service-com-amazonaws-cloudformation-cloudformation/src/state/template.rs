@@ -1853,17 +1853,25 @@ const MAX_IDENTITY_ROUNDS: usize = 4;
 /// Whether a resource type's published identifier is a function of ANOTHER resource of the
 /// template, so it can only be computed once that resource's identity is known.
 ///
-/// Five of the catalogued types are: an Amazon ECS service's ARN carries the CLUSTER that
+/// Seven of the catalogued types are: an Amazon ECS service's ARN carries the CLUSTER that
 /// hosts it (`service/<cluster>/<name>`), an ELBv2 listener's and listener rule's ARNs nest
 /// inside the ARN of the load balancer and the listener their declaration names, an Amazon
-/// S3 Vectors index's nests inside the ARN of the vector bucket its declaration names, and a
+/// S3 Vectors index's nests inside the ARN of the vector bucket its declaration names, a
 /// CodeArtifact repository's nests inside the DOMAIN its declaration names
-/// (`repository/<domain>/<name>`). Every other type's return values are functions of its own
-/// name and its own declared properties, so one pass computes them.
+/// (`repository/<domain>/<name>`), and an AWS Lambda published version's and alias's are the
+/// ARN of the FUNCTION their declaration names with a qualifier. Every other type's return
+/// values are functions of its own name and its own declared properties, so one pass
+/// computes them.
 fn identity_depends_on_another_resource(resource_type: &str) -> bool {
     matches!(
         resource_type,
-        ECS_SERVICE | ELB_LISTENER | ELB_LISTENER_RULE | S3VECTORS_INDEX | CODEARTIFACT_REPOSITORY
+        ECS_SERVICE
+            | ELB_LISTENER
+            | ELB_LISTENER_RULE
+            | S3VECTORS_INDEX
+            | CODEARTIFACT_REPOSITORY
+            | LAMBDA_VERSION
+            | LAMBDA_ALIAS
     )
 }
 
@@ -3263,6 +3271,8 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     FIREHOSE_DELIVERY_STREAM,
     KINESIS_STREAM,
     "AWS::Lambda::Function",
+    LAMBDA_ALIAS,
+    LAMBDA_VERSION,
     "AWS::Logs::LogGroup",
     MQ_BROKER,
     MSK_CLUSTER,
@@ -4138,8 +4148,10 @@ pub fn process_with_parameters(body: &str, supplied: &BTreeMap<String, String>) 
     // walked over by the expansion.
     let parameters = directive_parameters(&document, supplied);
     // The SAM macro's expansion reads the `Transform` section itself, so it runs while that
-    // section is still there.
-    super::sam::expand(&mut document);
+    // section is still there — with the parameter values in force, since one property of
+    // that expansion reads a parameter (see
+    // [`expand_with_parameters`](super::sam::expand_with_parameters)).
+    super::sam::expand_with_parameters(&mut document, &parameters.values);
     if let Some(sections) = document.as_object_mut() {
         // The processed template is what CloudFormation deploys, and the transforms it
         // declared have been applied by then: the member does not survive into it.

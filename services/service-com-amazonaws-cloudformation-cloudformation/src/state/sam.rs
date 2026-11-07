@@ -145,6 +145,30 @@ const DIGEST_CHARS: usize = 10;
 /// change a REMOVAL of the resource the stack had.
 const RETENTION_POLICY_PROPERTY: &str = "RetentionPolicy";
 
+/// `AWS::Serverless::Function$AutoPublishAlias`: "the name of the Lambda alias" the
+/// transform publishes a version for and points at it.
+const AUTO_PUBLISH_ALIAS_PROPERTY: &str = "AutoPublishAlias";
+
+/// `AWS::Serverless::Function$AutoPublishCodeSha256`: the value a declaration states to
+/// "address the following scenario … a new version is not published", which the generated
+/// version's logical id carries instead of a hash of the code.
+const AUTO_PUBLISH_SHA_PROPERTY: &str = "AutoPublishCodeSha256";
+
+/// `AWS::Serverless::Function$VersionDescription`: "a description of the function version",
+/// which `AWS::Lambda::Version` spells as its own `Description`.
+const VERSION_DESCRIPTION_PROPERTY: &str = "VersionDescription";
+
+/// `AWS::Serverless::Function$ProvisionedConcurrencyConfig`: "the provisioned concurrency
+/// configuration of a function's alias", which belongs on the generated ALIAS — "must be
+/// specified with AutoPublishAlias" — under the same name `AWS::Lambda::Alias` spells it.
+const PROVISIONED_CONCURRENCY_PROPERTY: &str = "ProvisionedConcurrencyConfig";
+
+/// The logical-id fragments the generated version and alias carry, between the function's
+/// own logical id and the hash (or the alias's name): "AWS SAM generates … a
+/// `<function-logical-id>Version<sha>` and a `<function-logical-id>Alias<alias-name>`".
+const VERSION_ID_INFIX: &str = "Version";
+const ALIAS_ID_INFIX: &str = "Alias";
+
 /// The resource attributes a reference walk reads: the ways a template names another
 /// resource ([`rename_references`]).
 const REF: &str = "Ref";
@@ -350,6 +374,22 @@ const EVENT_SOURCE_PASSTHROUGH: &[&str] = &[
 /// Its caller needs to know, because a processed template that differs from the submitted
 /// one is the only reason to report anything but the submitted body itself.
 pub fn expand(document: &mut Value) -> bool {
+    expand_with_parameters(document, &BTreeMap::new())
+}
+
+/// [`expand`] with the PARAMETER VALUES in force on the deployment, which is how the stage
+/// a stack deploys is expanded.
+///
+/// One property of the expansion reads a parameter: the `AutoPublishCodeSha256` the
+/// generated version's logical id carries, which a declaration states as `!Ref` of a
+/// parameter precisely so that each deployment can state a different value for it
+/// ([`stated_code_sha`]). Every other part of the expansion is a function of the document
+/// alone, so a caller with no parameter values in hand expands the same document the same
+/// way.
+pub fn expand_with_parameters(
+    document: &mut Value,
+    parameters: &BTreeMap<String, String>,
+) -> bool {
     if !declares_the_transform(document) {
         return false;
     }
@@ -357,7 +397,7 @@ pub fn expand(document: &mut Value) -> bool {
         return false;
     };
     let globals = document.get("Globals").cloned().unwrap_or(Value::Null);
-    let expansion = expanded_resources(&resources, &globals);
+    let expansion = expanded_resources(&resources, &globals, parameters);
     if expansion.resources == resources && expansion.renamed.is_empty() {
         return false;
     }
@@ -402,7 +442,11 @@ fn declares_the_transform(document: &Value) -> bool {
 
 /// The `Resources` section the transform produces from the one the template declares, with
 /// the logical ids it renamed on the way.
-fn expanded_resources(resources: &Map<String, Value>, globals: &Value) -> Expansion {
+fn expanded_resources(
+    resources: &Map<String, Value>,
+    globals: &Value,
+    parameters: &BTreeMap<String, String>,
+) -> Expansion {
     // The functions' properties, resolved against `Globals` once: the API events are read
     // off them, and so is each function's own expansion.
     let functions: Vec<(String, Value)> = resources
@@ -440,6 +484,7 @@ fn expanded_resources(resources: &Map<String, Value>, globals: &Value) -> Expans
                     &mut added,
                     (logical_id, declaration, &properties),
                     &events,
+                    parameters,
                 );
             }
             Some(API) => {
@@ -640,6 +685,7 @@ fn expand_function(
     added: &mut Map<String, Value>,
     declared: (&String, &Value, &Value),
     events: &[ApiEvent],
+    parameters: &BTreeMap<String, String>,
 ) {
     let (logical_id, declaration, properties) = declared;
     let condition = declaration.get("Condition");
@@ -669,6 +715,19 @@ fn expand_function(
     function
         .entry("Timeout".to_string())
         .or_insert_with(|| json!(DEFAULT_TIMEOUT));
+    // "AutoPublishCodeSha256 … use this property to … publish a new version": AWS Lambda
+    // "doesn't publish a version if the function's configuration and code haven't changed
+    // since the last version", so what makes the publication below a NEW version is that
+    // the value the declaration states travels into the FUNCTION's own description — a
+    // configuration that differs exactly when that value does. It is stated as the
+    // declaration wrote it, so a value spelled as a `Ref` to a parameter is the one
+    // CloudFormation resolves for this deployment. A description the declaration states
+    // itself wins, as every other property of the function does.
+    if let Some(sha) = auto_published_sha(properties) {
+        function
+            .entry("Description".to_string())
+            .or_insert_with(|| sha.clone());
+    }
     function.insert(
         "Tags".to_string(),
         tag_list(properties.get("Tags"), Some(CREATED_BY_TAG)),
@@ -689,9 +748,16 @@ fn expand_function(
             );
         }
     }
+    let published_code = function.get("Code").cloned();
     primary.insert(
         logical_id.clone(),
         carried_over(declaration, "AWS::Lambda::Function", function),
+    );
+    auto_published_version(
+        added,
+        (logical_id, condition, properties),
+        published_code.as_ref(),
+        parameters,
     );
 
     for event in events.iter().filter(|event| &event.function == logical_id) {
@@ -783,6 +849,115 @@ fn expand_function(
             _ => {}
         }
     }
+}
+
+/// The version and the alias an `AutoPublishAlias` asks for, beside the function.
+///
+/// "AutoPublishAlias: the name of the Lambda alias … AWS SAM … creates and publishes an
+/// `AWS::Lambda::Version` … and creates and updates an `AWS::Lambda::Alias` with the name
+/// you provide, pointing to that version." A published version is IMMUTABLE, so each
+/// snapshot is a resource of its own: the generated version's logical id carries a hash,
+/// exactly as a generated layer version's does, and a deployment whose code changed
+/// therefore declares a DIFFERENT version resource — which is what publishes a new version
+/// and what the alias is then pointed at.
+///
+/// The hash is the one SAM's logical-id generator produces: the declaration's
+/// `AutoPublishCodeSha256` where it states one — that property exists precisely so a caller
+/// can decide when a new version is published — and otherwise a digest of the function's own
+/// `Code`, so a changed deployment package is a changed id. Either way it is
+/// [`DIGEST_CHARS`] characters, the length SAM appends.
+///
+/// Nothing is generated for a declaration that states no alias: the version publication is
+/// what the alias property asks for.
+fn auto_published_version(
+    added: &mut Map<String, Value>,
+    declared: (&String, Option<&Value>, &Value),
+    code: Option<&Value>,
+    parameters: &BTreeMap<String, String>,
+) {
+    let (logical_id, condition, properties) = declared;
+    let Some(alias) = properties
+        .get(AUTO_PUBLISH_ALIAS_PROPERTY)
+        .filter(|alias| !alias.is_null())
+    else {
+        return;
+    };
+    let hash = stated_code_sha(properties, parameters)
+        .unwrap_or_else(|| digest(code.unwrap_or(&Value::Null)));
+    let version_id = format!("{logical_id}{VERSION_ID_INFIX}{hash}");
+
+    let mut version = Map::new();
+    version.insert("FunctionName".to_string(), json!({ REF: logical_id }));
+    if let Some(description) = properties.get(VERSION_DESCRIPTION_PROPERTY) {
+        version.insert("Description".to_string(), description.clone());
+    }
+    let mut published = resource("AWS::Lambda::Version", version);
+    // The hashed logical id above makes each snapshot a resource of its own, so a changed
+    // code content REMOVES the resource the stack had — the event `DeletionPolicy` governs.
+    // A published version is what an alias can be pointed BACK at, so the versions a stack
+    // published are retained rather than taken away by the deployment that publishes the
+    // next one, exactly as the generated layer version's are ([`retained`]).
+    if let Some(members) = published.as_object_mut() {
+        members.insert(
+            DELETION_POLICY.to_string(),
+            json!(super::deletion_policy::RETAIN),
+        );
+    }
+    added.insert(version_id.clone(), conditioned(published, condition));
+
+    let mut generated = Map::new();
+    generated.insert("Name".to_string(), alias.clone());
+    generated.insert("FunctionName".to_string(), json!({ REF: logical_id }));
+    // The alias invokes the version this expansion just declared, read off that resource —
+    // "Version: the version number" — so the alias is pointed at the version Lambda
+    // published rather than at a number the template guessed.
+    generated.insert(
+        "FunctionVersion".to_string(),
+        json!({ "Fn::GetAtt": [version_id, "Version"] }),
+    );
+    if let Some(config) = properties.get(PROVISIONED_CONCURRENCY_PROPERTY) {
+        generated.insert(PROVISIONED_CONCURRENCY_PROPERTY.to_string(), config.clone());
+    }
+    let named = alias.as_str().map(logical_fragment).unwrap_or_default();
+    added.insert(
+        format!("{logical_id}{ALIAS_ID_INFIX}{named}"),
+        conditioned(resource("AWS::Lambda::Alias", generated), condition),
+    );
+}
+
+/// The `AutoPublishCodeSha256` a declaration states, as it wrote it, where the declaration
+/// asks for the automatic publication at all — the property has meaning only beside
+/// `AutoPublishAlias`, which is what publishes a version.
+fn auto_published_sha(properties: &Value) -> Option<&Value> {
+    properties
+        .get(AUTO_PUBLISH_ALIAS_PROPERTY)
+        .filter(|alias| !alias.is_null())?;
+    properties
+        .get(AUTO_PUBLISH_SHA_PROPERTY)
+        .filter(|sha| !sha.is_null())
+}
+
+/// The hash the generated version's logical id carries where the declaration STATES one:
+/// [`DIGEST_CHARS`] characters of its `AutoPublishCodeSha256`.
+///
+/// The property is "a string that, when changed, triggers a new version to be published",
+/// and what a caller changes per deployment is normally a template PARAMETER — so a value
+/// stated as `!Ref` of one is read as the value in force for that parameter, which is the
+/// same resolution SAM performs before it hashes. `None` where the declaration states none,
+/// or states one from something no parameter value resolves: the hash is then the digest of
+/// the function's own code, which changes exactly when the code does.
+fn stated_code_sha(properties: &Value, parameters: &BTreeMap<String, String>) -> Option<String> {
+    let stated = properties.get(AUTO_PUBLISH_SHA_PROPERTY)?;
+    let stated = match stated {
+        Value::String(stated) => stated.clone(),
+        Value::Object(_) => {
+            let name = stated.get(REF).and_then(Value::as_str)?;
+            parameters.get(name)?.clone()
+        }
+        _ => return None,
+    };
+    let hash: String = stated.chars().take(DIGEST_CHARS).collect();
+    (!hash.is_empty()).then_some(hash)
 }
 
 /// The `Code` a function's declaration states: "CodeUri: The Amazon S3 URI … or a local
@@ -2062,3 +2237,240 @@ fn canonical(value: &Value, depth: usize) -> String {
         scalar => scalar.to_string(),
     }
 }
+
+#[cfg(test)]
+mod auto_publish_tests {
+    use super::*;
+
+    /// A serverless function declaring `properties`, as a whole template the transform is
+    /// asked to expand.
+    fn document(properties: Value, parameters: Option<Value>) -> Value {
+        let mut sections = json!({
+            "Transform": TRANSFORM,
+            "Resources": { "Fn": { "Type": FUNCTION, "Properties": properties } }
+        });
+        if let Some(parameters) = parameters {
+            sections["Parameters"] = parameters;
+        }
+        sections
+    }
+
+    /// The properties of one resource of the expansion, or `Value::Null` for a logical id
+    /// the expansion did not produce.
+    fn expanded(document: &Value, logical_id: &str) -> Value {
+        document
+            .pointer(&format!("/Resources/{logical_id}"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// Every logical id of the expansion carrying `resource_type`.
+    fn of_type(document: &Value, resource_type: &str) -> Vec<String> {
+        document
+            .get("Resources")
+            .and_then(Value::as_object)
+            .map(|resources| {
+                resources
+                    .iter()
+                    .filter(|(_, declared)| resource_type_of(declared) == Some(resource_type))
+                    .map(|(logical_id, _)| logical_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// [`resource_type`] under another name: the test module's own `resource_type` binding
+    /// would otherwise shadow the function.
+    fn resource_type_of(declared: &Value) -> Option<&str> {
+        super::resource_type(declared)
+    }
+
+    /// The code digest a row states, which the generated logical id carries ten characters
+    /// of. Any string does: the property is one "that, when changed, triggers a new version
+    /// to be published".
+    const SHA: &str = "9f2c3b7a1d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8";
+
+    /// One row: a declaration, the parameter values in force on the deployment, and what the
+    /// expansion is to make of it.
+    struct Row {
+        case: &'static str,
+        /// The `AWS::Serverless::Function`'s declared properties.
+        properties: Value,
+        /// The template's own `Parameters` section, for a row that states the digest through
+        /// one.
+        parameters: Option<Value>,
+        /// The parameter values in force, as a deployment supplies them.
+        supplied: Vec<(&'static str, &'static str)>,
+        /// The logical id the generated version is to carry, or `None` where the hash is a
+        /// digest of the code — which is this crate's own derivation, so the row states its
+        /// SHAPE instead.
+        version_id: Option<String>,
+        /// The function's description as the expansion leaves it: a digest stated as an
+        /// intrinsic travels into the description as the declaration wrote it, which is what
+        /// CloudFormation resolves for the deployment.
+        description: Option<Value>,
+    }
+
+    /// `AutoPublishAlias` expands into one `AWS::Lambda::Version` under a hashed logical id,
+    /// retained, and one `AWS::Lambda::Alias` invoking it — and the digest the declaration
+    /// states, in whichever form it states it, is what that hash is and what the function's
+    /// own description carries.
+    ///
+    /// The rows differ along what the rule generalises over: how the digest is stated (a
+    /// literal, a `Ref` to a parameter, not at all), whether the declaration describes the
+    /// function itself, and whether it asks for the automatic publication at all.
+    #[test]
+    fn auto_publish_alias_expands_into_a_retained_version_and_an_alias() {
+        let rows: Vec<Row> = vec![
+            Row {
+                case: "the digest written out in the declaration",
+                properties: json!({
+                    "InlineCode": "handler",
+                    "AutoPublishAlias": "live",
+                    "AutoPublishCodeSha256": SHA,
+                }),
+                parameters: None,
+                supplied: vec![],
+                version_id: Some(format!("FnVersion{}", &SHA[..DIGEST_CHARS])),
+                description: Some(json!(SHA)),
+            },
+            Row {
+                case: "the digest stated as a parameter of the template",
+                properties: json!({
+                    "InlineCode": "handler",
+                    "AutoPublishAlias": "live",
+                    "AutoPublishCodeSha256": { "Ref": "CodeSha" },
+                }),
+                parameters: Some(json!({ "CodeSha": { "Type": "String" } })),
+                supplied: vec![("CodeSha", SHA)],
+                version_id: Some(format!("FnVersion{}", &SHA[..DIGEST_CHARS])),
+                description: Some(json!({ "Ref": "CodeSha" })),
+            },
+            Row {
+                case: "no digest at all, so the hash is one of the code itself",
+                properties: json!({ "InlineCode": "handler", "AutoPublishAlias": "live" }),
+                parameters: None,
+                supplied: vec![],
+                version_id: None,
+                description: None,
+            },
+            Row {
+                case: "a description the declaration states itself, beside a digest",
+                properties: json!({
+                    "InlineCode": "handler",
+                    "AutoPublishAlias": "live",
+                    "AutoPublishCodeSha256": SHA,
+                    "Description": "what this function does",
+                }),
+                parameters: None,
+                supplied: vec![],
+                version_id: Some(format!("FnVersion{}", &SHA[..DIGEST_CHARS])),
+                description: Some(json!("what this function does")),
+            },
+        ];
+
+        for row in rows {
+            let Row {
+                case,
+                properties,
+                parameters,
+                supplied,
+                version_id,
+                description,
+            } = row;
+            let mut expanded_document = document(properties, parameters);
+            let values: BTreeMap<String, String> = supplied
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            let changed = expand_with_parameters(&mut expanded_document, &values);
+            assert!(
+                changed,
+                "case {case:?}: expected the transform to expand the declaration"
+            );
+
+            let versions = of_type(&expanded_document, "AWS::Lambda::Version");
+            match &version_id {
+                Some(expected) => assert_eq!(
+                    versions,
+                    vec![expected.clone()],
+                    "case {case:?}: expected exactly the version {expected:?}, got \
+                     {versions:?} in {expanded_document}"
+                ),
+                // A hash of the code is this crate's own digest, so what the row states
+                // about it is its SHAPE: the ten hexadecimal characters a generated logical
+                // id carries.
+                None => {
+                    let hash = versions
+                        .first()
+                        .and_then(|id| id.strip_prefix("FnVersion"))
+                        .unwrap_or_default()
+                        .to_string();
+                    assert!(
+                        versions.len() == 1
+                            && hash.len() == DIGEST_CHARS
+                            && hash.chars().all(|digit| digit.is_ascii_hexdigit()),
+                        "case {case:?}: expected one version hashed over the code, got \
+                         {versions:?}"
+                    );
+                }
+            }
+            let version = versions.first().cloned().unwrap_or_default();
+            assert_eq!(
+                expanded(&expanded_document, &version)
+                    .get(DELETION_POLICY)
+                    .and_then(Value::as_str),
+                Some(super::super::deletion_policy::RETAIN),
+                "case {case:?}: expected the generated version to be retained, got \
+                 {expanded_document}"
+            );
+
+            // The alias is named for the alias the declaration asks for, belongs to the same
+            // function, and invokes the version the hash names.
+            let alias = expanded(&expanded_document, "FnAliaslive");
+            assert_eq!(
+                alias.pointer("/Properties/FunctionVersion").cloned(),
+                Some(json!({ "Fn::GetAtt": [version, "Version"] })),
+                "case {case:?}: expected the alias to invoke the generated version, got \
+                 {alias}"
+            );
+            assert_eq!(
+                alias.pointer("/Properties/Name").and_then(Value::as_str),
+                Some("live"),
+                "case {case:?}: expected the alias to carry the declared name, got {alias}"
+            );
+
+            // ...and the function's own description is what makes the publication a NEW
+            // version where the declaration states a digest, unless the declaration
+            // describes the function itself. Compared as the whole VALUE: a digest stated as
+            // an intrinsic is a description that is an intrinsic, and a row that only read
+            // it as text would pass on a description the expansion had dropped.
+            let described = expanded(&expanded_document, "Fn");
+            assert_eq!(
+                described.pointer("/Properties/Description").cloned(),
+                description,
+                "case {case:?}: expected the function's description to be {description:?}, \
+                 got {described}"
+            );
+        }
+    }
+
+    /// A declaration that asks for no alias has no version and no alias generated for it:
+    /// the publication is what `AutoPublishAlias` asks for.
+    #[test]
+    fn a_function_without_the_alias_property_publishes_nothing() {
+        let mut expanded_document = document(
+            json!({ "InlineCode": "handler", "AutoPublishCodeSha256": SHA }),
+            None,
+        );
+        expand_with_parameters(&mut expanded_document, &BTreeMap::new());
+        for resource_type in ["AWS::Lambda::Version", "AWS::Lambda::Alias"] {
+            let generated = of_type(&expanded_document, resource_type);
+            assert!(
+                generated.is_empty(),
+                "case {resource_type:?}: expected no generated resource, got {generated:?}"
+            );
+        }
+    }
+}
+

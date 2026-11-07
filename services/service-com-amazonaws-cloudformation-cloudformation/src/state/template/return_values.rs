@@ -400,6 +400,43 @@ pub(super) fn return_values(
             );
             (name.to_string(), attributes)
         }
+        // "Ref returns the ARN of the function version"; Fn::GetAtt: FunctionArn, Version.
+        // Both carry the version NUMBER, which is AWS Lambda's to allocate — "each time you
+        // publish a version, Lambda increments the version number" — so neither can be
+        // computed from the template: what this gives the resource is the stand-in the
+        // publish then replaces, under the identifier CloudFormation computed for it
+        // ([`identity_is_service_assigned`] names the type, and
+        // [`crate::state::provisioning`] re-points the id and the attribute together).
+        LAMBDA_VERSION => {
+            match lambda_function_arn(properties, scope, budget, region) {
+                Some(function_arn) => {
+                    let arn = format!("{function_arn}:{name}");
+                    attributes.insert("FunctionArn".to_string(), arn.clone());
+                    attributes.insert("Version".to_string(), name.to_string());
+                    (arn, attributes)
+                }
+                // A declaration naming no function leaves the version with
+                // CloudFormation's own generated identity rather than an ARN built on a
+                // value that is not one.
+                None => (name.to_string(), attributes),
+            }
+        }
+        // "Ref returns the alias ARN"; Fn::GetAtt: AliasArn. An alias's ARN is the FUNCTION's
+        // own qualified by the alias name ("arn:aws:lambda:us-west-2:123456789012:function:
+        // my-function:BLUE"), so it is resolved once the function the declaration names has
+        // an identity ([`resolve_dependent_identities`]) — and it is the ARN `CreateAlias`
+        // answers, since both are built from the one account id this emulator mints, the
+        // function's name and the alias's.
+        LAMBDA_ALIAS => {
+            match lambda_function_arn(properties, scope, budget, region) {
+                Some(function_arn) => {
+                    let arn = format!("{function_arn}:{name}");
+                    attributes.insert("AliasArn".to_string(), arn.clone());
+                    (arn, attributes)
+                }
+                None => (name.to_string(), attributes),
+            }
+        }
         // "Ref returns the log group name"; Fn::GetAtt: Arn. A CloudWatch Logs log-group
         // ARN ends in `:*` ("such as
         // arn:aws:logs:us-east-1:123456789012:log-group:/mystack-testgroup-12ABC1AB12A1:*").
@@ -1438,6 +1475,10 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         S3VECTORS_INDEX => &["IndexArn"],
         "AWS::DynamoDB::Table" => &["Arn"],
         "AWS::Lambda::Function" => &["Arn"],
+        // "Fn::GetAtt … FunctionArn: the ARN of the version. Version: the version number."
+        LAMBDA_VERSION => &["FunctionArn", "Version"],
+        // "Fn::GetAtt … AliasArn: the Amazon Resource Name (ARN) of the alias."
+        LAMBDA_ALIAS => &["AliasArn"],
         "AWS::Logs::LogGroup" => &["Arn"],
         TRANSFER_SERVER => &["Arn", "ServerId"],
         "AWS::Transfer::Workflow" => &["Arn", "WorkflowId"],
@@ -1639,6 +1680,12 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // the IPSet — and answers the `IpSetId` GuardDuty minted, which is what that
         // type's `Ref` returns and what every GuardDuty call on the list takes.
         || resource_type == GUARDDUTY_IP_SET
+        // An AWS Lambda function VERSION is the same case: `PublishVersion` takes no
+        // identifier for the version — the declaration states the function it is published
+        // from — and answers the number Lambda allocated, which "Ref returns the ARN of the
+        // function version" embeds and which every call on the version takes as its
+        // qualifier.
+        || resource_type == LAMBDA_VERSION
         || resource_type == KMS_KEY
         || resource_type == AOSS_COLLECTION
         || resource_type == ACM_ACME_ENDPOINT
@@ -3064,6 +3111,41 @@ pub(super) fn ec2_network_identity(
 
 /// The `AWS::ECS::Service` resource type: a service running on an ECS cluster.
 pub(super) const ECS_SERVICE: &str = "AWS::ECS::Service";
+
+/// The two AWS Lambda types whose published identifier is the FUNCTION's ARN with a
+/// qualifier: a published version's carries the version number, an alias's the alias name.
+/// Both are therefore resolved once the function the declaration names has an identity,
+/// which is what [`identity_depends_on_another_resource`] names them for.
+pub(super) const LAMBDA_VERSION: &str = "AWS::Lambda::Version";
+pub(super) const LAMBDA_ALIAS: &str = "AWS::Lambda::Alias";
+
+/// The ARN of the function a version's or an alias's declaration names, from its
+/// `FunctionName` property: "the name or ARN of the Lambda function".
+///
+/// The property states either, and an alias and a version are addressed by both — so the
+/// value is used as the ARN where it already is one, and the function's ARN is built from
+/// the name where it is a name, which is what a `Ref` to a function of the same template
+/// resolves to ("Ref returns the function name"). `None` for a declaration that names no
+/// function, or names one from something this module cannot resolve.
+fn lambda_function_arn(
+    properties: &Value,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+    region: &str,
+) -> Option<String> {
+    let reference = properties
+        .get("FunctionName")
+        .and_then(|value| text(value, scope, 0, budget))
+        .filter(|reference| !reference.is_empty())?;
+    if reference.starts_with("arn:") {
+        return Some(reference);
+    }
+    Some(::emulator_server::emulator_arn(
+        "lambda",
+        region,
+        &format!("function:{reference}"),
+    ))
+}
 
 /// An Elastic Load Balancing v2 listener's and listener rule's resource types. Each one's
 /// published identifier NESTS inside its parent's ARN, which is what [`nested_elb_arn`]

@@ -55,6 +55,9 @@ fn computed_attributes(resource_type: &str) -> BTreeMap<String, String> {
             // The CodeArtifact domain an `AWS::CodeArtifact::Repository` declares its
             // repository in, whose ARN that repository's own ARN nests inside.
             "DomainName": "a-domain",
+            // The function an `AWS::Lambda::Version` and an `AWS::Lambda::Alias` declare
+            // against, whose ARN each of their own ARNs is a qualified form of.
+            "FunctionName": "a-function",
         }),
         condition: None,
         declaration: Value::Null,

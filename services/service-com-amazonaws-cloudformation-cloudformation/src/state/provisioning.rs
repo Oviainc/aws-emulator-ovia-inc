@@ -205,10 +205,12 @@ mod cognito_identity_pool;
 pub(super) mod dynamodb_table;
 mod ec2_vpc_network;
 mod iam_policy;
+mod lambda_alias;
 mod lambda_event_source_mapping;
 mod lambda_function;
 mod lambda_layer_version;
 mod lambda_permission;
+mod lambda_version;
 /// `AWS::CloudFormation::Stack`: the NESTED STACK a stack declares, created in
 /// CloudFormation itself ([`nested_stack`]).
 mod nested_stack;
@@ -608,6 +610,8 @@ pub(super) enum Owner {
     /// the per-entity `AWS::IAM::RolePolicy`, `UserPolicy` and `GroupPolicy`). Which of them
     /// it is travels with the owner, so the algorithm resolves the type once.
     IamPolicy(iam_policy::Kind),
+    /// `AWS::Lambda::Alias`, whose arms are [`lambda_alias`]'s.
+    LambdaAlias,
     /// `AWS::Lambda::EventSourceMapping`, whose arms are
     /// [`lambda_event_source_mapping`]'s.
     LambdaEventSourceMapping,
@@ -617,6 +621,8 @@ pub(super) enum Owner {
     LambdaLayerVersion,
     /// `AWS::Lambda::Permission`, whose arms are [`lambda_permission`]'s.
     LambdaPermission,
+    /// `AWS::Lambda::Version`, whose arms are [`lambda_version`]'s.
+    LambdaVersion,
     /// One of the Amazon EC2 VPC-network types [`ec2_vpc_network`] creates: the route table,
     /// the subnet association that puts a subnet on one, the VPC endpoint reached through it,
     /// the internet and virtual private gateways, the attachment that puts one of those on a
@@ -645,6 +651,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     if let Some(kind) = iam_policy::kind_of(resource_type) {
         return Some(Owner::IamPolicy(kind));
     }
+    if resource_type == lambda_alias::LAMBDA_ALIAS {
+        return Some(Owner::LambdaAlias);
+    }
     if resource_type == lambda_event_source_mapping::LAMBDA_EVENT_SOURCE_MAPPING {
         return Some(Owner::LambdaEventSourceMapping);
     }
@@ -656,6 +665,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if resource_type == lambda_permission::LAMBDA_PERMISSION {
         return Some(Owner::LambdaPermission);
+    }
+    if resource_type == lambda_version::LAMBDA_VERSION {
+        return Some(Owner::LambdaVersion);
     }
     if let Some(kind) = ec2_vpc_network::kind_of(resource_type) {
         return Some(Owner::Ec2VpcNetwork(kind));
@@ -695,6 +707,10 @@ impl Owner {
             Self::IamPolicy(kind) => iam_policy::create(ctx, region, kind, resource)
                 .await
                 .map(|()| Created::default()),
+            // Neither an alias nor a published version takes tags: Lambda's tagging calls
+            // address FUNCTIONS, so there is no call that could carry a tag to one.
+            Self::LambdaAlias => lambda_alias::create(ctx, region, resource).await,
+            Self::LambdaVersion => lambda_version::create(ctx, region, resource).await,
             Self::LambdaEventSourceMapping => {
                 lambda_event_source_mapping::create(ctx, region, resource, propagated).await
             }
@@ -763,6 +779,10 @@ impl Owner {
             }
             // The document is embedded in every entity it names the moment the put answers.
             Self::IamPolicy(_) => Ok(Readiness::Ready),
+            // The alias is in force, and the version exists and can be invoked, the moment
+            // the call that made it answers: both are snapshots of a function AWS Lambda
+            // already reports settled.
+            Self::LambdaAlias | Self::LambdaVersion => Ok(Readiness::Ready),
             Self::LambdaEventSourceMapping => Ok(lambda_event_source_mapping::readiness()),
             Self::LambdaFunction => Ok(lambda_function::readiness()),
             // The version exists, and a function may name it, the moment
@@ -812,11 +832,15 @@ impl Owner {
             // A mapping publishes the id its own create answered, which the resource already
             // carries as its physical id, so there is nothing left to read for it either; and
             // an inline policy publishes no attribute at all.
+            // An alias's and a version's identifiers are the ones their own create
+            // answered with, so there is nothing left to read for either.
             Self::IamPolicy(_)
+            | Self::LambdaAlias
             | Self::LambdaEventSourceMapping
             | Self::LambdaFunction
             | Self::LambdaLayerVersion
-            | Self::LambdaPermission => Ok(BTreeMap::new()),
+            | Self::LambdaPermission
+            | Self::LambdaVersion => Ok(BTreeMap::new()),
             // A table's `Arn` and `StreamArn` are the ones its own `CreateTable` answered
             // with, so there is nothing left to read once the resource is up.
             Self::DynamodbTable => Ok(BTreeMap::new()),
@@ -854,6 +878,11 @@ impl Owner {
             // `Delete<entity>Policy` takes the embedded document away, so there is nothing
             // to wait for.
             Self::IamPolicy(_) => Ok(Removal::Gone),
+            // `DeleteAlias` takes the alias away, so there is nothing to wait for.
+            Self::LambdaAlias => Ok(Removal::Gone),
+            Self::LambdaVersion => {
+                lambda_version::removal(ctx, region, physical_resource_id).await
+            }
             Self::LambdaEventSourceMapping => {
                 lambda_event_source_mapping::removal(ctx, region, physical_resource_id).await
             }
@@ -913,6 +942,14 @@ impl Owner {
             Self::IamPolicy(kind) => iam_policy::update(ctx, region, kind, resource, declared)
                 .await
                 .map(|()| Some(Created::default())),
+            Self::LambdaAlias => lambda_alias::update(ctx, region, resource, declared)
+                .await
+                .map(Some),
+            // A published version cannot be CHANGED: its code and configuration are the
+            // snapshot the publish took, and Lambda publishes no call that edits one — so a
+            // changed declaration is reported as not applied rather than as a success that
+            // dropped the caller's change.
+            Self::LambdaVersion => Ok(None),
             Self::LambdaEventSourceMapping => {
                 lambda_event_source_mapping::update(ctx, region, resource, declared).await
             }
@@ -992,10 +1029,14 @@ impl Owner {
             // inline policy, so nothing is asked about their tags; the tags of a mapping that
             // already exists are reconciled by no arm here yet ([`Provisioner::retag`]'s own
             // default).
+            // Neither an alias nor a published version is taggable either: Lambda's tagging
+            // calls address functions, so nothing is asked about their tags.
             Self::IamPolicy(_)
+            | Self::LambdaAlias
             | Self::LambdaEventSourceMapping
             | Self::LambdaLayerVersion
-            | Self::LambdaPermission => Ok(()),
+            | Self::LambdaPermission
+            | Self::LambdaVersion => Ok(()),
             // The tags of an Amazon EC2 resource that already exists are reconciled by no arm
             // here yet — as for every other type of that service ([`Provisioner::retag`]'s
             // own default) — so nothing is asked about them.
@@ -1048,6 +1089,11 @@ impl Owner {
             // Lambda takes no snapshot of a mapping on the way out either: there is no such
             // call, so a `Snapshot` deletion policy on this type deletes the mapping with no
             // snapshot invented for it.
+            // Lambda takes no snapshot of an alias or of a published version on the way out
+            // either: there is no such call, so a `Snapshot` deletion policy on either type
+            // deletes the resource with no snapshot invented for it.
+            Self::LambdaAlias => lambda_alias::delete(ctx, region, resource).await,
+            Self::LambdaVersion => lambda_version::delete(ctx, region, resource).await,
             Self::LambdaEventSourceMapping => {
                 lambda_event_source_mapping::delete(ctx, region, resource).await
             }
@@ -1104,6 +1150,10 @@ impl Owner {
             // An embedded policy reports no configuration of its own to compare: the
             // document is read by the entity's own drift read, as a policy statement's is.
             Self::IamPolicy(_) => Ok(None),
+            Self::LambdaAlias => lambda_alias::actual_configuration(ctx, region, resource).await,
+            // A published version is immutable, so nothing of it can have drifted from its
+            // declaration.
+            Self::LambdaVersion => Ok(None),
             Self::LambdaEventSourceMapping => {
                 lambda_event_source_mapping::actual_configuration(
                     ctx,
@@ -1157,10 +1207,12 @@ impl Owner {
             // AWS IAM's resource provider reports the service's own message as it came.
             Self::IamPolicy(_) => message.to_string(),
             // AWS Lambda's resource provider reports the service's own message as it came.
-            Self::LambdaEventSourceMapping
+            Self::LambdaAlias
+            | Self::LambdaEventSourceMapping
             | Self::LambdaFunction
             | Self::LambdaLayerVersion
-            | Self::LambdaPermission => message.to_string(),
+            | Self::LambdaPermission
+            | Self::LambdaVersion => message.to_string(),
             // Amazon DynamoDB's does the same.
             Self::DynamodbTable => message.to_string(),
             // Amazon EC2's does the same.
