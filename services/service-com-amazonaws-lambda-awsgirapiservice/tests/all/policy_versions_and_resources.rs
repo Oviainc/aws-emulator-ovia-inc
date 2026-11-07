@@ -261,6 +261,12 @@ async fn get_function_configuration_reports_the_stored_configuration() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = crate::function_lifecycle::router_on(&engine);
     let code = package_bytes(128);
+    // The container-image row resolves its reference against the registry at create.
+    crate::function_lifecycle::seed_image(
+        &engine,
+        "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn:latest",
+    )
+    .await;
 
     let cases = vec![
         // Nothing but the required members: every reported value must be a documented

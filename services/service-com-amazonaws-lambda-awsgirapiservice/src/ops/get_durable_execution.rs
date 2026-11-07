@@ -218,6 +218,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
+
+        // "Specifies whether to include execution data such as input payload, result, and
+        // error information in the response. Set to false for a more compact response that
+        // includes only execution metadata." The member carries the documented default of
+        // `true`, so a request that names it not at all asks for the data.
+        let include_execution_data = input.include_execution_data;
+
+        // Reporting that data DECRYPTS it under the key the function's `DurableConfig`
+        // names, which is why this operation binds the four KMS failures at 502: the key is
+        // asked about at the point of use, with no store guard held, and a key the key
+        // service reports as unusable refuses the read (see
+        // [`crate::state::durable_data_key_fault`]). A request that asks for no data
+        // decrypts nothing and asks about nothing.
+        let data_key = include_execution_data
+            .then(|| {
+                let mut store = state.lock();
+                crate::state::resolve_durable_execution(
+                    &mut store,
+                    &input.durable_execution_arn,
+                    &region,
+                    now,
+                )
+                .ok()
+                .and_then(|(record, name)| {
+                    record
+                        .durable_executions
+                        .get(&name)
+                        .and_then(|execution| execution.kms_key_arn.clone())
+                })
+            })
+            .flatten();
+        if let Some(fault) =
+            crate::state::durable_data_key_fault(ctx.callback(), &region, data_key.as_deref())
+                .await
+        {
+            return Err(kms_refusal(fault));
+        }
+
         let mut store = state.lock();
 
         // The execution is addressed by the ARN `Invoke` answered, which carries the
@@ -261,11 +299,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // "Specifies whether to include execution data such as input payload, result, and
-        // error information in the response. Set to false for a more compact response that
-        // includes only execution metadata." The member carries the documented default of
-        // `true`, so a request that names it not at all asks for the data.
-        let include_execution_data = input.include_execution_data;
+        // The decision whether to report the data was made above, before the key was asked
+        // about; it is applied to each data member below.
         Ok(GetDurableExecutionOutput {
             durable_execution_arn: record.durable_execution_arn(execution),
             durable_execution_name: execution.name.clone(),
@@ -306,4 +341,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .and_then(|config| config.durable_config.clone()),
         })
     }
+}
+
+/// How a key that cannot decrypt a durable execution's data refuses this READ: the
+/// modelled 502 for the fault the key service reported, carrying that fault's own sentence.
+fn kms_refusal(fault: crate::state::EnvironmentKeyFault) -> GetDurableExecutionError {
+    match fault {
+        crate::state::EnvironmentKeyFault::Disabled(message) => {
+            GetDurableExecutionErrorModeled::KMSDisabledException(KMSDisabledException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
+        crate::state::EnvironmentKeyFault::InvalidState(message) => {
+            GetDurableExecutionErrorModeled::KMSInvalidStateException(KMSInvalidStateException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
+        crate::state::EnvironmentKeyFault::NotFound(message) => {
+            GetDurableExecutionErrorModeled::KMSNotFoundException(KMSNotFoundException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
+        crate::state::EnvironmentKeyFault::AccessDenied(message) => {
+            GetDurableExecutionErrorModeled::KMSAccessDeniedException(KMSAccessDeniedException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
+    }
+    .into()
 }

@@ -307,6 +307,10 @@ mod version_publishing;
 mod vpc_config_execution_role_permissions;
 #[path = "all/async_invocation_delivery.rs"]
 mod async_invocation_delivery;
+#[path = "all/container_image_package_source.rs"]
+mod container_image_package_source;
+#[path = "all/durable_execution_completion.rs"]
+mod durable_execution_completion;
 #[path = "all/event_source_mapping_processed_batch.rs"]
 mod event_source_mapping_processed_batch;
 #[path = "all/invoke_caller_authorization.rs"]

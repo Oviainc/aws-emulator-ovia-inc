@@ -140,17 +140,6 @@ fn expected_code_sha256(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(bytes))
 }
 
-/// The hexadecimal SHA-256 of `image_uri` — the independent computation of the IMAGE
-/// digest `CodeSha256` reports for a `PackageType=Image` function, which AWS writes in the
-/// lower-case hexadecimal an OCI digest is written in rather than the base64 a .zip
-/// archive's digest carries.
-fn expected_image_code_sha256(image_uri: &str) -> String {
-    sha2::Sha256::digest(image_uri.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 /// Deployment package bytes of a given length. The content is irrelevant to the API —
 /// only its length and its digest are reported — but it differs per length so two
 /// packages never share a digest.
@@ -272,6 +261,20 @@ struct UpdateCase {
 async fn update_function_code_replaces_the_stored_package() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
+    // Both container-image references the image row names — the one it is created on and
+    // the one the update moves it to — are RESOLVED against the registry, so both are
+    // pushed there first.
+    crate::function_lifecycle::seed_image(&engine, IMAGE_URI).await;
+    let updated_digest = crate::function_lifecycle::seed_image(
+        &engine,
+        "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn:2026-01",
+    )
+    .await;
+    // The digest the registry minted for the NEW image is what the updated function's
+    // `CodeSha256` reports, since the image IS its deployment package.
+    let updated_sha256 = updated_digest
+        .split_once(':')
+        .map(|(_, hexadecimal)| hexadecimal.to_string());
 
     let old = package_bytes(64);
     let small = package_bytes(128);
@@ -447,9 +450,9 @@ async fn update_function_code_replaces_the_stored_package() {
             }),
             version: "$LATEST",
             code_size: 0,
-            code_sha256: Some(expected_image_code_sha256(
-                "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn:2026-01",
-            )),
+            // The digest the REGISTRY minted for the new image, since the image IS the
+            // deployment package.
+            code_sha256: updated_sha256,
             architectures: json!(["x86_64"]),
             package_type: "Image",
             repository_type: "ECR",
@@ -941,6 +944,8 @@ struct RefusalCase {
 async fn update_function_code_refuses_a_request_it_cannot_serve() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
+    // The image function's reference is resolved against the registry at create.
+    crate::function_lifecycle::seed_image(&engine, IMAGE_URI).await;
 
     let code = package_bytes(160);
     create_zip_function(&router, "refusals", &code).await;

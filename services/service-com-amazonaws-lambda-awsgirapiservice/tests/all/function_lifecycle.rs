@@ -172,16 +172,6 @@ fn expected_code_sha256(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(bytes))
 }
 
-/// The hexadecimal SHA-256 of `image_uri` — the independent computation of the IMAGE
-/// digest `CodeSha256` reports for a `PackageType=Image` function, written as the
-/// lower-case hexadecimal an OCI digest is written in.
-fn expected_image_code_sha256(image_uri: &str) -> String {
-    sha2::Sha256::digest(image_uri.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 /// Deployment package bytes of a given length. The content is irrelevant to the API —
 /// only its length and its digest are reported — but it differs per length so two
 /// packages never share a digest.
@@ -214,6 +204,94 @@ pub(crate) fn make_activation_due(engine: &Arc<engine::InMemoryEngine>) {
     for provider in store.capacity_providers.values_mut() {
         provider.active_due = past;
     }
+}
+
+/// Push an image to the Amazon ECR registry of the SAME engine, so a container-image
+/// `ImageUri` naming it RESOLVES: a `PackageType=Image` create follows its reference into
+/// that registry, and a reference naming nothing pushed is refused.
+///
+/// The image goes in through ECR's OWN `CreateRepository`/`PutImage`, over a router
+/// carrying ECR alone on this engine, so what a Lambda create resolves is what the
+/// registry minted. The manifest declares no layer and no configuration blob, so the push
+/// needs no layer upload behind it. Answers the manifest digest the registry minted.
+pub(crate) async fn seed_image(
+    engine: &Arc<engine::InMemoryEngine>,
+    image_uri: &str,
+) -> String {
+    let path = image_uri
+        .split_once('/')
+        .map_or(image_uri, |(_, path)| path);
+    let (repository, tag) = match path.rsplit_once(':') {
+        Some((repository, tag)) if !tag.contains('/') => (repository, tag),
+        _ => (path, "latest"),
+    };
+    let mut registry = MultiServiceRouter::new();
+    registry.set_request_authentication(false);
+    registry.register_service(
+        service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::EmulatedService::new(
+            Arc::clone(engine),
+        ),
+    );
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "layers": [],
+        "annotations": { "org.opencontainers.image.ref.name": image_uri },
+    })
+    .to_string();
+    let call = |operation: &'static str, body: serde_json::Value| {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://api.ecr.us-east-1.amazonaws.com/")
+            .header("host", "api.ecr.us-east-1.amazonaws.com")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 \
+                 Credential=emulator-test-key/20260101/us-east-1/ecr/aws4_request, \
+                 SignedHeaders=host, Signature=not-verified",
+            )
+            .header("content-type", "application/x-amz-json-1.1")
+            .header(
+                "x-amz-target",
+                format!("AmazonEC2ContainerRegistry_V20150921.{operation}"),
+            )
+            .body(bytes::Bytes::from(body.to_string()))
+            .expect("the registry request is well formed");
+        request
+    };
+    let _ = registry
+        .dispatch(call(
+            "CreateRepository",
+            serde_json::json!({ "repositoryName": repository }),
+        ))
+        .await;
+    let pushed = registry
+        .dispatch(call(
+            "PutImage",
+            serde_json::json!({
+                "repositoryName": repository,
+                "imageTag": tag,
+                "imageManifest": manifest,
+            }),
+        ))
+        .await;
+    let body = pushed.into_body();
+    let document: serde_json::Value = serde_json::from_slice(&body).unwrap_or_else(|error| {
+        panic!(
+            "expected PutImage to answer JSON ({error}): {}",
+            String::from_utf8_lossy(&body)
+        )
+    });
+    document
+        .pointer("/image/imageId/imageDigest")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected PutImage to mint a manifest digest for {image_uri}, got {}",
+                String::from_utf8_lossy(&body)
+            )
+        })
+        .to_string()
 }
 
 /// Create a function and bring it to `Active`, the state every invocation test needs.
@@ -268,6 +346,16 @@ async fn create_function_persists_what_it_reports() {
 
     let small = package_bytes(64);
     let large = package_bytes(5_000);
+
+    // The container-image row's reference is RESOLVED against the registry when the
+    // package is stored, so the image it names is pushed there first — and the digest the
+    // registry minted is what that function's `CodeSha256` reports, since the image IS its
+    // deployment package.
+    let image_digest =
+        seed_image(&engine, "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn:latest").await;
+    let image_sha256 = image_digest
+        .split_once(':')
+        .map(|(_, hexadecimal)| hexadecimal.to_string());
 
     let cases = vec![
         // An inline .zip archive, everything but the required members defaulted.
@@ -374,10 +462,8 @@ async fn create_function_persists_what_it_reports() {
             }),
             code_size: 0,
             // An `Image` package's `CodeSha256` is the digest of the image the function is
-            // frozen to.
-            code_sha256: Some(expected_image_code_sha256(
-                "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn:latest",
-            )),
+            // frozen to, which for a pushed image is the one the REGISTRY minted.
+            code_sha256: image_sha256,
             version: "$LATEST",
             package_type: "Image",
             memory_size: 128,

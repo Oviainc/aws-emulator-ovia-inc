@@ -127,16 +127,6 @@ fn expected_code_sha256(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(bytes))
 }
 
-/// The hexadecimal SHA-256 of `image_uri` — the independent computation of the IMAGE
-/// digest `CodeSha256` reports for a `PackageType=Image` function, written as the
-/// lower-case hexadecimal an OCI digest is written in.
-fn expected_image_code_sha256(image_uri: &str) -> String {
-    sha2::Sha256::digest(image_uri.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 /// Deployment package bytes of a given length. The content is irrelevant to the API —
 /// only its length and its digest are reported — but it differs per length so two
 /// packages never share a digest.
@@ -227,6 +217,17 @@ struct PublishCase {
 async fn publish_version_freezes_the_current_code_and_configuration() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
+    // The container-image row's reference is resolved against the registry at create, so
+    // the image it names is pushed there first — and the digest the registry minted is what
+    // that function's `CodeSha256` reports, since the image IS its deployment package.
+    let image_digest = crate::function_lifecycle::seed_image(
+        &engine,
+        "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn:latest",
+    )
+    .await;
+    let image_sha256 = image_digest
+        .split_once(':')
+        .map(|(_, hexadecimal)| hexadecimal.to_string());
 
     let small = package_bytes(64);
     let large = package_bytes(4_096);
@@ -335,10 +336,9 @@ async fn publish_version_freezes_the_current_code_and_configuration() {
             version: "1",
             code_size: 0,
             // An `Image` package's `CodeSha256` is the digest of the image the function is
-            // frozen to, which the published version freezes with the rest of its code.
-            code_sha256: Some(expected_image_code_sha256(
-                "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn:latest",
-            )),
+            // frozen to — the one the REGISTRY minted — which the published version freezes
+            // with the rest of its code.
+            code_sha256: image_sha256,
             description: Some(""),
             latest_description: Some(""),
             memory_size: 2048,

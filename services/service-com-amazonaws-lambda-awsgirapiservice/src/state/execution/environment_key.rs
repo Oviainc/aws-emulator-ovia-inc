@@ -153,6 +153,89 @@ pub async fn environment_key_fault(
     }
 }
 
+/// How the refusal of a read of a durable execution's DATA is worded: the operation Lambda
+/// could not perform (decrypting that execution's data), why, and WHICH key it could not
+/// perform it under.
+///
+/// The sentence is the same class of failure [`DISABLED_MESSAGE`] and its siblings word for
+/// the environment-variable decrypt, said of the data this read reports and naming the key
+/// the function's `DurableConfig` names — the one variable part, taken from the stored
+/// configuration.
+fn durable_data_message(why: &str, key_arn: &str) -> String {
+    format!(
+        "Lambda was unable to decrypt the durable execution data because the KMS key \
+         {key_arn} {why}. Please check the function's KMS key settings."
+    )
+}
+
+/// Why the DATA of a durable execution encrypted under `kms_key_arn` cannot be read, or
+/// `None` when nothing says it cannot.
+///
+/// Every operation that reports a durable execution's data binds the same four KMS
+/// failures `Invoke` binds (`smithy_query(query="operation",
+/// operation="GetDurableExecution,GetDurableExecutionHistory,GetDurableExecutionState")`:
+/// `KMSAccessDeniedException`, `KMSDisabledException`, `KMSInvalidStateException`,
+/// `KMSNotFoundException`, each `@httpError(502)`), because reporting that data decrypts it
+/// under the key the function's `DurableConfig` names. So the key is asked about at the
+/// point of use, over the same seam and with the same reading as
+/// [`environment_key_fault`]: only a DEFINITE answer refuses.
+///
+/// It differs from that reading in ONE respect, and deliberately: a key the key service
+/// holds no record of is NOT a refusal here. A durable function's key is named in its
+/// configuration and may belong to another account, so an absent record establishes
+/// nothing about it — while a key the key service HOLDS and reports unusable is evidence
+/// that the data behind it cannot be read.
+pub async fn durable_data_key_fault(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    kms_key_arn: Option<&str>,
+) -> Option<EnvironmentKeyFault> {
+    let key_arn = kms_key_arn?;
+    let described = kms_client(callback, region)
+        .describe_key()
+        .key_id(key_arn)
+        .send()
+        .await;
+    match described {
+        Ok(answer) => {
+            let state = answer
+                .key_metadata()
+                .and_then(::aws_sdk_kms::types::KeyMetadata::key_state)
+                .map(|state| state.as_str().to_string());
+            match state.as_deref() {
+                None | Some(STATE_ENABLED) => None,
+                Some("Disabled") => Some(EnvironmentKeyFault::Disabled(durable_data_message(
+                    "is disabled",
+                    key_arn,
+                ))),
+                Some(state) if STATES_INVALID_FOR_DECRYPT.contains(&state) => {
+                    Some(EnvironmentKeyFault::InvalidState(durable_data_message(
+                        "is not in a valid state for Decrypt",
+                        key_arn,
+                    )))
+                }
+                Some(_) => None,
+            }
+        }
+        Err(failure) => match failure {
+            ::aws_sdk_kms::error::SdkError::ServiceError(answered) => {
+                match answered.into_err() {
+                    error if is_access_denied(&error) => {
+                        Some(EnvironmentKeyFault::AccessDenied(durable_data_message(
+                            "may not be used",
+                            key_arn,
+                        )))
+                    }
+                    // Every other answer about the key — including one about a key this
+                    // key service holds no record of — establishes nothing.
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+    }
+}
+
 /// Whether `error` is the key service saying this caller may not use the key.
 ///
 /// Read off the error CODE rather than a variant, because an access denial is not one of

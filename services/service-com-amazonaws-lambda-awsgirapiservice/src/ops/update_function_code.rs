@@ -439,8 +439,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // member with: "If the function's package type is Image, then you must specify
         // the code package in ImageUri [...] If the function's package type is Zip, then
         // you must specify the deployment package as a .zip file archive."
-        let code = crate::state::resolve_package_code(
+        let mut code = crate::state::resolve_package_code(
             &record.config.package_type,
+            crate::state::PackageCall::Updating,
             crate::state::PackageMembers {
                 zip_file: input.zip_file.as_deref(),
                 s3_bucket: input.s3_bucket.as_deref(),
@@ -452,6 +453,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         )
         .map_err(invalid_parameter)?;
+
+        // A new container image is FOLLOWED into the registry exactly as the create's was:
+        // the same rule decides whether the reference names an image of this Region's
+        // registry at all, and pins the function to the manifest digest that registry
+        // minted for it (see [`crate::state::image_source`]).
+        if let Some(image_uri) = code.image_uri.clone() {
+            let resolution = crate::state::resolve_image_source(&*self.engine, &region, &image_uri);
+            if let Some(message) = crate::state::source_image_message(&image_uri, &resolution) {
+                return Err(invalid_parameter(message));
+            }
+            if let crate::state::ImageResolution::Resolved(digest) = resolution {
+                code.resolved_image_digest = Some(digest);
+            }
+        }
+
         // The size and the digest of the package this call SUBMITTED, read by the one
         // reading both operations that store a package share
         // (`crate::state::package_code_identity`).

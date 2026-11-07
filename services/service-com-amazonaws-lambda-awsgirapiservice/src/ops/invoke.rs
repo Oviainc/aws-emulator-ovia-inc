@@ -808,7 +808,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &resolved_config,
             )),
         };
-            (invocation, admitted.slot, function_name, resource, kms_key_arn)
+            (
+                invocation,
+                admitted.slot,
+                function_name,
+                resource,
+                kms_key_arn,
+            )
         };
         // The slot this invocation holds, released when it goes out of scope — which is when
         // this invocation is answered, however it ends.

@@ -442,7 +442,22 @@ fn assert_member(label: &str, body: &Value, pointer: &str, expected: &Value) {
 async fn get_function_configuration_reports_the_stored_configuration_of_the_resolved_version() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
-    let fixtures = fixtures();
+    let mut fixtures = fixtures();
+    // The container-image fixture resolves its reference against the registry at create,
+    // and the digest the registry minted is what that function's `CodeSha256` reports,
+    // since the image IS its deployment package.
+    let image_digest = crate::function_lifecycle::seed_image(
+        &engine,
+        "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn:latest",
+    )
+    .await;
+    for fixture in &mut fixtures {
+        if fixture.expected.package_type == "Image" {
+            fixture.expected.code_sha256 = json!(image_digest
+                .split_once(':')
+                .map(|(_, hexadecimal)| hexadecimal.to_string()));
+        }
+    }
 
     for fixture in &fixtures {
         let (status, body) = call(&router, "POST", FUNCTIONS_URI, &fixture.request).await;

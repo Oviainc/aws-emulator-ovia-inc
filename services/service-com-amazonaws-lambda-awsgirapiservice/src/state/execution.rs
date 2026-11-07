@@ -112,7 +112,7 @@ mod host_posix;
 /// Whether the key a function's environment variables are encrypted with can decrypt them
 /// — the check every invocation of such a function begins with.
 pub mod environment_key;
-pub use environment_key::{environment_key_fault, EnvironmentKeyFault};
+pub use environment_key::{durable_data_key_fault, environment_key_fault, EnvironmentKeyFault};
 
 /// How many handlers run at once.
 pub const MAX_CONCURRENT_RUNS: usize = 4;

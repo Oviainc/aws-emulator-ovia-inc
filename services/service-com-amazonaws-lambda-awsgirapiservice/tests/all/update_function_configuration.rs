@@ -27,6 +27,8 @@ use service_com_amazonaws_lambda_awsgirapiservice::state::ComAmazonawsLambdaAwsg
 use service_com_amazonaws_lambda_awsgirapiservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::function_lifecycle::seed_image;
+
 /// A SigV4 credential scope naming this service's signing name (`lambda`), which is what
 /// routes a request here. Nothing in it is verified: the harness turns request
 /// authentication off, exactly as the emulator runs unless started with it on.
@@ -202,6 +204,11 @@ fn create_zip_request(name: &str) -> Value {
     })
 }
 
+/// The container image every `Image`-package function of this suite is created on. It is
+/// pushed to the registry first ([`seed_image`]), because a create RESOLVES its reference
+/// there.
+const IMAGE_URI: &str = "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn:latest";
+
 /// Create one `Image`-package function: "You do not need to specify the handler and
 /// runtime properties."
 fn create_image_request(name: &str) -> Value {
@@ -210,7 +217,7 @@ fn create_image_request(name: &str) -> Value {
         "Role": ROLE,
         "PackageType": "Image",
         "Description": "as created",
-        "Code": { "ImageUri": "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn:latest" },
+        "Code": { "ImageUri": IMAGE_URI },
     })
 }
 
@@ -548,6 +555,7 @@ fn members(body: &Value) -> Map<String, Value> {
 async fn a_named_setting_is_replaced_and_every_other_setting_is_left_alone() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
+    seed_image(&engine, IMAGE_URI).await;
 
     for case in cases() {
         let name = case.label;
@@ -877,6 +885,7 @@ async fn a_function_being_created_or_updated_cannot_be_modified() {
 async fn an_update_of_a_resource_that_does_not_exist_is_refused() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
+    seed_image(&engine, IMAGE_URI).await;
 
     // Every documented `FunctionName` form names the same absent record, so each one is
     // the same 404 — and a request naming no stored function is refused for that before

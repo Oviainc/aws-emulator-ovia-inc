@@ -32,11 +32,10 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lambda_awsgirapiservice::state::ComAmazonawsLambdaAwsgirapiserviceState;
-use sha2::Digest as _;
 
 use crate::function_lifecycle::{
     create_active_function, create_function, json_call, make_activation_due, package_bytes,
-    router_on, zip_file, Answer, ACCOUNT, REGION, ROLE,
+    router_on, seed_image, zip_file, Answer, ACCOUNT, REGION, ROLE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -654,46 +653,59 @@ struct ImageCase {
     /// The case name, which is also the function name.
     name: &'static str,
     /// The `Code.ImageUri` the create request carried.
-    image_uri: &'static str,
+    image_uri: String,
     /// The repository part of that URI, which the resolved URI must keep.
-    repository: &'static str,
+    repository: String,
+    /// The manifest digest the REGISTRY minted for the image that URI names.
+    digest: String,
 }
 
 /// `ResolvedImageUri` is "The resolved URI for the image": the SAME repository the
-/// function was created against, pinned to the digest of the image it is frozen to —
-/// never the mutable tag that was supplied. The digest is a property of the image
-/// reference, so it is stable across reads and differs for two different references.
+/// function was created against, pinned to the digest the REGISTRY holds for the image it
+/// is frozen to — never the mutable tag that was supplied. The digest is the registry's
+/// own, so it is stable across reads, equal for two references to one image and different
+/// for two images.
 ///
 /// The rows differ along what the rule generalises over: a tagged URI, a second tag of the
 /// same repository, a URI that already carries a digest, and a repository path with
-/// several segments.
+/// several segments. Every image is pushed through Amazon ECR's own surface first, because
+/// a reference naming nothing pushed is refused rather than resolved.
 #[tokio::test]
 async fn resolved_image_uri_pins_the_same_repository_to_a_digest() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
 
     let registry = format!("{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com");
+    let repository = format!("{registry}/fn");
+    let nested_repository = format!("{registry}/team/fn");
+    let v1 = seed_image(&engine, &format!("{repository}:v1")).await;
+    let v2 = seed_image(&engine, &format!("{repository}:v2")).await;
+    let v3 = seed_image(&engine, &format!("{repository}:v3")).await;
+    let nested = seed_image(&engine, &format!("{nested_repository}:latest")).await;
     let cases = vec![
         ImageCase {
             name: "tagged",
-            image_uri: "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn:v1",
-            repository: "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn",
+            image_uri: format!("{repository}:v1"),
+            repository: repository.clone(),
+            digest: v1,
         },
         ImageCase {
             name: "another-tag",
-            image_uri: "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn:v2",
-            repository: "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn",
+            image_uri: format!("{repository}:v2"),
+            repository: repository.clone(),
+            digest: v2,
         },
         ImageCase {
             name: "already-pinned",
-            image_uri: "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn@sha256:\
-                        0000000000000000000000000000000000000000000000000000000000000000",
-            repository: "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn",
+            image_uri: format!("{repository}@{v3}"),
+            repository: repository.clone(),
+            digest: v3,
         },
         ImageCase {
             name: "nested-repository",
-            image_uri: "000000000000.dkr.ecr.us-east-1.amazonaws.com/team/fn:latest",
-            repository: "000000000000.dkr.ecr.us-east-1.amazonaws.com/team/fn",
+            image_uri: format!("{nested_repository}:latest"),
+            repository: nested_repository.clone(),
+            digest: nested,
         },
     ];
     assert!(
@@ -739,17 +751,13 @@ async fn resolved_image_uri_pins_the_same_repository_to_a_digest() {
             .unwrap_or_default()
             .to_string();
 
-        // The digest is the SHA-256 of the image reference the function is frozen to,
-        // computed here independently rather than read out of the answer.
-        let digest: String = sha2::Sha256::digest(case.image_uri.as_bytes())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        // The digest is the one the registry minted for the pushed manifest, which the
+        // push reported rather than this test computing it.
         assert_eq!(
             resolved,
-            format!("{}@sha256:{digest}", case.repository),
-            "case {:?}: expected the repository {:?} pinned to the digest of {:?}, got \
-             {resolved:?}",
+            format!("{}@{}", case.repository, case.digest),
+            "case {:?}: expected the repository {:?} pinned to the registry's digest for \
+             {:?}, got {resolved:?}",
             case.name,
             case.repository,
             case.image_uri

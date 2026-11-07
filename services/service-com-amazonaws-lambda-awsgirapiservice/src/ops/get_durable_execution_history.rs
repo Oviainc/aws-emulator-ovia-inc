@@ -199,6 +199,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
+
+        // The history IS the execution's data: reporting it decrypts the payloads its
+        // events carry under the key the function's `DurableConfig` names, which is why
+        // this operation binds the four KMS failures at 502. The key is asked about at the
+        // point of use, with no store guard held (see
+        // [`crate::state::durable_data_key_fault`]).
+        let data_key = {
+            let mut store = state.lock();
+            crate::state::resolve_durable_execution(
+                &mut store,
+                &input.durable_execution_arn,
+                &region,
+                now,
+            )
+            .ok()
+            .and_then(|(record, name)| {
+                record
+                    .durable_executions
+                    .get(&name)
+                    .and_then(|execution| execution.kms_key_arn.clone())
+            })
+        };
+        if let Some(fault) =
+            crate::state::durable_data_key_fault(ctx.callback(), &region, data_key.as_deref())
+                .await
+        {
+            return Err(kms_refusal(fault));
+        }
+
         let mut store = state.lock();
 
         // The execution is addressed by the ARN `Invoke` answered, which carries the
@@ -283,6 +312,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|event| event_marker(event)),
         })
     }
+}
+
+/// How a key that cannot decrypt a durable execution's data refuses this READ: the
+/// modelled 502 for the fault the key service reported, carrying that fault's own sentence.
+fn kms_refusal(fault: crate::state::EnvironmentKeyFault) -> GetDurableExecutionHistoryError {
+    match fault {
+        crate::state::EnvironmentKeyFault::Disabled(message) => {
+            GetDurableExecutionHistoryErrorModeled::KMSDisabledException(KMSDisabledException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
+        crate::state::EnvironmentKeyFault::InvalidState(message) => {
+            GetDurableExecutionHistoryErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    r#type: None,
+                    message: Some(message),
+                },
+            )
+        }
+        crate::state::EnvironmentKeyFault::NotFound(message) => {
+            GetDurableExecutionHistoryErrorModeled::KMSNotFoundException(KMSNotFoundException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
+        crate::state::EnvironmentKeyFault::AccessDenied(message) => {
+            GetDurableExecutionHistoryErrorModeled::KMSAccessDeniedException(
+                KMSAccessDeniedException {
+                    r#type: None,
+                    message: Some(message),
+                },
+            )
+        }
+    }
+    .into()
 }
 
 /// The history events reported to a caller that names no `MaxItems`, which the member's

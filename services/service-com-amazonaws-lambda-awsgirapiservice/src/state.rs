@@ -262,6 +262,13 @@ pub use event_source_authorization::unreadable_event_source;
 pub mod vpc_attachment_authorization;
 pub use vpc_attachment_authorization::unattachable_vpc_config;
 
+/// Following a container-image package's reference into the Amazon ECR registry — whether
+/// it names an image at all, and which image bytes the function is frozen to — lives in
+/// [`image_source`], reached through the same shared engine as the stores above and
+/// re-exported for the same reason: a handler names it as `crate::state::…`.
+pub mod image_source;
+pub use image_source::{resolve_image_source, source_image_message, ImageResolution};
+
 /// Asking that question for the SET of calls one such thing takes — which of them the role
 /// may not make — lives in [`role_actions`], so the gates that each take several calls ask it
 /// the same way over the one decision above.
@@ -319,9 +326,9 @@ pub use recursion::{
 /// module.
 pub mod execution;
 pub use execution::{
-    engine_for, environment_key_fault, layer_archives, log_target, mint_request_id,
-    run_invocation, runs_handler, AwsAccess, Engine, EnvironmentKeyFault, Invocation, Invoked,
-    LogTarget, Unrunnable,
+    durable_data_key_fault, engine_for, environment_key_fault, layer_archives, log_target,
+    mint_request_id, run_invocation, runs_handler, AwsAccess, Engine, EnvironmentKeyFault,
+    Invocation, Invoked, LogTarget, Unrunnable,
 };
 
 /// How large a stored .zip archive is once EXPANDED — the second size Lambda reports for a
@@ -909,150 +916,6 @@ pub const NO_RESOURCE_POLICY_MESSAGE: &str = "The resource you requested does no
 pub const RESOURCE_POLICY_REVISION_MISMATCH_MESSAGE: &str =
     "The value of RevisionId provided doesn't match the policy's latest revision ID. Use the \
      GetResourcePolicy API action to retrieve the current revision ID and try again.";
-
-/// Where the code of a function came from.
-///
-/// `zip_bytes` is the only variant whose bytes this emulator holds, so it is the only
-/// one `code_size` and `code_sha256` can be computed from; an S3 object or a container
-/// image is a reference this emulator does not resolve, and nothing is reported for it
-/// that was not computed.
-#[derive(Debug, Clone, Default)]
-pub struct CodeRecord {
-    /// The deployment package bytes, when the caller uploaded them inline.
-    pub zip_bytes: Option<Vec<u8>>,
-    /// The S3 bucket holding the deployment package, when the caller named one.
-    pub s3_bucket: Option<String>,
-    /// The S3 key of the deployment package.
-    pub s3_key: Option<String>,
-    /// The S3 object version of the deployment package.
-    pub s3_object_version: Option<String>,
-    /// How the deployment package is stored, when the caller said: `COPY` (the default,
-    /// "Uploads a copy of your deployment package to Lambda") or `REFERENCE` ("Lambda
-    /// references the deployment package from the specified Amazon S3 bucket"). See
-    /// [`S3_OBJECT_STORAGE_MODE_COPY`] and [`S3_OBJECT_STORAGE_MODE_REFERENCE`].
-    pub s3_object_storage_mode: Option<String>,
-    /// The ARN of the customer managed KMS key the .zip deployment package is encrypted
-    /// with, when the caller named one; `FunctionCodeLocation$SourceKMSKeyArn` reports
-    /// it back.
-    pub source_kms_key_arn: Option<String>,
-    /// The container image URI, for an `Image` package.
-    pub image_uri: Option<String>,
-}
-
-impl CodeRecord {
-    /// Whether this package is a container image.
-    #[must_use]
-    pub fn is_image(&self) -> bool {
-        self.image_uri.is_some()
-    }
-}
-
-/// The members of a request that name a deployment package.
-///
-/// `CreateFunction` carries them on its `Code` member and `UpdateFunctionCode` carries
-/// them on the request itself, but they name the same package in the same forms, so both
-/// resolve them through [`resolve_package_code`] rather than each deciding for itself
-/// what a package may be.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct PackageMembers<'a> {
-    /// `ZipFile` — the deployment package bytes, uploaded inline.
-    pub zip_file: Option<&'a [u8]>,
-    /// `S3Bucket` — the bucket holding the deployment package.
-    pub s3_bucket: Option<&'a str>,
-    /// `S3Key` — the key of the deployment package.
-    pub s3_key: Option<&'a str>,
-    /// `S3ObjectVersion` — "For versioned objects, the version of the deployment package
-    /// object to use."
-    pub s3_object_version: Option<&'a str>,
-    /// `S3ObjectStorageMode` — `COPY` or `REFERENCE`.
-    pub s3_object_storage_mode: Option<&'a str>,
-    /// `ImageUri` — the container image in the Amazon ECR registry.
-    pub image_uri: Option<&'a str>,
-    /// `SourceKMSKeyArn` — the customer managed key the .zip package is encrypted with.
-    pub source_kms_key_arn: Option<&'a str>,
-}
-
-impl PackageMembers<'_> {
-    /// Whether any member that only an S3-sourced package has was named.
-    fn names_s3_object(&self) -> bool {
-        self.s3_bucket.is_some()
-            || self.s3_key.is_some()
-            || self.s3_object_version.is_some()
-            || self.s3_object_storage_mode.is_some()
-    }
-}
-
-/// The [`CodeRecord`] `package_type` admits for `members`, or the message of the refusal.
-///
-/// The model states the rule on both operations: "If the function's package type is
-/// Image, then you must specify the code package in ImageUri as the URI of a container
-/// image in the Amazon ECR registry. If the function's package type is Zip, then you must
-/// specify the deployment package as a .zip file archive. Enter the Amazon S3 bucket and
-/// key of the code .zip file location. You can also provide the function code inline
-/// using the ZipFile field."
-pub fn resolve_package_code(
-    package_type: &str,
-    members: PackageMembers<'_>,
-) -> Result<CodeRecord, String> {
-    if package_type == PACKAGE_TYPE_IMAGE {
-        let Some(image_uri) = members.image_uri else {
-            return Err(
-                "ImageUri is required for a function whose PackageType is Image".to_string(),
-            );
-        };
-        if members.zip_file.is_some() || members.names_s3_object() {
-            return Err(
-                "Only ImageUri may name the code of a function whose PackageType is Image"
-                    .to_string(),
-            );
-        }
-        return Ok(CodeRecord {
-            image_uri: Some(image_uri.to_string()),
-            ..CodeRecord::default()
-        });
-    }
-
-    if members.image_uri.is_some() {
-        return Err(
-            "ImageUri may only name the code of a function whose PackageType is Image"
-                .to_string(),
-        );
-    }
-    match (members.zip_file, members.s3_bucket, members.s3_key) {
-        (Some(zip_file), None, None) if !members.names_s3_object() => {
-            // `AccountLimit$CodeSizeZipped` is "The maximum size of a deployment package
-            // when it's uploaded directly to Lambda", which is the ceiling on these
-            // bytes — and, since they are held in memory here, on the store too.
-            if i64::try_from(zip_file.len()).unwrap_or(i64::MAX) > CODE_SIZE_ZIPPED_LIMIT {
-                return Err(format!(
-                    "ZipFile must be smaller than {CODE_SIZE_ZIPPED_LIMIT} bytes for a direct \
-                     upload; use S3Bucket and S3Key for a larger deployment package"
-                ));
-            }
-            Ok(CodeRecord {
-                zip_bytes: Some(zip_file.to_vec()),
-                source_kms_key_arn: members.source_kms_key_arn.map(str::to_string),
-                ..CodeRecord::default()
-            })
-        }
-        (None, Some(bucket), Some(key)) => Ok(CodeRecord {
-            s3_bucket: Some(bucket.to_string()),
-            s3_key: Some(key.to_string()),
-            s3_object_version: members.s3_object_version.map(str::to_string),
-            s3_object_storage_mode: members.s3_object_storage_mode.map(str::to_string),
-            source_kms_key_arn: members.source_kms_key_arn.map(str::to_string),
-            ..CodeRecord::default()
-        }),
-        // Either neither form was named, or both were: the inline bytes and the S3
-        // object each name a whole package, so a request carrying members of both names
-        // no single one.
-        _ => Err(
-            "The code must name either ZipFile or both S3Bucket and S3Key for a function \
-             whose PackageType is Zip"
-                .to_string(),
-        ),
-    }
-}
 
 /// The service principal a function's execution role has to let assume it.
 ///
@@ -3976,32 +3839,35 @@ pub fn held_package_bytes(code: &CodeRecord) -> Option<&[u8]> {
 /// image.
 ///
 /// The member is "The resolved URI for the image", and what AWS resolves a mutable tag to
-/// is the same repository pinned to the CONTENT it found behind it
-/// (`<repository>@sha256:<digest>`), which is what makes the resolved URI say which image
-/// the function is frozen to. This emulator pulls no image, so the content it holds for an
-/// image package is the reference itself: the digest is computed from the stored
-/// `ImageUri`, which makes the resolved URI stable across reads, equal for two functions
-/// on the same image and different for two different tags of one repository — and only a
-/// new `ImageUri` changes it.
+/// is the same repository pinned to the CONTENT behind it (`<repository>@sha256:<digest>`),
+/// which is what makes the resolved URI say which image the function is frozen to — and
+/// what a client compares against `DescribeImages`/`BatchGetImage`. So the digest is the
+/// one the REGISTRY minted for the reference, which the call that stored the package
+/// resolved and kept on the record (`resolved_digest`, see [`image_source`]).
+///
+/// A package stored while no registry could be asked carries none, and nothing the
+/// registry minted can be reported for it: the resolved URI then pins the repository to a
+/// digest over the reference itself, which is stable across reads, equal for two functions
+/// on the same image and different for two tags of one repository.
 #[must_use]
-pub fn resolved_image_uri(image_uri: &str) -> String {
-    format!(
-        "{}@sha256:{}",
-        image_repository(image_uri),
-        image_code_sha256(image_uri)
-    )
+pub fn resolved_image_uri(image_uri: &str, resolved_digest: Option<&str>) -> String {
+    let repository = image_repository(image_uri);
+    if let Some(digest) = resolved_digest {
+        return format!("{repository}@{digest}");
+    }
+    format!("{repository}@sha256:{}", image_code_sha256(image_uri))
 }
 
-/// The digest of the container image an `Image` package names, which `CodeSha256` reports
-/// for such a function and which [`resolved_image_uri`] pins that image by.
+/// The digest of the container image an `Image` package names, for a package stored while
+/// no registry could be asked: the content this emulator holds for such a package is the
+/// reference itself, so the digest is stable across reads, equal for two functions on the
+/// same image and different for two references.
 ///
 /// AWS reports an image function's `CodeSha256` as the digest of the image it is frozen to,
 /// rendered as the lower-case hexadecimal an OCI digest is written in — unlike a .zip
 /// archive's, which is base64 ([`code_sha256`]) — so the two are told apart by their form
-/// as AWS tells them apart. The digest is of the content this emulator holds for the
-/// package, which for an image is the reference itself, so it is stable across reads, equal
-/// for two functions on the same image, different for two different references, and changed
-/// only by a new `ImageUri`.
+/// as AWS tells them apart. A package whose image the REGISTRY resolved reports that
+/// registry's own digest instead (see [`package_code::reported_code_sha256`]).
 #[must_use]
 pub fn image_code_sha256(image_uri: &str) -> String {
     let digest = sha2::Sha256::digest(image_uri.as_bytes());
@@ -4290,10 +4156,12 @@ pub fn package_code_identity(code: &CodeRecord) -> (i64, Option<String>) {
         );
     }
     // A container image is a reference this emulator does not pull, so it holds no archive
-    // to measure — but the image content it IS frozen to is the reference itself, which is
-    // what the digest is computed from (see [`image_code_sha256`]).
-    if let Some(image_uri) = &code.image_uri {
-        return (0, Some(image_code_sha256(image_uri)));
+    // to measure — and the digest it is frozen to is the manifest digest the REGISTRY
+    // minted for that reference, which the call that stored the package resolved (see
+    // [`package_code::reported_code_sha256`]); a package stored while no registry could be
+    // asked falls back to the digest of the reference itself ([`image_code_sha256`]).
+    if code.image_uri.is_some() {
+        return (0, reported_code_sha256(code));
     }
     (0, None)
 }
@@ -4883,6 +4751,11 @@ pub fn resolve_layer_version_ref<'a>(
 
 #[cfg(test)]
 mod tests;
+
+/// How a request NAMES a function's deployment package, and what each package type admits;
+/// see the module's own header.
+mod package_code;
+pub use package_code::*;
 
 /// Which RESOURCE a tagging request addresses, and what a request naming one this store
 /// holds no record of is answered — the whole reading behind the

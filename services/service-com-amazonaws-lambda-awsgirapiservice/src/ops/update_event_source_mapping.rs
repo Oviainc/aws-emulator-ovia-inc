@@ -406,12 +406,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is still settling, or whose removal is still owed, is not available to take
             // another change. See the module docs.
             if record.is_deleting() || record.is_settling() {
-                return Err(resource_in_use(format!(
-                    "The operation cannot be performed at this time. The event source \
-                     mapping {uuid} is currently in the following state: {state}",
-                    uuid = record.uuid,
-                    state = record.state
-                )));
+                // The refusal is a FIXED sentence: it states that the mapping is in use,
+                // and names neither the mapping nor the state it is settling through.
+                return Err(resource_in_use(
+                    "Cannot update the event source mapping because it is in use.".to_string(),
+                ));
             }
         }
 

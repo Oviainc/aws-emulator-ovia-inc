@@ -651,6 +651,20 @@ async fn bounds_that_describe_no_range_are_refused_and_store_nothing() {
                     answer.error_code(),
                     answer.text()
                 );
+                // The refusal is a FIXED sentence naming the two bounds' roles, with no
+                // part of it taken from the request: it is the one AWS words for a
+                // configuration that describes no range.
+                let reported = answer
+                    .string("/Message")
+                    .or_else(|| answer.string("/message"))
+                    .unwrap_or_default();
+                assert_eq!(
+                    reported,
+                    "Invalid function scaling configuration. Min execution environments \
+                     should be lower or equal than Max execution environments.",
+                    "bounds {bounds:?} on {qualifier:?}: expected the fixed range sentence, \
+                     got {reported:?}"
+                );
             }
 
             // Nothing was stored by the refusal: the qualifier still reports what the

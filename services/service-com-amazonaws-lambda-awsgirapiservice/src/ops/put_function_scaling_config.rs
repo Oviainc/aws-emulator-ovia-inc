@@ -195,12 +195,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             requested.max_execution_environments,
         ) {
             if minimum > maximum {
-                return Err(invalid_parameter(format!(
-                    "1 validation error detected: Value '{minimum}' at \
-                     'functionScalingConfig.minExecutionEnvironments' failed to satisfy \
-                     constraint: Member must be less than or equal to the value \
-                     '{maximum}' at 'functionScalingConfig.maxExecutionEnvironments'"
-                )));
+                return Err(invalid_parameter(
+                    INVALID_SCALING_RANGE_MESSAGE.to_string(),
+                ));
             }
         }
 
@@ -258,6 +255,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The refusal AWS words for a scaling configuration whose minimum is above its maximum:
+/// a fixed sentence naming the two bounds' roles, with no part taken from the request.
+const INVALID_SCALING_RANGE_MESSAGE: &str = "Invalid function scaling configuration. Min \
+                                             execution environments should be lower or equal \
+                                             than Max execution environments.";
 
 /// The modelled 400 this operation refuses a request it cannot satisfy with.
 fn invalid_parameter(message: String) -> PutFunctionScalingConfigError {

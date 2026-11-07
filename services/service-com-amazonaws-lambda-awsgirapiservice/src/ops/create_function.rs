@@ -405,7 +405,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        let code = package_code(&package_type, &input)?;
+        let mut code = package_code(&package_type, &input)?;
 
         // SnapStart "create[s] a snapshot of the initialized execution environment when
         // you publish a function version", which only a managed runtime carrying the
@@ -456,6 +456,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
+
+        // "For a container image, the code property must include the URI of a container
+        // image in the Amazon ECR registry": Lambda FOLLOWS that reference when the
+        // package is stored, in the function's own Region. A URI that is no image of that
+        // Region's registry, or names nothing pushed there, is refused and nothing is
+        // created; one the registry holds pins the function to the manifest digest the
+        // registry minted, which is what `ResolvedImageUri` reports (see
+        // [`crate::state::image_source`]). A registry this emulator cannot ask shows
+        // nothing about the image and refuses nothing.
+        if let Some(image_uri) = code.image_uri.clone() {
+            let resolution =
+                crate::state::resolve_image_source(&*self.engine, &region, &image_uri);
+            if let Some(message) = crate::state::source_image_message(&image_uri, &resolution) {
+                return Err(invalid_parameter(message));
+            }
+            if let crate::state::ImageResolution::Resolved(digest) = resolution {
+                code.resolved_image_digest = Some(digest);
+            }
+        }
 
         // "To create a function, you need a deployment package and an execution role."
         // The function RUNS AS the role the request names, so that role is resolved
@@ -779,6 +798,20 @@ fn package_code(
                 "Handler cannot be set for a function whose PackageType is Image".to_string(),
             ));
         }
+        // "A list of function layers to add to the function's EXECUTION ENVIRONMENT":
+        // a layer is unpacked into the execution environment Lambda builds from a .zip
+        // package, and a container image brings its own whole filesystem, so there is
+        // nowhere for one to be mounted. A request naming any layer is refused with the
+        // fixed sentence, and nothing is created.
+        if input
+            .layers
+            .as_ref()
+            .is_some_and(|layers| !layers.is_empty())
+        {
+            return Err(invalid_parameter(
+                crate::state::LAYERS_UNSUPPORTED_FOR_IMAGE_MESSAGE.to_string(),
+            ));
+        }
     } else {
         if input.runtime.is_none() {
             return Err(invalid_parameter(
@@ -794,6 +827,7 @@ fn package_code(
 
     crate::state::resolve_package_code(
         package_type,
+        crate::state::PackageCall::Creating,
         crate::state::PackageMembers {
             zip_file: code.zip_file.as_deref(),
             s3_bucket: code.s3_bucket.as_deref(),

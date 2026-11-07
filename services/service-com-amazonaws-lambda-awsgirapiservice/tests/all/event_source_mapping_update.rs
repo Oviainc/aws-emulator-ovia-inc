@@ -370,13 +370,13 @@ async fn of_two_concurrent_updates_of_one_mapping_exactly_one_wins() {
             "case {label:?}: the loser is refused as the resource being unavailable, got {}",
             loser.error_code()
         );
-        assert!(
+        assert_eq!(
             loser
                 .string("message")
                 .or_else(|| loser.string("Message"))
-                .unwrap_or_default()
-                .contains(STATE_UPDATING),
-            "case {label:?}: the refusal names the state the mapping is in, got {:?}",
+                .as_deref(),
+            Some("Cannot update the event source mapping because it is in use."),
+            "case {label:?}: the refusal is the fixed in-use sentence, got {:?}",
             loser.text()
         );
 

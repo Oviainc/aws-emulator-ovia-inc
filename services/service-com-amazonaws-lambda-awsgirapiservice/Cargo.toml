@@ -37,6 +37,15 @@ service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # identity-based policies an INVOCATION is authorized against
 # (`state::invoke_authorization`).
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# A container-image package names an image in the Amazon ECR registry, and Lambda follows
+# that reference when the package is stored (`state::image_source`): the registry's own
+# image and tag records are reached through the shared engine, which needs the owning
+# service's state TYPE.
+service-com-amazonaws-ecr-amazonec2containerregistry-v20150921 = { workspace = true }
+# A function's own invocation logs go to the CloudWatch Logs store of the same engine
+# (`state::log_delivery`), which is where `FilterLogEvents` and `GetLogEvents` read them
+# from: the delivery writes that service's own records rather than a second copy.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # An invocation is authorized against the principal its access key id speaks for, which is
 # the session the token service minted that key for — the same record `GetCallerIdentity`
 # answers from (`state::invoke_authorization`), reached through the shared engine.
@@ -172,6 +181,9 @@ percent-encoding = "2.3"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The key service a durable function's `DurableConfig` names a key in, mounted beside
+# lambda so a key really is disabled when the test says it is.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 # A deployment package the invoke tests upload is a .zip archive they write in memory.
 zip = { version = "9", default-features = false, features = ["deflate"] }
 # `time` on top of the workspace features: the data-plane tests wait out the state-settle

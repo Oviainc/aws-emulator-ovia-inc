@@ -1017,7 +1017,10 @@ impl FunctionRecord {
             return FunctionCodeLocation {
                 repository_type: Some(REPOSITORY_TYPE_ECR.to_string()),
                 image_uri: Some(image_uri.clone()),
-                resolved_image_uri: Some(resolved_image_uri(image_uri)),
+                resolved_image_uri: Some(resolved_image_uri(
+                    image_uri,
+                    code.resolved_image_digest.as_deref(),
+                )),
                 ..FunctionCodeLocation::default()
             };
         }

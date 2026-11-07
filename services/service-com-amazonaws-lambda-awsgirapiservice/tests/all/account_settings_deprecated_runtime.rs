@@ -242,6 +242,9 @@ async fn the_account_reports_whether_a_function_runs_a_deprecated_runtime() {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let router = router_on(&engine);
         let label = case.name;
+        // A container-image row resolves its reference against the registry at create, so
+        // the image it names is pushed there first.
+        crate::function_lifecycle::seed_image(&engine, IMAGE_URI).await;
 
         // Before anything is created the flag is already reported, and false: an account
         // with no function has none on a deprecated runtime.
