@@ -197,38 +197,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `MaxResults` is modelled with a default of 0 and a range of 0..250; 0 is "no
         // caller-supplied page size", so the whole remaining list is returned.
-        let limit = (input.max_results > 0).then_some(input.max_results as usize);
-
         let store = state.lock();
         // `wireless_devices` is a `BTreeMap`, so this walks the devices in one stable
-        // id order — which is what lets the resume key below name an exact position.
-        // One more than the page size is taken, so whether a next page exists is known
-        // without materialising the whole remaining list.
-        let mut page: Vec<WirelessDeviceStatistics> = store
-            .wireless_devices
-            .values()
-            .filter(|device| {
-                resume_after
-                    .as_deref()
-                    .is_none_or(|last| device.id.as_str() > last)
-            })
-            .filter(|device| matches(device, &input))
-            .take(limit.map_or(usize::MAX, |limit| limit.saturating_add(1)))
-            .map(statistics)
-            .collect();
-
-        let mut next_token = None;
-        if let Some(limit) = limit {
-            if page.len() > limit {
-                page.truncate(limit);
-                // Resume AFTER the last id this page returned, so the next page starts
-                // at the very next device with neither a repeat nor an omission.
-                next_token = page
-                    .last()
-                    .and_then(|last| last.id.as_deref())
-                    .map(crate::state::encode_page_token);
-            }
-        }
+        // id order — which is what lets the shared paginator's resume key name an exact
+        // position. The request's filters narrow the walk before it pages, so a page is
+        // full whenever enough matching devices remain.
+        let (page, next_token) = crate::state::page_of(
+            store
+                .wireless_devices
+                .values()
+                .filter(|device| matches(device, &input)),
+            resume_after.as_deref(),
+            input.max_results,
+            |device| device.id.as_str(),
+            statistics,
+        );
 
         Ok(ListWirelessDevicesOutput {
             next_token,

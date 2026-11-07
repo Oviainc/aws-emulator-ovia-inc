@@ -53,8 +53,10 @@ const NAME_MAX_LEN: usize = 256;
 /// Source: each member's doc on `smithy_query(query="shape",
 /// shape="LoRaWANServiceProfile")` — `TxPowerIndexMin` "Default: 0",
 /// `TxPowerIndexMax` "Default: 15", `NbTransMin` "Default: 0", `NbTransMax`
-/// "Default: 3" — and the `DrMin`/`DrMax` defaults the reported
-/// `LoRaWANGetServiceProfileInfo` declares.
+/// "Default: 3" — the `DrMin`/`DrMax` defaults the reported
+/// `LoRaWANGetServiceProfileInfo` declares, and the network-server settings the
+/// provisioned profile carries, which [`super::service_profile_network_server_settings`]
+/// is the suite for.
 fn default_settings() -> Value {
     json!({
         "AddGwMetadata": false,
@@ -66,6 +68,15 @@ fn default_settings() -> Value {
         "TxPowerIndexMax": 15,
         "NbTransMin": 0,
         "NbTransMax": 3,
+        "UlRate": 60,
+        "UlBucketSize": 4096,
+        "DlRate": 60,
+        "DlBucketSize": 4096,
+        "DevStatusReqFreq": 24,
+        "MinGwDiversity": 1,
+        "TargetPer": 5,
+        "AdrAlgorithm": "ORIGINAL",
+        "UplinkHistoryLen": 20,
     })
 }
 
@@ -79,21 +90,12 @@ fn settings_with(overrides: &Value) -> Value {
     expected
 }
 
-/// The `LoRaWANGetServiceProfileInfo` members no operation this service models can set,
-/// so a read must report none of them rather than a value nothing computed.
-/// Source: `smithy_query(query="shape", shape="LoRaWANGetServiceProfileInfo")` minus the
-/// members `LoRaWANServiceProfile` carries.
-const UNSET_REPORTED_MEMBERS: &[&str] = &[
-    "UlRate",
-    "UlBucketSize",
-    "UlRatePolicy",
-    "DlRate",
-    "DlBucketSize",
-    "DlRatePolicy",
-    "DevStatusReqFreq",
-    "ChannelMask",
-    "MinGwDiversity",
-];
+/// The `LoRaWANGetServiceProfileInfo` members the network server provisions no value
+/// for, so a read must report none of them rather than a value nothing computed.
+/// Source: `smithy_query(query="shape", shape="LoRaWANGetServiceProfileInfo")` — the two
+/// rate policies and the channel mask, which neither the create nor the provisioning
+/// defaults set.
+const UNSET_REPORTED_MEMBERS: &[&str] = &["UlRatePolicy", "DlRatePolicy", "ChannelMask"];
 
 /// Every published bound of every `LoRaWANServiceProfile` integer member, and the value
 /// one step outside each end.
@@ -111,6 +113,18 @@ const RANGED_MEMBERS: &[&str] = &[
 const RANGE_MIN: i64 = 0;
 const RANGE_MAX: i64 = 15;
 
+/// The `LoRaWAN` block that exercises `member` at `value` alone. `DrMin` is paired with
+/// the top of its range, because the data-rate window must not be inverted (the rule
+/// [`super::service_profile_network_server_settings`] covers), and this case is about
+/// each member's published RANGE, not that rule.
+fn ranged_member_body(member: &str, value: i64) -> Value {
+    let mut lorawan = json!({ member: value });
+    if member == "DrMin" {
+        lorawan["DrMax"] = json!(RANGE_MAX);
+    }
+    json!({ "LoRaWAN": lorawan })
+}
+
 async fn create_profile(router: &MultiServiceRouter, body: Value) -> (StatusCode, Value) {
     call(router, Method::POST, "/service-profiles", Some(body)).await
 }
@@ -125,8 +139,8 @@ struct Case {
     name: Option<String>,
     /// The `LoRaWAN` member the create carries, if any.
     lorawan: Option<Value>,
-    /// What `GetServiceProfile` must report under `LoRaWAN`, if anything.
-    expected: Option<Value>,
+    /// What `GetServiceProfile` must report under `LoRaWAN`.
+    expected: Value,
     tags: Option<Value>,
 }
 
@@ -147,7 +161,7 @@ fn cases() -> Vec<Case> {
                 "NbTransMin": RANGE_MAX,
                 "NbTransMax": RANGE_MAX,
             })),
-            expected: Some(json!({
+            expected: json!({
                 "AddGwMetadata": true,
                 "DrMin": RANGE_MAX,
                 "DrMax": RANGE_MAX,
@@ -157,7 +171,7 @@ fn cases() -> Vec<Case> {
                 "TxPowerIndexMax": RANGE_MAX,
                 "NbTransMin": RANGE_MAX,
                 "NbTransMax": RANGE_MAX,
-            })),
+            }),
             tags: Some(json!([{ "Key": "stage", "Value": "test" }])),
         },
         // The other end of every range, and no name.
@@ -175,10 +189,10 @@ fn cases() -> Vec<Case> {
                 "NbTransMin": RANGE_MIN,
                 "NbTransMax": RANGE_MIN,
             })),
-            expected: Some(settings_with(&json!({
+            expected: settings_with(&json!({
                 "TxPowerIndexMax": RANGE_MIN,
                 "NbTransMax": RANGE_MIN,
-            }))),
+            })),
             tags: None,
         },
         // No settings at all: the member is present and empty, so the stored resource
@@ -187,7 +201,7 @@ fn cases() -> Vec<Case> {
             case: "no-settings",
             name: Some(String::new()),
             lorawan: Some(json!({})),
-            expected: Some(default_settings()),
+            expected: default_settings(),
             tags: Some(json!([])),
         },
         // A subset of the members, mixing booleans and mid-range integers: the named
@@ -201,24 +215,25 @@ fn cases() -> Vec<Case> {
                 "DrMax": 7,
                 "NbTransMax": 1,
             })),
-            expected: Some(settings_with(&json!({
+            expected: settings_with(&json!({
                 "AddGwMetadata": true,
                 "DrMin": 3,
                 "DrMax": 7,
                 "NbTransMax": 1,
-            }))),
+            })),
             tags: Some(json!([
                 { "Key": "owner", "Value": "fleet-a" },
                 { "Key": "stage", "Value": "prod" },
             ])),
         },
-        // No technology member at all: the profile carries no LoRaWAN settings, so the
-        // reader reports none rather than inventing a default set.
+        // No technology member at all: a service profile is provisioned on the network
+        // server either way, so naming no block is naming none of its members and the
+        // stored resource carries exactly the same defaults as an empty block.
         Case {
             case: "no-lorawan-member",
             name: Some("x".repeat(NAME_MAX_LEN)),
             lorawan: None,
-            expected: None,
+            expected: default_settings(),
             tags: None,
         },
     ]
@@ -310,36 +325,26 @@ async fn a_service_profile_round_trips_through_get() {
             fetched.get("Name")
         );
 
-        match &case.expected {
-            Some(expected) => {
-                for (key, value) in expected.as_object().expect("an object of settings") {
-                    assert_eq!(
-                        fetched.get("LoRaWAN").and_then(|found| found.get(key)),
-                        Some(value),
-                        "case {:?}: expected LoRaWAN.{key} = {value}, got {:?}",
-                        case.case,
-                        fetched.get("LoRaWAN").and_then(|found| found.get(key))
-                    );
-                }
-                for member in UNSET_REPORTED_MEMBERS {
-                    assert!(
-                        fetched
-                            .get("LoRaWAN")
-                            .and_then(|found| found.get(member))
-                            .is_none(),
-                        "case {:?}: nothing sets LoRaWAN.{member}, so it must not be \
-                         reported, got {:?}",
-                        case.case,
-                        fetched.get("LoRaWAN").and_then(|found| found.get(member))
-                    );
-                }
-            }
-            None => assert!(
-                fetched.get("LoRaWAN").is_none(),
-                "case {:?}: a profile created without LoRaWAN settings must report none, got {:?}",
+        for (key, value) in case.expected.as_object().expect("an object of settings") {
+            assert_eq!(
+                fetched.get("LoRaWAN").and_then(|found| found.get(key)),
+                Some(value),
+                "case {:?}: expected LoRaWAN.{key} = {value}, got {:?}",
                 case.case,
-                fetched.get("LoRaWAN")
-            ),
+                fetched.get("LoRaWAN").and_then(|found| found.get(key))
+            );
+        }
+        for member in UNSET_REPORTED_MEMBERS {
+            assert!(
+                fetched
+                    .get("LoRaWAN")
+                    .and_then(|found| found.get(member))
+                    .is_none(),
+                "case {:?}: nothing sets LoRaWAN.{member}, so it must not be \
+                 reported, got {:?}",
+                case.case,
+                fetched.get("LoRaWAN").and_then(|found| found.get(member))
+            );
         }
     }
 }
@@ -537,7 +542,7 @@ async fn a_setting_outside_its_published_range_is_refused() {
             (RANGE_MAX + 1, false),
         ] {
             let (status, body) =
-                create_profile(&router, json!({ "LoRaWAN": { member: value } })).await;
+                create_profile(&router, ranged_member_body(member, value)).await;
             if accepted {
                 assert_eq!(
                     status,

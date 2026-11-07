@@ -103,6 +103,9 @@ pub mod reset_all_resource_log_levels_types;
 pub mod reset_resource_log_level_types;
 pub mod send_data_to_multicast_group_types;
 pub mod send_data_to_wireless_device_types;
+/// The reported service-profile settings, declared against this crate's own local model
+/// extension rather than the shipped snapshot — see the module for why.
+pub mod service_profile_report_types;
 pub mod shared_types;
 pub mod start_bulk_associate_wireless_device_with_multicast_group_types;
 pub mod start_bulk_disassociate_wireless_device_from_multicast_group_types;
@@ -306,6 +309,8 @@ pub use reset_resource_log_level_types::*;
 pub use send_data_to_multicast_group_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use send_data_to_wireless_device_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use service_profile_report_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use shared_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

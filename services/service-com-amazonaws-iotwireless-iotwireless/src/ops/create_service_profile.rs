@@ -179,6 +179,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The data-rate window `DrMin..DrMax` must not be inverted. No modelled trait
+        // expresses this cross-member rule, so it is checked here — before anything is
+        // minted, so a refused create provisions nothing.
+        if let Some(refusal) = input
+            .lo_ra_wan
+            .as_ref()
+            .and_then(crate::state::inverted_data_rate_window)
+        {
+            return Err(CreateServiceProfileErrorModeled::ValidationException(refusal).into());
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let fingerprint = fingerprint(&input);
         let mut store = state.lock();
@@ -236,12 +247,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             id: id.clone(),
             name: input.name.clone(),
             // The created resource carries the settings the request named plus the
-            // default each member's model doc publishes for the ones it left out, so
-            // every later reader projects one stored record.
-            lorawan: input
-                .lo_ra_wan
-                .as_ref()
-                .map(crate::state::service_profile_settings),
+            // default the network server provisions for every member it did not — or
+            // could not — name, so every later reader projects one stored record.
+            lorawan: crate::state::service_profile_settings(input.lo_ra_wan.as_ref()),
             tags: input.tags.clone().unwrap_or_default(),
         };
         let output = CreateServiceProfileOutput {

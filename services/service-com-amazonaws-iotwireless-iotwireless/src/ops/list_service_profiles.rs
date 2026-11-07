@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServiceProfiles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServiceProfiles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServiceProfiles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: enumerates the stored service profiles, one stable page at a time. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +140,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServiceProfiles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServiceProfilesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServiceProfiles"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListServiceProfilesError::from(
+                ListServiceProfilesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the iotwireless store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        // An empty `nextToken` query parameter is "no token", the same as omitting it;
+        // a non-empty one must be a token this service minted.
+        let resume_after = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListServiceProfilesErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "NextToken is not a token this service issued".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        // `MaxResults` is modelled with a default of 0 and a range of 0..250; 0 is "no
+        // caller-supplied page size", so the whole remaining list is returned.
+        let store = state.lock();
+        // `service_profiles` is a `BTreeMap`, so this walks the profiles in one stable
+        // id order — which is what lets the shared paginator's resume key name an exact
+        // position.
+        let (page, next_token) = crate::state::page_of(
+            store.service_profiles.values(),
+            resume_after.as_deref(),
+            input.max_results,
+            |profile| profile.id.as_str(),
+            listed,
+        );
+
+        Ok(ListServiceProfilesOutput {
+            next_token,
+            service_profile_list: Some(page),
+        })
+    }
+}
+
+/// The `ServiceProfile` summary view of a stored profile: the identity members the list
+/// reports, projected from the same record `GetServiceProfile` returns in full. The
+/// list's own shape carries no settings, so none are projected here.
+fn listed(profile: &crate::state::ServiceProfile) -> ServiceProfile {
+    ServiceProfile {
+        arn: Some(profile.arn.clone()),
+        id: Some(profile.id.clone()),
+        name: profile.name.clone(),
     }
 }

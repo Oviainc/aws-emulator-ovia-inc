@@ -41,6 +41,10 @@ mod resource_log_level_overrides;
 mod resource_event_configuration;
 #[path = "all/service_profile_lifecycle.rs"]
 mod service_profile_lifecycle;
+#[path = "all/service_profile_listing.rs"]
+mod service_profile_listing;
+#[path = "all/service_profile_network_server_settings.rs"]
+mod service_profile_network_server_settings;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/wireless_device_provisioning_refusals.rs"]

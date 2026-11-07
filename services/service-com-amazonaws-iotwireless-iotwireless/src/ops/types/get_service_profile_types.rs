@@ -26,31 +26,7 @@ pub struct GetServiceProfileOutput {
     pub lo_ra_wan: Option<LoRaWANGetServiceProfileInfo>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.iotwireless#LoRaWANGetServiceProfileInfo")]
-#[derive(Debug, Clone, Default)]
-pub struct LoRaWANGetServiceProfileInfo {
-    pub ul_rate: Option<i32>,
-    pub ul_bucket_size: Option<i32>,
-    pub ul_rate_policy: Option<String>,
-    pub dl_rate: Option<i32>,
-    pub dl_bucket_size: Option<i32>,
-    pub dl_rate_policy: Option<String>,
-    pub add_gw_metadata: bool,
-    pub dev_status_req_freq: Option<i32>,
-    pub report_dev_status_battery: bool,
-    pub report_dev_status_margin: bool,
-    pub dr_min: i32,
-    pub dr_max: i32,
-    pub channel_mask: Option<String>,
-    pub pr_allowed: bool,
-    pub hr_allowed: bool,
-    pub ra_allowed: bool,
-    pub nwk_geo_loc: bool,
-    pub target_per: i32,
-    pub min_gw_diversity: Option<i32>,
-    pub tx_power_index_min: Option<i32>,
-    pub tx_power_index_max: Option<i32>,
-    pub nb_trans_min: Option<i32>,
-    pub nb_trans_max: Option<i32>,
-}
+// `LoRaWANGetServiceProfileInfo` is declared in `service_profile_report_types`, against
+// the local model extension that also declares the two members the service reports and
+// the shipped snapshot does not. That module says why.
 

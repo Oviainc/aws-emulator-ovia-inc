@@ -11,7 +11,7 @@ use std::time::SystemTime;
 use crate::ops::types::{
     ConflictException, ConnectionStatusEventConfiguration,
     DeviceRegistrationStateEventConfiguration, JoinEventConfiguration, LoRaWANDevice,
-    LoRaWANDeviceProfile, LoRaWANFuotaTask, LoRaWANGateway,
+    LoRaWANDeviceProfile, LoRaWANFuotaTask, LoRaWANGateway, LoRaWANGetServiceProfileInfo,
     LoRaWANConnectionStatusEventNotificationConfigurations,
     LoRaWANJoinEventNotificationConfigurations, LoRaWANMulticast, LoRaWANServiceProfile,
     MessageDeliveryStatusEventConfiguration, ProximityEventConfiguration,
@@ -147,6 +147,42 @@ pub fn decode_page_token(token: &str) -> Option<String> {
         .strip_prefix(PAGE_TOKEN_MARKER)
         .filter(|key| !key.is_empty())
         .map(str::to_string)
+}
+
+/// One page of a list, and the `NextToken` that resumes after it.
+///
+/// `records` walks the store's values in the stable key order its `BTreeMap` holds them
+/// in, already narrowed to whatever the request filtered on; `key` names the record's
+/// store key (what a resume point is), and `project` is the list's own view of a record.
+/// `max_results` is the modelled page size, where 0 is "no caller-supplied page size"
+/// and the whole remaining list is returned.
+///
+/// One function, so every paginated list in this service resumes, truncates and mints
+/// its token the same way: one more than the page size is taken, so whether a further
+/// page exists is known without materialising the whole remaining list, and the token
+/// resumes AFTER the last key the page returned — neither a repeat nor an omission.
+pub fn page_of<'a, T: 'a, V>(
+    records: impl Iterator<Item = &'a T>,
+    resume_after: Option<&str>,
+    max_results: i32,
+    key: impl Fn(&T) -> &str,
+    project: impl Fn(&T) -> V,
+) -> (Vec<V>, Option<String>) {
+    let limit = (max_results > 0).then_some(max_results as usize);
+    let mut page: Vec<(String, V)> = records
+        .filter(|record| resume_after.is_none_or(|last| key(record) > last))
+        .take(limit.map_or(usize::MAX, |limit| limit.saturating_add(1)))
+        .map(|record| (key(record).to_string(), project(record)))
+        .collect();
+
+    let mut next_token = None;
+    if let Some(limit) = limit {
+        if page.len() > limit {
+            page.truncate(limit);
+            next_token = page.last().map(|(key, _)| encode_page_token(key));
+        }
+    }
+    (page.into_iter().map(|(_, value)| value).collect(), next_token)
 }
 
 /// A destination: the rule or MQTT topic a device's uplinks are routed to.
@@ -297,15 +333,20 @@ pub fn mac_version_mismatch(mac_version: &str) -> ValidationException {
 /// A service profile: the LoRaWAN network-server settings a set of wireless devices
 /// shares.
 ///
-/// `lorawan` holds the settings as the resource carries them — the create's own members
-/// with the defaults its model docs publish filled in for the ones it omitted — so every
-/// reader projects one stored record rather than re-deriving a default of its own.
+/// `lorawan` holds the settings as the network server carries them — the create's own
+/// members where the request named them, and the default the service applies for every
+/// other member of the reported shape — so every reader projects one stored record
+/// rather than re-deriving a default of its own. It is the REPORTED shape
+/// (`LoRaWANGetServiceProfileInfo`), a superset of what a create can set, because the
+/// network server adds its rate-policing, ADR and status-request configuration to every
+/// profile it provisions; it is not optional for the same reason — every service profile
+/// is provisioned there, whether or not its create named a `LoRaWAN` block.
 #[derive(Debug, Clone)]
 pub struct ServiceProfile {
     pub id: String,
     pub arn: String,
     pub name: Option<String>,
-    pub lorawan: Option<LoRaWANServiceProfile>,
+    pub lorawan: LoRaWANGetServiceProfileInfo,
     pub tags: Vec<Tag>,
 }
 
@@ -325,13 +366,77 @@ pub const DEFAULT_NB_TRANS_MIN: i32 = 0;
 /// Source: `LoRaWANServiceProfile.NbTransMax`'s model doc ("Default: 3").
 pub const DEFAULT_NB_TRANS_MAX: i32 = 3;
 
-/// The settings a created service profile carries: the ones the request named, and the
-/// default its model doc publishes for each one it left out.
+/// The `DrMin` a service profile carries when its create named none.
+/// Source: `LoRaWANGetServiceProfileInfo.DrMin`'s modelled `@default` (0), which is the
+/// value the reported shape carries for a member nothing set.
+pub const DEFAULT_DR_MIN: i32 = 0;
+
+/// The `DrMax` a service profile carries when its create named none.
+/// Source: `LoRaWANGetServiceProfileInfo.DrMax`'s modelled `@default` (0).
+pub const DEFAULT_DR_MAX: i32 = 0;
+
+/// The `UlRate` the network server provisions a service profile with (messages per
+/// hour), one of the account's service-profile defaults: a server-side constant the
+/// create cannot set and no reader may report as unset.
+pub const DEFAULT_UL_RATE: i32 = 60;
+
+/// The `UlBucketSize` the network server provisions a service profile with.
+pub const DEFAULT_UL_BUCKET_SIZE: i32 = 4096;
+
+/// The `DlRate` the network server provisions a service profile with.
+pub const DEFAULT_DL_RATE: i32 = 60;
+
+/// The `DlBucketSize` the network server provisions a service profile with.
+pub const DEFAULT_DL_BUCKET_SIZE: i32 = 4096;
+
+/// The `DevStatusReqFreq` the network server provisions a service profile with (device
+/// status requests per day).
+pub const DEFAULT_DEV_STATUS_REQ_FREQ: i32 = 24;
+
+/// The `MinGwDiversity` the network server provisions a service profile with — the
+/// bottom of the member's published range (`@range` 1..100).
+pub const DEFAULT_MIN_GW_DIVERSITY: i32 = 1;
+
+/// The `TargetPer` the network server provisions a service profile with: the packet
+/// error rate ADR aims at, as a percentage inside the member's published range
+/// (`@range` 0..100).
+pub const DEFAULT_TARGET_PER: i32 = 5;
+
+/// The `AdrAlgorithm` the network server runs for a provisioned service profile.
+///
+/// `AdrAlgorithm` and [`DEFAULT_UPLINK_HISTORY_LEN`]'s member are reported members the
+/// shipped service-model snapshot does not declare on `LoRaWANGetServiceProfileInfo`,
+/// so that one shape is declared against this crate's own small model extension
+/// instead; [`crate::ops::types::service_profile_report_types`] says why and what a
+/// later refresh of the snapshot should do with it.
+pub const DEFAULT_ADR_ALGORITHM: &str = "ORIGINAL";
+
+/// The `UplinkHistoryLen` the network server's adaptive data rate algorithm keeps for a
+/// provisioned service profile.
+pub const DEFAULT_UPLINK_HISTORY_LEN: i32 = 20;
+
+/// The settings a created service profile carries, as the reported shape carries them:
+/// the ones the request named, and the default the service applies for every member it
+/// could not or did not name.
 ///
 /// One function, so the stored resource — and therefore every reader of it — carries
-/// the same settings whether or not the create spelled them out.
-pub fn service_profile_settings(requested: &LoRaWANServiceProfile) -> LoRaWANServiceProfile {
-    LoRaWANServiceProfile {
+/// the same settings whether or not the create spelled them out, and the network-server
+/// half of the profile (rate policing, device-status requests, gateway diversity, the
+/// ADR packet-error target) is provisioned once, where the resource is minted. A create
+/// that named no `LoRaWAN` block at all (`None`) is a create that named none of its
+/// members, so it carries the same provisioned settings as one that sent an empty block.
+pub fn service_profile_settings(
+    requested: Option<&LoRaWANServiceProfile>,
+) -> LoRaWANGetServiceProfileInfo {
+    let requested = requested.cloned().unwrap_or_default();
+    LoRaWANGetServiceProfileInfo {
+        // The members `CreateServiceProfile`'s own shape carries, as the request named
+        // them, with each member's published default for the ones it omitted.
+        add_gw_metadata: requested.add_gw_metadata,
+        dr_min: requested.dr_min.unwrap_or(DEFAULT_DR_MIN),
+        dr_max: requested.dr_max.unwrap_or(DEFAULT_DR_MAX),
+        pr_allowed: requested.pr_allowed,
+        ra_allowed: requested.ra_allowed,
         tx_power_index_min: Some(
             requested
                 .tx_power_index_min
@@ -344,8 +449,39 @@ pub fn service_profile_settings(requested: &LoRaWANServiceProfile) -> LoRaWANSer
         ),
         nb_trans_min: Some(requested.nb_trans_min.unwrap_or(DEFAULT_NB_TRANS_MIN)),
         nb_trans_max: Some(requested.nb_trans_max.unwrap_or(DEFAULT_NB_TRANS_MAX)),
-        ..requested.clone()
+        // The network-server half, which nothing in this service's model can set: the
+        // provisioned profile carries the service's default for each one.
+        ul_rate: Some(DEFAULT_UL_RATE),
+        ul_bucket_size: Some(DEFAULT_UL_BUCKET_SIZE),
+        dl_rate: Some(DEFAULT_DL_RATE),
+        dl_bucket_size: Some(DEFAULT_DL_BUCKET_SIZE),
+        dev_status_req_freq: Some(DEFAULT_DEV_STATUS_REQ_FREQ),
+        min_gw_diversity: Some(DEFAULT_MIN_GW_DIVERSITY),
+        target_per: DEFAULT_TARGET_PER,
+        adr_algorithm: Some(DEFAULT_ADR_ALGORITHM.to_string()),
+        uplink_history_len: Some(DEFAULT_UPLINK_HISTORY_LEN),
+        // Everything left is a member the network server provisions no value for — the
+        // two rate policies, the channel mask — or a boolean flag whose modelled default
+        // is `false`, which is what `Default` carries.
+        ..LoRaWANGetServiceProfileInfo::default()
     }
+}
+
+/// The `ValidationException` body for a create whose data-rate window is inverted, or
+/// `None` when it is not.
+///
+/// The window is `DrMin..DrMax` with the modelled default standing in for either member
+/// the request omitted, and the service refuses a window whose bottom is above its top
+/// before provisioning anything; the message's only variable parts are those two
+/// effective values.
+pub fn inverted_data_rate_window(requested: &LoRaWANServiceProfile) -> Option<ValidationException> {
+    let dr_min = requested.dr_min.unwrap_or(DEFAULT_DR_MIN);
+    let dr_max = requested.dr_max.unwrap_or(DEFAULT_DR_MAX);
+    (dr_min > dr_max).then(|| ValidationException {
+        message: Some(format!(
+            "DrMin {dr_min} should not be larger than DrMax {dr_max}"
+        )),
+    })
 }
 
 /// The `EventNotificationTopicStatus` an event topic carries until an update enables it.
@@ -1469,6 +1605,16 @@ impl ComAmazonawsIotwirelessIotwirelessState {
             MAX_SERVICE_PROFILE_TOKENS,
             token,
             record,
+        );
+    }
+
+    /// Drop every idempotency token that minted service profile `id`, so a token never
+    /// outlives the resource it names.
+    pub fn forget_service_profile_tokens_for(&mut self, id: &str) {
+        forget_tokens_for(
+            &mut self.service_profile_tokens,
+            &mut self.service_profile_token_order,
+            id,
         );
     }
 

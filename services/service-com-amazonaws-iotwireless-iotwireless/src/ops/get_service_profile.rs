@@ -150,44 +150,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let store = state.lock();
+        // A profile the store does not hold — one that never existed, or one a delete
+        // has removed — is refused with the sentence
+        // `crate::state::resource_not_found` words for every resource kind this service
+        // addresses by `Id`.
         let profile = store.service_profiles.get(&input.id).ok_or_else(|| {
             GetServiceProfileError::from(GetServiceProfileErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("ServiceProfile {} not found", input.id)),
-                    resource_id: Some(input.id.clone()),
-                    resource_type: Some("ServiceProfile".to_string()),
-                },
+                crate::state::resource_not_found("ServiceProfile", &input.id),
             ))
         })?;
 
+        // The stored record IS the reported shape — the create's own members plus the
+        // network-server settings the profile was provisioned with — so this reader
+        // projects it whole rather than filling anything in of its own.
         Ok(GetServiceProfileOutput {
             arn: Some(profile.arn.clone()),
             name: profile.name.clone(),
             id: Some(profile.id.clone()),
-            lo_ra_wan: profile.lorawan.as_ref().map(reported_settings),
+            lo_ra_wan: Some(profile.lorawan.clone()),
         })
-    }
-}
-
-/// The stored service-profile settings as this operation's own view of them.
-///
-/// `LoRaWANGetServiceProfileInfo` carries every member `LoRaWANServiceProfile` does plus
-/// the network-server counters and policies no operation this service models can set, so
-/// the shared members are projected from the stored record and the rest are left at the
-/// value the model declares for a member nothing has set.
-fn reported_settings(stored: &LoRaWANServiceProfile) -> LoRaWANGetServiceProfileInfo {
-    LoRaWANGetServiceProfileInfo {
-        add_gw_metadata: stored.add_gw_metadata,
-        // `DrMin`/`DrMax` are boxed on the create and unboxed with a modelled default
-        // here, so a profile created without them reports that default.
-        dr_min: stored.dr_min.unwrap_or_default(),
-        dr_max: stored.dr_max.unwrap_or_default(),
-        pr_allowed: stored.pr_allowed,
-        ra_allowed: stored.ra_allowed,
-        tx_power_index_min: stored.tx_power_index_min,
-        tx_power_index_max: stored.tx_power_index_max,
-        nb_trans_min: stored.nb_trans_min,
-        nb_trans_max: stored.nb_trans_max,
-        ..LoRaWANGetServiceProfileInfo::default()
     }
 }

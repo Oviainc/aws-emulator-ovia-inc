@@ -1,0 +1,170 @@
+{
+  "smithy": "2.0",
+  "shapes": {
+    "com.amazonaws.iotwireless#LoRaWANGetServiceProfileInfo": {
+      "type": "structure",
+      "members": {
+        "UlRate": { "target": "com.amazonaws.iotwireless#UlRate" },
+        "UlBucketSize": { "target": "com.amazonaws.iotwireless#UlBucketSize" },
+        "UlRatePolicy": { "target": "com.amazonaws.iotwireless#UlRatePolicy" },
+        "DlRate": { "target": "com.amazonaws.iotwireless#DlRate" },
+        "DlBucketSize": { "target": "com.amazonaws.iotwireless#DlBucketSize" },
+        "DlRatePolicy": { "target": "com.amazonaws.iotwireless#DlRatePolicy" },
+        "AddGwMetadata": {
+          "target": "com.amazonaws.iotwireless#AddGwMetadata",
+          "traits": { "smithy.api#default": false }
+        },
+        "DevStatusReqFreq": { "target": "com.amazonaws.iotwireless#DevStatusReqFreq" },
+        "ReportDevStatusBattery": {
+          "target": "com.amazonaws.iotwireless#ReportDevStatusBattery",
+          "traits": { "smithy.api#default": false }
+        },
+        "ReportDevStatusMargin": {
+          "target": "com.amazonaws.iotwireless#ReportDevStatusMargin",
+          "traits": { "smithy.api#default": false }
+        },
+        "DrMin": {
+          "target": "com.amazonaws.iotwireless#DrMin",
+          "traits": { "smithy.api#default": 0 }
+        },
+        "DrMax": {
+          "target": "com.amazonaws.iotwireless#DrMax",
+          "traits": { "smithy.api#default": 0 }
+        },
+        "ChannelMask": { "target": "com.amazonaws.iotwireless#ChannelMask" },
+        "PrAllowed": {
+          "target": "com.amazonaws.iotwireless#PrAllowed",
+          "traits": { "smithy.api#default": false }
+        },
+        "HrAllowed": {
+          "target": "com.amazonaws.iotwireless#HrAllowed",
+          "traits": { "smithy.api#default": false }
+        },
+        "RaAllowed": {
+          "target": "com.amazonaws.iotwireless#RaAllowed",
+          "traits": { "smithy.api#default": false }
+        },
+        "NwkGeoLoc": {
+          "target": "com.amazonaws.iotwireless#NwkGeoLoc",
+          "traits": { "smithy.api#default": false }
+        },
+        "TargetPer": {
+          "target": "com.amazonaws.iotwireless#TargetPer",
+          "traits": { "smithy.api#default": 0 }
+        },
+        "MinGwDiversity": { "target": "com.amazonaws.iotwireless#MinGwDiversity" },
+        "TxPowerIndexMin": { "target": "com.amazonaws.iotwireless#TxPowerIndexMin" },
+        "TxPowerIndexMax": { "target": "com.amazonaws.iotwireless#TxPowerIndexMax" },
+        "NbTransMin": { "target": "com.amazonaws.iotwireless#NbTransMin" },
+        "NbTransMax": { "target": "com.amazonaws.iotwireless#NbTransMax" },
+        "AdrAlgorithm": { "target": "com.amazonaws.iotwireless#AdrAlgorithm" },
+        "UplinkHistoryLen": { "target": "com.amazonaws.iotwireless#UplinkHistoryLen" }
+      }
+    },
+
+    "com.amazonaws.iotwireless#AdrAlgorithm": { "type": "string" },
+    "com.amazonaws.iotwireless#UplinkHistoryLen": { "type": "integer" },
+
+    "com.amazonaws.iotwireless#UlRate": {
+      "type": "integer",
+      "traits": { "smithy.api#range": { "min": 0, "max": 2147483647 } }
+    },
+    "com.amazonaws.iotwireless#UlBucketSize": {
+      "type": "integer",
+      "traits": { "smithy.api#range": { "min": 0, "max": 2147483647 } }
+    },
+    "com.amazonaws.iotwireless#UlRatePolicy": {
+      "type": "string",
+      "traits": { "smithy.api#length": { "min": 0, "max": 256 } }
+    },
+    "com.amazonaws.iotwireless#DlRate": {
+      "type": "integer",
+      "traits": { "smithy.api#range": { "min": 0, "max": 2147483647 } }
+    },
+    "com.amazonaws.iotwireless#DlBucketSize": {
+      "type": "integer",
+      "traits": { "smithy.api#range": { "min": 0, "max": 2147483647 } }
+    },
+    "com.amazonaws.iotwireless#DlRatePolicy": {
+      "type": "string",
+      "traits": { "smithy.api#length": { "min": 0, "max": 256 } }
+    },
+    "com.amazonaws.iotwireless#AddGwMetadata": {
+      "type": "boolean",
+      "traits": { "smithy.api#default": false }
+    },
+    "com.amazonaws.iotwireless#DevStatusReqFreq": {
+      "type": "integer",
+      "traits": { "smithy.api#range": { "min": 0, "max": 2147483647 } }
+    },
+    "com.amazonaws.iotwireless#ReportDevStatusBattery": {
+      "type": "boolean",
+      "traits": { "smithy.api#default": false }
+    },
+    "com.amazonaws.iotwireless#ReportDevStatusMargin": {
+      "type": "boolean",
+      "traits": { "smithy.api#default": false }
+    },
+    "com.amazonaws.iotwireless#DrMin": {
+      "type": "integer",
+      "traits": {
+        "smithy.api#default": 0,
+        "smithy.api#range": { "min": 0, "max": 15 }
+      }
+    },
+    "com.amazonaws.iotwireless#DrMax": {
+      "type": "integer",
+      "traits": {
+        "smithy.api#default": 0,
+        "smithy.api#range": { "min": 0, "max": 15 }
+      }
+    },
+    "com.amazonaws.iotwireless#ChannelMask": {
+      "type": "string",
+      "traits": { "smithy.api#length": { "min": 0, "max": 2048 } }
+    },
+    "com.amazonaws.iotwireless#PrAllowed": {
+      "type": "boolean",
+      "traits": { "smithy.api#default": false }
+    },
+    "com.amazonaws.iotwireless#HrAllowed": {
+      "type": "boolean",
+      "traits": { "smithy.api#default": false }
+    },
+    "com.amazonaws.iotwireless#RaAllowed": {
+      "type": "boolean",
+      "traits": { "smithy.api#default": false }
+    },
+    "com.amazonaws.iotwireless#NwkGeoLoc": {
+      "type": "boolean",
+      "traits": { "smithy.api#default": false }
+    },
+    "com.amazonaws.iotwireless#TargetPer": {
+      "type": "integer",
+      "traits": {
+        "smithy.api#default": 0,
+        "smithy.api#range": { "min": 0, "max": 100 }
+      }
+    },
+    "com.amazonaws.iotwireless#MinGwDiversity": {
+      "type": "integer",
+      "traits": { "smithy.api#range": { "min": 1, "max": 100 } }
+    },
+    "com.amazonaws.iotwireless#TxPowerIndexMin": {
+      "type": "integer",
+      "traits": { "smithy.api#range": { "min": 0, "max": 15 } }
+    },
+    "com.amazonaws.iotwireless#TxPowerIndexMax": {
+      "type": "integer",
+      "traits": { "smithy.api#range": { "min": 0, "max": 15 } }
+    },
+    "com.amazonaws.iotwireless#NbTransMin": {
+      "type": "integer",
+      "traits": { "smithy.api#range": { "min": 0, "max": 15 } }
+    },
+    "com.amazonaws.iotwireless#NbTransMax": {
+      "type": "integer",
+      "traits": { "smithy.api#range": { "min": 0, "max": 15 } }
+    }
+  }
+}
