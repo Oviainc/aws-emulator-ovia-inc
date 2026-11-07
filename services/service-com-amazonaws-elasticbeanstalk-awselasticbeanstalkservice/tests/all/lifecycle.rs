@@ -101,8 +101,25 @@ impl Emulator {
         Self::over_engine(true)
     }
 
+    /// A fresh emulator with the SNS and SQS services mounted beside Elastic
+    /// Beanstalk on the SAME engine — which is what the assembled emulator does.
+    ///
+    /// An environment whose configuration names an Elastic Beanstalk
+    /// notification topic has its events PUBLISHED to that topic, by calling
+    /// Amazon SNS in process, so a suite that asserts the delivery needs SNS
+    /// answering and a queue of its own to read the notification from.
+    pub(crate) fn with_notification_services() -> Self {
+        Self::mounting(false, true)
+    }
+
     /// The one construction path both constructors use, so they cannot drift.
     fn over_engine(with_object_storage: bool) -> Self {
+        Self::mounting(with_object_storage, false)
+    }
+
+    /// Mount Elastic Beanstalk, and the other services a suite needs answering
+    /// beside it, on one shared engine.
+    fn mounting(with_object_storage: bool, with_notification_services: bool) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(eb::EmulatedService::new(Arc::clone(&engine)));
@@ -111,7 +128,24 @@ impl Emulator {
                 Arc::clone(&engine),
             ));
         }
+        if with_notification_services {
+            router.register_service(
+                service_com_amazonaws_sns_amazonsimplenotificationservice::EmulatedService::new(
+                    Arc::clone(&engine),
+                ),
+            );
+            router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
+                Arc::clone(&engine),
+            ));
+        }
         Self { router, engine }
+    }
+
+    /// Dispatch a request the caller built itself, for a suite that drives
+    /// ANOTHER mounted service over ITS own wire protocol (the SNS awsQuery
+    /// surface, the SQS awsJson one) rather than this service's.
+    pub(crate) async fn dispatch(&self, request: http::Request<bytes::Bytes>) -> Answer {
+        Answer::of(self.router.dispatch(request).await)
     }
 
     /// This service's store inside the engine the mounted handlers use — the
@@ -403,7 +437,11 @@ fn opening_tag(xml: &str, tag: &str, from: usize) -> Option<(usize, usize)> {
 /// Percent-encode a form value: everything outside SigV4's unreserved set
 /// (`A-Z a-z 0-9 - _ . ~`) becomes `%XX`, which is how an AWS SDK encodes an
 /// awsQuery parameter and what this service's query deserializer decodes.
-fn form_encoded(value: &str) -> String {
+///
+/// `pub(crate)` so a suite that drives ANOTHER awsQuery service mounted beside
+/// this one (SNS, in the environment-notification suite) encodes its form with
+/// the same rule instead of keeping a second copy of it.
+pub(crate) fn form_encoded(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {

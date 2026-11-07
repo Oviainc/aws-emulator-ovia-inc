@@ -575,17 +575,20 @@ pub const GENERAL_CONFIGURATION_OPTIONS: &[ConfigurationOption] = &[
         "true",
     )
     .boolean(),
-    // aws:elasticbeanstalk:sns:topics — environment event notifications.
+    // aws:elasticbeanstalk:sns:topics — environment event notifications, which
+    // this service really publishes (see [`super::event_notifications`]); the
+    // namespace and the option names are that module's, so the catalog and the
+    // delivery cannot disagree about what they are called.
     ConfigurationOption::new(
-        "aws:elasticbeanstalk:sns:topics",
-        "Notification Endpoint",
+        NAMESPACE_SNS_TOPICS,
+        OPTION_NOTIFICATION_ENDPOINT,
         CHANGE_SEVERITY_NO_INTERRUPTION,
         "",
     )
     .with_max_length(255),
     ConfigurationOption::new(
-        "aws:elasticbeanstalk:sns:topics",
-        "Notification Protocol",
+        NAMESPACE_SNS_TOPICS,
+        OPTION_NOTIFICATION_PROTOCOL,
         CHANGE_SEVERITY_NO_INTERRUPTION,
         "email",
     )
@@ -593,15 +596,15 @@ pub const GENERAL_CONFIGURATION_OPTIONS: &[ConfigurationOption] = &[
     // The topic the service creates for those notifications: it reports the ARN
     // it created, so this one is not a value a caller sets.
     ConfigurationOption::new(
-        "aws:elasticbeanstalk:sns:topics",
-        "Notification Topic ARN",
+        NAMESPACE_SNS_TOPICS,
+        OPTION_NOTIFICATION_TOPIC_ARN,
         CHANGE_SEVERITY_NO_INTERRUPTION,
         "",
     )
     .service_defined(),
     ConfigurationOption::new(
-        "aws:elasticbeanstalk:sns:topics",
-        "Notification Topic Name",
+        NAMESPACE_SNS_TOPICS,
+        OPTION_NOTIFICATION_TOPIC_NAME,
         CHANGE_SEVERITY_NO_INTERRUPTION,
         "",
     )

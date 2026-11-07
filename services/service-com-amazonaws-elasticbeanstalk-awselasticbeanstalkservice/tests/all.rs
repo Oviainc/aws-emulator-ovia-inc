@@ -41,6 +41,8 @@ mod dns_availability;
 mod enhanced_health;
 #[path = "all/environment_draft_configuration.rs"]
 mod environment_draft_configuration;
+#[path = "all/environment_event_notifications.rs"]
+mod environment_event_notifications;
 #[path = "all/environment_info.rs"]
 mod environment_info;
 #[path = "all/environment_info_request_shape.rs"]

@@ -42,9 +42,11 @@
 //!
 //! Three of those seams are taken here. `override_refusal` words a framework refusal the
 //! way this service words one (below), and `override_operation` plus `definition` are
-//! taken for the one reason named in [`query_error_envelope`]: an awsQuery error response
+//! taken for the reasons named in [`query_error_envelope`]: an awsQuery error response
 //! carries a `<RequestId>` element in its `<ErrorResponse>` envelope, which the
-//! framework's renderers omit. `override_operation` wraps the operation the routing table
+//! framework's renderers omit, and an environment's events are PUBLISHED to the Amazon SNS
+//! topic its configuration names, which no single operation owns.
+//! `override_operation` wraps the operation the routing table
 //! names, so the element reaches a handler-returned error, the scaffold's 501 and a
 //! refusal raised while serving it, and the [`ElasticBeanstalkDefinition`] this file hands
 //! back from `definition` adds it to a routing failure, a transport failure and a
@@ -68,7 +70,7 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: ElasticBeanstalkDefinition<Eng>,
     /// The envelope wrapper every routable request is served through. Held in a field,
     /// built once, because `override_operation` hands back a reference to it.
-    envelope: RequestIdEnvelopeOperation,
+    envelope: RequestIdEnvelopeOperation<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -77,8 +79,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: ElasticBeanstalkDefinition::new(engine),
-            envelope: RequestIdEnvelopeOperation,
+            entry: ElasticBeanstalkDefinition::new(Arc::clone(&engine)),
+            envelope: RequestIdEnvelopeOperation::new(engine),
         }
     }
 }

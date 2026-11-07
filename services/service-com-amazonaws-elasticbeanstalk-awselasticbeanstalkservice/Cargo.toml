@@ -42,6 +42,13 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # other services that read caller-supplied YAML use (YAML 1.2 is a superset of JSON,
 # which a configuration file may be written in instead).
 yaml-rust2 = { version = "0.10", default-features = false }
+# The AWS SDK for SNS, driven over the in-process callback
+# (`OperationContext::callback`): an environment whose configuration names an Elastic
+# Beanstalk notification topic has its events published to that topic with `Publish`, and
+# a configuration naming only an endpoint has the topic created and the endpoint
+# subscribed (`state::event_notifications`). Only the generated client is needed — the
+# emulator supplies the transport.
+aws-sdk-sns = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -54,6 +61,13 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 # The pre-processing suite writes the source bundles it uploads in memory, the way a
 # caller writes the .zip it uploads.
 zip = { version = "9", default-features = false, features = ["deflate"] }
+# SNS is mounted beside Elastic Beanstalk on one engine in the environment-notification
+# suite, because an environment's notifications are published to an SNS topic and the
+# delivery is asserted where a client sees it: on the queue subscribed to that topic.
+service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
+# SQS is mounted with it, because that subscriber is a queue and the delivered
+# notification is read from it.
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 
 [lints]
 workspace = true

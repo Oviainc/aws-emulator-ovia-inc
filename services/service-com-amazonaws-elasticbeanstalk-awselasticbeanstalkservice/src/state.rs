@@ -22,8 +22,10 @@
 //! platform catalog ([`platform_catalog`]), the configuration-option catalog
 //! ([`configuration_option_catalog`]), the managed-action schedule
 //! ([`managed_action_schedule`]), the enhanced-health derivations
-//! ([`environment_health`]) and the pre-processing of an application version's
-//! source bundle ([`version_processing`]).
+//! ([`environment_health`]), the pre-processing of an application version's
+//! source bundle ([`version_processing`]) and the delivery of an environment's
+//! events to the Amazon SNS topic its configuration names
+//! ([`event_notifications`]).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -45,12 +47,14 @@ use crate::ops::types::{
 };
 pub mod configuration_option_catalog;
 pub mod environment_health;
+pub mod event_notifications;
 pub mod managed_action_schedule;
 pub mod platform_catalog;
 pub mod version_processing;
 
 pub use configuration_option_catalog::*;
 pub use environment_health::*;
+pub use event_notifications::*;
 pub use managed_action_schedule::*;
 pub use platform_catalog::*;
 pub use version_processing::*;
@@ -3189,6 +3193,13 @@ pub struct ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     /// Source of unique `EnvironmentId` values, of version sequence numbers and
     /// of event sequence numbers.
     pub next_id_counter: u64,
+    /// The environment events whose notification has not been published to the
+    /// environment's Amazon SNS topic yet, OLDEST first. Appended by
+    /// [`Self::record_event_at`] for an environment whose configuration names a
+    /// notification topic or endpoint, and drained by
+    /// [`event_notifications::deliver_environment_notifications`], which is what
+    /// publishes them.
+    pub pending_notifications: Vec<PendingEventNotification>,
 }
 
 /// The store a fresh engine starts from: no applications, versions, custom
@@ -3218,6 +3229,9 @@ impl Default for ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             platform_branches: managed_platform_branch_catalog(),
             platform_catalog_published_at: now(),
             next_id_counter: 0,
+            // Nothing has happened to an environment yet, so nothing is owed a
+            // notification.
+            pending_notifications: Vec::new(),
         }
     }
 }
@@ -3277,14 +3291,21 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
         event_date: ::aws_smithy_types::DateTime,
     ) {
         let sequence = self.next_counter();
-        self.events.push(Event {
+        let event = Event {
             sequence,
             event_date,
             message: message.into(),
             severity: severity.to_string(),
             request_id: request_id.to_string(),
             subject,
-        });
+        };
+        // An environment event is also NOTIFIED, to the Amazon SNS topic that
+        // environment's configuration names: every event of a configured
+        // environment is queued for delivery here, so the log and the
+        // notifications cannot disagree about what happened to it. See
+        // [`event_notifications`].
+        self.queue_event_notification(&event);
+        self.events.push(event);
         self.evict_retired_events();
     }
 

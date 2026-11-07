@@ -26,7 +26,8 @@
 //!   raised while a matched operation was being served — an absent required member, a
 //!   value outside a declared bound or outside an enum's declared set — through
 //!   [`RequestIdEnvelopeOperation`], the operation wrapper this service hands back from
-//!   `Service::override_operation`;
+//!   `Service::override_operation` (which is also where the environment notifications one
+//!   call's events owe are published, for the reason given on it);
 //! * a routing failure (an `Action` naming no modelled operation), a transport failure
 //!   and a pre-dispatch refusal, through [`ElasticBeanstalkDefinition`], the definition
 //!   this service hands back from `Service::definition`.
@@ -142,16 +143,33 @@ fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dy
 }
 
 /// Serves a modelled operation through the framework exactly as the routing table would,
-/// then adds the envelope's `<RequestId>` to the response.
+/// then adds the envelope's `<RequestId>` to the response and publishes the environment
+/// notifications the call's own events owe.
 ///
 /// It stores no operation of its own: the one it delegates to is the one the service's
 /// routing table names for the request, resolved from the `svc` the framework passes into
 /// [`ErasedOperation::run`]. So the framework still owns the whole
 /// deserialize → validate → handle → serialize sequence (and every status, code and
-/// message it answers with), and this wrapper owns one element of the envelope.
-pub struct RequestIdEnvelopeOperation;
+/// message it answers with), and this wrapper owns one element of the envelope — plus the
+/// one piece of work that belongs to NO single operation: an environment event is
+/// published to the Amazon SNS topic the environment's configuration names, and an event
+/// is recorded by the lifecycle calls AND by every call that materialises a change the
+/// clock made due, so the delivery is made here rather than repeated in each of them. It
+/// runs after the response has been rendered, so it cannot change what this call answers.
+pub struct RequestIdEnvelopeOperation<Eng: Send + Sync + 'static> {
+    /// The shared engine this service's store lives in — the one the notifications are
+    /// taken from. Held rather than reached through `svc`, which is engine-erased.
+    engine: std::sync::Arc<Eng>,
+}
 
-impl ErasedOperation for RequestIdEnvelopeOperation {
+impl<Eng: Send + Sync + 'static> RequestIdEnvelopeOperation<Eng> {
+    /// Build the wrapper over the shared engine, as `EmulatedService::new` does.
+    pub fn new(engine: std::sync::Arc<Eng>) -> Self {
+        Self { engine }
+    }
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for RequestIdEnvelopeOperation<Eng> {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
@@ -159,7 +177,7 @@ impl ErasedOperation for RequestIdEnvelopeOperation {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            match modeled_operation(svc, req) {
+            let answered = match modeled_operation(svc, req) {
                 Some(op) => with_request_id(op.run(svc, req, ctx).await),
                 // Unreachable through `Service::override_operation`, which claims a
                 // request only when the routing table holds its key; answered as the
@@ -168,7 +186,9 @@ impl ErasedOperation for RequestIdEnvelopeOperation {
                 // [`ElasticBeanstalkDefinition::routing_error_response`], which already
                 // adds it, so there is exactly one writer on this path.
                 None => svc.definition().routing_error_response(req),
-            }
+            };
+            crate::state::deliver_environment_notifications(&*self.engine, ctx).await;
+            answered
         })
     }
 
