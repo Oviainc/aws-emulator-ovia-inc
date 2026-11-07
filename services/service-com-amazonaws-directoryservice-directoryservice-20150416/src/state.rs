@@ -249,7 +249,8 @@ pub fn subnet_pair_defect(subnet_ids: &[String]) -> Option<String> {
 /// neither the ids it rejected nor how many were sent. [`refusal`] appends the request id,
 /// once.
 pub const INVALID_SUBNET_IDS: &str =
-    "Invalid subnet ID(s). The two subnets must be in different Availability Zones.";
+    "Invalid subnet ID(s). They must correspond to two subnets in different Availability \
+     Zones.";
 
 /// The number of domain controllers a Managed Microsoft AD directory is created with.
 ///
@@ -730,9 +731,10 @@ pub const TRUST_STATE_VERIFIED: &str = "Verified";
 /// the `Failed` value of the modelled `TrustState` enum.
 ///
 /// The Amazon Web Services side of a trust can only be established against a peer the
-/// remote domain actually has, so a create naming a domain that cannot be resolved
-/// settles here instead of on [`TRUST_STATE_CREATED`] — see [`remote_domain_resolvable`]
-/// and [`TRUST_CREATE_FAILURE_REASON`].
+/// remote domain actually has, so a create naming a domain under a top-level domain the
+/// IETF reserves as never-installed settles here instead of on [`TRUST_STATE_CREATED`] —
+/// see [`remote_domain_has_a_reserved_top_level_domain`] and
+/// [`TRUST_CREATE_FAILURE_REASON`].
 pub const TRUST_STATE_FAILED: &str = "Failed";
 
 /// The `TrustStateReason` ("The reason for the TrustState") a trust that settled on
@@ -749,24 +751,26 @@ pub const TRUST_CREATE_FAILURE_REASON: &str =
 /// `example.com`, `example.net` and `example.org` are ordinary resolvable names and are
 /// NOT in this set).
 ///
-/// This is what [`remote_domain_resolvable`] decides an external domain's reachability
-/// by: this emulator resolves no name off this process, so the names DNS itself
-/// guarantees do not exist are the ones a trust cannot be established with.
+/// This is the set [`remote_domain_has_a_reserved_top_level_domain`] decides an external
+/// domain by: this emulator resolves no name and opens no socket — the decision is taken
+/// from the stored name's own last label and nothing else — so the names the IETF
+/// guarantees are never installed are the ones a trust cannot be established with.
 pub const NON_RESOLVABLE_TOP_LEVEL_DOMAINS: [&str; 4] =
     ["invalid", "test", "localhost", "example"];
 
-/// Whether `remote_domain_name` is a domain the global DNS can resolve — whether a trust
-/// to it can reach a peer at all.
+/// Whether `remote_domain_name` sits under one of [`NON_RESOLVABLE_TOP_LEVEL_DOMAINS`] —
+/// a name the IETF reserves as never installed in the global DNS, so no peer can exist at
+/// it and a trust to it cannot be established.
 ///
-/// A name whose top-level domain is one of [`NON_RESOLVABLE_TOP_LEVEL_DOMAINS`] is
-/// guaranteed by the IETF not to exist in the global DNS, so nothing answers for it; any
-/// other name is one a resolver can follow. The comparison is on the name's last label,
-/// case-insensitively and without the trailing root dot, the way [`domain_key`] compares
-/// one domain name with another.
-pub fn remote_domain_resolvable(remote_domain_name: &str) -> bool {
+/// A STRING comparison and nothing else: the name's last label is compared against that
+/// fixed set, case-insensitively and without the trailing root dot, the way [`domain_key`]
+/// compares one domain name with another. No name resolution is performed, no resolver is
+/// consulted and no socket is opened — this emulator reaches nothing off its own process,
+/// so the outcome is the same on every host and cannot block a caller.
+pub fn remote_domain_has_a_reserved_top_level_domain(remote_domain_name: &str) -> bool {
     let key = domain_key(remote_domain_name);
     let top_level = key.rsplit('.').next().unwrap_or_default();
-    !NON_RESOLVABLE_TOP_LEVEL_DOMAINS.contains(&top_level)
+    NON_RESOLVABLE_TOP_LEVEL_DOMAINS.contains(&top_level)
 }
 
 /// The `TrustState` a trust relationship carries between `DeleteTrust` and
@@ -920,6 +924,14 @@ pub const MAX_DIRECTORY_IDS_PER_REQUEST: usize = 100;
 /// list can only repeat ids — and it is what keeps the caller-chosen list from being
 /// allocated and scanned unbounded.
 pub const MAX_SNAPSHOT_IDS_PER_REQUEST: usize = 100;
+
+/// The most `Settings` entries a single `UpdateSettings` will apply.
+///
+/// NOT an AWS quota: a resource guard, deliberately well above any list a caller has
+/// reason to send — a directory carries [`DIRECTORY_SETTINGS`]`.len()` settings, so a
+/// longer list can only repeat names — and it is what keeps the caller-chosen list from
+/// being scanned unbounded, and from being scanned at all while the store lock is held.
+pub const MAX_SETTINGS_PER_REQUEST: usize = 100;
 
 /// The most trust relationships this emulator will store on one directory.
 ///
@@ -1690,6 +1702,16 @@ pub struct UserRecord {
 /// created with.
 pub const DIRECTORY_CONFIGURATION_STATUS_DEFAULT: &str = "Default";
 
+/// The `DirectoryConfigurationStatus` a setting an update has just been requested for
+/// carries: the first value of the modelled enum, the status of a request the directory
+/// has accepted and not carried out yet.
+pub const DIRECTORY_CONFIGURATION_STATUS_REQUESTED: &str = "Requested";
+
+/// The `DirectoryConfigurationStatus` a setting reaches once the transition its update
+/// owes has fallen due: the `Updated` value of the modelled enum, the status of a request
+/// the directory has carried out.
+pub const DIRECTORY_CONFIGURATION_STATUS_UPDATED: &str = "Updated";
+
 /// The directory types that carry configurable settings for `DescribeSettings` to report.
 ///
 /// The settings this service publishes ([`DIRECTORY_SETTINGS`]) are the security protocol
@@ -1711,8 +1733,9 @@ pub struct SettingDefinition {
     /// of a setting".
     pub data_type: &'static str,
     /// The modelled `SettingEntry$AllowedValues`, "the valid range of values for the
-    /// directory setting".
-    pub allowed_values: &'static str,
+    /// directory setting" — the values themselves, which
+    /// [`allowed_values_encoding`] is what renders into that member.
+    pub allowed_values: &'static [&'static str],
     /// The value the setting carries until `UpdateSettings` changes it.
     pub default_value: &'static str,
 }
@@ -1728,9 +1751,11 @@ const SETTING_TYPE_PROTOCOL: &str = "Protocol";
 /// `Boolean`, `DurationInSeconds`, or `Enum`" — the member's own documentation.
 const SETTING_DATA_TYPE_BOOLEAN: &str = "Boolean";
 
-/// The two values a switch admits, as `AllowedValues` states a range: a comma-separated
-/// list. Both spellings satisfy the modelled `AppliedValue` pattern `^[a-zA-Z0-9_]*$`.
-const SETTING_VALUES_ENABLE_DISABLE: &str = "Enable,Disable";
+/// The two values a switch admits. Both spellings satisfy the modelled
+/// `DirectoryConfigurationSettingValue` pattern `^[a-zA-Z0-9_]*$`, and `Setting$Value`'s
+/// own documentation names them: "for `TLS_1_0`, the valid values are: `Enable` and
+/// `Disable`".
+const SETTING_VALUES_ENABLE_DISABLE: [&str; 2] = [SETTING_VALUE_ENABLE, "Disable"];
 
 /// The value a protocol switch of a freshly created directory carries: the protocol is in
 /// service until an administrator turns it off.
@@ -1738,21 +1763,127 @@ const SETTING_VALUE_ENABLE: &str = "Enable";
 
 /// The configurable settings a Managed Microsoft AD directory of this emulator carries.
 ///
-/// One entry per setting this service publishes a NAME for from the model itself:
-/// `SettingEntry$Name`'s own documentation gives `TLS_1_0` as the name of a directory
-/// setting, `SettingEntry$Type`'s gives `Protocol` as the category such a switch falls in,
-/// and `SettingEntry$DataType`'s gives `Boolean` as the data type that defines its
-/// `AllowedValues`. The switch is `Enable` on a fresh directory and `UpdateSettings` is
-/// what requests another value. Every other setting name AWS publishes is a name the model
-/// does not state, so the catalogue grows as a recording confirms one rather than carrying
-/// a name a caller could not use with `UpdateSettings`.
-pub const DIRECTORY_SETTINGS: [SettingDefinition; 1] = [SettingDefinition {
-    name: "TLS_1_0",
-    setting_type: SETTING_TYPE_PROTOCOL,
-    data_type: SETTING_DATA_TYPE_BOOLEAN,
-    allowed_values: SETTING_VALUES_ENABLE_DISABLE,
-    default_value: SETTING_VALUE_ENABLE,
-}];
+/// One entry per directory security switch this service reports, each as the model
+/// describes one: `SettingEntry$Name`'s own documentation gives
+/// `TLS_1_0` as the name of a directory setting, `SettingEntry$Type`'s gives `Protocol` as
+/// the category such a switch falls in, and `SettingEntry$DataType`'s gives `Boolean` as
+/// the data type that defines its `AllowedValues`.
+///
+/// The two names here are the legacy TLS protocol versions AWS publishes as directory
+/// security settings an administrator turns off to harden the directory — each in service
+/// on a fresh directory, each a `Boolean` switch of the `Protocol` category, and each
+/// independently settable. They are what this emulator publishes, NOT the whole of AWS's
+/// published set: every other switch AWS documents is a name no recording of this corpus
+/// shows this service reporting, so the catalogue grows as one confirms another rather than
+/// carrying a name a caller could not use. Recorded behaviour does require MORE THAN ONE
+/// entry: the settings units of this service's behavioural corpus read `DescribeSettings`
+/// on an Active Managed Microsoft AD, pick one entry to update, and then assert the entries
+/// they did NOT name are untouched — an assertion a one-entry catalogue leaves without a
+/// subject. `UpdateSettings` is what requests another value for one of them, and a setting
+/// name outside this catalogue is one this service does not support, which is what it
+/// refuses.
+pub const DIRECTORY_SETTINGS: [SettingDefinition; 2] = [
+    SettingDefinition {
+        name: "TLS_1_0",
+        setting_type: SETTING_TYPE_PROTOCOL,
+        data_type: SETTING_DATA_TYPE_BOOLEAN,
+        allowed_values: &SETTING_VALUES_ENABLE_DISABLE,
+        default_value: SETTING_VALUE_ENABLE,
+    },
+    SettingDefinition {
+        name: "TLS_1_1",
+        setting_type: SETTING_TYPE_PROTOCOL,
+        data_type: SETTING_DATA_TYPE_BOOLEAN,
+        allowed_values: &SETTING_VALUES_ENABLE_DISABLE,
+        default_value: SETTING_VALUE_ENABLE,
+    },
+];
+
+/// The `AllowedValues` encoding of the values a setting admits: a JSON array of strings.
+///
+/// `SettingEntry$AllowedValues` is a single string member ("the valid range of values for
+/// the directory setting"), and the range is reported in it as a JSON-encoded array — so a
+/// client enumerates the legal values of a setting by decoding the member, rather than by
+/// guessing a separator. THE one place that encoding is produced, so what `DescribeSettings`
+/// reports and what `UpdateSettings` accepts are the same list. Rendered through the JSON
+/// value's own `Display`, which cannot fail for a list of strings, so the member never
+/// degrades into something a client's decoder would reject.
+pub fn allowed_values_encoding(values: &[String]) -> String {
+    ::serde_json::Value::from(values.to_vec()).to_string()
+}
+
+/// The `UnsupportedOperationException` message for a directory whose TYPE carries no
+/// configurable settings at all.
+///
+/// Shared by the settings operations (`DescribeSettings`, `UpdateSettings`), so reading and
+/// writing a directory that has no settings state the same thing about the same failure:
+/// the id the request asked for, the type that directory is of, and the types that DO carry
+/// settings ([`SETTINGS_DIRECTORY_TYPES`]), which is what tells a caller the feature belongs
+/// to another directory type rather than that something is missing. [`refusal`] appends the
+/// request id, once.
+pub fn settings_unsupported_for_type(directory_id: &str, directory_type: &str) -> String {
+    format!(
+        "DirectoryId {directory_id} names a {directory_type} directory; configurable \
+         settings are supported for {supported} directories only",
+        supported = SETTINGS_DIRECTORY_TYPES.join(", ")
+    )
+}
+
+/// The `UnsupportedSettingsException` message for a setting name this service publishes no
+/// setting under.
+///
+/// The failure Directory Service states, with the name the request sent as its only
+/// variable part: it is what tells a caller which of the settings it submitted to drop,
+/// and the names that ARE supported are what `DescribeSettings` reports. Restated behind
+/// the inner exception that produced it ([`restating_its_inner_exception`]). [`refusal`]
+/// appends the request id, once.
+pub fn unsupported_setting(name: &str) -> String {
+    restating_its_inner_exception(
+        &format!("Setting name: {name} is not currently supported"),
+        UNSUPPORTED_SETTING_EXCEPTION,
+    )
+}
+
+/// The exception class Directory Service names as the inner one of that refusal — the
+/// error shape's own name in the SINGULAR, which is how the recorded message spells it.
+const UNSUPPORTED_SETTING_EXCEPTION: &str = "UnsupportedSettingException";
+
+/// The `InvalidParameterException` message for a value outside the values a setting admits.
+///
+/// Names the setting and the value the request sent — the two halves of the pair that
+/// cannot be stored — and nothing about which values WOULD be admitted, since that is what
+/// `SettingEntry$AllowedValues` reports for the setting. Restated behind the inner
+/// exception that produced it ([`restating_its_inner_exception`]), which for this family is
+/// the refusal's own class. [`refusal`] appends the request id, once.
+pub fn invalid_setting_value(name: &str, value: &str) -> String {
+    restating_its_inner_exception(
+        &format!("Invalid setting value found for Setting name: {name} and value: {value}"),
+        INVALID_PARAMETER_EXCEPTION,
+    )
+}
+
+/// The exception class Directory Service names as the inner one of that refusal: the
+/// modelled error the call is refused with.
+const INVALID_PARAMETER_EXCEPTION: &str = "InvalidParameterException";
+
+/// A settings diagnostic as Directory Service states it: the clause, then the SAME clause
+/// again behind the name of the exception class that raised it.
+///
+/// The settings family words its refusals that way — the caller reads the failure once as
+/// the service states it and once as the component that produced it did — and both
+/// occurrences are the same sentence, so the two cannot disagree. The envelope's request-id
+/// suffix follows, once ([`refusal`]).
+///
+/// The form is the RECORDED one, from this service's behavioural corpus (the settings units
+/// that drive `UpdateSettings` with a name no catalogue publishes and with a value outside a
+/// setting's allowed values), which is also where the inner class's SINGULAR spelling comes
+/// from. It is the same shape [`refusal_restating_its_request_id`] documents for the tag
+/// family: a recorded message that states its own diagnostic twice. Should a later recording
+/// show a single-clause form for this family, this helper and both callers lose the
+/// restatement.
+fn restating_its_inner_exception(stated: &str, exception: &str) -> String {
+    format!("{stated} with Inner Exception: {exception}: {stated}")
+}
 
 /// The settings a freshly created directory of `directory_type` carries: every entry of
 /// [`DIRECTORY_SETTINGS`] at its default value, for a type that has settings at all
@@ -1773,10 +1904,17 @@ pub fn initial_settings(
                     name: definition.name.to_string(),
                     setting_type: definition.setting_type.to_string(),
                     data_type: definition.data_type.to_string(),
-                    allowed_values: definition.allowed_values.to_string(),
+                    allowed_values: definition
+                        .allowed_values
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect(),
                     applied_value: definition.default_value.to_string(),
+                    requested_value: definition.default_value.to_string(),
                     status: DIRECTORY_CONFIGURATION_STATUS_DEFAULT.to_string(),
+                    status_due_at: None,
                     last_updated: now,
+                    last_requested: None,
                 },
             )
         })
@@ -1816,16 +1954,28 @@ pub struct DirectorySettingRecord {
     pub setting_type: String,
     /// The modelled `SettingEntry$DataType`.
     pub data_type: String,
-    /// The modelled `SettingEntry$AllowedValues`.
-    pub allowed_values: String,
+    /// The modelled `SettingEntry$AllowedValues`: the values this setting admits, which
+    /// [`allowed_values_encoding`] renders into that member.
+    pub allowed_values: Vec<String>,
     /// "The value of the directory setting that is applied to the directory."
     pub applied_value: String,
+    /// "The value that was last requested for the directory setting": the applied value
+    /// until `UpdateSettings` requests another one for this setting.
+    pub requested_value: String,
     /// One of the modelled `DirectoryConfigurationStatus` values:
     /// [`DIRECTORY_CONFIGURATION_STATUS_DEFAULT`] until `UpdateSettings` requests another
-    /// value for this setting.
+    /// value for this setting, then [`DIRECTORY_CONFIGURATION_STATUS_REQUESTED`] until the
+    /// transition that update owes falls due and
+    /// [`DIRECTORY_CONFIGURATION_STATUS_UPDATED`] after it.
     pub status: String,
+    /// When the transition an update owes falls due; `None` once there is none left to
+    /// make. See [`TRANSITION_SPAN`].
+    pub status_due_at: Option<SystemTime>,
     /// "The date and time when the directory setting was last updated."
     pub last_updated: SystemTime,
+    /// "The date and time when the request to update a directory setting was last
+    /// submitted" — `None` for a setting no update was ever requested for.
+    pub last_requested: Option<SystemTime>,
 }
 
 impl DirectorySettingRecord {
@@ -1834,23 +1984,49 @@ impl DirectorySettingRecord {
     /// The one place a stored setting is rendered, so every operation that reports one
     /// reports exactly what was persisted. `RequestedValue` is the applied value while the
     /// setting rests at its default — nothing else has been requested for it — and
-    /// `RequestDetailedStatus` / `RequestStatusMessage` / `LastRequestedDateTime` stay
-    /// absent for the same reason: they describe an update request this directory has had
-    /// none of.
+    /// `LastRequestedDateTime` stays absent for the same reason.
+    /// `RequestDetailedStatus` stays absent because it reports the status of the request
+    /// "in each region" a setting is deployed in, which the directory's own Region
+    /// replications are not, and `RequestStatusMessage` because no update of this
+    /// emulator fails.
     pub fn to_setting_entry(&self) -> SettingEntry {
         SettingEntry {
             r#type: Some(self.setting_type.clone()),
             name: Some(self.name.clone()),
-            allowed_values: Some(self.allowed_values.clone()),
+            allowed_values: Some(allowed_values_encoding(&self.allowed_values)),
             applied_value: Some(self.applied_value.clone()),
-            requested_value: Some(self.applied_value.clone()),
+            requested_value: Some(self.requested_value.clone()),
             request_status: Some(self.status.clone()),
             request_detailed_status: None,
             request_status_message: None,
             last_updated_date_time: Some(as_timestamp(self.last_updated)),
-            last_requested_date_time: None,
+            last_requested_date_time: self.last_requested.map(as_timestamp),
             data_type: Some(self.data_type.clone()),
         }
+    }
+
+    /// Record the update `value` requests for this setting: the value is the one last
+    /// REQUESTED and the setting moves to [`DIRECTORY_CONFIGURATION_STATUS_REQUESTED`],
+    /// while the value APPLIED to the directory stays as it is until the transition the
+    /// update owes falls due one [`TRANSITION_SPAN`] later — which `advance_clock` is what
+    /// materialises, so a caller that reads the setting straight after the update sees the
+    /// request it made rather than a change nothing has carried out yet.
+    pub fn request_value(&mut self, value: &str, now: SystemTime) {
+        self.requested_value = value.to_string();
+        self.status = DIRECTORY_CONFIGURATION_STATUS_REQUESTED.to_string();
+        self.status_due_at = Some(now + TRANSITION_SPAN);
+        self.last_requested = Some(now);
+    }
+
+    /// Why `value` is not one this setting can carry, or `None` when it is one of
+    /// [`Self::allowed_values`] — the same list [`allowed_values_encoding`] reports, so a
+    /// client that enumerates the legal values of a setting and sends one of them is
+    /// never refused.
+    pub fn value_defect(&self, value: &str) -> Option<String> {
+        if self.allowed_values.iter().any(|allowed| allowed == value) {
+            return None;
+        }
+        Some(invalid_setting_value(&self.name, value))
     }
 }
 
@@ -2008,7 +2184,8 @@ impl Directory {
     /// directory identifier". The documented example shows a scheme, but the value the
     /// service reports is the HOST alone — the alias in the
     /// [`ACCESS_URL_SUFFIX`] domain and nothing else — which is what a client uses as a
-    /// host name, so no scheme and no path are composed into it.
+    /// host name, so no scheme and no path are composed into it. THE one place a stored
+    /// directory's access URL is rendered, so every operation that reports one reports this.
     pub fn access_url(&self) -> String {
         format!("{alias}{ACCESS_URL_SUFFIX}", alias = self.effective_alias())
     }
@@ -3053,7 +3230,8 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// route's status when `AddIpRoutes` or `RemoveIpRoutes` ran, an assessment's
     /// status when
     /// `StartADAssessment` ran, a directory's data-access status when
-    /// `EnableDirectoryDataAccess` ran, a directory's LDAPS status when `EnableLDAPS`
+    /// `EnableDirectoryDataAccess` ran, a directory setting's status when
+    /// `UpdateSettings` ran, a directory's LDAPS status when `EnableLDAPS`
     /// ran, a domain controller's status when the placement or the retirement of it ran.
     pub fn advance_clock(&mut self, now: SystemTime) {
         for directory in self.directories.values_mut() {
@@ -3112,6 +3290,21 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                         directory.data_access_status = DATA_ACCESS_DISABLED.to_string();
                         directory.data_access_due_at = None;
                     }
+                }
+            }
+            // The transition an `UpdateSettings` owes: the value the update REQUESTED
+            // becomes the value APPLIED to the directory, and the setting's transient
+            // `Requested` settles on `Updated`. Nothing is removed — a directory keeps
+            // every setting it carries, at whatever value it last settled on.
+            for setting in directory.settings.values_mut() {
+                let Some(due) = setting.status_due_at else {
+                    continue;
+                };
+                if now >= due {
+                    setting.applied_value = setting.requested_value.clone();
+                    setting.status = DIRECTORY_CONFIGURATION_STATUS_UPDATED.to_string();
+                    setting.last_updated = due;
+                    setting.status_due_at = None;
                 }
             }
             // The state transition `RegisterCertificate` owes: the transient
@@ -3206,10 +3399,14 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
             }
         }
         // The state transitions the trust writes owe: the transient `Creating` a create
-        // answers in settles on `Created` when the external domain the trust points at
-        // can be resolved and on `Failed` when it cannot — establishing the Amazon Web
-        // Services side needs a peer at that domain, and a domain DNS guarantees does not
-        // exist has none, which is the state reason the failed trust then carries. The
+        // answers in settles on `Created`, and on `Failed` for a remote domain under a
+        // top-level domain the IETF reserves as never installed — establishing the Amazon
+        // Web Services side needs a peer at that domain, and such a name can have none,
+        // which is the state reason the failed trust then carries. The branch is decided by
+        // a STRING comparison over the stored name (see
+        // [`remote_domain_has_a_reserved_top_level_domain`]): nothing here resolves a name,
+        // consults a resolver or opens a socket, so no caller-supplied value leaves this
+        // process and the outcome is the same on every host. The
         // `Verifying` a verify answers in settles on `Verified`, and the `Deleting` a
         // delete answers in settles on `Deleted` — after which the relationship leaves
         // the store one span later, because a trust this service no longer holds is not
@@ -3225,13 +3422,13 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
             }
             let (settled, reason) = match trust.trust_state.as_str() {
                 TRUST_STATE_CREATING => {
-                    if remote_domain_resolvable(&trust.remote_domain_name) {
-                        (TRUST_STATE_CREATED, None)
-                    } else {
+                    if remote_domain_has_a_reserved_top_level_domain(&trust.remote_domain_name) {
                         (
                             TRUST_STATE_FAILED,
                             Some(TRUST_CREATE_FAILURE_REASON.to_string()),
                         )
+                    } else {
+                        (TRUST_STATE_CREATED, None)
                     }
                 }
                 TRUST_STATE_VERIFYING => (TRUST_STATE_VERIFIED, None),
@@ -3720,6 +3917,7 @@ modeled_failures!(
     SnapshotLimitExceededException,
     TagLimitExceededException,
     UnsupportedOperationException,
+    UnsupportedSettingsException,
     UserDoesNotExistException,
 );
 
@@ -3735,6 +3933,20 @@ modeled_failures!(
 pub fn refusal<E: ModeledFailure>(message: impl Into<String>) -> E {
     let request_id = next_request_id();
     E::from_parts(with_request_id(&message.into(), &request_id), request_id)
+}
+
+/// Refuse the call with one of this service's modelled errors whose diagnostic is NOT this
+/// service's own: the message is stated exactly as the layer that decided the failure words
+/// it, with no request-id suffix after it.
+///
+/// An authorization failure is decided by IAM ahead of this service (see
+/// `crate::service::authorization`), so its diagnostic is IAM's sentence and nothing else:
+/// the correlation handle travels in the modelled `RequestId` member — which this still
+/// mints and reports, so the response carries the same handle every other refusal does —
+/// rather than inside a message clients compare against IAM's documented wording. Every
+/// diagnostic this SERVICE words itself goes through [`refusal`], which appends the suffix.
+pub fn refusal_stating_its_diagnostic_alone<E: ModeledFailure>(message: impl Into<String>) -> E {
+    E::from_parts(message.into(), next_request_id())
 }
 
 /// Refuse the call with one of this service's modelled errors, where the diagnostic
@@ -3795,12 +4007,17 @@ pub fn invalid_directory_id(directory_id: &str) -> String {
 
 /// The same report for an operation whose filter is a LIST of directory ids
 /// (`DescribeDirectories$DirectoryIds`): every id the store could not resolve, in the
-/// order the filter is scanned, comma-separated, under the plural spelling of the member
-/// the ids arrived in. [`refusal`] appends the request id, once.
+/// order the filter is scanned, separated by a BARE comma, under the plural spelling of
+/// the member the ids arrived in. [`refusal`] appends the request id, once.
+///
+/// The separator carries no space, so a client that splits the message on `,` to recover
+/// which ids were rejected gets the ids themselves, and the order is the filter's rather
+/// than a sorted one, so the nth name answers the nth id the request sent that the store
+/// could not resolve.
 pub fn invalid_directory_ids(directory_ids: &[String]) -> String {
     format!(
         "Invalid directory ID(s): {ids}.",
-        ids = directory_ids.join(", ")
+        ids = directory_ids.join(",")
     )
 }
 

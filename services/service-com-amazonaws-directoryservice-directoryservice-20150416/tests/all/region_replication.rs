@@ -851,3 +851,97 @@ async fn a_replication_is_recorded_and_the_refusals_follow_from_the_store() {
     )
     .await;
 }
+
+/// RULE: an authorization refusal is IAM's decision rather than this service's, so its
+/// `Message` is IAM's sentence and nothing after it — the principal, the action, the
+/// resource the request addressed and which of IAM's rules refused — while the call's
+/// request id travels in the modelled `RequestId` member, where a client reads it from.
+#[tokio::test]
+async fn an_authorization_refusal_states_iams_sentence_and_nothing_after_it() {
+    let emulator = emulator();
+    let directory = active_directory(&emulator, "iam-worded.example.com", None).await;
+    let account = ::engine::emulator_account_id();
+    let directory_arn = format!("arn:aws:ds:{HOME_REGION}:{account}:directory/{directory}");
+
+    // Rows spanning what the sentence's last clause states — which of IAM's two rules
+    // refused — across the operations of this service whose model declares the error. Each
+    // row is a caller of its own, so the policies under test are only its.
+    let rows: Vec<(&str, &str, String, String, String)> = vec![
+        (
+            "an explicit deny of this action",
+            "RemoveRegion",
+            r#"{"Statement":[{"Effect":"Allow","Action":"*","Resource":"*"},
+                     {"Effect":"Deny","Action":"ds:RemoveRegion","Resource":"*"}]}"#
+                .to_string(),
+            format!(" on resource: {directory_arn}"),
+            "with an explicit deny in an identity-based policy".to_string(),
+        ),
+        (
+            "no policy allowing the action",
+            "RemoveRegion",
+            r#"{"Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}"#
+                .to_string(),
+            format!(" on resource: {directory_arn}"),
+            "because no identity-based policy allows the ds:RemoveRegion action".to_string(),
+        ),
+        (
+            "an explicit deny of a read of the same directory",
+            "DescribeDirectoryDataAccess",
+            r#"{"Statement":[{"Effect":"Allow","Action":"*","Resource":"*"},
+                     {"Effect":"Deny","Action":"ds:DescribeDirectoryDataAccess","Resource":"*"}]}"#
+                .to_string(),
+            format!(" on resource: {directory_arn}"),
+            "with an explicit deny in an identity-based policy".to_string(),
+        ),
+        (
+            "a deny reached through a policy allowing everything else",
+            "AddRegion",
+            r#"{"Statement":[{"Effect":"Allow","Action":"*","Resource":"*"},
+                     {"Effect":"Deny","Action":"ds:AddRegion","Resource":"*"}]}"#
+                .to_string(),
+            format!(" on resource: {directory_arn}"),
+            "with an explicit deny in an identity-based policy".to_string(),
+        ),
+    ];
+
+    for (index, (case, operation, document, resource_clause, reason)) in rows.iter().enumerate() {
+        let access_key_id = format!("AKIDIAMWORD{index:05}");
+        let role_name = format!("ds-iam-worded-{index}");
+        caller(&emulator, &access_key_id, &role_name, Some(document));
+
+        let body = if *operation == "AddRegion" {
+            add_region(&directory, OTHER_REGION)
+        } else {
+            json!({ "DirectoryId": &directory })
+        };
+        let (status, parsed) =
+            call_as(&emulator, &access_key_id, HOME_REGION, operation, body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the refusal, got {status} with {parsed}"
+        );
+        assert_eq!(
+            error_code(&parsed),
+            ACCESS_DENIED,
+            "case {case:?}: expected {ACCESS_DENIED}, got {parsed}"
+        );
+
+        let session_arn = format!("arn:aws:sts::{account}:assumed-role/{role_name}/session-1");
+        let stated = format!(
+            "User: {session_arn} is not authorized to perform: ds:{operation}\
+             {resource_clause} {reason}"
+        );
+        let message = parsed["Message"].as_str().unwrap_or_default();
+        assert_eq!(
+            message, stated,
+            "case {case:?}: expected IAM's sentence alone, got {message:?}"
+        );
+        // The correlation handle is still reported — in the member a client reads it from.
+        let request_id = parsed["RequestId"].as_str().unwrap_or_default();
+        assert!(
+            !request_id.is_empty() && !message.contains(request_id),
+            "case {case:?}: expected the request id in the RequestId member and not in the \
+             message, got {parsed}"
+        );
+    }
+}

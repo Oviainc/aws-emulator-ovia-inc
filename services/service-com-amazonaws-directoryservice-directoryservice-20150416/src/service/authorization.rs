@@ -179,9 +179,14 @@ pub fn authorize<Eng: Send + Sync + 'static>(
 /// addressed.
 ///
 /// An action that addresses no resource of its own is judged against [`ANY_RESOURCE`], and
-/// the sentence states no resource clause for it: there is nothing to name. The call's
-/// request id is appended by [`crate::state::refusal`], the one place a refusal of this
-/// service is built, so this states the diagnostic alone.
+/// the sentence states no resource clause for it: there is nothing to name.
+///
+/// The authorization decision is IAM's rather than this service's, so the message is IAM's
+/// sentence and NOTHING else: it is what a client compares against IAM's documented
+/// wording to tell an explicit deny from an implicit one, so this service appends no
+/// request-id suffix of its own to it. The call's request id is reported in the modelled
+/// `RequestId` member, which [`crate::state::refusal_stating_its_diagnostic_alone`] mints
+/// exactly as every other refusal of this service does.
 fn not_authorized(
     principal: &str,
     action: &str,
@@ -193,7 +198,7 @@ fn not_authorized(
     } else {
         format!(" on resource: {resource}")
     };
-    crate::state::refusal(format!(
+    crate::state::refusal_stating_its_diagnostic_alone(format!(
         "User: {principal} is not authorized to perform: {action}{on_resource} {reason}"
     ))
 }
@@ -400,9 +405,10 @@ mod tests {
             let message = refusal.message.unwrap_or_default();
             let stated =
                 format!("User: {principal} is not authorized to perform: {action}{clause} {reason}");
-            assert!(
-                message.starts_with(&stated),
-                "case {case:?}: expected IAM's wording {stated:?}, got {message:?}"
+            assert_eq!(
+                message, stated,
+                "case {case:?}: expected IAM's wording {stated:?} and nothing after it, got \
+                 {message:?}"
             );
         }
     }

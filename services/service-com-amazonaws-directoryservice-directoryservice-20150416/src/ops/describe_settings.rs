@@ -203,11 +203,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let directory_type = directory.directory_type.clone();
             return Err(
                 DescribeSettingsErrorModeled::UnsupportedOperationException(
-                    crate::state::refusal(format!(
-                        "DirectoryId {id} names a {directory_type} directory; configurable \
-                         settings are supported for {supported} directories only",
-                        id = input.directory_id,
-                        supported = crate::state::SETTINGS_DIRECTORY_TYPES.join(", ")
+                    crate::state::refusal(crate::state::settings_unsupported_for_type(
+                        &input.directory_id,
+                        &directory_type,
                     )),
                 )
                 .into(),

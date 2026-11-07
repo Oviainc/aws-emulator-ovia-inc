@@ -226,15 +226,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A `DirectoryIds` filter narrows the result, and an id naming no stored
         // directory is reported rather than silently dropped from the page. The ids
         // arrived as a FILTER over the directories, so the refusal reports the VALUES as
-        // invalid directory ids — every unresolved one of them, comma-separated — rather
-        // than stating that one directory does not exist: the two ds not-found families
-        // are worded differently.
-        if let Some(requested) = requested.as_ref() {
-            let unresolved: Vec<String> = requested
-                .iter()
-                .filter(|directory_id| !store.directories.contains_key(**directory_id))
-                .map(|directory_id| (*directory_id).clone())
-                .collect();
+        // invalid directory ids — every unresolved one of them, in the order the filter
+        // sent them — rather than stating that one directory does not exist: the two ds
+        // not-found families are worded differently.
+        if let Some(filtered_ids) = input.directory_ids.as_ref() {
+            // Scanned in FILTER order (the caller's list), not in the order the lookup set
+            // above holds them, so the nth name in the diagnostic answers the nth id the
+            // request sent that the store could not resolve. An id the request repeated is
+            // named once: the message states which ids the caller has to fix. The scan is
+            // bounded by the guard the filter already passed above
+            // ([`crate::state::MAX_DIRECTORY_IDS_PER_REQUEST`]), which dominates it.
+            let mut unresolved: Vec<String> = Vec::new();
+            for directory_id in filtered_ids {
+                if !store.directories.contains_key(directory_id)
+                    && !unresolved.contains(directory_id)
+                {
+                    unresolved.push(directory_id.clone());
+                }
+            }
             if !unresolved.is_empty() {
                 return Err(DescribeDirectoriesErrorModeled::EntityDoesNotExistException(
                     crate::state::refusal(crate::state::invalid_directory_ids(&unresolved)),

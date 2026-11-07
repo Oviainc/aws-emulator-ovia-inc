@@ -15,6 +15,8 @@
 mod ad_assessment;
 #[path = "all/ad_connector.rs"]
 mod ad_connector;
+#[path = "all/aws_worded_diagnostics.rs"]
+mod aws_worded_diagnostics;
 #[path = "all/certificate_deregistration.rs"]
 mod certificate_deregistration;
 #[path = "all/certificate_functions.rs"]

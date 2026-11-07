@@ -218,12 +218,19 @@ async fn a_directorys_settings_are_reported_from_persisted_state() {
                 "case {case:?}/{name}: expected the status of an unchanged setting, \
                  got {entry}"
             );
-            // The applied value is one of the values the entry says it allows.
-            let allowed: BTreeSet<&str> = entry["AllowedValues"]
-                .as_str()
-                .unwrap_or_default()
-                .split(',')
-                .collect();
+            // The applied value is one of the values the entry says it allows, which the
+            // member carries as a JSON array of strings.
+            let allowed: BTreeSet<String> = serde_json::from_str::<Vec<String>>(
+                entry["AllowedValues"].as_str().unwrap_or_default(),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "case {case:?}/{name}: expected AllowedValues to decode as a JSON array \
+                     of strings, got {entry} ({error})"
+                )
+            })
+            .into_iter()
+            .collect();
             let applied = entry["AppliedValue"].as_str().unwrap_or_default();
             assert!(
                 allowed.contains(applied),
@@ -349,6 +356,344 @@ async fn the_status_filter_and_an_unissued_next_token() {
             json!({ "DirectoryId": &managed, "NextToken": token }),
             "InvalidNextTokenException",
             &case,
+        )
+        .await;
+    }
+}
+
+/// The one entry of `entries` named `name`.
+fn entry_named(found: &[Value], name: &str, case: &str) -> Value {
+    found
+        .iter()
+        .find(|entry| entry["Name"] == json!(name))
+        .unwrap_or_else(|| panic!("case {case:?}: expected an entry named {name}, got {found:?}"))
+        .clone()
+}
+
+/// The whole `UnsupportedSettingsException` diagnostic for a setting name the catalogue
+/// does not publish: the clause naming what the request sent, restated behind the inner
+/// exception that raised it.
+fn unsupported_setting_message(name: &str) -> String {
+    let stated = format!("Setting name: {name} is not currently supported");
+    format!("{stated} with Inner Exception: UnsupportedSettingException: {stated}")
+}
+
+/// The whole `InvalidParameterException` diagnostic for a value a setting does not admit,
+/// stated the same way: the pair the request sent, restated behind the inner exception.
+fn invalid_setting_value_message(name: &str, value: &str) -> String {
+    let stated =
+        format!("Invalid setting value found for Setting name: {name} and value: {value}");
+    format!("{stated} with Inner Exception: InvalidParameterException: {stated}")
+}
+
+/// RULE: `UpdateSettings` requests a value a setting admits — the value becomes the one
+/// last REQUESTED at once and the one APPLIED to the directory when the transition the
+/// update owes falls due — and it touches only the settings the request named.
+#[tokio::test]
+async fn an_update_requests_a_value_the_setting_admits_and_leaves_its_neighbours_alone() {
+    let router = service();
+    let managed = create_microsoft_ad(
+        &router,
+        minimal_microsoft_ad("updated.example.com"),
+        "the directory",
+    )
+    .await;
+    tokio::time::sleep(PAST_ONE_SPAN).await;
+
+    let before = entries(
+        &settings_of(&router, &managed, "before any update").await,
+        "before any update",
+    );
+    assert!(
+        before.len() > 1,
+        "case \"before any update\": expected more than one setting so an update has a \
+         neighbour to leave alone, got {before:?}"
+    );
+
+    // Every setting the catalogue publishes, updated one at a time to every value it
+    // admits BESIDES the one it carries, so the rows span the settings and their values
+    // rather than one recorded pair.
+    for subject in &before {
+        let name = subject["Name"].as_str().unwrap_or_default().to_string();
+        let applied = subject["AppliedValue"].as_str().unwrap_or_default().to_string();
+        let allowed: Vec<String> = serde_json::from_str(
+            subject["AllowedValues"].as_str().unwrap_or_default(),
+        )
+        .unwrap_or_default();
+        for value in allowed.iter().filter(|value| **value != applied) {
+            let case = format!("{name} -> {value}");
+            // What every setting of the directory looks like just before this update, so
+            // the neighbours are compared against the configuration this row started from.
+            let baseline = entries(
+                &settings_of(&router, &managed, &case).await,
+                &case,
+            );
+            let answer = ok(
+                &router,
+                "UpdateSettings",
+                json!({
+                    "DirectoryId": &managed,
+                    "Settings": [{ "Name": &name, "Value": value }],
+                }),
+                &case,
+            )
+            .await;
+            assert_eq!(
+                answer["DirectoryId"],
+                json!(&managed),
+                "case {case:?}: expected the answer to name the directory updated, got {answer}"
+            );
+
+            // Read back straight away: the directory has ACCEPTED the request and not
+            // carried it out yet, so the value requested is the new one while the value
+            // applied is still the old one.
+            let requested = entry_named(
+                &entries(&settings_of(&router, &managed, &case).await, &case),
+                &name,
+                &case,
+            );
+            assert_eq!(
+                requested["RequestedValue"],
+                json!(value),
+                "case {case:?}: expected the requested value to be stored, got {requested}"
+            );
+            assert_eq!(
+                requested["AppliedValue"],
+                json!(&applied),
+                "case {case:?}: expected the applied value to wait for the transition, got \
+                 {requested}"
+            );
+            assert_eq!(
+                requested["RequestStatus"],
+                json!("Requested"),
+                "case {case:?}: expected the status of an accepted request, got {requested}"
+            );
+            assert!(
+                requested["LastRequestedDateTime"].is_number(),
+                "case {case:?}: expected the instant the request was submitted, got {requested}"
+            );
+
+            // Once the transition the update owes has fallen due, the value requested is
+            // the value applied — and no later call was needed to make it so.
+            tokio::time::sleep(PAST_ONE_SPAN).await;
+            let settled_in = entries(&settings_of(&router, &managed, &case).await, &case);
+            let settled = entry_named(&settled_in, &name, &case);
+            assert_eq!(
+                settled["AppliedValue"],
+                json!(value),
+                "case {case:?}: expected the requested value to be applied, got {settled}"
+            );
+            assert_eq!(
+                settled["RequestStatus"],
+                json!("Updated"),
+                "case {case:?}: expected the status of a carried-out request, got {settled}"
+            );
+
+            // The settings the request did not name are untouched: same value, same
+            // status, and the same request instant they had before this update.
+            for neighbour in &settled_in {
+                if neighbour["Name"] == json!(&name) {
+                    continue;
+                }
+                let other = neighbour["Name"].as_str().unwrap_or_default();
+                let was = entry_named(&baseline, other, &case);
+                assert_eq!(
+                    neighbour, &was,
+                    "case {case:?}: expected {other} to be untouched, got {neighbour}"
+                );
+            }
+
+            // Put the setting back, so the next row starts from the catalogue's default.
+            ok(
+                &router,
+                "UpdateSettings",
+                json!({
+                    "DirectoryId": &managed,
+                    "Settings": [{ "Name": &name, "Value": &applied }],
+                }),
+                &format!("{case} (restored)"),
+            )
+            .await;
+            tokio::time::sleep(PAST_ONE_SPAN).await;
+        }
+    }
+}
+
+/// RULE: an update is refused — and changes NOTHING — when it names a setting this service
+/// publishes none of, or a value outside the ones that setting admits, or a directory that
+/// cannot carry settings or is not in service.
+#[tokio::test]
+async fn an_update_this_service_cannot_carry_out_is_refused_and_persists_nothing() {
+    let router = service();
+    let managed = create_microsoft_ad(
+        &router,
+        minimal_microsoft_ad("refused.example.com"),
+        "the directory",
+    )
+    .await;
+    // A second directory still being built by the transition its create owes.
+    let pending = create_microsoft_ad(
+        &router,
+        minimal_microsoft_ad("pending.example.com"),
+        "the directory still being built",
+    )
+    .await;
+    let (_, pending_refusal) = call(
+        &router,
+        "UpdateSettings",
+        json!({
+            "DirectoryId": &pending,
+            "Settings": [{ "Name": "TLS_1_0", "Value": "Disable" }],
+        }),
+    )
+    .await;
+    assert!(
+        pending_refusal["__type"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("DirectoryUnavailableException"),
+        "case \"a directory still being built\": expected the unavailable refusal, got \
+         {pending_refusal}"
+    );
+    tokio::time::sleep(PAST_ONE_SPAN).await;
+
+    let before = entries(
+        &settings_of(&router, &managed, "before the refusals").await,
+        "before the refusals",
+    );
+    let name = before[0]["Name"].as_str().unwrap_or_default().to_string();
+    let applied = before[0]["AppliedValue"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let other = before[1]["Name"].as_str().unwrap_or_default().to_string();
+
+    // (case, the payload, the modelled error it is refused with, the whole diagnostic it
+    // states). The unsupported names span a name of another shape, a name whose spelling
+    // differs from a published one only in case, and a name that extends one — none of them
+    // is in the catalogue `DescribeSettings` reports.
+    let rows: Vec<(String, Value, &str, String)> = vec![
+        (
+            "a setting name of another shape".to_string(),
+            json!([{ "Name": "NOT_A_SETTING", "Value": "Enable" }]),
+            "UnsupportedSettingsException",
+            unsupported_setting_message("NOT_A_SETTING"),
+        ),
+        (
+            format!("{name} in another case"),
+            json!([{ "Name": name.to_lowercase(), "Value": "Enable" }]),
+            "UnsupportedSettingsException",
+            unsupported_setting_message(&name.to_lowercase()),
+        ),
+        (
+            format!("a name extending {name}"),
+            json!([{ "Name": format!("{name}_1"), "Value": "Enable" }]),
+            "UnsupportedSettingsException",
+            unsupported_setting_message(&format!("{name}_1")),
+        ),
+        (
+            "a value outside the ones the setting admits".to_string(),
+            json!([{ "Name": &name, "Value": "Maybe" }]),
+            "InvalidParameterException",
+            invalid_setting_value_message(&name, "Maybe"),
+        ),
+        (
+            "an admitted value in another case".to_string(),
+            json!([{ "Name": &name, "Value": applied.to_uppercase() }]),
+            "InvalidParameterException",
+            invalid_setting_value_message(&name, &applied.to_uppercase()),
+        ),
+        (
+            "one admissible setting beside one that is not".to_string(),
+            json!([
+                { "Name": &other, "Value": "Disable" },
+                { "Name": "NOT_A_SETTING", "Value": "Enable" },
+            ]),
+            "UnsupportedSettingsException",
+            unsupported_setting_message("NOT_A_SETTING"),
+        ),
+        (
+            "one admissible setting beside a value that is not".to_string(),
+            json!([
+                { "Name": &other, "Value": "Disable" },
+                { "Name": &name, "Value": "Perhaps" },
+            ]),
+            "InvalidParameterException",
+            invalid_setting_value_message(&name, "Perhaps"),
+        ),
+    ];
+
+    for (case, settings, expected, diagnostic) in &rows {
+        let (status, parsed) = call(
+            &router,
+            "UpdateSettings",
+            json!({ "DirectoryId": &managed, "Settings": settings }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the update to be refused, got {status} with {parsed}"
+        );
+        let wire_type = parsed["__type"].as_str().unwrap_or_default();
+        assert!(
+            wire_type.contains(expected),
+            "case {case:?}: expected {expected}, got {parsed}"
+        );
+        let message = parsed["Message"].as_str().unwrap_or_default();
+        let request_id = parsed["RequestId"].as_str().unwrap_or_default();
+        assert!(
+            !request_id.is_empty(),
+            "case {case:?}: expected a RequestId, got {parsed}"
+        );
+        assert_eq!(
+            message,
+            format!("{diagnostic} : RequestId: {request_id}"),
+            "case {case:?}: expected the diagnostic to name what the request sent, got \
+             {message:?}"
+        );
+    }
+
+    // No refused payload wrote anything — not even the admissible half of one.
+    let after = entries(
+        &settings_of(&router, &managed, "after the refusals").await,
+        "after the refusals",
+    );
+    assert_eq!(
+        after, before,
+        "case \"after the refusals\": expected every setting untouched, got {after:?}"
+    );
+
+    // A directory whose type carries no settings cannot have them updated either.
+    let simple = create_directory(
+        &router,
+        minimal_create("no-settings.example.com"),
+        "the Simple AD directory",
+    )
+    .await;
+    tokio::time::sleep(PAST_ONE_SPAN).await;
+    refused(
+        &router,
+        "UpdateSettings",
+        json!({
+            "DirectoryId": &simple,
+            "Settings": [{ "Name": &name, "Value": "Disable" }],
+        }),
+        "UnsupportedOperationException",
+        "UpdateSettings on a Simple AD directory",
+    )
+    .await;
+
+    // And an id no directory is stored under answers the directory's own not-found class.
+    for (absent, class) in ABSENT_DIRECTORY_IDS {
+        refused(
+            &router,
+            "UpdateSettings",
+            json!({
+                "DirectoryId": absent,
+                "Settings": [{ "Name": &name, "Value": "Disable" }],
+            }),
+            "DirectoryDoesNotExistException",
+            &format!("UpdateSettings of {absent} ({class})"),
         )
         .await;
     }

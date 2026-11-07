@@ -53,7 +53,7 @@ const CUSTOMER_DNS_IPS: [&str; 2] = ["10.7.0.10", "10.7.1.10"];
 const SIZE_CATALOG: [&str; 2] = ["Small", "Large"];
 
 /// `ConnectSettings` for `subnet_ids` in one VPC.
-fn connect_settings(subnet_ids: &[&str]) -> Value {
+pub(crate) fn connect_settings(subnet_ids: &[&str]) -> Value {
     json!({
         "VpcId": "vpc-0a1b2c3d",
         "SubnetIds": subnet_ids,

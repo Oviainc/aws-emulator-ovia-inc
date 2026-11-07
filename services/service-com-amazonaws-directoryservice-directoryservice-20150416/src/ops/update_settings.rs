@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Requests another value for one or more of a directory's configurable settings — the
+//! directory security switches [`crate::state::DIRECTORY_SETTINGS`] publishes and
+//! `DescribeSettings` reports.
+//!
+//! An accepted update is recorded as the change the directory ACCEPTED: each named
+//! setting's `RequestedValue` becomes the value the request sent and its
+//! `RequestStatus` the transient
+//! [`crate::state::DIRECTORY_CONFIGURATION_STATUS_REQUESTED`], while the value APPLIED to
+//! the directory moves one [`crate::state::TRANSITION_SPAN`] later, when the clock — not a
+//! later call — settles the setting on
+//! [`crate::state::DIRECTORY_CONFIGURATION_STATUS_UPDATED`]. `DescribeSettings` is what
+//! reports where an update stands.
+//!
+//! The refusals, each checked before anything is written so a refused payload changes
+//! nothing: an id no directory is stored under answers `DirectoryDoesNotExistException`, a
+//! directory whose type carries no settings `UnsupportedOperationException`, one that is
+//! not in service `DirectoryUnavailableException`, a setting name this service publishes
+//! no setting under `UnsupportedSettingsException`, and a value outside the values that
+//! setting admits `InvalidParameterException`. `IncompatibleSettingsException` is left
+//! unused: no setting of this catalogue constrains another.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +165,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSettings"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Nothing caller-sized reaches the store, or the store LOCK, unchecked: the list
+        // of settings is bounded here — before the store is reached — by a guard set well
+        // above the catalogue a directory carries, so a longer list can only repeat names.
+        if input.settings.len() > crate::state::MAX_SETTINGS_PER_REQUEST {
+            return Err(UpdateSettingsErrorModeled::InvalidParameterException(
+                crate::state::refusal(format!(
+                    "This emulator applies at most {max} Settings entries in one call, got \
+                     {got}",
+                    max = crate::state::MAX_SETTINGS_PER_REQUEST,
+                    got = input.settings.len()
+                )),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        let directory = store
+            .directories
+            .get_mut(&input.directory_id)
+            .ok_or_else(|| {
+                UpdateSettingsErrorModeled::DirectoryDoesNotExistException(
+                    crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
+                )
+            })?;
+
+        // The settings this operation changes are a feature of the directory types that
+        // run their own domain controllers, so a request naming a directory of another
+        // type asks for something that type does not have — refused through the shared
+        // diagnostic `DescribeSettings` refuses such a directory with, so reading and
+        // writing cannot disagree about it.
+        if !directory.has_settings() {
+            let directory_type = directory.directory_type.clone();
+            return Err(UpdateSettingsErrorModeled::UnsupportedOperationException(
+                crate::state::refusal(crate::state::settings_unsupported_for_type(
+                    &input.directory_id,
+                    &directory_type,
+                )),
+            )
+            .into());
+        }
+
+        // Changing a directory's configuration changes the directory itself, so it needs
+        // one that is in service: one still being built by the transition its create owes
+        // is unavailable. The diagnostic is this service's shared one for a directory a
+        // call cannot reach.
+        if directory.stage != crate::state::STAGE_ACTIVE {
+            return Err(
+                UpdateSettingsErrorModeled::DirectoryUnavailableException(crate::state::refusal(
+                    crate::state::directory_unavailable(&input.directory_id),
+                ))
+                .into(),
+            );
+        }
+
+        // EVERY submitted setting is checked before ANY of them is written, so a payload
+        // carrying one name this service publishes no setting under, or one value outside
+        // the values its setting admits, changes nothing at all: a partially applied
+        // update would leave the directory in a configuration no caller asked for.
+        for submitted in &input.settings {
+            let Some(setting) = directory.settings.get(&submitted.name) else {
+                return Err(UpdateSettingsErrorModeled::UnsupportedSettingsException(
+                    crate::state::refusal(crate::state::unsupported_setting(&submitted.name)),
+                )
+                .into());
+            };
+            if let Some(defect) = setting.value_defect(&submitted.value) {
+                return Err(UpdateSettingsErrorModeled::InvalidParameterException(
+                    crate::state::refusal(defect),
+                )
+                .into());
+            }
+        }
+
+        // The update is recorded as the change the directory ACCEPTED: the value each
+        // setting named is the one last requested for it, and the move to the value
+        // applied to the directory is owed by the clock one transition span later —
+        // nothing here sleeps for it. Only the settings the request named are touched, so
+        // the directory's other settings keep the value and the status they had.
+        for submitted in &input.settings {
+            if let Some(setting) = directory.settings.get_mut(&submitted.name) {
+                setting.request_value(&submitted.value, now);
+            }
+        }
+
+        Ok(UpdateSettingsOutput {
+            directory_id: Some(directory.directory_id.clone()),
+        })
     }
 }
