@@ -112,9 +112,11 @@
 //! * the four `AWS::WAFv2::*` types — a web ACL, a rule group, an IP set and a regex
 //!   pattern set — have properties that ARE their create's own members, named identically on
 //!   both sides, so the evaluated document is the request with the name CloudFormation
-//!   decides set on it. One member is spelled differently on the two sides and is rewritten
-//!   both ways ([`wafv2_byte_match_rewritten`]): a byte-match statement's search value is a
-//!   BLOB, which the wire carries base64-encoded while a template declares the bytes. Each
+//!   decides set on it. The few members the two sides spell DIFFERENTLY are rewritten both
+//!   ways ([`wafv2_spelled`]): a byte-match statement's search value is a BLOB, which the
+//!   wire carries base64-encoded while a template declares the bytes, and the ARN a
+//!   reference statement names another entity by is `ARN` on the wire and `Arn` in a
+//!   template. Each
 //!   type's identity is WAF's own — its create assigns the entity `Id` and builds the ARN
 //!   that carries the scope, the name and that id — so its arm answers both, and what the
 //!   stack publishes for the resource is what `AssociateWebACL` and the `Get…` calls take.

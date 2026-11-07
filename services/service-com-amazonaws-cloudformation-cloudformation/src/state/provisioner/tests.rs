@@ -335,8 +335,8 @@ fn a_property_document_nested_past_the_bound_is_refused() {
             ("camel_cased", camel_cased(document, 0)),
             ("lower_camel_members", lower_camel_members(document, 0)),
             (
-                "wafv2_byte_match_rewritten",
-                wafv2_byte_match_rewritten(document, 0, wafv2_search_string_encoded),
+                "wafv2_spelled",
+                wafv2_spelled(document, 0, Wafv2Spelling::Wire),
             ),
         ]
     }
@@ -414,7 +414,7 @@ fn a_byte_match_search_value_round_trips_through_both_template_spellings() {
                 }],
             });
             let request =
-                wafv2_byte_match_rewritten(&properties, 0, wafv2_search_string_encoded)
+                wafv2_spelled(&properties, 0, Wafv2Spelling::Wire)
                     .unwrap_or_else(|refusal| {
                         panic!("case {case:?}/{spelling}: expected the walk to carry the \
                                     document, got {refusal:?}")
@@ -445,11 +445,7 @@ fn a_byte_match_search_value_round_trips_through_both_template_spellings() {
             // And the reported statement carries the value in BOTH spellings, so the
             // drift comparison — which compares only a member the declaration carries —
             // finds it in the one that declaration wrote.
-            let reported = wafv2_byte_match_rewritten(
-                &request,
-                0,
-                wafv2_search_string_decoded,
-            )
+            let reported = wafv2_spelled(&request, 0, Wafv2Spelling::Template)
             .unwrap_or_else(|refusal| {
                 panic!("case {case:?}/{spelling}: expected the walk to carry the reported \
                             document, got {refusal:?}")

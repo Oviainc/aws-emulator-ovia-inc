@@ -3877,6 +3877,35 @@ pub(super) const WAFV2_BYTE_MATCH_STATEMENT: &str = "ByteMatchStatement";
 pub(super) const WAFV2_SEARCH_STRING: &str = "SearchString";
 pub(super) const WAFV2_SEARCH_STRING_BASE64: &str = "SearchStringBase64";
 
+/// The statements that name ANOTHER WAFv2 entity: "create an IPSet that specifies the
+/// addresses you want to detect, then use the ARN of that set in this statement"
+/// (`IPSetReferenceStatement`), and the same for a regex pattern set and a rule group.
+///
+/// Each takes the referenced entity's ARN under a REQUIRED member, and that member is the
+/// one a rule tree spells differently on the two sides ([`wafv2_reference_arn`]).
+pub(super) const WAFV2_REFERENCE_STATEMENTS: &[&str] = &[
+    "IPSetReferenceStatement",
+    "RegexPatternSetReferenceStatement",
+    "RuleGroupReferenceStatement",
+];
+
+/// The two spellings of that member: `ARN` is what the API declares
+/// (`IPSetReferenceStatement$ARN`, `RegexPatternSetReferenceStatement$ARN`,
+/// `RuleGroupReferenceStatement$ARN`, each `@required`), and `Arn` is what the resource
+/// types write it as.
+pub(super) const WAFV2_REFERENCE_ARN: &str = "ARN";
+pub(super) const WAFV2_TEMPLATE_REFERENCE_ARN: &str = "Arn";
+
+/// Which side's spelling a WAFv2 document is in ([`wafv2_spelled`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Wafv2Spelling {
+    /// The members as the API's own model declares them, which is what a call carries.
+    Wire,
+    /// The members as a resource type's properties write them, which is what a template
+    /// declares and what a drift comparison reads.
+    Template,
+}
+
 /// The calls one KIND of WAFv2 entity is created, read and deleted through.
 ///
 /// The four types this emulator provisions differ only in these names: each `Create…` takes
@@ -4004,9 +4033,9 @@ pub(super) async fn delete_wafv2_entity(
 ///
 /// The document the read answers carries the entity's members under exactly the names the
 /// type's properties have (`Description`, `Rules`, `VisibilityConfig`, `Addresses`), so it
-/// is the actual configuration the declared one is compared against — with the one member
+/// is the actual configuration the declared one is compared against — with each member
 /// whose SPELLING differs between the two sides reported in both of the spellings a template
-/// writes it in ([`wafv2_search_string_decoded`]), so an entity nobody changed is not
+/// writes it in ([`wafv2_spelled`]), so an entity nobody changed is not
 /// reported as modified whichever of them its declaration used.
 pub(super) async fn describe_wafv2_entity(
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -4017,7 +4046,7 @@ pub(super) async fn describe_wafv2_entity(
     let Some((entity, _)) = read_wafv2_entity(ctx, region, resource, calls).await? else {
         return Ok(None);
     };
-    wafv2_byte_match_rewritten(&entity, 0, wafv2_search_string_decoded).map(Some)
+    wafv2_spelled(&entity, 0, Wafv2Spelling::Template).map(Some)
 }
 
 /// One WAFv2 entity as its own `Get…` answers it, with the `LockToken` that read marked its
@@ -4050,13 +4079,14 @@ pub(super) async fn read_wafv2_entity(
 /// to carry ([`tags_of`]) — WAF's `TagList` is `length 1..`, so a resource with no tag at all
 /// carries the member not at all rather than an empty list.
 ///
-/// The one member whose SPELLING differs is a byte-match statement's search value
-/// ([`wafv2_search_string_encoded`]).
+/// The members whose SPELLING differs — a byte-match statement's search value and the ARN a
+/// reference statement names another entity by — are put in the API's spelling on the way
+/// out ([`wafv2_spelled`]).
 pub(super) fn wafv2_create_request(
     resource: &StoredResource,
     propagated: &[(String, String)],
 ) -> Result<Value, Refusal> {
-    let declared = wafv2_byte_match_rewritten(&resource.properties, 0, wafv2_search_string_encoded)?;
+    let declared = wafv2_spelled(&resource.properties, 0, Wafv2Spelling::Wire)?;
     let mut request = declared.as_object().cloned().unwrap_or_default();
     request.insert("Name".to_string(), Value::String(declared_name(resource)));
     let tags = tags_of(&resource.properties, propagated);
@@ -4087,24 +4117,30 @@ pub(super) fn wafv2_entity_key(resource: &StoredResource) -> Value {
     Value::Object(key)
 }
 
-/// The same document with `rewrite` applied to the members of every `ByteMatchStatement` in
-/// it, and everything else — the rules around it, the statements it is nested in — carried
-/// through as it stands.
+/// The same document with every member the two sides spell DIFFERENTLY put in `spelling`'s
+/// spelling, and everything else — the rules around a statement, the statements it is
+/// nested in — carried through as it stands.
 ///
-/// A byte-match statement is the one place a WAFv2 rule tree holds a BLOB
-/// (`ByteMatchStatement$SearchString`, "a string value that you want WAF to search for"),
-/// and a blob travels base64-encoded on the awsJson wire while a template declares the bytes
-/// themselves. Both directions of that one difference are this walk's `rewrite`, so the
-/// request a declaration becomes and the configuration the entity reads back as are spelled
-/// the way each side spells them. The statement's own members carry no further statement, so
-/// a rewritten one is not descended into.
+/// Two members are in that position, and both sit inside a rule's statement tree:
+///
+/// * a byte-match statement's search value, the one place a WAFv2 rule tree holds a BLOB
+///   (`ByteMatchStatement$SearchString`, "a string value that you want WAF to search for"),
+///   which travels base64-encoded on the awsJson wire while a template declares the bytes
+///   themselves ([`wafv2_search_string_encoded`], [`wafv2_search_string_decoded`]);
+/// * the ARN a reference statement names another entity by, which the API declares as `ARN`
+///   and the resource types write as `Arn` ([`wafv2_reference_arn`]).
+///
+/// Both directions of each difference are this walk's business, so the request a declaration
+/// becomes and the configuration the entity reads back as are spelled the way each side
+/// spells them — a rule naming an IP set reaches that API under the member it requires
+/// rather than being refused for a member the call did not carry.
 ///
 /// `depth` is how many levels are already above this one, so the outermost call passes `0`;
 /// a document deeper than [`MAX_PROPERTY_NESTING`] is refused rather than walked.
-pub(super) fn wafv2_byte_match_rewritten(
+pub(super) fn wafv2_spelled(
     value: &Value,
     depth: usize,
-    rewrite: fn(&Map<String, Value>) -> Map<String, Value>,
+    spelling: Wafv2Spelling,
 ) -> Result<Value, Refusal> {
     if depth >= MAX_PROPERTY_NESTING {
         return Err(too_deeply_nested());
@@ -4115,9 +4151,24 @@ pub(super) fn wafv2_byte_match_rewritten(
             for (key, member) in members {
                 let member = match (key.as_str(), member) {
                     (WAFV2_BYTE_MATCH_STATEMENT, Value::Object(statement)) => {
-                        Value::Object(rewrite(statement))
+                        // The statement's own members carry no further statement, so a
+                        // rewritten one is not descended into.
+                        Value::Object(match spelling {
+                            Wafv2Spelling::Wire => wafv2_search_string_encoded(statement),
+                            Wafv2Spelling::Template => wafv2_search_string_decoded(statement),
+                        })
                     }
-                    _ => wafv2_byte_match_rewritten(member, depth + 1, rewrite)?,
+                    (name, Value::Object(statement))
+                        if WAFV2_REFERENCE_STATEMENTS.contains(&name) =>
+                    {
+                        // The ARN member is renamed and the statement's REMAINING members
+                        // (a forwarded-IP configuration, the overrides of a referenced
+                        // group, a field to match) are carried through the same walk, none
+                        // of them being a reference statement itself.
+                        let renamed = Value::Object(wafv2_reference_arn(statement, spelling));
+                        wafv2_spelled(&renamed, depth + 1, spelling)?
+                    }
+                    _ => wafv2_spelled(member, depth + 1, spelling)?,
                 };
                 rewritten.insert(key.clone(), member);
             }
@@ -4126,12 +4177,46 @@ pub(super) fn wafv2_byte_match_rewritten(
         Value::Array(items) => {
             let mut rewritten = Vec::with_capacity(items.len());
             for item in items {
-                rewritten.push(wafv2_byte_match_rewritten(item, depth + 1, rewrite)?);
+                rewritten.push(wafv2_spelled(item, depth + 1, spelling)?);
             }
             Ok(Value::Array(rewritten))
         }
         scalar => Ok(scalar.clone()),
     }
+}
+
+/// One reference statement with the ARN it names another entity by under the member
+/// `spelling`'s side names it.
+///
+/// Towards the API the template's spelling is what is renamed, since the member the call
+/// requires is [`WAFV2_REFERENCE_ARN`]; a document that already carries that member keeps
+/// its value, so a declaration written in the API's own spelling is not rewritten by a
+/// template-spelled one beside it.
+///
+/// Towards a TEMPLATE both spellings are reported, exactly as a byte-match statement's
+/// search value is ([`wafv2_search_string_decoded`]): the drift comparison compares only a
+/// member the declaration itself carries, so an entity nobody changed is not reported as
+/// modified whichever of them its declaration used.
+pub(super) fn wafv2_reference_arn(
+    statement: &Map<String, Value>,
+    spelling: Wafv2Spelling,
+) -> Map<String, Value> {
+    let mut rewritten = statement.clone();
+    match spelling {
+        Wafv2Spelling::Wire => {
+            if let Some(declared) = rewritten.remove(WAFV2_TEMPLATE_REFERENCE_ARN) {
+                if !rewritten.contains_key(WAFV2_REFERENCE_ARN) {
+                    rewritten.insert(WAFV2_REFERENCE_ARN.to_string(), declared);
+                }
+            }
+        }
+        Wafv2Spelling::Template => {
+            if let Some(reported) = rewritten.get(WAFV2_REFERENCE_ARN).cloned() {
+                rewritten.insert(WAFV2_TEMPLATE_REFERENCE_ARN.to_string(), reported);
+            }
+        }
+    }
+    rewritten
 }
 
 /// One byte-match statement as the API takes it: its search value base64-encoded, which is

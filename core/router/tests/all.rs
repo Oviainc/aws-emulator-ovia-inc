@@ -23,16 +23,14 @@ mod cloudformation_fifo_resource_generated_names;
 #[path = "all/apigateway_iam_authenticated_invoke.rs"]
 mod apigateway_iam_authenticated_invoke;
 // Declared here, in this same head region, for the reason the entry above records.
-#[path = "all/cloudformation_rollback_triggers_revert_the_operation.rs"]
-mod cloudformation_rollback_triggers_revert_the_operation;
+#[path = "all/cloudformation_wafv2_protection_stack.rs"]
+mod cloudformation_wafv2_protection_stack;
 // Declared here, in this same head region, for the reason the entry above records: the
 // appended tail and the sorted `r…` span are both regions concurrently landing suites add
 // their line to.
 #[path = "all/rds_s3_snapshot_export_flow.rs"]
 mod rds_s3_snapshot_export_flow;
-// Declared here, in this same head region, for the reason the entry above records: the
 // appended tail and the sorted `d…` span are both regions concurrently landing suites add
-// their line to.
 #[path = "all/directory_data_plane_authorization.rs"]
 mod directory_data_plane_authorization;
 // Declared here, in this same head region, for the reason the entries above record.
@@ -41,12 +39,8 @@ mod directory_data_access_cycle;
 // appended tail and the sorted `k…` span are both regions concurrently landing suites add
 #[path = "all/kinesisvideo_discovered_data_plane.rs"]
 mod kinesisvideo_discovered_data_plane;
-// Declared here, in this same head region, for the reason the entry above records.
-#[path = "all/lambda_sqs_event_source_batching_window.rs"]
-mod lambda_sqs_event_source_batching_window;
 #[path = "all/codebuild_service_role_trust.rs"]
 mod codebuild_service_role_trust;
-// Declared here, in this same head region, for the reason the entry above records.
 #[path = "all/cloudformation_ec2_cdk_vpc_estate.rs"]
 mod cloudformation_ec2_cdk_vpc_estate;
 #[path = "all/greengrass_deployment_iot_job.rs"]
@@ -59,7 +53,6 @@ mod cloudformation_sam_function_writes_its_table;
 // the rule every cross-service suite that stages an S3 object addresses its setup calls by.
 #[path = "all/s3_address_forms.rs"]
 mod s3_address_forms;
-// Declared here, in this same head region, for the reason the entry above records.
 #[path = "all/sns_lambda_subscription_pipeline.rs"]
 mod sns_lambda_subscription_pipeline;
 #[path = "all/cloudformation_refuses_s3vectors_vector_buckets.rs"]
@@ -963,3 +956,7 @@ mod sns_lambda_cdk_subscription_delivery;
 // and the log group the invocation that path makes writes its run to.
 #[path = "all/apigateway_proxy_lambda_ddb_pipeline.rs"]
 mod apigateway_proxy_lambda_ddb_pipeline;
+#[path = "all/cloudformation_rollback_triggers_revert_the_operation.rs"]
+mod cloudformation_rollback_triggers_revert_the_operation;
+#[path = "all/lambda_sqs_event_source_batching_window.rs"]
+mod lambda_sqs_event_source_batching_window;
