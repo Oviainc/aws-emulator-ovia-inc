@@ -2541,11 +2541,12 @@ impl StoredStack {
     ///
     /// `StackResource$ResourceStatus` is the resource's "Current status", so once a deletion
     /// an owning service refused has ended, the resource it refused reports the failed
-    /// delete status and that service's refusal, and one the same walk DID delete reports its
-    /// deletion as complete: the per-resource view and the event stream of one deletion
-    /// cannot disagree about what became of each resource. A record the walk never reached —
-    /// one it stopped before, or one no owning service holds — keeps the status it carried,
-    /// because nothing happened to that resource.
+    /// delete status and that service's refusal, one the same walk DID delete reports its
+    /// deletion as complete, and one whose `DeletionPolicy` kept it — nothing was asked of
+    /// the service that owns it — reports its deletion as skipped: the per-resource view and
+    /// the event stream of one deletion cannot disagree about what became of each resource. A
+    /// record the walk never reached — one it stopped before, or one no owning service holds
+    /// — keeps the status it carried, because nothing happened to that resource.
     ///
     /// A deletion that COMPLETES disposes of every record at once
     /// ([`disposed_resources`]); this is the counterpart for the one that could not.
@@ -2554,28 +2555,25 @@ impl StoredStack {
         transitions: &[provisioning::ResourceTransition],
         at: SystemTime,
     ) {
-        self.record_resource_statuses(transitions, at, |status| {
-            status == resource_status::DELETE_COMPLETE
-                || status == resource_status::DELETE_FAILED
-        });
+        self.record_resource_statuses(transitions, at);
     }
 
-    /// Leave each of the stack's resource records in the status one walk left it in, for the
-    /// transitions `applies` selects.
+    /// Leave each of the stack's resource records in the status one walk left it in, for
+    /// every transition of that walk which ENDED.
     ///
     /// `StackResource$ResourceStatus` is the resource's "Current status", so what a walk did
     /// to a resource is what that resource then reports — the one rule both the deletion
     /// above and the rollback below are an application of, so the two cannot drift about what
-    /// a resource's current status is. A record no selected transition names keeps the status
-    /// it carried, because that walk did not act on it.
+    /// a resource's current status is. A transition still IN PROGRESS is not what became of
+    /// the resource (the walk that opened it is what concludes it), and a record no
+    /// transition names keeps the status it carried, because that walk did not act on it.
     fn record_resource_statuses(
         &mut self,
         transitions: &[provisioning::ResourceTransition],
         at: SystemTime,
-        applies: impl Fn(&str) -> bool,
     ) {
         for transition in transitions {
-            if !applies(&transition.status) {
+            if transition.status.ends_with(IN_PROGRESS_SUFFIX) {
                 continue;
             }
             let Some(deployed) = self
@@ -2604,9 +2602,7 @@ impl StoredStack {
         transitions: &[provisioning::ResourceTransition],
         at: SystemTime,
     ) {
-        self.record_resource_statuses(transitions, at, |status| {
-            !status.ends_with(IN_PROGRESS_SUFFIX)
-        });
+        self.record_resource_statuses(transitions, at);
     }
 
     /// Record that the operation in flight could not be carried out: the stack takes the

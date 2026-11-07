@@ -245,6 +245,8 @@ mod rds_stack_resources;
 mod refusals_name_their_modelled_taxonomy;
 #[path = "all/registry_and_scan_read_members.rs"]
 mod registry_and_scan_read_members;
+#[path = "all/refused_delete_resource_views.rs"]
+mod refused_delete_resource_views;
 #[path = "all/refused_resource_sdk_exception.rs"]
 mod refused_resource_sdk_exception;
 #[path = "all/refused_stack_deletion.rs"]
