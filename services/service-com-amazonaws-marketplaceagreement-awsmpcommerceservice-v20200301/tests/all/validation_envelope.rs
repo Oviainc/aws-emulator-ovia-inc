@@ -47,13 +47,22 @@ const SIGNED_FOR_US_EAST_1: &str = "AWS4-HMAC-SHA256 \
 /// What a `ValidationExceptionField` says about a member that carried a value
 /// the service does not accept, and about one that carried none. Spelled out
 /// here rather than imported, so a change of wording in the service fails this
-/// test instead of silently agreeing with it. The recorded AWS responses for
-/// this service carry the present-but-unacceptable class unpunctuated and the
-/// absent class punctuated.
+/// test instead of silently agreeing with it.
+///
+/// The present-but-unacceptable class is worded by WHAT refused the value: a
+/// constraint the model declares is missed before any handler runs
+/// ([`FIELD_INVALID_CONSTRAINT`]), while a well-formed value a rule of the
+/// service itself does not accept reads unpunctuated.
 const FIELD_INVALID: &str = "Member is invalid";
+/// See [`FIELD_INVALID`]. The class the boundary walk raises for a value that
+/// misses a `@length`, `@range`, `@pattern` or enumerated value set.
+const FIELD_INVALID_CONSTRAINT: &str = "Member is invalid.";
 /// See [`FIELD_INVALID`]. The absent-member class states the requirement the
 /// member is under, not the value it did not carry.
 const FIELD_MISSING: &str = "Member is required.";
+/// See [`FIELD_INVALID`]. The class for a member left out of a request whose
+/// `intent` is what made it required names that conditional rule.
+const FIELD_MISSING_FOR_INTENT: &str = "Member must not be null for the provided intent.";
 
 /// `ValidationException`'s own documentation, which is the message a refusal
 /// states when no `ValidationExceptionReason` value names the member
@@ -141,17 +150,23 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> Answ
 /// Whether the member this row refuses carried a value or carried none.
 #[derive(Debug, Clone, Copy)]
 enum Member {
-    /// A value outside what the service accepts.
+    /// A value that misses a constraint the model declares.
     Invalid,
+    /// A well-formed value a rule of the service itself does not accept.
+    Unacceptable,
     /// Absent from the request.
     Absent,
+    /// Absent from a request whose `intent` is what made the member required.
+    AbsentForIntent,
 }
 
 impl Member {
     fn field_message(self) -> &'static str {
         match self {
-            Self::Invalid => FIELD_INVALID,
+            Self::Invalid => FIELD_INVALID_CONSTRAINT,
+            Self::Unacceptable => FIELD_INVALID,
             Self::Absent => FIELD_MISSING,
+            Self::AbsentForIntent => FIELD_MISSING_FOR_INTENT,
         }
     }
 }
@@ -289,7 +304,7 @@ fn rows() -> Vec<Row> {
             }),
             reason: "INVALID_NEXT_TOKEN",
             field: "nextToken".to_string(),
-            member: Member::Invalid,
+            member: Member::Unacceptable,
             message: "Provided next token is invalid.",
         },
         Row {
@@ -334,7 +349,7 @@ fn rows() -> Vec<Row> {
             request: json!({"sort": {"sortBy": "Sideways"}}),
             reason: "INVALID_SORT_BY",
             field: "sort.sortBy".to_string(),
-            member: Member::Invalid,
+            member: Member::Unacceptable,
             message: "Provided sort by is invalid.",
         },
         Row {
@@ -343,7 +358,7 @@ fn rows() -> Vec<Row> {
             request: json!({"filters": [{"name": "NotARealFilterName", "values": ["x"]}]}),
             reason: "INVALID_FILTER_NAME",
             field: "filters.1.member.name".to_string(),
-            member: Member::Invalid,
+            member: Member::Unacceptable,
             message: "Provided filter name is invalid.",
         },
         Row {
@@ -352,7 +367,7 @@ fn rows() -> Vec<Row> {
             request: json!({"filters": [status_filter(), {"name": "NotARealFilterName", "values": ["x"]}]}),
             reason: "INVALID_FILTER_NAME",
             field: "filters.2.member.name".to_string(),
-            member: Member::Invalid,
+            member: Member::Unacceptable,
             message: "Provided filter name is invalid.",
         },
         Row {
@@ -363,7 +378,7 @@ fn rows() -> Vec<Row> {
             }),
             reason: "INVALID_FILTER_NAME",
             field: "filters.3.member.name".to_string(),
-            member: Member::Invalid,
+            member: Member::Unacceptable,
             message: "Provided filter name is invalid.",
         },
         Row {
@@ -390,7 +405,7 @@ fn rows() -> Vec<Row> {
             request: json!({"filters": [{"name": "PartyType", "values": ["Bystander"]}]}),
             reason: "INVALID_PARTY_TYPE",
             field: "filters.1.member.values.1.member".to_string(),
-            member: Member::Invalid,
+            member: Member::Unacceptable,
             message: "Provided party type is invalid.",
         },
         Row {
@@ -399,7 +414,7 @@ fn rows() -> Vec<Row> {
             request: json!({"filters": [{"name": "AfterEndTime", "values": ["yesterday"]}]}),
             reason: "INVALID_FILTER_VALUES",
             field: "filters.1.member.values.1.member".to_string(),
-            member: Member::Invalid,
+            member: Member::Unacceptable,
             message: "Provided filter values is invalid.",
         },
         Row {
@@ -408,7 +423,7 @@ fn rows() -> Vec<Row> {
             request: json!({"intent": "NEW", "requestedTerms": [{"id": "eula.v1"}]}),
             reason: "MISSING_AGREEMENT_PROPOSAL_IDENTIFIER",
             field: "agreementProposalIdentifier".to_string(),
-            member: Member::Absent,
+            member: Member::AbsentForIntent,
             message: "Agreement proposal identifier is required.",
         },
         Row {
@@ -589,7 +604,7 @@ async fn a_member_no_reason_names_reports_the_modelled_catch_all() {
         answer.body
     );
     assert_eq!(
-        fields[0].1, FIELD_INVALID,
+        fields[0].1, FIELD_INVALID_CONSTRAINT,
         "expected the invalid-member sentence, got {:?}",
         answer.body
     );
@@ -627,7 +642,7 @@ async fn every_offending_member_of_one_request_is_reported() {
         answer
             .fields()
             .iter()
-            .all(|(_, message)| message == FIELD_INVALID),
+            .all(|(_, message)| message == FIELD_INVALID_CONSTRAINT),
         "every entry states the member is invalid, got {:?}",
         answer.body
     );

@@ -189,6 +189,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // alike wherever it was found. The rule each enforces is quoted above
         // it, where a reader of the code needs it.
         //
+        // A member left out that the stated `intent` is what made required is
+        // reported through `crate::state::intent_conditional_member_missing`,
+        // whose field entry states the conditional rule rather than an
+        // unconditional one — the absence is of a member the SAME request would
+        // not have had to carry under another intent.
+        //
         // `agreementProposalIdentifier`: "This parameter is required if the
         // intent is not AMEND" — every other intent has no source agreement to
         // take its terms from.
@@ -196,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             && input.agreement_proposal_identifier.is_none()
         {
             return Err(CreateAgreementRequestErrorModeled::ValidationException(
-                crate::state::validation_exception(
+                crate::state::intent_conditional_member_missing(
                     "MISSING_AGREEMENT_PROPOSAL_IDENTIFIER",
                     "agreementProposalIdentifier",
                 ),
@@ -219,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             None if input.intent != crate::state::INTENT_NEW => {
                 return Err(CreateAgreementRequestErrorModeled::ValidationException(
-                    crate::state::validation_exception(
+                    crate::state::intent_conditional_member_missing(
                         "MISSING_SOURCE_AGREEMENT_IDENTIFIER",
                         "sourceAgreementIdentifier",
                     ),

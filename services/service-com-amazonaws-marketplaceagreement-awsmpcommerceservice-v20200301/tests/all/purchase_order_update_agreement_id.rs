@@ -61,6 +61,9 @@ const MISSING_AGREEMENT_ID: &str = "MISSING_AGREEMENT_ID";
 const MISSING_AGREEMENT_ID_MESSAGE: &str = "Agreement id is required.";
 /// See [`MISSING_AGREEMENT_ID_MESSAGE`].
 const FIELD_MISSING: &str = "Member is required.";
+/// See [`MISSING_AGREEMENT_ID_MESSAGE`]. What the entry states instead about a
+/// member the request left out that the `intent` it stated is what required.
+const FIELD_MISSING_FOR_INTENT: &str = "Member must not be null for the provided intent.";
 
 /// A well-formed `ResourceId` no agreement of the store is ever minted under,
 /// and one no charge of it is: the member is not resolved, so neither is
@@ -462,6 +465,10 @@ struct Absent {
     reason: &'static str,
     field: &'static str,
     message: &'static str,
+    /// The fixed text the entry states: the unconditional requirement
+    /// ([`FIELD_MISSING`]), or the intent-conditional one for a member the
+    /// request's `intent` is what made required.
+    text: &'static str,
 }
 
 /// The absent-member class reads alike wherever it is reported: the sentence
@@ -470,9 +477,10 @@ struct Absent {
 ///
 /// The rows span the depths a member sits at and the operations that refuse one:
 /// a top-level member of a single-resource read, a member the service requires
-/// only for some intents, a member of an element of a list the boundary walk
-/// refuses, and the member this operation requires of its own elements, which is
-/// the one a handler refuses.
+/// only for some intents — whose entry states that conditional requirement
+/// instead ([`FIELD_MISSING_FOR_INTENT`]) — a member of an element of a list the
+/// boundary walk refuses, and the member this operation requires of its own
+/// elements, which is the one a handler refuses.
 #[tokio::test]
 async fn the_absent_member_class_states_the_requirement_whichever_member_it_is_about() {
     let router = emulator();
@@ -484,6 +492,7 @@ async fn the_absent_member_class_states_the_requirement_whichever_member_it_is_a
             reason: "MISSING_AGREEMENT_ID",
             field: "agreementId",
             message: "Agreement id is required.",
+            text: FIELD_MISSING,
         },
         Absent {
             case: "a member required for the intent the request states",
@@ -492,6 +501,7 @@ async fn the_absent_member_class_states_the_requirement_whichever_member_it_is_a
             reason: "MISSING_AGREEMENT_PROPOSAL_IDENTIFIER",
             field: "agreementProposalIdentifier",
             message: "Agreement proposal identifier is required.",
+            text: FIELD_MISSING_FOR_INTENT,
         },
         Absent {
             case: "a member of an element of a list",
@@ -500,6 +510,7 @@ async fn the_absent_member_class_states_the_requirement_whichever_member_it_is_a
             reason: "MISSING_FILTER_NAME",
             field: "filters.1.member.name",
             message: "Filter name is required.",
+            text: FIELD_MISSING,
         },
         Absent {
             case: "the member an update requires of its own elements",
@@ -512,6 +523,7 @@ async fn the_absent_member_class_states_the_requirement_whichever_member_it_is_a
             reason: "MISSING_AGREEMENT_ID",
             field: "purchaseOrders.1.member.agreementId",
             message: "Agreement id is required.",
+            text: FIELD_MISSING,
         },
     ];
 
@@ -549,9 +561,10 @@ async fn the_absent_member_class_states_the_requirement_whichever_member_it_is_a
         );
         assert_eq!(
             answer.str_at("/fields/0/message"),
-            FIELD_MISSING,
-            "case {case:?} ({}): expected the entry to state {FIELD_MISSING:?}, got {:?}",
+            row.text,
+            "case {case:?} ({}): expected the entry to state {:?}, got {:?}",
             row.operation,
+            row.text,
             answer.body
         );
     }

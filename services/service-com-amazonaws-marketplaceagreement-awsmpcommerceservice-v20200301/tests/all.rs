@@ -137,6 +137,8 @@ mod unsettled_store_listings;
 mod unsettled_store_single_agreement_reads;
 #[path = "all/validation_envelope.rs"]
 mod validation_envelope;
+#[path = "all/validation_field_texts.rs"]
+mod validation_field_texts;
 #[path = "all/validation_messages.rs"]
 mod validation_messages;
 #[path = "all/window_token_scopes.rs"]
