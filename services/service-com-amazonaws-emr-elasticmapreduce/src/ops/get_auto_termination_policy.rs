@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAutoTerminationPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAutoTerminationPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAutoTerminationPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the auto-termination policy attached to a cluster, read out of the cluster's
+//! own record: whatever `RunJobFlow$AutoTerminationPolicy` or the last
+//! `PutAutoTerminationPolicy` attached, and nothing once `RemoveAutoTerminationPolicy`
+//! has taken it off. An ATTACHED policy carrying no `IdleTimeout` is still a policy, so
+//! it is reported as the empty structure it was attached as rather than as no policy at
+//! all: the attachment and the members of the attached policy are separate facts. A
+//! cluster the service holds no record for is REFUSED (400 `ValidationException`) rather
+//! than answered with no policy, so a caller can tell "no such cluster" from "this
+//! cluster has no policy". Writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -75,9 +76,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-emr-elasticmapreduce.js
 // here — hence the `GetAutoTerminationPolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.emr#GetAutoTerminationPolicy")]
+// `InternalServerException` is widened in through `extra_errors`: this SERVICE models it
+// ("This exception occurs when there is an internal failure in the Amazon EMR service.")
+// and `DescribeCluster` declares it, but this operation's own `errors` list is empty —
+// so without the widening an unreachable shared store would have no modelled failure to
+// answer with.
+#[smithy_macros::operation_error(
+    "com.amazonaws.emr#GetAutoTerminationPolicy",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetAutoTerminationPolicyErrorModeled {
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -131,18 +141,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAutoTerminationPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAutoTerminationPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAutoTerminationPolicy"))
+        let _ = ctx;
+
+        // The SHAPE of the cluster id is settled BEFORE any cluster is resolved: a value
+        // carrying characters no cluster id is drawn from names no cluster the service
+        // could hold, so it is refused as a bad REQUEST — naming the member the caller
+        // has to fix — rather than looked up. This operation models no client error, so
+        // both refusals travel the 400 `ValidationException` channel and the SENTENCE is
+        // what tells them apart.
+        if !crate::state::is_cluster_id_shaped(&input.cluster_id) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::malformed_cluster_id_message(&input.cluster_id),
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetAutoTerminationPolicyErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the EMR cluster store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let store = state.lock();
+
+        // Reporting only: this reads the cluster record and changes nothing, so the store
+        // is taken as a plain read and no clock-owed transition is materialised (an
+        // attached policy does not depend on the cluster's state).
+        let Some(cluster) = store.clusters.get(&input.cluster_id) else {
+            // This operation models no client error, so an unknown cluster is refused
+            // through the 400 `ValidationException` channel.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::unknown_cluster_message(&input.cluster_id),
+            ));
+        };
+
+        // Exactly what is attached: absent when nothing was ever attached, and the
+        // attached structure otherwise — including one carrying no `IdleTimeout`, which is
+        // an attached policy rather than the absence of one.
+        Ok(GetAutoTerminationPolicyOutput {
+            auto_termination_policy: cluster.auto_termination_policy.clone(),
+        })
     }
 }

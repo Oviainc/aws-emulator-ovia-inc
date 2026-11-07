@@ -561,6 +561,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             monitoring_configuration: input.monitoring_configuration,
             instances,
             managed_scaling_policy: input.managed_scaling_policy,
+            // "An auto-termination policy for an Amazon EMR cluster."
+            // (RunJobFlow$AutoTerminationPolicy doc.) A policy attached at creation is
+            // the same attachment `PutAutoTerminationPolicy` makes, so it is persisted
+            // on the record `GetAutoTerminationPolicy` reads.
+            auto_termination_policy: input.auto_termination_policy,
             tags: input.tags.unwrap_or_default(),
             status: ClusterStatusRecord {
                 // A new cluster is not up yet; the clock owes it the move to RUNNING,

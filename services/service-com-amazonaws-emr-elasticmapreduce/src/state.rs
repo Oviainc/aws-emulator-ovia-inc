@@ -25,7 +25,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Application, AutoScalingPolicy, AutoScalingPolicyDescription, AutoScalingPolicyStatus,
-    BlockPublicAccessConfiguration, BlockPublicAccessConfigurationMetadata, BootstrapActionConfig,
+    AutoTerminationPolicy, BlockPublicAccessConfiguration, BlockPublicAccessConfigurationMetadata,
+    BootstrapActionConfig,
     Cluster, ClusterStateChangeReason, ClusterStatus, ClusterSummary, ClusterTimeline,
     Configuration, EbsBlockDevice, EbsConfiguration, Ec2InstanceAttributes, HadoopStepConfig,
     InstanceFleet, InstanceFleetConfig, InstanceFleetStateChangeReason, InstanceFleetStatus,
@@ -2793,6 +2794,15 @@ pub struct ClusterRecord {
     /// `PutManagedScalingPolicy`, and `None` once `RemoveManagedScalingPolicy` has taken
     /// it off. `GetManagedScalingPolicy` reports exactly this.
     pub managed_scaling_policy: Option<ManagedScalingPolicy>,
+    /// The auto-termination policy attached to this cluster, by `RunJobFlow` or by
+    /// `PutAutoTerminationPolicy`, and `None` once `RemoveAutoTerminationPolicy` has
+    /// taken it off. `GetAutoTerminationPolicy` reports exactly this.
+    ///
+    /// The OPTION is the attachment and the structure inside it is the policy, so a
+    /// policy that carries no `IdleTimeout` is still an attached policy and stays
+    /// distinguishable from no policy at all: whatever a request submitted is what a
+    /// later read reports.
+    pub auto_termination_policy: Option<AutoTerminationPolicy>,
     pub tags: Vec<Tag>,
     pub status: ClusterStatusRecord,
     /// Steps in submission order. `ListSteps` reverses this.
