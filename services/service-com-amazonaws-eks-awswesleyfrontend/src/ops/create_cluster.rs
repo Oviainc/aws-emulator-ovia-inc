@@ -605,7 +605,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = (region.clone(), input.name.clone());
         // The store's own refusals and the write, under ONE lock — which is released
         // before anything is asked of another service.
-        let mut cluster = {
+        let (mut cluster, log_export) = {
             let mut guard = store.lock();
             guard.materialize_due_transitions(now);
 
@@ -674,9 +674,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             let cluster = record.to_created_cluster();
+            // What this cluster's control plane exports to CloudWatch Logs, read off the
+            // record while the lock is held; the export itself runs below, with none.
+            let log_export = state::ControlPlaneLogExport::of(&record, input.logging.as_ref());
             guard.arn_index.insert(arn, key.clone());
             guard.clusters.insert(key.clone(), record);
-            cluster
+            (cluster, log_export)
         };
 
         // Creating a cluster provisions ONE security group of its own, in the VPC the
@@ -711,6 +714,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
             }
+        }
+
+        // A log type this create enabled exports its control plane logs to CloudWatch Logs
+        // (`LogSetup$enabled`), from the moment Amazon EKS provisions the control plane,
+        // so the cluster's log group and the stream of each enabled type are provisioned
+        // here, beside the cluster's other managed resources. A create that enables no
+        // type provisions none, which is what `ControlPlaneLogExport::of` answers `None`
+        // for.
+        if let Some(export) = log_export.as_ref() {
+            state::export_control_plane_logs(ctx, &region, export).await;
         }
 
         Ok(CreateClusterOutput {

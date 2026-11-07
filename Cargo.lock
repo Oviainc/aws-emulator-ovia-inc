@@ -11001,6 +11001,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-cloudwatchlogs",
  "aws-sdk-ec2",
  "aws-sdk-iam",
  "aws-smithy-runtime-api",

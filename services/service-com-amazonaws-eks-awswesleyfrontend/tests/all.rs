@@ -83,6 +83,8 @@ mod cluster_versions;
 mod connected_cluster_gate;
 #[path = "all/connected_clusters.rs"]
 mod connected_clusters;
+#[path = "all/control_plane_log_export.rs"]
+mod control_plane_log_export;
 #[path = "all/eks_anywhere_subscriptions.rs"]
 mod eks_anywhere_subscriptions;
 #[path = "all/encryption_config_association.rs"]

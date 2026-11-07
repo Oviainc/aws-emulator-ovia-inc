@@ -677,6 +677,12 @@ mod eks_cluster_security_group;
 // puts its line in.
 #[path = "all/eks_wrapped_peer_refusals.rs"]
 mod eks_wrapped_peer_refusals;
+// Declared HERE, beside the sibling suites above in the same quiet `n`/`o` gap, for the
+// reason those entries record: the appended tail at the end of this file and the `e…` span
+// beside the other `eks_*` suites are both regions every concurrently landing router suite
+// puts its line in.
+#[path = "all/eks_control_plane_logs.rs"]
+mod eks_control_plane_logs;
 // Declared HERE, in this same quiet `n`/`o` gap rather than in the appended tail at the end
 // of this file or beside the sibling `logs_emf_*` suite in it: both of those are where every
 // concurrently landing router suite puts its line.

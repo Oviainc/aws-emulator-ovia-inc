@@ -294,133 +294,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let now = SystemTime::now();
-        let mut guard = store.lock();
-        guard.materialize_due_transitions(now);
-
         // A cluster name identifies a cluster only within one region, so the record this
-        // updates is the one in the region the request is signed for. The cluster is
-        // resolved BEFORE the request body is judged against it: `name` is the
-        // `@httpLabel` that names the resource being acted on, so a call against a
-        // cluster this region does not hold is a 404, whatever the body asks for.
+        // updates is the one in the region the request is signed for.
         let key = (region.clone(), cluster_name.clone());
-        let Some(record) = guard.clusters.get(&key) else {
-            return Err(
-                UpdateClusterConfigErrorModeled::ResourceNotFoundException(
-                    crate::state::cluster_not_found(&cluster_name),
-                )
-                .into(),
-            );
+        // Every refusal this operation reads off the store, and the write that starts the
+        // update, under ONE lock — which is given up before the control plane logs are
+        // exported, because that is a call out to another service.
+        let (answer, export) = {
+            let mut guard = store.lock();
+            guard.materialize_due_transitions(now);
+
+            // The cluster is resolved BEFORE the request body is judged against it:
+            // `name` is the `@httpLabel` that names the resource being acted on, so a
+            // call against a cluster this region does not hold is a 404, whatever the
+            // body asks for.
+            let Some(record) = guard.clusters.get(&key) else {
+                return Err(
+                    UpdateClusterConfigErrorModeled::ResourceNotFoundException(
+                        crate::state::cluster_not_found(&cluster_name),
+                    )
+                    .into(),
+                );
+            };
+
+            // `clientRequestToken` is `@idempotencyToken`: an SDK generates it once per
+            // call and RESENDS the same value when it retries, so a retry of the call
+            // that started an update is answered with THAT update rather than starting a
+            // second one. A blank token identifies nothing, so it never matches, and only
+            // an update THIS operation minted can be a retry of this call: the same token
+            // on an update of another operation's type is a reused token, not a retry.
+            let replayed_token = input
+                .client_request_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|token| !token.is_empty());
+            let replayed_update = replayed_token
+                .and_then(|token| record.update_for_token(token))
+                .filter(|update| is_cluster_config_update_type(&update.r#type));
+            if let Some(update) = replayed_update {
+                return Ok(UpdateClusterConfigOutput {
+                    update: Some(update.to_update()),
+                });
+            }
+
+            // One update at a time per cluster: while another is running the cluster is in
+            // use, which is exactly what `ResourceInUseException` reports, worded by
+            // [`crate::state::update_in_progress`] for the update type this call would
+            // have minted. A body this operation would go on to refuse names no category
+            // of change, so it is reported as the generic cluster configuration update.
+            if let Some(in_flight) = record.in_flight_update() {
+                let attempted = requested_change(&input, record)
+                    .map(|change| change.update_type)
+                    .unwrap_or(UPDATE_TYPE_CONFIG);
+                return Err(
+                    UpdateClusterConfigErrorModeled::ResourceInUseException(
+                        crate::state::update_in_progress(attempted, &cluster_name, in_flight),
+                    )
+                    .into(),
+                );
+            }
+
+            // Every member this operation changes belongs to an Amazon EKS control plane:
+            // a cluster `RegisterCluster` connected has none — it reports a
+            // `connectorConfig` and nothing else — so this operation does not apply to it
+            // at all. That is a PERMANENT fact about the cluster, which is why it is
+            // `ClientException` and not `InvalidRequestException` ("the request is invalid
+            // given the STATE of the cluster"): a client reads the state refusal as
+            // transient and waits for a status that will never come. It precedes the
+            // status gate below for the same reason.
+            if record.is_connected() {
+                return Err(
+                    UpdateClusterConfigErrorModeled::ClientException(
+                        crate::state::connected_cluster_refusal(&cluster_name),
+                    )
+                    .into(),
+                );
+            }
+
+            // An update can only be started on a cluster that is running: one still being
+            // created, or being deleted, or that failed, cannot take one.
+            if record.status != STATUS_ACTIVE {
+                return Err(invalid_request(
+                    &cluster_name,
+                    format!(
+                        "Cluster {cluster_name} is in {} status; it must be {STATUS_ACTIVE} to \
+                         update its configuration",
+                        record.status
+                    ),
+                ));
+            }
+
+            // And then the change itself, read against the cluster it applies to: the
+            // members the request carried decide the update's type and parameters, and the
+            // values it asks for are merged onto what the cluster already reports.
+            let change = requested_change(&input, record)
+                .map_err(|message| invalid_parameter(&cluster_name, message))?;
+
+            let sequence = guard.next_update_sequence();
+            let update = UpdateRecord {
+                id: state::new_update_id(sequence),
+                r#type: change.update_type.to_string(),
+                status: UPDATE_IN_PROGRESS.to_string(),
+                created_at: now,
+                params: change.params,
+                client_request_token: replayed_token.map(str::to_owned),
+                succeeds_at: Some(now + UPDATE_COMPLETION_DELAY),
+                pending_config: Some(change.pending),
+                // "This field is present only if any cancellation is attempted for the
+                // update": none has been, so `CancelUpdate` is the only writer of either.
+                cancellation: None,
+                cancellation_request_token: None,
+                // A configuration change is a change to the cluster's own control
+                // plane, not to a resource inside it.
+                scope: UpdateScope::Cluster,
+            };
+            let answer = update.to_update();
+
+            let record = guard.clusters.get_mut(&key).ok_or_else(|| {
+                UpdateClusterConfigError::from(UpdateClusterConfigErrorModeled::ServerException(
+                    ServerException {
+                        cluster_name: Some(cluster_name.clone()),
+                        message: Some(
+                            "the cluster record disappeared while updating it".to_string(),
+                        ),
+                        ..Default::default()
+                    },
+                ))
+            })?;
+            // The cluster is under an update until the clock completes it, and the
+            // configuration it reports changes only then — the update is asynchronous, so
+            // the new values are not visible on the cluster the instant they are
+            // requested. The update joins the cluster's history through
+            // [`ClusterRecord::record_update`], which keeps that history bounded: this
+            // operation can be called again for every change a caller makes.
+            record.status = STATUS_UPDATING.to_string();
+            record.record_update(update);
+            // What the control plane log export needs off the cluster, read while the lock
+            // is still held.
+            let export = state::ControlPlaneLogExport::of(record, input.logging.as_ref());
+            (answer, export)
         };
 
-        // `clientRequestToken` is `@idempotencyToken`: an SDK generates it once per call
-        // and RESENDS the same value when it retries, so a retry of the call that started
-        // an update is answered with THAT update rather than starting a second one. A
-        // blank token identifies nothing, so it never matches, and only an update THIS
-        // operation minted can be a retry of this call: the same token on an update of
-        // another operation's type is a reused token, not a retry.
-        let replayed_token = input
-            .client_request_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|token| !token.is_empty());
-        let replayed_update = replayed_token
-            .and_then(|token| record.update_for_token(token))
-            .filter(|update| is_cluster_config_update_type(&update.r#type));
-        if let Some(update) = replayed_update {
-            return Ok(UpdateClusterConfigOutput {
-                update: Some(update.to_update()),
-            });
+        // A log type this request enabled exports its control plane logs to CloudWatch
+        // Logs (`LogSetup$enabled`), so turning one on is what makes those logs appear:
+        // the cluster's log group and the stream of each enabled type are provisioned
+        // here rather than only recorded on the cluster. A request that enables no type
+        // provisions none, which is what `ControlPlaneLogExport::of` answers `None` for.
+        if let Some(export) = export.as_ref() {
+            state::export_control_plane_logs(ctx, &region, export).await;
         }
-
-        // One update at a time per cluster: while another is running the cluster is in
-        // use, which is exactly what `ResourceInUseException` reports, worded by
-        // [`crate::state::update_in_progress`] for the update type this call would have
-        // minted. A body this operation would go on to refuse names no category of
-        // change, so it is reported as the generic cluster configuration update.
-        if let Some(in_flight) = record.in_flight_update() {
-            let attempted = requested_change(&input, record)
-                .map(|change| change.update_type)
-                .unwrap_or(UPDATE_TYPE_CONFIG);
-            return Err(
-                UpdateClusterConfigErrorModeled::ResourceInUseException(
-                    crate::state::update_in_progress(attempted, &cluster_name, in_flight),
-                )
-                .into(),
-            );
-        }
-
-        // Every member this operation changes belongs to an Amazon EKS control plane:
-        // a cluster `RegisterCluster` connected has none — it reports a `connectorConfig`
-        // and nothing else — so this operation does not apply to it at all. That is a
-        // PERMANENT fact about the cluster, which is why it is `ClientException` and not
-        // `InvalidRequestException` ("the request is invalid given the STATE of the
-        // cluster"): a client reads the state refusal as transient and waits for a status
-        // that will never come. It precedes the status gate below for the same reason.
-        if record.is_connected() {
-            return Err(
-                UpdateClusterConfigErrorModeled::ClientException(
-                    crate::state::connected_cluster_refusal(&cluster_name),
-                )
-                .into(),
-            );
-        }
-
-        // An update can only be started on a cluster that is running: one still being
-        // created, or being deleted, or that failed, cannot take one.
-        if record.status != STATUS_ACTIVE {
-            return Err(invalid_request(
-                &cluster_name,
-                format!(
-                    "Cluster {cluster_name} is in {} status; it must be {STATUS_ACTIVE} to update \
-                     its configuration",
-                    record.status
-                ),
-            ));
-        }
-
-        // And then the change itself, read against the cluster it applies to: the members
-        // the request carried decide the update's type and parameters, and the values it
-        // asks for are merged onto what the cluster already reports.
-        let change = requested_change(&input, record)
-            .map_err(|message| invalid_parameter(&cluster_name, message))?;
-
-        let sequence = guard.next_update_sequence();
-        let update = UpdateRecord {
-            id: state::new_update_id(sequence),
-            r#type: change.update_type.to_string(),
-            status: UPDATE_IN_PROGRESS.to_string(),
-            created_at: now,
-            params: change.params,
-            client_request_token: replayed_token.map(str::to_owned),
-            succeeds_at: Some(now + UPDATE_COMPLETION_DELAY),
-            pending_config: Some(change.pending),
-            // "This field is present only if any cancellation is attempted for the
-            // update": none has been, so `CancelUpdate` is the only writer of either.
-            cancellation: None,
-            cancellation_request_token: None,
-            // A configuration change is a change to the cluster's own control
-            // plane, not to a resource inside it.
-            scope: UpdateScope::Cluster,
-        };
-        let answer = update.to_update();
-
-        let record = guard.clusters.get_mut(&key).ok_or_else(|| {
-            UpdateClusterConfigError::from(UpdateClusterConfigErrorModeled::ServerException(
-                ServerException {
-                    cluster_name: Some(cluster_name.clone()),
-                    message: Some("the cluster record disappeared while updating it".to_string()),
-                    ..Default::default()
-                },
-            ))
-        })?;
-        // The cluster is under an update until the clock completes it, and the
-        // configuration it reports changes only then — the update is asynchronous, so the
-        // new values are not visible on the cluster the instant they are requested. The
-        // update joins the cluster's history through
-        // [`ClusterRecord::record_update`], which keeps that history bounded: this
-        // operation can be called again for every change a caller makes.
-        record.status = STATUS_UPDATING.to_string();
-        record.record_update(update);
 
         Ok(UpdateClusterConfigOutput {
             update: Some(answer),

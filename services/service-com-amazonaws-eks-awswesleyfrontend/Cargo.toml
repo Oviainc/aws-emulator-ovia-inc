@@ -35,6 +35,11 @@ aws-sdk-iam = { version = "1", default-features = false }
 # `CreateNodegroup` resolve the subnets they are given with `DescribeSubnets`
 # before they provision anything, because the account's subnets are EC2's.
 aws-sdk-ec2 = { version = "1", default-features = false }
+# The AWS SDK for CloudWatch Logs, over the same callback: a cluster whose
+# `logging` enables a control plane log type exports that type's logs to the
+# cluster's own log group, which is CloudWatch Logs' resource to create and write
+# (`src/state/control_plane_logs.rs`).
+aws-sdk-cloudwatchlogs = { version = "1", default-features = false }
 # `iam_trust_policy`: the one reading of an IAM trust policy — including the
 # decode of the URL-encoded form IAM reports a document in — shared with every
 # other service that resolves a caller-supplied role.

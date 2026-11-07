@@ -17,22 +17,13 @@ use super::*;
 /// is not reported at all, so a cluster whose request enabled nothing reports one
 /// entry carrying every type, disabled.
 ///
-/// A type is enabled when ANY requested entry that enables logging names it,
-/// which is also why a type named twice, or named in both an enabled and a
-/// disabled entry, still reports once.
+/// Which types are enabled is read by [`enabled_log_types`], the same reading the
+/// CloudWatch Logs export is driven from: a type is enabled when ANY requested
+/// entry that enables logging names it, which is also why a type named twice, or
+/// named in both an enabled and a disabled entry, still reports once.
 pub fn reported_logging(requested: Option<&Logging>) -> Logging {
-    let requested_setups = requested
-        .and_then(|logging| logging.cluster_logging.as_deref())
-        .unwrap_or_default();
-    let is_enabled = |log_type: &String| {
-        requested_setups.iter().any(|setup| {
-            setup.enabled.unwrap_or(false)
-                && setup
-                    .types
-                    .as_deref()
-                    .is_some_and(|types| types.contains(log_type))
-        })
-    };
+    let enabled_types = enabled_log_types(requested);
+    let is_enabled = |log_type: &String| enabled_types.contains(&log_type.as_str());
     let (enabled, disabled): (Vec<String>, Vec<String>) = LOG_TYPE_VALUES
         .iter()
         .map(|log_type| (*log_type).to_string())
