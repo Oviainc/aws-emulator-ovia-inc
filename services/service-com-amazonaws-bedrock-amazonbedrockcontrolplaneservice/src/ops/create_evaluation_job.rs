@@ -8,7 +8,10 @@
 //! decided by the `iam:PassRole` step for that role BEFORE anything it names is read
 //! ([`crate::state::job_pass_role_denial`], the one decision every job-creating operation
 //! of this service makes): a role the caller may not pass is the modelled
-//! `AccessDeniedException`, and such a refusal writes no job at all.
+//! `AccessDeniedException`, and such a refusal writes no job at all. The role is taken on
+//! FOR the job this create mints, so that job's ARN is minted first and handed to the
+//! decision as the `aws:SourceArn` the assume carries — a trust policy narrowed to the
+//! evaluation-job family is decided against it.
 //!
 //! Where that decision admits the pass, this mints one evaluation job in the store and
 //! answers its `jobArn`. The job is accepted and
@@ -197,25 +200,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx.parts());
 
-        // The `iam:PassRole` step for `roleArn`, ahead of the store and ahead of every
-        // resource this request names: the role is the one Amazon Bedrock takes on to run
-        // the evaluation and write its output, so whether this caller may pass it is
-        // settled before the configuration is read — a denied pass is an authorization
-        // refusal rather than a report about the request's contents — and it leaves no job
-        // behind. The decision is the one every job-creating operation of this service
-        // makes (`crate::state::job_pass_role_denial`), grounded in what this account's IAM
-        // answers about the role.
-        if let Some(denial) =
-            crate::state::job_pass_role_denial(ctx, &region, &input.role_arn).await
-        {
-            return Err(CreateEvaluationJobErrorModeled::AccessDeniedException(
-                AccessDeniedException {
-                    message: Some(denial),
-                },
-            )
-            .into());
-        }
-
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateEvaluationJobErrorModeled::InternalServerException(
                 InternalServerException {
@@ -225,6 +209,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let now = ::std::time::SystemTime::now();
+
+        // The ARN of the job this create mints, fixed BEFORE the pass below is decided
+        // because it is one of the values that pass carries: Amazon Bedrock takes the role on
+        // FOR this job, so the job's ARN is the `aws:SourceArn` of the assume
+        // (`crate::state::job_pass_role_denial`). It is spelled out of the Region and a fresh
+        // id alone (`EvaluationJobArn`: `…:evaluation-job/[a-z0-9]{12}`), so nothing the
+        // request names has to be resolved to know it, and the store is reached for the id
+        // and released again immediately — no guard is held across the authorization call. A
+        // create any later step refuses leaves this id unused, which is the one id the next
+        // create does not carry; it writes no job and nothing else.
+        let arn = {
+            let mut store = state.lock();
+            let job_id = store.mint_evaluation_job_id(now);
+            crate::state::evaluation_job_arn(&region, &job_id)
+        };
+
+        // The `iam:PassRole` step for `roleArn`, ahead of the store and ahead of every
+        // resource this request names: the role is the one Amazon Bedrock takes on to run
+        // the evaluation and write its output, so whether this caller may pass it is
+        // settled before the configuration is read — a denied pass is an authorization
+        // refusal rather than a report about the request's contents — and it leaves no job
+        // behind. The decision is the one every job-creating operation of this service
+        // makes (`crate::state::job_pass_role_denial`), grounded in what this account's IAM
+        // answers about the role.
+        if let Some(denial) =
+            crate::state::job_pass_role_denial(ctx, &region, &input.role_arn, Some(&arn)).await
+        {
+            return Err(CreateEvaluationJobErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(denial),
+                },
+            )
+            .into());
+        }
 
         // `TooManyTagsException` is not among this operation's modelled errors, so the
         // per-resource tag bound is refused with the modelled `ValidationException`
@@ -320,8 +338,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let job_id = store.mint_evaluation_job_id(now);
-        let arn = crate::state::evaluation_job_arn(&region, &job_id);
         let job = crate::state::EvaluationJobRecord {
             arn: arn.clone(),
             name: input.job_name,

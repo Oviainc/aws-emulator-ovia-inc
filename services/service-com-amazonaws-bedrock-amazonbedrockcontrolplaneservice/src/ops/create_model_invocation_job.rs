@@ -6,7 +6,11 @@
 //! `iam:PassRole` step for that role BEFORE anything it names is resolved
 //! ([`crate::state::job_pass_role_denial`], the one decision every job-creating operation
 //! of this service makes): a role the caller may not pass is the modelled
-//! `AccessDeniedException`, and such a refusal writes no job at all.
+//! `AccessDeniedException`, and such a refusal writes no job at all. The role is taken on
+//! FOR the job this submission mints, so that job's ARN is minted first and handed to the
+//! decision as the `aws:SourceArn` the assume carries — the batch-inference service role
+//! AWS documents narrows its trust to exactly that job family, and the clause is decided
+//! against the ARN of the job being submitted.
 //!
 //! Where that decision admits the pass, the job is minted `Submitted` — "this job has been
 //! submitted to a queue for validation" — and the submission arms the whole clock the job
@@ -214,25 +218,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx.parts());
 
-        // The `iam:PassRole` step for `roleArn`, ahead of the store and ahead of every
-        // resource this request names: the role is the one Amazon Bedrock takes on to carry
-        // out and manage the batch inference, so whether this caller may pass it is settled
-        // before `modelId` is resolved — a denied pass is an authorization refusal rather
-        // than a report about a model — and it leaves no job behind. The decision is the
-        // one every job-creating operation of this service makes
-        // (`crate::state::job_pass_role_denial`), grounded in what this account's IAM
-        // answers about the role.
-        if let Some(denial) =
-            crate::state::job_pass_role_denial(ctx, &region, &input.role_arn).await
-        {
-            return Err(CreateModelInvocationJobErrorModeled::AccessDeniedException(
-                AccessDeniedException {
-                    message: Some(denial),
-                },
-            )
-            .into());
-        }
-
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateModelInvocationJobErrorModeled::InternalServerException(
                 InternalServerException {
@@ -244,6 +229,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let now = ::std::time::SystemTime::now();
+
+        // The ARN of the job this submission mints, fixed BEFORE the pass below is decided
+        // because it is one of the values that pass carries: Amazon Bedrock takes the role on
+        // FOR this job, so the job's ARN is the `aws:SourceArn` of the assume
+        // (`crate::state::job_pass_role_denial`). It is spelled out of the Region and a fresh
+        // id alone (`ModelInvocationJobArn`:
+        // `…:model-invocation-job/[a-z0-9]{12}`), so nothing the request names has to be
+        // resolved to know it, and the store is reached for the id and released again
+        // immediately — no guard is held across the authorization call. A submission the pass
+        // refuses leaves this id unused, which is the one id the next submission does not
+        // carry; it writes no job and nothing else.
+        let arn = {
+            let mut store = state.lock();
+            let job_id = store.mint_model_invocation_job_id(now);
+            crate::state::model_invocation_job_arn(&region, &job_id)
+        };
+
+        // The `iam:PassRole` step for `roleArn`, ahead of the store and ahead of every
+        // resource this request names: the role is the one Amazon Bedrock takes on to carry
+        // out and manage the batch inference, so whether this caller may pass it is settled
+        // before `modelId` is resolved — a denied pass is an authorization refusal rather
+        // than a report about a model — and it leaves no job behind. The decision is the
+        // one every job-creating operation of this service makes
+        // (`crate::state::job_pass_role_denial`), grounded in what this account's IAM
+        // answers about the role.
+        if let Some(denial) =
+            crate::state::job_pass_role_denial(ctx, &region, &input.role_arn, Some(&arn)).await
+        {
+            return Err(CreateModelInvocationJobErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(denial),
+                },
+            )
+            .into());
+        }
 
         // The invocation endpoint the job runs against: one of the modelled enum's values,
         // resolved rather than kept as whatever text arrived.
@@ -359,8 +379,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .await;
 
         let mut store = state.lock();
-        let job_id = store.mint_model_invocation_job_id(now);
-        let arn = crate::state::model_invocation_job_arn(&region, &job_id);
         let clock = crate::state::ModelInvocationJobClock::armed_at(now);
         // What the validation step established about the input decides BOTH the records the
         // job runs over and the lifecycle it is owed: a job whose input the object store

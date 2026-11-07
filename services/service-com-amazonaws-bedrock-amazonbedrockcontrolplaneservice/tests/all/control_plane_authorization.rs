@@ -69,10 +69,10 @@ const PASS_ROLE_REFUSAL: &str = "Cross-account pass role is not allowed.";
 
 /// The service principal a job role's trust policy has to grant the assume to: this
 /// service's own `awsService$cloudTrailEventSource`.
-const SERVICE_PRINCIPAL: &str = "bedrock.amazonaws.com";
+pub(crate) const SERVICE_PRINCIPAL: &str = "bedrock.amazonaws.com";
 
 /// The role a job create hands Amazon Bedrock, as IAM holds it.
-const JOB_ROLE: &str = "BedrockJobExecution";
+pub(crate) const JOB_ROLE: &str = "BedrockJobExecution";
 
 /// The resource a refusal of a request that addresses no resource of this service is
 /// judged against, as IAM writes it for such a request — the sentence states no resource
@@ -134,7 +134,7 @@ fn job_name(prefix: &str, suffix: &str) -> String {
 /// (`smithy_query(query="operation",operation="CreateModelInvocationJob")`), and the ARN
 /// spelling is what proves the action is judged against the JOB collection rather than
 /// against the model the job runs.
-fn invocation_job_body(name: &str, role_arn: &str) -> Value {
+pub(crate) fn invocation_job_body(name: &str, role_arn: &str) -> Value {
     invocation_job_body_for(name, role_arn, CATALOG[0].model_id)
 }
 
@@ -150,7 +150,7 @@ fn invocation_job_body_for(name: &str, role_arn: &str, model_id: &str) -> Value 
 }
 
 /// A `CreateEvaluationJob` body carrying only the members the model marks required.
-fn evaluation_job_body(name: &str, role_arn: &str) -> Value {
+pub(crate) fn evaluation_job_body(name: &str, role_arn: &str) -> Value {
     json!({
         "jobName": name,
         "roleArn": role_arn,
@@ -316,7 +316,7 @@ async fn fixture(emu: &Emulator) -> (String, String) {
 
 /// Record a role IAM holds under `name`, carrying `trust` as its trust policy — what
 /// `iam:CreateRole` records.
-fn given_role(engine: &Arc<engine::InMemoryEngine>, name: &str, trust: Option<&Value>) {
+pub(crate) fn given_role(engine: &Arc<engine::InMemoryEngine>, name: &str, trust: Option<&Value>) {
     let store = iam::service_state(&**engine).expect("the IAM store");
     store.lock().roles.insert(
         iam::name_key(name),
@@ -339,7 +339,7 @@ fn given_role(engine: &Arc<engine::InMemoryEngine>, name: &str, trust: Option<&V
 
 /// A trust policy granting `SERVICE_PRINCIPAL` the assume, optionally narrowed by
 /// `condition`.
-fn trust(condition: Option<Value>) -> Value {
+pub(crate) fn trust(condition: Option<Value>) -> Value {
     let mut statement = json!({
         "Effect": "Allow",
         "Principal": { "Service": SERVICE_PRINCIPAL },
@@ -821,10 +821,28 @@ async fn a_job_create_decides_the_pass_of_the_role_it_hands_bedrock() {
             admitted: true,
         },
         Pass {
-            case: "a trust narrowed by a key the pass carries no value for",
+            // The pass carries the ARN of the job being created as `aws:SourceArn`, so a
+            // grant narrowed to this account's Bedrock resources in this Region covers
+            // either job create.
+            case: "a trust narrowed by the source ARN of this account's jobs",
+            trust_policy: Some(trust(Some(json!({
+                "StringEquals": { "aws:SourceAccount": ACCOUNT },
+                "ArnLike": {
+                    "aws:SourceArn": format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:*"),
+                },
+            })))),
+            role_arn: held.clone(),
+            admitted: true,
+        },
+        Pass {
+            // The same key, narrowed to a job family NEITHER create mints: the clause is
+            // decided and does not hold. Which family each create's source ARN names, and
+            // the family-by-family table, is `crate::job_pass_role_source_arn`.
+            case: "a trust narrowed to another job family",
             trust_policy: Some(trust(Some(json!({
                 "ArnEquals": {
-                    "aws:SourceArn": format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:evaluation-job/*"),
+                    "aws:SourceArn":
+                        format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:model-customization-job/*"),
                 },
             })))),
             role_arn: held.clone(),

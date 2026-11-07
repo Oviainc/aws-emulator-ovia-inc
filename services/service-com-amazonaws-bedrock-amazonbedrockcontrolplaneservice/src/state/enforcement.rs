@@ -328,17 +328,27 @@ pub async fn pass_role_denial(
 /// * this account's IAM has to HOLD that role; and
 /// * the trust policy the role carries has to grant [`BEDROCK_SERVICE_PRINCIPAL`] the
 ///   `sts:AssumeRole` this pass would make. A statement's `Condition` is part of its grant,
-///   so a grant this pass cannot be shown to satisfy is not one: the pass carries the
-///   account whose request Amazon Bedrock would be acting for
-///   ([`SOURCE_ACCOUNT_CONDITION_KEY`]) and nothing else — the job the role would be assumed
-///   for does not exist while its own creation is still being authorized, so its ARN is no
-///   value of this request — and a clause over any other key leaves the statement undecided,
-///   which IAM never reads as a grant. RECORDED, not derived from the documentation: the
-///   corpus records this operation REFUSING a pass of exactly that shape — a role of the
-///   caller's own account, trusted to this service, whose grant is narrowed to the ARN of
-///   the very job the call would create — and no value is guessed for a key the request does
-///   not carry (`::service_common::iam_authorization` decides a clause or leaves it
-///   undecided; it never fills one in).
+///   so a grant this pass cannot be shown to satisfy is not one, and the pass is decided
+///   under the context the assume itself carries: the account whose request Amazon Bedrock
+///   would be acting for ([`SOURCE_ACCOUNT_CONDITION_KEY`]) and the job the role is taken on
+///   FOR ([`SOURCE_ARN_CONDITION_KEY`]) — the two confused-deputy keys AWS documents a
+///   Bedrock service role's trust policy with. `source_arn` is the ARN of the job the
+///   request is creating, which the caller states where that ARN is FIXED at the point this
+///   decision is taken: a job addressed by a minted id alone (`ModelInvocationJobArn` and
+///   `EvaluationJobArn` are `…:<family>/[a-z0-9]{12}`) is minted out of the Region and a
+///   fresh id, both held before anything the request names is resolved, so a trust statement
+///   narrowed to that job family is DECIDED and admits the pass — which is what the corpus
+///   records a batch-inference submission carrying exactly that trust policy getting.
+/// * a clause over a key the pass carries no value for leaves the statement undecided, which
+///   IAM never reads as a grant, and no value is guessed for it
+///   (`::service_common::iam_authorization` decides a clause or leaves it undecided; it
+///   never fills one in). A job whose ARN carries a segment this decision stands IN FRONT of
+///   is in that position: `ModelCustomizationJobArn` spells the base model before the id,
+///   and the base model is resolved only after this gate, so a customization pass states no
+///   source ARN (`None`) and a grant narrowed by that key cannot be shown to cover it —
+///   RECORDED, not derived from the documentation: the corpus records that operation
+///   refusing a pass of exactly that shape, a role of the caller's own account, trusted to
+///   this service, whose grant is narrowed to the customization-job family.
 ///
 /// Refused only on what IAM ANSWERED: an emulator with no IAM to ask, or an answer this
 /// could not read, leaves the pass admitted, because a refusal has to be grounded.
@@ -358,11 +368,15 @@ pub async fn job_pass_role_denial(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     role_arn: &str,
+    source_arn: Option<&str>,
 ) -> Option<String> {
-    let context = [(
+    let mut context = vec![(
         SOURCE_ACCOUNT_CONDITION_KEY.to_string(),
         ::engine::emulator_account_id().to_string(),
     )];
+    context.extend(
+        source_arn.map(|arn| (SOURCE_ARN_CONDITION_KEY.to_string(), arn.to_string())),
+    );
     ::service_common::iam_role::role_pass_is_unauthorized(
         ctx,
         region,
@@ -386,3 +400,8 @@ pub const BEDROCK_SERVICE_PRINCIPAL: &str = "bedrock.amazonaws.com";
 /// service is acting for, which is the one value an `iam:PassRole` decision of this account
 /// carries: the account making the call is the account the service would act for.
 pub(super) const SOURCE_ACCOUNT_CONDITION_KEY: &str = "aws:SourceAccount";
+
+/// `aws:SourceArn` — IAM's global condition key for the RESOURCE the service is acting for,
+/// which for a job create is the job the passed role is taken on to run: the other
+/// confused-deputy key AWS documents a Bedrock service role's trust policy with.
+pub(super) const SOURCE_ARN_CONDITION_KEY: &str = "aws:SourceArn";

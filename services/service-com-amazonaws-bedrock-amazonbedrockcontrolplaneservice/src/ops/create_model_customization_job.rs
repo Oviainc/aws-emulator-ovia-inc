@@ -216,8 +216,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than a report about a model — and it leaves no job and no custom model
         // behind. See `crate::state::job_pass_role_denial` for the decision,
         // which is grounded in what this account's IAM answers about the role.
+        //
+        // The pass states NO source ARN: a customization job's ARN carries the base model
+        // before its id (`ModelCustomizationJobArn`:
+        // `…:model-customization-job/<base model>/<id>`), and that base model is whatever
+        // `baseModelIdentifier` resolves to in the published catalog — which this decision
+        // stands IN FRONT of — so there is no job ARN to state here, and a grant narrowed by
+        // that key cannot be shown to cover this pass.
         if let Some(denial) =
-            crate::state::job_pass_role_denial(ctx, &region, &input.role_arn).await
+            crate::state::job_pass_role_denial(ctx, &region, &input.role_arn, None).await
         {
             return Err(
                 CreateModelCustomizationJobErrorModeled::AccessDeniedException(
