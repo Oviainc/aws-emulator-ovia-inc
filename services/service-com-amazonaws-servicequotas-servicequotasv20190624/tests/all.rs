@@ -39,6 +39,8 @@ mod catalog_pagination;
 mod context_id_domain;
 #[path = "all/cross_region_settlement.rs"]
 mod cross_region_settlement;
+#[path = "all/default_catalogs_batch_through_codepipeline.rs"]
+mod default_catalogs_batch_through_codepipeline;
 #[path = "all/default_catalogs_keyed_on_aws_codes.rs"]
 mod default_catalogs_keyed_on_aws_codes;
 #[path = "all/default_quota_catalog.rs"]

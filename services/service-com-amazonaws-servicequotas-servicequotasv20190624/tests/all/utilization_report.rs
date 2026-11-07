@@ -37,6 +37,8 @@ use serde_json::{json, Value};
 // ServiceQuotasV20190624.<Op>` through the `MultiServiceRouter`, over one shared
 // engine, plus its listing walker and token helper. Declared `pub(crate)` in
 // `quota_workflow` for sibling suites to reuse.
+use service_com_amazonaws_servicequotas_servicequotasv20190624::state::UTILIZATION_REPORT_PAGE_SIZE;
+
 use crate::quota_workflow::{base64_of, client, emulator, walk_pages, Client};
 
 /// Comfortably past `crate::state::REPORT_COMPLETION_DELAY` (500 ms), so a report
@@ -534,13 +536,15 @@ async fn a_report_is_ordered_by_utilization_descending_and_pages_consistently() 
         }
     }
 
-    // Rows: page sizes spanning one record per page, several, exactly the record
-    // count, the modelled maximum (1000) and no MaxResults at all.
+    // Rows: page sizes spanning one record per page, several, the whole report in one
+    // page, the modelled maximum (1000) and no MaxResults at all. The whole-report row
+    // is bounded by that maximum, because `MaxResultsUtilization` is `@range 1..1000`
+    // and a report longer than one page cannot be asked for in one.
     let sizes: Vec<Option<i64>> = vec![
         Some(1),
         Some(2),
         Some(3),
-        Some(whole.len() as i64),
+        Some(whole.len().min(UTILIZATION_REPORT_PAGE_SIZE) as i64),
         Some(1_000),
         None,
     ];

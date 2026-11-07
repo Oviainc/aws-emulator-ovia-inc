@@ -19,6 +19,28 @@
 use super::{quota, QuotaRow, LEVEL_ALL};
 use crate::ops::types::MetricInfo;
 
+// The row tables of the services whose catalogs run long enough to own a file: one module
+// per `ServiceCode`, so a service's rows and the facts behind them sit together. They read
+// the row builder and the shared `UsageMetric` / rate constructors below out of this
+// module, which is what keeps one construction of each class for the whole catalog.
+mod batch;
+mod cassandra;
+mod cloud9;
+mod cloudhsm;
+mod cloudtrail;
+mod codeartifact;
+mod codedeploy;
+mod codepipeline;
+
+pub(super) use batch::batch_quotas;
+pub(super) use cassandra::cassandra_quotas;
+pub(super) use cloud9::cloud9_quotas;
+pub(super) use cloudhsm::cloudhsm_quotas;
+pub(super) use cloudtrail::cloudtrail_quotas;
+pub(super) use codeartifact::codeartifact_quotas;
+pub(super) use codedeploy::codedeploy_quotas;
+pub(super) use codepipeline::codepipeline_quotas;
+
 /// Amazon API Gateway's published default-quota catalog.
 ///
 /// SOURCE: AWS's published Service Quotas data for the `apigateway` service code

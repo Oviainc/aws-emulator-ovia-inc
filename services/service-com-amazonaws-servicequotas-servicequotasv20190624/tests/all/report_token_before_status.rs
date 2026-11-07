@@ -25,6 +25,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_servicequotas_servicequotasv20190624::state::UTILIZATION_REPORT_PAGE_SIZE;
+
 use crate::quota_workflow::{base64_of, client, emulator, Client};
 
 /// Comfortably past `crate::state::REPORT_COMPLETION_DELAY` (500 ms), so a report
@@ -125,6 +127,32 @@ async fn status_now(caller: &Client, report_id: &str) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("a report must report a Status, got {read}"))
         .to_string()
+}
+
+/// Every record of a COMPLETED report, walked with the tokens the service issues.
+///
+/// A report longer than one page reports its first page and a `NextToken`, so the whole
+/// snapshot takes the walk — reading one unasked page would be reading one page of it.
+async fn whole_report(caller: &Client, report_id: &str) -> Vec<Value> {
+    let mut records: Vec<Value> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut body = json!({"ReportId": report_id});
+        if let Some(next) = &token {
+            body["NextToken"] = json!(next);
+        }
+        let page = caller.ok("GetQuotaUtilizationReport", body).await;
+        records.extend(
+            page["Quotas"]
+                .as_array()
+                .unwrap_or_else(|| panic!("a completed report publishes Quotas, got {page}"))
+                .clone(),
+        );
+        token = page["NextToken"].as_str().map(str::to_string);
+        if token.is_none() {
+            return records;
+        }
+    }
 }
 
 /// Assert one bogus token is refused as the model declares.
@@ -269,13 +297,11 @@ async fn a_token_naming_a_position_in_the_report_is_served_in_either_status() {
     // And once the clock has completed it, the same positions serve the snapshot from
     // exactly the offsets they name.
     tokio::time::sleep(PAST_COMPLETION).await;
-    let whole = caller
-        .ok("GetQuotaUtilizationReport", json!({"ReportId": &report_id}))
-        .await;
-    let all: Vec<Value> = whole["Quotas"]
-        .as_array()
-        .unwrap_or_else(|| panic!("a completed report publishes Quotas, got {whole}"))
-        .clone();
+    // The whole snapshot, walked with the tokens the service issues: a report longer
+    // than one page (`UTILIZATION_REPORT_PAGE_SIZE`) reports its first page and a
+    // `NextToken`, so the records a position names are the slice that starts there
+    // BOUNDED by one page.
+    let all = whole_report(&caller, &report_id).await;
     assert!(
         all.len() > 3,
         "case the completed report: the snapshot must be longer than the offsets this \
@@ -297,11 +323,16 @@ async fn a_token_naming_a_position_in_the_report_is_served_in_either_status() {
             .as_array()
             .unwrap_or_else(|| panic!("case {case}: expected Quotas, got {served}"))
             .clone();
+        let expected: Vec<Value> = all[offset..]
+            .iter()
+            .take(UTILIZATION_REPORT_PAGE_SIZE)
+            .cloned()
+            .collect();
         assert_eq!(
             records,
-            all[offset..].to_vec(),
+            expected,
             "case {case}: a token resumes at the position it names, expected {} records, got {}",
-            all.len() - offset,
+            expected.len(),
             records.len()
         );
     }

@@ -3287,6 +3287,19 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         // one row of the eight this catalog already keyed onto AWS's code, is counted
         // per Region like the rest of that service's published rows rather than
         // account-wide.
+        //
+        // And it covers eight further services, whose recorded default-quota listings
+        // publish every quota under an AWS `L-` code and report this catalog's
+        // descriptive row as a surplus entry: `batch/ComputeEnvironments`,
+        // `batch/JobQueues`, `cassandra/TablesPerRegion`, `cloud9/Environments`,
+        // `cloudhsm/ClustersPerRegion`, `cloudtrail/TrailsPerRegion`,
+        // `codeartifact/DomainsPerAccount`, `codedeploy/ApplicationsPerRegion`,
+        // `codedeploy/DeploymentGroupsPerApplication` and
+        // `codepipeline/PipelinesPerRegion`. Each stand-in is dropped and the published
+        // catalog of its service is served under AWS's own codes in its place
+        // ([`batch_quotas`], [`cassandra_quotas`], [`cloud9_quotas`],
+        // [`cloudhsm_quotas`], [`cloudtrail_quotas`], [`codeartifact_quotas`],
+        // [`codedeploy_quotas`], [`codepipeline_quotas`]).
         service(
             "b2bi",
             "B2B Data Interchange",
@@ -3312,14 +3325,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             vec![quota("Customer profiles per account", 5.0).code("ProfilesPerAccount")],
         ),
         service("backup", "AWS Backup", backup_quotas()),
-        service(
-            "batch",
-            "AWS Batch",
-            vec![
-                quota("Job queues", 50.0),
-                quota("Compute environments", 50.0),
-            ],
-        ),
+        service("batch", "AWS Batch", batch_quotas()),
         service(
             "budgets",
             "AWS Budgets",
@@ -3328,13 +3334,9 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service(
             "cassandra",
             "Amazon Keyspaces (for Apache Cassandra)",
-            vec![quota("Tables per Region", 256.0)],
+            cassandra_quotas(),
         ),
-        service(
-            "cloud9",
-            "AWS Cloud9",
-            vec![quota("Environments", 50.0)],
-        ),
+        service("cloud9", "AWS Cloud9", cloud9_quotas()),
         service(
             "cloudformation",
             "AWS CloudFormation",
@@ -3354,21 +3356,9 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                 quota("Cache behaviors per distribution", 25.0).global(),
             ],
         ),
-        service(
-            "cloudhsm",
-            "AWS CloudHSM",
-            vec![quota("Clusters per Region", 4.0)],
-        ),
-        service(
-            "cloudtrail",
-            "AWS CloudTrail",
-            vec![quota("Trails per Region", 5.0).fixed()],
-        ),
-        service(
-            "codeartifact",
-            "AWS CodeArtifact",
-            vec![quota("Domains per account", 10.0)],
-        ),
+        service("cloudhsm", "AWS CloudHSM", cloudhsm_quotas()),
+        service("cloudtrail", "AWS CloudTrail", cloudtrail_quotas()),
+        service("codeartifact", "AWS CodeArtifact", codeartifact_quotas()),
         service(
             "codebuild",
             "AWS CodeBuild",
@@ -3382,19 +3372,8 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "AWS CodeCommit",
             vec![quota("Repositories per account", 5000.0).code("L-81790602")],
         ),
-        service(
-            "codedeploy",
-            "AWS CodeDeploy",
-            vec![
-                quota("Applications per Region", 1000.0),
-                quota("Deployment groups per application", 1000.0),
-            ],
-        ),
-        service(
-            "codepipeline",
-            "AWS CodePipeline",
-            vec![quota("Pipelines per Region", 1000.0)],
-        ),
+        service("codedeploy", "AWS CodeDeploy", codedeploy_quotas()),
+        service("codepipeline", "AWS CodePipeline", codepipeline_quotas()),
         service(
             "cognito-identity",
             "Amazon Cognito Federated Identities",

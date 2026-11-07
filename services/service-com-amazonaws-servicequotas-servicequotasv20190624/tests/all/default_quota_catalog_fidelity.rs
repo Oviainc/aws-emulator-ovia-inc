@@ -268,6 +268,8 @@ const USAGE_METRIC_SERVICE_NAMES: &[(&str, &str)] = &[
     // Amazon EBS's API call counts and Amazon ECR's are published under each
     // service's short display name, and the file-system and load-balancing counts
     // under the names `AWS/Usage` publishes those services as.
+    ("cloudhsm", "CloudHSM"),
+    ("cloudtrail", "CloudTrail"),
     ("ebs", "EBS"),
     ("ec2", "EC2"),
     ("ecr", "ECR"),
@@ -309,6 +311,16 @@ const USAGE_METRIC_SERVICE_NAMES: &[(&str, &str)] = &[
 /// gives it.
 const SURPLUS_QUOTA_CODES: &[(&str, &str)] = &[
     ("autoscaling-plans", "ScalingPlansPerRegion"),
+    ("batch", "ComputeEnvironments"),
+    ("batch", "JobQueues"),
+    ("cassandra", "TablesPerRegion"),
+    ("cloud9", "Environments"),
+    ("cloudhsm", "ClustersPerRegion"),
+    ("cloudtrail", "TrailsPerRegion"),
+    ("codeartifact", "DomainsPerAccount"),
+    ("codedeploy", "ApplicationsPerRegion"),
+    ("codedeploy", "DeploymentGroupsPerApplication"),
+    ("codepipeline", "PipelinesPerRegion"),
     ("config", "DeliveryChannels"),
     ("datasync", "TasksPerAccount"),
     ("datasync", "AgentsPerAccount"),
