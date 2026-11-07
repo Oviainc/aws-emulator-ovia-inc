@@ -204,11 +204,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             entries.push(ListGeofenceCollectionsResponseEntry {
                 collection_name: collection.name.clone(),
                 description: collection.description.clone(),
-                // Documented as fixed on this entry: PricingPlan "Always returns
-                // RequestBasedUsage", PricingPlanDataSource "Always returns an
-                // empty string".
+                // PricingPlan is documented fixed on this entry: "Always returns
+                // RequestBasedUsage". PricingPlanDataSource is deprecated and
+                // unused, and the listing does not populate it, so the member is
+                // left out of the entry altogether rather than sent as an empty
+                // string; the describe read, whose member doc states it always
+                // returns one, is where it is carried.
                 pricing_plan: Some(crate::state::ALWAYS_PRICING_PLAN.to_string()),
-                pricing_plan_data_source: Some(String::new()),
+                pricing_plan_data_source: None,
                 create_time: crate::state::to_date_time(collection.create_time),
                 update_time: crate::state::to_date_time(collection.update_time),
             });
