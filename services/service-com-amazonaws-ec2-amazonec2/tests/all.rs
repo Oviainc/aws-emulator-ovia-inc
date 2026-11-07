@@ -1526,6 +1526,11 @@ mod instance_attribute_describe;
 // `CapacityManager.Disabled` refusal an account that has not enabled Capacity Manager gets.
 #[path = "all/capacity_manager_metric_dimensions.rs"]
 mod capacity_manager_metric_dimensions;
+// What `ModifyCapacityReservation` applies to a stored Capacity Reservation — its capacity,
+// the condition it is released under and the instances it accepts — which states admit a
+// modification at all, and what it refuses. Declared at the tail of this file, which is
+#[path = "all/modify_capacity_reservation.rs"]
+mod modify_capacity_reservation;
 // What `DeleteNetworkInsightsAccessScopeAnalysis` takes out of the Network Access Scope
 // analysis store: the one analysis the request names, answered by its id, with the client
 // token that named it and the bytes it held released — and the ids and dry run it refuses

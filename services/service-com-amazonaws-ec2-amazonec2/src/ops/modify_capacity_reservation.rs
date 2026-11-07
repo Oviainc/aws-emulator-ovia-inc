@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyCapacityReservation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyCapacityReservation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyCapacityReservation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the capacity, end-condition and instance-eligibility changes the
+//! request names to the Capacity Reservation [`crate::state`] holds, as far as that
+//! reservation's own state and commitment admit them, so every later reader of the
+//! reservation reports what this call wrote. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +191,410 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyCapacityReservation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyCapacityReservationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyCapacityReservation"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — the store
+        // holds Capacity Reservations per account, so the Region a request was signed for
+        // does not narrow them, the same reading `CancelCapacityReservation` takes. The
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // ONE reading of the wall clock for this call: the state the reservation is judged
+        // in, the commitment window a change is measured against and the dates this writes
+        // are all the same instant.
+        let now = ::std::time::SystemTime::now();
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // Every move the clock already owed — a future-dated request's `assessing` ->
+        // `scheduled` among them — is materialised before anything is read, so this call
+        // decides against the state a caller would have been shown anyway.
+        store.materialize_due_transitions();
+
+        // "The ID of the Capacity Reservation": an id the account holds no reservation for
+        // is an error, not a modification of nothing.
+        let reservation_id = input.capacity_reservation_id.clone();
+        let view = state::require_known_capacity_reservation(&store, &reservation_id)?.view_at(now);
+        let reservation_state = view.state.clone().unwrap_or_default();
+
+        // What this request asks to CHANGE. `Accept` ("Reserved. Capacity Reservations you
+        // have created are accepted by default") and `AdditionalInfo` ("Reserved for future
+        // use") ask for nothing, so neither is a modification; a request that names no
+        // modification at all is the no-op it asked for and leaves the reservation as it
+        // stands.
+        let changes_configuration = input.instance_count.is_some()
+            || input.end_date.is_some()
+            || input.end_date_type.is_some()
+            || input.instance_match_criteria.is_some();
+        let changes_start_date = input.start_date.is_some();
+
+        // "The ID of the quote that describes the modification you want to apply. Generate
+        // a quote by using CreateCapacityReservationDateChangeQuote. The quote must be in
+        // the active state, and each quote can be used only once" (`$QuoteId`): the terms a
+        // quoted modification applies are the quote's, so a quote this account does not
+        // hold describes nothing to apply. The id's own FORM is read before any lookup, so a
+        // value that is not a quote id is malformed rather than reported as a quote the
+        // account does not hold — the order this crate refuses the cancellation quote beside
+        // it in. This emulator mints modification quotes nowhere —
+        // `CreateCapacityReservationDateChangeQuote`, the one operation that issues one, is
+        // still a scaffold — so every well-formed quote id names a quote that does not
+        // exist, which is what the refusal says.
+        if let Some(quote_id) = input.quote_id.as_deref() {
+            if !state::issued_long_id_is_well_formed(
+                CAPACITY_RESERVATION_MODIFICATION_QUOTE_ID_PREFIX,
+                quote_id,
+            ) {
+                return Err(Scaffolded::service_error(
+                    INVALID_CAPACITY_RESERVATION_MODIFICATION_QUOTE_ID_MALFORMED,
+                    400,
+                    format!(
+                        "Capacity Reservation modification quote ID '{quote_id}' is malformed"
+                    ),
+                ));
+            }
+            return Err(Scaffolded::service_error(
+                INVALID_CAPACITY_RESERVATION_MODIFICATION_QUOTE_ID_NOT_FOUND,
+                400,
+                format!(
+                    "The capacity-reservation-modification-quote ID '{quote_id}' does not \
+                     exist"
+                ),
+            ));
+        }
+
+        // "You can't modify or cancel a Capacity Block" (this operation's own doc and
+        // `CancelCapacityReservation`'s): the reservation that holds a block's capacity is
+        // bought for that block's window and keeps the configuration the purchase gave it.
+        if view.capacity_block_id.is_some() {
+            return Err(state::incorrect_state(format!(
+                "The Capacity Reservation '{reservation_id}' holds the capacity of a \
+                 Capacity Block, which cannot be modified"
+            )));
+        }
+
+        // "The allowed modifications depend on the state of the Capacity Reservation" (this
+        // operation's own doc), which enumerates them: `active` — every modification,
+        // subject to the commitment checked further down; `assessing` or `scheduled` — "You
+        // can modify the tags only", and this operation carries no tags, so the only change
+        // left for one is the quoted start-date push-out below; `pending` — "You can't modify
+        // the Capacity Reservation in any way"; `expired`, `cancelled`, `unsupported` or
+        // `failed` — the same. Every other member of the modelled enum the doc does not list
+        // is a state the reservation is on its way out of, so it admits no modification
+        // either. The refusal is the one this crate words for a request a resource's own
+        // state forbids, naming the state it is in, and it answers the REQUEST rather than
+        // one member of it: a modify of a reservation whose state admits no modification is
+        // refused whether or not it names a member to change.
+        let awaiting_delivery = reservation_state == state::CAPACITY_RESERVATION_STATE_ASSESSING
+            || reservation_state == state::CAPACITY_RESERVATION_STATE_SCHEDULED;
+        let active = reservation_state == state::CAPACITY_RESERVATION_STATE_ACTIVE;
+        if (!active && !awaiting_delivery) || (awaiting_delivery && changes_configuration) {
+            return Err(state::incorrect_state_of(
+                CAPACITY_RESERVATION,
+                &reservation_id,
+                &reservation_state,
+            ));
+        }
+
+        // "The new start date for the Capacity Reservation … Applies to future-dated
+        // Capacity Reservations only" (`$StartDate`), and only while one "has not yet been
+        // delivered" (this operation's own doc) — which is a reservation EC2 is still
+        // assessing or has scheduled for a date, never one whose capacity is already
+        // delivered or gone.
+        if changes_start_date && !awaiting_delivery {
+            return Err(state::incorrect_state_of(
+                CAPACITY_RESERVATION,
+                &reservation_id,
+                &reservation_state,
+            ));
+        }
+        // "Requires a quote from CreateCapacityReservationDateChangeQuote; pass the quote ID
+        // in QuoteId with AcceptModificationTerms set to true" (`$StartDate`) — and the
+        // request reaching here carries no quote id, since one is refused above.
+        if changes_start_date {
+            return Err(Scaffolded::missing_parameter(format!(
+                "The request must contain the parameter quoteId: pushing out the start date \
+                 of Capacity Reservation '{reservation_id}' requires a quote generated by \
+                 CreateCapacityReservationDateChangeQuote"
+            )));
+        }
+
+        // The capacity this reservation reserves — "the total number of instances for which
+        // the Capacity Reservation reserves capacity"
+        // (`CapacityReservation$TotalInstanceCount`) — and the part of it nothing has
+        // launched into — "the number of instances that can be launched in the Capacity
+        // Reservation" (`$AvailableInstanceCount`): every capacity change is measured against
+        // the first and moves the second with it.
+        let total = view.total_instance_count.unwrap_or_default();
+        let available = view.available_instance_count.unwrap_or_default();
+        // The capacity instances are already running in: "Information about instance capacity
+        // usage" (`$CapacityAllocations`), whose `used` entries are the capacity "in use by
+        // instances that are running in the Capacity Reservation"
+        // (`CapacityAllocation$AllocationType`), each carrying "the amount of instance
+        // capacity associated with the usage" (`$Count`) — the modelled member usage is read
+        // from, since the difference of the two counts is NOT usage: capacity allocated to an
+        // interruptible reservation also lowers the available count
+        // (`crate::ops::get_capacity_reservation_usage`). That difference is still a FLOOR on
+        // what a modification may leave reserved, so the larger of the two decides. A
+        // reservation this emulator holds reports no usage at all — nothing launches an
+        // instance into a Capacity Reservation yet — which leaves that floor at none.
+        let allocated = view
+            .capacity_allocations
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|allocation| {
+                allocation.allocation_type.as_deref() == Some(ALLOCATION_TYPE_USED)
+            })
+            .map(|allocation| allocation.count.unwrap_or_default())
+            .fold(0i32, i32::saturating_add);
+        let in_use = allocated.max(total.saturating_sub(available));
+
+        // "The date and time at which the commitment duration expires"
+        // (`CapacityReservationCommitmentInfo$CommitmentEndDate`), while it has not: an
+        // elapsed commitment holds nothing, which is the "active state with no commitment
+        // duration or elapsed commitment duration - All modifications are allowed" case of
+        // this operation's own doc.
+        let commitment_end_date = view
+            .commitment_info
+            .as_ref()
+            .and_then(|commitment| commitment.commitment_end_date)
+            .and_then(|end_date| ::std::time::SystemTime::try_from(end_date).ok())
+            .filter(|end_date| *end_date > now);
+
+        // "The number of instances for which to reserve capacity" (`$InstanceCount`), as far
+        // as the published bound on a change, the capacity a reservation can hold at all and
+        // the commitment admit it.
+        let instance_count = match input.instance_count {
+            None => None,
+            Some(requested) => {
+                // "Valid range: 1 - 1000"
+                // (`CreateCapacityReservationRequest$InstanceCount`) puts the FLOOR on the
+                // capacity a reservation holds, which a modification cannot take it below:
+                // capacity for no instances reserves nothing. That range's CEILING is a bound
+                // on one CREATE rather than on a reservation: inside it the largest change
+                // possible would be 999, so the bound of 1000 this member publishes on a
+                // single change only reads if a modification may carry a reservation past it
+                // — which is what a modification is held to instead.
+                let floor = *state::CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE.start();
+                if requested < floor {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{requested}' for instanceCount: a Capacity \
+                         Reservation reserves capacity for at least {floor} instance"
+                    )));
+                }
+                // "The number of instances can't be increased or decreased by more than
+                // 1000 in a single request" (`$InstanceCount`). Widened to `i64` so the
+                // difference of two counts cannot overflow the modelled type.
+                let change = i64::from(requested) - i64::from(total);
+                if change.abs() > MAX_INSTANCE_COUNT_CHANGE {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{requested}' for instanceCount: Capacity \
+                         Reservation '{reservation_id}' reserves capacity for {total} \
+                         instances, and a single request changes that by at most \
+                         {MAX_INSTANCE_COUNT_CHANGE}"
+                    )));
+                }
+                // "active state but still within the commitment duration - You can't
+                // decrease the instance count" (this operation's own doc): the committed
+                // capacity is held for as long as the commitment runs.
+                if let Some(commitment_end) = commitment_end_date.filter(|_| requested < total) {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{requested}' for instanceCount: Capacity \
+                         Reservation '{reservation_id}' is committed to {total} instances \
+                         until {}",
+                        state::iso8601_utc(commitment_end)
+                    )));
+                }
+                // Capacity something is already using is not released by a modification:
+                // what is left of the total after it is "the number of instances that can be
+                // launched in the Capacity Reservation" (`$AvailableInstanceCount`), which
+                // cannot be fewer than none.
+                if requested < in_use {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{requested}' for instanceCount: {in_use} of the \
+                         instances Capacity Reservation '{reservation_id}' reserves \
+                         capacity for are in use"
+                    )));
+                }
+                Some(requested)
+            }
+        };
+
+        // "Indicates the way in which the Capacity Reservation ends" (`$EndDateType`), with
+        // a request that names an end date and no end type asking for the end type that end
+        // date belongs to: "limited - The Capacity Reservation expires automatically at a
+        // specified date and time" (same member).
+        let end_date_type = match (input.end_date_type.as_deref(), input.end_date) {
+            (Some(end_date_type), _) => Some(end_date_type),
+            (None, Some(_)) => Some(state::END_DATE_TYPE_LIMITED),
+            (None, None) => None,
+        };
+        // What the request leaves the end of the reservation as: `None` for one that asks for
+        // no change, `Some(None)` for one released only when the caller cancels it, and
+        // `Some(Some(instant))` for one that expires then. "You must provide an EndDate value
+        // if EndDateType is limited. Omit EndDate if EndDateType is unlimited" (`$EndDate`).
+        let end_date = match (end_date_type, input.end_date) {
+            (None, _) => None,
+            (Some(state::END_DATE_TYPE_UNLIMITED), Some(_)) => {
+                return Err(Scaffolded::invalid_parameter_combination(
+                    "endDate may not be specified when endDateType is 'unlimited'",
+                ));
+            }
+            (Some(state::END_DATE_TYPE_UNLIMITED), None) => Some(None),
+            (Some(state::END_DATE_TYPE_LIMITED), None) => {
+                return Err(Scaffolded::missing_parameter(
+                    "endDate must be specified when endDateType is 'limited'",
+                ));
+            }
+            (Some(state::END_DATE_TYPE_LIMITED), Some(requested)) => {
+                // The instant the requested date names, which the checks below are made
+                // against. The reservation keeps the TIMESTAMP the request sent rather than
+                // this reading of it, so the date a caller named is the date every reader of
+                // the reservation reports.
+                let end_date = ::std::time::SystemTime::try_from(requested).map_err(|_| {
+                    Scaffolded::invalid_parameter_value(
+                        "Invalid value for endDate: it is not a representable date and time",
+                    )
+                })?;
+                // "The Capacity Reservation's state changes to expired when it reaches its
+                // end date and time" (`$EndDate`), so an end date that has already passed
+                // would expire the reservation the moment it was set rather than name a date
+                // it is to be released on.
+                if end_date <= now {
+                    return Err(Scaffolded::invalid_parameter_value(
+                        "Invalid value for endDate: it must be in the future",
+                    ));
+                }
+                // "active state but still within the commitment duration - You can't … set
+                // an end date that is within the commitment duration" (this operation's own
+                // doc), the same bound `CreateCapacityReservation` holds a future-dated
+                // request's end date to.
+                if let Some(commitment_end) = commitment_end_date.filter(|end| end_date < *end) {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{}' for endDate: it falls inside the commitment \
+                         duration, which ends at {}",
+                        state::iso8601_utc(end_date),
+                        state::iso8601_utc(commitment_end),
+                    )));
+                }
+                Some(Some(requested))
+            }
+            // Unreachable: `EndDateType` targets a modelled enum of exactly those two
+            // members, so the boundary validator has already refused anything else.
+            (Some(other), _) => {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{other}' for endDateType"
+                )));
+            }
+        };
+
+        // "The matching criteria (instance eligibility) that you want to use in the modified
+        // Capacity Reservation … To modify the instance eligibility, the Capacity Reservation
+        // must be completely idle (zero usage)" (`$InstanceMatchCriteria`). The modelled enum
+        // has already refused any spelling outside it.
+        if input.instance_match_criteria.is_some() && in_use != 0 {
+            return Err(state::incorrect_state(format!(
+                "The Capacity Reservation '{reservation_id}' has {in_use} of the {total} \
+                 instances it reserves capacity for in use, so its instance eligibility \
+                 cannot be modified"
+            )));
+        }
+
+        // DryRun sits AFTER the reservation has been resolved and every change validated,
+        // and BEFORE the first write: "Checks whether you have the required permissions for
+        // the action, without actually making the request" (`DryRun`), so a request that
+        // would have been refused is refused with that reason instead, and one that would
+        // have succeeded leaves the store untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let Some(record) = store.capacity_reservations.get_mut(&reservation_id) else {
+            return Err(Scaffolded::internal_error(format!(
+                "the Capacity Reservation '{reservation_id}' could not be read back to \
+                 modify it"
+            )));
+        };
+        // Each change the request asked for, written to the ONE record every reader of this
+        // reservation reports out of. A new total moves the capacity nothing has launched into
+        // with it — by the same number, since the capacity in use stays in use — and that
+        // capacity is never less than none nor more than the reservation reserves.
+        if let Some(requested) = instance_count {
+            record.view.total_instance_count = Some(requested);
+            record.view.available_instance_count = Some(
+                available
+                    .saturating_add(requested.saturating_sub(total))
+                    .clamp(0, requested),
+            );
+        }
+        if let Some(end_date) = end_date {
+            record.view.end_date = end_date;
+            record.view.end_date_type = Some(
+                if end_date.is_some() {
+                    state::END_DATE_TYPE_LIMITED
+                } else {
+                    state::END_DATE_TYPE_UNLIMITED
+                }
+                .to_string(),
+            );
+        }
+        if let Some(instance_match_criteria) = input.instance_match_criteria.clone() {
+            record.view.instance_match_criteria = Some(instance_match_criteria);
+        }
+
+        // "Returns true if the request succeeds; otherwise, it returns an error"
+        // (`$Return`). `AdjustmentStatus` and `AdjustmentDetails` describe a modification
+        // that is not in effect yet — "The configuration that the Capacity Reservation WILL
+        // HAVE after the adjustment is applied" (`$AdjustmentDetails`) — which the changes
+        // written above are not: each one is in the store by the time this answers, so there
+        // is no adjustment left to describe, exactly as the recorded contract of a
+        // modification that applies at once reports.
+        Ok(ModifyCapacityReservationOutput {
+            r#return: Some(true),
+            adjustment_status: None,
+            adjustment_details: None,
+        })
     }
 }
+
+/// The KIND of resource this operation's state refusal names, as the sibling operations that
+/// refuse on a Capacity Reservation's state spell it
+/// (`crate::ops::cancel_capacity_reservation`).
+const CAPACITY_RESERVATION: &str = "Capacity Reservation";
+
+/// The `AllocationType` of the capacity a Capacity Reservation has instances RUNNING in:
+/// "`used` indicates that the instance capacity is in use by instances that are running in
+/// the Capacity Reservation" (`CapacityAllocation$AllocationType`), one member of the
+/// modelled enum (`smithy_query(query="shape",shape="AllocationType")`) beside the `future`
+/// and `cancelling` capacity nothing is running in.
+const ALLOCATION_TYPE_USED: &str = "used";
+
+/// How far one request may move a Capacity Reservation's instance count: "The number of
+/// instances can't be increased or decreased by more than `1000` in a single request"
+/// (`ModifyCapacityReservationRequest$InstanceCount`).
+const MAX_INSTANCE_COUNT_CHANGE: i64 = 1000;
+
+/// The code this operation answers for a modification quote id the account holds no quote
+/// for, in the `Invalid<Resource>Id.NotFound` family this service refuses every other id it
+/// cannot resolve with
+/// (`crate::state::INVALID_CAPACITY_RESERVATION_CANCELLATION_QUOTE_ID_NOT_FOUND` for the
+/// cancellation quote beside it).
+const INVALID_CAPACITY_RESERVATION_MODIFICATION_QUOTE_ID_NOT_FOUND: &str =
+    "InvalidCapacityReservationModificationQuoteId.NotFound";
+
+/// The code for a value that is not a modification quote id at all, so there is nothing to
+/// look it up as, in the `Invalid<Resource>Id.Malformed` family this service refuses an
+/// unissuable id of any other kind with
+/// (`crate::state::INVALID_CAPACITY_RESERVATION_CANCELLATION_QUOTE_ID_MALFORMED`).
+const INVALID_CAPACITY_RESERVATION_MODIFICATION_QUOTE_ID_MALFORMED: &str =
+    "InvalidCapacityReservationModificationQuoteId.Malformed";
+
+/// The id prefix a Capacity Reservation modification quote carries, in the `<prefix>-<hex>`
+/// form every EC2 resource id takes. The model publishes no pattern for
+/// `CapacityReservationModificationQuoteId`, so the form is the one this service issues an id
+/// of this resource in: the LONG resource-id reading
+/// (`crate::state::issued_long_id_is_well_formed`) under this prefix, which is how the
+/// cancellation quote beside it reads its own
+/// (`crate::state::CAPACITY_RESERVATION_CANCELLATION_QUOTE_ID_PREFIX`, `crcq`).
+const CAPACITY_RESERVATION_MODIFICATION_QUOTE_ID_PREFIX: &str = "crmq";
