@@ -23,6 +23,10 @@ mod probe;
 mod refusal_wording;
 #[path = "all/response_detail.rs"]
 mod response_detail;
+#[path = "all/route_matrix_boundary.rs"]
+mod route_matrix_boundary;
+#[path = "all/route_matrix_metrics.rs"]
+mod route_matrix_metrics;
 #[path = "all/routing.rs"]
 mod routing;
 #[path = "all/state_roundtrip.rs"]

@@ -19,6 +19,11 @@
 //!   code names it.
 //! * both endpoints matched but no road connects them — `NoRoute`.
 //!
+//! `RoutingBoundary` reports back the boundary the matrix was evaluated under: the geometry
+//! that bounded it (an `AutoCircle` request reported as the `Circle` it derived), and the
+//! `Unbounded` boolean carrying the value that applied — `false` beside a geometry, `true`
+//! where nothing bounded the area — rather than left absent.
+//!
 //! `Exclude` answers 501: a country exclusion is "strictly excluded" and no road of the
 //! model carries the country it is in. So do `Avoid.Areas` and
 //! `Avoid.ControlledAccessHighways`: an avoidance is best-effort and a violated one
@@ -603,6 +608,20 @@ fn unbounded_boundary() -> RouteMatrixBoundary {
     }
 }
 
+/// The boundary a `Geometry` bounds the matrix by, as the response reports it back.
+///
+/// `RoutingBoundary` is a required output member, and the boundary it reports is the one
+/// the matrix was evaluated under: both WHICH area bounded it and WHETHER it was
+/// unrestricted. So the boolean is reported with the value that applied — `false` beside a
+/// geometry, `true` in [`unbounded_boundary`] — rather than left absent for a caller to
+/// read an unset member as a value.
+fn bounded_boundary(geometry: RouteMatrixBoundaryGeometry) -> RouteMatrixBoundary {
+    RouteMatrixBoundary {
+        geometry: Some(geometry),
+        unbounded: Some(false),
+    }
+}
+
 /// The one geometry a `RoutingBoundary.Geometry` sets, resolved to the area to compute
 /// within and the geometry to report.
 fn resolve_geometry(
@@ -647,18 +666,15 @@ fn resolve_geometry(
             .min(MAX_BOUNDARY_RADIUS_M);
         return Ok((
             Boundary::Circle { center, radius_m },
-            RouteMatrixBoundary {
-                geometry: Some(RouteMatrixBoundaryGeometry {
-                    auto_circle: None,
-                    circle: Some(Circle {
-                        center: state::position_to_vec(center),
-                        radius: radius_m,
-                    }),
-                    bounding_box: None,
-                    polygon: None,
+            bounded_boundary(RouteMatrixBoundaryGeometry {
+                auto_circle: None,
+                circle: Some(Circle {
+                    center: state::position_to_vec(center),
+                    radius: radius_m,
                 }),
-                unbounded: None,
-            },
+                bounding_box: None,
+                polygon: None,
+            }),
         ));
     }
 
@@ -679,15 +695,12 @@ fn resolve_geometry(
                 center,
                 radius_m: circle.radius,
             },
-            RouteMatrixBoundary {
-                geometry: Some(RouteMatrixBoundaryGeometry {
-                    auto_circle: None,
-                    circle: Some(circle.clone()),
-                    bounding_box: None,
-                    polygon: None,
-                }),
-                unbounded: None,
-            },
+            bounded_boundary(RouteMatrixBoundaryGeometry {
+                auto_circle: None,
+                circle: Some(circle.clone()),
+                bounding_box: None,
+                polygon: None,
+            }),
         ));
     }
 
@@ -723,15 +736,12 @@ fn resolve_geometry(
                 east: north_east[0],
                 north: north_east[1],
             },
-            RouteMatrixBoundary {
-                geometry: Some(RouteMatrixBoundaryGeometry {
-                    auto_circle: None,
-                    circle: None,
-                    bounding_box: Some(bounding_box.clone()),
-                    polygon: None,
-                }),
-                unbounded: None,
-            },
+            bounded_boundary(RouteMatrixBoundaryGeometry {
+                auto_circle: None,
+                circle: None,
+                bounding_box: Some(bounding_box.clone()),
+                polygon: None,
+            }),
         ));
     }
 
@@ -774,15 +784,12 @@ fn resolve_geometry(
     }
     Ok((
         Boundary::Polygon(positions),
-        RouteMatrixBoundary {
-            geometry: Some(RouteMatrixBoundaryGeometry {
-                auto_circle: None,
-                circle: None,
-                bounding_box: None,
-                polygon: Some(polygon.clone()),
-            }),
-            unbounded: None,
-        },
+        bounded_boundary(RouteMatrixBoundaryGeometry {
+            auto_circle: None,
+            circle: None,
+            bounding_box: None,
+            polygon: Some(polygon.clone()),
+        }),
     ))
 }
 
