@@ -66,6 +66,8 @@ mod list_types;
 mod multi_region_table_replicas;
 #[path = "all/name_conflict_precedes_type_resolution.rs"]
 mod name_conflict_precedes_type_resolution;
+#[path = "all/name_validation_envelope.rs"]
+mod name_validation_envelope;
 #[path = "all/one_replication_region_rule.rs"]
 mod one_replication_region_rule;
 #[path = "all/page_token_codec.rs"]
