@@ -32,6 +32,10 @@ use service_com_amazonaws_lambda_awsgirapiservice::state::ACTIVATION_DELAY;
 use service_com_amazonaws_lambda_awsgirapiservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+// Every test below RUNS a handler, so each one takes this target's shared invocation
+// stream: see the helper's own documentation for why a suite that runs handlers holds it.
+use crate::invoke_request_id::one_invocation_stream_at_a_time;
+
 /// The Region every call below is signed for, so the ARNs the decisions are made about are the
 /// ones this Region's functions carry.
 const REGION: &str = "us-east-1";
@@ -531,6 +535,7 @@ fn assert_refused(case: &str, answer: &Answer, expected_message: &str) {
 /// `AccessDeniedException` before the function runs.
 #[tokio::test]
 async fn an_invocation_is_served_only_to_a_principal_iam_allows() {
+    let _stream = one_invocation_stream_at_a_time().await;
     let emulator = Emulator::new();
     emulator.function("gated").await;
     let arn = function_arn("gated");
@@ -636,6 +641,7 @@ struct QualifierRow<'a> {
 /// of them allows exactly the invocations that address it.
 #[tokio::test]
 async fn the_grant_is_read_for_the_qualifier_the_invocation_addressed() {
+    let _stream = one_invocation_stream_at_a_time().await;
     let emulator = Emulator::new();
     emulator.function("qualified").await;
     let arn = function_arn("qualified");
@@ -749,6 +755,7 @@ async fn the_grant_is_read_for_the_qualifier_the_invocation_addressed() {
 /// other.
 #[tokio::test]
 async fn each_invoking_entry_point_is_decided_on_its_own_published_action() {
+    let _stream = one_invocation_stream_at_a_time().await;
     let emulator = Emulator::new();
     emulator.function("entrypoints").await;
     let arn = function_arn("entrypoints");
@@ -834,6 +841,7 @@ async fn each_invoking_entry_point_is_decided_on_its_own_published_action() {
 /// only that one.
 #[tokio::test]
 async fn a_function_policy_naming_the_principal_grants_the_invocation_on_its_own() {
+    let _stream = one_invocation_stream_at_a_time().await;
     let emulator = Emulator::new();
     emulator.function("shared").await;
     let arn = function_arn("shared");
@@ -895,6 +903,7 @@ async fn a_function_policy_naming_the_principal_grants_the_invocation_on_its_own
 /// role decide the invocation and the refusal blames the session ARN STS reports.
 #[tokio::test]
 async fn an_assumed_role_session_is_judged_on_the_roles_policies() {
+    let _stream = one_invocation_stream_at_a_time().await;
     let emulator = Emulator::new();
     emulator.function("role-gated").await;
     let arn = function_arn("role-gated");
@@ -941,6 +950,7 @@ async fn an_assumed_role_session_is_judged_on_the_roles_policies() {
 /// a grant queues one.
 #[tokio::test]
 async fn a_refused_invocation_queues_nothing() {
+    let _stream = one_invocation_stream_at_a_time().await;
     let emulator = Emulator::new();
     emulator.function("queue-gated").await;
     let arn = function_arn("queue-gated");

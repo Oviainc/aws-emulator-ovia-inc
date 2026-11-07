@@ -25,6 +25,8 @@ mod arn_region_scope;
 mod attachment_state_reports;
 #[path = "all/awsvpc_configuration_store.rs"]
 mod awsvpc_configuration_store;
+#[path = "all/awsvpc_interface_subnet_and_identity.rs"]
+mod awsvpc_interface_subnet_and_identity;
 #[path = "all/capacity_providers.rs"]
 mod capacity_providers;
 #[path = "all/cluster_capacity_and_statistics.rs"]
