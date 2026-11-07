@@ -130,13 +130,15 @@ pub fn recipe_version_used_by_job_message(version: &str, job: &str) -> String {
     format!("Recipe versions {version} are used by job {job}")
 }
 
-/// The `ErrorMessage` a per-item version failure reports for the working version of a
-/// recipe that still holds other versions.
+/// The message a refusal of the working version's delete states, and the `ErrorMessage` a
+/// per-item version failure reports for it: the working version of a recipe that still
+/// holds other versions cannot be deleted.
 ///
-/// The rule is stated on the operation itself — "The LATEST_WORKING version will only be
-/// deleted if the recipe has no other versions" (model: `BatchDeleteRecipeVersion`) — and
-/// the item states exactly that rule, which has no variable part: the version this item
-/// is about is already its `RecipeVersion` member.
+/// The rule is stated on the version rather than on one operation — "The LATEST_WORKING
+/// version will only be deleted if the recipe has no other versions" (model:
+/// `BatchDeleteRecipeVersion`) — so every operation that deletes a recipe version states
+/// it the same way, and the sentence has no variable part: the version it is about is
+/// already the identifier the request carried.
 pub fn working_version_not_last_message() -> String {
     format!(
         "The {LATEST_WORKING} version will only be deleted if the recipe has no other \
@@ -425,9 +427,11 @@ pub struct RecipeVersionRecord {
 /// A stored DataBrew recipe: the versions it holds, plus the members that belong to
 /// the recipe as a whole (its name, ARN, tags and the project it is attached to).
 ///
-/// Every recipe has a working version from the moment it is created, and publishing
-/// adds frozen versions beside it, so the two are held apart rather than in one map:
-/// `LATEST_WORKING` and `LATEST_PUBLISHED` name exactly these.
+/// A recipe is created holding one working version and publishing adds frozen versions
+/// beside it, so the two are held apart rather than in one map: `LATEST_WORKING` and
+/// `LATEST_PUBLISHED` name exactly these. Every recipe has a working version for as long
+/// as the recipe exists: that version is deleted only when the recipe holds no other
+/// version, and the delete that takes it takes the recipe with it.
 #[derive(Debug, Clone)]
 pub struct RecipeRecord {
     pub name: String,
@@ -636,6 +640,38 @@ impl ComAmazonawsDatabrewAwsgluedatabrewState {
             },
         }
     }
+
+    /// The job that runs a version of `recipe_name` addressed by any of `identifiers`,
+    /// or `None` when no stored job references that version.
+    ///
+    /// A job runs ONE version of one recipe (model: `Job$RecipeReference`), so a version
+    /// a job references cannot be deleted out from under it, and every operation that
+    /// deletes a recipe version asks this the same way. One version is addressed by more
+    /// than one identifier — its own number and the alias that resolves to it — so the
+    /// caller passes every identifier that names the version it is asking about; a
+    /// reference carrying no version addresses the latest published one exactly as a
+    /// versionless lookup does. The store is keyed by job name, so the job answered is
+    /// the first in that order and two calls about one version always name the same job.
+    pub fn job_running_recipe_version(
+        &self,
+        recipe_name: &str,
+        identifiers: &[&str],
+    ) -> Option<String> {
+        self.jobs
+            .values()
+            .find(|job| {
+                job.recipe_reference.as_ref().is_some_and(|reference| {
+                    reference.name == recipe_name
+                        && identifiers.contains(
+                            &reference
+                                .recipe_version
+                                .as_deref()
+                                .unwrap_or(LATEST_PUBLISHED),
+                        )
+                })
+            })
+            .map(|job| job.name.clone())
+    }
 }
 
 impl DatasetRecord {
@@ -758,6 +794,17 @@ impl RecipeRecord {
             version if version == self.working.version => Some(&self.working),
             version => self.published.iter().find(|held| held.version == version),
         }
+    }
+
+    /// Whether this recipe holds a version BESIDE its working one, which is what keeps
+    /// that working version from being deleted (model: `BatchDeleteRecipeVersion` — "The
+    /// LATEST_WORKING version will only be deleted if the recipe has no other versions").
+    ///
+    /// The question is asked of the versions the recipe holds when the request ARRIVES —
+    /// "if you try to delete LATEST_WORKING while other versions exist" — so a request
+    /// that names the working version together with every other one still runs into it.
+    pub fn holds_other_versions(&self) -> bool {
+        !self.published.is_empty()
     }
 
     /// The number the NEXT publish of this recipe freezes a version at: the major

@@ -39,6 +39,8 @@ mod recipe_version_batch_delete;
 mod recipe_version_listing;
 #[path = "all/recipe_version_resolution.rs"]
 mod recipe_version_resolution;
+#[path = "all/recipe_version_single_delete.rs"]
+mod recipe_version_single_delete;
 #[path = "all/recipe_working_update.rs"]
 mod recipe_working_update;
 #[path = "all/resource_not_found_message.rs"]

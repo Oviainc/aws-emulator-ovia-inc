@@ -272,36 +272,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             named.push(addressed);
         }
 
-        // The jobs that run a version of THIS recipe, by the identifier each job's recipe
-        // reference addresses it with (model: `Job$RecipeReference`). The store is keyed
-        // by job name, so the job reported for a version is the first in name order, and a
-        // reference that carries no version addresses the latest published one exactly as
-        // a versionless lookup does.
-        let mut job_of_version: ::std::collections::BTreeMap<String, String> =
-            ::std::collections::BTreeMap::new();
-        for job in store.jobs.values() {
-            let Some(reference) = &job.recipe_reference else {
-                continue;
-            };
-            if reference.name != input.name {
-                continue;
-            }
-            let addressed = reference
-                .recipe_version
-                .clone()
-                .unwrap_or_else(|| crate::state::LATEST_PUBLISHED.to_string());
-            job_of_version
-                .entry(addressed)
-                .or_insert_with(|| job.name.clone());
-        }
-        // The first job, in name order, that addresses a version by any of the
-        // identifiers that resolve to it.
+        // A version a job runs is one this request cannot delete, whichever identifier
+        // the job's recipe reference addresses it with; the lookup is the state's
+        // ([`crate::state::ComAmazonawsDatabrewAwsgluedatabrewState::job_running_recipe_version`]),
+        // so every operation that deletes a version of a recipe asks it the same way.
         let job_running = |identifiers: &[&str]| -> Option<String> {
-            identifiers
-                .iter()
-                .filter_map(|identifier| job_of_version.get(*identifier))
-                .min()
-                .cloned()
+            store.job_running_recipe_version(&input.name, identifiers)
         };
 
         // Each version is decided on its own: the ones that can go are deleted and the
