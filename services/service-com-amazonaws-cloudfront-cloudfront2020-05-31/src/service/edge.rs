@@ -93,10 +93,16 @@
 //! * PREFIXED PATH-STYLE: `/_aws/cloudfront/{distribution-id}/{viewer-path}`, read on
 //!   whatever host it arrives at — the reserved first segment is in no service's modelled
 //!   path space;
-//! * PATH-STYLE: the first path segment is a distribution id this service holds, read
-//!   only on a host that names NO SERVICE (the emulator's own endpoint) or names THIS
-//!   service, so a first segment that happens to equal a distribution id cannot take a
-//!   request away from the service whose endpoint the host names.
+//! * PATH-STYLE: the first path segment names a distribution this service holds — its id,
+//!   or the domain name a viewer would have addressed in the host, the same name carried
+//!   where this client can carry it — read only on a host that
+//!   names NO SERVICE (the emulator's own endpoint) or names THIS service, so a first
+//!   segment that happens to name a distribution cannot take a request away from the service
+//!   whose endpoint the host names.
+//!
+//! A distribution is addressed by the name it PUBLISHES, in the host or in that first
+//! segment, and by nothing else: what an origin happens to hold decides what a fetch
+//! answers, never which distribution a request is for.
 //!
 //! The viewer's SCHEME is not carried on the request the router hands a service
 //! (origin-form URI plus a `Host` header), so `ViewerProtocolPolicy` — which is about
@@ -190,14 +196,20 @@ const GEO_RESTRICTED_DETAIL: &str =
 const VIEWER_COUNTRY_HEADER: &str = "cloudfront-viewer-country";
 
 /// The headers that belong to ONE hop of an HTTP connection and are never forwarded to an
-/// origin, as RFC 9110 lists them, plus the viewer's own `Authorization`.
+/// origin, as RFC 9110 lists them, plus the viewer's own `Authorization` and the headers
+/// CloudFront itself puts on an origin request.
 ///
 /// A viewer credential is never relayed to an origin by this emulator: the origin is named
 /// by the distribution's stored configuration, so forwarding a caller's credential there
 /// would hand it to a destination the caller of THIS request did not choose. Every other
 /// viewer header is forwarded exactly as the behaviour's origin request policy says
 /// ([`forwards_header`]).
-const HEADERS_NEVER_FORWARDED: [&str; 10] = [
+///
+/// [`X_AMZ_CF_ID`] is here for the other reason: it is CloudFront's OWN identifier for the
+/// request it is serving ([`stamp`] mints one per request), so an origin request carries the
+/// edge's value and never a viewer's — a header a viewer sent under that name describes a
+/// request the edge did not serve.
+const HEADERS_NEVER_FORWARDED: [&str; 11] = [
     "authorization",
     "connection",
     "keep-alive",
@@ -208,6 +220,7 @@ const HEADERS_NEVER_FORWARDED: [&str; 10] = [
     "transfer-encoding",
     "upgrade",
     "x-amz-security-token",
+    X_AMZ_CF_ID,
 ];
 
 /// An `OriginRequestPolicyHeadersConfig$HeaderBehavior` that forwards every viewer header.
@@ -314,10 +327,21 @@ fn resolve<'s, 'r>(
         return None;
     }
     let (first, rest) = split_first_segment(addressed.path)?;
-    store.distributions.get(first).map(|distribution| Resolved {
-        distribution,
-        viewer_path: rest,
-    })
+    // The segment is the distribution's id, or the domain name a viewer would have
+    // addressed in the host — the same name, carried where this client could carry it.
+    store
+        .distributions
+        .get(first)
+        .or_else(|| {
+            store
+                .distributions
+                .values()
+                .find(|distribution| serves_host(distribution, bare_host(first)))
+        })
+        .map(|distribution| Resolved {
+            distribution,
+            viewer_path: rest,
+        })
 }
 
 /// Whether `host` is a domain name this distribution is served on: the `DomainName`
@@ -1243,15 +1267,32 @@ async fn fetch_origin<Eng: Send + Sync + 'static>(
     // policy grants this distribution is SIGNED, which is what such an origin serves a
     // request for at all; one it does not grant travels as it would with no control, so the
     // origin answers it itself (see [`origin_access`]).
+    //
+    // A granted fetch is signed AS CloudFront's own service principal, acting for this
+    // distribution: the credential it is signed with is minted for this one request and
+    // recorded as that call, so a decision the origin's service makes itself about it (the
+    // key policy of a KMS key the object's bytes are encrypted under) is made for that
+    // principal rather than for the account. Both the credential and the record are destroyed
+    // when `_as_the_service_principal` is dropped, which is every path out of this function.
+    let mut _as_the_service_principal = None;
     if let Some(access) = &fetch.access {
         if origin_access::grants_origin_request(ctx, access, fetch.read_timeout).await {
-            if let Err(error) = origin_access::sign(&mut request, access, ctx).await {
-                ::tracing::warn!(
+            match origin_access::sign_as_the_service_principal(
+                engine,
+                &mut request,
+                access,
+                ctx,
+                fetch.read_timeout,
+            )
+            .await
+            {
+                Ok(in_flight) => _as_the_service_principal = in_flight,
+                Err(error) => ::tracing::warn!(
                     uri = %fetch.uri,
                     %error,
                     "the origin request could not be signed for this origin access control, \
                      so it is made as a request carrying no credential"
-                );
+                ),
             }
         }
     }

@@ -38,6 +38,16 @@
 //! not read decides nothing here, so the control's own instruction stands and the request is
 //! signed; whatever the origin then answers is what the edge serves.
 //!
+//! One identity the fetch cannot carry on the credential every in-process call shares it
+//! carries on a credential of its own. A decision the ORIGIN's service makes ITSELF about the
+//! fetch (the KMS key policy of the key an SSE-KMS origin object's bytes are encrypted under
+//! is the one here) has to be made for the CloudFront service principal and this
+//! distribution's ARN, not for the account. So a granted fetch is signed with a credential
+//! minted for that one fetch and RECORDED, under it, as the call it is
+//! ([`sign_as_the_service_principal`]); the serving service reads that record for the access
+//! key id the signature was verified against. The resource-policy half is decided here
+//! ([`admits`]) and is not decided again from the record.
+//!
 //! Two limits worth stating. A viewer's own credential is never relayed to an origin
 //! ([`super::edge`]'s `HEADERS_NEVER_FORWARDED` says why), so under `no-override` a request
 //! whose viewer presented one travels with neither that header nor a signature. And the
@@ -190,7 +200,10 @@ pub fn of_fetch(
         return None;
     }
     let signing_name = signing_name(&config.origin_access_control_origin_type)?;
-    let host = host_of(&origin.domain_name);
+    // `Origin$DomainName` is caller-supplied, so what this reads it as is a HOSTNAME or
+    // nothing: an origin whose domain name is not one names no endpoint of any service, and a
+    // control over it signs no request rather than composing one from whatever it says.
+    let host = dns_host(&host_of(&origin.domain_name))?;
     let s3_object = (config.origin_access_control_origin_type == S3_ORIGIN_TYPE)
         .then(|| s3_object(&host, method, object_path))
         .flatten();
@@ -335,6 +348,31 @@ fn host_of(domain_name: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// `host` when it is a well-formed DNS NAME, and `None` when it is not.
+///
+/// An `Origin$DomainName` is caller-supplied, and everything this module does with it — the
+/// bucket it names, the Region it addresses, the resource-policy read it composes itself —
+/// treats it as a hostname. So it is read as one HERE, once, and a value that is not one names
+/// no origin at all: a name is at most 253 characters of 1-to-63-character labels, each of
+/// letters, digits and hyphens alone (RFC 1035's preferred syntax, as every AWS endpoint host
+/// and every S3 bucket host is spelled). That rejects everything that is not a host and would
+/// otherwise travel in a request this module builds — a path or query separator, userinfo, an
+/// address literal, a space, an empty label — so a later test over the name's trailing labels
+/// (`AWS_ENDPOINT_ZONES`) is a test on a label boundary and cannot be fooled by a name whose
+/// authority ends somewhere else.
+fn dns_host(host: &str) -> Option<String> {
+    let well_formed = !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        });
+    well_formed.then(|| host.to_string())
+}
+
 /// Whether the ORIGIN's own resource policy leaves this fetch signed: it grants
 /// [`SERVICE_PRINCIPAL`], acting for this distribution, the action on the object — or it is
 /// a document this emulator cannot read, which decides nothing and leaves the control's own
@@ -416,6 +454,44 @@ enum PolicyRead {
     Unreadable,
 }
 
+/// The zones AWS serves its own endpoints in, and so the only zones an origin whose resource
+/// policy this module READS can be under: every emulated service's endpoint host is in one of
+/// them, and an origin host outside them names no endpoint of the service the control's
+/// `OriginAccessControlOriginType` says this origin belongs to.
+///
+/// `Origin$DomainName` is caller-supplied, so this is what keeps the policy read — the one
+/// request this module composes itself, rather than relaying — to the hosts this emulator
+/// serves. The value tested is already a well-formed DNS name ([`dns_host`], which the access
+/// is built through), and each zone below begins at a label boundary, so the labels this
+/// matches are the trailing labels of the authority the request is actually addressed to.
+/// (It is dispatched over the in-process transport `OperationContext::callback` hands a
+/// handler, which opens no socket and reaches nothing but this emulator; the zone test is the
+/// second half, so the request is not even composed for a host that names no AWS endpoint.)
+const AWS_ENDPOINT_ZONES: [&str; 4] =
+    [".amazonaws.com", ".amazonaws.com.cn", ".api.aws", ".on.aws"];
+
+/// The most bytes of an origin's resource policy this module reads.
+///
+/// An EMULATOR ceiling: the document is answered by another service of this emulator over the
+/// in-process transport, and a document longer than this is not read into an authorization
+/// decision at all. AWS's own bucket-policy limit is 20 KB
+/// ("Bucket policies are limited to 20 KB in size", Amazon S3 User Guide), so a document this
+/// refuses is one no origin could be carrying.
+const MAX_POLICY_DOCUMENT_BYTES: usize = 64 * 1024;
+
+/// Whether `host` is a name under one of [`AWS_ENDPOINT_ZONES`].
+///
+/// `host` is a DNS name ([`dns_host`]) and each zone begins with its separating dot, so the
+/// test is on a label boundary: a name merely ENDING in those characters inside a longer label
+/// (`not-amazonaws.com`) is not under the zone and is not read.
+fn under_an_aws_endpoint_zone(host: &str) -> bool {
+    dns_host(host).is_some_and(|host| {
+        AWS_ENDPOINT_ZONES
+            .iter()
+            .any(|zone| host.ends_with(zone) && host.len() > zone.len())
+    })
+}
+
 /// Read the policy of the bucket an `s3` origin names, through that bucket's own
 /// `GetBucketPolicy` (`GET /{Bucket}?policy`, answered with the document as the payload).
 ///
@@ -423,11 +499,24 @@ enum PolicyRead {
 /// held by the bucket the distribution's configuration names, and signed the way the fetch
 /// itself is — the read is part of serving this viewer request, so it is bounded by the same
 /// origin read timeout.
+///
+/// Two bounds on a read composed from a caller-supplied `DomainName`: the host — a DNS name
+/// by the time an access carries it ([`dns_host`]) — must be under one of the zones AWS
+/// serves its endpoints in ([`AWS_ENDPOINT_ZONES`]), and a document longer than
+/// [`MAX_POLICY_DOCUMENT_BYTES`] is not read. Either way nothing is known about what the
+/// origin grants, which leaves the control's own instruction standing.
 async fn bucket_policy(
     ctx: &OperationContext<'_>,
     access: &OriginAccess,
     read_timeout: Duration,
 ) -> PolicyRead {
+    if !under_an_aws_endpoint_zone(&access.host) {
+        ::tracing::debug!(
+            origin = %access.host,
+            "this origin's host names no AWS endpoint, so no resource policy of it is read"
+        );
+        return PolicyRead::Unreadable;
+    }
     let uri = format!("https://{}/?{BUCKET_POLICY_QUERY}", access.host);
     let built = ::http::Request::builder()
         .method("GET")
@@ -443,6 +532,15 @@ async fn bucket_policy(
     let Ok((status, body)) = call(ctx, request, read_timeout).await else {
         return PolicyRead::Unreadable;
     };
+    if body.len() > MAX_POLICY_DOCUMENT_BYTES {
+        ::tracing::debug!(
+            origin = %access.host,
+            bytes = body.len(),
+            "the origin answered more than this emulator reads of a resource policy, so \
+             nothing it states is known for this origin request"
+        );
+        return PolicyRead::Unreadable;
+    }
     let text = String::from_utf8_lossy(&body).to_string();
     if status == 200 {
         return PolicyRead::Document(text);
@@ -481,6 +579,180 @@ async fn call(
         .map(<[u8]>::to_vec)
         .unwrap_or_default();
     Ok((status, body))
+}
+
+/// How long past the fetch's own deadline an in-flight record stays readable.
+///
+/// What ENDS a record is the guard being dropped, which happens on every path out of the
+/// fetch; the deadline is the floor that bounds a record nothing dropped (see
+/// [`::service_common::service_principal_calls`]). It sits beyond the fetch's deadline so a
+/// record can never expire while the ORIGIN's own handler is still deciding the call — a read
+/// that found no record would be decided against the credential instead, which is the one
+/// thing this design must not let happen.
+const IN_FLIGHT_RECORD_SLACK: Duration = Duration::from_secs(60);
+
+/// Sign one origin request AS [`SERVICE_PRINCIPAL`], acting for the distribution `access` was
+/// built for, and record that call for as long as it is in flight.
+///
+/// The CREDENTIAL is what says whose call this is. This mints one in the emulator's own
+/// credential store for this one fetch, signs the fetch with it, and records under its access
+/// key id the principal the call is made as and the resource it is made for
+/// ([`::service_common::service_principal_calls`]). The service SERVING the fetch — the KMS
+/// key policy of the key an origin object's bytes are encrypted under is the decision that
+/// needs this — resolves the record from the access key id the signature was verified
+/// against, and so decides the fetch for the CloudFront service principal and this
+/// distribution's ARN, exactly as the bucket-policy half is decided here ([`admits`]).
+///
+/// The credential and the record live only as long as the call: the returned value deletes
+/// both when it is dropped, which is every path out of the fetch, and the record carries the
+/// fetch's own read timeout as its deadline so neither outlives the request it describes.
+///
+/// A fetch that cannot be made AS that principal is not made as the ACCOUNT instead: on an
+/// engine carrying no such directory, or when the directory already holds as many in-flight
+/// calls as it records, the request is left UNSIGNED (`Ok(None)`), so the origin answers it as
+/// it answers a caller presenting no credential — the same travel a fetch the origin's own
+/// document does not grant makes. Signing it with the credential every in-process call
+/// carries would decide the origin's own checks for the ACCOUNT, which a default key policy
+/// permits and AWS would refuse. `Err` carries what went wrong as text, with the request left
+/// unsigned for the caller to report.
+pub async fn sign_as_the_service_principal<'e, Eng: Send + Sync + 'static>(
+    engine: &'e Eng,
+    request: &mut ::http::Request<Vec<u8>>,
+    access: &OriginAccess,
+    ctx: &'e OperationContext<'_>,
+    read_timeout: Duration,
+) -> Result<Option<InFlightOriginRequest<'e, Eng>>, String> {
+    let Some(directory) = in_flight_calls(engine) else {
+        // No directory to record the call in, so there is no way for the origin's service to
+        // decide it as the CloudFront principal: the request travels UNSIGNED rather than as
+        // the account, and the origin answers it as it answers a credential-less caller.
+        ::tracing::warn!(
+            origin = %access.host,
+            "this emulator holds no directory of service-principal calls, so this origin \
+             request is made carrying no credential"
+        );
+        return Ok(None);
+    };
+    let minted = ctx
+        .credential_store()
+        .create(&::emulator_server::aws_credentials::AWS_ACCESS_KEY);
+    let Some(secret) = minted
+        .secret(::emulator_server::aws_credentials::SECRET_ACCESS_KEY)
+        .map(str::to_string)
+    else {
+        let _ = ctx.credential_store().delete(&minted.id);
+        return Err("the credential store minted no secret for this origin request".to_string());
+    };
+    let now = ::std::time::SystemTime::now();
+    let Some(source_account) = source_account(access) else {
+        // The distribution's own ARN names no account, so no record could carry the
+        // `aws:SourceAccount` a reader matches on: the request is made carrying no credential
+        // rather than as the account, the same narrow answer the cap path gives.
+        ::tracing::warn!(
+            origin = %access.host,
+            distribution = %access.source_arn,
+            "this distribution's ARN names no account, so this origin request cannot be made \
+             as the CloudFront service principal and is made carrying no credential"
+        );
+        let _ = ctx.credential_store().delete(&minted.id);
+        return Ok(None);
+    };
+    let recorded = directory.lock().remember(
+        minted.id.clone(),
+        ::service_common::service_principal_calls::ServicePrincipalCall {
+            principal: SERVICE_PRINCIPAL.to_string(),
+            source_arn: access.source_arn.clone(),
+            source_account,
+            expires_at: now + read_timeout + IN_FLIGHT_RECORD_SLACK,
+        },
+        now,
+    );
+    if !recorded {
+        // The same narrow answer: an unrecorded call is made carrying no credential, never as
+        // the account.
+        ::tracing::warn!(
+            origin = %access.host,
+            "this emulator is already making as many service-principal calls as it records \
+             at once, so this origin request is made carrying no credential"
+        );
+        let _ = ctx.credential_store().delete(&minted.id);
+        return Ok(None);
+    }
+    let in_flight = InFlightOriginRequest {
+        engine,
+        credentials: ctx.credential_store(),
+        access_key_id: minted.id.clone(),
+    };
+    ::service_common::in_process_sigv4::sign_in_process_request_as(
+        request,
+        access.signing_name,
+        &access.region,
+        &minted.id,
+        &secret,
+    )
+    .await?;
+    Ok(Some(in_flight))
+}
+
+/// The account the distribution an origin request is made for belongs to, read out of its own
+/// ARN through the tree's one ARN parse: the value of `aws:SourceAccount`, and what scopes the
+/// record to this account.
+///
+/// `None` for an ARN that names no account, which no record can be written for: a record
+/// carrying no account matches no reader, and a call that cannot be recorded is made carrying
+/// no credential rather than as the account.
+fn source_account(access: &OriginAccess) -> Option<String> {
+    ::service_common::arn::parse(&access.source_arn)
+        .map(|arn| arn.account.to_string())
+        .filter(|account| !account.is_empty())
+}
+
+/// The shared directory of in-flight service-principal calls, in the one shared engine:
+/// written here and read by the service serving the origin request.
+fn in_flight_calls<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<
+    ::engine::ServiceState<::service_common::service_principal_calls::ServicePrincipalCalls>,
+> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::service_principal_calls::ServicePrincipalCalls,
+            >,
+        )
+}
+
+/// One origin request's own credential and in-flight record, held for as long as that request
+/// is being made.
+///
+/// Dropping it forgets the record and DELETES the credential, so the identity this call was
+/// made under exists only while the edge is waiting for it: a credential nothing holds can
+/// sign nothing, and a record nothing holds decides nothing.
+pub struct InFlightOriginRequest<'e, Eng: Send + Sync + 'static> {
+    engine: &'e Eng,
+    credentials: &'e ::emulator_server::CredentialStore,
+    access_key_id: String,
+}
+
+/// Prints the access key id of the credential, never a secret: the store never hands one back
+/// after creating it, so there is none here to print.
+impl<Eng: Send + Sync + 'static> ::std::fmt::Debug for InFlightOriginRequest<'_, Eng> {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("InFlightOriginRequest")
+            .field("access_key_id", &self.access_key_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<Eng: Send + Sync + 'static> Drop for InFlightOriginRequest<'_, Eng> {
+    fn drop(&mut self) {
+        if let Some(directory) = in_flight_calls(self.engine) {
+            directory.lock().forget(&self.access_key_id);
+        }
+        let _ = self.credentials.delete(&self.access_key_id);
+    }
 }
 
 /// SigV4-sign one origin request in place, for the service and Region the origin addresses.
@@ -775,6 +1047,53 @@ mod tests {
                     object.resource
                 );
             }
+        }
+    }
+
+    /// An `Origin$DomainName` is read as a HOSTNAME or as nothing, and only a name under one
+    /// of the zones AWS serves its endpoints in has a resource policy read from it.
+    ///
+    /// The rows span what the reading has to separate: the endpoint hosts an S3 origin takes
+    /// in each AWS zone, a customer domain, and every shape a caller-supplied value takes that
+    /// is not a hostname at all — a path or query separator, userinfo, a backslash, a space,
+    /// an empty label, an over-long label — including the ones that would end in an AWS zone
+    /// while addressing something else, and a name whose last labels merely spell a zone
+    /// inside a longer label.
+    #[test]
+    fn a_domain_name_is_read_as_a_host_and_only_an_aws_endpoint_host_is_read_for_a_policy() {
+        let longest_label = "a".repeat(63);
+        let over_long_label = "a".repeat(64);
+        let rows: [(&str, bool, bool); 16] = [
+            ("reports.s3.us-east-1.amazonaws.com", true, true),
+            ("reports.s3.amazonaws.com", true, true),
+            ("reports.s3-website-us-east-1.amazonaws.com", true, true),
+            ("reports.s3.cn-north-1.amazonaws.com.cn", true, true),
+            ("abc123.lambda-url.us-east-1.on.aws", true, true),
+            ("reports.s3.us-east-1.api.aws", true, true),
+            (&format!("{longest_label}.s3.us-east-1.amazonaws.com"), true, true),
+            ("content.example.com", true, false),
+            ("not-amazonaws.com", true, false),
+            ("elsewhere.example.com/.amazonaws.com", false, false),
+            ("elsewhere.example.com?.amazonaws.com", false, false),
+            ("user@elsewhere.example.com", false, false),
+            ("elsewhere.example.com\\.amazonaws.com", false, false),
+            ("a space.amazonaws.com", false, false),
+            ("reports..s3.us-east-1.amazonaws.com", false, false),
+            (&format!("{over_long_label}.s3.amazonaws.com"), false, false),
+        ];
+        for (domain_name, a_host, read_for_a_policy) in rows {
+            let read = dns_host(&host_of(domain_name));
+            assert_eq!(
+                read.is_some(),
+                a_host,
+                "case {domain_name:?}: expected a host {a_host}, got {read:?}"
+            );
+            let under_a_zone = under_an_aws_endpoint_zone(&host_of(domain_name));
+            assert_eq!(
+                under_a_zone, read_for_a_policy,
+                "case {domain_name:?}: expected a policy read {read_for_a_policy}, got \
+                 {under_a_zone}"
+            );
         }
     }
 }

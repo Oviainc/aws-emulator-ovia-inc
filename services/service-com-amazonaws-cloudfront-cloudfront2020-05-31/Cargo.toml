@@ -24,7 +24,9 @@ tracing = { workspace = true }
 # `iam_authorization`: the ONE evaluation of the resource policy an origin states its grant
 # to the CloudFront service principal in; `in_process_sigv4`: the ONE signature an
 # in-process call to another emulated service carries; `s3_bucket_name`: whether a host
-# label names a bucket; `arn`: the account an ARN belongs to.
+# label names a bucket; `arn`: the account an ARN belongs to;
+# `service_principal_calls`: the directory of the calls this service makes AS the CloudFront
+# service principal, which the service serving one reads.
 service-common = { path = "../common" }
 
 [build-dependencies]

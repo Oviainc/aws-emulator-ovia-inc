@@ -99,6 +99,11 @@
 //!   identities Amazon SES's two APIs publish, written by whichever surface records or
 //!   deletes an identity and read by both, so an identity created with the modern API
 //!   is listed, reported and gated on by the legacy one and the other way round;
+//! * [`service_principal_calls`], the cross-service calls one service is making as its own
+//!   SERVICE PRINCIPAL on behalf of one of its resources — written by the calling service
+//!   while its call is in flight and read by the service that authorizes that call, which
+//!   cannot read the caller's store and cannot read the principal off a credential every
+//!   in-process call shares;
 //! * [`ad_directories`], the inventory of which Active Directory directories the account
 //!   holds — written by the AWS Directory Service control plane, which creates and deletes
 //!   them, and read by the Directory Service DATA plane, whose own API creates no directory
@@ -436,6 +441,11 @@ pub mod ses_identities;
 /// Which member paths a boundary refusal states no value for, read from a service's own
 /// Smithy model: the members it marks `@sensitive`.
 pub mod sensitive_members;
+/// The cross-service calls one emulated service is making AS ITS OWN SERVICE PRINCIPAL, on
+/// behalf of one of its resources — written by the calling service for as long as its call
+/// is in flight, read by the service that has to authorize that call and cannot read the
+/// caller's store.
+pub mod service_principal_calls;
 pub mod shared_path;
 /// The ONE list of SQL functions caller SQL may call, for every data plane that runs it on
 /// the in-process SQLite engine.

@@ -77,11 +77,41 @@ pub async fn sign_callback_request(
         .provide_credentials()
         .await
         .map_err(|error| error.to_string())?;
+    sign_in_process_request_as(
+        request,
+        signing_name,
+        region,
+        credentials.access_key_id(),
+        credentials.secret_access_key(),
+    )
+    .await
+}
+
+/// The same signature, made with a credential the CALLER holds rather than with the
+/// framework's own.
+///
+/// One call a service makes for another identity than its own needs this: a credential its
+/// operation created in the emulator's credential store
+/// (`OperationContext::credential_store`), which the emulator's verifier resolves exactly as
+/// it resolves the framework's — so the call is served with request authentication on, and
+/// the service SERVING it can tell which credential made it. Everything else is
+/// [`sign_callback_request`]'s: the same settings the verifier re-signs with, and nothing
+/// read from outside the request.
+///
+/// The secret is put in the request's `Authorization` and nowhere else — never in a
+/// response, a log or a file.
+pub async fn sign_in_process_request_as(
+    request: &mut ::http::Request<Vec<u8>>,
+    signing_name: &str,
+    region: &str,
+    access_key_id: &str,
+    secret_access_key: &str,
+) -> Result<(), String> {
     let identity: ::aws_smithy_runtime_api::client::identity::Identity =
         ::aws_credential_types::Credentials::builder()
             .provider_name(PROVIDER_NAME)
-            .access_key_id(credentials.access_key_id())
-            .secret_access_key(credentials.secret_access_key())
+            .access_key_id(access_key_id)
+            .secret_access_key(secret_access_key)
             .build()
             .into();
     let mut settings = SigningSettings::default();

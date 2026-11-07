@@ -43,6 +43,9 @@ mod cloudformation_sam_function_writes_its_table;
 mod s3_address_forms;
 #[path = "all/cloudformation_refuses_s3vectors_vector_buckets.rs"]
 mod cloudformation_refuses_s3vectors_vector_buckets;
+// Declared here, in this same head region, for the reason the entries above record.
+#[path = "all/cloudfront_oac_kms_s3_origin_edge.rs"]
+mod cloudfront_oac_kms_s3_origin_edge;
 // Declared here, in this same head region, for the reason the entry above records: the
 // appended tail and the sorted `a…` span (where the other apigateway suites land) are both
 // regions concurrently landing suites add their line to.

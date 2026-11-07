@@ -61,6 +61,13 @@
 //! * **A principal holding an attachment this emulator cannot read.** An AWS-MANAGED
 //!   policy's document belongs to AWS, not to this account, so refusing on evidence this
 //!   emulator does not have would deny access AWS permits.
+//! * **An AWS SERVICE acting for one of its own resources.** A cryptographic operation
+//!   another service performs as its OWN service principal — CloudFront opening the bytes
+//!   of an origin object for a fetch its origin access control signed — is made by no
+//!   principal of this account at all ([`Caller::service_principal`]): it holds no
+//!   identity-based policies and naming the account grants it nothing, so the key policy is
+//!   the whole decision, and what it carries beside its principal is the resource it acts
+//!   for.
 //!
 //! An expired session credential speaks for nobody: it carries no documents and no
 //! principal spelling, so every action it asks for is refused.
@@ -79,7 +86,10 @@
 //! rather than left undecided. `kms:ViaService` is answered for the requests that have a
 //! value for it — the ones another service makes on the caller's behalf, which name
 //! themselves through [`RequestedUse::through_service`] — and for a request a caller makes
-//! directly to this service there is no such value, so it is left unpublished there. Every
+//! directly to this service there is no such value, so it is left unpublished there. A
+//! request another service makes as its own service principal answers instead for
+//! `aws:SourceArn` and `aws:SourceAccount` — the keys a grant to such a principal is scoped
+//! by — and for no principal ARN, since no IAM entity made it. Every
 //! other key is left unpublished too, so a statement naming one stays undecided and the
 //! shared evaluator reads it fail-closed.
 
@@ -110,6 +120,15 @@ const ENCRYPTION_CONTEXT_KEY_FAMILY: &str = "kms:EncryptionContext:";
 /// with those specified in the policy" (KMS's own condition keys). A multi-valued key, so a
 /// statement decides it under one of IAM's set qualifiers.
 const ENCRYPTION_CONTEXT_KEYS_KEY: &str = "kms:EncryptionContextKeys";
+
+/// The global condition keys that name the RESOURCE a request was made ON BEHALF OF, and
+/// the account holding it: "aws:SourceArn — the ARN of the resource that is making a
+/// service-to-service request" and "aws:SourceAccount — the account the resource making a
+/// service-to-service request belongs to" (IAM's global condition keys). Only a request
+/// another AWS service makes as its own service principal for one of its resources has a
+/// value for either, and a key policy written for such a caller is scoped by them.
+const SOURCE_ARN_KEY: &str = "aws:SourceArn";
+const SOURCE_ACCOUNT_KEY: &str = "aws:SourceAccount";
 
 /// The condition key naming the service a request was made THROUGH: "kms:ViaService …
 /// limits use of a KMS key to requests from particular Amazon Web Services services" (KMS's
@@ -146,9 +165,55 @@ pub struct Caller {
     /// Set when the principal has a policy attached whose document the IAM store does
     /// not hold — an AWS-managed policy (see the module docs).
     pub unreadable_attachment: bool,
+    /// Set for a request another AWS SERVICE made as its own service principal on behalf of
+    /// one of its resources ([`Caller::service_principal`]): the resource that request was
+    /// made for. `None` for a request a caller made with a credential of its own, which has
+    /// no value for [`SOURCE_ARN_KEY`] at all.
+    pub on_behalf_of: Option<CallingResource>,
+}
+
+/// The resource a service-to-service request was made ON BEHALF OF, as the condition keys
+/// a grant to a service principal is scoped by name it.
+#[derive(Debug, Clone)]
+pub struct CallingResource {
+    /// The resource's ARN — the value of [`SOURCE_ARN_KEY`].
+    pub arn: String,
+    /// The account holding it — the value of [`SOURCE_ACCOUNT_KEY`], empty for an ARN that
+    /// names no account, which declares no value for that key rather than a guess.
+    pub account: String,
 }
 
 impl Caller {
+    /// The caller of a request an AWS SERVICE made as its own service principal on behalf of
+    /// one of its own resources — the shape of a cryptographic operation CloudFront performs
+    /// for an origin fetch its origin access control signed, which arrives as the
+    /// `cloudfront.amazonaws.com` principal with `aws:SourceArn` naming the distribution.
+    ///
+    /// Such a caller is NOT a principal of the account: it holds no identity-based policies
+    /// (there is no IAM entity to attach one to), and naming the account grants it nothing,
+    /// so the KEY's own policy is the only document in force over it — which is why a key
+    /// whose policy does not name the service principal refuses it even when the account's
+    /// own credential would be served. What it carries instead is the resource it acts for,
+    /// which is what a grant to that principal is scoped by ([`CallingResource`]).
+    #[must_use]
+    pub fn service_principal(principal: &str, source_arn: &str) -> Self {
+        let account = ::service_common::arn::parse(source_arn)
+            .map(|arn| arn.account.to_string())
+            .unwrap_or_default();
+        Self {
+            arn: principal.to_string(),
+            principals: vec![principal.to_string()],
+            account: Vec::new(),
+            documents: Vec::new(),
+            account_credential: false,
+            unreadable_attachment: false,
+            on_behalf_of: Some(CallingResource {
+                arn: source_arn.to_string(),
+                account,
+            }),
+        }
+    }
+
     /// Whether `grant` was issued to THIS caller, so the permissions it carries are the
     /// caller's: "the grantee principal" is the identity a grant gives permission to, and
     /// a session of a role is the role it is a session of.
@@ -520,7 +585,18 @@ fn request_conditions(
 ) -> RequestConditions {
     let mut carried = Vec::new();
     let mut published = Vec::new();
-    if !caller.principals.is_empty() {
+    // A request another service made AS ITS OWN SERVICE PRINCIPAL answers for the resource it
+    // was made on behalf of, and for no principal ARN: a service principal is not an IAM
+    // entity, so there is no `aws:PrincipalArn` value to compare and a clause over one stays
+    // undecided rather than being decided against a service name.
+    if let Some(source) = &caller.on_behalf_of {
+        carried.push((SOURCE_ARN_KEY.to_string(), source.arn.clone()));
+        published.push(SOURCE_ARN_KEY);
+        if !source.account.is_empty() {
+            carried.push((SOURCE_ACCOUNT_KEY.to_string(), source.account.clone()));
+            published.push(SOURCE_ACCOUNT_KEY);
+        }
+    } else if !caller.principals.is_empty() {
         carried.push((PRINCIPAL_ARN_KEY.to_string(), caller.arn.clone()));
         published.push(PRINCIPAL_ARN_KEY);
         let account = ::service_common::arn::parse(&caller.arn)
@@ -625,6 +701,7 @@ pub fn caller<Eng: Send + Sync + 'static>(
                 documents: Vec::new(),
                 account_credential: false,
                 unreadable_attachment: false,
+                on_behalf_of: None,
             }
         }
     };
@@ -636,6 +713,7 @@ pub fn caller<Eng: Send + Sync + 'static>(
         arn: identity.arn,
         documents: Vec::new(),
         unreadable_attachment: false,
+        on_behalf_of: None,
     };
     let Some(iam_state) = iam_store::service_state(engine) else {
         return caller;

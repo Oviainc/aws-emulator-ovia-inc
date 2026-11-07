@@ -21,14 +21,28 @@
 //! role admits that role's sessions and leaves every other session to the policy's other
 //! statements.
 //!
+//! One class of read presents no credential of a caller's at all: a read ANOTHER AWS SERVICE
+//! performs as its own service principal for one of its resources — CloudFront fetching an
+//! origin object for a distribution whose origin access control signed the fetch. AWS decides
+//! such a read for that service principal, with `aws:SourceArn` naming the resource it acts
+//! for, so a key whose policy grants `cloudfront.amazonaws.com` for one distribution opens an
+//! object's bytes for that distribution's fetches and for nothing else. Which calls are in
+//! that class is recorded by the calling service, under the access key id of the credential
+//! it created for the one call and signed it with, for only as long as that call is in flight
+//! ([`::service_common::service_principal_calls`]) — so the record is resolved here from the
+//! access key id the request PRESENTS, which the emulator's verifier resolves and checks the
+//! signature against when request authentication is on, and from the account this service
+//! serves; a read presenting any other credential is decided as above.
+//!
 //! Both halves are the KMS service's OWN ([`kms_store::authorization`]), made against the
 //! key policy, caller identity policies and grants that KMS's and IAM's handlers wrote, so
 //! this service and KMS cannot disagree about a key and the refusal a caller sees is the
 //! sentence KMS itself words for it. This module reaches no state of THIS service, so a
 //! handler asks it while still holding its own store guard — the object whose bytes are
 //! about to be served is the one the guard is held for, and the stores this reads (KMS's,
-//! and through it STS's and IAM's) belong to services that do not read this one's, so no
-//! call here can come back round to the guard a caller holds.
+//! and through it STS's and IAM's, beside the shared directory of in-flight
+//! service-principal calls) belong to services that do not read this one's, so no call here
+//! can come back round to the guard a caller holds.
 //!
 //! What is NOT decided here: a read that serves no bytes. "A HEAD request has the same
 //! options as a GET operation on an object" (`HeadObject`'s own documentation) except that
@@ -105,7 +119,7 @@ pub fn decrypt_refusal<Eng: Send + Sync + 'static>(
     let kms = kms_store::service_state(engine)?;
     // The caller is resolved before the KMS store is locked, because resolving it reads
     // the STS and IAM stores.
-    let caller = kms_store::authorization::caller(engine, ctx);
+    let caller = caller(engine, ctx);
     let store = kms.lock();
     let key = match store.resolve(region, key_id) {
         kms_store::KeyRef::Found(key) => key,
@@ -133,6 +147,57 @@ pub fn decrypt_refusal<Eng: Send + Sync + 'static>(
         None,
     )
     .err()
+}
+
+/// Whose read this is, as the key policy decides it.
+///
+/// A read ANOTHER AWS SERVICE is performing as its own service principal for one of its
+/// resources is that principal, acting for that resource: the calling service signed the call
+/// with a credential it created for it alone and recorded both under that credential's access
+/// key id, so the record is resolved from the access key id the request PRESENTS — the
+/// credential the emulator's verifier resolves, and checks the signature against when request
+/// authentication is on — and only for a call of this account (see the module docs). Every
+/// other read is the principal of the credential it presents, which is KMS's own resolution
+/// ([`kms_store::authorization::caller`]).
+fn caller<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> kms_store::authorization::Caller {
+    if let Some(directory) = service_principal_calls(engine) {
+        let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+        let account = ::engine::emulator_account_id();
+        let now = ::std::time::SystemTime::now();
+        let held = directory.lock();
+        if let Some(call) = held.call(&access_key_id, account, now) {
+            ::tracing::debug!(
+                principal = %call.principal,
+                source_arn = %call.source_arn,
+                "this read is one another service is making as its own service principal, so \
+                 the object's key is asked about that principal"
+            );
+            return kms_store::authorization::Caller::service_principal(
+                &call.principal,
+                &call.source_arn,
+            );
+        }
+    }
+    kms_store::authorization::caller(engine, ctx)
+}
+
+/// The shared directory of the cross-service calls another service is making as its own
+/// service principal, in the one shared engine: written by that service, read here.
+fn service_principal_calls<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<
+    ::engine::ServiceState<::service_common::service_principal_calls::ServicePrincipalCalls>,
+> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::service_principal_calls::ServicePrincipalCalls,
+            >,
+        )
 }
 
 /// The encryption context the data key of `object` is bound to, which is what a key policy
