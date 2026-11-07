@@ -1,0 +1,43 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: bedrock-agent__lambda__opensearchserverless.bedrock-kb-opensearchserverless-data-access-policy-missing-negative
+Issue-Key: bedrock-agent__lambda__opensearchserverless.bedrock-kb-opensearchserverless-data-access-policy-missing-negative|_create_vector_index#16|AssertionError|raise AssertionError(f"could not create vector index after retries: {last_exc}")
+Issue-Commit: edd8d27229a8bc99e308a4b32d393f13d6f32cb7
+
+# bedrock-agent__lambda__opensearchserverless: the published VECTORSEARCH collectionEndpoint answers the harness's own OpenSearch REST index create with 400 SerializationException 'missing required header x-amz-target', so CreateKnowledgeBase's missing-data-access-grant refusal is never reached
+
+> _Note: this issue was identified against the code base at commit `edd8d27229a8bc99e308a4b32d393f13d6f32cb7`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateKnowledgeBase
+
+## Description
+ONE net-new root cause, grounded in the single failing behavioral check listed under the `bedrock-agent__lambda__opensearchserverless` service heading that the replay report did NOT mark ALREADY FILED or OWNED. Overlap note: the open issues 20261104T034157Z-bedrock-agent-lambda-opensearchserverles-...-the-published-vectorsearch-collection.md, 20261102T091854Z-bedrock-agent-lambda-opensearchserverles-...-a-vectorsearch-collection-endpoint.md and 20261029T191222Z-bedrock-agent-lambda-opensearchserverles-...-4-net-new-causes.md describe the same wall under this service token, but the suite bound none of them to this check's replay key (the report lists this check with no OWNED marker), so it is filed here to carry that key; if one of those lands first this closes with it.
+
+=== Cause 1 of 1: the collection endpoint published for a VECTORSEARCH collection serves the AWS-JSON RPC front door instead of the OpenSearch REST data plane, so the index under test cannot be created and the permission-boundary refusal it gates is never produced ===
+AWS: the collection data plane is the OpenSearch REST API and is not Smithy-modeled, so that leg is recorded behavior only; the control plane does state the contract — Smithy (com.amazonaws.opensearchserverless) documents CollectionDetail.collectionEndpoint as the "Collection-specific endpoint used to submit index, search, and data upload requests to an OpenSearch Serverless collection". Recorded behavior: with a data-access policy that grants index permissions to the harness's own identity (and deliberately NOT to the knowledge-base role), a SigV4-signed (service name `aoss`) PUT of a knn_vector index body to https://<collectionEndpoint>/<indexName> — opensearch-py `indices.create`, with NO `x-amz-target` header, because the OpenSearch REST protocol has no RPC target — is accepted, and a HEAD of that index then reports it visible. Only then is the behavior under test observable: bedrock-agent CreateKnowledgeBase naming that index with a role that has no data access grant is refused with a ValidationException whose message is the fixed service text "The knowledge base storage configuration provided is invalid... Dependency error document status code: 403, error message: Bad Authorization"; adding the grant to the same policy makes the identical request succeed.
+Emulator: the index-create PUT to the host the emulator itself published as collectionEndpoint is answered HTTP 400 with body {"__type":"SerializationException","message":"missing required header `x-amz-target`"} — fixed emulator text, no part derived from the request — raised to the client as opensearchpy.exceptions.RequestError(400, ...). The published endpoint host reaches the AWS-JSON `x-amz-target` dispatcher rather than an OpenSearch REST handler. The check retries and then asserts "could not create vector index after retries", so no index exists and neither the negative CreateKnowledgeBase refusal nor the positive control after the grant is added is ever exercised.
+Why: the emulator advertises an endpoint for index, search and data-upload requests and then rejects every such request as malformed, blaming a header the OpenSearch protocol does not define. A client cannot stand up the vector store a Bedrock knowledge base requires, so the whole permission boundary this check protects — that a knowledge base role without an AOSS data access grant is refused rather than silently accepted — is unverifiable and, in practice, unenforceable by any caller.
+Fix: the opensearchserverless collection data plane plus the emulator's host/endpoint routing table — route the host published as CollectionDetail.collectionEndpoint to an OpenSearch REST handler (index create/head/get/delete, document index and search) that authorises SigV4 `aoss` requests against the collection's data-access policy, rather than letting that host fall through to the AWS-JSON target dispatcher. With the index reachable, the bedrock-agent CreateKnowledgeBase handler's storage-configuration validation (403 'Bad Authorization' dependency error surfaced as the ValidationException message above) is what the check then measures.
+Traces: bedrock-agent__lambda__opensearchserverless.bedrock-kb-opensearchserverless-data-access-policy-missing-negative.
+
+## Evidence
+Expected (recorded AWS): PUT https://<collectionEndpoint>/<indexName>, SigV4-signed with service name 'aoss', is accepted and the knn_vector index becomes visible to HEAD. bedrock-agent.create_knowledge_base naming that index with a role holding no AOSS data access grant is then refused: Error.Code 'ValidationException', Error.Message 'The knowledge base storage configuration provided is invalid... Dependency error document status code: 403, error message: Bad Authorization' (fixed service text; the only request-derived parts of this flow are the collection/index/role names). After update_access_policy adds the grant for that role, the identical CreateKnowledgeBase succeeds.
+
+Actual (emulator), from the replay output for bedrock-agent__lambda__opensearchserverless.bedrock-kb-opensearchserverless-data-access-policy-missing-negative:
+  File "check_bedrock_agent__lambda__opensearchserverless_bedrock_kb_opensearchserverless_data_access_policy_missing_negative.py", line 68, in run
+    _create_vector_index(ctx, search_client, index_name)
+  File "check_bedrock_agent__lambda__opensearchserverless_bedrock_kb_opensearchserverless_data_access_policy_missing_negative.py", line 448, in _create_vector_index
+    raise AssertionError(f"could not create vector index after retries: {last_exc}")
+  AssertionError: could not create vector index after retries: RequestError(400, '{"__type":"SerializationException","message":"missing required header `x-amz-target`"}')
+
+The diverging response is HTTP 400, __type 'SerializationException', message 'missing required header `x-amz-target`' — entirely fixed emulator text, with nothing taken from the request, the collection or the index name. No CreateKnowledgeBase call is made, so the expected ValidationException is never observed.
+
+## Steps to Reproduce
+1. opensearchserverless.create_security_policy(type='encryption') for the collection name; create a private VPC endpoint and a network policy admitting it; create_access_policy(type='data') granting index and collection permissions to the CALLER's ARN only (deliberately omit the knowledge-base role).
+2. iam.create_role for the knowledge-base role (not named in the data access policy).
+3. opensearchserverless.create_collection(name=<name>, type='VECTORSEARCH'); poll batch_get_collection until ACTIVE; read collectionDetails[0].collectionEndpoint; wait for the VPC endpoint to be ACTIVE.
+4. With opensearch-py signing SigV4 as service 'aoss', call client.indices.create(index=<index name>, body={'settings': {'index.knn': True}, 'mappings': {'properties': {'vector_field': {'type': 'knn_vector', 'dimension': 1536, ...}, 'text_field': {'type': 'text'}, 'metadata_field': {'type': 'text'}}}}) against that endpoint.
+   -> HTTP 400 {"__type":"SerializationException","message":"missing required header `x-amz-target`"} instead of a created index.
+5. Because step 4 never succeeds, the legs under test are unreachable: bedrock-agent.create_knowledge_base over that index with the ungranted role (expected ValidationException 'The knowledge base storage configuration provided is invalid... Dependency error document status code: 403, error message: Bad Authorization'), then opensearchserverless.update_access_policy adding the grant and the same CreateKnowledgeBase succeeding.
