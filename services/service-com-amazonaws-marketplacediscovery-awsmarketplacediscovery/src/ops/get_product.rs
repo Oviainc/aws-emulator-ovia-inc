@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let product = state.products.get(&input.product_id).ok_or_else(|| {
             GetProductErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::not_found_message("Product")),
+                message: Some(crate::state::not_found_message("productId")),
             })
         })?;
 

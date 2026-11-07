@@ -5,10 +5,10 @@
 //!
 //! The rule under test: a string input member carrying a `@pattern` is accepted only when
 //! the whole of its value matches that expression, and a value that merely CONTAINS a
-//! match is refused with HTTP 400 `ValidationException` naming the member and the pattern.
-//! Smithy specifies the trait as a find (match somewhere in the value), which coincides
-//! with the whole-value reading for every expression a model anchors with `^` / `$` and is
-//! weaker for an unanchored one — and this service models exactly one unanchored pattern,
+//! match is refused with HTTP 400 `ValidationException` naming the member. Smithy
+//! specifies the trait as a find (match somewhere in the value), which coincides with the
+//! whole-value reading for every expression a model anchors with `^` / `$` and is weaker
+//! for an unanchored one — and this service models exactly one unanchored pattern,
 //! `SearchText`'s `[^\n]*` (`smithy_query(query="shape",shape="SearchText")`), carried by
 //! `SearchFacetsInput$searchText` and `SearchListingsInput$searchText`.
 //!
@@ -16,6 +16,8 @@
 //!
 //! * the unanchored member, over a set of values differing in WHERE the line feed sits,
 //!   how many there are, and what else the value holds — on BOTH operations that carry it;
+//!   how that refusal is WORDED is this service's own sentence, pinned in
+//!   `tests/all/refusal_wording.rs`;
 //! * every other character the same pattern admits, swept over the whole ASCII control
 //!   range plus the sizes and scripts a search query can carry, which must still be
 //!   answered from the catalog;
@@ -32,6 +34,7 @@ use serde_json::{json, Value};
 // asserting the status and the error code) declared once in `validation_message_rules` —
 // reused here rather than copied.
 use crate::catalog_drilldown::router;
+use crate::refusal_wording::NEWLINE_REFUSAL;
 use crate::validation_message_rules::{call, refused, VALIDATION_STATUS};
 
 // The generated input schemas and the model-pattern lookup the service's whole-value check
@@ -41,17 +44,16 @@ use service_com_amazonaws_marketplacediscovery_awsmarketplacediscovery::ops::typ
 };
 use service_com_amazonaws_marketplacediscovery_awsmarketplacediscovery::state::modelled_member_pattern;
 
-/// The clause this service reports a `@pattern` violation with, as
-/// `tests/all/validation_message_rules.rs` pins it for every other pattern-bearing member:
-/// the envelope, the member path, and the expression with its `^` / `$` anchors stripped.
+/// The sentence this service refuses a `searchText` outside its modelled pattern with: the
+/// member's name and the rule it broke, declared once in `tests/all/refusal_wording.rs`
+/// (which pins it as a wording rule, over the same class of values and the parts the
+/// sentence may not carry). The pattern excludes one character, the line feed, which is
+/// what the sentence states.
 ///
 /// Source: `smithy_query(query="shape",shape="SearchText")` — `@length 1..512`,
 /// `@pattern "[^\n]*"`, which the model spells with a LITERAL line feed inside the
-/// character class and the service quotes as the escape matching the same character.
+/// character class.
 const SEARCH_TEXT_PATTERN: &str = r"[^\n]*";
-const PATTERN_CLAUSE: &str =
-    "at 'searchText' failed to satisfy constraint: \
-     Member must satisfy regular expression pattern: ";
 
 /// The two operations that carry a `searchText`, with the member each one's successful
 /// answer reports its matches through.
@@ -117,20 +119,10 @@ async fn a_search_text_outside_its_pattern_is_refused_on_every_operation_carryin
             // `refused` pins HTTP 400, the `ValidationException` code in the body's
             // `__type` and in `x-amzn-errortype`, and hands back the message.
             let message = refused(&router, &case, operation, &search_input(operation, &value)).await;
-            assert!(
-                message.starts_with("1 validation error detected: "),
-                "case {case:?}: expected the one-violation envelope this service reports a \
-                 constraint failure in, got {message:?}"
-            );
-            assert!(
-                message.contains(PATTERN_CLAUSE),
-                "case {case:?}: expected the clause {PATTERN_CLAUSE:?} naming the member, \
+            assert_eq!(
+                message, NEWLINE_REFUSAL,
+                "case {case:?}: expected this service's own refusal {NEWLINE_REFUSAL:?}, \
                  got {message:?}"
-            );
-            assert!(
-                message.contains(SEARCH_TEXT_PATTERN),
-                "case {case:?}: expected the clause to quote the modelled expression \
-                 {SEARCH_TEXT_PATTERN:?}, got {message:?}"
             );
         }
     }
@@ -223,8 +215,8 @@ fn both_search_inputs_declare_the_same_search_text_pattern() {
         "case the searchText member of both search inputs: expected one modelled pattern, \
          got {facets:?} and {listings:?}"
     );
-    // The expression the service quotes is this one with its control characters escaped,
-    // which is what the refusal clauses above assert.
+    // The expression the service enforces is this one once its literal control characters
+    // are written as escapes, which is the class the refusals above span.
     assert_eq!(
         facets.map(|pattern| pattern.replace('\n', r"\n")),
         Some(SEARCH_TEXT_PATTERN.to_string()),

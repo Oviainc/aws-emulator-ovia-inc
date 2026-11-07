@@ -156,7 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let offer = state.offers.get(&input.offer_id).ok_or_else(|| {
             GetOfferTermsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::not_found_message("Offer")),
+                message: Some(crate::state::not_found_message("offerId")),
             })
         })?;
 

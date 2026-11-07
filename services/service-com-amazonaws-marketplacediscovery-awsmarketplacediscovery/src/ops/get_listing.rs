@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let listing = state.listings.get(&input.listing_id).ok_or_else(|| {
             GetListingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::not_found_message("Listing")),
+                message: Some(crate::state::not_found_message("listingId")),
             })
         })?;
 

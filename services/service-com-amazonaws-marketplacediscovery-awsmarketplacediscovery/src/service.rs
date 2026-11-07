@@ -62,12 +62,12 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 ///   `$` anchoring a model spells it with (see [`unanchored`]);
 /// * the echoed value is entity-escaped TWICE (see [`entity_escaped_twice`]).
 ///
+/// * an enumerated value set is listed in the order THIS SERVICE emits it in, which is
+///   not the order the model declares its values in (see [`listed_value_set`]).
+///
 /// Everything else — the member path, the bound a `@length` / `@range` clause states, and
 /// the membership of an enumerated value set — is read off the violation the framework
-/// reports. An enumerated set arrives in the order the MODEL declares (the framework
-/// reads it off the `@enum` trait / enum shape's member list, which is ordered) and is
-/// listed in that order: a set has no order of its own that the model or AWS's
-/// documentation fixes, and a report has to read the same on every run.
+/// reports.
 ///
 /// Returns `None` for a violation class this service has no wording for, which lets
 /// [`constraint_envelope`] decline the whole refusal and keep the framework's wording
@@ -93,7 +93,10 @@ pub(crate) fn constraint_clause(violation: &Violation) -> Option<String> {
             unanchored(pattern)
         ),
         ViolationKind::EnumValue(allowed) => {
-            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
+            format!(
+                "Member must satisfy enum value set: [{}]",
+                listed_value_set(allowed).join(", ")
+            )
         }
         ViolationKind::UniqueItems => "Member must have unique values".to_string(),
         _ => return None,
@@ -108,6 +111,54 @@ pub(crate) fn constraint_clause(violation: &Violation) -> Option<String> {
         // not a value the caller sent, so there is nothing to escape.
         None => format!("Value null at '{path}' failed to satisfy constraint: {requirement}"),
     })
+}
+
+/// The values of `SearchFilterType`, in the order this service LISTS them in an enum
+/// clause.
+///
+/// Recorded behaviour establishes the order: a refusal of a `filterType` outside the enum
+/// reports the set this way, which is NOT the order the model declares the values in
+/// (`smithy_query(query="shape",shape="SearchFilterType")` declares
+/// `MIN_AVERAGE_CUSTOMER_RATING` first and `NUMBER_OF_PRODUCTS` last). The list is fixed
+/// text of the refusal — a constant of the service, carrying nothing from the request —
+/// so the same order is reported for every member and every operation whose value set is
+/// this enum's.
+const SEARCH_FILTER_TYPE_LISTED_ORDER: &[&str] = &[
+    "MAX_AVERAGE_CUSTOMER_RATING",
+    "FULFILLMENT_OPTION_TYPE",
+    "MIN_AVERAGE_CUSTOMER_RATING",
+    "PRICING_MODEL",
+    "NUMBER_OF_PRODUCTS",
+    "DEPLOYED_ON_AWS",
+    "PUBLISHER",
+    "PRICING_UNIT",
+    "CATEGORY",
+];
+
+/// Every value set whose listed order recorded behaviour establishes, one row per enum.
+const LISTED_VALUE_SET_ORDERS: &[&[&str]] = &[SEARCH_FILTER_TYPE_LISTED_ORDER];
+
+/// The admissible values as this service LISTS them in an enum clause.
+///
+/// The MEMBERSHIP comes off the violation the framework reports — the enum shape's own
+/// values, so it cannot drift from the model. The ORDER does not: this service lists a
+/// value set in an order of its own ([`LISTED_VALUE_SET_ORDERS`]), the same on every run
+/// and for every member the set constrains, rather than in the order the model happens to
+/// declare the values in. A row is used only when the reported membership is exactly that
+/// row's, so an enum this service has no recorded order for — and a model change that adds
+/// or removes a value — keeps declaration order instead of silently dropping a value from
+/// the clause or inventing one.
+fn listed_value_set(allowed: &[String]) -> Vec<&str> {
+    for order in LISTED_VALUE_SET_ORDERS {
+        if order.len() == allowed.len()
+            && order
+                .iter()
+                .all(|value| allowed.iter().any(|reported| reported == value))
+        {
+            return order.to_vec();
+        }
+    }
+    allowed.iter().map(String::as_str).collect()
 }
 
 /// A `@pattern` expression without the anchors a model may spell it with. A `$` escaped
@@ -252,11 +303,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // This service states a constraint violation in AWS's standard validation
         // report, which `constraint_envelope` builds: the anchors stripped from a
-        // modeled `@pattern` and the echoed value entity-escaped twice. An enumerated
-        // value set is listed in the order the MODEL declares — deliberately, since
-        // nothing fixes an order for a set, and a report has to read the same on every
-        // run. The code stays the modeled `ValidationException` (HTTP 400), which is
-        // what the framework would have answered — only the wording changes.
+        // modeled `@pattern`, the echoed value entity-escaped twice, and an enumerated
+        // value set listed in this service's own order. The code stays the modeled
+        // `ValidationException` (HTTP 400), which is what the framework would have
+        // answered — only the wording changes.
         //
         // An authentication refusal keeps the framework's wording: it is not an
         // input-constraint failure.

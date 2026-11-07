@@ -163,13 +163,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The options belong to a product, so an id the catalog does not hold is the
         // modelled 404 rather than an empty page. The message follows the ONE rule this
         // service's `ResourceNotFoundException` follows everywhere
-        // (`crate::state::not_found_message`): it names the kind of resource that was
-        // missing and discloses neither the requested id nor the catalog it was looked up
-        // in.
+        // (`crate::state::not_found_message`): it names the resource the lookup was made
+        // by, as the model names it, and discloses neither the requested id nor the
+        // catalog it was looked up in.
         let product = state.products.get(&input.product_id).ok_or_else(|| {
             ListFulfillmentOptionsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::not_found_message("Product")),
+                    message: Some(crate::state::not_found_message("productId")),
                 },
             )
         })?;

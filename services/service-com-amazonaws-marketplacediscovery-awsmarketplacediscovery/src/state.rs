@@ -21,7 +21,7 @@
 //!   from ([`ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState::search_matches`],
 //!   [`matches_every_search_filter`]);
 //! * the member-`@pattern` check the framework's input walk cannot make for an
-//!   unanchored expression ([`validate_member_patterns`]).
+//!   unanchored expression ([`validate_search_text`]).
 
 use std::collections::BTreeMap;
 
@@ -1067,10 +1067,31 @@ pub fn availability_status(expiration_time: Option<i64>, now_secs: i64) -> &'sta
 /// independent recordings of `GetListing` with three DIFFERENT well-formed but unknown
 /// `listingId`s all answered the identical message "Listing not found", so the message
 /// names only the kind of resource that was missing and discloses neither the requested
-/// id nor the catalog it was looked up in. `resource` is therefore the resource KIND
-/// (`"Listing"`, `"Offer"`, `"Product"`), never a value out of the request.
-pub fn not_found_message(resource: &str) -> String {
-    format!("{resource} not found")
+/// id nor the catalog it was looked up in.
+///
+/// `id_member` is the input member the lookup was made by (`"listingId"`,
+/// `"offerSetId"`), and the resource is named [`resource_name`] spells it — the model's
+/// own name for the resource, never English prose about it.
+pub fn not_found_message(id_member: &str) -> String {
+    format!("{} not found", resource_name(id_member))
+}
+
+/// The resource an id member identifies, named as the model names it: the member's name
+/// without its `Id` suffix, in the upper-camel spelling of the shape family around it —
+/// `offerSetId` gives `OfferSet`, the spelling of `OfferSetId` and `GetOfferSet`, and
+/// `listingId` gives `Listing`.
+///
+/// Derived from the member name rather than written out per operation, so a refusal can
+/// no longer re-spell a resource as prose ("Offer set"): the only name available here is
+/// the modelled one. A member that does not end in `Id` is a member no lookup is made by,
+/// and is named as it stands.
+pub fn resource_name(id_member: &str) -> String {
+    let name = id_member.strip_suffix("Id").unwrap_or(id_member);
+    let mut characters = name.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => id_member.to_string(),
+    }
 }
 
 /// A wire timestamp from stored epoch seconds.
@@ -1232,9 +1253,9 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 // NOTHING about constraint checking is reimplemented here: the member's own modelled
 // expression is read off its schema, anchored, and re-declared in the framework's own form
 // (a [`TraitMap`] carrying a [`PatternTrait`]) hung on a member schema of the same name,
-// and the check is [`validate`] — the same walk the request boundary runs — reported
-// through [`crate::service::constraint_envelope`], so a refusal made here reads exactly
-// like one made there.
+// and the check is [`validate`] — the same walk the request boundary runs. Only the WORDING
+// of the refusal is this service's own: recorded behavior answers this one with a sentence
+// of its own rather than with a constraint clause (see [`validate_search_text`]).
 
 use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use ::aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
@@ -1247,15 +1268,13 @@ const NAMESPACE: &str = "com.amazonaws.marketplacediscovery";
 /// The `@pattern` the model declares for `searchText`, anchored at both ends so the WHOLE
 /// value has to match it.
 ///
-/// Read off the member's own schema (so it cannot drift from the model), wrapped in a
-/// non-capturing group that keeps a top-level alternation inside the anchors, and rendered
-/// with each control character as its regex escape — the model spells `SearchText`'s class
-/// with a LITERAL line feed, which `\n` matches identically while keeping the constraint
-/// clause on one line. `None` when the model gives the member no pattern, which is nothing
-/// to check.
+/// Read off the member's own schema (so it cannot drift from the model) and wrapped in a
+/// non-capturing group that keeps a top-level alternation inside the anchors. `None` when
+/// the model gives the member no pattern, which is nothing to check.
 static ANCHORED_SEARCH_TEXT_PATTERN: LazyLock<Option<String>> = LazyLock::new(|| {
-    let modelled = modelled_member_pattern(crate::ops::types::SEARCH_FACETS_INPUT_SCHEMA, "searchText")?;
-    Some(format!("^(?:{})$", control_characters_escaped(modelled)))
+    let modelled =
+        modelled_member_pattern(crate::ops::types::SEARCH_FACETS_INPUT_SCHEMA, "searchText")?;
+    Some(format!("^(?:{modelled})$"))
 });
 
 /// `searchText`'s constraints for the whole-value walk: the anchored pattern, and nothing
@@ -1308,11 +1327,22 @@ impl SerializableStruct for WholeValueSearchText<'_> {
     }
 }
 
+/// The member whose whole-value `@pattern` this service checks itself, as the refusal
+/// below names it.
+const SEARCH_TEXT_MEMBER: &str = "searchText";
+
 /// Refuse a `searchText` whose WHOLE value does not match the member's modelled
 /// `@pattern`, or pass it through.
 ///
-/// `Err` is this service's constraint report for the violation — the same envelope and
-/// clause the boundary walk's refusals carry — so the caller answers it with the modelled
+/// The refusal is worded by THIS SERVICE rather than reported as a constraint clause:
+/// recorded behavior answers a `searchText` carrying a line feed with the sentence
+/// [`must_not_contain_newlines`] builds — fixed text naming the member, with no `N
+/// validation error(s) detected` envelope, no echo of the submitted value and no mention
+/// of the expression. The member's modelled class admits every character but the line feed
+/// (`smithy_query(query="shape",shape="SearchText")`), so a line feed is the only way the
+/// whole value can fall outside it, which is exactly what that sentence states.
+///
+/// `Err` is that message, so the caller answers it with the modelled
 /// `ValidationException` (HTTP 400). An absent `searchText` is nothing to check.
 pub fn validate_search_text(search_text: Option<&str>) -> Result<(), String> {
     let Some(search_text) = search_text else {
@@ -1322,10 +1352,18 @@ pub fn validate_search_text(search_text: Option<&str>) -> Result<(), String> {
         &WholeValueSearchText { search_text },
         &WHOLE_VALUE_SEARCH_TEXT_SCHEMA,
     );
-    match crate::service::constraint_envelope(&violations) {
-        None => Ok(()),
-        Some(message) => Err(message),
+    if violations.is_empty() {
+        return Ok(());
     }
+    Err(must_not_contain_newlines(SEARCH_TEXT_MEMBER))
+}
+
+/// The sentence this service refuses a member carrying a line feed with: the member's
+/// name and the rule it broke, and nothing of the request beyond that name.
+///
+/// Public so the handlers' own refusals and a test read the same sentence.
+pub fn must_not_contain_newlines(member: &str) -> String {
+    format!("{member} must not contain newlines")
 }
 
 /// The `@pattern` expression the model declares for one member of `input_schema`, or
@@ -1340,27 +1378,6 @@ pub fn modelled_member_pattern(input_schema: &Schema, member: &str) -> Option<&'
         .find(|candidate| candidate.member_name() == Some(member))?;
     let pattern = member_schema.traits()?.get(&PatternTrait::TRAIT_ID)?;
     Some(pattern.as_any().downcast_ref::<PatternTrait>()?.regex)
-}
-
-/// A regular expression with each ASCII control character written as the escape that
-/// matches the same character: a COSMETIC rewrite, equivalent to the model's own
-/// expression for the regex engine, so a refusal quoting the expression stays on one line
-/// instead of breaking across two.
-fn control_characters_escaped(pattern: &str) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(pattern.len());
-    for c in pattern.chars() {
-        match c {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            other if other.is_control() => {
-                let _ = write!(out, "\\x{{{:x}}}", other as u32);
-            }
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------

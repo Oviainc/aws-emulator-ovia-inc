@@ -25,6 +25,8 @@ mod fulfillment_options;
 mod keyword_search_and_paging;
 #[path = "all/purchase_option_badges_and_offer_sets.rs"]
 mod purchase_option_badges_and_offer_sets;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/search_facets.rs"]
 mod search_facets;
 #[path = "all/signing_name_claims.rs"]

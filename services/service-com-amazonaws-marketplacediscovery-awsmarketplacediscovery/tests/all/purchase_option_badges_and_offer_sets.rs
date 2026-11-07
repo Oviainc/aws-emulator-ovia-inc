@@ -387,8 +387,9 @@ async fn an_offer_set_the_catalog_does_not_hold_is_not_found() {
         );
         let message = text(&body, "message");
         assert_eq!(
-            message, "Offer set not found",
-            "case offerSetId={unknown}: expected the fixed kind-only message, got {message:?}"
+            message, "OfferSet not found",
+            "case offerSetId={unknown}: expected the fixed resource-only message, got \
+             {message:?}"
         );
         assert!(
             !message.contains(unknown.as_str()),
