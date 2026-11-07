@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveRoleFromDBInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveRoleFromDBInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation drops an IAM role association from the stored DB instance —
+//! the entry `DBInstance$AssociatedRoles` reported for that role and feature — and is the
+//! ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveRoleFromDBInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +160,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveRoleFromDBInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveRoleFromDBInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveRoleFromDBInstance"))
+        let region =
+            crate::state::request_region(ctx).map_err(RemoveRoleFromDBInstanceError::validation)?;
+        // "The name of the DB instance to disassociate the IAM role from", folded the way
+        // the stored key is.
+        let identifier = crate::state::db_instance_identifier_of(&input.db_instance_identifier)
+            .to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all; 501 is the honest answer, never a
+        // disassociation nothing performed.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due, so the disassociation is judged
+        // against the state the instance is really in.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: an identifier that names an instance in another region names
+        // none here.
+        let key = (region.clone(), identifier.clone());
+        let Some(instance) = store.db_instances.get(&key) else {
+            return Err(
+                RemoveRoleFromDBInstanceErrorModeled::DBInstanceNotFoundFault(
+                    DBInstanceNotFoundFault {
+                        message: Some(format!("DBInstance not found: {identifier}")),
+                    },
+                )
+                .into(),
+            );
+        };
+        // A disassociation changes the instance's configuration, so it needs the same
+        // available instance an association does; the status the clock has yet to settle is
+        // real.
+        if instance.status != crate::state::DB_INSTANCE_STATUS_AVAILABLE {
+            let status = instance.status.clone();
+            return Err(
+                RemoveRoleFromDBInstanceErrorModeled::InvalidDBInstanceStateFault(
+                    InvalidDBInstanceStateFault {
+                        message: Some(crate::state::modify_db_instance_invalid_state_message(
+                            &status,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "The specified RoleArn value doesn't match the specified feature for the DB
+        // instance": the pair is the identity of an association, so a role associated for
+        // another feature is not the one this request names.
+        let held = crate::state::instance_role_pairs(&instance.associated_roles);
+        if !crate::state::holds_association(&held, &input.role_arn, Some(&input.feature_name)) {
+            return Err(
+                RemoveRoleFromDBInstanceErrorModeled::DBInstanceRoleNotFoundFault(
+                    DBInstanceRoleNotFoundFault {
+                        message: Some(crate::state::role_not_associated_message(
+                            "DB instance",
+                            &identifier,
+                            &input.role_arn,
+                            Some(&input.feature_name),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(instance) = store.db_instances.get_mut(&key) else {
+            return Err(
+                RemoveRoleFromDBInstanceErrorModeled::DBInstanceNotFoundFault(
+                    DBInstanceNotFoundFault {
+                        message: Some(format!("DBInstance not found: {identifier}")),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The association is gone from here on: the engine can no longer act under that
+        // role for that feature, and the instance reports one association fewer.
+        instance.associated_roles.retain(|role| {
+            role.role_arn.as_deref() != Some(input.role_arn.as_str())
+                || role.feature_name.as_deref() != Some(input.feature_name.as_str())
+        });
+        instance.engine_log.record(format!(
+            "IAM role {} disassociated from DB instance {identifier} for feature {}",
+            input.role_arn, input.feature_name
+        ));
+        Ok(RemoveRoleFromDBInstanceOutput)
     }
 }

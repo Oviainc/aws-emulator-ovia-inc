@@ -178,7 +178,7 @@ pub async fn mint_master_user_secret(
     region: &str,
     asked: &MasterSecretRequest<'_>,
 ) -> Result<MintedMasterSecret, String> {
-    let secrets = secrets_manager_client(ctx, region);
+    let secrets = secrets_manager_client(ctx, region).ok_or_else(unaskable_region)?;
     let password = generated_password(&secrets, asked.engine).await?;
     let created = secrets
         .create_secret()
@@ -221,7 +221,7 @@ pub async fn rotate_master_user_secret(
     username: Option<&str>,
     engine: &str,
 ) -> Result<String, String> {
-    let secrets = secrets_manager_client(ctx, region);
+    let secrets = secrets_manager_client(ctx, region).ok_or_else(unaskable_region)?;
     let password = generated_password(&secrets, engine).await?;
     secrets
         .put_secret_value()
@@ -253,6 +253,7 @@ pub async fn release_master_user_secret(
     secret_arn: &str,
 ) -> Result<(), String> {
     secrets_manager_client(ctx, region)
+        .ok_or_else(unaskable_region)?
         .delete_secret()
         .secret_id(secret_arn)
         .send()
@@ -384,12 +385,12 @@ async fn encrypting_key_id(
     requested: Option<&str>,
 ) -> String {
     let named = requested.unwrap_or(SECRETS_MANAGER_DEFAULT_KEY_ALIAS);
-    match kms_client(ctx, region)
-        .describe_key()
-        .key_id(named)
-        .send()
-        .await
-    {
+    let Some(kms) = kms_client(ctx, region) else {
+        // The signing scope names no Region this emulator can ask KMS in, so nothing was
+        // learned about the key and the identifier the secret was created under stands.
+        return named.to_string();
+    };
+    match kms.describe_key().key_id(named).send().await {
         Ok(described) => described
             .key_metadata()
             .and_then(|metadata| metadata.arn())
@@ -413,6 +414,15 @@ async fn encrypting_key_id(
 /// AWS publishes for it.
 const SECRETS_MANAGER_DEFAULT_KEY_ALIAS: &str = "alias/aws/secretsmanager";
 
+/// The sentence a managed-secret call reports when the request's signing scope names no
+/// Region this emulator can ask a peer service in ([`secrets_manager_client`]): a failure of
+/// this emulator to reach the service that owns the secret, like the others here.
+fn unaskable_region() -> String {
+    "the master user secret could not be reached in Amazon Web Services Secrets Manager: the \
+     request's signing scope names no Amazon Web Services Region"
+        .to_string()
+}
+
 /// A Secrets Manager client over the IN-PROCESS callback into this same emulator: the
 /// secret RDS manages is one this emulator holds, so creating and rotating it never
 /// leaves the process.
@@ -422,10 +432,18 @@ const SECRETS_MANAGER_DEFAULT_KEY_ALIAS: &str = "alias/aws/secretsmanager";
 /// client needs and this one cannot have is disabled: retries, timeouts, stalled-stream
 /// protection and identity caching each need a sleep implementation the callback
 /// transport is not given, and there is nothing behind it to retry.
+///
+/// The Region a request is signed for is CALLER-SUPPLIED text and here it ends up in an
+/// endpoint URL's authority, so it is read as a Region LABEL
+/// (`service_common::arn::region_label`, the one place this tree states that grammar) instead
+/// of being interpolated as given — the same gate [`kms_client`] applies: `None` for a value
+/// that would name an authority the caller chose rather than the peer service this emulator
+/// asks.
 fn secrets_manager_client(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
-) -> ::aws_sdk_secretsmanager::Client {
+) -> Option<::aws_sdk_secretsmanager::Client> {
+    let region = ::service_common::arn::region_label(region)?;
     let config = ::aws_sdk_secretsmanager::Config::builder()
         .behavior_version(::aws_sdk_secretsmanager::config::BehaviorVersion::latest())
         .region(::aws_sdk_secretsmanager::config::Region::new(
@@ -441,14 +459,27 @@ fn secrets_manager_client(
             ::aws_sdk_secretsmanager::config::StalledStreamProtectionConfig::disabled(),
         )
         .build();
-    ::aws_sdk_secretsmanager::Client::from_conf(config)
+    Some(::aws_sdk_secretsmanager::Client::from_conf(config))
 }
 
-/// A KMS client over the same in-process callback, for [`encrypting_key_id`].
-fn kms_client(
+/// A KMS client over the same in-process callback, for [`encrypting_key_id`] and for the
+/// export's own key check ([`super::export_access::kms_key_is_inaccessible`]) — the ONE place
+/// this crate builds one.
+///
+/// The endpoint URL is only the address the callback's transport routes on IN PROCESS: no
+/// socket is opened, no name is resolved and nothing leaves this process. The credentials are
+/// the callback's, which sign this in-process hop and never appear in a response.
+///
+/// The Region a request is signed for is CALLER-SUPPLIED text and here it ends up in an
+/// endpoint URL's authority, so it is read as a Region LABEL
+/// (`service_common::arn::region_label`, the one place this tree states that grammar) instead
+/// of being interpolated as given: `None` for a value that would name an authority the caller
+/// chose rather than the peer service this emulator asks.
+pub(super) fn kms_client(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
-) -> ::aws_sdk_kms::Client {
+) -> Option<::aws_sdk_kms::Client> {
+    let region = ::service_common::arn::region_label(region)?;
     let config = ::aws_sdk_kms::Config::builder()
         .behavior_version(::aws_sdk_kms::config::BehaviorVersion::latest())
         .region(::aws_sdk_kms::config::Region::new(region.to_string()))
@@ -460,7 +491,7 @@ fn kms_client(
         .identity_cache(::aws_sdk_kms::config::IdentityCache::no_cache())
         .stalled_stream_protection(::aws_sdk_kms::config::StalledStreamProtectionConfig::disabled())
         .build();
-    ::aws_sdk_kms::Client::from_conf(config)
+    Some(::aws_sdk_kms::Client::from_conf(config))
 }
 
 /// What a request that turns master-password management on is refused with when it also

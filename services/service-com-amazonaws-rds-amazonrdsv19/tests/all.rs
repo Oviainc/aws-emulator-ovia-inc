@@ -211,6 +211,8 @@ mod published_catalog_creates;
 mod query_catalog_reads;
 #[path = "all/query_error_envelope.rs"]
 mod query_error_envelope;
+#[path = "all/rds_s3_integration.rs"]
+mod rds_s3_integration;
 #[path = "all/reboot_db_shard_group.rs"]
 mod reboot_db_shard_group;
 #[path = "all/refusal_class_by_cause.rs"]

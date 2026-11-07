@@ -781,6 +781,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 instance_create_time: crate::state::now_as_wire_timestamp(),
                 engine_started_at: crate::state::now_as_wire_timestamp(),
                 tags,
+                // A read replica carries no IAM-role association of its own: this
+                // operation publishes no `AssociatedRoles` member, and an association is
+                // made by `AddRoleToDBInstance` against the replica itself.
+                associated_roles: Vec::new(),
                 engine_log: crate::state::InstanceLog::default(),
                 // A read replica manages NO Secrets Manager secret of its own: this
                 // operation has no `ManageMasterUserPassword` member, so nothing creates a

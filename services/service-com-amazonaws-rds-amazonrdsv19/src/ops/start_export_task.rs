@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartExportTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartExportTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation starts an export of a stored DB snapshot, DB cluster
+//! snapshot or DB cluster to Amazon S3 — it writes the exported objects into the
+//! destination bucket and records the task `DescribeExportTasks` then reports — and is the
+//! ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartExportTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -230,18 +228,502 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartExportTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartExportTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region =
+            crate::state::request_region(ctx).map_err(StartExportTaskError::validation)?;
+
+        // Every stored free-form value is BOUNDED where it enters the store: none of these
+        // members publishes a bound of its own and all of them are stored.
+        crate::state::check_stored_text(
+            "ExportTaskIdentifier",
+            &input.export_task_identifier,
+            crate::state::MAX_EXPORT_TASK_IDENTIFIER_LEN,
+        )
+        .map_err(StartExportTaskError::invalid_parameter_value)?;
+        for (member, value) in [
+            ("SourceArn", input.source_arn.as_str()),
+            ("S3BucketName", input.s3_bucket_name.as_str()),
+            ("KmsKeyId", input.kms_key_id.as_str()),
+        ] {
+            crate::state::check_free_form(member, value)
+                .map_err(StartExportTaskError::invalid_parameter_value)?;
+        }
+        if let Some(prefix) = &input.s3_prefix {
+            crate::state::check_free_form("S3Prefix", prefix)
+                .map_err(StartExportTaskError::invalid_parameter_value)?;
+        }
+        crate::state::check_stored_text(
+            "IamRoleArn",
+            &input.iam_role_arn,
+            crate::state::MAX_IAM_ROLE_ARN_LEN,
+        )
+        .map_err(StartExportTaskError::invalid_parameter_value)?;
+        let export_only = input.export_only.clone().unwrap_or_default();
+        crate::state::check_request_list_len(
+            "ExportOnly",
+            export_only.len(),
+            crate::state::MAX_CLUSTER_LIST_ENTRIES,
+        )
+        .map_err(StartExportTaskError::invalid_parameter_value)?;
+        // `ExportOnly` publishes the forms one entry may take — "database",
+        // "database.table", "database.schema", "database.schema.table" — so a value outside
+        // them names nothing exportable, which is the modelled `InvalidExportOnlyFault`.
+        for entry in &export_only {
+            crate::state::check_free_form("ExportOnly", entry)
+                .map_err(StartExportTaskError::invalid_parameter_value)?;
+            if !crate::state::export_only_entry_is_well_formed(entry) {
+                return Err(StartExportTaskErrorModeled::InvalidExportOnlyFault(
+                    InvalidExportOnlyFault {
+                        message: Some(crate::state::invalid_export_only_message(entry)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all; 501 is the honest answer, never an export
+        // nothing started.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        // What is being exported, and the database the export reads: resolved under the
+        // lock, which is then released — the IAM, S3 and KMS answers below are other
+        // services' and cannot be asked while this service's store is held.
+        let source = {
+            let mut store = state.lock();
+            // The transitions the clock already made due, so the export is judged against
+            // the state the source is really in.
+            store.settle_due_transitions(&region);
+            // "You can't start an export task that's already running": an identifier the
+            // region already holds a task under is the modelled already-exists fault.
+            if store
+                .resolve_export_task(&region, &input.export_task_identifier)
+                .is_some()
+            {
+                return Err(StartExportTaskErrorModeled::ExportTaskAlreadyExistsFault(
+                    ExportTaskAlreadyExistsFault {
+                        message: Some(crate::state::export_task_already_exists_message(
+                            &input.export_task_identifier,
+                        )),
+                    },
+                )
+                .into());
+            }
+            resolve_export_source(&store, &region, &input.source_arn)?
+        };
+
+        // The destination bucket is a resource of ANOTHER service, so it is resolved where
+        // that service holds it: a bucket Amazon S3 holds nothing under can take no export,
+        // which is the modelled `InvalidS3BucketFault`. An engine with no object store
+        // beside this service establishes nothing and refuses nothing.
+        if crate::state::bucket_is_absent(&*self.engine, &input.s3_bucket_name) == Some(true) {
+            return Err(StartExportTaskErrorModeled::InvalidS3BucketFault(
+                InvalidS3BucketFault {
+                    message: Some(crate::state::invalid_s3_bucket_message(
+                        &input.s3_bucket_name,
+                    )),
+                },
+            )
+            .into());
+        }
+        // "The Amazon S3 bucket ... must be in the same Amazon Web Services Region as the
+        // snapshot" (Exporting DB snapshot data to Amazon S3): a bucket in another Region
+        // is a parameter this export cannot be run with, which this Query API answers
+        // `InvalidParameterValue`.
+        if let Some(bucket_region) =
+            crate::state::bucket_region(&*self.engine, &input.s3_bucket_name)
+        {
+            if !bucket_region.is_empty() && bucket_region != region {
+                return Err(StartExportTaskError::invalid_parameter_value(
+                    crate::state::cross_region_export_bucket_message(
+                        &input.s3_bucket_name,
+                        &bucket_region,
+                        &region,
+                    ),
+                ));
+            }
+        }
+
+        // "The ID of the Amazon Web Services KMS key to use to encrypt the data exported to
+        // Amazon S3": a key KMS holds nothing under, or one it holds disabled, cannot
+        // encrypt the export — the modelled `KMSKeyNotAccessibleFault`.
+        if crate::state::kms_key_is_inaccessible(ctx, &region, &input.kms_key_id).await {
+            return Err(StartExportTaskErrorModeled::KMSKeyNotAccessibleFault(
+                KMSKeyNotAccessibleFault {
+                    message: Some(crate::state::kms_key_not_accessible_message(
+                        &input.kms_key_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The provided IAM role must have access to the S3 bucket": a role the export
+        // principal cannot assume is the modelled `IamRoleNotFoundFault`, and one that can
+        // be assumed but is not granted the object write — or is denied it by the bucket's
+        // own policy — is the modelled `IamRoleMissingPermissionsFault`.
+        match crate::state::export_role_defect(
+            ctx,
+            &*self.engine,
+            &region,
+            &input.iam_role_arn,
+            &input.s3_bucket_name,
+        )
+        .await
+        {
+            Some(crate::state::ExportRoleDefect::NotAssumable) => {
+                return Err(StartExportTaskErrorModeled::IamRoleNotFoundFault(
+                    IamRoleNotFoundFault {
+                        message: Some(crate::state::export_role_not_found_message(
+                            &input.iam_role_arn,
+                        )),
+                    },
+                )
+                .into())
+            }
+            Some(crate::state::ExportRoleDefect::MissingPermissions) => {
+                return Err(StartExportTaskErrorModeled::IamRoleMissingPermissionsFault(
+                    IamRoleMissingPermissionsFault {
+                        message: Some(crate::state::export_role_missing_permissions_message(
+                            &input.iam_role_arn,
+                            &input.s3_bucket_name,
+                        )),
+                    },
+                )
+                .into())
+            }
+            None => {}
+        }
+
+        // Everything the export needs holds, so the TASK is recorded first and the export
+        // then runs: `STARTING` with the clock owing it `IN_PROGRESS` and then `COMPLETE`,
+        // so a caller polling `DescribeExportTasks` walks the progression the real service
+        // reports rather than finding a task that was finished before the call returned.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartExportTask"))
+        // Recording it before any object is written is what keeps the two in step: the
+        // identifier and the region's room are taken under the same guard that inserts the
+        // record, so a call this store has no room for is refused BEFORE it copies anything
+        // into the object store, and a caller never finds objects of an export no task
+        // stands for.
+        let started = ::std::time::SystemTime::now();
+        let prefix =
+            crate::state::export_prefix(input.s3_prefix.as_deref(), &input.export_task_identifier);
+        let part_file = crate::state::part_file_name(&crate::state::export_part_id(
+            &input.export_task_identifier,
+        ));
+        let key = (region.clone(), input.export_task_identifier.clone());
+        {
+            let mut store = state.lock();
+            // Resolved again under this guard: the lock was released for the answers of the
+            // three services above, so an export another request started under the same
+            // identifier in between is the modelled already-exists fault.
+            if store
+                .resolve_export_task(&region, &input.export_task_identifier)
+                .is_some()
+            {
+                return Err(StartExportTaskErrorModeled::ExportTaskAlreadyExistsFault(
+                    ExportTaskAlreadyExistsFault {
+                        message: Some(crate::state::export_task_already_exists_message(
+                            &input.export_task_identifier,
+                        )),
+                    },
+                )
+                .into());
+            }
+            // The store is bounded like every other family here: a region that already
+            // holds its quota of export tasks takes no more. The quota is this emulator's
+            // bound on its own memory — the objects the export writes included — so it is
+            // taken here, before the export reads or writes anything, and refused as a
+            // parameter this service will not serve rather than as a modelled fault the
+            // operation does not declare.
+            if !store.has_room_for_region(&region)
+                || store.export_tasks_in(&region).len()
+                    >= crate::state::EXPORT_TASK_QUOTA_PER_REGION
+            {
+                return Err(StartExportTaskError::invalid_parameter_value(
+                    crate::state::export_task_quota_message(&region),
+                ));
+            }
+            store.export_tasks.insert(
+                key.clone(),
+                crate::state::ExportTaskRecord {
+                    identifier: input.export_task_identifier.clone(),
+                    region: region.clone(),
+                    source_arn: source.arn.clone(),
+                    source_type: source.source_type.to_string(),
+                    export_only: export_only.clone(),
+                    snapshot_time: source.snapshot_time,
+                    task_start_time: crate::state::now_as_wire_timestamp(),
+                    task_end_time: None,
+                    s3_bucket: input.s3_bucket_name.clone(),
+                    s3_prefix: input.s3_prefix.clone(),
+                    iam_role_arn: input.iam_role_arn.clone(),
+                    kms_key_id: input.kms_key_id.clone(),
+                    status: crate::state::EXPORT_TASK_STATUS_STARTING.to_string(),
+                    pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                        crate::state::EXPORT_TASK_STATUS_IN_PROGRESS,
+                    )),
+                    percent_progress: crate::state::INITIAL_PERCENT_PROGRESS,
+                    // Nothing is extracted yet; the size the export really wrote is
+                    // recorded below, once it has written it.
+                    total_extracted_data_in_gb: 0,
+                    failure_cause: None,
+                    warning_message: None,
+                },
+            );
+        }
+
+        // The export RUNS: the source's tables are read out of its own database and written
+        // into the destination bucket as the Parquet objects an export leaves behind, with
+        // the file that says what was exported beside them. The objects are recorded in
+        // Amazon S3's own store, so what this writes is what a caller's own `ListObjectsV2`
+        // and `GetObject` then serve.
+        let tables = match source.database.clone() {
+            Some(database) => {
+                // Reading the source's tables and encoding them as Parquet is ENGINE work:
+                // blocking and CPU-bound, like the copy a snapshot takes
+                // (`crate::state::capture_instance_storage`), so it runs on a blocking task
+                // rather than on a runtime worker a long export would starve.
+                let wire = source.wire;
+                let only = export_only.clone();
+                let under = prefix.clone();
+                let part = part_file.clone();
+                ::tokio::task::spawn_blocking(move || {
+                    crate::state::exported_tables(&database, wire, &only, &under, &part)
+                })
+                .await
+                .map_err(|error| {
+                    crate::scaffolded::Scaffolded::internal_failure(format!(
+                        "the export could not read the source's tables: {error}"
+                    ))
+                })?
+            }
+            // A source this emulator holds no database for has no table to export: the
+            // export writes the file that says so rather than inventing data.
+            None => Vec::new(),
+        };
+        let mut objects: Vec<crate::state::ExportedObject> = tables
+            .iter()
+            .map(|table| crate::state::ExportedObject {
+                key: table.key.clone(),
+                body: table.body.clone(),
+            })
+            .collect();
+        objects.push(crate::state::ExportedObject {
+            key: crate::state::tables_info_key(
+                &prefix,
+                &input.export_task_identifier,
+                tables.len(),
+            ),
+            body: crate::state::tables_info_document(
+                &tables,
+                started,
+                ::std::time::SystemTime::now(),
+            )
+            .into_bytes(),
+        });
+        let written = crate::state::write_objects(&*self.engine, &input.s3_bucket_name, &objects);
+
+        let mut store = state.lock();
+        // The record this call inserted, read back under the new guard: a cancel that ran in
+        // between leaves its own status on it, so what is answered is what is stored.
+        let Some(record) = store.export_tasks.get_mut(&key) else {
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the export task this call recorded is no longer in the store".to_string(),
+            ));
+        };
+        // "The total amount of data exported, in gigabytes": the size of the objects the
+        // object store really TOOK, so a write it refused is not reported as exported. Zero
+        // for a source smaller than a gigabyte, exactly as the real service reports for a
+        // small snapshot.
+        record.total_extracted_data_in_gb = crate::state::gigabytes(written.bytes);
+        // An object the store would not take is data this export did not write, which is
+        // what `WarningMessage` — "a warning about the snapshot or cluster export task" —
+        // reports, rather than letting the task claim the whole of it.
+        if written.objects < objects.len() {
+            record.warning_message = Some(crate::state::partial_export_warning(
+                objects.len() - written.objects,
+                &input.s3_bucket_name,
+            ));
+        }
+        let answer = record.to_wire();
+        Ok(StartExportTaskOutput {
+            export_task_identifier: answer.export_task_identifier,
+            source_arn: answer.source_arn,
+            export_only: answer.export_only,
+            snapshot_time: answer.snapshot_time,
+            task_start_time: answer.task_start_time,
+            task_end_time: answer.task_end_time,
+            s3_bucket: answer.s3_bucket,
+            s3_prefix: answer.s3_prefix,
+            iam_role_arn: answer.iam_role_arn,
+            kms_key_id: answer.kms_key_id,
+            status: answer.status,
+            percent_progress: answer.percent_progress,
+            total_extracted_data_in_gb: answer.total_extracted_data_in_gb,
+            failure_cause: answer.failure_cause,
+            warning_message: answer.warning_message,
+            source_type: answer.source_type,
+        })
+    }
+}
+
+/// What one `SourceArn` resolved to: the source an export reads, and the database it holds.
+struct ExportSource {
+    /// The ARN as the resolved source's own, so the task reports the source it really
+    /// exported.
+    arn: String,
+    /// `SourceType`, one of the values `ExportSourceType` publishes.
+    source_type: &'static str,
+    /// "The time when the snapshot was created" — the snapshot's own creation time, and the
+    /// instant the export read a cluster at.
+    snapshot_time: ::aws_smithy_types::DateTime,
+    /// The wire the source's engine speaks, which decides whether a two-segment
+    /// `ExportOnly` entry names a table or a schema and how the objects are laid out.
+    wire: crate::state::EngineWire,
+    /// The database the export reads its rows out of: the copy a DB snapshot carries, or
+    /// the live database of a cluster's writer. `None` for a source this emulator holds no
+    /// database for, which has no table to export.
+    database: Option<::std::sync::Arc<crate::state::data_plane::sql_engine::InstanceDatabase>>,
+}
+
+/// Resolve `SourceArn` — "the Amazon Resource Name (ARN) of the snapshot or cluster to
+/// export to Amazon S3" — against this region's stored resources.
+///
+/// The three forms an export reads are the ones the operation models a not-found fault for:
+/// a DB snapshot, a DB cluster snapshot and a DB cluster. RDS is regional, so a value naming
+/// a resource in another region names none here; a value that is no RDS ARN at all names no
+/// resource either, and is refused as the parameter value it is.
+fn resolve_export_source(
+    store: &crate::state::ComAmazonawsRdsAmazonrdsv19State,
+    region: &str,
+    source_arn: &str,
+) -> Result<ExportSource, StartExportTaskError> {
+    let Some((resource_type, name)) = crate::state::export_source_of(source_arn) else {
+        return Err(StartExportTaskError::invalid_parameter_value(
+            crate::state::invalid_export_source_arn_message(source_arn),
+        ));
+    };
+    match resource_type {
+        crate::state::EXPORT_SOURCE_DB_SNAPSHOT => {
+            let Some(snapshot) = store
+                .db_snapshots
+                .get(&(region.to_string(), name.to_string()))
+            else {
+                return Err(StartExportTaskErrorModeled::DBSnapshotNotFoundFault(
+                    DBSnapshotNotFoundFault {
+                        message: Some(crate::state::db_snapshot_not_found_message(source_arn)),
+                    },
+                )
+                .into());
+            };
+            // "The state of the export snapshot is invalid for exporting to an Amazon S3
+            // bucket": a snapshot that is still being taken or copied holds no settled data
+            // to export.
+            if snapshot.status != crate::state::SNAPSHOT_STATUS_AVAILABLE {
+                return Err(StartExportTaskErrorModeled::InvalidExportSourceStateFault(
+                    InvalidExportSourceStateFault {
+                        message: Some(crate::state::invalid_export_source_state_message(
+                            &snapshot.status,
+                        )),
+                    },
+                )
+                .into());
+            }
+            Ok(ExportSource {
+                arn: snapshot.arn(),
+                source_type: crate::state::EXPORT_SOURCE_TYPE_SNAPSHOT,
+                snapshot_time: snapshot.snapshot_create_time,
+                wire: crate::state::engine_wire(&snapshot.engine)
+                    .unwrap_or(crate::state::EngineWire::MySql),
+                database: snapshot.storage.clone(),
+            })
+        }
+        crate::state::EXPORT_SOURCE_DB_CLUSTER_SNAPSHOT => {
+            let Some(snapshot) = store
+                .db_cluster_snapshots
+                .get(&(region.to_string(), name.to_ascii_lowercase()))
+            else {
+                return Err(
+                    StartExportTaskErrorModeled::DBClusterSnapshotNotFoundFault(
+                        DBClusterSnapshotNotFoundFault {
+                            message: Some(crate::state::db_cluster_snapshot_not_found_message(
+                                source_arn,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            if snapshot.status != crate::state::SNAPSHOT_STATUS_AVAILABLE {
+                return Err(StartExportTaskErrorModeled::InvalidExportSourceStateFault(
+                    InvalidExportSourceStateFault {
+                        message: Some(crate::state::invalid_export_source_state_message(
+                            &snapshot.status,
+                        )),
+                    },
+                )
+                .into());
+            }
+            Ok(ExportSource {
+                arn: snapshot.arn(),
+                source_type: crate::state::EXPORT_SOURCE_TYPE_SNAPSHOT,
+                snapshot_time: snapshot.snapshot_create_time,
+                wire: crate::state::engine_wire(&snapshot.engine)
+                    .unwrap_or(crate::state::EngineWire::MySql),
+                // An Aurora DB cluster's data plane is its own cluster endpoint, which this
+                // emulator serves no database behind, so a cluster snapshot carries no copy
+                // to export.
+                database: None,
+            })
+        }
+        _ => {
+            let identifier = name.to_ascii_lowercase();
+            let Some(cluster) = store
+                .db_clusters
+                .get(&(region.to_string(), identifier.clone()))
+            else {
+                return Err(StartExportTaskErrorModeled::DBClusterNotFoundFault(
+                    DBClusterNotFoundFault {
+                        message: Some(crate::state::db_cluster_cannot_be_accessed_message(
+                            source_arn,
+                        )),
+                    },
+                )
+                .into());
+            };
+            if cluster.status != crate::state::DB_CLUSTER_STATUS_AVAILABLE {
+                return Err(StartExportTaskErrorModeled::InvalidExportSourceStateFault(
+                    InvalidExportSourceStateFault {
+                        message: Some(crate::state::invalid_export_source_state_message(
+                            &cluster.status,
+                        )),
+                    },
+                )
+                .into());
+            }
+            // The cluster's data lives on its WRITER member, which is the database an
+            // export of the cluster reads.
+            let database = store
+                .cluster_members(cluster)
+                .first()
+                .map(|member| (member.region.clone(), member.identifier.clone()))
+                .and_then(|key| {
+                    store
+                        .engine_endpoint(&key)
+                        .map(crate::state::DbEngineEndpoint::database)
+                });
+            Ok(ExportSource {
+                arn: cluster.arn(),
+                source_type: crate::state::EXPORT_SOURCE_TYPE_CLUSTER,
+                // An export of a CLUSTER reads it as it stands, so the instant it was read
+                // at is what the task reports as the time of the data it exported.
+                snapshot_time: crate::state::now_as_wire_timestamp(),
+                wire: crate::state::engine_wire(&cluster.engine)
+                    .unwrap_or(crate::state::EngineWire::MySql),
+                database,
+            })
+        }
     }
 }

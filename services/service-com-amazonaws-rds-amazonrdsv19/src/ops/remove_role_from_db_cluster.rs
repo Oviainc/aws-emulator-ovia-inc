@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveRoleFromDBCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveRoleFromDBCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation drops an IAM role association from the stored DB cluster —
+//! the entry `DBCluster$AssociatedRoles` reported for that role and feature — and is the
+//! ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveRoleFromDBCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +163,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveRoleFromDBCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveRoleFromDBClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveRoleFromDBCluster"))
+        let region =
+            crate::state::request_region(ctx).map_err(RemoveRoleFromDBClusterError::validation)?;
+        // "The name of the DB cluster to disassociate the IAM role from", folded the way
+        // the stored key is.
+        let identifier = crate::state::db_cluster_identifier_of(&input.db_cluster_identifier)
+            .to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all; 501 is the honest answer, never a
+        // disassociation nothing performed.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due, so the disassociation is judged
+        // against the state the cluster is really in.
+        store.settle_due_transitions(&region);
+
+        let key = (region.clone(), identifier.clone());
+        let Some(cluster) = store.db_clusters.get(&key) else {
+            return Err(RemoveRoleFromDBClusterErrorModeled::DBClusterNotFoundFault(
+                DBClusterNotFoundFault {
+                    message: Some(crate::state::db_cluster_cannot_be_accessed_message(
+                        &input.db_cluster_identifier,
+                    )),
+                },
+            )
+            .into());
+        };
+        // A disassociation changes the cluster's configuration, so it needs the same
+        // available cluster an association does.
+        if cluster.status != crate::state::DB_CLUSTER_STATUS_AVAILABLE {
+            return Err(
+                RemoveRoleFromDBClusterErrorModeled::InvalidDBClusterStateFault(
+                    InvalidDBClusterStateFault {
+                        message: Some(
+                            crate::state::MODIFY_DB_CLUSTER_INVALID_STATE_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "The specified IAM role Amazon Resource Name (ARN) isn't associated with the
+        // specified DB cluster": the role-and-feature pair is the identity of an
+        // association, so a role associated for another feature is not the one this request
+        // names.
+        let held = crate::state::cluster_role_pairs(&cluster.associated_roles);
+        if !crate::state::holds_association(&held, &input.role_arn, input.feature_name.as_deref()) {
+            return Err(
+                RemoveRoleFromDBClusterErrorModeled::DBClusterRoleNotFoundFault(
+                    DBClusterRoleNotFoundFault {
+                        message: Some(crate::state::role_not_associated_message(
+                            "DB cluster",
+                            &identifier,
+                            &input.role_arn,
+                            input.feature_name.as_deref(),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(cluster) = store.db_clusters.get_mut(&key) else {
+            return Err(RemoveRoleFromDBClusterErrorModeled::DBClusterNotFoundFault(
+                DBClusterNotFoundFault {
+                    message: Some(crate::state::db_cluster_cannot_be_accessed_message(
+                        &input.db_cluster_identifier,
+                    )),
+                },
+            )
+            .into());
+        };
+        // The association is gone from here on: the cluster's engine can no longer act
+        // under that role for that feature.
+        cluster.associated_roles.retain(|role| {
+            role.role_arn.as_deref() != Some(input.role_arn.as_str())
+                || role.feature_name.as_deref() != input.feature_name.as_deref()
+        });
+        Ok(RemoveRoleFromDBClusterOutput)
     }
 }

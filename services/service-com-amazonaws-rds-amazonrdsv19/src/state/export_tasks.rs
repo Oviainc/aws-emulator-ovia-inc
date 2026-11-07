@@ -61,6 +61,15 @@ const TERMINAL_STATUSES: [&str; 3] = [
     EXPORT_TASK_STATUS_FAILED,
 ];
 
+/// `ExportTask$PercentProgress` of an export that finished: all of the source was
+/// exported.
+pub const COMPLETE_PERCENT_PROGRESS: i32 = 100;
+
+/// `ExportTask$PercentProgress` of an export that has not finished writing yet: nothing of
+/// it is reported exported until the export is complete, which is what a caller polls the
+/// pair of members for.
+pub const INITIAL_PERCENT_PROGRESS: i32 = 0;
+
 /// The sentence an `ExportTaskNotFoundFault` carries for an `ExportTaskIdentifier` that
 /// names no stored export task.
 ///
@@ -71,6 +80,188 @@ const TERMINAL_STATUSES: [&str; 3] = [
 /// same way.
 pub fn export_task_not_found_message(named: &str) -> String {
     format!("The export task {named} doesn't exist.")
+}
+
+/// The sentence an `ExportTaskAlreadyExistsFault` carries: "You can't start an export task
+/// that's already running", named with the identifier the request asked to start a second
+/// export under.
+pub fn export_task_already_exists_message(named: &str) -> String {
+    format!("The export task {named} already exists.")
+}
+
+/// The longest `ExportTaskIdentifier` this service stores. The member publishes no bound of
+/// its own and the value is stored and keyed by, so it carries this emulator's cap for a
+/// stored identifier — the same 255 characters every other identifier of this store is
+/// bounded by.
+pub const MAX_EXPORT_TASK_IDENTIFIER_LEN: usize = 255;
+
+/// How many export tasks one region's store holds. Export tasks are records this emulator
+/// keeps in memory, so the family is bounded like every other one here; the bound is this
+/// emulator's, not a quota AWS publishes.
+pub const EXPORT_TASK_QUOTA_PER_REGION: usize = 100;
+
+/// What a request that would put a region past [`EXPORT_TASK_QUOTA_PER_REGION`] export
+/// tasks is refused with.
+pub fn export_task_quota_message(region: &str) -> String {
+    format!(
+        "This emulator holds at most {EXPORT_TASK_QUOTA_PER_REGION} export tasks per region, \
+         and {region} already holds that many."
+    )
+}
+
+/// What an `InvalidExportOnlyFault` carries for an `ExportOnly` entry outside the forms the
+/// member publishes: it names the entry that cannot be read and the forms one may take.
+pub fn invalid_export_only_message(entry: &str) -> String {
+    format!(
+        "The export {entry} is invalid. Each value of ExportOnly must name a database, \
+         database.table, database.schema or database.schema.table."
+    )
+}
+
+/// What an `InvalidExportSourceStateFault` carries: the source is not in a state its data
+/// can be exported from, naming the state it is in.
+pub fn invalid_export_source_state_message(status: &str) -> String {
+    format!("The state of the export source is invalid for exporting to an Amazon S3 bucket: {status}.")
+}
+
+/// What an `InvalidS3BucketFault` carries: the destination bucket cannot be found or
+/// reached, which is how the fault itself is worded ("The specified Amazon S3 bucket name
+/// can't be found or Amazon RDS isn't authorized to access the specified Amazon S3 bucket").
+pub fn invalid_s3_bucket_message(bucket: &str) -> String {
+    format!(
+        "The specified Amazon S3 bucket name {bucket} can't be found or Amazon RDS isn't \
+         authorized to access the specified Amazon S3 bucket."
+    )
+}
+
+/// What a request naming a destination bucket in another Region is refused with: an export
+/// writes to a bucket in the Region the source is in.
+pub fn cross_region_export_bucket_message(
+    bucket: &str,
+    bucket_region: &str,
+    request_region: &str,
+) -> String {
+    format!(
+        "The S3 bucket {bucket} is in region {bucket_region}, which is not the region the \
+         export runs in ({request_region}). The S3 bucket must be in the same region as the \
+         snapshot or cluster being exported."
+    )
+}
+
+/// What an `IamRoleNotFoundFault` carries: the role an export was asked to run under is not
+/// one Amazon RDS can assume for an export, naming the principal its trust policy has to
+/// grant.
+pub fn export_role_not_found_message(role_arn: &str) -> String {
+    format!(
+        "The IAM role {role_arn} is missing for exporting to an Amazon S3 bucket. The role \
+         must exist and its trust relationship must allow {} to assume it.",
+        super::EXPORT_SERVICE_PRINCIPAL
+    )
+}
+
+/// What an `IamRoleMissingPermissionsFault` carries: the role can be assumed but is not
+/// granted the object write the export performs, naming the action and the bucket.
+pub fn export_role_missing_permissions_message(role_arn: &str, bucket: &str) -> String {
+    format!(
+        "The IAM role {role_arn} requires additional permissions to export to the Amazon S3 \
+         bucket {bucket}: the role's policy must allow {} on the objects of that bucket, and \
+         the bucket policy must not deny it.",
+        super::EXPORT_OBJECT_WRITE_ACTION
+    )
+}
+
+/// What a `KMSKeyNotAccessibleFault` carries for a `KmsKeyId` KMS will not encrypt the
+/// export under.
+pub fn kms_key_not_accessible_message(key_id: &str) -> String {
+    format!(
+        "The specified KMS key [{key_id}] does not exist, is not enabled or you do not have \
+         permissions to access it."
+    )
+}
+
+/// `ExportTask$WarningMessage` for an export the object store would not take every object of:
+/// "a warning about the snapshot or cluster export task", naming how much of it is missing
+/// from the destination so a caller reading the task knows the export is incomplete.
+pub fn partial_export_warning(unwritten: usize, bucket: &str) -> String {
+    format!(
+        "{unwritten} of the exported files could not be written to the Amazon S3 bucket \
+         {bucket}, so the export is incomplete."
+    )
+}
+
+/// What a request whose `SourceArn` names no exportable Amazon RDS resource is refused
+/// with: the member is "the Amazon Resource Name (ARN) of the snapshot or cluster to export
+/// to Amazon S3", so a value that is no such ARN names nothing to export.
+pub fn invalid_export_source_arn_message(source_arn: &str) -> String {
+    format!(
+        "The parameter SourceArn must name the ARN of a DB snapshot, DB cluster snapshot or \
+         DB cluster to export; got {source_arn}."
+    )
+}
+
+/// The ARN resource type of a DB SNAPSHOT, as Amazon RDS spells it in an ARN
+/// (`arn:aws:rds:<region>:<account>:snapshot:<identifier>`).
+pub const EXPORT_SOURCE_DB_SNAPSHOT: &str = "snapshot";
+
+/// The ARN resource type of a DB CLUSTER snapshot
+/// (`arn:aws:rds:<region>:<account>:cluster-snapshot:<identifier>`).
+pub const EXPORT_SOURCE_DB_CLUSTER_SNAPSHOT: &str = "cluster-snapshot";
+
+/// The ARN resource type of a DB CLUSTER
+/// (`arn:aws:rds:<region>:<account>:cluster:<identifier>`).
+pub const EXPORT_SOURCE_DB_CLUSTER: &str = "cluster";
+
+/// `ExportTask$SourceType` for an export of a snapshot, as `ExportSourceType` publishes it
+/// ([`crate::ops::types::EXPORT_SOURCE_TYPE_VALUES`]).
+pub const EXPORT_SOURCE_TYPE_SNAPSHOT: &str = "SNAPSHOT";
+
+/// `ExportTask$SourceType` for an export of a DB cluster.
+pub const EXPORT_SOURCE_TYPE_CLUSTER: &str = "CLUSTER";
+
+/// The `(resource type, name)` an export's `SourceArn` names, for the three Amazon RDS ARN
+/// forms an export can read: a DB snapshot, a DB cluster snapshot or a DB cluster.
+///
+/// `None` for a value that is not an Amazon RDS ARN of one of those types — the ARN grammar
+/// itself is [`::service_common::arn`]'s, this crate's one ARN parse, so nothing here reads
+/// the six fields again.
+#[must_use]
+pub fn export_source_of(source_arn: &str) -> Option<(&'static str, &str)> {
+    let arn = ::service_common::arn::parse_of(source_arn, super::ARN_NAMESPACE)?;
+    let (resource_type, name) = arn.resource.split_once(':')?;
+    if name.is_empty() {
+        return None;
+    }
+    let resource_type = match resource_type {
+        EXPORT_SOURCE_DB_SNAPSHOT => EXPORT_SOURCE_DB_SNAPSHOT,
+        EXPORT_SOURCE_DB_CLUSTER_SNAPSHOT => EXPORT_SOURCE_DB_CLUSTER_SNAPSHOT,
+        EXPORT_SOURCE_DB_CLUSTER => EXPORT_SOURCE_DB_CLUSTER,
+        _ => return None,
+    };
+    Some((resource_type, name))
+}
+
+/// The id the part files of ONE export carry, so the objects of two exports of the same
+/// source do not collide.
+///
+/// Amazon RDS names each part file after the export that wrote it
+/// (`part-00000-<id>-c000.gz.parquet`); the id here is a digest of the export task's own
+/// identifier, so the objects of one export are named deterministically from the export
+/// that wrote them and two exports never write the same key.
+#[must_use]
+pub fn export_part_id(export_task_identifier: &str) -> String {
+    use ::sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(format!("export:{export_task_identifier}"));
+    let hex = ::hex::encode(&digest[..16]);
+    // The 8-4-4-4-12 form AWS's own part ids carry.
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// A persisted snapshot or cluster export task.
@@ -140,6 +331,18 @@ impl ExportTaskRecord {
         match pending.change {
             PendingChange::Status(status) => {
                 self.status = status;
+                // An export that has STARTED writing is not finished: the clock owes it the
+                // `COMPLETE` it ends in, so a caller polling the task walks the same
+                // STARTING → IN_PROGRESS → COMPLETE progression the real service reports.
+                if self.status == EXPORT_TASK_STATUS_IN_PROGRESS {
+                    self.pending_status =
+                        Some(PendingStatus::in_a_moment(EXPORT_TASK_STATUS_COMPLETE));
+                }
+                if self.status == EXPORT_TASK_STATUS_COMPLETE {
+                    // "The progress of the snapshot or cluster export task as a
+                    // percentage": an export that finished exported all of its source.
+                    self.percent_progress = COMPLETE_PERCENT_PROGRESS;
+                }
                 if self.is_terminal() && self.task_end_time.is_none() {
                     self.task_end_time = Some(now_as_wire_timestamp());
                 }

@@ -115,6 +115,11 @@ pub struct DbInstanceRecord {
     /// ([`data_plane::pg_server::running_parameters`]).
     pub engine_started_at: ::aws_smithy_types::DateTime,
     pub tags: Vec<Tag>,
+    /// `AssociatedRoles`: the IAM roles associated with this instance, in the order they
+    /// were associated — what `AddRoleToDBInstance` adds to and
+    /// `RemoveRoleFromDBInstance` removes from, bounded by
+    /// [`associated_roles::MAX_ASSOCIATED_ROLES`] entries.
+    pub associated_roles: Vec<DBInstanceRole>,
     /// The instance's log: the lifecycle lines THIS SERVICE has recorded for it, which is
     /// what `DescribeDBLogFiles` lists and `DownloadDBLogFilePortion` serves. See
     /// [`engine_log`] for why those lines are the only honest content for it, and for the
@@ -443,10 +448,10 @@ impl DbInstanceRecord {
             database_insights_mode: Some(self.database_insights_mode.clone()),
             performance_insights_enabled: Some(self.performance_insights_enabled),
             deletion_protection: Some(self.deletion_protection),
-            // No implemented operation associates an IAM role with an instance
-            // (`AddRoleToDBInstance` is still a stub): EMPTY for the same reason as the
-            // read-replica list above.
-            associated_roles: Some(Vec::new()),
+            // "A list of Amazon Web Services Identity and Access Management (IAM) roles
+            // associated with the DB instance": the associations this instance carries, in
+            // the order they were made, and EMPTY for an instance that carries none.
+            associated_roles: Some(self.associated_roles.clone()),
             max_allocated_storage: self.max_allocated_storage,
             tag_list: Some(self.tags.clone()),
             customer_owned_ip_enabled: Some(self.customer_owned_ip_enabled),

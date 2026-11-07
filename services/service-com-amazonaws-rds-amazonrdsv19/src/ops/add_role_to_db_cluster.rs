@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddRoleToDBCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddRoleToDBCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation records an IAM role association on the stored DB cluster —
+//! the role and feature `DBCluster$AssociatedRoles` then reports — and is the ONLY file to
+//! touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddRoleToDBCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +163,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddRoleToDBCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddRoleToDBClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddRoleToDBCluster"))
+        let region =
+            crate::state::request_region(ctx).map_err(AddRoleToDBClusterError::validation)?;
+        // `RoleArn` and `FeatureName` are both STORED on the cluster, so each is clamped
+        // where it enters the store — the bounds `CreateDBCluster` applies to the same two
+        // members of an `AssociatedRoles` entry.
+        crate::state::check_stored_text(
+            "RoleArn",
+            &input.role_arn,
+            crate::state::MAX_IAM_ROLE_ARN_LEN,
+        )
+        .map_err(AddRoleToDBClusterError::invalid_parameter_value)?;
+        if let Some(feature_name) = &input.feature_name {
+            crate::state::check_free_form("FeatureName", feature_name)
+                .map_err(AddRoleToDBClusterError::invalid_parameter_value)?;
+        }
+        // "The name of the DB cluster to associate the IAM role with" — not case-sensitive,
+        // and every member naming a cluster also accepts its ARN, so the lookup folds the
+        // way the stored key does.
+        let identifier = crate::state::db_cluster_identifier_of(&input.db_cluster_identifier)
+            .to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all; 501 is the honest answer, never an association
+        // nothing recorded.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        // What the addressed cluster is, read under the lock and then released: the IAM
+        // lookup below is an in-process call to another service, which cannot be made while
+        // this service's store is held.
+        let (engine, engine_version, status) = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+            let Some(cluster) = store.db_clusters.get(&(region.clone(), identifier.clone()))
+            else {
+                return Err(AddRoleToDBClusterErrorModeled::DBClusterNotFoundFault(
+                    DBClusterNotFoundFault {
+                        message: Some(crate::state::db_cluster_cannot_be_accessed_message(
+                            &input.db_cluster_identifier,
+                        )),
+                    },
+                )
+                .into());
+            };
+            (
+                cluster.engine.clone(),
+                cluster.engine_version.clone(),
+                cluster.status.clone(),
+            )
+        };
+
+        // An association changes the cluster's configuration, so the cluster has to be
+        // available for it: one still coming up, stopped or on its way out cannot take one,
+        // which is the modelled cluster-state fault. The status the clock has yet to settle
+        // is real.
+        if status != crate::state::DB_CLUSTER_STATUS_AVAILABLE {
+            return Err(AddRoleToDBClusterErrorModeled::InvalidDBClusterStateFault(
+                InvalidDBClusterStateFault {
+                    message: Some(
+                        crate::state::MODIFY_DB_CLUSTER_INVALID_STATE_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `FeatureName` names "the feature for the DB cluster that the IAM role is to be
+        // associated with. For information about supported feature names, see
+        // DBEngineVersion": a value outside the `SupportedFeatureNames` of the engine
+        // version this cluster runs names no feature of it, which is the Query API's
+        // `InvalidParameterValue`. The member is optional, and a request that names no
+        // feature associates the role with the cluster itself, which no catalogue entry
+        // gates.
+        if let Some(feature_name) = &input.feature_name {
+            if !crate::state::feature_name_is_supported(
+                &engine,
+                engine_version.as_deref(),
+                feature_name,
+            ) {
+                return Err(AddRoleToDBClusterError::invalid_parameter_value(
+                    crate::state::unsupported_feature_name_message(
+                        &engine,
+                        engine_version.as_deref(),
+                        feature_name,
+                    ),
+                ));
+            }
+        }
+
+        // The association lets the engine ACT under the role, so the role has to be one
+        // Amazon RDS can assume: a role this account's IAM holds whose trust policy does
+        // not grant `sts:AssumeRole` to `rds.amazonaws.com` is refused with
+        // `InvalidParameterValue`. A role IAM holds nothing under is not refused here — see
+        // `service_common::iam_role` for why that answer is about this store rather than
+        // about the role.
+        if ::service_common::iam_role::held_role_is_unassumable(
+            ctx,
+            &region,
+            &input.role_arn,
+            crate::state::RDS_SERVICE_PRINCIPAL,
+        )
+        .await
+        {
+            return Err(AddRoleToDBClusterError::invalid_parameter_value(
+                crate::state::role_not_trusted_message(
+                    &input.role_arn,
+                    crate::state::RDS_SERVICE_PRINCIPAL,
+                ),
+            ));
+        }
+
+        let mut store = state.lock();
+        // Resolved again under the new guard: the lock was released for the IAM lookup, so a
+        // delete that ran in between is a not-found, never a panic.
+        let Some(cluster) = store
+            .db_clusters
+            .get_mut(&(region.clone(), identifier.clone()))
+        else {
+            return Err(AddRoleToDBClusterErrorModeled::DBClusterNotFoundFault(
+                DBClusterNotFoundFault {
+                    message: Some(crate::state::db_cluster_cannot_be_accessed_message(
+                        &input.db_cluster_identifier,
+                    )),
+                },
+            )
+            .into());
+        };
+        // "The specified IAM role Amazon Resource Name (ARN) is already associated with the
+        // specified DB cluster": the role-and-feature pair is the identity of an
+        // association, so associating it twice is the modelled already-exists fault rather
+        // than a second entry.
+        let held = crate::state::cluster_role_pairs(&cluster.associated_roles);
+        if crate::state::holds_association(&held, &input.role_arn, input.feature_name.as_deref()) {
+            return Err(
+                AddRoleToDBClusterErrorModeled::DBClusterRoleAlreadyExistsFault(
+                    DBClusterRoleAlreadyExistsFault {
+                        message: Some(crate::state::role_already_associated_message(
+                            "DB cluster",
+                            &identifier,
+                            &input.role_arn,
+                            input.feature_name.as_deref(),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The published per-resource quota, which is what the modelled quota fault reports
+        // having reached — and what bounds the list this record stores.
+        if cluster.associated_roles.len() >= crate::state::MAX_ASSOCIATED_ROLES {
+            return Err(
+                AddRoleToDBClusterErrorModeled::DBClusterRoleQuotaExceededFault(
+                    DBClusterRoleQuotaExceededFault {
+                        message: Some(crate::state::role_quota_message(
+                            "DB cluster",
+                            &identifier,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // In place from here on, so it reports the `ACTIVE` status of an association that
+        // holds — the same status `CreateDBCluster` records for a role it was created with.
+        cluster.associated_roles.push(DBClusterRole {
+            role_arn: Some(input.role_arn),
+            feature_name: input.feature_name,
+            status: Some(crate::state::DB_CLUSTER_ROLE_STATUS_ACTIVE.to_string()),
+        });
+        Ok(AddRoleToDBClusterOutput)
     }
 }

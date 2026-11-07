@@ -75,7 +75,8 @@ use crate::ops::types::{
     CreateDBShardGroupOutput,
     DBCluster, DBClusterAutomatedBackup, DBClusterMember, DBClusterOptionGroupStatus,
     DBClusterParameterGroup, DBClusterRole, DBClusterSnapshot, DBClusterSnapshotAttribute,
-    DBClusterSnapshotAttributesResult, DBInstance, DBParameterGroup, DBParameterGroupStatus,
+    DBClusterSnapshotAttributesResult, DBInstance, DBInstanceRole, DBParameterGroup,
+    DBParameterGroupStatus,
     DBSecurityGroup, DBSecurityGroupMembership, DBSnapshot, DBSubnetGroup,
     DomainMembership, EC2SecurityGroup, Endpoint, EventCategoriesMap, EventSubscription,
     GlobalCluster, GlobalClusterMember, IPRange, MasterUserSecret, Option2, OptionGroup,
@@ -112,12 +113,23 @@ pub mod option_catalog;
 // enough to crowd this module: each lives in its own file and is re-exported here, so a
 // handler still reaches every one of them as `crate::state::<name>` and the store struct
 // below stays the one place that says which maps exist.
+// The IAM-role associations a DB instance and a DB cluster both carry, and the rules the
+// four association operations share.
+pub mod associated_roles;
 pub mod blue_green;
 pub mod custom_engine_versions;
 pub mod db_proxies;
 pub mod engine_log;
 pub mod events;
 pub mod export_tasks;
+// What an export WRITES: the objects it records in the destination bucket, and the Parquet
+// encoding of one exported table. Beside them, the preconditions one is accepted against:
+// the role that writes the objects and the key they are encrypted under.
+pub mod export_access;
+pub mod export_objects;
+pub mod export_parquet;
+pub use export_access::*;
+pub use export_objects::*;
 pub mod integrations;
 pub mod tags;
 pub mod tenant_databases;
@@ -138,6 +150,7 @@ mod parameter_groups;
 mod shard_groups;
 mod snapshots;
 
+pub use associated_roles::*;
 pub use certificates::*;
 pub use default_catalog::*;
 pub use event_catalog::*;
@@ -181,10 +194,19 @@ pub use events::{
     DESCRIBE_EVENTS_SOURCE_TYPES, EVENT_RETENTION_SECONDS, MAX_EVENTS_PER_REGION,
 };
 pub use export_tasks::{
-    export_task_not_found_message, ExportTaskRecord, EXPORT_TASK_STATUS_CANCELED,
-    EXPORT_TASK_STATUS_CANCELING,
+    export_part_id, export_source_of, export_task_already_exists_message,
+    export_task_not_found_message, export_task_quota_message,
+    export_role_missing_permissions_message, export_role_not_found_message,
+    cross_region_export_bucket_message, invalid_export_only_message,
+    invalid_export_source_arn_message, invalid_export_source_state_message,
+    invalid_s3_bucket_message, kms_key_not_accessible_message, partial_export_warning,
+    ExportTaskRecord,
+    COMPLETE_PERCENT_PROGRESS, EXPORT_SOURCE_DB_CLUSTER, EXPORT_SOURCE_DB_CLUSTER_SNAPSHOT,
+    EXPORT_SOURCE_DB_SNAPSHOT, EXPORT_SOURCE_TYPE_CLUSTER, EXPORT_SOURCE_TYPE_SNAPSHOT,
+    EXPORT_TASK_QUOTA_PER_REGION, EXPORT_TASK_STATUS_CANCELED, EXPORT_TASK_STATUS_CANCELING,
     EXPORT_TASK_STATUS_COMPLETE, EXPORT_TASK_STATUS_FAILED, EXPORT_TASK_STATUS_IN_PROGRESS,
-    EXPORT_TASK_STATUS_STARTING, EXPORT_TASK_STATUS_VALUES,
+    EXPORT_TASK_STATUS_STARTING, EXPORT_TASK_STATUS_VALUES, INITIAL_PERCENT_PROGRESS,
+    MAX_EXPORT_TASK_IDENTIFIER_LEN,
 };
 pub use integrations::{
     check_integration_target_arn, check_kms_key_id, integration_not_found_message,

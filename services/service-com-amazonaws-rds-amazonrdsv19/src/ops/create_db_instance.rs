@@ -799,6 +799,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The engine's first run starts with the instance; a later restart moves it.
             engine_started_at: crate::state::now_as_wire_timestamp(),
             tags: input.tags.unwrap_or_default(),
+            // `CreateDBInstance` publishes no `AssociatedRoles` member, so an instance is
+            // created with none: `AddRoleToDBInstance` is what associates a role with one.
+            associated_roles: Vec::new(),
             // The instance's log starts empty; the line below is its first entry, and the
             // transitions the clock then makes due add the rest (`DbInstanceRecord`).
             engine_log: crate::state::InstanceLog::default(),

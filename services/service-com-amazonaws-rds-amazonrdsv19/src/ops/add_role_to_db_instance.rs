@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddRoleToDBInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddRoleToDBInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation records an IAM role association on the stored DB instance —
+//! the role and feature `DBInstance$AssociatedRoles` then reports — and is the ONLY file to
+//! touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddRoleToDBInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +164,174 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddRoleToDBInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddRoleToDBInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddRoleToDBInstance"))
+        let region =
+            crate::state::request_region(ctx).map_err(AddRoleToDBInstanceError::validation)?;
+        // `RoleArn` is STORED on the instance and the member publishes no bound of its own,
+        // so it is clamped where it enters the store, exactly as every other stored ARN of
+        // this service is (`CreateDBCluster`'s `AssociatedRoles.RoleArn`).
+        crate::state::check_stored_text(
+            "RoleArn",
+            &input.role_arn,
+            crate::state::MAX_IAM_ROLE_ARN_LEN,
+        )
+        .map_err(AddRoleToDBInstanceError::invalid_parameter_value)?;
+        crate::state::check_free_form("FeatureName", &input.feature_name)
+            .map_err(AddRoleToDBInstanceError::invalid_parameter_value)?;
+        // "The name of the DB instance to associate the IAM role with", which every member
+        // that names a DB instance folds the way the stored key does.
+        let identifier =
+            crate::state::db_instance_identifier_of(&input.db_instance_identifier).to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all; 501 is the honest answer, never an association
+        // nothing recorded.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        // What the addressed instance is, read under the lock and then released: the IAM
+        // lookup below is an in-process call to another service, which cannot be made while
+        // this service's store is held.
+        let (engine, engine_version, status) = {
+            let mut store = state.lock();
+            // The transitions the clock already made due, so the association is judged
+            // against the state the instance is really in.
+            store.settle_due_transitions(&region);
+            // RDS is regional: an instance is addressable only in the region it was created
+            // in, so an identifier that names one elsewhere is not found here.
+            let Some(instance) = store.db_instances.get(&(region.clone(), identifier.clone()))
+            else {
+                return Err(AddRoleToDBInstanceErrorModeled::DBInstanceNotFoundFault(
+                    DBInstanceNotFoundFault {
+                        message: Some(format!("DBInstance not found: {identifier}")),
+                    },
+                )
+                .into());
+            };
+            (
+                instance.engine.clone(),
+                instance.engine_version.clone(),
+                instance.status.clone(),
+            )
+        };
+
+        // "To add a role to a DB instance, the status of the DB instance must be
+        // available": an instance still coming up, stopped or on its way out cannot take
+        // an association, which is the modelled instance-state fault.
+        if status != crate::state::DB_INSTANCE_STATUS_AVAILABLE {
+            return Err(AddRoleToDBInstanceErrorModeled::InvalidDBInstanceStateFault(
+                InvalidDBInstanceStateFault {
+                    message: Some(crate::state::modify_db_instance_invalid_state_message(
+                        &status,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `FeatureName` names "the feature for the DB instance that the IAM role is to be
+        // associated with. For information about supported feature names, see
+        // DBEngineVersion": a value outside the `SupportedFeatureNames` of the engine
+        // version this instance runs names no feature of it, which is the Query API's
+        // `InvalidParameterValue` rather than an association for a feature that engine has
+        // not got.
+        if !crate::state::feature_name_is_supported(
+            &engine,
+            engine_version.as_deref(),
+            &input.feature_name,
+        ) {
+            return Err(AddRoleToDBInstanceError::invalid_parameter_value(
+                crate::state::unsupported_feature_name_message(
+                    &engine,
+                    engine_version.as_deref(),
+                    &input.feature_name,
+                ),
+            ));
+        }
+
+        // The association lets the engine ACT under the role, so the role has to be one
+        // Amazon RDS can assume: a role this account's IAM holds whose trust policy does
+        // not grant `sts:AssumeRole` to `rds.amazonaws.com` is refused with
+        // `InvalidParameterValue`, the code this Query API answers a value it will not take
+        // with. A role IAM holds nothing under is NOT refused here — an execution role is
+        // routinely provisioned out of band, so this emulator's own store says nothing
+        // about it (`service_common::iam_role`).
+        if ::service_common::iam_role::held_role_is_unassumable(
+            ctx,
+            &region,
+            &input.role_arn,
+            crate::state::RDS_SERVICE_PRINCIPAL,
+        )
+        .await
+        {
+            return Err(AddRoleToDBInstanceError::invalid_parameter_value(
+                crate::state::role_not_trusted_message(
+                    &input.role_arn,
+                    crate::state::RDS_SERVICE_PRINCIPAL,
+                ),
+            ));
+        }
+
+        let mut store = state.lock();
+        // The instance is resolved again under the new guard: the lock was released for the
+        // IAM lookup, so a delete that ran in between is a not-found, never a panic.
+        let Some(instance) = store
+            .db_instances
+            .get_mut(&(region.clone(), identifier.clone()))
+        else {
+            return Err(AddRoleToDBInstanceErrorModeled::DBInstanceNotFoundFault(
+                DBInstanceNotFoundFault {
+                    message: Some(format!("DBInstance not found: {identifier}")),
+                },
+            )
+            .into());
+        };
+        // "The specified RoleArn or FeatureName value is already associated with the DB
+        // instance": the pair is the identity of an association, so associating it twice is
+        // the modelled already-exists fault rather than a second entry.
+        let held = crate::state::instance_role_pairs(&instance.associated_roles);
+        if crate::state::holds_association(&held, &input.role_arn, Some(&input.feature_name)) {
+            return Err(
+                AddRoleToDBInstanceErrorModeled::DBInstanceRoleAlreadyExistsFault(
+                    DBInstanceRoleAlreadyExistsFault {
+                        message: Some(crate::state::role_already_associated_message(
+                            "DB instance",
+                            &identifier,
+                            &input.role_arn,
+                            Some(&input.feature_name),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The published per-resource quota, which is what the modelled quota fault reports
+        // having reached — and what bounds the list this record stores.
+        if instance.associated_roles.len() >= crate::state::MAX_ASSOCIATED_ROLES {
+            return Err(
+                AddRoleToDBInstanceErrorModeled::DBInstanceRoleQuotaExceededFault(
+                    DBInstanceRoleQuotaExceededFault {
+                        message: Some(crate::state::role_quota_message(
+                            "DB instance",
+                            &identifier,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The association is in place from here on, so it reports the `ACTIVE` status of an
+        // association that holds — the same status `CreateDBCluster` records for a role it
+        // was created with.
+        instance.associated_roles.push(DBInstanceRole {
+            role_arn: Some(input.role_arn.clone()),
+            feature_name: Some(input.feature_name.clone()),
+            status: Some(crate::state::DB_CLUSTER_ROLE_STATUS_ACTIVE.to_string()),
+        });
+        instance.engine_log.record(format!(
+            "IAM role {} associated with DB instance {identifier} for feature {}",
+            input.role_arn, input.feature_name
+        ));
+        Ok(AddRoleToDBInstanceOutput)
     }
 }

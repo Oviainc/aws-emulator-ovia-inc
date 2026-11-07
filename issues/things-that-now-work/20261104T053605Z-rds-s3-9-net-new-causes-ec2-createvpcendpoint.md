@@ -59,6 +59,8 @@ Issue-Commit: f099a2d3bf6bcdb075a9bf115e0dc86bb75f03d7
 
 > _Note: this issue was identified against the code base at commit `f099a2d3bf6bcdb075a9bf115e0dc86bb75f03d7`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _Resolved in part: cause 3 (`StartExportTask` and every refusal it models), cause 5 (`AddRoleToDBCluster` / `AddRoleToDBInstance` and the two removals) and the export half of cause 6 are fixed and pinned by `services/service-com-amazonaws-rds-amazonrdsv19/tests/all/rds_s3_integration.rs`. Causes 1, 2, 4, 6 (the flows that also need cause 2), 7, 8 and 9 are NOT fixed: they are re-filed, with their trace ids and Issue-Keys, as `issues/things-that-do-not-work/20261107T061500Z-rds-s3-6-remaining-causes-in-engine-s3-statements-and-cloudformation.md`, so they are not recorded as working._
+
 ## Operation
 StartExportTask
 

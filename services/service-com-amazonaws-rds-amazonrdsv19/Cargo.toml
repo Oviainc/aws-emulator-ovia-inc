@@ -84,6 +84,20 @@ aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio",
 # an awsQuery `<ErrorResponse>` envelope is shaped by library code rather than by hand.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `StartExportTask` writes the exported snapshot or cluster data INTO the one object store
+# this emulator serves, where the caller then lists and reads it: the export objects are
+# recorded through Amazon S3's own store on the same engine (`src/state/export_objects.rs`),
+# so a bucket this service writes to is a bucket that service holds.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The export writes each table as the Apache Parquet file Amazon RDS exports a snapshot as
+# ("the data is exported in Apache Parquet format", Exporting DB snapshot data to Amazon S3):
+# `parquet` is the Apache implementation of that format, used through its low-level row-group
+# writer, and `flate2-rust_backend` is the one compression feature it needs for the
+# GZIP-compressed columns those `.gz.parquet` objects carry — the pure-Rust backend, so no
+# native zlib is built. Nothing else of the crate is built — in particular no Arrow, and no
+# `thrift` (this release line reads the format's metadata with its own code, so the advisory
+# against `thrift` before 0.23 does not reach this build).
+parquet = { version = "60", default-features = false, features = ["flate2-rust_backend"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -101,6 +115,13 @@ service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 sha1 = "0.10"
 rustls = { workspace = true }
 tokio-rustls = "0.26"
+# The RDS/S3 integration suite mounts Amazon S3 and IAM beside this service on one engine,
+# exactly as the assembled router mounts them, and reads the objects an export wrote back
+# through Amazon S3's OWN operations: `aws-sdk-s3` and `aws-sdk-iam` are those clients, over
+# the in-process callback.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-sdk-iam = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # The managed-master-password suite mounts Secrets Manager (and KMS, which encrypts a
 # secret's value) beside this service on one engine, exactly as the assembled router
 # mounts them, so the secret a cluster or instance reports is a real secret of this

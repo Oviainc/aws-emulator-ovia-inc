@@ -805,6 +805,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // reboot or start moves it.
                 engine_started_at: crate::state::now_as_wire_timestamp(),
                 tags,
+                // A restore publishes no `AssociatedRoles` member either, so the restored
+                // instance starts with none of the source's associations: each one is made
+                // against the instance that carries it.
+                associated_roles: Vec::new(),
                 engine_log: crate::state::InstanceLog::default(),
             };
             record.engine_log.record(format!(

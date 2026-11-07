@@ -271,6 +271,13 @@ pub fn db_snapshot_not_found_message(named: &str) -> String {
     format!("DBSnapshot not found: {named}")
 }
 
+/// How Amazon RDS words the DB CLUSTER snapshot not-found fault: the same
+/// `<type> not found: <name>` form [`db_snapshot_not_found_message`] words, for the cluster
+/// snapshot a request NAMED, carrying the request's own spelling of the identifier.
+pub fn db_cluster_snapshot_not_found_message(named: &str) -> String {
+    format!("DBClusterSnapshot not found: {named}")
+}
+
 /// A stored DB snapshot: the source instance's settings as they stood when the
 /// snapshot was taken, which is why they are copied rather than re-read later.
 #[derive(Debug, Clone)]

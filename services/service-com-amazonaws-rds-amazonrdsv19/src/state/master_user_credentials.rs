@@ -123,6 +123,7 @@ mod tests {
             instance_create_time: now_as_wire_timestamp(),
             engine_started_at: now_as_wire_timestamp(),
             tags: Vec::new(),
+            associated_roles: Vec::new(),
             engine_log: InstanceLog::default(),
         }
     }
