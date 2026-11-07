@@ -98,12 +98,10 @@ pub fn log_target<Eng: Send + Sync + 'static>(
     region: &str,
     config: &crate::state::FunctionConfig,
 ) -> LogTarget {
-    let log_group = config
-        .logging_config
-        .as_ref()
-        .and_then(|logging| logging.log_group.clone())
-        .filter(|group| !group.is_empty())
-        .unwrap_or_else(|| crate::state::default_log_group(&config.name));
+    // The ONE reading of where this function's invocations are logged, shared with what a
+    // READ of the function reports for its `LoggingConfig`.
+    let log_group =
+        crate::state::configured_log_group(config.logging_config.as_ref(), &config.name);
     LogTarget {
         grants: grants(engine, region, &config.role, &log_group),
         log_group,

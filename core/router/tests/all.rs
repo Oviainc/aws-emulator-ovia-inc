@@ -938,3 +938,7 @@ mod cloudformation_provisions_cognito_identity_pools;
 mod ds_log_subscription_forwarding;
 #[path = "all/sns_lambda_cdk_subscription_delivery.rs"]
 mod sns_lambda_cdk_subscription_delivery;
+// Declared here, in the appended tail: the whole ingest path of a deployed `AWS_PROXY` stage,
+// and the log group the invocation that path makes writes its run to.
+#[path = "all/apigateway_proxy_lambda_ddb_pipeline.rs"]
+mod apigateway_proxy_lambda_ddb_pipeline;

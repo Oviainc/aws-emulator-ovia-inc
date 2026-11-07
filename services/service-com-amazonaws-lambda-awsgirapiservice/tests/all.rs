@@ -317,3 +317,5 @@ mod durable_execution_completion;
 mod event_source_mapping_processed_batch;
 #[path = "all/invoke_caller_authorization.rs"]
 mod invoke_caller_authorization;
+#[path = "all/invocation_logs.rs"]
+mod invocation_logs;

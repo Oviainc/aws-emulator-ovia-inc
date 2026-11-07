@@ -346,6 +346,13 @@ pub use archive::unzipped_bytes;
 pub mod invocation_payload;
 pub use invocation_payload::unparseable_payload_message;
 
+/// WHERE a function's invocations are logged — the one reading of `LoggingConfig$LogGroup`
+/// and of the default group — lives in [`invocation_logs`], between the read that REPORTS
+/// that group and the delivery that WRITES to it. It is re-exported here for the same reason
+/// as [`capacity_provider`]: both of those name it as `crate::state::…`.
+pub mod invocation_logs;
+pub use invocation_logs::configured_log_group;
+
 /// What the RUN of a durable function's invocation does to the EXECUTION that invocation
 /// started lives in [`durable_run`], beside the running of the invocation in [`execution`]
 /// and the queue that drives it in [`async_invocation`]. The record it settles stays in this

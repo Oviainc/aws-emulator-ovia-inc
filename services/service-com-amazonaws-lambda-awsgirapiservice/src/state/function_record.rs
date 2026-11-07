@@ -22,7 +22,8 @@ use crate::ops::types::{
 };
 
 use super::{
-    code_location_url, configured_capacity_provider, default_log_group, event_payload, iso8601,
+    code_location_url, configured_capacity_provider, configured_log_group, event_payload,
+    iso8601,
     mint_durable_execution_id, mint_revision_id, resolved_image_uri, runtime_version_arn,
     service_managed_function_scaling_config, AliasRecord, AsyncInvocationOutcome,
     AsyncInvocationRecord, CapacityProviderVersion, CodeRecord, DurableExecutionRecord,
@@ -902,11 +903,10 @@ impl FunctionRecord {
                             .as_ref()
                             .and_then(|logging| logging.system_log_level.clone()),
                     ),
-                    log_group: config
-                        .logging_config
-                        .as_ref()
-                        .and_then(|logging| logging.log_group.clone())
-                        .or_else(|| Some(default_log_group(&config.name))),
+                    log_group: Some(configured_log_group(
+                        config.logging_config.as_ref(),
+                        &config.name,
+                    )),
                     log_format: Some(log_format),
                 })
             },
