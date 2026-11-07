@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFunctionEventInvokeConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFunctionEventInvokeConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFunctionEventInvokeConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the asynchronous-invocation configuration of ONE function, version or alias on
+//! the record [`crate::state`] holds — "Updates the configuration for asynchronous
+//! invocation for a function, version, or alias" — so `GetFunctionEventInvokeConfig`
+//! reports exactly what this call left behind.
+//!
+//! Only the settings the request CARRIES are changed: "To set one option without affecting
+//! existing settings for other options, use UpdateFunctionEventInvokeConfig", which is what
+//! separates it from `PutFunctionEventInvokeConfig`, whose request replaces the
+//! configuration whole. A qualifier that holds no configuration has nothing to update, so
+//! such a request is refused `ResourceNotFoundException` (see
+//! [`crate::state::no_event_invoke_config_message`]) rather than creating one.
+//!
+//! A destination this call stores is judged exactly as the put judges one: Lambda writes it
+//! acting as the function's execution role, so a role that may not make that write is
+//! refused `InvalidParameterValueException` and nothing is changed (see
+//! [`crate::state::event_invoke_config`]).
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +187,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFunctionEventInvokeConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFunctionEventInvokeConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFunctionEventInvokeConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(service_error("Lambda state is not reachable on this engine"));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // The `FunctionName`/`Qualifier` pair names the function, version or alias whose
+        // configuration is updated, resolved exactly the way the put that stored it
+        // resolved the same pair.
+        let (record, qualifier) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            input.qualifier.as_deref(),
+            &region,
+            now,
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
+            crate::state::ResolveFailure::NotFound(message) => not_found(message),
+        })?;
+
+        let function_arn = crate::state::configured_function_arn(&record.arn, &qualifier);
+        // There is nothing to update on a qualifier that holds no configuration: this
+        // operation changes an existing one, and `PutFunctionEventInvokeConfig` is what
+        // creates one. The state of the RESOURCE decides whether the request's own members
+        // are judged at all, so this comes before the gate below.
+        if !record.event_invoke_configs.contains_key(&qualifier) {
+            return Err(not_found(crate::state::no_event_invoke_config_message(
+                &function_arn,
+            )));
+        }
+
+        // The same gate the put passes through, on the destinations THIS request names: a
+        // role that may not write one of them names a destination no invocation record
+        // could ever reach, so the configuration is left exactly as it stands.
+        let Some(role) = record.config_of(&qualifier).map(|config| config.role.clone()) else {
+            return Err(service_error(
+                "Lambda resolved the function without a configuration to read its execution \
+                 role from",
+            ));
+        };
+        let destinations = crate::state::requested_destinations(input.destination_config.as_ref());
+        if let Some(message) =
+            crate::state::unwritable_destination(&*self.engine, &role, &destinations)
+        {
+            return Err(invalid_parameter(message));
+        }
+
+        let Some(stored) = record.event_invoke_configs.get_mut(&qualifier) else {
+            return Err(service_error(
+                "Lambda lost the configuration between finding it and updating it",
+            ));
+        };
+        stored.apply_update(
+            input.maximum_retry_attempts,
+            input.maximum_event_age_in_seconds,
+            input.destination_config.as_ref(),
+            now,
+        );
+
+        // Answered by reading the stored record back, so the response reports what is held
+        // rather than what the request carried.
+        Ok(configuration(stored.reported(function_arn)))
     }
+}
+
+/// The one `FunctionEventInvokeConfig` the model declares, in this operation's own
+/// generated shape of it.
+///
+/// [`crate::state::EventInvokeConfigRecord::reported`] builds it as
+/// `GetFunctionEventInvokeConfigOutput`, so the members are carried across one for one
+/// rather than rebuilt from state a second time.
+fn configuration(
+    reported: GetFunctionEventInvokeConfigOutput,
+) -> UpdateFunctionEventInvokeConfigOutput {
+    UpdateFunctionEventInvokeConfigOutput {
+        last_modified: reported.last_modified,
+        function_arn: reported.function_arn,
+        maximum_retry_attempts: reported.maximum_retry_attempts,
+        maximum_event_age_in_seconds: reported.maximum_event_age_in_seconds,
+        destination_config: reported.destination_config,
+    }
+}
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> UpdateFunctionEventInvokeConfigError {
+    UpdateFunctionEventInvokeConfigErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 404 for a function or version this emulator does not hold, and for a
+/// qualifier that holds no configuration to update.
+fn not_found(message: String) -> UpdateFunctionEventInvokeConfigError {
+    UpdateFunctionEventInvokeConfigErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 500 for a failure of the store itself.
+fn service_error(message: &str) -> UpdateFunctionEventInvokeConfigError {
+    UpdateFunctionEventInvokeConfigErrorModeled::ServiceException(ServiceException {
+        r#type: None,
+        message: Some(message.to_string()),
+    })
+    .into()
 }

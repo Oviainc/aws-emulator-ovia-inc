@@ -116,6 +116,16 @@
 //! rather than answered for (see
 //! [`FunctionRecord::require_capacity_provider_configuration`]).
 //!
+//! The asynchronous-invocation-configuration slice hangs off the same record, one entry per
+//! qualifier: `PutFunctionEventInvokeConfig` "Configures options for asynchronous
+//! invocation on a function, version, or alias", so what it persists lives on
+//! [`FunctionRecord::event_invoke_configs`] keyed by the qualifier the call addressed, and
+//! `GetFunctionEventInvokeConfig` and `ListFunctionEventInvokeConfigs` report exactly those
+//! records. A qualifier nobody has configured holds NO configuration, which is what the
+//! reads answer the modelled 404 for (see [`no_event_invoke_config_message`]); the put
+//! replaces an addressed qualifier's configuration whole and the update changes only the
+//! settings its request carries (see [`EventInvokeConfigRecord`]).
+//!
 //! What those same records come to at the account level is also METERED, with no client
 //! action at all: Lambda publishes how much of the Region's concurrency the account has
 //! claimed and how much of its unreserved pool is in use, which is what an operator alarms
@@ -250,6 +260,18 @@ pub use event_source_authorization::unreadable_event_source;
 /// same reason: a handler names it as `crate::state::…`.
 pub mod vpc_attachment_authorization;
 pub use vpc_attachment_authorization::unattachable_vpc_config;
+
+/// The ASYNCHRONOUS-INVOCATION CONFIGURATION of a function, version or alias — the record
+/// the `…FunctionEventInvokeConfig` operations read and write, and whether the function's
+/// execution role lets Lambda deliver a record to the destinations one names — lives in
+/// [`event_invoke_config`], beside the execution-role reading above it shares its evidence
+/// with. It is re-exported here for the same reason as [`capacity_provider`]: the records
+/// hang off the function record this module holds.
+pub mod event_invoke_config;
+pub use event_invoke_config::{
+    configured_function_arn, no_event_invoke_config_message, requested_destinations,
+    unwritable_destination, EventInvokeConfigRecord,
+};
 
 /// What the account's CONCURRENCY does with no client action at all — the series Lambda
 /// publishes about how much of the Region's capacity the account has claimed, and how much

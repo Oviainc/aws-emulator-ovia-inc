@@ -283,25 +283,13 @@ impl EventSourceAccess {
             .permissions_boundary_document(role_arn)
             .map(|document| iam::prepare_documents(::std::slice::from_ref(&document)));
         self.decided_actions().find(|name| {
-            let action = format!("{}:{name}", self.namespace);
-            let request = iam::Request::new(&action, resource, &[]);
-            let stated = iam::identity_decision_prepared(&documents, &request);
-            // An attachment whose document this account does not hold is a grant this
-            // emulator cannot read, so it cannot be the basis of a refusal — but it cannot
-            // overturn one either: an explicit `Deny` in a document that IS held wins over
-            // every grant, including one whose content is unknown here.
-            let granted = stated == Decision::Allowed
-                || (stated != Decision::Denied && !policies.uncarried.is_empty());
-            // A read an identity-based policy explicitly DENIES is already withheld on that
-            // deny, so no ceiling is read for it.
-            let capped = if stated == Decision::Denied {
-                Decision::Allowed
-            } else {
-                boundary.as_ref().map_or(Decision::Allowed, |boundary| {
-                    iam::identity_decision_prepared(boundary, &request)
-                })
-            };
-            !granted || capped != Decision::Allowed
+            call_is_withheld(
+                &documents,
+                boundary.as_deref(),
+                !policies.uncarried.is_empty(),
+                &format!("{}:{name}", self.namespace),
+                resource,
+            )
         })
     }
 
@@ -365,6 +353,81 @@ fn access_of(event_source_arn: &str) -> Option<&'static EventSourceAccess> {
     EVENT_SOURCE_ACCESS
         .iter()
         .find(|entry| entry.vendor == vendor)
+}
+
+/// How Lambda words the refusal of a role that may not make ONE call Lambda itself would
+/// make on the caller's behalf, as the surfaces that stand a resource UP word it: "The
+/// provided execution role does not have permissions to call CreateNetworkInterface on EC2"
+/// ([`super::vpc_attachment_authorization`]). Only the CALL and the service it would have
+/// been made to vary with the request; the rest is fixed text.
+///
+/// Shared with the gate on the destination an asynchronous invocation record is delivered to
+/// ([`super::event_invoke_config`]), so one error class is worded one way. The refusal of a
+/// read of a mapping's event SOURCE is a sentence of its own ([`Refusal::Call`]), as that
+/// service answered it when it was observed.
+pub(super) fn provided_role_refusal_message(action: &str, service: &str) -> String {
+    format!("The provided execution role does not have permissions to call {action} on {service}")
+}
+
+/// Whether the identity-based documents in force on `role_arn` WITHHOLD the call `action`
+/// on `resource`.
+///
+/// `None` when nothing of the kind can be shown: this account's IAM holds no role under
+/// that ARN (it may belong to another account), or the store holds no policies to read for
+/// it. The DECISION itself is [`call_is_withheld`], the one reading of the documents in
+/// force this module states.
+pub(super) fn withholds_call(
+    iam: &IamState,
+    role_arn: &str,
+    action: &str,
+    resource: &str,
+) -> Option<bool> {
+    iam.roles.values().find(|role| role.arn == role_arn)?;
+    let policies = iam.principal_policies(role_arn)?;
+    let documents = iam::prepare_documents(&policies.documents);
+    let boundary = iam
+        .permissions_boundary_document(role_arn)
+        .map(|document| iam::prepare_documents(::std::slice::from_ref(&document)));
+    Some(call_is_withheld(
+        &documents,
+        boundary.as_deref(),
+        !policies.uncarried.is_empty(),
+        action,
+        resource,
+    ))
+}
+
+/// Whether `action` on `resource` is withheld by the documents in force, read in IAM's own
+/// order.
+///
+/// `documents` are the identity-based documents the role carries and `boundary` the
+/// permissions boundary that caps them, both already prepared so one call can be decided
+/// over the same documents as the next. `uncarried` says whether the role carries an
+/// attachment whose document this account does not hold.
+fn call_is_withheld(
+    documents: &[iam::PreparedDocument],
+    boundary: Option<&[iam::PreparedDocument]>,
+    uncarried: bool,
+    action: &str,
+    resource: &str,
+) -> bool {
+    let request = iam::Request::new(action, resource, &[]);
+    let stated = iam::identity_decision_prepared(documents, &request);
+    // An attachment whose document this account does not hold is a grant this emulator
+    // cannot read, so it cannot be the basis of a refusal — but it cannot overturn one
+    // either: an explicit `Deny` in a document that IS held wins over every grant,
+    // including one whose content is unknown here.
+    let granted = stated == Decision::Allowed || (stated != Decision::Denied && uncarried);
+    // A call an identity-based policy explicitly DENIES is already withheld on that deny,
+    // so no ceiling is read for it.
+    let capped = if stated == Decision::Denied {
+        Decision::Allowed
+    } else {
+        boundary.map_or(Decision::Allowed, |boundary| {
+            iam::identity_decision_prepared(boundary, &request)
+        })
+    };
+    !granted || capped != Decision::Allowed
 }
 
 /// The sentence Lambda refuses a mapping between the event source `event_source_arn` and a

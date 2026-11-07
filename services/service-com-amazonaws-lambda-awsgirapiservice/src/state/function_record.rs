@@ -26,7 +26,8 @@ use super::{
     mint_durable_execution_id, mint_revision_id, resolved_image_uri, runtime_version_arn,
     service_managed_function_scaling_config, AliasRecord, AsyncInvocationOutcome,
     AsyncInvocationRecord, CapacityProviderVersion, CodeRecord, DurableExecutionRecord,
-    DurableExecutionStart, FunctionConfig, FunctionScalingConfigRecord, FunctionUrlConfigRecord,
+    DurableExecutionStart, EventInvokeConfigRecord, FunctionConfig, FunctionScalingConfigRecord,
+    FunctionUrlConfigRecord,
     FunctionVersionRecord, PolicyRecord, ProvisionedConcurrencyRecord, RequestChainRecord,
     RuntimeManagementConfigRecord, ASYNC_DELIVERY_DELAY, ASYNC_NOT_DELIVERED_REASON,
     ASYNC_RECURSION_STOPPED_REASON, DEFAULT_LOG_FORMAT, DURABLE_EXECUTION_ARN_INFIX,
@@ -148,6 +149,13 @@ pub struct FunctionRecord {
     /// number or [`VERSION_LATEST_PUBLISHED`]. A qualifier nobody has configured holds
     /// none at all.
     pub function_scaling_configs: BTreeMap<String, FunctionScalingConfigRecord>,
+    /// The asynchronous-invocation configuration of each qualifier that has had one put on
+    /// it, keyed by the qualifier the `PutFunctionEventInvokeConfig` call addressed —
+    /// [`VERSION_LATEST`], a published version number or an alias name. The resource is "a
+    /// function, version, or alias", so a configuration put on an alias is the alias's own
+    /// and never the one the version that alias invokes holds, and a qualifier nobody has
+    /// configured holds none at all.
+    pub event_invoke_configs: BTreeMap<String, EventInvokeConfigRecord>,
 }
 
 impl FunctionRecord {

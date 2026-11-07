@@ -65,9 +65,11 @@ fn network_interface_resource(region: &str) -> String {
 ///
 /// "The provided execution role does not have permissions to call CreateNetworkInterface on
 /// EC2" — the sentence is fixed text apart from the CALL the role may not make, which is the
-/// first of [`NETWORK_INTERFACE_ACTIONS`] the role is short of.
+/// first of [`NETWORK_INTERFACE_ACTIONS`] the role is short of. It is worded once, in
+/// [`super::event_source_authorization::provided_role_refusal_message`], because the gate on
+/// the destination an invocation record is delivered to answers the same error class.
 fn message(withheld: &str) -> String {
-    format!("The provided execution role does not have permissions to call {withheld} on EC2")
+    super::event_source_authorization::provided_role_refusal_message(withheld, "EC2")
 }
 
 /// The sentence Lambda refuses the VPC configuration `vpc_config` on a function running as

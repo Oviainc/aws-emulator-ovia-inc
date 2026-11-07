@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFunctionEventInvokeConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFunctionEventInvokeConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFunctionEventInvokeConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the asynchronous-invocation configuration of ONE function, version or alias out
+//! of the record [`crate::state`] holds — "Retrieves the configuration for asynchronous
+//! invocation for a function, version, or alias" — so what it answers is exactly what
+//! `PutFunctionEventInvokeConfig` or `UpdateFunctionEventInvokeConfig` persisted.
+//!
+//! A qualifier nobody has configured holds NO configuration, and this operation's resource
+//! is the configuration rather than the function, so such a read is refused
+//! `ResourceNotFoundException` naming the function ARN it addressed (see
+//! [`crate::state::no_event_invoke_config_message`]) rather than answered with settings
+//! nobody asked for.
+//!
+//! A REPORT: it changes nothing, so the next caller reads exactly what this one did.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +171,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFunctionEventInvokeConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFunctionEventInvokeConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFunctionEventInvokeConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(service_error("Lambda state is not reachable on this engine"));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // The `FunctionName`/`Qualifier` pair names the function, version or alias whose
+        // configuration is reported, resolved exactly the way the write that stored it
+        // resolved the same pair, so every documented way of naming one reads the one
+        // configuration it holds.
+        let (record, qualifier) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            input.qualifier.as_deref(),
+            &region,
+            now,
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
+            crate::state::ResolveFailure::NotFound(message) => not_found(message),
+        })?;
+
+        let function_arn = crate::state::configured_function_arn(&record.arn, &qualifier);
+        let Some(stored) = record.event_invoke_configs.get(&qualifier) else {
+            return Err(not_found(crate::state::no_event_invoke_config_message(
+                &function_arn,
+            )));
+        };
+        Ok(stored.reported(function_arn))
     }
+}
+
+/// The modelled 400 for a request that names no single resource.
+fn invalid_parameter(message: String) -> GetFunctionEventInvokeConfigError {
+    GetFunctionEventInvokeConfigErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 404 for a function or version this emulator does not hold, and for a
+/// qualifier that holds no configuration.
+fn not_found(message: String) -> GetFunctionEventInvokeConfigError {
+    GetFunctionEventInvokeConfigErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 500 for a failure of the store itself.
+fn service_error(message: &str) -> GetFunctionEventInvokeConfigError {
+    GetFunctionEventInvokeConfigErrorModeled::ServiceException(ServiceException {
+        r#type: None,
+        message: Some(message.to_string()),
+    })
+    .into()
 }

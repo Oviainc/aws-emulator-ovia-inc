@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutFunctionEventInvokeConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutFunctionEventInvokeConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutFunctionEventInvokeConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the asynchronous-invocation configuration of ONE function, version or alias on
+//! the record [`crate::state`] holds — "Configures options for asynchronous invocation on
+//! a function, version, or alias" — so `GetFunctionEventInvokeConfig` and
+//! `ListFunctionEventInvokeConfigs` report exactly what this call persisted and nothing is
+//! echoed back out of a request without being stored first.
+//!
+//! The call REPLACES whatever the addressed qualifier held: "If a configuration already
+//! exists for a function, version, or alias, this operation overwrites it. If you exclude
+//! any settings, they are removed" — which is what separates it from
+//! `UpdateFunctionEventInvokeConfig`, whose request changes only the settings it carries.
+//!
+//! A destination is written to by Lambda ACTING AS the execution role of the function
+//! version the configuration belongs to, so a configuration whose role may not make that
+//! write names a destination no invocation record could ever reach: it is refused with this
+//! operation's own `InvalidParameterValueException` ("One of the parameters in the request
+//! is not valid") before anything is persisted, on IAM's own reading of its own store (see
+//! [`crate::state::event_invoke_config`], including the cases that show nothing about the
+//! role and refuse nothing).
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +201,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutFunctionEventInvokeConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutFunctionEventInvokeConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutFunctionEventInvokeConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(service_error("Lambda state is not reachable on this engine"));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // "Configures options for asynchronous invocation on a function, version, or
+        // alias": the `FunctionName`/`Qualifier` pair names the one the configuration
+        // belongs to, resolved exactly the way every other operation on this service
+        // resolves that pair, and a request naming no qualifier addresses the unpublished
+        // version, which is what resolution defaults to.
+        let (record, qualifier) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            input.qualifier.as_deref(),
+            &region,
+            now,
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
+            crate::state::ResolveFailure::NotFound(message) => not_found(message),
+        })?;
+
+        // Lambda delivers an invocation record to a destination ACTING AS the execution
+        // role of the function version the configuration belongs to, so a role the policies
+        // in force on it do not let make that write names a destination no record could
+        // ever reach: it is refused before anything is persisted rather than stored as a
+        // destination nothing is ever delivered to.
+        let Some(role) = record.config_of(&qualifier).map(|config| config.role.clone()) else {
+            return Err(service_error(
+                "Lambda resolved the function without a configuration to read its execution \
+                 role from",
+            ));
+        };
+        let function_arn = crate::state::configured_function_arn(&record.arn, &qualifier);
+        let destinations = crate::state::requested_destinations(input.destination_config.as_ref());
+        if let Some(message) =
+            crate::state::unwritable_destination(&*self.engine, &role, &destinations)
+        {
+            return Err(invalid_parameter(message));
+        }
+
+        // "If a configuration already exists for a function, version, or alias, this
+        // operation overwrites it. If you exclude any settings, they are removed." So what
+        // is stored is exactly what this request carried, in place of whatever the
+        // addressed qualifier held.
+        record.event_invoke_configs.insert(
+            qualifier.clone(),
+            crate::state::EventInvokeConfigRecord::of_request(
+                input.maximum_retry_attempts,
+                input.maximum_event_age_in_seconds,
+                input.destination_config.as_ref(),
+                now,
+            ),
+        );
+
+        // Answered by reading the stored record back, so the response reports what is held
+        // rather than what the request carried.
+        let stored = record
+            .event_invoke_configs
+            .get(&qualifier)
+            .ok_or_else(|| service_error("Lambda lost the configuration it stored"))?;
+        Ok(configuration(stored.reported(function_arn)))
     }
+}
+
+/// The one `FunctionEventInvokeConfig` the model declares, in this operation's own
+/// generated shape of it.
+///
+/// [`crate::state::EventInvokeConfigRecord::reported`] builds it as
+/// `GetFunctionEventInvokeConfigOutput`, so the members are carried across one for one
+/// rather than rebuilt from state a second time.
+fn configuration(reported: GetFunctionEventInvokeConfigOutput) -> PutFunctionEventInvokeConfigOutput {
+    PutFunctionEventInvokeConfigOutput {
+        last_modified: reported.last_modified,
+        function_arn: reported.function_arn,
+        maximum_retry_attempts: reported.maximum_retry_attempts,
+        maximum_event_age_in_seconds: reported.maximum_event_age_in_seconds,
+        destination_config: reported.destination_config,
+    }
+}
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> PutFunctionEventInvokeConfigError {
+    PutFunctionEventInvokeConfigErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 404 for a name and qualifier that name no function, or no such version of
+/// one.
+fn not_found(message: String) -> PutFunctionEventInvokeConfigError {
+    PutFunctionEventInvokeConfigErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 500 for a failure of the store itself.
+fn service_error(message: &str) -> PutFunctionEventInvokeConfigError {
+    PutFunctionEventInvokeConfigErrorModeled::ServiceException(ServiceException {
+        r#type: None,
+        message: Some(message.to_string()),
+    })
+    .into()
 }

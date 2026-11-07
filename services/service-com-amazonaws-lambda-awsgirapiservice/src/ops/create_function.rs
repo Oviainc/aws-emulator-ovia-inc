@@ -688,6 +688,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ... and no scaling configuration on any of its qualifiers until
             // `PutFunctionScalingConfig` sets one for one of them.
             function_scaling_configs: ::std::collections::BTreeMap::new(),
+            // ... and no asynchronous-invocation configuration on any of its qualifiers
+            // until `PutFunctionEventInvokeConfig` puts one on one of them, so every read
+            // of one reports that none is held rather than a configuration nobody asked
+            // for.
+            event_invoke_configs: ::std::collections::BTreeMap::new(),
         };
 
         // "Use the Publish parameter to create version 1 of your function from its
