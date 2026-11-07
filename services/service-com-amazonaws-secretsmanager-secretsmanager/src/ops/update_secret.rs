@@ -352,6 +352,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let sealed = match value.as_ref().filter(|_| !target.replay) {
             Some(value) => Some(
                 crate::state::envelope::seal(
+                    &*self.engine,
                     ctx,
                     &region,
                     target.kms_key_id.as_deref(),
@@ -372,7 +373,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // each is opened under the key holding it and sealed again under the new
         // one, which is what leaves the key the secret came from no longer needed
         // to read them.
-        let resealed = reseal_staged(ctx, &region, &target, staged).await?;
+        let resealed = reseal_staged(&*self.engine, ctx, &region, &target, staged).await?;
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -586,7 +587,8 @@ fn moves_to_another_key(held_under: Option<&str>, resolved: Option<&str>) -> boo
 /// (`UpdateSecretRequest$KmsKeyId`, this service's Smithy model) — while a version
 /// that cannot be OPENED at all refuses this update with `DecryptionFailure`,
 /// since a value this service cannot read is one it cannot move to another key.
-async fn reseal_staged(
+async fn reseal_staged<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     target: &Target,
@@ -595,10 +597,11 @@ async fn reseal_staged(
     let mut resealed = Vec::with_capacity(staged.len());
     for (staged_id, stored) in staged {
         let context = crate::state::envelope::ValueContext::new(&target.arn, &staged_id);
-        let opened = crate::state::envelope::open(ctx, region, &context, &stored)
+        let opened = crate::state::envelope::open(engine, ctx, region, &context, &stored)
             .await
             .map_err(decryption_failure)?;
         match crate::state::envelope::seal(
+            engine,
             ctx,
             region,
             target.kms_key_id.as_deref(),
@@ -621,22 +624,32 @@ async fn reseal_staged(
     Ok(resealed)
 }
 
-/// `DecryptionFailure` — "Secrets Manager can't decrypt the protected secret text
-/// using the provided KMS key." — for a stored version this update had to read,
-/// to move it to another key, and whose key would not decrypt it, relaying the KMS
-/// refusal (see [`crate::state::envelope::KmsRefusal`]).
+/// How a read this update had to make, to move a version to another key, and that the
+/// version's key refused is answered.
+///
+/// A caller whose authority does not reach `kms:Decrypt` on that key is NOT AUTHORIZED,
+/// which the IAM layer refuses ahead of this service's own answer: the refusal is the common
+/// `AccessDeniedException` carrying the sentence KMS worded for the action and the key. Every
+/// other refusal is `DecryptionFailure` — "Secrets Manager can't decrypt the protected secret
+/// text using the provided KMS key." — relaying the KMS refusal it met (see
+/// [`crate::state::envelope::KmsRefusal`]).
 fn decryption_failure(refusal: crate::state::envelope::KmsRefusal) -> UpdateSecretError {
+    if let Some(denied) = refusal.denied_message() {
+        return crate::scaffolded::AccessDeniedException::new(denied).into();
+    }
     UpdateSecretErrorModeled::DecryptionFailure(DecryptionFailure {
         message: Some(refusal.decryption_failure_message()),
     })
     .into()
 }
 
-/// `EncryptionFailure` — "Secrets Manager can't encrypt the protected secret text
-/// using the provided KMS key." — for a value the secret's KMS key would not
-/// encrypt, relaying the KMS refusal (see
-/// [`crate::state::envelope::KmsRefusal`]).
+/// How a write the secret's KMS key refused is answered, which is the mirror of
+/// [`decryption_failure`]: the common `AccessDeniedException` for a caller whose authority
+/// does not reach `kms:GenerateDataKey` on the key, and `EncryptionFailure` otherwise.
 fn encryption_failure(refusal: crate::state::envelope::KmsRefusal) -> UpdateSecretError {
+    if let Some(denied) = refusal.denied_message() {
+        return crate::scaffolded::AccessDeniedException::new(denied).into();
+    }
     UpdateSecretErrorModeled::EncryptionFailure(EncryptionFailure {
         message: Some(refusal.encryption_failure_message()),
     })

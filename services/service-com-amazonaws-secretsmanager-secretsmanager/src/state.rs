@@ -45,6 +45,10 @@ pub mod authorization;
 /// gate above decides a statement's `Condition` against.
 pub mod condition_keys;
 
+/// Rotating a secret: whether this service may invoke the rotation function, and the four
+/// steps it drives that function through once a rotation has started.
+pub mod rotation;
+
 /// Cross-region replication: how a replica of a secret becomes a secret of its own
 /// in its Region, how its status settles, and how it is torn down or promoted.
 pub mod replication;
@@ -167,6 +171,32 @@ pub const MISSING_CLIENT_REQUEST_TOKEN_MESSAGE: &str =
 /// state rather than reported as missing.
 pub const MARKED_FOR_DELETION_MESSAGE: &str =
     "You can't perform this operation on the secret because it was marked for deletion.";
+
+/// The `InvalidRequestException` message `RotateSecret` refuses a call with when the secret
+/// has no Lambda rotation function to invoke: the documented cause "You tried to enable
+/// rotation on a secret that doesn't already have a Lambda function ARN configured and you
+/// didn't include such an ARN as a parameter in this call." (`InvalidRequestException`, this
+/// service's Smithy model).
+///
+/// One fixed sentence, interpolating no secret, no ARN and no parameter value. It is the
+/// answer for every way a call leaves the secret without one: a call that names no
+/// `RotationLambdaARN` for a secret that stores none, and a call whose `RotationLambdaARN`
+/// names no Lambda function at all — a value that is not a function's ARN associates no
+/// rotation function with the secret.
+pub const NO_ROTATION_FUNCTION_MESSAGE: &str =
+    "No Lambda rotation function ARN is associated with this secret.";
+
+/// The `InvalidRequestException` message `RotateSecret` refuses a call with while a
+/// rotation of that secret has not finished: "If the AWSPENDING staging label is present
+/// but not attached to the same version as AWSCURRENT, then any later invocation of
+/// RotateSecret assumes that a previous rotation request is still in progress and returns
+/// an error." (`RotateSecret`, this service's Smithy model).
+///
+/// One fixed sentence, carrying no version id, no secret and nothing else from the request:
+/// what it reports is that a rotation of this secret is not complete and that the service
+/// will try it again.
+pub const ROTATION_IN_PROGRESS_MESSAGE: &str =
+    "A previous rotation isn't complete. That rotation will be reattempted.";
 
 /// The `InvalidParameterException` message `StopReplicationToReplica` refuses a
 /// `SecretId` with that, in the Region the request is signed for, names a secret
@@ -768,9 +798,11 @@ fn statement_effect(statement: &Value) -> Option<String> {
 /// (`PutResourcePolicyRequest$BlockPublicPolicy`, this service's Smithy model).
 ///
 /// Broad access is an ALLOW statement whose principal is the wildcard — the
-/// bare `"*"`, or `"*"` among the identifiers of any principal type it maps. A
-/// policy whose every allow statement names a concrete principal, and one that
-/// only denies, grant no broad access however many statements they carry.
+/// bare `"*"`, or `"*"` among the identifiers of any principal type it maps —
+/// AND whose `Condition` does not bind the caller to one this account names
+/// ([`statement_conditions_bind_the_caller`]). A policy whose every allow
+/// statement names a concrete principal, and one that only denies, grant no
+/// broad access however many statements they carry.
 pub fn policy_grants_public_access(policy: &Value) -> bool {
     policy_statements(policy)
         .unwrap_or_default()
@@ -778,7 +810,202 @@ pub fn policy_grants_public_access(policy: &Value) -> bool {
         .any(|statement| {
             statement_effect(statement).as_deref() == Some("allow")
                 && names_wildcard_principal(statement)
+                && !statement_conditions_bind_the_caller(statement)
         })
+}
+
+/// Condition keys that bind a request to a caller something names — one principal,
+/// one account, one organization, one calling service or one network path.
+///
+/// A wildcard principal under a clause over one of these reaches exactly the callers
+/// that key admits rather than everybody, which is why it is not broad access: the
+/// statement a `Condition` like this carries is the documented way to open a secret to
+/// an account or an organization without opening it to the world. The names are AWS's
+/// global condition context keys for the principal making the request and for the
+/// service or resource making it on the principal's behalf (IAM User Guide, "AWS global
+/// condition context keys"), compared case-insensitively as IAM compares key names.
+///
+/// The `aws:Resource…` family is deliberately absent: those keys describe the account
+/// that OWNS the secret rather than the caller, so a clause over one of them holds for
+/// every caller.
+const CALLER_BINDING_CONDITION_KEYS: &[&str] = &[
+    "aws:PrincipalAccount",
+    "aws:PrincipalArn",
+    "aws:PrincipalOrgID",
+    "aws:PrincipalOrgPaths",
+    "aws:PrincipalIsAWSService",
+    "aws:PrincipalServiceName",
+    "aws:userid",
+    "aws:username",
+    "aws:SourceAccount",
+    "aws:SourceArn",
+    "aws:SourceOrgID",
+    "aws:SourceOrgPaths",
+    "aws:SourceOwner",
+    "aws:SourceVpc",
+    "aws:SourceVpce",
+    "aws:SourceIp",
+    "aws:VpcSourceIp",
+];
+
+/// Condition key FAMILIES that bind the caller, each carrying a suffix naming one tag
+/// of the principal (`aws:PrincipalTag/<tag-key>`), from the same documentation.
+const CALLER_BINDING_CONDITION_KEY_FAMILIES: &[&str] = &["aws:PrincipalTag/"];
+
+/// The IAM operators whose comparison says what a request must NOT be, and the suffix
+/// that makes a clause hold when the key is ABSENT: neither binds a caller, because the
+/// caller a wildcard principal opens the secret to is exactly the one that carries no
+/// value for the key.
+///
+/// `Not` is the spelling IAM gives every negated comparison (`StringNotEquals`,
+/// `ArnNotLike`, `StringNotEqualsIgnoreCase`, …), which is the same reading the shared
+/// evaluation of a policy makes of an operator name
+/// ([`::service_common::iam_authorization`]).
+const NEGATED_OPERATOR_INFIX: &str = "Not";
+const IF_EXISTS_SUFFIX: &str = "IfExists";
+
+/// The set qualifiers an operator may carry, which name how MANY of a multi-valued key's
+/// values the comparison has to hold for rather than what the comparison is: a clause's
+/// operator is read with the qualifier stripped off ([`clause_binds_the_caller`]).
+const SET_QUALIFIER_SEPARATOR: char = ':';
+
+/// The `Null` operator, which compares PRESENCE: `"false"` demands the key be there,
+/// which binds the caller to one that carries it, while `"true"` demands the opposite
+/// and binds nobody.
+const NULL_OPERATOR: &str = "Null";
+const NULL_KEY_MUST_EXIST: &str = "false";
+
+/// Whether a statement's `Condition` binds the request to a caller something names, so
+/// its wildcard principal does not reach the public.
+///
+/// A `Condition` is a conjunction, so ONE clause that binds the caller is enough. A
+/// clause binds when its key is one of [`CALLER_BINDING_CONDITION_KEYS`] (or a family of
+/// [`CALLER_BINDING_CONDITION_KEY_FAMILIES`]), its operator is a positive comparison, and
+/// EVERY value it accepts names something concrete — a value carrying an IAM wildcard
+/// admits callers nothing named, so a clause accepting one is no narrower than the
+/// wildcard principal itself.
+fn statement_conditions_bind_the_caller(statement: &Value) -> bool {
+    let Some(Value::Object(clauses)) = statement.get("Condition") else {
+        return false;
+    };
+    clauses.iter().any(|(operator, compared)| {
+        let Value::Object(keys) = compared else {
+            return false;
+        };
+        keys.iter()
+            .any(|(key, values)| clause_binds_the_caller(operator, key, values))
+    })
+}
+
+/// Whether one `(operator, key, values)` clause binds the caller.
+fn clause_binds_the_caller(operator: &str, key: &str, values: &Value) -> bool {
+    if !binds_the_caller(key) {
+        return false;
+    }
+    // The comparison is what follows the set qualifier, so it is the LAST
+    // `:`-separated segment of the clause's name (`ForAnyValue:StringNotEquals` compares
+    // with `StringNotEquals`); an operator carrying no qualifier is that segment itself.
+    let comparison = operator
+        .rsplit(SET_QUALIFIER_SEPARATOR)
+        .next()
+        .unwrap_or(operator);
+    if comparison.contains(NEGATED_OPERATOR_INFIX) || comparison.ends_with(IF_EXISTS_SUFFIX) {
+        return false;
+    }
+    let compared = condition_values(values);
+    if compared.is_empty() {
+        return false;
+    }
+    if comparison == NULL_OPERATOR {
+        return compared
+            .iter()
+            .all(|value| value.eq_ignore_ascii_case(NULL_KEY_MUST_EXIST));
+    }
+    compared
+        .iter()
+        .all(|value| !names_every_caller(key, value))
+}
+
+/// Whether a condition key is one this service reads as binding the caller.
+fn binds_the_caller(key: &str) -> bool {
+    CALLER_BINDING_CONDITION_KEYS
+        .iter()
+        .any(|binding| key.eq_ignore_ascii_case(binding))
+        || CALLER_BINDING_CONDITION_KEY_FAMILIES.iter().any(|family| {
+            key.len() > family.len()
+                && key
+                    .as_bytes()
+                    .get(..family.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(family.as_bytes()))
+        })
+}
+
+/// The values one condition clause compares against: the single value it names, or the
+/// list it holds. A value that is not a string is rendered as the document wrote it, so
+/// the flag and number forms a document may use are compared as text.
+fn condition_values(values: &Value) -> Vec<String> {
+    match values {
+        Value::Array(items) => items.iter().flat_map(condition_values).collect(),
+        Value::String(value) => vec![value.clone()],
+        Value::Null => Vec::new(),
+        other => vec![other.to_string()],
+    }
+}
+
+/// Whether a condition value is no narrower than the wildcard principal, judged on the kind
+/// of value the KEY carries.
+///
+/// Three kinds are judged on their own terms, which is the reading the tree's other
+/// public-access judgement makes of the same clause
+/// (`service-com-amazonaws-accessanalyzer-accessanalyzer`'s `CheckNoPublicAccess`):
+///
+/// * a FLAG key narrows only in the polarity that excludes nobody else
+///   ([`BINDING_FLAG_VALUES`]) — the opposite polarity excludes one kind of caller and leaves
+///   every other, the anonymous one included;
+/// * a NETWORK ADDRESS narrows unless its CIDR covers every address
+///   ([`NETWORK_ADDRESS_KEYS`]), since `0.0.0.0/0` admits every caller there is;
+/// * every other value narrows only when it names something concrete, so an IAM wildcard
+///   anywhere in it, and the empty value, match callers nothing named.
+fn names_every_caller(key: &str, value: &str) -> bool {
+    let value = value.trim();
+    if let Some((_, binding)) = BINDING_FLAG_VALUES
+        .iter()
+        .find(|(flag, _)| key.eq_ignore_ascii_case(flag))
+    {
+        return !value.eq_ignore_ascii_case(binding);
+    }
+    if NETWORK_ADDRESS_KEYS
+        .iter()
+        .any(|network| key.eq_ignore_ascii_case(network))
+        && covers_every_address(value)
+    {
+        return true;
+    }
+    value.is_empty() || value.contains('*') || value.contains('?')
+}
+
+/// The caller-binding keys whose value is a FLAG, with the value that actually binds a
+/// caller: `aws:PrincipalIsAWSService` binds only when it demands the caller BE an AWS
+/// service, since demanding it not be one leaves every other caller admitted.
+const BINDING_FLAG_VALUES: &[(&str, &str)] = &[("aws:PrincipalIsAWSService", "true")];
+
+/// The caller-binding keys whose value is a network address, so a CIDR covering every
+/// address binds nobody (IAM's global condition keys: `aws:SourceIp`, `aws:VpcSourceIp`).
+const NETWORK_ADDRESS_KEYS: &[&str] = &["aws:SourceIp", "aws:VpcSourceIp"];
+
+/// What separates a network address from its CIDR prefix length, and the prefix length that
+/// covers EVERY address of either family (`0.0.0.0/0`, `::/0`, …) — judged by the parsed
+/// length rather than by how the address is spelled. A value carrying no prefix length names
+/// one address, which binds.
+const CIDR_PREFIX_SEPARATOR: char = '/';
+const EVERY_ADDRESS_PREFIX_LENGTH: u8 = 0;
+
+/// Whether a network-address condition value covers every address.
+fn covers_every_address(value: &str) -> bool {
+    value
+        .rsplit_once(CIDR_PREFIX_SEPARATOR)
+        .and_then(|(_, prefix_length)| prefix_length.trim().parse::<u8>().ok())
+        .is_some_and(|prefix_length| prefix_length == EVERY_ADDRESS_PREFIX_LENGTH)
 }
 
 /// Whether a statement names the wildcard principal.
@@ -2078,6 +2305,27 @@ impl Secret {
             existing.version_stages.retain(|held| held != STAGE_PENDING);
         }
         self.pending_rotation_version_id = Some(version_id);
+        self.last_changed_date = at;
+    }
+
+    /// Record that the rotation that was in flight COMPLETED, at `at`.
+    ///
+    /// "The last date and time that Secrets Manager rotated the secret. If the secret isn't
+    /// configured for rotation or was never rotated, Secrets Manager returns null."
+    /// (`DescribeSecretResponse$LastRotatedDate`, this service's Smithy model) — so the
+    /// instant the rotation finished is what this stamps, and the schedule's next due
+    /// instant is measured from it: `NextRotationDate` is "the next rotation is scheduled to
+    /// occur on or before this date", which for a schedule stated as an interval is that
+    /// interval after the rotation that just happened.
+    ///
+    /// Only the stamps move. Which version holds which staging label is the rotation
+    /// FUNCTION's own work, written through this service's operations while the rotation
+    /// ran, so nothing here moves a label or mints a version.
+    pub fn finish_rotation(&mut self, at: SystemTime) {
+        self.last_rotated_date = Some(at);
+        self.next_rotation_date = self
+            .rotation_interval()
+            .and_then(|interval| at.checked_add(interval));
         self.last_changed_date = at;
     }
 

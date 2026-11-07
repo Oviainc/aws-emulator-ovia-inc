@@ -213,6 +213,24 @@ pub const APIS: &[Api] = &[
         endpoint_prefix: "apigateway",
         protocol: Protocol::RestJson(&APIGATEWAY),
     },
+    // `services/service-com-amazonaws-secretsmanager-secretsmanager/smithy-model/
+    // com-amazonaws-secretsmanager-secretsmanager.json`: awsJson1_1, sigv4Name
+    // `secretsmanager`, endpointPrefix `secretsmanager`, sdkId `Secrets Manager`, service
+    // shape `secretsmanager`.
+    //
+    // A SECRETS MANAGER ROTATION FUNCTION is one of the functions AWS documents as calling
+    // the service that invoked it: each of the four steps of a rotation reads the secret's
+    // metadata and writes a version of it through these operations, so a handler that
+    // cannot reach them cannot rotate anything.
+    Api {
+        sdk_token: "secretsmanager",
+        signing_name: "secretsmanager",
+        endpoint_prefix: "secretsmanager",
+        protocol: Protocol::AwsJson {
+            target_prefix: "secretsmanager",
+            json_version: "1.1",
+        },
+    },
 ];
 
 /// Amazon API Gateway's own model, which a call to it is bound by.

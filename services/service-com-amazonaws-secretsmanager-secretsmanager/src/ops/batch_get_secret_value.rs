@@ -338,8 +338,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for entry in pending {
             let context =
                 crate::state::envelope::ValueContext::new(&entry.context_arn, &entry.version_id);
-            match crate::state::envelope::open(ctx, &entry.sealed_region, &context, &entry.value)
-                .await
+            match crate::state::envelope::open(
+                &*self.engine,
+                ctx,
+                &entry.sealed_region,
+                &context,
+                &entry.value,
+            )
+            .await
             {
                 Ok(opened) => {
                     let (secret_string, secret_binary) = opened.into_members();
@@ -354,10 +360,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         created_date: Some(crate::state::timestamp(entry.created_date)),
                     });
                 }
-                Err(refusal) => errors.push(APIErrorType {
-                    secret_id: Some(entry.secret_id),
-                    error_code: Some("DecryptionFailure".to_string()),
-                    message: Some(refusal.decryption_failure_message()),
+                // The error this entry reports is the one the read of that secret
+                // alone would have been refused with: a caller whose authority does
+                // not reach `kms:Decrypt` on that secret's key is NOT AUTHORIZED,
+                // which is the common `AccessDeniedException` carrying the sentence
+                // KMS worded, and every other refusal is this service's own
+                // `DecryptionFailure` relaying the KMS refusal it met.
+                Err(refusal) => errors.push(match refusal.denied_message() {
+                    Some(denied) => APIErrorType {
+                        secret_id: Some(entry.secret_id),
+                        error_code: Some(crate::scaffolded::ACCESS_DENIED_CODE.to_string()),
+                        message: Some(denied.to_string()),
+                    },
+                    None => APIErrorType {
+                        secret_id: Some(entry.secret_id),
+                        error_code: Some("DecryptionFailure".to_string()),
+                        message: Some(refusal.decryption_failure_message()),
+                    },
                 }),
             }
         }

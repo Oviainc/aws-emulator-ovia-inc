@@ -210,6 +210,15 @@ fn decide<Eng: Send + Sync + 'static>(
     let action = format!("{ACTION_PREFIX}:{operation}");
     let caller = caller(engine, ctx);
     let refusal = |reason: &str| not_authorized(&caller.arn, &action, reported, reason);
+    // The keys the CALLER populates travel with the request too, so a statement scoped to
+    // one principal or one account — how a resource-based policy admits an account's
+    // callers without admitting every caller — is decided rather than left undecided. A
+    // credential that speaks for nobody populates neither.
+    let mut conditions = conditions.clone();
+    if !caller.principals.is_empty() {
+        conditions.add_caller(&caller.arn);
+    }
+    let conditions = &conditions;
     // The principal spellings travel with the request because that is what a statement's
     // `Principal` element is matched against; an identity-based document states no such
     // element, so for those documents the decision rests on the action, the resource and

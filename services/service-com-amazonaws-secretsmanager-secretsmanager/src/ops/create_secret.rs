@@ -515,6 +515,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let sealed = match &value {
             Some(value) => Some(
                 crate::state::envelope::seal(
+                    &*self.engine,
                     ctx,
                     &region,
                     input.kms_key_id.as_deref(),
@@ -690,11 +691,35 @@ fn already_exists(name: &str) -> CreateSecretError {
     .into()
 }
 
-/// `EncryptionFailure` — "Secrets Manager can't encrypt the protected secret text
-/// using the provided KMS key." — for an initial value the KMS key this request
-/// names would not encrypt, relaying the KMS refusal (see
-/// [`crate::state::envelope::KmsRefusal`]).
+/// How a create is refused when the customer managed key it names will not encrypt
+/// the initial value.
+///
+/// A create names the key the secret is to be held under, and the account prepares that
+/// key before the secret exists: a key KMS will not perform a cryptographic operation
+/// with — whatever it states about it, its state or the authority on it — is a
+/// prerequisite of this create that was not completed, which is the modelled
+/// `PreconditionNotMetException`: "The request failed because you did not complete all
+/// the prerequisite steps." (this service's Smithy model). The sentence carries the KMS
+/// refusal that says WHICH step, so a caller learns what to change about the key.
+///
+/// A failure KMS said nothing about is not a judgement of the key, so it is the
+/// modelled `EncryptionFailure` for a value this service could not encrypt.
 fn encryption_failure(refusal: crate::state::envelope::KmsRefusal) -> CreateSecretError {
+    // A caller whose authority does not reach `kms:GenerateDataKey` on the key is NOT
+    // AUTHORIZED, which the IAM layer refuses ahead of this service's own answer: the
+    // refusal is the common `AccessDeniedException` carrying the sentence KMS worded for
+    // the action and the key.
+    if let Some(denied) = refusal.denied_message() {
+        return crate::scaffolded::AccessDeniedException::new(denied).into();
+    }
+    if refusal.stated_by_kms() {
+        return CreateSecretErrorModeled::PreconditionNotMetException(
+            PreconditionNotMetException {
+                message: Some(refusal.encryption_failure_message()),
+            },
+        )
+        .into();
+    }
     CreateSecretErrorModeled::EncryptionFailure(EncryptionFailure {
         message: Some(refusal.encryption_failure_message()),
     })

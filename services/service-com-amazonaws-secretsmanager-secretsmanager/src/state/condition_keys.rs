@@ -51,6 +51,14 @@ pub const SERVICE_RESOURCE_TAG_PREFIX: &str = "secretsmanager:ResourceTag/";
 /// The `SecretId` the request addressed the secret by, as it carried it.
 pub const SECRET_ID_KEY: &str = "secretsmanager:SecretId";
 
+/// The global condition key naming the principal that made the request: "aws:PrincipalArn
+/// — the ARN of the principal that made the request" (IAM's global condition keys).
+pub const PRINCIPAL_ARN_KEY: &str = "aws:PrincipalArn";
+
+/// The global condition key naming that principal's account: "aws:PrincipalAccount — the
+/// account the principal belongs to" (IAM's global condition keys).
+pub const PRINCIPAL_ACCOUNT_KEY: &str = "aws:PrincipalAccount";
+
 /// The `Name` a create states for the secret.
 pub const NAME_KEY: &str = "secretsmanager:Name";
 
@@ -206,6 +214,28 @@ impl Conditions {
                 self.values
                     .push((format!("{family}{key}"), value.to_string()));
             }
+        }
+    }
+
+    /// Add the keys the CALLER populates: the ARN of the principal that made the request
+    /// and the account that principal belongs to.
+    ///
+    /// Called by the authorization gate once it has resolved the caller, so a statement
+    /// scoped to one principal or one account — the documented way a resource-based
+    /// policy admits a whole account without admitting everybody — is decided rather than
+    /// left undecided. A request whose credential speaks for no principal populates
+    /// neither, so a clause over one of them stays undecided for it.
+    pub fn add_caller(&mut self, principal_arn: &str) {
+        self.publish(PRINCIPAL_ARN_KEY);
+        self.values
+            .push((PRINCIPAL_ARN_KEY.to_string(), principal_arn.to_string()));
+        let account = ::service_common::arn::parse(principal_arn)
+            .map(|arn| arn.account)
+            .filter(|account| !account.is_empty());
+        if let Some(account) = account {
+            self.publish(PRINCIPAL_ACCOUNT_KEY);
+            self.values
+                .push((PRINCIPAL_ACCOUNT_KEY.to_string(), account.to_string()));
         }
     }
 

@@ -22,6 +22,18 @@
 //! each relaying the KMS refusal it met. Nothing here inspects the key's state
 //! itself: KMS owns that judgement, and this module asks it.
 //!
+//! A key's PERMISSIONS decide both paths for the same reason. Each call is one this
+//! service makes on the CALLER's behalf and through its own service path, so it is
+//! authorized as that caller: "you must also have the kms:GenerateDataKey and
+//! kms:Decrypt permissions" on the key for a write and a read of a secret under a
+//! customer managed key. The decision is KMS's OWN ([`kms_store::authorization`]),
+//! taken against the key policy, caller identity policies and grants KMS's and IAM's
+//! handlers wrote and under the encryption context the value is bound to, with
+//! `kms:ViaService` naming this service's endpoint — so a key policy that grants a
+//! role only `kms:Decrypt` lets that role read the secret and refuses its write, and
+//! the refusal a caller sees is the sentence KMS itself words for it, relayed like
+//! any other KMS refusal.
+//!
 //! A secret left on the service-managed key names no key a caller can act on — it
 //! cannot be disabled, scheduled for deletion or deleted — so there is no refusal
 //! for this module to meet and the value is held as sent.
@@ -44,6 +56,7 @@ use std::fmt;
 
 use ::aws_sdk_kms::error::{ProvideErrorMetadata, SdkError};
 use ::aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+use ::service_com_amazonaws_kms_trentservice::state as kms_store;
 use ::ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use ::ring::digest::{digest, SHA256};
 use ::ring::rand::{SecureRandom, SystemRandom};
@@ -89,6 +102,18 @@ const KMS_SERVICE_NAME: &str = "AWSKMS";
 /// refusal's CLASS rather than the status line of one answer.
 const KMS_CLIENT_STATUS: u16 = 400;
 const KMS_FAULT_STATUS: u16 = 500;
+
+/// The KMS operation a write of a secret value performs on the secret's key: the
+/// data key the value is sealed under is one that key generates.
+const GENERATE_DATA_KEY_OPERATION: &str = "GenerateDataKey";
+
+/// The KMS operation a read of a sealed secret value performs on the key that sealed
+/// it: the wrapped data key is one only that key unwraps.
+const DECRYPT_OPERATION: &str = "Decrypt";
+
+/// The error code KMS answers a cryptographic operation no authority in force reaches
+/// for, which is the code the relayed clause of such a refusal states.
+const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
 
 /// The entry of the encryption context naming the secret the value belongs to.
 const CONTEXT_SECRET_ARN: &str = "SecretARN";
@@ -204,6 +229,11 @@ enum Content {
 /// ciphertext with its authentication tag.
 #[derive(Clone)]
 struct Sealed {
+    /// The key that wrapped the data key, as the write that sealed the value named
+    /// it. A version is opened under the key it was SEALED with, so this — not
+    /// whatever key the secret names now — is the key a read of this version is
+    /// authorized against.
+    key_id: String,
     /// The `CiphertextBlob` KMS wrapped the data key as. Only the key that wrapped
     /// it can unwrap it, and the blob names that key, so a version is opened under
     /// the key it was sealed with whatever key the secret names now — which is what
@@ -287,12 +317,20 @@ pub struct KmsRefusal {
     /// The KMS refusal to relay, when KMS answered with one; `None` when KMS did not
     /// answer at all, which is nothing to report about the key.
     relayed: Option<String>,
+    /// The sentence KMS worded for a refusal that was an AUTHORIZATION decision about
+    /// the key — no authority in force reaches the cryptographic operation for this
+    /// caller — which this service answers as the common `AccessDeniedException`
+    /// carrying that sentence, rather than as a failure to encrypt or decrypt.
+    denied: Option<String>,
 }
 
 impl KmsRefusal {
     /// A failure KMS stated nothing about.
     fn unrelayed() -> Self {
-        Self { relayed: None }
+        Self {
+            relayed: None,
+            denied: None,
+        }
     }
 
     /// The `DecryptionFailure` message for this refusal.
@@ -303,6 +341,43 @@ impl KmsRefusal {
     /// The `EncryptionFailure` message for this refusal.
     pub fn encryption_failure_message(&self) -> String {
         self.worded(ENCRYPTION_RELAY_PREFIX, ENCRYPTION_FAILURE_MESSAGE)
+    }
+
+    /// The sentence to answer an AUTHORIZATION refusal of the key with, or `None` when
+    /// the call failed for a reason that is not one.
+    ///
+    /// A caller whose authority does not reach the cryptographic operation on the secret's
+    /// key is NOT AUTHORIZED, which is the IAM layer's own refusal rather than a failure of
+    /// the service to encrypt or decrypt: the operation is answered with the common
+    /// `AccessDeniedException`, carrying the sentence KMS worded about the action and the
+    /// key — so the caller is told which permission on which key it is missing.
+    pub fn denied_message(&self) -> Option<&str> {
+        self.denied.as_deref()
+    }
+
+    /// Whether KMS STATED this refusal, so what it says about the key is the key's own
+    /// answer rather than this emulator failing to ask.
+    pub fn stated_by_kms(&self) -> bool {
+        self.relayed.is_some()
+    }
+
+    /// An AUTHORIZATION refusal of the key: the sentence KMS worded for the action it
+    /// withheld, which this service answers as the common `AccessDeniedException` rather
+    /// than as a failure to encrypt or decrypt ([`Self::denied_message`]).
+    ///
+    /// The sentence is relayed as every other KMS refusal this service wraps is — the
+    /// message KMS stated, then the clause naming the service, the status and the code it
+    /// was stated under — because what the caller is told is the answer this service's own
+    /// call to KMS met.
+    fn denied(message: &str) -> Self {
+        let relayed = format!(
+            "{message} {}",
+            relay_clause(ACCESS_DENIED_CODE, KMS_CLIENT_STATUS, None)
+        );
+        Self {
+            denied: Some(relayed.clone()),
+            relayed: Some(relayed),
+        }
     }
 
     /// What Secrets Manager could not do, and then the KMS refusal it wraps — so
@@ -322,7 +397,8 @@ impl KmsRefusal {
 /// A secret on the service-managed key (`None`, the empty string, or the managed
 /// key's own alias) has no customer managed key to call, so its value is held as
 /// sent.
-pub async fn seal(
+pub async fn seal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     kms_key_id: Option<&str>,
@@ -332,6 +408,18 @@ pub async fn seal(
     let Some(key_id) = customer_managed_key(kms_key_id) else {
         return Ok(StoredValue::as_sent(value));
     };
+    // The data key is one the caller's own authority on the key has to reach, so the
+    // key is asked about THIS caller before anything is sealed under it.
+    if let Some(refusal) = use_refusal(
+        engine,
+        ctx,
+        region,
+        key_id,
+        GENERATE_DATA_KEY_OPERATION,
+        context,
+    ) {
+        return Err(refusal);
+    }
 
     let generated = match kms_client(ctx, region)
         .generate_data_key()
@@ -367,6 +455,7 @@ pub async fn seal(
         kind: value.kind,
         fingerprint: fingerprint(value.kind, &value.bytes),
         content: Content::Sealed(Sealed {
+            key_id: key_id.to_string(),
             wrapped_data_key: wrapped_data_key.as_ref().to_vec(),
             nonce,
             body,
@@ -380,7 +469,8 @@ pub async fn seal(
 /// unwraps the data key it was sealed under. The unwrap names no key: the wrapped
 /// data key carries the identity of the key that wrapped it, which is what keeps a
 /// version readable after the secret is pointed at another key.
-pub async fn open(
+pub async fn open<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     context: &ValueContext,
@@ -395,6 +485,13 @@ pub async fn open(
         }
         Content::Sealed(sealed) => sealed,
     };
+    // Unwrapping the data key is the caller's own use of the key that sealed it, so
+    // that key is asked about THIS caller before the ciphertext is opened.
+    if let Some(refusal) =
+        use_refusal(engine, ctx, region, &sealed.key_id, DECRYPT_OPERATION, context)
+    {
+        return Err(refusal);
+    }
 
     let opened = match kms_client(ctx, region)
         .decrypt()
@@ -591,23 +688,102 @@ fn call_failure<E: ProvideErrorMetadata + ::std::error::Error + 'static>(
         .into_iter()
         .find_map(|header| answered.headers().get(header))
         .map(str::to_string)
-        // A request identifier belongs to the ANSWER, and the refusal is relayed
-        // with the one that answer carried. An answer that carries none is still an
-        // answer to one request, so the relay states an identifier of that form for
-        // it rather than leaving the field out of a clause that states it.
-        .unwrap_or_else(|| ::uuid::Uuid::new_v4().to_string());
-    let clause = format!(
-        "(Service: {KMS_SERVICE_NAME}; Status Code: {status}; Error Code: {}; \
-         Request ID: {request_id}; Proxy: {ABSENT_FIELD})",
-        code.unwrap_or(ABSENT_FIELD)
-    );
+        .unwrap_or_default();
+    let request_id = (!request_id.is_empty()).then_some(request_id);
+    let clause = relay_clause(code.unwrap_or(ABSENT_FIELD), status, request_id.as_deref());
     let wrapped = match refused.message() {
         Some(message) => format!("{message} {clause}"),
         None => clause,
     };
     CallFailure::Failed(KmsRefusal {
-        relayed: Some(wrapped),
+        relayed: Some(wrapped.clone()),
+        // A refusal KMS stated under its access-denied code is an AUTHORIZATION decision
+        // about the key, whoever the call was made for, so it is answered as one: the
+        // answer KMS gave, relayed as it stands.
+        denied: (code == Some(ACCESS_DENIED_CODE)).then_some(wrapped),
     })
+}
+
+/// The clause a relayed KMS refusal ends in: which service refused, the status its
+/// class is answered with, the code it was stated under and the identifier of the
+/// answer it belongs to.
+///
+/// A request identifier belongs to the ANSWER, and the refusal is relayed with the one
+/// that answer carried. An answer that carries none — and a refusal taken from the key's
+/// own policy, which was not a call of its own — is still an answer to one request, so
+/// the relay states an identifier of that form for it rather than leaving the field out
+/// of a clause that states it.
+fn relay_clause(code: &str, status: u16, request_id: Option<&str>) -> String {
+    let minted = request_id.map_or_else(|| ::uuid::Uuid::new_v4().to_string(), str::to_string);
+    format!(
+        "(Service: {KMS_SERVICE_NAME}; Status Code: {status}; Error Code: {code}; \
+         Request ID: {minted}; Proxy: {ABSENT_FIELD})"
+    )
+}
+
+/// Why the key `key_id` names does not let THIS caller perform `operation` on it under
+/// the encryption context `context`, as the refusal to relay; `None` when it does.
+///
+/// The judgement is KMS's own ([`kms_store::authorization::authorize_use`]), made
+/// against the key policy, the caller's identity-based policies and the grants on the
+/// key, with `kms:ViaService` naming this service's path to it — so a key confined to
+/// this service's use of it admits these calls and refuses a caller's direct ones, and a
+/// policy that grants one cryptographic action and not another decides each of a secret's
+/// reads and writes on its own.
+///
+/// `None`, so nothing is refused on evidence that is not there, for: an engine carrying
+/// no KMS service, where there is no key to ask and no policy to read; an identifier this
+/// endpoint holds no key for, which the call itself then answers for; and a key AWS
+/// MANAGES, whose policy AWS manages for the service that owns it, so a caller needs no
+/// grant of its own on it.
+fn use_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    key_id: &str,
+    operation: &str,
+    context: &ValueContext,
+) -> Option<KmsRefusal> {
+    let kms = kms_store::service_state(engine)?;
+    // The caller is resolved before the KMS store is locked, because resolving it reads
+    // the STS and IAM stores.
+    let caller = kms_store::authorization::caller(engine, ctx);
+    let store = kms.lock();
+    let key = match store.resolve(region, key_id) {
+        kms_store::KeyRef::Found(key) => key,
+        // An identifier whose account segment is not an account id is refused for want of
+        // permission before any key is looked up, with KMS's own sentence for it.
+        kms_store::KeyRef::UnauthorizedAccount => {
+            return Some(KmsRefusal::denied(
+                &kms_store::unauthorized_account_message(operation),
+            ))
+        }
+        kms_store::KeyRef::NotFound | kms_store::KeyRef::MalformedArn => return None,
+    };
+    if key.key_manager != kms_store::KEY_MANAGER_CUSTOMER {
+        return None;
+    }
+    kms_store::authorization::authorize_use(
+        &caller,
+        &store,
+        region,
+        key,
+        kms_store::authorization::RequestedUse::through_service(operation, &via_service(region)),
+        Some(&context.kms()),
+        None,
+    )
+    .err()
+    .map(|denial| KmsRefusal::denied(&denial))
+}
+
+/// The value of the `kms:ViaService` condition key for a cryptographic operation this
+/// service performs on a caller's behalf: this service's regional endpoint name, which is
+/// what a key policy confining a key to Secrets Manager's use of it names.
+fn via_service(region: &str) -> String {
+    format!(
+        "{}.{region}.amazonaws.com",
+        super::authorization::ACTION_PREFIX
+    )
 }
 
 /// A KMS client over the in-process callback into this same emulator.

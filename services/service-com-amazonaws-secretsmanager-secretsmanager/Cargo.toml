@@ -43,6 +43,13 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # resource, so every service that enforces authorization decides alike. `iam_role` and
 # `arn`: which IAM entity a principal ARN names, and whether a `SecretId` is an ARN.
 service-common = { path = "../common" }
+# The KMS store, for the judgement a secret's own key makes about the caller a seal or an
+# open is performed for: `kms:GenerateDataKey` on a write and `kms:Decrypt` on a read are
+# KMS's own decisions, taken where the key policy and the grants on the key live.
+service-com-amazonaws-kms-trentservice = { workspace = true }
+# The Lambda client a rotation drives its rotation function over, in process through the
+# emulator's own callback.
+aws-sdk-lambda = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -51,10 +58,13 @@ emulator-core-build-support = { workspace = true }
 sha2 = { workspace = true }
 # SecretBinary is a blob, which awsJson1_1 carries base64-encoded on the wire.
 base64 = "0.22"
-# The envelope suite mounts KMS beside this service on one engine, exactly as the
-# assembled router mounts them, so the keys a secret is sealed under are real keys
-# minted through KMS's own operations.
-service-com-amazonaws-kms-trentservice = { workspace = true }
+# The rotation suite mounts Lambda beside this service on one engine, exactly as the
+# assembled router mounts them, so the rotation function a rotation drives is a real
+# function running its own deployment package.
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# That deployment package is a .zip archive the suite writes in memory, the way a caller
+# uploads one.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true

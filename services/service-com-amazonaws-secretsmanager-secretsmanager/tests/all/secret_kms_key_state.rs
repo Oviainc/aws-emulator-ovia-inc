@@ -8,8 +8,11 @@
 //! versions sealed under data keys that key wrapped, so a key KMS will not perform
 //! a cryptographic operation with refuses the read with `DecryptionFailure` and the
 //! write with `EncryptionFailure` — each relaying the KMS refusal it met — and the
-//! write stores nothing; a secret left on the Amazon Web Services managed key names
-//! no key a caller can act on, so nothing stands between its reads and its value.
+//! write stores nothing; a CREATE naming such a key is refused with
+//! `PreconditionNotMetException`, since the key it names is a prerequisite of
+//! creating the secret at all; and a secret left on the Amazon Web Services managed
+//! key names no key a caller can act on, so nothing stands between its reads and its
+//! value.
 //!
 //! Pointing a secret at another key moves the versions the service's own staging
 //! labels reach to that key, re-encrypting each under it, so the key they came from
@@ -547,7 +550,14 @@ async fn reads_and_writes_are_refused_while_the_secret_key_cannot_be_used() {
                 )
                 .await;
 
-            // And a create naming the same key stores no secret at all.
+            // And a create naming the same key stores no secret at all. A create
+            // names the key the secret is to be held under, and the account
+            // prepares that key before the secret exists: a key KMS will not
+            // encrypt with is a prerequisite of the create that was not
+            // completed, which is this operation's own
+            // `PreconditionNotMetException` — "The request failed because you did
+            // not complete all the prerequisite steps." — carrying the KMS
+            // refusal that says which step.
             let create_case = format!("{case}, CreateSecret");
             let fresh = format!("{name}-fresh");
             let (code, message) = emulator
@@ -558,8 +568,9 @@ async fn reads_and_writes_are_refused_while_the_secret_key_cannot_be_used() {
                 )
                 .await;
             assert_eq!(
-                code, "EncryptionFailure",
-                "case {create_case:?}: expected EncryptionFailure, got {code} with {message:?}"
+                code, "PreconditionNotMetException",
+                "case {create_case:?}: expected PreconditionNotMetException, got {code} with \
+                 {message:?}"
             );
             assert_relays_kms(
                 &message,
@@ -987,4 +998,230 @@ async fn concurrent_creates_under_one_token_all_answer_the_same_version() {
         .sm_ok("GetSecretValue", &json!({"SecretId": name}), case)
         .await;
     value.assert_round_trip(&read, case);
+}
+
+/// The actions a key policy grants the caller, and what a secret under that key may then
+/// be read and written for.
+struct KeyPolicyRow {
+    case: &'static str,
+    /// The cryptographic actions the statement names, beside the admin ones every row
+    /// keeps so the key stays describable.
+    granted: &'static [&'static str],
+    /// Whether a READ of the secret's value may be served — `kms:Decrypt` on the key.
+    reads: bool,
+    /// Whether a WRITE of a value may be stored — `kms:GenerateDataKey` on the key.
+    writes: bool,
+}
+
+/// The rows span what the rule generalises over: which of the two cryptographic actions a
+/// secret's key grants, each on its own, both together, the wildcard that covers them, and
+/// neither.
+const KEY_POLICY_ROWS: &[KeyPolicyRow] = &[
+    KeyPolicyRow {
+        case: "the key grants only kms:Decrypt",
+        granted: &["kms:Decrypt"],
+        reads: true,
+        writes: false,
+    },
+    KeyPolicyRow {
+        case: "the key grants only kms:GenerateDataKey",
+        granted: &["kms:GenerateDataKey"],
+        reads: false,
+        writes: true,
+    },
+    KeyPolicyRow {
+        case: "the key grants both cryptographic actions",
+        granted: &["kms:Decrypt", "kms:GenerateDataKey"],
+        reads: true,
+        writes: true,
+    },
+    KeyPolicyRow {
+        case: "the key grants every action by wildcard",
+        granted: &["kms:*"],
+        reads: true,
+        writes: true,
+    },
+    KeyPolicyRow {
+        case: "the key grants the pattern covering the data-key actions",
+        granted: &["kms:GenerateDataKey*"],
+        reads: false,
+        writes: true,
+    },
+    KeyPolicyRow {
+        case: "the key grants neither cryptographic action",
+        granted: &[],
+        reads: false,
+        writes: false,
+    },
+];
+
+/// The actions a key policy must keep granting whatever else it states, so the key can be
+/// described and its policy replaced: the service asks the key about itself through
+/// `kms:DescribeKey`, and the suite replaces the policy again between rows.
+const KEY_ADMIN_ACTIONS: [&str; 3] = ["kms:DescribeKey", "kms:GetKeyPolicy", "kms:PutKeyPolicy"];
+
+/// A key policy granting `granted` plus [`KEY_ADMIN_ACTIONS`] to the principal this
+/// emulator authenticates every request as.
+fn key_policy(granted: &[&str]) -> String {
+    let mut actions: Vec<&str> = KEY_ADMIN_ACTIONS.to_vec();
+    actions.extend_from_slice(granted);
+    json!({
+        "Version": "2012-10-17",
+        "Id": "key-under-test",
+        "Statement": [{
+            "Sid": "StatementUnderTest",
+            "Effect": "Allow",
+            "Principal": {"AWS": service_com_amazonaws_kms_trentservice::state::caller_identity_arn()},
+            "Action": actions,
+            "Resource": "*",
+        }],
+    })
+    .to_string()
+}
+
+/// The sentence KMS words an authorization refusal of a key with, which Secrets Manager
+/// relays as it stands: the principal it refused, the IAM action it asked for and the key it
+/// asked for it on.
+///
+/// Read from the TREE's one spelling of that refusal class
+/// ([`::service_common::iam_authorization::not_authorized_by_resource_policy`]), which KMS's
+/// own `no_resource_policy_message` answers it from, so this suite follows a change to that
+/// wording rather than pinning a second copy of it in another service's tests.
+fn not_authorized(action: &str, key_arn: &str) -> String {
+    ::service_common::iam_authorization::not_authorized_by_resource_policy(
+        &service_com_amazonaws_kms_trentservice::state::caller_identity_arn(),
+        action,
+        key_arn,
+    )
+}
+
+/// Assert an authorization refusal of the key is worded as this class is: the sentence KMS
+/// stated, then the clause naming the answer it was relayed from.
+fn assert_denies_key_use(message: &str, action: &str, key_arn: &str, case: &str) {
+    assert_relays_kms(
+        message,
+        &not_authorized(action, key_arn),
+        "AccessDeniedException",
+        action,
+        case,
+    );
+}
+
+/// RULE: a read of a secret under a customer managed key performs `kms:Decrypt` on that key
+/// as the CALLER, and a write performs `kms:GenerateDataKey` — so the authority in force on
+/// the key decides each of them on its own, and a caller the key does not permit the action
+/// is NOT AUTHORIZED (HTTP 400 `AccessDeniedException`, carrying the sentence KMS worded)
+/// rather than served or told the value could not be encrypted.
+#[tokio::test]
+async fn the_keys_own_grants_decide_each_read_and_each_write() {
+    for (index, row) in KEY_POLICY_ROWS.iter().enumerate() {
+        let case = row.case;
+        let emulator = Emulator::new();
+        let (key_arn, _) = emulator.create_key(case).await;
+        let name = format!("key-policy-{index}");
+        let value = ValueCase::string("the initial value", "under-a-granting-key");
+
+        // The secret is created while the key still carries its default policy, so the
+        // refusals below are the policy under test and nothing else.
+        emulator
+            .sm_ok(
+                "CreateSecret",
+                &create_body(&name, Some(&key_arn), &value),
+                case,
+            )
+            .await;
+        emulator
+            .kms_ok(
+                "PutKeyPolicy",
+                &json!({
+                    "KeyId": key_arn,
+                    "Policy": key_policy(row.granted),
+                    // Every document here is the one statement under test, so it leaves no
+                    // path to a later PutKeyPolicy that the lockout safety check accepts.
+                    "BypassPolicyLockoutSafetyCheck": true,
+                }),
+                case,
+            )
+            .await;
+
+        // The READ: `kms:Decrypt` on the key.
+        let read_case = format!("{case}, GetSecretValue");
+        if row.reads {
+            let read = emulator
+                .sm_ok("GetSecretValue", &json!({"SecretId": name}), &read_case)
+                .await;
+            value.assert_round_trip(&read, &read_case);
+        } else {
+            let (code, message) = emulator
+                .sm_err("GetSecretValue", &json!({"SecretId": name}), &read_case)
+                .await;
+            assert_eq!(
+                code, "AccessDeniedException",
+                "case {read_case:?}: expected AccessDeniedException, got {code} with {message:?}"
+            );
+            assert_denies_key_use(&message, "kms:Decrypt", &key_arn, &read_case);
+        }
+
+        // The WRITE: `kms:GenerateDataKey` on the key.
+        let replacement = ValueCase::string("a replacement", "written-under-a-granting-key");
+        let mut write_body = Map::new();
+        write_body.insert("SecretId".to_string(), json!(name));
+        if let Value::Object(members) = replacement.wire_members() {
+            write_body.extend(members);
+        }
+        let write_body = Value::Object(write_body);
+        let write_case = format!("{case}, PutSecretValue");
+        let before = version_count(&emulator, &name, &write_case).await;
+        if row.writes {
+            emulator
+                .sm_ok("PutSecretValue", &write_body, &write_case)
+                .await;
+            assert_eq!(
+                version_count(&emulator, &name, &write_case).await,
+                before + 1,
+                "case {write_case:?}: a permitted write stored no version"
+            );
+        } else {
+            let (code, message) = emulator
+                .sm_err("PutSecretValue", &write_body, &write_case)
+                .await;
+            assert_eq!(
+                code, "AccessDeniedException",
+                "case {write_case:?}: expected AccessDeniedException, got {code} with {message:?}"
+            );
+            assert_denies_key_use(&message, "kms:GenerateDataKey", &key_arn, &write_case);
+            assert_eq!(
+                version_count(&emulator, &name, &write_case).await,
+                before,
+                "case {write_case:?}: a refused write stored a version"
+            );
+        }
+
+        // And a CREATE under that key is the same write: the secret is held under the key
+        // it names, so a key that does not permit the data key stores no secret.
+        let create_case = format!("{case}, CreateSecret");
+        let fresh = format!("{name}-fresh");
+        let created = create_body(&fresh, Some(&key_arn), &value);
+        if row.writes {
+            emulator.sm_ok("CreateSecret", &created, &create_case).await;
+        } else {
+            let (code, message) = emulator
+                .sm_err("CreateSecret", &created, &create_case)
+                .await;
+            assert_eq!(
+                code, "AccessDeniedException",
+                "case {create_case:?}: expected AccessDeniedException, got {code} with \
+                 {message:?}"
+            );
+            assert_denies_key_use(&message, "kms:GenerateDataKey", &key_arn, &create_case);
+            let (status, parsed) = emulator
+                .sm("DescribeSecret", &json!({"SecretId": fresh}))
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {create_case:?}: expected the refused create to store nothing, got \
+                 {status} with {parsed}"
+            );
+        }
+    }
 }

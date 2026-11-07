@@ -308,6 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let context =
             crate::state::envelope::ValueContext::new(&resolved.context_arn, &resolved.version_id);
         let opened = crate::state::envelope::open(
+            &*self.engine,
             ctx,
             &resolved.sealed_region,
             &context,
@@ -355,11 +356,18 @@ struct Resolved {
     value: crate::state::envelope::StoredValue,
 }
 
-/// `DecryptionFailure` — "Secrets Manager can't decrypt the protected secret text
-/// using the provided KMS key." — for a value the secret's KMS key would not
-/// decrypt, relaying the KMS refusal (see
+/// How a read the secret's KMS key refused is answered.
+///
+/// A caller whose authority does not reach `kms:Decrypt` on that key is NOT AUTHORIZED,
+/// which the IAM layer refuses ahead of this service's own answer: the refusal is the common
+/// `AccessDeniedException` carrying the sentence KMS worded for the action and the key. Every
+/// other refusal is `DecryptionFailure` — "Secrets Manager can't decrypt the protected secret
+/// text using the provided KMS key." — relaying the KMS refusal it met (see
 /// [`crate::state::envelope::KmsRefusal`]).
 fn decryption_failure(refusal: crate::state::envelope::KmsRefusal) -> GetSecretValueError {
+    if let Some(denied) = refusal.denied_message() {
+        return crate::scaffolded::AccessDeniedException::new(denied).into();
+    }
     GetSecretValueErrorModeled::DecryptionFailure(DecryptionFailure {
         message: Some(refusal.decryption_failure_message()),
     })

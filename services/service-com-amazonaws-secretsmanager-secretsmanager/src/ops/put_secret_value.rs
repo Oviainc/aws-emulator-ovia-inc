@@ -319,6 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `EncryptionFailure` this write answers, and no version is stored.
         let context = crate::state::envelope::ValueContext::new(&arn, &version_id);
         let sealed = crate::state::envelope::seal(
+            &*self.engine,
             ctx,
             &region,
             kms_key_id.as_deref(),
@@ -470,11 +471,18 @@ fn no_such_secret() -> PutSecretValueError {
     .into()
 }
 
-/// `EncryptionFailure` — "Secrets Manager can't encrypt the protected secret text
-/// using the provided KMS key." — for a value the secret's KMS key would not
-/// encrypt, relaying the KMS refusal (see
-/// [`crate::state::envelope::KmsRefusal`]).
+/// How a write the secret's KMS key refused is answered.
+///
+/// A caller whose authority does not reach `kms:GenerateDataKey` on that key is NOT
+/// AUTHORIZED, which the IAM layer refuses ahead of this service's own answer: the refusal
+/// is the common `AccessDeniedException` carrying the sentence KMS worded for the action and
+/// the key. Every other refusal is `EncryptionFailure` — "Secrets Manager can't encrypt the
+/// protected secret text using the provided KMS key." — relaying the KMS refusal it met
+/// (see [`crate::state::envelope::KmsRefusal`]).
 fn encryption_failure(refusal: crate::state::envelope::KmsRefusal) -> PutSecretValueError {
+    if let Some(denied) = refusal.denied_message() {
+        return crate::scaffolded::AccessDeniedException::new(denied).into();
+    }
     PutSecretValueErrorModeled::EncryptionFailure(EncryptionFailure {
         message: Some(refusal.encryption_failure_message()),
     })

@@ -7,13 +7,14 @@
 //! recomputes the next due instant from the schedule, and stakes `AWSPENDING` on
 //! the id of the version the rotation will create.
 //!
-//! The rotation itself is carried out by a Lambda rotation function — user code —
-//! and Lambda's `Invoke` in this emulator does not run a deployment package, so
-//! the rotation this call starts never finishes: no version holding a new secret
-//! value appears, `AWSCURRENT` does not move, `LastRotatedDate` stays unset, and a
-//! later `RotateSecret` is refused while `AWSPENDING` names a version other than
-//! the `AWSCURRENT` one — which is exactly how the service itself leaves a
-//! rotation that did not complete. Nothing here reports a rotation that ran.
+//! The rotation itself is the rotation FUNCTION's work: this call refuses a rotation
+//! whose function does not grant this service `lambda:InvokeFunction`, and otherwise
+//! hands the four documented steps to a task of its own, which invokes that function
+//! once per step and stamps the secret as rotated when the last one returns
+//! (`crate::state::rotation`). The call ANSWERS while that is in flight, which is why
+//! it reports the id of a version the function has not created yet and why a second
+//! `RotateSecret` is refused while `AWSPENDING` names a version other than the
+//! `AWSCURRENT` one.
 //!
 //! ## Shape of an operation
 //!
@@ -225,24 +226,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
         let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
-        store.expire_due(now);
-        store.settle_replicas_due(now);
 
-        // "A unique identifier for the new version of the secret. ... If you use
-        // the Amazon Web Services CLI or one of the Amazon Web Services SDKs to
-        // call this operation, then you can leave this parameter empty. The CLI
-        // or SDK generates a random UUID for you": the id of the version this
-        // rotation creates, minted here when the caller named none.
-        let version_id = input
-            .client_request_token
-            .clone()
-            .unwrap_or_else(crate::state::new_version_id);
-        // "The default for RotateImmediately is true. If you don't specify this
-        // value, Secrets Manager rotates the secret immediately."
-        let rotate_immediately = input.rotate_immediately.unwrap_or(true);
+        // What this call is refused for, and what the rotation it starts will be driven
+        // with, decided under the store's guard; asking the rotation function's own policy
+        // whether this service may invoke it is a call to Lambda, which cannot be made
+        // while the guard is held.
+        let planned = {
+            let mut store = state.lock();
+            store.expire_due(now);
+            store.settle_replicas_due(now);
+            plan(&mut store, &region, &input)?
+        };
 
+        // "You also need lambda:InvokeFunction permissions on the rotation function": a
+        // rotation this service cannot invoke the function for is one that cannot be
+        // started, so it is refused before anything about the secret changes
+        // (`crate::state::rotation`). A managed external rotation names a role rather than
+        // a function, and there is no function to invoke.
+        if let Some(lambda_arn) = &planned.lambda_arn {
+            if let Some(refusal) = crate::state::rotation::invoke_permission_refusal(
+                ctx.callback(),
+                &region,
+                lambda_arn,
+                &planned.arn,
+            )
+            .await
+            {
+                return Err(crate::scaffolded::AccessDeniedException::new(refusal).into());
+            }
+        }
+
+        let mut store = state.lock();
+        // The guard was released while the rotation function's policy was read, so the
+        // refusals are decided again against what the store holds NOW: a concurrent
+        // delete, or a rotation another call started in the meantime, refuses this one
+        // rather than overwriting what it did.
+        let planned = plan(&mut store, &region, &input)?;
         let Some(secret) = store.get_mut(&region, &input.secret_id) else {
             return Err(RotateSecretErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -252,93 +272,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // "In RotateSecret, you can set the rotation schedule in RotationRules
-        // with AutomaticallyAfterDays or ScheduleExpression, but not both" —
-        // rules that cannot hold together, or a schedule expression that is not
-        // one of the documented forms, are refused before anything is stored.
-        // Checked after the secret is resolved, so a call that names a secret
-        // this service does not hold is answered with that, whatever else it
-        // carries. `configure_rotation` reads the same schedule back out of the
-        // stored rules when it computes the next due instant.
-        if let Some(rules) = input.rotation_rules.as_ref() {
-            crate::state::parse_rotation_rules(rules).map_err(invalid_parameter)?;
-        }
-
-        // The documented causes of `InvalidRequestException`, in the order the
-        // model lists them: "The secret is scheduled for deletion. You tried to
-        // enable rotation on a secret that doesn't already have a Lambda
-        // function ARN configured and you didn't include such an ARN as a
-        // parameter in this call. The secret is managed by another service, and
-        // you must use that service to update it."
-        if secret.scheduled_for_deletion() {
-            return Err(invalid_request(crate::state::MARKED_FOR_DELETION_MESSAGE));
-        }
-        // A replica tracks its primary, so the rotation of the secret is
-        // configured and started on the primary, and the versions it creates
-        // reach the replica from there.
-        if secret.is_replica() {
-            return Err(invalid_parameter(
-                crate::state::NOT_PERMITTED_ON_REPLICA_MESSAGE.to_string(),
-            ));
-        }
-        if let Some(owner) = secret.owning_service.clone() {
-            return Err(invalid_request(format!(
-                "You can't perform this operation on the secret because it is managed by \
-                 {owner}, and you must use that service to update it."
-            )));
-        }
-        // "For secrets that use a Lambda rotation function to rotate, the ARN of
-        // the Lambda rotation function. For secrets that use managed rotation,
-        // omit this field" — and a managed external secret names a rotation role
-        // instead, so a rotation is configurable once the secret has either, from
-        // this call or from a previous one. An empty `RotationLambdaARN` names no
-        // function (`RotationLambdaARNType` is modelled with a minimum length of
-        // 0).
-        let lambda_arn = input
-            .rotation_lambda_arn
-            .clone()
-            .filter(|arn| !arn.is_empty());
-        let role_arn = input
-            .external_secret_rotation_role_arn
-            .clone()
-            .filter(|arn| !arn.is_empty());
-        if lambda_arn.is_none()
-            && role_arn.is_none()
-            && secret.rotation_lambda_arn.is_none()
-            && secret.external_rotation_role_arn.is_none()
-        {
-            return Err(invalid_request(
-                "You must specify RotationLambdaARN, or the secret must already have a Lambda \
-                 rotation function configured, to enable rotation.",
-            ));
-        }
-
-        // "If the AWSPENDING staging label is present but not attached to the
-        // same version as AWSCURRENT, then any later invocation of RotateSecret
-        // assumes that a previous rotation request is still in progress and
-        // returns an error."
-        if secret.rotation_in_progress() {
-            return Err(invalid_request(format!(
-                "A previous rotation request is still in progress: the AWSPENDING staging label \
-                 is attached to version {} rather than to the AWSCURRENT version.",
-                secret.pending_version_id().unwrap_or_default()
-            )));
-        }
-        // `ClientRequestToken` is "a unique identifier for the NEW version of the
-        // secret", and a version id names one version of a secret for as long as
-        // that version is stored — so a token that already names a stored version
-        // cannot be the id of the version this rotation creates, and the call is
-        // refused rather than answered with a version id it did not stake.
-        if secret.version(&version_id).is_some() {
-            return Err(invalid_request(format!(
-                "The ClientRequestToken {version_id} already identifies a version of this \
-                 secret, so it can't identify the new version this rotation creates."
-            )));
-        }
-
         secret.configure_rotation(
             crate::state::RotationConfig {
-                lambda_arn,
+                lambda_arn: planned.configured_lambda_arn.clone(),
                 rules: input
                     .rotation_rules
                     .as_ref()
@@ -352,39 +288,208 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .map(crate::state::StoredKeyValue::from_modeled)
                             .collect()
                     }),
-                role_arn,
+                role_arn: planned.role_arn.clone(),
             },
             now,
         );
 
-        // Starting a rotation is the one thing this operation does that the
-        // emulator cannot carry through: the rotation function is user code, and
-        // Lambda's `Invoke` in this emulator does not run a deployment package,
-        // so no version holding a new secret value is ever created and
-        // AWSCURRENT never moves. What Secrets Manager itself does for a
-        // rotation it has started IS done: the version id is minted and
-        // AWSPENDING is staked on it ("During rotation, Secrets Manager creates
-        // an AWSPENDING version ID before creating the new secret version"),
-        // which leaves the secret in the state the service leaves an unfinished
-        // rotation in — the current value still readable, `LastRotatedDate`
-        // unset, and a later RotateSecret refused while that label is not on the
-        // AWSCURRENT version.
+        // "During rotation, Secrets Manager creates an AWSPENDING version ID before
+        // creating the new secret version": the id is minted and AWSPENDING staked on it
+        // here, which is what the rotation function reads back to learn which version it
+        // is to create, and what makes a second RotateSecret refused while this rotation
+        // is in flight.
         //
-        // With `RotateImmediately` false nothing is staked: "Secrets Manager
-        // tests the rotation configuration by running the testSecret step of the
-        // Lambda rotation function. This test creates an AWSPENDING version of
-        // the secret and then removes it" — a test that leaves no version
-        // behind, and that this emulator cannot run either.
-        if rotate_immediately {
-            secret.start_rotation(version_id.clone(), now);
+        // With `RotateImmediately` false nothing is staked and no step runs: "Secrets
+        // Manager tests the rotation configuration by running the testSecret step of the
+        // Lambda rotation function. This test creates an AWSPENDING version of the secret
+        // and then removes it" — a test that leaves no version behind.
+        if planned.rotate_immediately {
+            secret.start_rotation(planned.version_id.clone(), now);
         }
-
-        Ok(RotateSecretOutput {
+        let answer = RotateSecretOutput {
             arn: Some(secret.arn.clone()),
             name: Some(secret.name.clone()),
-            version_id: Some(version_id),
-        })
+            version_id: Some(planned.version_id.clone()),
+        };
+        drop(store);
+
+        // The rotation itself is the rotation FUNCTION's work, invoked once per step. It
+        // happens off the response path, because this call answers while the rotation is
+        // still in flight — it reports the id of a version the function has not created
+        // yet (`crate::state::rotation`).
+        if planned.rotate_immediately {
+            if let Some(lambda_arn) = planned.lambda_arn {
+                crate::state::rotation::drive(
+                    ::std::sync::Arc::clone(&self.engine),
+                    ctx.callback().clone(),
+                    crate::state::rotation::Rotation {
+                        region,
+                        secret_arn: planned.arn,
+                        version_id: planned.version_id,
+                        lambda_arn,
+                    },
+                );
+            }
+        }
+        Ok(answer)
     }
+}
+
+/// What a `RotateSecret` call resolved to: the secret it rotates, the version the rotation
+/// will create, and the function that rotation drives.
+struct Planned {
+    /// The secret's own ARN.
+    arn: String,
+    /// The id of the version this rotation creates, which is the `ClientRequestToken` the
+    /// call carried or the one minted for it.
+    version_id: String,
+    /// Whether the rotation starts now: "The default for RotateImmediately is true. If you
+    /// don't specify this value, Secrets Manager rotates the secret immediately."
+    rotate_immediately: bool,
+    /// The rotation function this rotation is driven through: the one this call names, else
+    /// the one the secret already stores. `None` for a managed external rotation, which
+    /// names a role instead.
+    lambda_arn: Option<String>,
+    /// The `RotationLambdaARN` this call CONFIGURES, which is only the one it named: a call
+    /// naming none "starts a rotation with the values already stored in the secret".
+    configured_lambda_arn: Option<String>,
+    /// The `ExternalSecretRotationRoleArn` this call configures.
+    role_arn: Option<String>,
+}
+
+/// Everything this call is refused for, and what the rotation it starts is driven with.
+///
+/// Taken under the store's guard and taken AGAIN once that guard has been re-acquired, so
+/// every refusal is decided against what the store holds when the rotation is applied.
+fn plan(
+    store: &mut crate::state::ComAmazonawsSecretsmanagerSecretsmanagerState,
+    region: &str,
+    input: &RotateSecretInput,
+) -> Result<Planned, RotateSecretError> {
+    // "A unique identifier for the new version of the secret. ... If you use
+    // the Amazon Web Services CLI or one of the Amazon Web Services SDKs to
+    // call this operation, then you can leave this parameter empty. The CLI
+    // or SDK generates a random UUID for you": the id of the version this
+    // rotation creates, minted here when the caller named none.
+    let version_id = input
+        .client_request_token
+        .clone()
+        .unwrap_or_else(crate::state::new_version_id);
+    // "The default for RotateImmediately is true. If you don't specify this
+    // value, Secrets Manager rotates the secret immediately."
+    let rotate_immediately = input.rotate_immediately.unwrap_or(true);
+
+    let Some(secret) = store.get(region, &input.secret_id) else {
+        return Err(RotateSecretErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
+            },
+        )
+        .into());
+    };
+
+    // "In RotateSecret, you can set the rotation schedule in RotationRules
+    // with AutomaticallyAfterDays or ScheduleExpression, but not both" —
+    // rules that cannot hold together, or a schedule expression that is not
+    // one of the documented forms, are refused before anything is stored.
+    // Checked after the secret is resolved, so a call that names a secret
+    // this service does not hold is answered with that, whatever else it
+    // carries. `configure_rotation` reads the same schedule back out of the
+    // stored rules when it computes the next due instant.
+    if let Some(rules) = input.rotation_rules.as_ref() {
+        crate::state::parse_rotation_rules(rules).map_err(invalid_parameter)?;
+    }
+
+    // The documented causes of `InvalidRequestException`, in the order the
+    // model lists them: "The secret is scheduled for deletion. You tried to
+    // enable rotation on a secret that doesn't already have a Lambda
+    // function ARN configured and you didn't include such an ARN as a
+    // parameter in this call. The secret is managed by another service, and
+    // you must use that service to update it."
+    if secret.scheduled_for_deletion() {
+        return Err(invalid_request(crate::state::MARKED_FOR_DELETION_MESSAGE));
+    }
+    // A replica tracks its primary, so the rotation of the secret is
+    // configured and started on the primary, and the versions it creates
+    // reach the replica from there.
+    if secret.is_replica() {
+        return Err(invalid_parameter(
+            crate::state::NOT_PERMITTED_ON_REPLICA_MESSAGE.to_string(),
+        ));
+    }
+    if let Some(owner) = secret.owning_service.clone() {
+        return Err(invalid_request(format!(
+            "You can't perform this operation on the secret because it is managed by \
+             {owner}, and you must use that service to update it."
+        )));
+    }
+    // "For secrets that use a Lambda rotation function to rotate, the ARN of
+    // the Lambda rotation function. For secrets that use managed rotation,
+    // omit this field" — and a managed external secret names a rotation role
+    // instead, so a rotation is configurable once the secret has either, from
+    // this call or from a previous one. An empty `RotationLambdaARN` names no
+    // function (`RotationLambdaARNType` is modelled with a minimum length of
+    // 0).
+    let configured_lambda_arn = input
+        .rotation_lambda_arn
+        .clone()
+        .filter(|arn| !arn.is_empty());
+    // A rotation is driven by INVOKING the function this member names, so the value has to
+    // name one: a value that is not the ARN of a Lambda function states no function to
+    // invoke (`crate::state::rotation::names_a_function`).
+    if configured_lambda_arn
+        .as_deref()
+        .is_some_and(|arn| !crate::state::rotation::names_a_function(arn))
+    {
+        return Err(invalid_request(
+            crate::state::rotation::not_a_function_message(),
+        ));
+    }
+    let role_arn = input
+        .external_secret_rotation_role_arn
+        .clone()
+        .filter(|arn| !arn.is_empty());
+    if configured_lambda_arn.is_none()
+        && role_arn.is_none()
+        && secret.rotation_lambda_arn.is_none()
+        && secret.external_rotation_role_arn.is_none()
+    {
+        return Err(invalid_request(crate::state::NO_ROTATION_FUNCTION_MESSAGE));
+    }
+
+    // "If the AWSPENDING staging label is present but not attached to the
+    // same version as AWSCURRENT, then any later invocation of RotateSecret
+    // assumes that a previous rotation request is still in progress and
+    // returns an error." The sentence is AWS's own for that condition, and it is
+    // fixed: it names no version, because what it reports is that a rotation of
+    // this secret has not finished and will be tried again.
+    if secret.rotation_in_progress() {
+        return Err(invalid_request(crate::state::ROTATION_IN_PROGRESS_MESSAGE));
+    }
+    // `ClientRequestToken` is "a unique identifier for the NEW version of the
+    // secret", and a version id names one version of a secret for as long as
+    // that version is stored — so a token that already names a stored version
+    // cannot be the id of the version this rotation creates, and the call is
+    // refused rather than answered with a version id it did not stake.
+    if secret.version(&version_id).is_some() {
+        return Err(invalid_request(format!(
+            "The ClientRequestToken {version_id} already identifies a version of this \
+             secret, so it can't identify the new version this rotation creates."
+        )));
+    }
+
+    Ok(Planned {
+        arn: secret.arn.clone(),
+        version_id,
+        rotate_immediately,
+        // The rotation is driven through the function in force for this secret once this
+        // call's configuration is applied: the one it names, else the one already stored.
+        lambda_arn: configured_lambda_arn
+            .clone()
+            .or_else(|| secret.rotation_lambda_arn.clone()),
+        configured_lambda_arn,
+        role_arn,
+    })
 }
 
 /// `InvalidParameterException` for a parameter value this operation refuses:
