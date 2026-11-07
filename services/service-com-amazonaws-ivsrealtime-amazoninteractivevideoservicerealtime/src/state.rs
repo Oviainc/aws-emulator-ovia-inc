@@ -683,13 +683,13 @@ pub const UNNAMED_PARTICIPANT_USER_ID: &str = "";
 /// `IngestConfiguration$redundantIngestCredentials` is "a list of redundant ingest
 /// credentials, present only when `redundantIngest` is set to `true`", and the Redundant
 /// Ingest section of *IVS RTMP Publishing* it points at describes redundant ingest as
-/// publishing one source over a second, backup path. The configuration's own
-/// `streamKey`/`participantId` are the primary path, so one further credential is what a
-/// backup path takes. The model states no count, so the COUNT is this reading of that
-/// doc; what the model does state is applied exactly — the member is absent unless
-/// redundant ingest is on, and each entry carries its own participant id and its own
-/// ingest key.
-pub const REDUNDANT_INGEST_CREDENTIALS: usize = 1;
+/// publishing one source to the service's redundant ingest endpoints beside the primary
+/// one, so the list holds ONE credential per redundant endpoint — the two the service
+/// offers beside the primary path the configuration's own
+/// `streamKey`/`participantId` publish to. What the model states is applied exactly: the
+/// member is absent unless redundant ingest is on, and each entry carries its own
+/// participant id and its own ingest key.
+pub const REDUNDANT_INGEST_CREDENTIALS: usize = 2;
 
 // ---------------------------------------------------------------------------
 // Participant replication
@@ -1300,9 +1300,10 @@ pub struct IngestConfigurationRecord {
     /// than one each projection decides, and every projection reports it.
     pub user_id: String,
     pub redundant_ingest: bool,
-    /// The backup credentials redundant ingest takes, minted at creation beside the
-    /// primary one. Empty unless [`Self::redundant_ingest`] is set; see
-    /// [`REDUNDANT_INGEST_CREDENTIALS`].
+    /// The backup credentials redundant ingest takes, minted beside the primary one when
+    /// the switch is set — at creation, or by the update that sets it. Empty for a
+    /// configuration whose [`Self::redundant_ingest`] was never set, and kept once minted;
+    /// see [`REDUNDANT_INGEST_CREDENTIALS`] and [`Self::apply_redundant_ingest`].
     pub redundant_ingest_credentials: Vec<IngestCredential>,
     pub attributes: HashMap<String, String>,
     pub tags: HashMap<String, String>,
@@ -1333,14 +1334,21 @@ impl IngestConfigurationRecord {
             // "the member is not served".
             user_id: Some(self.user_id.clone()),
             redundant_ingest: self.redundant_ingest,
-            // "present only when `redundantIngest` is set to `true`", as the member's
-            // own doc states it: see [`REDUNDANT_INGEST_CREDENTIALS`].
-            redundant_ingest_credentials: self.redundant_ingest.then(|| {
-                self.redundant_ingest_credentials
-                    .iter()
-                    .map(IngestCredential::to_redundant_ingest_credential)
-                    .collect()
-            }),
+            // Reported exactly when this configuration HOLDS backup credentials, which is
+            // when its `redundantIngest` was set — "present only when `redundantIngest` is
+            // set to `true`", as the member's own doc states what materialises them. They
+            // are then the configuration's own
+            // ([`IngestConfigurationRecord::apply_redundant_ingest`]), so a configuration
+            // whose switch has since gone off still reports the keys it handed out, and one
+            // whose switch was never on reports no member at all.
+            redundant_ingest_credentials: (!self.redundant_ingest_credentials.is_empty()).then(
+                || {
+                    self.redundant_ingest_credentials
+                        .iter()
+                        .map(IngestCredential::to_redundant_ingest_credential)
+                        .collect()
+                },
+            ),
             // Reported only when the configuration carries attributes, the same way a
             // participant token's are: the member is optional, and an absent member is
             // how the model says "none".
@@ -1408,6 +1416,31 @@ impl IngestConfigurationRecord {
     /// no longer holds.
     pub fn clear_stage_association(&mut self) {
         self.stage_arn = NO_ASSOCIATED_STAGE_ARN.to_string();
+    }
+
+    /// Leave this configuration with redundant ingest `redundant_ingest`, taking `minted`
+    /// as its backup credentials where the configuration carries none yet and the switch
+    /// turns the feature ON.
+    ///
+    /// The ONE writer of the pair `redundantIngest`/`redundantIngestCredentials`, so what
+    /// a configuration's backup credentials are does not depend on which operation last
+    /// wrote the switch. The credentials are MATERIALISED by the switch and then belong to
+    /// the configuration: `IngestConfiguration$redundantIngestCredentials` is "present only
+    /// when `redundantIngest` is set to `true`", which is what brings them into existence,
+    /// and the recorded service keeps reporting them once minted — switching the feature off
+    /// stops the redundant paths being published to, it does not revoke the ingest keys
+    /// already handed out, so a publisher that cached one keeps working and a caller that
+    /// switches the feature back on broadcasts to the same paths. A configuration whose
+    /// switch was never on therefore carries no list at all.
+    pub fn apply_redundant_ingest(
+        &mut self,
+        redundant_ingest: bool,
+        minted: Vec<IngestCredential>,
+    ) {
+        self.redundant_ingest = redundant_ingest;
+        if redundant_ingest && self.redundant_ingest_credentials.is_empty() {
+            self.redundant_ingest_credentials = minted;
+        }
     }
 
     /// Whether `participant_id` is one of the participants THIS configuration's ingest
@@ -3980,7 +4013,6 @@ pub fn issue_token_record(
                 })
     });
 
-    let token = mint_participant_token(credentials)?;
     // The documented defaults are applied to what the token IS — the lifetime its
     // expiry is computed from, and the capability set every reader of this participant
     // decides from — while the members the request carried are kept as it carried them,
@@ -3989,6 +4021,11 @@ pub fn issue_token_record(
     let duration_minutes = requested
         .duration
         .unwrap_or(DEFAULT_TOKEN_DURATION_MINUTES);
+    // The expiry is settled before the token is minted, because the token itself claims
+    // it: the instant inside the token and the `expirationTime` the record reports are the
+    // same one.
+    let expiration_time = expiration_time(duration_minutes);
+    let token = mint_participant_token(credentials, stage_arn, &participant_id, expiration_time)?;
     Some(ParticipantTokenRecord {
         participant_id,
         token,
@@ -4001,7 +4038,7 @@ pub fn issue_token_record(
             .clone()
             .unwrap_or_else(default_token_capabilities),
         requested_capabilities: requested.capabilities,
-        expiration_time: expiration_time(duration_minutes),
+        expiration_time,
     })
 }
 
@@ -4018,31 +4055,85 @@ pub fn attributes_size(attributes: &HashMap<String, String>) -> usize {
     ::serde_json::to_vec(attributes).map_or(usize::MAX, |encoded| encoded.len())
 }
 
-/// The client token a participant joins the stage with.
+/// The `typ` of a token in the compact serialization (RFC 7519 §5.1).
+const TOKEN_TYPE: &str = "JWT";
+
+/// The JWS algorithm a token this service issues is authenticated under: the HMAC with
+/// SHA-256 of RFC 7518 §3.2, computed over the token's own encoded header and claim set.
+const TOKEN_SIGNING_ALGORITHM: &str = "HS256";
+
+/// `time` as whole seconds since the epoch, which is how a claim carries an instant
+/// (RFC 7519 §2's `NumericDate`).
+fn unix_seconds(time: SystemTime) -> i64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|since_epoch| i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
+
+/// The client token a participant joins the stage `stage_arn` with, as the participant
+/// `participant_id`, until `expires_at`.
 ///
-/// The token is a secret handed to the caller, and nothing in a service may construct a
-/// secret itself, so it is minted by the one component of this emulator that generates
-/// secrets — the credential store — and then removed from that store again: the caller
-/// gets the secret, the emulator keeps no credential it would accept as SigV4 (this token
-/// authenticates to a stage, not to the emulator's API), and nothing accumulates per
-/// call. The same pattern the MWAA and Grafana emulators use for their caller-facing
-/// tokens.
+/// The FORM is a JSON Web Token in compact serialization (RFC 7515 §3.1, RFC 7519 §3):
+/// `base64url(header) '.' base64url(claims) '.' base64url(signature)`, each segment in the
+/// URL-safe alphabet without padding (RFC 7515 §2). That is the serialization the clients
+/// of this API parse a token in — they split it on `.` and base64url-decode the segments
+/// before presenting it — so a value carrying no segments at all is rejected before any
+/// stage is reached, whatever its contents. The model's own `ParticipantToken` doc fixes
+/// what a caller may rely on BEYOND the form: "Treat tokens as opaque; i.e., do not build
+/// functionality based on token contents. The format of tokens could change in the
+/// future."
 ///
-/// The model's own `ParticipantToken` doc fixes the contract a caller may rely on: "Treat
-/// tokens as opaque; i.e., do not build functionality based on token contents. The format
-/// of tokens could change in the future." So the only properties that matter are the ones
-/// this gives: every token is distinct, and none is echoed back from the request.
+/// The claim set is what this service already knows about the token, each claim the one
+/// RFC 7519 §4.1 registers for it: the stage it admits its holder to (`aud`), the
+/// participant it admits them as (`jti`) and the instant it expires (`exp`, the same
+/// instant the reported `expirationTime` carries). Nothing else the request supplied
+/// travels in it.
+///
+/// The signature is the MAC of [`TOKEN_SIGNING_ALGORITHM`] over the encoded header and
+/// claim set, keyed by a secret minted per issuance by the one component of this emulator
+/// that generates secrets — the credential store — which is then removed from it again:
+/// the caller gets a token no other party can produce, the emulator keeps no credential it
+/// would accept as SigV4 (this token authenticates to a stage, not to the emulator's API),
+/// and nothing accumulates per call. The same pattern the MWAA and Grafana emulators use
+/// for their caller-facing tokens. So every token is distinct, and none is echoed back
+/// from the request.
 ///
 /// `None` when the store minted no session-token secret, which leaves the operation to
 /// answer [`token_minting_failed`] rather than report a token it made up.
-pub fn mint_participant_token(credentials: &::emulator_server::CredentialStore) -> Option<String> {
+pub fn mint_participant_token(
+    credentials: &::emulator_server::CredentialStore,
+    stage_arn: &str,
+    participant_id: &str,
+    expires_at: SystemTime,
+) -> Option<String> {
     let minted = credentials.create(&::emulator_server::aws_credentials::AWS_SESSION);
-    let token = minted
+    let secret = minted
         .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
         .map(str::to_string);
-    // The participant token is not a credential of this emulator; see above.
+    // The signing key is not a credential of this emulator; see above.
     let _ = credentials.delete(&minted.id);
-    token
+    let secret = secret?;
+
+    let header = ::serde_json::json!({ "typ": TOKEN_TYPE, "alg": TOKEN_SIGNING_ALGORITHM });
+    let claims = ::serde_json::json!({
+        "aud": stage_arn,
+        "jti": participant_id,
+        "exp": unix_seconds(expires_at),
+    });
+    // RFC 7515 §5.1: the signature is computed over the ENCODED header and claim set
+    // joined by '.', so those exact bytes are what the token carries. The segment coding
+    // is this tree's one base64url coder, beside the JOSE reading that reads such a token.
+    let signing_input = format!(
+        "{}.{}",
+        ::service_common::jwt::encode_base64url(header.to_string().as_bytes()),
+        ::service_common::jwt::encode_base64url(claims.to_string().as_bytes())
+    );
+    let key = ::ring::hmac::Key::new(::ring::hmac::HMAC_SHA256, secret.as_bytes());
+    let signature = ::ring::hmac::sign(&key, signing_input.as_bytes());
+    Some(format!(
+        "{signing_input}.{}",
+        ::service_common::jwt::encode_base64url(signature.as_ref())
+    ))
 }
 
 /// One ingest credential: a fresh participant id, and the ingest key minted for it.
@@ -4068,6 +4159,27 @@ pub fn mint_ingest_credential(
         participant_id,
         stream_key,
     })
+}
+
+/// The backup credentials a configuration with redundant ingest enabled carries beside
+/// its own: [`REDUNDANT_INGEST_CREDENTIALS`] of them, each minted the single way this
+/// service mints an ingest credential ([`mint_ingest_credential`]).
+///
+/// The ONE place the set is minted, so the creating operation and the update that switches
+/// the feature on produce the same credentials in the same count, and neither decides it
+/// for itself.
+///
+/// `None` only when the credential store minted no secret for one of them, which the
+/// caller answers with [`stream_key_minting_failed`] rather than by reporting keys it made
+/// up — so a configuration never ends up with part of a set.
+pub fn mint_redundant_ingest_credentials(
+    state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    credentials: &::emulator_server::CredentialStore,
+    region: &str,
+) -> Option<Vec<IngestCredential>> {
+    (0..REDUNDANT_INGEST_CREDENTIALS)
+        .map(|_| mint_ingest_credential(state, credentials, region))
+        .collect()
 }
 
 /// The ingest key a publisher broadcasts with, for the participant `participant_id` of

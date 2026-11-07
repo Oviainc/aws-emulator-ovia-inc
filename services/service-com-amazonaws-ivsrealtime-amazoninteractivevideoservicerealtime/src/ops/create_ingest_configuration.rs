@@ -311,19 +311,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     CreateIngestConfigurationErrorModeled::InternalServerException,
                 )
             })?;
-        let mut redundant_ingest_credentials = Vec::new();
-        if input.redundant_ingest {
-            for _ in 0..crate::state::REDUNDANT_INGEST_CREDENTIALS {
-                let credential =
-                    crate::state::mint_ingest_credential(&mut store, ctx.credential_store(), &region)
-                        .ok_or_else(|| {
-                            crate::state::stream_key_minting_failed(
-                                CreateIngestConfigurationErrorModeled::InternalServerException,
-                            )
-                        })?;
-                redundant_ingest_credentials.push(credential);
-            }
-        }
+        let redundant_ingest_credentials = if input.redundant_ingest {
+            crate::state::mint_redundant_ingest_credentials(
+                &mut store,
+                ctx.credential_store(),
+                &region,
+            )
+            .ok_or_else(|| {
+                crate::state::stream_key_minting_failed(
+                    CreateIngestConfigurationErrorModeled::InternalServerException,
+                )
+            })?
+        } else {
+            Vec::new()
+        };
 
         let record = crate::state::IngestConfigurationRecord {
             arn: arn.clone(),

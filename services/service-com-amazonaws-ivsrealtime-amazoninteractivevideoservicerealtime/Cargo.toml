@@ -21,6 +21,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `state`: the tree's one base64url coder and JOSE reading, which the compact form of an
+# issued participant token is encoded with — a path dependency on this repository's own
+# shared service crate, not a third-party component.
+service-common = { path = "../common" }
+# `state`: the HMAC of RFC 7518 section 3.2, which authenticates an issued participant
+# token. An in-process COMPUTATION over data: it opens no listener, spawns nothing and
+# reads nothing off the host. It is the cryptography library this workspace already signs
+# and checks its tokens with (`service-common`'s JOSE reading and the user-pool service),
+# so it is already in this workspace's build and lockfile and no capability class arrives
+# with this declaration — and no second implementation of the primitive is written.
+ring = "0.17"
 # PEM decoding of the `publicKeyMaterial` an `ImportPublicKey` call carries.
 pem = "3"
 # SubjectPublicKeyInfo parsing, so an import is refused unless the material really is a

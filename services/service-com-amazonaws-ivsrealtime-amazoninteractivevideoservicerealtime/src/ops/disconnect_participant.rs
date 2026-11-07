@@ -22,7 +22,12 @@
 //! (`crate::state::participant_attached_to_stage`): one the stage's own records hold —
 //! whichever call recorded it, a data-plane join or a replication putting a replica of
 //! another stage's publisher into it — or an identity this service issued against the
-//! stage. Only a participant that is neither is the modelled `ResourceNotFoundException`.
+//! stage. A `participantId` the stage holds neither a record nor an identity for names no
+//! connection to end, so there is nothing left to do and the operation answers its empty
+//! success: the disconnect is idempotent, the way the clients that call it defensively (on
+//! a timeout, on a retry, on cleanup) need it to be. The modelled
+//! `ResourceNotFoundException` is for the resource this operation is addressed to, the
+//! stage.
 //!
 //! `reason` describes "why this participant is being disconnected" and no member of any
 //! shape this service reports carries it (`Participant`, `ParticipantSummary` and `Event`
@@ -191,37 +196,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // Both identifiers the request carries name a resource, so neither being held is
-        // the modelled `ResourceNotFoundException` (HTTP 404) — the stage first, in this
-        // request's own region's view of the account, then the participant "attached" to
-        // it, resolved through the ONE answer to "does this stage have this participant"
-        // (`crate::state::participant_attached_to_stage`): a participant the stage's own
-        // records hold, whichever call recorded it, or an identity this service issued
-        // against the stage. The readers of the same stage report exactly those
-        // participants, so a participant `ListParticipants` reports is one this operation
-        // can take out of the stage.
+        // The stage is the resource this operation is addressed to, so a stage this
+        // request's own region's view of the account does not hold is the modelled
+        // `ResourceNotFoundException` (HTTP 404).
         if store.stage_in(&region, &input.stage_arn).is_none() {
             return Err(crate::state::resource_not_found(
                 DisconnectParticipantErrorModeled::ResourceNotFoundException,
                 &input.stage_arn,
             ));
         }
+
+        // The `participantId` names a connection WITHIN that stage rather than a resource
+        // of its own: once the stage resolves, an id it holds neither a record nor an
+        // identity for (`crate::state::participant_attached_to_stage`, the ONE answer to
+        // "does this stage have this participant") names no connection to end, so the
+        // request is already satisfied — it answers the operation's empty success and
+        // writes nothing, which is what makes a defensive retry, and the cleanup of a
+        // participant that has already dropped, succeed the way the first call did.
         if !crate::state::participant_attached_to_stage(
             &store,
             &input.stage_arn,
             &input.participant_id,
         ) {
-            return Err(crate::state::resource_not_found(
-                DisconnectParticipantErrorModeled::ResourceNotFoundException,
-                // A `participantId` is not an ARN, so the refusal names the kind of
-                // resource and quotes the id (`crate::state::named_resource`): that is
-                // what tells a caller the participant is what the stage does not have,
-                // and not the stage itself.
-                &crate::state::named_resource(
-                    crate::state::PARTICIPANT_RESOURCE,
-                    &input.participant_id,
-                ),
-            ));
+            return Ok(DisconnectParticipantOutput {});
         }
 
         // The sessions of this stage the participant is still CONNECTED in — the ONE
@@ -231,7 +228,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // participant that is publishing right now
         // (`crate::state::ingest_configuration_publishers`, the same lookup a
         // configuration's reported `state` and a forced delete follow) and the disconnect
-        // below is exactly what ends that.
+        // below is exactly what ends that. A participant that is attached but already
+        // disconnected is in no session and publishes with nothing, so both are empty and
+        // the call leaves it exactly as it was.
         let connected_sessions =
             crate::state::connected_sessions_of(&store, &input.stage_arn, &input.participant_id);
         let publishing_with: Vec<String> = store

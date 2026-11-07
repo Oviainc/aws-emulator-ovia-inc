@@ -1025,12 +1025,9 @@ async fn a_not_found_names_the_kind_of_a_bare_identifier() {
             format!("stage session \"{absent_session}\""),
         ),
         (
-            "a participant the stage has no identity for",
-            "DisconnectParticipant",
-            json!({ "stageArn": stage_arn, "participantId": absent_participant }),
-            format!("participant \"{absent_participant}\""),
-        ),
-        (
+            // `DisconnectParticipant` is NOT among these rows: a participant id its stage
+            // holds nothing for names no connection to end, so that call is the idempotent
+            // empty success rather than a refusal (see the `disconnect_participant` suite).
             "a participant named for replication",
             "StartParticipantReplication",
             json!({

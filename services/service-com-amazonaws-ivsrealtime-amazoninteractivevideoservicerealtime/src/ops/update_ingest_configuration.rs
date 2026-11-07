@@ -2,6 +2,12 @@
 
 //! @op UpdateIngestConfiguration
 //!
+//! Writes the two members this operation's own input names: the stage association and
+//! whether redundant ingest is enabled. Setting the switch materialises the backup
+//! credentials that feature takes, which are then the configuration's own — the reading
+//! `crate::state::IngestConfigurationRecord::apply_redundant_ingest` states, applied
+//! wherever either member is written.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -220,16 +226,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // "Only the stage ARN attached to the IngestConfiguration can be updated": the
-        // association is the one member this operation writes. Everything else the
-        // configuration carries — its ingest protocol, the ingest key and participant id
-        // minted for it, its redundant ingest and the backup credentials minted with it,
-        // its name, user id, attributes and tags — is left exactly as stored, so a
-        // publisher that cached the key keeps working across a move between stages. The
-        // request's `redundantIngest` is therefore not persisted either: it carries a
-        // modelled default, so an omitted member is indistinguishable from `false` on the
-        // wire, and honouring it would turn a stage move into a change of the ingest paths
-        // this operation documents itself as leaving alone.
+        // The backup credentials the requested state needs, minted BEFORE the record is
+        // touched: minting grows the store's own id sequence and can fail, and a refused
+        // update changes nothing. A set is minted only where one is needed — redundant
+        // ingest is being switched on for a configuration that carries none — so a request
+        // that leaves the feature as it stands, or switches it off, mints nothing and the
+        // keys a publisher cached keep working.
+        let minted = if input.redundant_ingest && record.redundant_ingest_credentials.is_empty() {
+            crate::state::mint_redundant_ingest_credentials(
+                &mut store,
+                ctx.credential_store(),
+                &region,
+            )
+            .ok_or_else(|| {
+                crate::state::stream_key_minting_failed(
+                    UpdateIngestConfigurationErrorModeled::InternalServerException,
+                )
+            })?
+        } else {
+            Vec::new()
+        };
+
+        // The two members this operation writes: the stage association, and whether
+        // redundant ingest is enabled. `redundantIngest` is an input member of this
+        // operation targeting a boolean with a modelled default, so the state it names is
+        // the state the configuration is left in, and what that state does to the
+        // configuration's backup credentials is the one writer of the pair
+        // (`crate::state::IngestConfigurationRecord::apply_redundant_ingest`): setting the
+        // switch materialises them, and they are the configuration's own from then on.
+        // Everything else the configuration carries — its ingest protocol, the primary
+        // ingest key and participant id minted for it, its name, user id, attributes and
+        // tags — is left exactly as stored, so a publisher that cached the primary key
+        // keeps working across a move between stages.
         let updated = store
             .ingest_configuration_in_mut(&region, &input.arn)
             .ok_or_else(|| {
@@ -239,6 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
         updated.stage_arn = stage_arn;
+        updated.apply_redundant_ingest(input.redundant_ingest, minted);
 
         // The configuration as it now stands, read back out of the store the way
         // `GetIngestConfiguration` reports it, so this answer and the next read are the

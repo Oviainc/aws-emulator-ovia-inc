@@ -20,10 +20,12 @@
 //!    is left associated with no stage, so a read of it reports the empty `stageArn` and
 //!    `INACTIVE`. A configuration the disconnected participant was NOT publishing with
 //!    keeps its stage.
-//! 3. A request naming a stage this account does not hold, or a participant that is not
-//!    an identity of that stage, is the modelled `ResourceNotFoundException` (HTTP 404)
-//!    and writes nothing; a value outside a member's modelled `@pattern` / `@length` is
-//!    the modelled `ValidationException` (HTTP 400).
+//! 3. A request naming a stage this account does not hold is the modelled
+//!    `ResourceNotFoundException` (HTTP 404) and writes nothing; a value outside a
+//!    member's modelled `@pattern` / `@length` is the modelled `ValidationException`
+//!    (HTTP 400). A well-formed `participantId` the resolved stage holds no connection for
+//!    is NOT a refusal: there is nothing to disconnect, so the call answers the modelled
+//!    200 carrying no member and writes nothing — the disconnect is idempotent.
 //!
 //! Nothing in the IVS RealTime control plane makes a participant JOIN a stage: a
 //! participant joins over the stage's data plane with the participant token or ingest key
@@ -745,10 +747,11 @@ async fn disconnecting_another_participant_leaves_a_configuration_alone() {
 // Rule 3 — what is refused, and that a refusal writes nothing
 // ---------------------------------------------------------------------------
 
-/// A request naming a stage this account does not hold, or a participant that is not an
-/// identity of the named stage, is refused with `ResourceNotFoundException` (404); a
-/// member outside its modelled constraints is refused with `ValidationException` (400).
-/// No refusal moves the participant that IS in the stage.
+/// A request naming a stage this account does not hold is refused with
+/// `ResourceNotFoundException` (404), and a member outside its modelled constraints with
+/// `ValidationException` (400); a well-formed participant id the resolved stage holds no
+/// connection for is the idempotent empty 200 instead. Neither answer moves the
+/// participant that IS in the stage.
 #[tokio::test]
 async fn a_request_naming_no_resource_of_this_account_is_refused() {
     let emulator = RealTime::new();
@@ -777,10 +780,14 @@ async fn a_request_naming_no_resource_of_this_account_is_refused() {
         format!("{prefix}/absent")
     };
 
-    // Rows differ in WHICH identifier does not resolve, and in how: an unheld stage, an
-    // id no token or ingest credential of this stage was minted for (including the empty
-    // id the member's `@length` minimum admits, and one belonging to another stage), and
-    // a `stageArn` outside the member's modelled pattern.
+    // Rows differ in WHICH identifier does not resolve, and in how: an unheld stage and a
+    // `stageArn` outside the member's modelled pattern are refused, while an id no token
+    // or ingest credential of this stage was minted for (including the empty id the
+    // member's `@length` minimum admits, and one belonging to another stage) names no
+    // connection to end and is answered with the empty 200.
+    //
+    // (case, stageArn, participantId, status, the error code — empty where the row is a
+    // success)
     let cases: Vec<(&str, String, String, u16, &str)> = vec![
         (
             "a stage this account does not hold",
@@ -793,22 +800,22 @@ async fn a_request_naming_no_resource_of_this_account_is_refused() {
             "a participant id nothing was minted for",
             stage_arn.clone(),
             "no-such-participant".to_string(),
-            404,
-            "ResourceNotFoundException",
+            200,
+            "",
         ),
         (
             "the empty participant id",
             stage_arn.clone(),
             String::new(),
-            404,
-            "ResourceNotFoundException",
+            200,
+            "",
         ),
         (
             "a participant of another stage",
             stage_arn.clone(),
             elsewhere.clone(),
-            404,
-            "ResourceNotFoundException",
+            200,
+            "",
         ),
         (
             "a stageArn outside the modelled pattern",
@@ -829,19 +836,30 @@ async fn a_request_naming_no_resource_of_this_account_is_refused() {
              {requested_stage:?} / participantId {requested_participant:?}, \
              got {status} {response}"
         );
-        assert_eq!(
-            error_code(&response),
-            expected_code,
-            "case {case:?}: expected {expected_code}, got {response}"
-        );
-        // The refusal wrote nothing: the stage's own participant is still connected.
+        if expected_code.is_empty() {
+            // The modelled output carries no member at all, so the whole answer is the
+            // empty JSON object.
+            assert_eq!(
+                response,
+                json!({}),
+                "case {case:?}: expected an answer carrying no member, got {response}"
+            );
+        } else {
+            assert_eq!(
+                error_code(&response),
+                expected_code,
+                "case {case:?}: expected {expected_code}, got {response}"
+            );
+        }
+        // Neither the refusal nor the no-op wrote anything: the stage's own participant is
+        // still connected.
         let actual = emulator
             .participant_state("refusals", &stage_arn, &session_id, &resident)
             .await;
         assert_eq!(
             actual.as_deref(),
             Some(PARTICIPANT_CONNECTED),
-            "case {case:?}: expected the refused request to leave {resident:?} \
+            "case {case:?}: expected the call to leave {resident:?} \
              {PARTICIPANT_CONNECTED:?}, got {actual:?}"
         );
     }

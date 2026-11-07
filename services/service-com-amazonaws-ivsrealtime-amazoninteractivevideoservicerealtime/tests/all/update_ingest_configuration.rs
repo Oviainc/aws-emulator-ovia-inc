@@ -9,13 +9,14 @@
 //!
 //! The RULES under test, each exercised over a SET of inputs rather than on one request:
 //!
-//! 1. "Only the stage ARN attached to the IngestConfiguration can be updated": an update
-//!    writes the association the request asks for and leaves every other member of the
-//!    configuration exactly as it was — the ingest protocol, the minted ingest key and
-//!    participant id, redundant ingest and its backup credentials, the name, user id,
-//!    attributes. The answer is the configuration `GetIngestConfiguration` then reports,
-//!    member for member, so the write round-trips; repeating the same update answers the
-//!    same thing.
+//! 1. The two members this operation's own input names are the two it writes: the stage
+//!    association, and whether redundant ingest is enabled (an absent `redundantIngest`
+//!    carrying the modelled default `false`). Setting that switch materialises the backup
+//!    credentials the feature takes, which are the configuration's from then on, and every
+//!    other member of the configuration is left exactly as it was: the ingest protocol, the
+//!    minted primary ingest key and participant id, the name, user id, attributes. The
+//!    answer is the configuration `GetIngestConfiguration` then reports, member for member,
+//!    so the write round-trips; repeating the same update answers the same thing.
 //! 2. The association a request supplies is resolved the way a create resolves it: a
 //!    stage this account holds is taken, the empty string and an absent member are the
 //!    modelled "no stage", and a well-formed stage ARN no stage answers for is the
@@ -261,13 +262,79 @@ fn arn(region: &str, resource_type: &str, id: &str) -> String {
     format!("arn:aws:ivs:{region}:{ACCOUNT}:{resource_type}/{id}")
 }
 
-/// `configuration` with its `stageArn` replaced by `stage_arn`: what rule 1 says an
-/// update's answer must be, given the configuration as it read before the call.
-fn with_stage_arn(configuration: &Value, stage_arn: &str) -> Value {
+/// `configuration` as rule 1 says an update must leave it: `stageArn` replaced by
+/// `stage_arn`, `redundantIngest` replaced by `redundant_ingest`, and the backup
+/// credentials either the set it already carried or, where this update is what set the
+/// switch, the set `answered` reports — whose SHAPE is asserted here, because a freshly
+/// minted credential is a value no earlier read could carry.
+fn after_update(
+    case: &str,
+    configuration: &Value,
+    stage_arn: &str,
+    redundant_ingest: bool,
+    answered: &Value,
+) -> Value {
     let mut expected = configuration.clone();
     expected["stageArn"] = json!(stage_arn);
+    expected["redundantIngest"] = json!(redundant_ingest);
+    match configuration.get("redundantIngestCredentials").cloned() {
+        // Credentials the configuration already holds are its own: they are reported
+        // whatever the switch now says.
+        Some(carried) => expected["redundantIngestCredentials"] = carried,
+        None if redundant_ingest => {
+            let minted = answered
+                .get("redundantIngestCredentials")
+                .cloned()
+                .unwrap_or(Value::Null);
+            assert_minted_credentials(case, &minted, configuration);
+            expected["redundantIngestCredentials"] = minted;
+        }
+        // A configuration whose switch was never set carries no list at all.
+        None => {
+            if let Some(members) = expected.as_object_mut() {
+                members.remove("redundantIngestCredentials");
+            }
+        }
+    }
     expected
 }
+
+/// The backup credentials an update that SET redundant ingest must report:
+/// [`state::REDUNDANT_INGEST_CREDENTIALS`] of them, each carrying its own participant id
+/// and its own ingest key of the modelled form, and none of them the primary credential of
+/// `configuration`.
+fn assert_minted_credentials(case: &str, minted: &Value, configuration: &Value) {
+    let credentials = minted.as_array().unwrap_or_else(|| {
+        panic!("case {case:?}: expected a redundantIngestCredentials list, got {minted}")
+    });
+    assert_eq!(
+        credentials.len(),
+        state::REDUNDANT_INGEST_CREDENTIALS,
+        "case {case:?}: expected {} backup credentials, got {minted}",
+        state::REDUNDANT_INGEST_CREDENTIALS
+    );
+    let primary_participant = member(configuration, "participantId");
+    let primary_key = member(configuration, "streamKey");
+    for credential in credentials {
+        let participant_id = member(credential, "participantId");
+        let stream_key = member(credential, "streamKey");
+        assert!(
+            !participant_id.is_empty() && participant_id != primary_participant,
+            "case {case:?}: expected a backup participantId of its own, got {credential}"
+        );
+        assert!(
+            stream_key.starts_with(STREAM_KEY_PREFIX) && stream_key != primary_key,
+            "case {case:?}: expected a backup streamKey of its own starting \
+             {STREAM_KEY_PREFIX:?}, got {credential}"
+        );
+    }
+}
+
+/// The first field of the modelled `StreamKey` `@pattern`
+/// `^rt_[0-9]+_[a-z0-9-]+_[a-zA-Z0-9-]+_.+$`, from
+/// `smithy_query(query="shape",shape="StreamKey")` — the `ingest_configurations` suite
+/// beside this one checks the whole pattern.
+const STREAM_KEY_PREFIX: &str = "rt_";
 
 /// How a row of the table below asks for the association, and the `stageArn` the
 /// configuration must then report.
@@ -394,7 +461,8 @@ async fn an_update_writes_the_association_and_leaves_every_other_member_alone() 
 
             let requested = association.requested(&stage, &other_stage);
             let expected_stage = association.expected(&stage, &other_stage);
-            let expected = with_stage_arn(&before, expected_stage);
+            // An absent `redundantIngest` carries the modelled default, `false`.
+            let expected_redundant = redundant_ingest.unwrap_or(false);
 
             let answer = emulator
                 .update(&configuration_arn, requested, redundant_ingest)
@@ -403,6 +471,13 @@ async fn an_update_writes_the_association_and_leaves_every_other_member_alone() 
                 answer.status, 200,
                 "case {case:?}: expected HTTP 200, got {} {}",
                 answer.status, answer.body
+            );
+            let expected = after_update(
+                &case,
+                &before,
+                expected_stage,
+                expected_redundant,
+                &answer.body["ingestConfiguration"],
             );
             assert_eq!(
                 answer.body["ingestConfiguration"], expected,

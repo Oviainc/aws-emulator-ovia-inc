@@ -12,8 +12,8 @@
 //! against that stage, so every participant the stage's readers report as one of its
 //! participants is one the operation whose `stageArn` is "the stage to which the
 //! participant is attached" disconnects (HTTP 200, and the record reports `DISCONNECTED`
-//! afterwards). Only a participant the stage holds neither a record nor an identity for is
-//! the modelled `ResourceNotFoundException` (HTTP 404).
+//! afterwards). A participant the stage holds neither a record nor an identity for has no
+//! connection to end, so that call is the same empty 200 and changes nothing.
 //!
 //! The rows differ in what the rule generalises over: HOW the stage came to hold the
 //! record (a replication putting a replica of another stage's publisher into it, with the
@@ -222,11 +222,6 @@ fn member(value: &Value, key: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
-}
-
-/// The wire error code of a failed call (`__type` in a restJson1 error body).
-fn error_code(response: &Value) -> &str {
-    response["__type"].as_str().unwrap_or("<no __type>")
 }
 
 /// Does this answer carry no members, as the modelled `DisconnectParticipantResponse`
@@ -539,22 +534,21 @@ async fn a_participant_the_stage_reports_is_one_the_stage_can_disconnect() {
             );
         }
 
-        // A participant the stage holds neither a record nor an identity for is still the
-        // modelled refusal, and a second disconnect of the departed participant is still
-        // accepted and changes nothing.
+        // A participant the stage holds neither a record nor an identity for has no
+        // connection to end, so the call is the idempotent empty 200 and changes nothing;
+        // a second disconnect of the departed participant is accepted the same way.
         let (status, response) = emulator
             .disconnect(&scenario.stage_arn, "nothing-minted-this-id")
             .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404 for an id {} holds nothing for, \
+            status, 200,
+            "case {case:?}: expected HTTP 200 for an id {} holds nothing for, \
              got {status} {response}",
             scenario.stage_arn,
         );
-        assert_eq!(
-            error_code(&response),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {response}"
+        assert!(
+            carries_no_members(&response),
+            "case {case:?}: expected an answer carrying no member, got {response}"
         );
         let (status, response) = emulator
             .disconnect(&scenario.stage_arn, &scenario.participant_id)

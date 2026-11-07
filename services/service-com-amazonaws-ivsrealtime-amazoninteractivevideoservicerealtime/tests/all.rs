@@ -59,6 +59,8 @@ mod delete_stage_ends_replications;
 mod delete_storage_configuration;
 #[path = "all/disconnect_participant.rs"]
 mod disconnect_participant;
+#[path = "all/disconnect_participant_idempotence.rs"]
+mod disconnect_participant_idempotence;
 #[path = "all/disconnect_participant_stage_records.rs"]
 mod disconnect_participant_stage_records;
 #[path = "all/documented_member_defaults.rs"]
@@ -127,10 +129,14 @@ mod participant_ingest_configuration;
 mod participant_replication;
 #[path = "all/participant_replication_stop.rs"]
 mod participant_replication_stop;
+#[path = "all/participant_token_form.rs"]
+mod participant_token_form;
 #[path = "all/participants.rs"]
 mod participants;
 #[path = "all/public_keys.rs"]
 mod public_keys;
+#[path = "all/redundant_ingest_toggle.rs"]
+mod redundant_ingest_toggle;
 #[path = "all/region_scoped_resources.rs"]
 mod region_scoped_resources;
 #[path = "all/replica_attributes_merge_bound.rs"]
