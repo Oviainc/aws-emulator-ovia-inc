@@ -25,16 +25,27 @@
 //! * `client.exceptions.<ShapeName>` is the modelled error class for that name, a subclass
 //!   of `ClientError`, so `except client.exceptions.QueueDoesNotExist` catches exactly that
 //!   refusal and nothing else.
-//! * There is no resource interface and no paginator: `boto3.resource(...)` and
-//!   `client.get_paginator(...)` raise rather than pretending to serve one. A blob member
-//!   travels as the base64 text an AWS JSON protocol carries it as, in both directions, and
-//!   `bytes` a handler passes are encoded to it.
+//! * DynamoDB's RESOURCE interface is supplied too ([`dynamodb`]), because it is the
+//!   interface an application stores from inside a function through:
+//!   `boto3.resource("dynamodb").Table(name)` carries the table name, its items are plain
+//!   Python values rather than the wire's attribute values, and a `Key`/`Attr` condition is
+//!   built into the expression the service reads. It is the same client underneath, so the
+//!   request, the signature and the refusal are the ones above. A service this runtime
+//!   supplies no resource classes for is REFUSED rather than served an interface that does
+//!   nothing.
+//! * There is no paginator: `client.get_paginator(...)` raises rather than pretending to
+//!   serve one. A blob member travels as the base64 text an AWS JSON protocol carries it
+//!   as, in both directions, and `bytes` a handler passes are encoded to it.
 //! * Nothing here is the containment. The services that can be reached, the bounds on a
 //!   call and the signature it carries are all host code's ([`super::aws_api`],
 //!   [`super::python`]); a handler that rebinds or deletes a name in these modules changes
 //!   none of them.
 
 use super::package::PackageModule;
+
+/// DynamoDB's resource interface: the service resource, its tables, and the item
+/// marshalling between a plain Python value and an attribute value.
+mod dynamodb;
 
 /// The modules this runtime puts on a Python handler's import path, as the SDK it ships.
 ///
@@ -51,6 +62,7 @@ pub fn runtime_modules() -> Vec<PackageModule> {
         ("boto3/session.py", BOTO3_SESSION_SOURCE),
     ]
     .into_iter()
+    .chain(dynamodb::modules())
     .map(|(path, source)| PackageModule {
         path: path.to_string(),
         source: source.to_string(),
@@ -59,8 +71,34 @@ pub fn runtime_modules() -> Vec<PackageModule> {
 }
 
 /// `botocore`: the package the client interface and the exceptions live under.
+///
+/// `xform_name` lives here because that is where the SDK keeps it: it is the one rule that
+/// turns a model's own member or operation name into the Python one an SDK reports it under
+/// (`TableName` -> `table_name`, `LatestStreamARN` -> `latest_stream_arn`).
 const BOTOCORE_SOURCE: &str = r#"
 """The AWS SDK for Python's lower half, as this runtime supplies it."""
+
+import re
+
+_first_cap_regex = re.compile("(.)([A-Z][a-z]+)")
+_number_cap_regex = re.compile("([a-z])([0-9]+)")
+_end_cap_regex = re.compile("([a-z0-9])([A-Z])")
+# A pluralised acronym (`ARNs`, `ACLs`, `CNAMEs`) is one word, not one per letter.
+_special_case_transform = re.compile("[A-Z]{2,}s$")
+
+
+def xform_name(name, sep="_"):
+    """A model's name as the Python one the SDK reports it under."""
+    if sep in name:
+        # Already transformed.
+        return name
+    special = _special_case_transform.search(name)
+    if special is not None:
+        matched = special.group()
+        name = "%s%s%ss" % (name[: -len(matched)], sep, matched[:-1].lower())
+    first = _first_cap_regex.sub(r"\1" + sep + r"\2", name)
+    numbered = _number_cap_regex.sub(r"\1" + sep + r"\2", first)
+    return _end_cap_regex.sub(r"\1" + sep + r"\2", numbered).lower()
 "#;
 
 /// `botocore.exceptions`: the exception types a handler catches.
@@ -320,12 +358,8 @@ def client(*args, **kwargs):
 
 
 def resource(*args, **kwargs):
-    from botocore.exceptions import SdkCallNotMade
-
-    raise SdkCallNotMade(
-        detail="the AWS SDK this runtime supplies has no resource interface; build a "
-        "client with boto3.client(...) instead"
-    )
+    """A service resource, as `boto3.resource(...)` builds one."""
+    return Session().resource(*args, **kwargs)
 
 
 def setup_default_session(**kwargs):
@@ -339,6 +373,9 @@ const BOTO3_SESSION_SOURCE: &str = r#"
 from botocore.client import Client
 from botocore.exceptions import SdkCallNotMade
 
+# The services this runtime's SDK supplies resource classes for.
+_RESOURCE_SERVICES = ("dynamodb",)
+
 
 class Session:
     def __init__(self, region_name=None, **_ignored):
@@ -347,9 +384,18 @@ class Session:
     def client(self, service_name, region_name=None, **kwargs):
         return Client(service_name, region_name=region_name or self.region_name, **kwargs)
 
-    def resource(self, *args, **kwargs):
+    def resource(self, service_name, region_name=None, **kwargs):
+        if service_name in _RESOURCE_SERVICES:
+            # Imported here rather than at module scope: a handler that only builds
+            # clients pays nothing for the resource interface's own modules.
+            from boto3.dynamodb.table import service_resource
+
+            return service_resource(
+                self.client(service_name, region_name=region_name, **kwargs)
+            )
         raise SdkCallNotMade(
-            detail="the AWS SDK this runtime supplies has no resource interface; build a "
-            "client with boto3.client(...) instead"
+            detail="the AWS SDK this runtime supplies has resource classes for %s only; "
+            "build a client with boto3.client(%r) instead"
+            % (", ".join(sorted(_RESOURCE_SERVICES)), service_name)
         )
 "#;
