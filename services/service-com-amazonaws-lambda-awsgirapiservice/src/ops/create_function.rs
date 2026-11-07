@@ -528,18 +528,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let (code_size, code_sha256) = match &code.zip_bytes {
-            // The only bytes this emulator holds are the ones the caller uploaded
-            // inline, so they are the only ones a size and a digest can come from.
-            Some(bytes) => (
-                i64::try_from(bytes.len()).unwrap_or(i64::MAX),
-                Some(crate::state::code_sha256(bytes)),
-            ),
-            // An S3 object or a container image is a reference this emulator does not
-            // resolve: it reports no size it did not measure and no digest it did not
-            // compute.
-            None => (0, None),
-        };
+        // The size and the digest of the package this create stored, read by the one
+        // reading both operations that store a package share
+        // (`crate::state::package_code_identity`): the bytes of an uploaded archive, or
+        // the digest of the image an `Image` package is frozen to. An S3 object this
+        // emulator does not resolve reports neither.
+        let (code_size, code_sha256) = crate::state::package_code_identity(&code);
 
         // "A list of function layers to add to the function's execution environment.
         // Specify each layer by its ARN, including the version." Each entry names a

@@ -30,9 +30,10 @@ use super::{
     FunctionUrlConfigRecord,
     FunctionVersionRecord, PolicyRecord, ProvisionedConcurrencyRecord, RequestChainRecord,
     RuntimeManagementConfigRecord, ASYNC_DELIVERY_DELAY, ASYNC_NOT_DELIVERED_REASON,
-    ASYNC_RECURSION_STOPPED_REASON, DEFAULT_LOG_FORMAT, DURABLE_EXECUTION_ARN_INFIX,
-    EVENT_TYPE_EXECUTION_STARTED, EXECUTION_STATUS_RUNNING, LAST_UPDATE_STATUS_IN_PROGRESS,
-    LAST_UPDATE_STATUS_SUCCESSFUL, MAX_DURABLE_EXECUTIONS, MAX_QUEUED_ASYNC_INVOCATIONS,
+    ASYNC_RECURSION_STOPPED_REASON, DEFAULT_LOG_FORMAT, DEFAULT_LOG_LEVEL,
+    DURABLE_EXECUTION_ARN_INFIX, EVENT_TYPE_EXECUTION_STARTED, EXECUTION_STATUS_RUNNING,
+    LAST_UPDATE_STATUS_IN_PROGRESS, LAST_UPDATE_STATUS_SUCCESSFUL, LOG_FORMAT_JSON,
+    MAX_DURABLE_EXECUTIONS, MAX_QUEUED_ASYNC_INVOCATIONS,
     NO_CAPACITY_PROVIDER_MESSAGE, REPOSITORY_TYPE_ECR, REPOSITORY_TYPE_S3,
     S3_OBJECT_STORAGE_MODE_REFERENCE, SNAP_START_APPLY_ON_NONE,
     SNAP_START_APPLY_ON_PUBLISHED_VERSIONS, SNAP_START_OPTIMIZATION_STATUS_OFF,
@@ -424,6 +425,9 @@ impl FunctionRecord {
             input_payload: payload.to_vec(),
             ended: None,
             error: None,
+            // The result is the one the RUN produces, so a freshly started execution has
+            // none (see [`DurableExecutionRecord::settle`]).
+            result: None,
             kms_key_arn: durable_config
                 .as_ref()
                 .and_then(|config| config.kms_key_arn.clone()),
@@ -856,26 +860,44 @@ impl FunctionRecord {
             // than no member: "The default log format is plain text", and "By default,
             // Lambda functions send logs to a default log group named
             // /aws/lambda/<function name>".
-            logging_config: Some(LoggingConfig {
-                log_format: config
+            //
+            // The two LEVEL members are the filters the JSON format carries: AWS documents
+            // them as available with that format, each defaulting to INFO, so a function on
+            // the JSON format reports both — the levels really in effect. A function on the
+            // plain-text format reports whatever is stored for them and nothing defaulted,
+            // because that format filters by no level at all.
+            logging_config: {
+                let log_format = config
                     .logging_config
                     .as_ref()
                     .and_then(|logging| logging.log_format.clone())
-                    .or_else(|| Some(DEFAULT_LOG_FORMAT.to_string())),
-                application_log_level: config
-                    .logging_config
-                    .as_ref()
-                    .and_then(|logging| logging.application_log_level.clone()),
-                system_log_level: config
-                    .logging_config
-                    .as_ref()
-                    .and_then(|logging| logging.system_log_level.clone()),
-                log_group: config
-                    .logging_config
-                    .as_ref()
-                    .and_then(|logging| logging.log_group.clone())
-                    .or_else(|| Some(default_log_group(&config.name))),
-            }),
+                    .unwrap_or_else(|| DEFAULT_LOG_FORMAT.to_string());
+                let level = |configured: Option<String>| {
+                    configured.or_else(|| {
+                        (log_format == LOG_FORMAT_JSON).then(|| DEFAULT_LOG_LEVEL.to_string())
+                    })
+                };
+                Some(LoggingConfig {
+                    application_log_level: level(
+                        config
+                            .logging_config
+                            .as_ref()
+                            .and_then(|logging| logging.application_log_level.clone()),
+                    ),
+                    system_log_level: level(
+                        config
+                            .logging_config
+                            .as_ref()
+                            .and_then(|logging| logging.system_log_level.clone()),
+                    ),
+                    log_group: config
+                        .logging_config
+                        .as_ref()
+                        .and_then(|logging| logging.log_group.clone())
+                        .or_else(|| Some(default_log_group(&config.name))),
+                    log_format: Some(log_format),
+                })
+            },
             // The runtime version the function is pinned to. A container image carries no
             // managed runtime, so there is no runtime version to report for one.
             runtime_version_config: config.runtime.as_deref().map(|runtime| {

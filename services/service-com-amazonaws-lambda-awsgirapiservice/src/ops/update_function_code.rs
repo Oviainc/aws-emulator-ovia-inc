@@ -452,18 +452,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         )
         .map_err(invalid_parameter)?;
-        let (code_size, code_sha256) = match &code.zip_bytes {
-            // The only bytes this emulator holds are the ones the caller uploaded
-            // inline, so they are the only ones a size and a digest can come from.
-            Some(bytes) => (
-                i64::try_from(bytes.len()).unwrap_or(i64::MAX),
-                Some(crate::state::code_sha256(bytes)),
-            ),
-            // An S3 object or a container image is a reference this emulator does not
-            // resolve: it reports no size it did not measure and no digest it did not
-            // compute.
-            None => (0, None),
-        };
+        // The size and the digest of the package this call SUBMITTED, read by the one
+        // reading both operations that store a package share
+        // (`crate::state::package_code_identity`).
+        let (code_size, code_sha256) = crate::state::package_code_identity(&code);
 
         // The new package replaces the old one, and a published version adds a copy of
         // it; AWS caps an account's total code storage and answers
@@ -504,10 +496,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Set to true to validate the request parameters and access permissions without
         // modifying the function code." Every refusal this request could earn has been
-        // answered above, so a dry run that reaches here is valid and persists nothing:
-        // the configuration it reports is the one the store still holds.
+        // answered above, so a dry run that reaches here is valid and persists nothing.
+        //
+        // What it REPORTS is the package it validated: a dry run is the pre-deploy
+        // validation step, so `CodeSha256` and `CodeSize` are the submitted package's —
+        // the artifact this call checked — while every other member is the configuration
+        // the store still holds, because nothing about the function changed.
         if input.dry_run {
-            let config = record.config.clone();
+            let mut config = record.config.clone();
+            config.code_size = code_size;
+            config.code_sha256 = code_sha256;
             return Ok(function_configuration(
                 record.configuration(crate::state::VERSION_LATEST, &config),
             ));

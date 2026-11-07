@@ -304,7 +304,15 @@ fn fixtures() -> Vec<Fixture> {
                 handler: Value::Null,
                 description: json!(""),
                 code_size: 0,
-                code_sha256: Value::Null,
+                // An `Image` package's `CodeSha256` is the digest of the image the
+                // function is frozen to, written as the hexadecimal an OCI digest is
+                // written in — computed here rather than read out of the answer.
+                code_sha256: json!(sha2::Sha256::digest(
+                    "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn:latest".as_bytes()
+                )
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()),
                 timeout: 3,
                 memory_size: 128,
                 package_type: "Image",

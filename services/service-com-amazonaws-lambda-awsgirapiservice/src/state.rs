@@ -194,7 +194,8 @@ use crate::ops::types::{
     CapacityProviderConfig, CapacityProviderPermissionsConfig, CapacityProviderScalingConfig,
     CapacityProviderTelemetryConfig, CapacityProviderVpcConfig, CodeSigningConfig,
     CodeSigningPolicies, Cors, CreateFunctionOutput, DeadLetterConfig, DurableConfig, Environment,
-    ErrorObject, Event, EventError, EventInput, ExecutionStoppedDetails, ExecutionTimedOutDetails,
+    ErrorObject, Event, EventError, EventInput, EventResult, ExecutionFailedDetails,
+    ExecutionStoppedDetails, ExecutionSucceededDetails, ExecutionTimedOutDetails,
     FileSystemConfig, FunctionScalingConfig, GetFunctionScalingConfigOutput, GetLayerVersionOutput,
     GetProvisionedConcurrencyConfigOutput, ImageConfig, InstanceRequirements,
     LayerVersionContentOutput, LayerVersionsListItem, LoggingConfig, PropagateTags,
@@ -321,6 +322,20 @@ pub use archive::unzipped_bytes;
 /// `crate::state::…`.
 pub mod invocation_payload;
 pub use invocation_payload::unparseable_payload_message;
+
+/// What the RUN of a durable function's invocation does to the EXECUTION that invocation
+/// started lives in [`durable_run`], beside the running of the invocation in [`execution`]
+/// and the queue that drives it in [`async_invocation`]. The record it settles stays in this
+/// module.
+pub mod durable_run;
+
+/// Which stored function URL a request ADDRESSES — the reading behind the data plane that
+/// serves the endpoints [`function_url()`] mints — lives in the [`function_url`] module,
+/// beside the [`FunctionUrlConfigRecord`]s it resolves. It is re-exported here for the same
+/// reason as [`capacity_provider`]: the plane in `crate::service` names it as
+/// `crate::state::…`.
+pub mod function_url;
+pub use function_url::{AddressedFunctionUrl, FunctionUrlTarget};
 
 /// The region an ARN carries when the request is unsigned and therefore names no
 /// SigV4 credential scope to read a region from.
@@ -492,6 +507,23 @@ pub fn configuration_quota_refusal(
 /// plain text", as AWS documents for the member (the model carries only its `JSON | Text`
 /// enum).
 pub const DEFAULT_LOG_FORMAT: &str = "Text";
+
+/// The `LogFormat` whose functions carry the LOG LEVELS as defaults.
+///
+/// `LoggingConfig$ApplicationLogLevel` and `$SystemLogLevel` are the level filters Lambda
+/// applies to a function's logs, and AWS documents them as available with the JSON log
+/// format ("To use this feature, set the log format to JSON") — so a function on that
+/// format carries both, at [`DEFAULT_LOG_LEVEL`] until the caller sets them, while one on
+/// the plain-text format carries only what was stored for it, filtering by no level.
+pub const LOG_FORMAT_JSON: &str = "JSON";
+
+/// The level both log-level members default to on a JSON-format function, which AWS
+/// documents for each of them: "Default: INFO".
+///
+/// It is the level the function's logs are FILTERED at, so a caller reading the effective
+/// configuration of a JSON-format function is told the levels that are in effect rather
+/// than nothing at all.
+pub const DEFAULT_LOG_LEVEL: &str = "INFO";
 
 /// The `SnapStart` `ApplyOn` a function gets when the caller names none, from the model's
 /// `SnapStartApplyOn` enum (`PublishedVersions | None`): no snapshot is taken.
@@ -2053,6 +2085,14 @@ pub const EVENT_TYPE_EXECUTION_STARTED: &str = "ExecutionStarted";
 /// `ExecutionTimeout` closes with; see [`EVENT_TYPE_EXECUTION_STARTED`].
 pub const EVENT_TYPE_EXECUTION_TIMED_OUT: &str = "ExecutionTimedOut";
 
+/// The model's `EventType` for the event an execution whose function RETURNED closes with,
+/// carrying the result it returned; see [`EVENT_TYPE_EXECUTION_STARTED`].
+pub const EVENT_TYPE_EXECUTION_SUCCEEDED: &str = "ExecutionSucceeded";
+
+/// The model's `EventType` for the event an execution whose function FAILED closes with,
+/// carrying the error it failed on; see [`EVENT_TYPE_EXECUTION_STARTED`].
+pub const EVENT_TYPE_EXECUTION_FAILED: &str = "ExecutionFailed";
+
 /// The model's `EventType` for the event an execution a caller STOPPED closes with; see
 /// [`EVENT_TYPE_EXECUTION_STARTED`] and [`DurableExecutionRecord::stop`].
 pub const EVENT_TYPE_EXECUTION_STOPPED: &str = "ExecutionStopped";
@@ -2111,6 +2151,14 @@ pub struct DurableExecutionRecord {
     /// The customer managed key the function's `DurableConfig` named for the execution's
     /// payload data, when it named one.
     pub kms_key_arn: Option<String>,
+    /// The result the execution's function RETURNED, once it ended successfully: "The JSON
+    /// result returned by the durable execution if it completed successfully. This field is
+    /// only present when the execution status is `SUCCEEDED`."
+    ///
+    /// It is only ever what the RUN of the function produced
+    /// ([`DurableExecutionRecord::settle`]), so no read reports a result the execution did
+    /// not produce.
+    pub result: Option<String>,
     /// When the execution's `ExecutionTimeout` falls due, while it is running and the
     /// function's `DurableConfig` set one.
     pub timeout_due: Option<SystemTime>,
@@ -2157,6 +2205,57 @@ impl DurableExecutionRecord {
             let mut event = self.next_event(EVENT_TYPE_EXECUTION_TIMED_OUT, due);
             event.execution_timed_out_details = Some(ExecutionTimedOutDetails { error: None });
             self.history.push(event);
+        }
+    }
+
+    /// Settle this execution on what the RUN of its function came to, at `now`.
+    ///
+    /// A durable execution is the handle on ONE invocation of a durable function, so the
+    /// status it ends in is the one that invocation's run produced: a handler that returned
+    /// makes the execution [`EXECUTION_STATUS_SUCCEEDED`] carrying the result it returned,
+    /// and a run that failed — a handler that raised, a run its timeout ended, a run this
+    /// emulator could not make at all — makes it [`EXECUTION_STATUS_FAILED`] carrying the
+    /// error that failure is. Nothing here reports a result or an error the run did not
+    /// produce.
+    ///
+    /// An execution already in a terminal status is NOT moved and nothing is appended: a
+    /// caller's `StopDurableExecution` and the timeout the clock owed both end it for good,
+    /// and the run of a stopped execution cannot re-open it.
+    pub fn settle(&mut self, outcome: &DurableOutcome, now: SystemTime) {
+        if self.status != EXECUTION_STATUS_RUNNING {
+            return;
+        }
+        self.ended = Some(now);
+        self.timeout_due = None;
+        // The history records what happened, so the terminal transition is appended as the
+        // event it is, carrying what the run produced. `Truncated` "indicates if the …
+        // payload was truncated due to size limits": the whole result the run produced is
+        // kept, so nothing here is truncated.
+        match outcome {
+            DurableOutcome::Succeeded(result) => {
+                self.status = EXECUTION_STATUS_SUCCEEDED.to_string();
+                self.result = result.clone();
+                let mut event = self.next_event(EVENT_TYPE_EXECUTION_SUCCEEDED, now);
+                event.execution_succeeded_details = Some(ExecutionSucceededDetails {
+                    result: EventResult {
+                        payload: result.clone(),
+                        truncated: Some(false),
+                    },
+                });
+                self.history.push(event);
+            }
+            DurableOutcome::Failed(error) => {
+                self.status = EXECUTION_STATUS_FAILED.to_string();
+                self.error = Some(error.clone());
+                let mut event = self.next_event(EVENT_TYPE_EXECUTION_FAILED, now);
+                event.execution_failed_details = Some(ExecutionFailedDetails {
+                    error: EventError {
+                        payload: Some(error.clone()),
+                        truncated: Some(false),
+                    },
+                });
+                self.history.push(event);
+            }
         }
     }
 
@@ -2267,6 +2366,16 @@ pub fn mint_durable_execution_id() -> String {
 #[must_use]
 pub fn mint_durable_execution_name() -> String {
     ::uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// What the RUN of a durable execution's function came to, which is what the execution is
+/// settled on ([`DurableExecutionRecord::settle`]).
+#[derive(Debug, Clone)]
+pub enum DurableOutcome {
+    /// The handler returned; the JSON result it produced, when it produced text at all.
+    Succeeded(Option<String>),
+    /// The run did not produce a result: the error it ended on.
+    Failed(ErrorObject),
 }
 
 /// What became of a [`FunctionRecord::start_durable_execution`] call.
@@ -3834,9 +3943,27 @@ pub fn held_package_bytes(code: &CodeRecord) -> Option<&[u8]> {
 /// new `ImageUri` changes it.
 #[must_use]
 pub fn resolved_image_uri(image_uri: &str) -> String {
+    format!(
+        "{}@sha256:{}",
+        image_repository(image_uri),
+        image_code_sha256(image_uri)
+    )
+}
+
+/// The digest of the container image an `Image` package names, which `CodeSha256` reports
+/// for such a function and which [`resolved_image_uri`] pins that image by.
+///
+/// AWS reports an image function's `CodeSha256` as the digest of the image it is frozen to,
+/// rendered as the lower-case hexadecimal an OCI digest is written in — unlike a .zip
+/// archive's, which is base64 ([`code_sha256`]) — so the two are told apart by their form
+/// as AWS tells them apart. The digest is of the content this emulator holds for the
+/// package, which for an image is the reference itself, so it is stable across reads, equal
+/// for two functions on the same image, different for two different references, and changed
+/// only by a new `ImageUri`.
+#[must_use]
+pub fn image_code_sha256(image_uri: &str) -> String {
     let digest = sha2::Sha256::digest(image_uri.as_bytes());
-    let rendered: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!("{}@sha256:{rendered}", image_repository(image_uri))
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// The repository part of an image URI: everything before the tag or the digest that
@@ -4098,6 +4225,37 @@ pub fn code_sha256(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(digest)
 }
 
+/// The `CodeSize` and `CodeSha256` of the package `code` names — the ONE reading both
+/// operations that store a package report them from, so a function's reported code identity
+/// does not depend on which call stored it.
+///
+/// `CodeSha256` is "The SHA256 hash of the function's deployment package", which AWS reports
+/// for every package type: for a .zip archive it is the digest of the archive's bytes
+/// (base64, as [`code_sha256`] renders it), and for a container image it is the digest of
+/// the IMAGE the function is frozen to — the same digest `ResolvedImageUri` pins that image
+/// by ([`image_code_sha256`]), so the two members a caller compares deployed image content
+/// with cannot disagree.
+///
+/// `CodeSize` is "The size of the function's deployment package, in bytes", which can only
+/// be measured for the bytes this emulator HOLDS: an S3 object it does not resolve has no
+/// size it measured and no digest it computed, so it reports neither.
+#[must_use]
+pub fn package_code_identity(code: &CodeRecord) -> (i64, Option<String>) {
+    if let Some(bytes) = &code.zip_bytes {
+        return (
+            i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+            Some(code_sha256(bytes)),
+        );
+    }
+    // A container image is a reference this emulator does not pull, so it holds no archive
+    // to measure — but the image content it IS frozen to is the reference itself, which is
+    // what the digest is computed from (see [`image_code_sha256`]).
+    if let Some(image_uri) = &code.image_uri {
+        return (0, Some(image_code_sha256(image_uri)));
+    }
+    (0, None)
+}
+
 /// Lambda's sentence for a `CodeSha256` precondition that did not hold.
 ///
 /// `PublishVersion` takes "Only publish a version if the hash value matches the value
@@ -4335,288 +4493,6 @@ fn name_and_qualifier(
         was_arn,
         region,
     })
-}
-
-/// What a `TaggableResource` ARN — the `Resource` label of the
-/// `/2017-03-31/tags/{Resource}` operations — names.
-///
-/// The member's own pattern admits exactly six Lambda resource types
-/// (`smithy_query(query="operation", operation="ListTags")`): a function, optionally
-/// qualified by a published version or an alias, a layer, a code-signing configuration, an
-/// event source mapping, a capacity provider and a network connector. A function, a
-/// capacity provider, an event source mapping and a code-signing configuration are the
-/// ones this store holds records of; the rest are reported by their resource type and
-/// answered as what is true of them here — a resource of that type this account does not
-/// have.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TaggableResourceRef {
-    /// `…:function:<name>` — one function, whose tag set is
-    /// [`FunctionRecord::tags`].
-    Function(String),
-    /// `…:function:<name>:<qualifier>` — a published version or an alias of a function.
-    /// The `Resource` member's own documentation says "Lambda does not support adding
-    /// tags to function aliases or versions", so a qualified ARN names no tag set.
-    FunctionQualifier {
-        /// The bare function name the ARN carries.
-        name: String,
-        /// The version label or alias name qualifying it.
-        qualifier: String,
-    },
-    /// `…:capacity-provider:<name>` — one capacity provider, whose tag set is
-    /// [`CapacityProviderRecord::tags`].
-    CapacityProvider(String),
-    /// `…:event-source-mapping:<uuid>` — one event source mapping, whose tag set is
-    /// [`EventSourceMappingRecord::tags`].
-    EventSourceMapping(String),
-    /// `…:code-signing-config:<id>` — one code-signing configuration, whose tag set is
-    /// [`CodeSigningConfigRecord::tags`]. The store keys a configuration by its ARN, so
-    /// this carries the whole ARN rather than the bare id.
-    CodeSigningConfig(String),
-    /// Another Lambda resource type the pattern admits, by its ARN resource type.
-    Other(String),
-}
-
-/// Split a `TaggableResource` into the parts that identify what it names, or `None`
-/// when the value is not a `lambda` resource ARN at all.
-///
-/// The ARN is read through `service_common::arn` — the one parse this repository states
-/// for a caller-supplied ARN — so the `<type>:<id>` and `<type>/<id>` conventions are
-/// handled in one place, and the function form is then split by
-/// [`parse_function_reference`] so that every tag operation resolves a function exactly
-/// the way every other operation on this service does.
-///
-/// The ARN's region and account fields are read by that parse and deliberately NOT
-/// reported: this store keys a function by its name alone, exactly as
-/// [`resolve_function`] resolves every other `FunctionName`, so reporting them here
-/// would invite a caller to refuse a cross-region or cross-account ARN that every
-/// other operation on this service accepts. A tag operation that needs to refuse one
-/// has to make that rule hold for the whole service, and should call
-/// `service_common::arn::parse_of` for the fields when it does.
-///
-/// [`TaggableResourceRef::Other`] is only a resource TYPE because this store holds no
-/// records of those types yet — whoever implements the network-connector operations has
-/// to carry the type's id through here and turn the tag handlers' `Other` branch into a
-/// real lookup against the new records, the way a capacity provider, an event source
-/// mapping and a code signing configuration are resolved here.
-#[must_use]
-pub fn parse_taggable_resource(value: &str) -> Option<TaggableResourceRef> {
-    let arn = service_common::arn::parse_of(value, ARN_NAMESPACE)?;
-    let resource_type = arn.resource_type();
-    if resource_type.is_empty() {
-        return None;
-    }
-    // A capacity provider is named by `…:capacity-provider:<name>`, and this store holds
-    // one record per provider, so the ARN resolves to the name that record is keyed by.
-    if resource_type == "capacity-provider" {
-        return Some(TaggableResourceRef::CapacityProvider(
-            parse_capacity_provider_name(value)?,
-        ));
-    }
-    // An event source mapping is named by `…:event-source-mapping:<uuid>`, and this store
-    // holds one record per mapping, so the ARN resolves to the UUID that record is keyed
-    // by.
-    if resource_type == "event-source-mapping" {
-        let uuid = service_common::arn::resource_id_of_type(value, resource_type)?;
-        return (!uuid.is_empty())
-            .then(|| TaggableResourceRef::EventSourceMapping(uuid.to_string()));
-    }
-    // A code-signing configuration is named by `…:code-signing-config:<id>`, and this
-    // store keys one record per configuration BY THAT ARN (the identifier every modelled
-    // operation on one binds), so the whole value is what names the record.
-    if resource_type == CODE_SIGNING_CONFIG_RESOURCE_TYPE {
-        let id = service_common::arn::resource_id_of_type(value, resource_type)?;
-        return (!id.is_empty()).then(|| TaggableResourceRef::CodeSigningConfig(value.to_string()));
-    }
-    if resource_type != "function" {
-        return Some(TaggableResourceRef::Other(resource_type.to_string()));
-    }
-    let reference = parse_function_reference(value)?;
-    Some(match reference.qualifier {
-        Some(qualifier) => TaggableResourceRef::FunctionQualifier {
-            name: reference.name,
-            qualifier,
-        },
-        None => TaggableResourceRef::Function(reference.name),
-    })
-}
-
-/// The most tags one Lambda resource may carry.
-///
-/// AWS publishes it as a tagging restriction rather than in the model: the Lambda
-/// Developer Guide's "Tag Lambda resources" states "Maximum number of tags per resource:
-/// 50". A tag write that would leave a resource holding more than this is refused whole,
-/// so the resource keeps the tag set it had.
-pub const MAX_TAGS_PER_RESOURCE: usize = 50;
-
-/// Lambda's sentence for a tag write that would push a resource past
-/// [`MAX_TAGS_PER_RESOURCE`].
-///
-/// It states the quota that was hit and nothing of the request: not the resource, not the
-/// count the merge would have left behind. The restriction is a published quota, so the
-/// sentence is the same for every resource that hits it.
-pub const TAG_LIMIT_EXCEEDED_MESSAGE: &str = "Number of tags exceeds resource tag limit.";
-
-/// The tag-key namespace AWS keeps for the tags it applies itself.
-///
-/// The Lambda Developer Guide's "Tag Lambda resources" states the restriction on a tag
-/// KEY: "Don't use the `aws:` prefix in tag keys, because it is reserved for Amazon Web
-/// Services use. You can't edit or delete tag keys with this prefix."
-pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
-
-/// Lambda's sentence for a request carrying a tag key it will not store.
-///
-/// It names the three conditions a key must meet and NOTHING of the request — not the
-/// resource, not the offending key — so the sentence is the same for every request that
-/// fails any of them.
-pub const INVALID_TAGS_MESSAGE: &str = "One or more of your tags had a problem, please \
-     ensure none of your tag names start with \"aws:\", none are empty, and there are no \
-     duplicate tags";
-
-/// Lambda's sentence for a tag ARN that qualifies a function with a version or an alias.
-///
-/// `Resource`'s own documentation states the rule — "Lambda does not support adding tags
-/// to function aliases or versions" — and the sentence says that and what to send instead,
-/// carrying nothing of the request: the caller already named the ARN it sent.
-pub const TAGS_ON_QUALIFIED_FUNCTION_MESSAGE: &str =
-    "Tags on function aliases and versions are not supported. Please specify a function \
-     ARN.";
-
-/// Lambda's sentence for a tag write that names no tag at all.
-///
-/// `TagResource`'s `Tags` is `@required` ("A list of tags to apply to the resource"), and
-/// a map with no entry applies none: there is nothing to store, so the request is refused
-/// rather than answered as a write that changed nothing. The sentence states the refusal
-/// and nothing about the request — it is the one AWS answers for this condition.
-pub const EMPTY_TAGS_MESSAGE: &str = "An error occurred and the request cannot be processed.";
-
-/// Whether `key` lies in the namespace [`RESERVED_TAG_KEY_PREFIX`] reserves.
-///
-/// Compared without regard to case, and by BYTES rather than by characters, so a key
-/// whose first bytes are a multi-byte character is simply not reserved instead of
-/// panicking on a split character boundary.
-#[must_use]
-pub fn is_reserved_tag_key(key: &str) -> bool {
-    key.get(..RESERVED_TAG_KEY_PREFIX.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
-}
-
-/// Whether every key in `keys` is one Lambda will store: not empty, not in the reserved
-/// namespace, and named at most once.
-///
-/// This is the whole of what [`INVALID_TAGS_MESSAGE`] states, asked of the keys a single
-/// request carries, so every operation that STORES tags asks it the same way and refuses
-/// with the same sentence.
-#[must_use]
-pub fn tag_keys_are_storable<'a, I>(keys: I) -> bool
-where
-    I: IntoIterator<Item = &'a str>,
-{
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
-    keys.into_iter()
-        .all(|key| !key.is_empty() && !is_reserved_tag_key(key) && seen.insert(key))
-}
-
-/// Why a `TaggableResource` — the `Resource` label of the `/2017-03-31/tags/{Resource}`
-/// operations — names no tag set.
-///
-/// The two variants are the two answers AWS gives, and every tag operation maps them to
-/// its own modelled errors the same way: [`Self::Invalid`] is the caller naming something
-/// that carries no tag set at all (an `InvalidParameterValueException`, HTTP 400) and
-/// [`Self::NotFound`] is a well-formed ARN for a resource this account does not hold (a
-/// `ResourceNotFoundException`, HTTP 404).
-#[derive(Debug, Clone)]
-pub enum TagResolveFailure {
-    /// The value is no Lambda resource ARN, or it qualifies a function with a version or
-    /// an alias, which carries no tag set of its own.
-    Invalid(String),
-    /// The ARN is well formed but names a resource this account does not hold.
-    NotFound(String),
-}
-
-/// Resolve a `TaggableResource` to the ONE tag map the store holds for the resource it
-/// names, so `ListTags`, `TagResource` and `UntagResource` all read and write the same
-/// record rather than three copies of it.
-///
-/// A function's tags live on [`FunctionRecord::tags`] (where `CreateFunction` persists
-/// the `Tags` of its request and `GetFunction` reads the `Tags` it reports), a capacity
-/// provider's on [`CapacityProviderRecord::tags`], an event source mapping's on
-/// [`EventSourceMappingRecord::tags`] and a code signing configuration's on
-/// [`CodeSigningConfigRecord::tags`]. A function ARN carrying a qualifier names no tag
-/// set — `Resource`'s own documentation says "Lambda does not support adding tags to
-/// function aliases or versions" — and a resource type this store holds no records of (a
-/// network connector) names no resource at all until whoever implements its create
-/// carries its records through [`parse_taggable_resource`].
-///
-/// The borrow is mutable because that is what a tag write needs; a reporting caller takes
-/// it too and simply does not write. The function branch goes through
-/// [`resolve_function`], so a function is resolved exactly as every other operation on
-/// this service resolves one, and the lifecycle transition the clock already owed is
-/// materialised on the way.
-pub fn resolve_resource_tags<'a>(
-    store: &'a mut ComAmazonawsLambdaAwsgirapiserviceState,
-    resource: &str,
-    region: &str,
-    now: SystemTime,
-) -> Result<&'a mut BTreeMap<String, String>, TagResolveFailure> {
-    // The `Resource` pattern has already been enforced at the boundary, so the value here
-    // is one of the resource ARNs it admits; the parse says WHICH.
-    let named = parse_taggable_resource(resource).ok_or_else(|| {
-        TagResolveFailure::Invalid(format!(
-            "1 validation error detected: Value '{resource}' at 'resource' failed to satisfy \
-             constraint: Member must be the Amazon Resource Name of a Lambda resource"
-        ))
-    })?;
-
-    match named {
-        TaggableResourceRef::Function(name) => {
-            let (record, _version) = resolve_function(store, &name, None, region, now).map_err(
-                |failure| match failure {
-                    ResolveFailure::Malformed(message) => TagResolveFailure::Invalid(message),
-                    ResolveFailure::NotFound(message) => TagResolveFailure::NotFound(message),
-                },
-            )?;
-            Ok(&mut record.tags)
-        }
-        TaggableResourceRef::FunctionQualifier { .. } => Err(TagResolveFailure::Invalid(
-            TAGS_ON_QUALIFIED_FUNCTION_MESSAGE.to_string(),
-        )),
-        TaggableResourceRef::CapacityProvider(provider) => {
-            let record = store
-                .capacity_providers
-                .get_mut(&provider)
-                .ok_or_else(no_such_taggable_resource)?;
-            record.materialize(now);
-            Ok(&mut record.tags)
-        }
-        TaggableResourceRef::EventSourceMapping(uuid) => {
-            // A mapping whose removal the clock already made due is gone, so it holds no
-            // tag set either: what the clock owes is applied in ONE place.
-            store.materialize_all(now);
-            let record = store
-                .event_source_mappings
-                .get_mut(&uuid)
-                .ok_or_else(no_such_taggable_resource)?;
-            Ok(&mut record.tags)
-        }
-        TaggableResourceRef::CodeSigningConfig(arn) => {
-            let record = store
-                .code_signing_configs
-                .get_mut(&arn)
-                .ok_or_else(no_such_taggable_resource)?;
-            Ok(&mut record.tags)
-        }
-        TaggableResourceRef::Other(_) => Err(no_such_taggable_resource()),
-    }
-}
-
-/// The refusal a well-formed `TaggableResource` ARN this account holds no resource for
-/// gets: the canonical [`RESOURCE_NOT_FOUND_MESSAGE`], naming neither the resource kind
-/// nor the ARN the request addressed.
-///
-/// A FUNCTION is the exception, because AWS gives it its own sentence; that branch above
-/// carries [`resolve_function`]'s refusal through unchanged.
-fn no_such_taggable_resource() -> TagResolveFailure {
-    TagResolveFailure::NotFound(RESOURCE_NOT_FOUND_MESSAGE.to_string())
 }
 
 /// The refusal a `DurableExecutionArn` that names no execution this emulator holds gets:
@@ -4965,3 +4841,9 @@ pub fn resolve_layer_version_ref<'a>(
 
 #[cfg(test)]
 mod tests;
+
+/// Which RESOURCE a tagging request addresses, and what a request naming one this store
+/// holds no record of is answered — the whole reading behind the
+/// `/2017-03-31/tags/{Resource}` operations; see the module's own header.
+mod resource_tags;
+pub use resource_tags::*;

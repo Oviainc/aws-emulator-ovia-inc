@@ -172,9 +172,14 @@ impl Drop for DeliveryPermit {
 /// With no async runtime to spawn onto nothing is delivered, and nothing a caller was told
 /// depends on it: the entry settles on the clock instead, carrying
 /// [`ASYNC_NOT_DELIVERED_REASON`].
+///
+/// `durable_execution` names the durable execution this invocation IS, when the accepting
+/// call started one: the run is that execution's, so what the run comes to is the status the
+/// execution ends in ([`super::durable_run`]).
 pub fn deliver(
     state: &::engine::ServiceState<ComAmazonawsLambdaAwsgirapiserviceState>,
     invocation: Invocation,
+    durable_execution: Option<String>,
 ) {
     let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
         ::tracing::warn!(
@@ -211,24 +216,21 @@ pub fn deliver(
             let Some(attempts) = claim(&state, &function_name, &request_id) else {
                 return;
             };
-            let (outcome, ran, function_error) =
-                match super::execution::run_invocation(invocation.clone()).await {
-                    Ok(invoked) => {
-                        let function_error = invoked.function_error.clone();
-                        (
-                            AsyncInvocationOutcome::Delivered {
-                                function_error: invoked.function_error,
-                            },
-                            true,
-                            function_error,
-                        )
-                    }
-                    Err(why) => (
-                        AsyncInvocationOutcome::Failed(unrunnable_reason(&why)),
-                        false,
-                        None,
-                    ),
-                };
+            let run = super::execution::run_invocation(invocation.clone()).await;
+            let (outcome, ran, function_error) = match &run {
+                Ok(invoked) => (
+                    AsyncInvocationOutcome::Delivered {
+                        function_error: invoked.function_error.clone(),
+                    },
+                    true,
+                    invoked.function_error.clone(),
+                ),
+                Err(why) => (
+                    AsyncInvocationOutcome::Failed(unrunnable_reason(why, THE_EVENT)),
+                    false,
+                    None,
+                ),
+            };
             if let AsyncInvocationOutcome::Failed(ref why) = outcome {
                 // A function an accepted event could not be run for is worth seeing: the
                 // caller was answered before the attempt, so this is the only place it is
@@ -245,6 +247,19 @@ pub fn deliver(
                 super::async_delivery::next_attempt_in(ran, function_error.as_deref(), attempts)
             else {
                 settle(&state, &function_name, &request_id, outcome);
+                // The run was the durable execution's, so the execution ends in the status
+                // the invocation came to — which is what makes a caller polling it see a
+                // terminal status rather than `RUNNING` for ever. It is settled on the LAST
+                // attempt only: an attempt the retry policy will make again has not ended
+                // the invocation.
+                if let Some(name) = &durable_execution {
+                    super::durable_run::settle(
+                        &state,
+                        &function_name,
+                        name,
+                        &super::durable_run::run_outcome(&run),
+                    );
+                }
                 return;
             };
             // The event has another attempt, so the entry is left as the one it is being
@@ -304,37 +319,42 @@ fn entry_of<'store>(
         .find(|entry| entry.request_id == request_id)
 }
 
-/// Why the function an accepted event was delivered to never ran, one reason per condition a
-/// run can fail to start on.
+/// Why the function the work `subject` names was handed to never ran, one reason per
+/// condition a run can fail to start on.
 ///
 /// A synchronous invocation answers each of these as one of `Invoke`'s own modelled errors;
 /// an asynchronous one has no caller left to answer, so the reason is recorded on the entry
-/// instead.
-fn unrunnable_reason(why: &super::execution::Unrunnable) -> String {
+/// instead — and on the durable execution that invocation started, which reads it from here
+/// ([`super::durable_run`]), as does the function URL plane for a request it could not run
+/// (`crate::service::function_url`). `subject` is what the sentence calls that work: the
+/// queued event here, the request there — so the ONE set of sentences serves every caller.
+pub(crate) fn unrunnable_reason(why: &super::execution::Unrunnable, subject: &str) -> String {
     match why {
         super::execution::Unrunnable::NoEngine { runtime } => format!(
             "the function's runtime {runtime} is not one this emulator embeds an engine for, \
-             so the event was never executed"
+             so {subject} was never executed"
         ),
-        super::execution::Unrunnable::NoHandler => {
-            "the function's configuration names no Handler to run, so the event was never \
+        super::execution::Unrunnable::NoHandler => format!(
+            "the function's configuration names no Handler to run, so {subject} was never \
              executed"
-                .to_string()
-        }
-        super::execution::Unrunnable::PackageNotHeld => {
-            "this emulator holds no deployment package for the version the event was \
+        ),
+        super::execution::Unrunnable::PackageNotHeld => format!(
+            "this emulator holds no deployment package for the version {subject} was \
              addressed to, so there was nothing to run it on"
-                .to_string()
-        }
+        ),
         super::execution::Unrunnable::PackageUnreadable(detail) => format!(
-            "the deployment package of the version the event was addressed to could not be \
+            "the deployment package of the version {subject} was addressed to could not be \
              read: {detail}"
         ),
         super::execution::Unrunnable::Overloaded(detail) => format!(
-            "the event's delivery attempt found no capacity to run the function in: {detail}"
+            "no capacity was found to run the function for {subject}: {detail}"
         ),
         super::execution::Unrunnable::Internal(detail) => {
-            format!("the event's delivery attempt could not run the function: {detail}")
+            format!("the function could not be run for {subject}: {detail}")
         }
     }
 }
+
+/// What the sentences above call a QUEUED EVENT, which is the work this module's own
+/// delivery makes.
+pub(crate) const THE_EVENT: &str = "the event";

@@ -404,7 +404,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // metered as one `Invocations` datapoint of the function and of the resource this
             // call addressed (`crate::state::metrics`), exactly as `Invoke` meters its own.
             crate::state::publish_invocation(&*self.engine, &function_name, &resource);
-            crate::state::async_invocation::deliver(&state, invocation);
+            // `InvokeAsync` is the deprecated invocation API and carries no
+            // `DurableExecutionName` member at all, so it starts no durable execution and
+            // its delivery settles none.
+            crate::state::async_invocation::deliver(&state, invocation, None);
         } else {
             crate::state::publish_recursive_invocation_dropped(&*self.engine, &function_name);
         }

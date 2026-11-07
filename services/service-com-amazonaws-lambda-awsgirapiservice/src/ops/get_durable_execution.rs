@@ -277,12 +277,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .flatten()
                 .filter(|payload| !payload.is_empty()),
             // "The JSON result returned by the durable execution if it completed
-            // successfully": no in-process runtime here ran the function's deployment
-            // package, so there is no result to report and none is invented.
-            result: None,
-            // The error is the one the execution ENDED with — the reason a
-            // `StopDurableExecution` gave for stopping it — and nothing else: no run
-            // here produced a failure payload. It is execution data, so a compact read
+            // successfully. This field is only present when the execution status is
+            // SUCCEEDED": the result is the one the RUN of the function produced and
+            // nothing else (`crate::state::durable_run`). It is execution data, so a
+            // compact read withholds it with the rest.
+            result: include_execution_data
+                .then(|| execution.result.clone())
+                .flatten(),
+            // The error is the one the execution ENDED with — the error the run it was the
+            // handle on failed with, or the reason a `StopDurableExecution` gave for
+            // stopping it — and nothing else. It is execution data, so a compact read
             // withholds it with the rest.
             error: include_execution_data
                 .then(|| execution.error.clone())

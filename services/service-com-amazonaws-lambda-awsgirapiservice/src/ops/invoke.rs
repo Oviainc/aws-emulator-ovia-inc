@@ -679,7 +679,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // second one, so it is not counted a second time either.
             if let Some(invocation) = delivered {
                 crate::state::publish_invocation(&*self.engine, &function_name, &resource);
-                crate::state::async_invocation::deliver(&state, invocation);
+                // The run this delivery makes is the durable execution's own run, when the
+                // start above registered one, so the execution it names is settled on what
+                // that run comes to (`crate::state::durable_run`).
+                crate::state::async_invocation::deliver(
+                    &state,
+                    invocation,
+                    started.execution_name.clone(),
+                );
             }
             return Ok(InvokeOutput {
                 status_code: ACCEPTED_STATUS,
@@ -922,6 +929,7 @@ fn start_durable_execution(
     match record.start_durable_execution(&name, &resolved, payload, now) {
         crate::state::DurableExecutionStart::Started(arn) => Ok(StartedDurableExecution {
             durable_execution_arn: Some(arn),
+            execution_name: Some(name),
             deduplicated: false,
         }),
         // "If you invoke a durable function using a name that already exists with the
@@ -930,6 +938,9 @@ fn start_durable_execution(
         crate::state::DurableExecutionStart::AlreadyStarted(arn) => {
             Ok(StartedDurableExecution {
                 durable_execution_arn: Some(arn),
+                // No run follows a de-duplicated repeat, so there is no execution for one
+                // to settle: the execution already started is the running one.
+                execution_name: None,
                 deduplicated: true,
             })
         }
@@ -970,6 +981,9 @@ struct StartedDurableExecution {
     /// The `DurableExecutionArn` to answer, absent when the invocation starts no durable
     /// execution.
     durable_execution_arn: Option<String>,
+    /// The NAME of the execution this invocation started, which is the one the run that
+    /// follows settles; absent when the invocation started none of its own.
+    execution_name: Option<String>,
     /// Whether this invocation named an execution the function already held, carrying the
     /// same payload — the repeat the model answers with "the existing execution instead of
     /// creating a duplicate", which therefore performs nothing a second time.

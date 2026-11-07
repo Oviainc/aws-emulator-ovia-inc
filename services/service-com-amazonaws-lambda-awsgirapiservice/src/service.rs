@@ -65,6 +65,18 @@
 //! whose object this emulator holds no bytes for — an S3-sourced package it does not
 //! resolve — is a `404`, because nothing may be served that was not stored.
 //!
+//! ## The function URL plane
+//!
+//! `CreateFunctionUrlConfig` hands out "a dedicated HTTP(S) endpoint that you can use to
+//! invoke your function", and a request to that endpoint names no modelled operation either,
+//! so it is carried by the same two seams: [`Service::can_handle`] claims a request
+//! addressed to a function URL this store HOLDS, and [`Service::override_operation`] serves
+//! it through [`function_url::FunctionUrlPlane`], which runs the function the URL is attached
+//! to and answers what the run produced. Unlike a download, it is mounted TWICE — once per
+//! `AuthType` — because which callers a URL admits is carried by the auth schemes the serving
+//! operation declares, so the emulator still verifies every signature and this service checks
+//! none. See that module's own header.
+//!
 //! ## How a broken constraint is stated
 //!
 //! An AWS constraint message is built from the REQUEST — `1 validation error detected:
@@ -98,6 +110,11 @@ use std::sync::Arc;
 /// no raise site carries because it is a property of the failure rather than of the call.
 /// Applied to every response [`StatedPerOperation`] answers; see the module's own header.
 pub mod fault_class;
+
+/// The FUNCTION URL data plane: how a request to the endpoint `CreateFunctionUrlConfig`
+/// handed out is served by the function that URL is attached to; see the module's own
+/// header.
+pub mod function_url;
 
 /// The media type an INVOCATION's response announces, which is the media type of the
 /// document the function produced rather than of the binding it travels in; see the
@@ -273,6 +290,15 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     response_stream: EventStreamRoute<
         crate::ops::invoke_with_response_stream::ResponseStreamEntry<Eng>,
     >,
+    /// Serves the FUNCTION URL endpoints `CreateFunctionUrlConfig` hands out, from the same
+    /// shared engine, for the same reason as [`Downloads`]: a request to one names no
+    /// modelled operation at all. Mounted once per `AuthType`, because which callers a URL
+    /// admits is carried by the auth schemes the serving operation declares (see
+    /// [`function_url`]).
+    function_urls_anonymous: function_url::FunctionUrlPlane<Eng>,
+    /// See [`Self::function_urls_anonymous`]: the mounting that serves the URLs whose
+    /// `AuthType` is `AWS_IAM`.
+    function_urls_aws_iam: function_url::FunctionUrlPlane<Eng>,
     /// The same modelled operations the generated table holds, each wrapped in
     /// [`StatedPerOperation`] so a refused request QUOTES the value it refused rather
     /// than the framework's shortened rendering of it. Keyed by the routing key the
@@ -397,6 +423,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             downloads: Downloads {
                 engine: Arc::clone(&engine),
             },
+            function_urls_anonymous: function_url::FunctionUrlPlane::anonymous(Arc::clone(&engine)),
+            function_urls_aws_iam: function_url::FunctionUrlPlane::aws_iam(Arc::clone(&engine)),
             stated,
         }
     }
@@ -761,6 +789,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             // without this the router answers `UnknownService` for a URL this service
             // handed out. See the module docs.
             || request_host(parts).is_some_and(crate::state::is_download_host)
+            // And a request addressed to a FUNCTION URL this service holds, for the same
+            // reason: the endpoint `CreateFunctionUrlConfig` handed out names no service
+            // in its first label either, and a client that cannot resolve that host
+            // reaches the emulator's own endpoint carrying the url id in the path. The
+            // claim is narrowed to a URL this store HOLDS (see
+            // [`function_url::FunctionUrlPlane::claims`]), so no control-plane request
+            // and no other service's traffic is claimed by it.
+            || self.function_urls_anonymous.claims(parts)
     }
 
     fn override_operation(
@@ -780,6 +816,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the router's answer for an unrouted request.
         if names_download_host(req) {
             return Some(&self.downloads as &dyn ErasedOperation);
+        }
+        // And a request to a FUNCTION URL this service holds, which names no modelled
+        // operation either: the url id is read off the request's address and the serving
+        // mounting is the one the stored `AuthType` names, so a URL restricted to
+        // authenticated callers is served only to a request the emulator verified a
+        // signature for (see [`function_url`]).
+        if let Some(target) = self.function_urls_anonymous.target(req) {
+            return Some(
+                if self.function_urls_aws_iam.serves_auth_type(&target.auth_type) {
+                    &self.function_urls_aws_iam as &dyn ErasedOperation
+                } else {
+                    &self.function_urls_anonymous as &dyn ErasedOperation
+                },
+            );
         }
         // And `InvokeWithResponseStream`: its output binds a `@streaming` union, which
         // the generated routing-table entry declines (that entry is still what the router

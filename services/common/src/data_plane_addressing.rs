@@ -194,16 +194,26 @@ pub fn is_host_shaped(host: &str) -> bool {
 /// own colons, which that reader's `:port` split does not expect.
 #[must_use]
 pub fn names_a_service(host: &str) -> bool {
+    service_named_by_host(host).is_some()
+}
+
+/// WHICH service `host` names, by the same reading [`names_a_service`] answers from — for a
+/// plane that has to tell its OWN service's endpoint from another service's, where "names a
+/// service" alone would reject the host its own control plane answers on.
+///
+/// `None` for a host that names none: the emulator's own endpoint, an IP literal (a
+/// bracketed IPv6 one included, whose colons that reader's `:port` split does not expect),
+/// and a value no host header can carry.
+#[must_use]
+pub fn service_named_by_host(host: &str) -> Option<String> {
     let host = host_only(host);
     if host.starts_with('[') || host.parse::<std::net::IpAddr>().is_ok() {
-        return false;
+        return None;
     }
-    let Ok(value) = ::http::HeaderValue::from_str(host) else {
-        return false;
-    };
+    let value = ::http::HeaderValue::from_str(host).ok()?;
     let mut headers = ::http::HeaderMap::new();
     headers.insert("host", value);
-    ::emulator_server::service_from_host(&headers).is_some()
+    ::emulator_server::service_from_host(&headers)
 }
 
 #[cfg(test)]

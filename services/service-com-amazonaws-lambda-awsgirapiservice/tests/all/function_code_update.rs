@@ -140,6 +140,17 @@ fn expected_code_sha256(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(bytes))
 }
 
+/// The hexadecimal SHA-256 of `image_uri` — the independent computation of the IMAGE
+/// digest `CodeSha256` reports for a `PackageType=Image` function, which AWS writes in the
+/// lower-case hexadecimal an OCI digest is written in rather than the base64 a .zip
+/// archive's digest carries.
+fn expected_image_code_sha256(image_uri: &str) -> String {
+    sha2::Sha256::digest(image_uri.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Deployment package bytes of a given length. The content is irrelevant to the API —
 /// only its length and its digest are reported — but it differs per length so two
 /// packages never share a digest.
@@ -420,7 +431,8 @@ async fn update_function_code_replaces_the_stored_package() {
             })),
         },
         // "If the function's package type is Image, then you must specify the code
-        // package in ImageUri": the new image is the one the function resolves to.
+        // package in ImageUri": the new image is the one the function resolves to, and its
+        // `CodeSha256` is that image's own digest.
         UpdateCase {
             name: "image",
             create: json!({
@@ -435,7 +447,9 @@ async fn update_function_code_replaces_the_stored_package() {
             }),
             version: "$LATEST",
             code_size: 0,
-            code_sha256: None,
+            code_sha256: Some(expected_image_code_sha256(
+                "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn:2026-01",
+            )),
             architectures: json!(["x86_64"]),
             package_type: "Image",
             repository_type: "ECR",
@@ -687,7 +701,9 @@ async fn a_dry_run_validates_without_modifying_the_code() {
     let created_revision = revision_id("dry-run", &created);
     make_activation_due(&engine);
 
-    // A valid dry run is accepted and reports the configuration the store still holds.
+    // A valid dry run is accepted and reports the package it VALIDATED — the pre-deploy
+    // validation step reports the hash of the artifact it checked — while every other
+    // member is the configuration the store still holds.
     let answer = update_function_code(
         &router,
         "dry-run",
@@ -703,10 +719,10 @@ async fn a_dry_run_validates_without_modifying_the_code() {
     );
     let reported = answer.json();
     for (member, expected) in [
-        ("CodeSha256", json!(expected_code_sha256(&stored))),
+        ("CodeSha256", json!(expected_code_sha256(&candidate))),
         (
             "CodeSize",
-            json!(i64::try_from(stored.len()).unwrap_or_default()),
+            json!(i64::try_from(candidate.len()).unwrap_or_default()),
         ),
         ("RevisionId", json!(created_revision.clone())),
         ("Version", json!("$LATEST")),

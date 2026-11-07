@@ -85,6 +85,8 @@ mod durable_execution_history;
 mod durable_execution_listing;
 #[path = "all/durable_execution_refusals.rs"]
 mod durable_execution_refusals;
+#[path = "all/durable_execution_run.rs"]
+mod durable_execution_run;
 #[path = "all/durable_execution_start.rs"]
 mod durable_execution_start;
 #[path = "all/durable_execution_stop.rs"]
@@ -177,6 +179,8 @@ mod function_scaling_config_default;
 mod function_update_window_conflict;
 #[path = "all/function_url_config.rs"]
 mod function_url_config;
+#[path = "all/function_url_data_plane.rs"]
+mod function_url_data_plane;
 #[path = "all/function_url_deletion.rs"]
 mod function_url_deletion;
 #[path = "all/function_url_listing.rs"]

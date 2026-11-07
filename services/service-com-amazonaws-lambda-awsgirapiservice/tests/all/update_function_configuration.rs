@@ -418,6 +418,52 @@ fn cases() -> Vec<Case> {
                 },
             }),
         },
+        // The two LEVEL members are the filters the JSON log format carries, and AWS
+        // documents each one's default as INFO — so naming the format alone reports both
+        // levels in effect rather than neither.
+        Case {
+            label: "logging-config-json-levels-defaulted",
+            package: Package::Zip,
+            patch: json!({ "LoggingConfig": { "LogFormat": "JSON" } }),
+            expected: json!({
+                "LoggingConfig": {
+                    "LogFormat": "JSON",
+                    "ApplicationLogLevel": "INFO",
+                    "SystemLogLevel": "INFO",
+                    "LogGroup": "/aws/lambda/logging-config-json-levels-defaulted",
+                },
+            }),
+        },
+        // One level named, the other defaulted: the one the caller set is kept, and the
+        // other still reports the documented default.
+        Case {
+            label: "logging-config-json-one-level-named",
+            package: Package::Zip,
+            patch: json!({
+                "LoggingConfig": { "LogFormat": "JSON", "SystemLogLevel": "WARN" },
+            }),
+            expected: json!({
+                "LoggingConfig": {
+                    "LogFormat": "JSON",
+                    "ApplicationLogLevel": "INFO",
+                    "SystemLogLevel": "WARN",
+                    "LogGroup": "/aws/lambda/logging-config-json-one-level-named",
+                },
+            }),
+        },
+        // The plain-text format carries no level filtering at all, so neither member is
+        // reported for it.
+        Case {
+            label: "logging-config-text-has-no-levels",
+            package: Package::Zip,
+            patch: json!({ "LoggingConfig": { "LogFormat": "Text" } }),
+            expected: json!({
+                "LoggingConfig": {
+                    "LogFormat": "Text",
+                    "LogGroup": "/aws/lambda/logging-config-text-has-no-levels",
+                },
+            }),
+        },
         Case {
             label: "file-system-mounted",
             package: Package::Zip,

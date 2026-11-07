@@ -172,6 +172,16 @@ fn expected_code_sha256(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(bytes))
 }
 
+/// The hexadecimal SHA-256 of `image_uri` — the independent computation of the IMAGE
+/// digest `CodeSha256` reports for a `PackageType=Image` function, written as the
+/// lower-case hexadecimal an OCI digest is written in.
+fn expected_image_code_sha256(image_uri: &str) -> String {
+    sha2::Sha256::digest(image_uri.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Deployment package bytes of a given length. The content is irrelevant to the API —
 /// only its length and its digest are reported — but it differs per length so two
 /// packages never share a digest.
@@ -363,7 +373,11 @@ async fn create_function_persists_what_it_reports() {
                 "Code": { "ImageUri": "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn:latest" },
             }),
             code_size: 0,
-            code_sha256: None,
+            // An `Image` package's `CodeSha256` is the digest of the image the function is
+            // frozen to.
+            code_sha256: Some(expected_image_code_sha256(
+                "000000000000.dkr.ecr.us-east-1.amazonaws.com/fn:latest",
+            )),
             version: "$LATEST",
             package_type: "Image",
             memory_size: 128,
