@@ -10,10 +10,13 @@
 //! `S3OutputPathExtension`/`Filename` and the inference id, so resubmitting one id yields
 //! the same strings by construction. A submission naming no endpoint, an endpoint with no
 //! deployment behind it, or an endpoint whose configuration carries no
-//! `AsyncInferenceConfig` is refused with the modelled `ValidationError` (HTTP 400) — as
-//! is an inline `Body` past the maximum the model declares for it, examined once that
-//! addressing has resolved, because the service resolves the endpoint a submission is
-//! addressed to before it looks at what the submission carries (the order
+//! `AsyncInferenceConfig` is refused with the modelled `ValidationError` (HTTP 400). WHICH
+//! input source a submission carries is decided before any of that, because it is a
+//! property of the request alone: a submission carrying neither `Body` nor `InputLocation`,
+//! or both, is refused naming that rule and never the endpoint, and an inline `Body` past
+//! the maximum the model declares for it is refused there too, since the size of the inline
+//! source is part of choosing it. Everything the endpoint itself decides follows the
+//! resolution of the endpoint the submission addressed (the order
 //! [`crate::service::error_envelope`] states for the whole service). This
 //! is the ONLY file to touch for this operation.
 //!
@@ -271,11 +274,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Body and InputLocation are mutually exclusive. Provide exactly one of them."
         // (`smithy_query(query="doc", shape="InvokeEndpointAsyncInput", member="Body")`).
         // An empty `@httpPayload` blob is indistinguishable on the wire from an absent
-        // one, so an empty inline body counts as "not provided". The check itself is made
-        // AFTER the endpoint resolves, below: a request naming an endpoint the account does
-        // not host is refused for that, whatever else it carries, so the outcome the log
-        // keeps names the first thing wrong with the request.
+        // one, so an empty inline body counts as "not provided".
         let inline_body = input.body.as_deref().filter(|body| !body.is_empty());
+
+        // Which input source the submission carries is a property of the REQUEST alone, so
+        // it is decided before the endpoint the request addresses is resolved: a submission
+        // that names no input source at all, or two, is refused for that whether or not the
+        // account hosts the endpoint, and the refusal names the rule rather than the
+        // endpoint. The two halves of the disjunction are separate refusals because they
+        // are separate mistakes — nothing to send, and nothing to choose between.
+        match (input.input_location.as_deref(), inline_body) {
+            (Some(_), None) | (None, Some(_)) => {}
+            (Some(_), Some(_)) => {
+                return Err(refuse(
+                    crate::state::InvocationOutcome::InputAmbiguous,
+                    "Both Body and InputLocation were provided. Provide exactly one.".to_string(),
+                ))
+            }
+            (None, None) => {
+                return Err(refuse(
+                    crate::state::InvocationOutcome::NoInput,
+                    "One of Body or InputLocation is required".to_string(),
+                ))
+            }
+        }
+
+        // The inline source's SIZE is part of choosing it: "The inline payload can be up to
+        // 128,000 bytes" is stated on the member itself
+        // (`smithy_query(query="doc", shape="InvokeEndpointAsyncInput", member="Body")`),
+        // the bound `AsyncBodyBlob` declares, so an inline payload past it is refused here,
+        // with the request's other input-source refusals and before the endpoint resolves.
+        // The clause and the bound are the framework's and the model's
+        // (`crate::service::error_envelope::payload_over_maximum`), so this reads exactly as
+        // a payload refused at the boundary would.
+        if let Some(message) = crate::service::error_envelope::payload_over_maximum(
+            Self::INPUT_SCHEMA,
+            input.body.as_deref().map_or(0, <[u8]>::len),
+        ) {
+            return Err(refuse(
+                crate::state::InvocationOutcome::PayloadOverMaximum,
+                message,
+            ));
+        }
 
         // The endpoint is the control plane's resource, so it is resolved there and
         // nowhere else — the same resolver `InvokeEndpoint` uses, so the two operations
@@ -315,40 +355,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     input.endpoint_name, facts.status
                 ),
             ));
-        }
-
-        // The inline payload is examined HERE, after everything the submission's addressing
-        // resolved: the endpoint a request names is resolved from the URI before its body
-        // is looked at, so a submission naming no hosted endpoint is refused for that
-        // whatever it carries. The bound and the sentence are the model's and the
-        // framework's (`crate::service::error_envelope::payload_over_maximum`).
-        if let Some(message) = crate::service::error_envelope::payload_over_maximum(
-            Self::INPUT_SCHEMA,
-            input.body.as_deref().map_or(0, <[u8]>::len),
-        ) {
-            return Err(refuse(
-                crate::state::InvocationOutcome::PayloadOverMaximum,
-                message,
-            ));
-        }
-
-        // Exactly one input, now that the endpoint the submission names is known to exist
-        // and to serve traffic.
-        match (input.input_location.as_deref(), inline_body) {
-            (Some(_), None) | (None, Some(_)) => {}
-            (Some(_), Some(_)) => {
-                return Err(refuse(
-                    crate::state::InvocationOutcome::InputAmbiguous,
-                    "Body and InputLocation are mutually exclusive. Provide exactly one of them."
-                        .to_string(),
-                ))
-            }
-            (None, None) => {
-                return Err(refuse(
-                    crate::state::InvocationOutcome::NoInput,
-                    "Provide exactly one of Body or InputLocation.".to_string(),
-                ))
-            }
         }
 
         // A submission can only be queued where the control plane configured somewhere to

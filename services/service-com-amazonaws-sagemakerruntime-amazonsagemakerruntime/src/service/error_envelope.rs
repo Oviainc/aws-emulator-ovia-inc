@@ -39,13 +39,16 @@
 //! # When the payload is examined
 //!
 //! An invocation is ADDRESSED to an endpoint by the `@httpLabel` in its URI, and the
-//! service resolves that endpoint before it looks at what the request carries: a request
-//! naming an endpoint the account does not host is refused for that whatever its payload
-//! is. The framework's boundary walk cannot express that order — it refuses every
-//! constraint violation before any handler runs — so a request whose payload ALONE is
-//! outside its modelled bound is handed to the handler, which resolves the endpoint and
-//! then examines the payload ([`payload_over_maximum`], called from each route once its
-//! addressing has resolved). Every other refusal keeps the boundary's order.
+//! service resolves that endpoint before it looks at the payload it streams to the model
+//! container: a request naming an endpoint the account does not host is refused for that
+//! whatever that payload is. The framework's boundary walk cannot express that order — it
+//! refuses every constraint violation before any handler runs — so a request whose payload
+//! ALONE is outside its modelled bound is handed to the handler, and the handler states
+//! where in its own order the payload belongs ([`payload_over_maximum`], called from each
+//! route). The two routes whose `Body` the model declares `@required` call it once their
+//! addressing has resolved; the asynchronous route, whose `Body` is one of two mutually
+//! exclusive input sources the request layer chooses between, calls it with that choice,
+//! before the endpoint resolves. Every other refusal keeps the boundary's order.
 
 use std::sync::LazyLock;
 
@@ -233,10 +236,11 @@ fn payload_maximum(input_schema: &Schema) -> Option<i64> {
 /// owed, or `None` when the payload is inside that maximum (or the operation declares no
 /// payload member and no maximum).
 ///
-/// A handler calls this once the endpoint the request addressed has resolved, which is
-/// WHERE this service examines a payload: the clause and the bound are still the
-/// framework's and the model's, so a payload refused here reads exactly as one refused at
-/// the boundary would.
+/// A handler calls this where the payload belongs in ITS order — after the addressing has
+/// resolved for the payload the service streams to the model container, and with the
+/// input-source choice for a payload that is one of several sources: the clause and the
+/// bound are still the framework's and the model's, so a payload refused here reads exactly
+/// as one refused at the boundary would.
 pub fn payload_over_maximum(input_schema: &Schema, bytes: usize) -> Option<String> {
     let maximum = payload_maximum(input_schema)?;
     if i64::try_from(bytes).is_ok_and(|bytes| bytes <= maximum) {

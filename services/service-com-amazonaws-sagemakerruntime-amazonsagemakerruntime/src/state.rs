@@ -131,8 +131,8 @@ pub enum InvocationOutcome {
     /// can carry, and the spliced key is never resolved here.)
     OutputLocationInvalid,
     /// The request's payload is past the maximum its member's modelled `@length` declares.
-    /// Reached only once the request's addressing resolved: the endpoint a request names is
-    /// resolved before its payload is examined.
+    /// Reached once the request's addressing resolved for a payload the service streams to
+    /// the model container, and with the input-source choice for one that is a source.
     PayloadOverMaximum,
     /// Everything about the request resolved; the submission was queued.
     Queued,

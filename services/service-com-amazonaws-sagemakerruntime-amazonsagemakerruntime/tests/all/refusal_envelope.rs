@@ -13,13 +13,16 @@
 //!   `ValidationError`, whose `Message` carries the AWS validation envelope naming the
 //!   member and quoting the constraint as the model declares it.
 //!
-//! The body-size rows pin the one ordering rule the three routes share: the endpoint the
-//! request is addressed to is resolved before the request's payload is examined.
+//! The body-size rows pin the ordering rule the routes share: the endpoint a request is
+//! addressed to is resolved before the payload the service streams to the model container
+//! is examined, while the payload that is one of the asynchronous route's two input
+//! sources is examined with the choice between them, before the endpoint resolves.
 
 use serde_json::Value;
 
 use crate::harness::{
-    async_invocations, invocations, post, response_stream, routes, Emulator, Headers, ACCOUNT,
+    async_invocations, headers_for, invocations, post, response_stream, routes, Emulator, Headers,
+    ACCOUNT,
 };
 
 /// One refusal row: the case, the path it calls, the headers it sends, and the clause the
@@ -89,7 +92,13 @@ async fn an_endpoint_the_account_does_not_host_is_refused_with_the_lookup_discri
     for (operation, path, headers) in routes {
         for name in names {
             let case = format!("{operation} / {name}");
-            let call = post(&emulator, &path(name), &headers, b"payload").await;
+            let call = post(
+                &emulator,
+                &path(name),
+                &headers_for(&headers, b"payload"),
+                b"payload",
+            )
+            .await;
             assert_eq!(
                 call.status, 400,
                 "case {case}: expected HTTP 400, got {} / {}",
@@ -242,9 +251,12 @@ async fn a_value_outside_a_modelled_constraint_is_refused_in_the_modelled_envelo
     }
 }
 
-/// RULE: the endpoint the request is addressed to is resolved BEFORE the request's payload
-/// is examined, so a request naming an endpoint the account does not host is refused for
-/// that whatever its payload carries.
+/// RULE: the endpoint the request is addressed to is resolved BEFORE the payload the
+/// service streams to the model container is examined, so a request naming an endpoint the
+/// account does not host is refused for that whatever its payload carries — while the
+/// asynchronous route's payload is one of two mutually exclusive INPUT SOURCES, so its
+/// modelled ceiling belongs to choosing the source and is examined before the endpoint
+/// resolves.
 ///
 /// The rows walk each route's own modelled payload range — the bounds the model publishes,
 /// a value inside it and one past the maximum — on all three routes.
@@ -253,13 +265,19 @@ async fn the_endpoint_is_resolved_before_the_payload_is_examined() {
     let emulator = Emulator::new();
     for (operation, path, headers) in routes() {
         let maximum = payload_maximum(operation);
+        // `InvokeEndpointAsyncInput` declares `Body` and `InputLocation` both optional and
+        // mutually exclusive, so the inline payload is a source the request layer chooses
+        // between; the other two routes declare `Body` `@required` (`@clientOptional`) and
+        // pass it to the model container, so it is examined once the addressing resolved.
+        let inline_source = operation == "InvokeEndpointAsync";
         for size in [0usize, 1, maximum - 1, maximum, maximum + 1] {
             let case = format!("{operation} / {size} bytes");
+            let body = vec![b'x'; size];
             let call = post(
                 &emulator,
                 &path("absent-endpoint"),
-                &headers,
-                &vec![b'x'; size],
+                &headers_for(&headers, &body),
+                &body,
             )
             .await;
             assert_eq!(
@@ -268,6 +286,26 @@ async fn the_endpoint_is_resolved_before_the_payload_is_examined() {
                 call.status,
                 String::from_utf8_lossy(&call.body)
             );
+            if inline_source && size > maximum {
+                assert_eq!(
+                    member(&call, "Message"),
+                    Some(format!(
+                        "1 validation error detected: Value at 'body' failed to satisfy \
+                         constraint: Member must have length less than or equal to {maximum}"
+                    )),
+                    "case {case}: an inline input source past its modelled ceiling is refused \
+                     before the endpoint resolves, got {:?}",
+                    String::from_utf8_lossy(&call.body)
+                );
+                assert_eq!(
+                    member(&call, "ErrorCode"),
+                    None,
+                    "case {case}: a constraint refusal carries no endpoint-lookup \
+                     discriminator, got {:?}",
+                    String::from_utf8_lossy(&call.body)
+                );
+                continue;
+            }
             assert_eq!(
                 member(&call, "Message"),
                 Some(format!(

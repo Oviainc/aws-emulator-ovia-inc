@@ -81,6 +81,22 @@ pub(crate) fn routes() -> Vec<Route> {
     ]
 }
 
+/// [`routes`]'s headers for a row that carries `body`: the asynchronous route takes
+/// EXACTLY ONE input source — the inline `Body` or `InputLocation` — so the location
+/// header stands in only where the inline body is empty, and is dropped where the row
+/// supplies a body of its own. Every other route carries its payload alone, so its
+/// headers are unchanged.
+pub(crate) fn headers_for<'h>(headers: &Headers<'h>, body: &[u8]) -> Headers<'h> {
+    if body.is_empty() {
+        return headers.clone();
+    }
+    headers
+        .iter()
+        .copied()
+        .filter(|(name, _)| *name != INPUT_LOCATION.0)
+        .collect()
+}
+
 /// `POST path` with `headers` and the raw `body`, over the same router an SDK client
 /// reaches. The data plane's routes differ only in their last segment, so one builder
 /// serves all three.
