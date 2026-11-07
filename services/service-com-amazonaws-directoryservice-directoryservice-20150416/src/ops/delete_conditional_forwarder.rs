@@ -160,19 +160,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Dropping a forwarder changes the directory's own DNS, exactly as creating one
-        // does, so it needs a directory that is in service: one still being built by the
-        // transition its create owes is unavailable, which is the modelled refusal for
-        // exactly that. The diagnostic is this service's shared one for a directory a
-        // call cannot reach: the requested id and nothing about the stage it is in.
-        if directory.stage != crate::state::STAGE_ACTIVE {
-            return Err(
-                DeleteConditionalForwarderErrorModeled::DirectoryUnavailableException(
-                    crate::state::refusal(crate::state::directory_unavailable(
-                        &input.directory_id,
-                    )),
-                )
-                .into(),
-            );
+        // does, so it needs a directory that serves its DNS configuration: one still being
+        // built by the transition its create owes does not. Directory Service checks that
+        // stage as a PARAMETER of the call, through the one guard the
+        // conditional-forwarder mutations share.
+        if let Some(defect) = crate::state::conditional_forwarder_stage_defect(
+            crate::state::FORWARDER_ACTION_DELETE,
+            &input.directory_id,
+            &directory.stage,
+        ) {
+            return Err(invalid_parameter(defect));
         }
 
         // A forwarder is identified by the remote domain it points at, resolved the way a
@@ -198,4 +195,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // directory's index, so `DescribeConditionalForwarders` no longer reports it.
         Ok(DeleteConditionalForwarderOutput {})
     }
+}
+
+/// Refuse the request with the modelled `InvalidParameterException`, naming the member and
+/// the rule it broke so the caller can fix the request from the message alone.
+fn invalid_parameter(message: String) -> DeleteConditionalForwarderError {
+    DeleteConditionalForwarderErrorModeled::InvalidParameterException(crate::state::refusal(
+        message,
+    ))
+    .into()
 }

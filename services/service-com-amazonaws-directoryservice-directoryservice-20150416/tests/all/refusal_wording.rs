@@ -61,6 +61,10 @@ struct UnavailableCase {
 /// published constraint of its input so the request reaches that check. `certificate` is a
 /// PEM-encoded X.509 certificate, which `RegisterCertificate` reads before it resolves the
 /// directory.
+///
+/// The conditional-forwarder mutations are NOT here: Directory Service checks the
+/// directory's stage as a PARAMETER of those calls and states the stages they need, which
+/// `tests/all/refusal_texts.rs` is what asserts.
 fn unavailable_rows(certificate: &str) -> Vec<UnavailableCase> {
     let certificate = certificate.to_string();
     vec![
@@ -92,38 +96,6 @@ fn unavailable_rows(certificate: &str) -> Vec<UnavailableCase> {
             operation: "RemoveIpRoutes",
             microsoft_ad: false,
             body: Box::new(|id| json!({ "DirectoryId": id, "CidrIps": ["10.0.0.0/24"] })),
-        },
-        UnavailableCase {
-            case: "CreateConditionalForwarder",
-            operation: "CreateConditionalForwarder",
-            microsoft_ad: false,
-            body: Box::new(|id| {
-                json!({
-                    "DirectoryId": id,
-                    "RemoteDomainName": "remote.example.com",
-                    "DnsIpAddrs": ["10.0.0.2"]
-                })
-            }),
-        },
-        UnavailableCase {
-            case: "UpdateConditionalForwarder",
-            operation: "UpdateConditionalForwarder",
-            microsoft_ad: false,
-            body: Box::new(|id| {
-                json!({
-                    "DirectoryId": id,
-                    "RemoteDomainName": "remote.example.com",
-                    "DnsIpAddrs": ["10.0.0.3"]
-                })
-            }),
-        },
-        UnavailableCase {
-            case: "DeleteConditionalForwarder",
-            operation: "DeleteConditionalForwarder",
-            microsoft_ad: false,
-            body: Box::new(|id| {
-                json!({ "DirectoryId": id, "RemoteDomainName": "remote.example.com" })
-            }),
         },
         UnavailableCase {
             case: "EnableDirectoryDataAccess",

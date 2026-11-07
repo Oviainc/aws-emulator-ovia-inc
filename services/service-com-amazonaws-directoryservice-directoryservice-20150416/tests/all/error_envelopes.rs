@@ -317,14 +317,15 @@ fn refusal_table(directory_id: &str, taken_alias: &str) -> Vec<Refusal> {
         diagnostic: Diagnostic::Fixed(INVALID_NEXT_TOKEN.to_string()),
     });
 
-    // An id of another kind that resolves to nothing: a snapshot and an assessment, each
-    // with its own family's diagnostic.
+    // An id of another kind that resolves to nothing: a snapshot — reported as the filter
+    // VALUE the listing cannot be narrowed by — and an assessment, with the lookup
+    // family's own diagnostic.
     rows.push(Refusal {
         case: "DescribeSnapshots filtered by an absent snapshot".to_string(),
         operation: "DescribeSnapshots",
         body: json!({ "SnapshotIds": ["s-0000000000"] }),
-        error: "EntityDoesNotExistException",
-        diagnostic: Diagnostic::Fixed("Snapshot: s-0000000000 does not exist".to_string()),
+        error: "InvalidParameterException",
+        diagnostic: Diagnostic::Fixed("Invalid snapshot ID: s-0000000000.".to_string()),
     });
     rows.push(Refusal {
         case: "DescribeADAssessment on an absent assessment".to_string(),

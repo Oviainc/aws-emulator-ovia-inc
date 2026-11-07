@@ -658,8 +658,10 @@ async fn a_directory_that_is_absent_or_not_yet_in_service_is_refused() {
         }
     }
 
-    // A directory still being built by the transition its create owes is not in service,
-    // so the write is refused as unavailable while the read reports its (empty) forwarders.
+    // A directory still being built by the transition its create owes is not in a stage
+    // that serves its DNS configuration, so the write is refused as a parameter the call
+    // cannot be served with (see `tests/all/refusal_texts.rs`) while the read
+    // reports its (empty) forwarders.
     let fresh = create_directory(&router, minimal_create("fresh.example.com"), "not in service").await;
     let request = json!({
         "DirectoryId": &fresh,
@@ -670,7 +672,7 @@ async fn a_directory_that_is_absent_or_not_yet_in_service_is_refused() {
         &router,
         "CreateConditionalForwarder",
         request.clone(),
-        "DirectoryUnavailableException",
+        "InvalidParameterException",
         "a directory still being built",
     )
     .await;

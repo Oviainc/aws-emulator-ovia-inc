@@ -247,14 +247,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A directory is shared with a given consumer account at most once: the share
         // already in place is what that account uses, so a second request for it is the
-        // directory that is already shared rather than a second shared directory id.
+        // directory that is already shared rather than a second shared directory id. The
+        // refusal names the pairing and not the stored share: see
+        // `crate::state::directory_already_shared`.
         if let Some(existing) = store.share_of(&input.directory_id, &consumer_account_id) {
             return Err(ShareDirectoryErrorModeled::DirectoryAlreadySharedException(
-                crate::state::refusal(format!(
-                    "Directory {id} is already shared with account {account} as {shared}",
-                    id = input.directory_id,
-                    account = existing.shared_account_id,
-                    shared = existing.shared_directory_id
+                crate::state::refusal(crate::state::directory_already_shared(
+                    &input.directory_id,
+                    &existing.shared_account_id,
                 )),
             )
             .into());

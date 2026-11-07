@@ -67,6 +67,8 @@ mod log_subscriptions;
 mod microsoft_ad;
 #[path = "all/pagination_token_refusal.rs"]
 mod pagination_token_refusal;
+#[path = "all/refusal_texts.rs"]
+mod refusal_texts;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/region_replication.rs"]

@@ -243,19 +243,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // repeats a block — one the directory already routes, or one it names twice —
         // or that would take the directory past the limit leaves the stored routes
         // exactly as they were.
+        //
+        // A block that is already routed is not a conflicting ENTITY but a route the
+        // caller already has: Directory Service answers it with the general client
+        // refusal, listing every block of the request that is already there so the
+        // caller can delete exactly those and retry.
         let mut merged = directory.ip_routes.clone();
+        let mut already_routed: Vec<String> = Vec::new();
         for record in requested {
             let block = record.block().to_string();
             if merged.contains_key(&block) {
-                return Err(AddIpRoutesErrorModeled::EntityAlreadyExistsException(
-                    crate::state::refusal(format!(
-                        "Directory {id} already routes the address block {block}",
-                        id = directory.directory_id
-                    )),
-                )
-                .into());
+                already_routed.push(block);
+                continue;
             }
             merged.insert(block, record);
+        }
+        if !already_routed.is_empty() {
+            return Err(AddIpRoutesErrorModeled::ClientException(crate::state::refusal(
+                crate::state::ip_routes_already_exist(&already_routed),
+            ))
+            .into());
         }
         if merged.len() > crate::state::MAX_IP_ROUTES {
             return Err(route_limit_exceeded(merged.len()));

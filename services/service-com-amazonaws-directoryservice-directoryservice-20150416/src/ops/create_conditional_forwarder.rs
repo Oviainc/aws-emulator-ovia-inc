@@ -183,35 +183,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The forwarder is replicated to the directory's own domain controllers (its
-        // `ReplicationScope`), so it needs a directory that is in service: one still
-        // being built by the transition its create owes is unavailable, which is the
-        // modelled refusal for exactly that. The diagnostic is this service's shared one
-        // for a directory a call cannot reach: the requested id and nothing about the
-        // stage it is in.
-        if directory.stage != crate::state::STAGE_ACTIVE {
-            return Err(
-                CreateConditionalForwarderErrorModeled::DirectoryUnavailableException(
-                    crate::state::refusal(crate::state::directory_unavailable(
-                        &input.directory_id,
-                    )),
-                )
-                .into(),
-            );
+        // `ReplicationScope`), so it needs a directory that serves its DNS configuration:
+        // one still being built by the transition its create owes does not. Directory
+        // Service checks that stage as a PARAMETER of the call — it states the stages the
+        // call needs, so a caller knows to wait for them — through the one guard the
+        // conditional-forwarder mutations share.
+        if let Some(defect) = crate::state::conditional_forwarder_stage_defect(
+            crate::state::FORWARDER_ACTION_CREATE,
+            &input.directory_id,
+            &directory.stage,
+        ) {
+            return Err(invalid_parameter(defect));
         }
 
         // A directory forwards a given remote domain to one place, so a second create of
         // the same remote domain is the entity that already exists rather than a second
         // forwarder or a silent overwrite: `UpdateConditionalForwarder` is what changes
-        // the addresses of one that is already there.
+        // the addresses of one that is already there. The refusal comes from the DNS
+        // server that would have hosted the zone, so it names the zone as the request
+        // spelled it and the directory's own DNS server: see
+        // `crate::state::conditional_forwarder_zone_exists`.
         let key = crate::state::Directory::conditional_forwarder_key(&input.remote_domain_name);
-        if let Some(existing) = directory.conditional_forwarders.get(&key) {
+        if directory.conditional_forwarders.contains_key(&key) {
             return Err(
                 CreateConditionalForwarderErrorModeled::EntityAlreadyExistsException(
-                    crate::state::refusal(format!(
-                        "Directory {id} already has a conditional forwarder for the remote \
-                         domain '{domain}'",
-                        id = directory.directory_id,
-                        domain = existing.remote_domain_name
+                    crate::state::refusal(crate::state::conditional_forwarder_zone_exists(
+                        &input.remote_domain_name,
+                        directory.dns_server(),
                     )),
                 )
                 .into(),

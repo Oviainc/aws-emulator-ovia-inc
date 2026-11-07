@@ -243,12 +243,12 @@ async fn a_delete_drops_exactly_the_snapshot_its_id_resolves_to() {
         );
 
         // The record is gone, not hidden: the `SnapshotIds` filter resolves nothing for
-        // it, which is the modelled not-found rather than an empty page.
+        // it, so the id is no longer a value that listing can be narrowed by.
         refused(
             &router,
             "DescribeSnapshots",
             json!({ "SnapshotIds": [doomed] }),
-            "EntityDoesNotExistException",
+            "InvalidParameterException",
             case,
         )
         .await;

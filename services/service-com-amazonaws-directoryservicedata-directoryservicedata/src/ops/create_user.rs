@@ -227,12 +227,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ds` control plane that creates a directory is not part of this API.
         let directory = store.directory_for_write(&input.directory_id);
         if directory.holds_object(&key) {
-            return Err(CreateUserErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "{} already names an object in directory {}",
-                    input.sam_account_name, input.directory_id
-                )),
-            })
+            return Err(CreateUserErrorModeled::ConflictException(
+                crate::state::user_already_exists(&input.directory_id),
+            )
             .into());
         }
 

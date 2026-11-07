@@ -214,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The quota is checked BEFORE anything is written, so a number past it leaves the
         // directory running exactly the controllers it was running.
         if desired > limit {
-            return Err(domain_controller_limit_exceeded(input.desired_number, limit));
+            return Err(domain_controller_limit_exceeded(limit));
         }
 
         // This operation's own documentation: "It may take up to 45 minutes for any new
@@ -264,19 +264,12 @@ fn invalid_parameter(message: String) -> UpdateNumberOfDomainControllersError {
     .into()
 }
 
-/// Refuse the request with the modelled `DomainControllerLimitExceededException`: the
-/// sentence that error's own documentation states, with the quota taken from this
-/// service's per-directory limit and the number taken from the request.
-fn domain_controller_limit_exceeded(
-    requested: i32,
-    limit: usize,
-) -> UpdateNumberOfDomainControllersError {
+/// Refuse the request with the modelled `DomainControllerLimitExceededException`, worded
+/// by this service's shared diagnostic for that quota: the ceiling the request broke, and
+/// not the number it asked for.
+fn domain_controller_limit_exceeded(limit: usize) -> UpdateNumberOfDomainControllersError {
     UpdateNumberOfDomainControllersErrorModeled::DomainControllerLimitExceededException(
-        crate::state::refusal(format!(
-            "The maximum allowed number of domain controllers per directory was exceeded. \
-             The default limit per directory is {limit} domain controllers; {requested} \
-             were requested."
-        )),
+        crate::state::refusal(crate::state::domain_controllers_limit_exceeded(limit)),
     )
     .into()
 }

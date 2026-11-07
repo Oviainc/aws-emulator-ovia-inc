@@ -205,26 +205,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // enabled has not finished the transition its enable started, and one already
         // deactivated is in the state this request asks for. In each case the activity
         // asked for is limited by the status the setting carries, which is the modelled
-        // refusal for exactly that.
+        // refusal for exactly that, stated by this service's shared sentence for it: the
+        // status that refused the call is not disclosed.
         let current = directory
             .ldaps_settings
             .get(&input.r#type)
             .map(|setting| setting.status.clone());
         if current.as_deref() != Some(crate::state::LDAPS_STATUS_ENABLED) {
             return Err(DisableLDAPSErrorModeled::InvalidLDAPSStatusException(
-                crate::state::refusal(match current {
-                    Some(status) => format!(
-                        "Directory {id} LDAPS of type {ldaps_type} is {status}, not {enabled}",
-                        id = input.directory_id,
-                        ldaps_type = input.r#type,
-                        enabled = crate::state::LDAPS_STATUS_ENABLED
-                    ),
-                    None => format!(
-                        "Directory {id} has no LDAPS of type {ldaps_type} to disable",
-                        id = input.directory_id,
-                        ldaps_type = input.r#type
-                    ),
-                }),
+                crate::state::refusal(crate::state::invalid_ldaps_status(
+                    crate::state::LDAPS_ACTION_DISABLE,
+                )),
             )
             .into());
         }

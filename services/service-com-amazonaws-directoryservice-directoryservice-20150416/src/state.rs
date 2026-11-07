@@ -133,6 +133,16 @@ pub const SNAPSHOTTABLE_DIRECTORY_TYPES: [&str; 2] = [TYPE_SIMPLE_AD, "Microsoft
 /// The stage a created directory reaches once [`TRANSITION_SPAN`] has elapsed.
 pub const STAGE_ACTIVE: &str = "Active";
 
+/// The stage a directory that is in service but degraded reports: the `Impaired` value of
+/// the modelled `DirectoryStage` enum
+/// (`smithy_query(query="shape",shape="DirectoryStage")`).
+///
+/// Nothing in this emulator puts a directory in it — no path degrades a directory — but it
+/// is one of the two stages that SERVE a mutation whose subject is the directory's DNS
+/// configuration ([`CONDITIONAL_FORWARDER_SERVING_STAGES`]), so the guard names it rather
+/// than admitting `Active` alone.
+pub const STAGE_IMPAIRED: &str = "Impaired";
+
 /// The `DirectoryType` of a directory created by `CreateDirectory`: Simple AD.
 ///
 /// `CreateDirectory`'s own documentation ("Creates a Simple AD directory"), rendered
@@ -1876,6 +1886,18 @@ impl Directory {
             "http://{alias}{ACCESS_URL_SUFFIX}",
             alias = self.effective_alias()
         )
+    }
+
+    /// The DNS server that answers for this directory, as this emulator can name it.
+    ///
+    /// A directory's DNS is served by its domain controllers, whose addresses the VPC data
+    /// plane allocates — which this emulator does not have, and which is why
+    /// `DirectoryDescription$DnsIpAddrs` and `DomainController$DnsIpAddr` stay absent
+    /// rather than carrying invented ones. So where a diagnostic names the server that
+    /// answered for this directory's DNS, it is named by the DNS domain the directory
+    /// serves: stored state, and nothing invented.
+    pub fn dns_server(&self) -> &str {
+        &self.name
     }
 
     /// This directory's associations as the modelled `EventTopics` list, in topic-name
@@ -3623,6 +3645,152 @@ pub fn invalid_directory_ids(directory_ids: &[String]) -> String {
 /// cannot read one out of the message. [`refusal`] appends the request id, once.
 pub fn directory_unavailable(directory_id: &str) -> String {
     no_such_directory(directory_id)
+}
+
+/// The stages a mutation of a directory's conditional forwarders is served in.
+///
+/// Directory Service checks the directory's stage as a PARAMETER of such a call — it
+/// states which stages the operation needs rather than reporting the directory as
+/// unreachable — and the two it serves are [`STAGE_ACTIVE`] and [`STAGE_IMPAIRED`]: a
+/// degraded directory still answers for its own DNS configuration.
+pub const CONDITIONAL_FORWARDER_SERVING_STAGES: [&str; 2] = [STAGE_ACTIVE, STAGE_IMPAIRED];
+
+/// Why the directory in `stage` cannot serve a mutation of its conditional forwarders, or
+/// `None` when it can.
+///
+/// THE one guard the conditional-forwarder mutations (`CreateConditionalForwarder`,
+/// `UpdateConditionalForwarder`, `DeleteConditionalForwarder`) read the directory's stage
+/// through, so all three refuse a directory that is not in service the same way: with the
+/// modelled `InvalidParameterException` stating the mutation it could not perform, the
+/// directory the request named and the stages that mutation needs, which is what tells a
+/// caller to wait rather than to retry. It is NOT [`directory_unavailable`], the diagnostic
+/// of the family that reports a directory as unreachable. `action` is the operation's own
+/// verb ([`FORWARDER_ACTION_CREATE`] and its siblings). [`refusal`] appends the request id,
+/// once.
+pub fn conditional_forwarder_stage_defect(
+    action: &str,
+    directory_id: &str,
+    stage: &str,
+) -> Option<String> {
+    if CONDITIONAL_FORWARDER_SERVING_STAGES.contains(&stage) {
+        return None;
+    }
+    Some(format!(
+        "Could not {action} conditional forwarder as directory: {directory_id} is not in \
+         {required} state.",
+        required = CONDITIONAL_FORWARDER_SERVING_STAGES.join(" or ")
+    ))
+}
+
+/// The verb each conditional-forwarder mutation states in that refusal: the action it could
+/// not perform, as its own name says it.
+pub const FORWARDER_ACTION_CREATE: &str = "create";
+pub const FORWARDER_ACTION_UPDATE: &str = "update";
+pub const FORWARDER_ACTION_DELETE: &str = "delete";
+
+/// The `EntityAlreadyExistsException` message for a remote domain the directory already
+/// forwards.
+///
+/// Directory Service answers this refusal from the DNS server that was asked to host the
+/// zone, so the sentence names the zone the request asked for and the server that already
+/// hosts one for it, and then states the reason. The trailing space is part of the
+/// recorded diagnostic, which carries it before the suffix [`refusal`] appends.
+pub fn conditional_forwarder_zone_exists(remote_domain_name: &str, dns_server: &str) -> String {
+    format!(
+        "Failed to create zone {remote_domain_name} on server {dns_server}. A conditional \
+         forwarding zone already exists for that name. "
+    )
+}
+
+/// The `ClientException` message for IP address blocks the directory already routes.
+///
+/// Directory Service states this refusal as the set of routes that are already there,
+/// bracketed and comma-separated in the order the request listed them, and then tells the
+/// caller how to recreate them. The blocks are the request's own, so a caller can read the
+/// offending ones straight out of the message. [`refusal`] appends the request id, once.
+pub fn ip_routes_already_exist(blocks: &[String]) -> String {
+    format!(
+        "The IP route(s) [{blocks}] already exist. If you want to recreate them, please \
+         delete the existing routes first.",
+        blocks = blocks.join(", ")
+    )
+}
+
+/// The `DirectoryAlreadySharedException` message for a directory already shared with the
+/// consumer account the request names.
+///
+/// Directory Service states the pairing that already exists — the directory the request
+/// named and the account it asked to share with, under the capitalised spelling of
+/// `Account` — and NOTHING about the shared directory the earlier share minted: the
+/// consumer's handle on it is not disclosed by this refusal. [`refusal`] appends the
+/// request id, once.
+pub fn directory_already_shared(directory_id: &str, shared_account_id: &str) -> String {
+    format!("Directory {directory_id} is already shared with Account {shared_account_id}.")
+}
+
+/// The `DomainControllerLimitExceededException` message for a requested number of domain
+/// controllers past the per-directory ceiling.
+///
+/// FIXED text with one variable part, the ceiling ([`MAX_DOMAIN_CONTROLLERS_PER_DIRECTORY`]):
+/// Directory Service states the quota that was broken and not the number the request
+/// asked for. [`refusal`] appends the request id, once.
+pub fn domain_controllers_limit_exceeded(limit: usize) -> String {
+    format!(
+        "Domain controllers limit exceeded. A maximum of {limit} domain controllers may be \
+         requested."
+    )
+}
+
+/// The `NoAvailableCertificateException` message for enabling LDAPS on a directory holding
+/// no certificate that can secure its LDAP calls.
+///
+/// FIXED text: Directory Service states the condition and names neither the directory nor
+/// the certificate type, so one sentence serves every such refusal. [`refusal`] appends the
+/// request id, once.
+pub const NO_VALID_CERTIFICATE_AVAILABLE: &str =
+    "Cannot enable LDAPS since there is no valid certificate available.";
+
+/// The `InvalidLDAPSStatusException` message for an LDAPS toggle the status the setting
+/// carries does not admit.
+///
+/// FIXED text with one variable part, the action the call asked for
+/// ([`LDAPS_ACTION_ENABLE`] / [`LDAPS_ACTION_DISABLE`]): Directory Service states that the
+/// LDAPS status is not one the action can be performed from, and names neither the
+/// directory, nor the `LDAPSType`, nor the status itself — so a directory carrying no
+/// setting at all and one carrying a status the action cannot start from are refused with
+/// one sentence, worded like this family's other refusal
+/// ([`NO_VALID_CERTIFICATE_AVAILABLE`]). [`refusal`] appends the request id, once.
+pub fn invalid_ldaps_status(action: &str) -> String {
+    format!("Cannot {action} LDAPS for a directory in an invalid LDAPS status.")
+}
+
+/// The action each LDAPS toggle states in that refusal, as its own name says it.
+pub const LDAPS_ACTION_ENABLE: &str = "enable";
+pub const LDAPS_ACTION_DISABLE: &str = "disable";
+
+/// The `DirectoryInDesiredStateException` message for a toggle whose directory already has
+/// the setting the request asks for.
+///
+/// Directory Service states that the directory IS in the state that was asked for, naming
+/// the directory and nothing else: neither the setting nor the status it carries, so an
+/// enable and a disable of the same setting are refused with one sentence — which is what
+/// the error shape's own documentation describes ("The directory is already updated to
+/// desired update type settings"). [`refusal`] appends the request id, once.
+pub fn directory_in_desired_state(directory_id: &str) -> String {
+    format!("Directory {directory_id} is already in the desired state.")
+}
+
+/// The message an operation that takes `SnapshotIds` as a FILTER refuses an id no snapshot
+/// is stored under with.
+///
+/// The snapshot half of the filter-value family [`invalid_directory_id`] words for a
+/// directory id: an id that arrived as a filter over a listing is reported as a VALUE the
+/// listing cannot be narrowed by — unquoted, singular, closed by a period — rather than as
+/// an entity that does not exist, which is what the family that RESOLVES a snapshot
+/// ([`no_such_snapshot`], `DeleteSnapshot` and `RestoreFromSnapshot`) reports.
+/// [`refusal`] appends the request id, once.
+pub fn invalid_snapshot_id(snapshot_id: &str) -> String {
+    format!("Invalid snapshot ID: {snapshot_id}.")
 }
 
 /// The `DirectoryNotSharedException` message for a directory that is not shared with the

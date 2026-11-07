@@ -578,8 +578,10 @@ async fn an_update_against_a_directory_that_is_absent_or_not_in_service_is_refus
         );
     }
 
-    // A directory still being built by the transition its create owes is not in service,
-    // so a forwarder write against it is refused as unavailable...
+    // A directory still being built by the transition its create owes is not in a stage
+    // that serves its DNS configuration, so a forwarder write against it is refused as a
+    // parameter the call cannot be served with (see `tests/all/refusal_texts.rs`,
+    // which asserts the class and the sentence over the whole family)...
     let building =
         create_directory(&router, minimal_create("building.example.com"), "building").await;
     refused(
@@ -590,7 +592,7 @@ async fn an_update_against_a_directory_that_is_absent_or_not_in_service_is_refus
             "RemoteDomainName": domain,
             "DnsIpAddrs": ["10.0.0.3"],
         }),
-        "DirectoryUnavailableException",
+        "InvalidParameterException",
         "a directory still being built",
     )
     .await;

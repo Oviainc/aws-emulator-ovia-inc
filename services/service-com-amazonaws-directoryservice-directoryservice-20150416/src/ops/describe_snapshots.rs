@@ -227,11 +227,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Likewise for a `SnapshotIds` filter: an id naming no stored snapshot is
-        // reported rather than silently dropped from the page.
+        // reported rather than silently dropped from the page. The id arrived as a FILTER
+        // over the listing, so — like the `DirectoryId` above — the refusal reports the
+        // VALUE the listing cannot be narrowed by, which Directory Service answers as a
+        // parameter it would not accept rather than as an entity that does not exist: a
+        // snapshot id that resolved yesterday and was deleted since is no longer a usable
+        // filter value, while the directory the caller is reading is still there.
         if let Some(requested) = requested_ids.as_ref() {
             for snapshot_id in requested {
                 if !store.snapshots.contains_key(*snapshot_id) {
-                    return Err(entity_does_not_exist(crate::state::no_such_snapshot(
+                    return Err(invalid_parameter(crate::state::invalid_snapshot_id(
                         snapshot_id,
                     )));
                 }

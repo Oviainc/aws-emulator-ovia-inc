@@ -522,32 +522,37 @@ async fn absent_ids_and_foreign_tokens_are_refused_with_the_modelled_error() {
     let snapshot_id = create_snapshot(&router, &directory, Some("refusals_one"), "refusals").await;
     create_snapshot(&router, &other, Some("refusals_two"), "refusals").await;
 
-    // A well-formed id naming nothing stored is "the specified entity could not be
-    // found", whichever member carried it, and whether it is read or written through.
+    // A well-formed id naming nothing stored is reported rather than served as an empty
+    // page, under the family the member it arrived in belongs to: a `DirectoryId` the
+    // listing is narrowed by, or a snapshot id that is no longer a usable filter value.
     let not_found = vec![
         (
             "DescribeSnapshots with an absent DirectoryId",
             "DescribeSnapshots",
             json!({ "DirectoryId": ABSENT_DIRECTORY_ID }),
+            "EntityDoesNotExistException",
         ),
         (
             "DescribeSnapshots with an absent SnapshotId",
             "DescribeSnapshots",
             json!({ "SnapshotIds": [ABSENT_SNAPSHOT_ID] }),
+            "InvalidParameterException",
         ),
         (
             "DescribeSnapshots with one present and one absent SnapshotId",
             "DescribeSnapshots",
             json!({ "SnapshotIds": [&snapshot_id, ABSENT_SNAPSHOT_ID] }),
+            "InvalidParameterException",
         ),
         (
             "CreateSnapshot of an absent directory",
             "CreateSnapshot",
             json!({ "DirectoryId": ABSENT_DIRECTORY_ID }),
+            "EntityDoesNotExistException",
         ),
     ];
-    for (case, operation, body) in not_found {
-        refused(&router, operation, body, "EntityDoesNotExistException", case).await;
+    for (case, operation, body, expected) in not_found {
+        refused(&router, operation, body, expected, case).await;
     }
 
     // A token this service did not issue for THIS listing is not a page of it: a token
@@ -634,7 +639,7 @@ async fn deleting_a_directory_deletes_the_snapshots_taken_of_it() {
             &router,
             "DescribeSnapshots",
             json!({ "SnapshotIds": [id] }),
-            "EntityDoesNotExistException",
+            "InvalidParameterException",
             "a snapshot of a deleted directory",
         )
         .await;
@@ -671,7 +676,7 @@ async fn an_oversized_snapshot_id_filter_is_refused() {
         &router,
         "DescribeSnapshots",
         json!({ "SnapshotIds": at_bound }),
-        "EntityDoesNotExistException",
+        "InvalidParameterException",
         "SnapshotIds at the guard",
     )
     .await;

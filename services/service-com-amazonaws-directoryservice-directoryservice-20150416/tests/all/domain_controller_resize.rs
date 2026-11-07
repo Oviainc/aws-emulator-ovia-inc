@@ -239,16 +239,17 @@ async fn a_desired_number_past_the_per_directory_quota_is_refused_and_changes_no
             "case {name:?}: expected DomainControllerLimitExceededException, got {parsed}"
         );
 
-        // The message states the error class's own sentence, with the quota and the
-        // number the request asked for filled in, and carries the modelled `RequestId`.
+        // The message states the quota that was broken, in Directory Service's own
+        // wording, and carries the modelled `RequestId`. The number the request asked for
+        // is NOT part of it: the refusal states the ceiling, not the request.
         let message = parsed["Message"].as_str().unwrap_or_default();
         assert!(
-            message.contains(
-                "The maximum allowed number of domain controllers per directory was exceeded."
-            ) && message.contains(&format!("{DOMAIN_CONTROLLER_QUOTA} domain controllers"))
-                && message.contains(&desired.to_string()),
-            "case {name:?}: expected the limit-exceeded wording naming {DOMAIN_CONTROLLER_QUOTA} \
-             and {desired}, got {parsed}"
+            message.starts_with(&format!(
+                "Domain controllers limit exceeded. A maximum of {DOMAIN_CONTROLLER_QUOTA} \
+                 domain controllers may be requested."
+            )),
+            "case {name:?}: expected the limit-exceeded wording naming {DOMAIN_CONTROLLER_QUOTA}, \
+             got {parsed}"
         );
         assert!(
             parsed["RequestId"].is_string(),

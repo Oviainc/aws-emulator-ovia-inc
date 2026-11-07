@@ -218,17 +218,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // transition an earlier enable started — is in the state this request asks for,
         // so the enable is refused rather than silently restarting that transition. The
         // LDAP activities this request asks for are limited by the status the setting
-        // already carries, which is the modelled refusal for exactly that.
+        // already carries, which is the modelled refusal for exactly that, stated by this
+        // service's shared sentence for it.
         if let Some(existing) = directory.ldaps_settings.get(&input.r#type) {
             if existing.status == crate::state::LDAPS_STATUS_ENABLING
                 || existing.status == crate::state::LDAPS_STATUS_ENABLED
             {
                 return Err(EnableLDAPSErrorModeled::InvalidLDAPSStatusException(
-                    crate::state::refusal(format!(
-                        "Directory {id} LDAPS of type {ldaps_type} is already {status}",
-                        id = input.directory_id,
-                        ldaps_type = input.r#type,
-                        status = existing.status
+                    crate::state::refusal(crate::state::invalid_ldaps_status(
+                        crate::state::LDAPS_ACTION_ENABLE,
                     )),
                 )
                 .into());
@@ -237,17 +235,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The switch is served by a certificate the directory holds: without one in
         // service there is nothing to secure the LDAP calls with, which is the modelled
-        // refusal whose own documentation reads "at least one valid certificate must be
-        // registered in the system". A registration still being made does not count —
-        // it is in service only once the transition its register owes falls due.
+        // refusal for exactly that, worded by this service's shared sentence for it. A
+        // registration still being made does not count — it is in service only once the
+        // transition its register owes falls due.
         if !directory.has_certificate_in_service(crate::state::CERTIFICATE_TYPE_CLIENT_LDAPS) {
             return Err(EnableLDAPSErrorModeled::NoAvailableCertificateException(
-                crate::state::refusal(format!(
-                    "LDAPS cannot be enabled for directory {id} because at least one valid \
-                     {certificate_type} certificate must be registered in the system",
-                    id = input.directory_id,
-                    certificate_type = crate::state::CERTIFICATE_TYPE_CLIENT_LDAPS
-                )),
+                crate::state::refusal(crate::state::NO_VALID_CERTIFICATE_AVAILABLE),
             )
             .into());
         }

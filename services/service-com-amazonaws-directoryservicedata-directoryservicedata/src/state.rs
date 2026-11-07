@@ -32,7 +32,9 @@ mod builtin_groups;
 
 use sha2::Digest;
 
-use crate::ops::types::{AttributeValue, Member, ResourceNotFoundException, ValidationException};
+use crate::ops::types::{
+    AttributeValue, ConflictException, Member, ResourceNotFoundException, ValidationException,
+};
 
 /// The Kerberos realm (AD domain name) the emulator's directories are created in.
 ///
@@ -970,6 +972,40 @@ pub fn membership_not_found(
     ResourceNotFoundException {
         message: Some(format!(
             "member {member_name} is not a member of group {group_name} in directory {directory_id}"
+        )),
+    }
+}
+
+/// The `ConflictException` payload for a create whose `SAMAccountName` already names a
+/// user of the directory.
+///
+/// Directory Service Data states this refusal as the CLASS of object that already exists
+/// and the directory it exists in, and quotes no name: a caller tells a duplicate user
+/// from any other conflict of the same call (a spent idempotency token, a membership
+/// conflict) by that class, so the two creates of this API word it with
+/// [`object_already_exists`] rather than each re-wording it.
+pub fn user_already_exists(directory_id: &str) -> ConflictException {
+    object_already_exists(OBJECT_CLASS_USER, directory_id)
+}
+
+/// The same refusal for a create whose `SAMAccountName` already names a group of the
+/// directory.
+pub fn group_already_exists(directory_id: &str) -> ConflictException {
+    object_already_exists(OBJECT_CLASS_GROUP, directory_id)
+}
+
+/// The object class `CreateUser` reports in that refusal.
+const OBJECT_CLASS_USER: &str = "User";
+
+/// The object class `CreateGroup` reports in it.
+const OBJECT_CLASS_GROUP: &str = "Group";
+
+/// The sentence both creates state: the class of object that already exists, then the
+/// directory it already exists in.
+fn object_already_exists(object_class: &str, directory_id: &str) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "{object_class} already exists in directory {directory_id}."
         )),
     }
 }

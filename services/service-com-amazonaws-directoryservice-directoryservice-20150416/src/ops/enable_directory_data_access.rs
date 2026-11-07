@@ -203,16 +203,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A directory already enabled — or already on its way there under the
         // transition an earlier enable started — is in the state this request asks for,
-        // so the enable is refused rather than silently restarting that transition.
+        // so the enable is refused rather than silently restarting that transition. The
+        // diagnostic is this service's shared sentence for a toggle whose directory is
+        // already in the desired state.
         if directory.data_access_status == crate::state::DATA_ACCESS_ENABLED
             || directory.data_access_status == crate::state::DATA_ACCESS_ENABLING
         {
             return Err(
                 EnableDirectoryDataAccessErrorModeled::DirectoryInDesiredStateException(
-                    crate::state::refusal(format!(
-                        "Directory {id} data access is already {status}",
-                        id = directory.directory_id,
-                        status = directory.data_access_status
+                    crate::state::refusal(crate::state::directory_in_desired_state(
+                        &directory.directory_id,
                     )),
                 )
                 .into(),

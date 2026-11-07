@@ -420,7 +420,7 @@ async fn a_block_the_directory_already_routes_is_refused_and_changes_nothing() {
             &router,
             "AddIpRoutes",
             json!({ "DirectoryId": id, "IpRoutes": routes }),
-            "EntityAlreadyExistsException",
+            "ClientException",
             case,
         )
         .await;

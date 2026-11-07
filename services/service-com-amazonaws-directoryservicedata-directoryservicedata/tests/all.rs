@@ -10,6 +10,9 @@
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
 
+#[path = "all/create_conflict_wording.rs"]
+mod create_conflict_wording;
+
 #[path = "all/directory_authorization.rs"]
 mod directory_authorization;
 

@@ -431,9 +431,10 @@ async fn a_delete_against_a_directory_that_is_absent_or_not_in_service_is_refuse
         );
     }
 
-    // A directory still being built by the transition its create owes is not in service,
-    // so a forwarder write against it is refused as unavailable — and the forwarder it
-    // already holds stays stored.
+    // A directory still being built by the transition its create owes is not in a stage
+    // that serves its DNS configuration, so a forwarder write against it is refused as a
+    // parameter the call cannot be served with (see `tests/all/refusal_texts.rs`)
+    // — and the forwarder it already holds stays stored.
     let fresh = active_directory(&router, "fresh.example.com", "not in service").await;
     let domain = "remote.example.com";
     ok(
@@ -449,7 +450,7 @@ async fn a_delete_against_a_directory_that_is_absent_or_not_in_service_is_refuse
         &router,
         "DeleteConditionalForwarder",
         json!({ "DirectoryId": &building, "RemoteDomainName": domain }),
-        "DirectoryUnavailableException",
+        "InvalidParameterException",
         "a directory still being built",
     )
     .await;
