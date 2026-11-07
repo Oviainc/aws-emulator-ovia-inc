@@ -234,24 +234,20 @@ async fn get_attribute_values_returns_the_distinct_values_of_the_attribute() {
         }
     }
 
-    // An unknown service, and an attribute the service does not publish: AttributeName
-    // and ServiceCode are both REQUIRED members here, not filters.
-    err(
-        &router,
-        "GetAttributeValues",
-        &json!({ "ServiceCode": "NoSuchService", "AttributeName": "instanceType" }),
-        400,
-        "NotFoundException",
-    )
-    .await;
-    err(
-        &router,
-        "GetAttributeValues",
-        &json!({ "ServiceCode": "AmazonEC2", "AttributeName": "noSuchAttribute" }),
-        400,
-        "NotFoundException",
-    )
-    .await;
+    // An unknown service, and an attribute the service does not publish: both SELECT no
+    // value, which is an empty list rather than a refusal (see
+    // `a_selection_that_matches_nothing_is_an_empty_page`).
+    for body in [
+        json!({ "ServiceCode": "NoSuchService", "AttributeName": "instanceType" }),
+        json!({ "ServiceCode": "AmazonEC2", "AttributeName": "noSuchAttribute" }),
+    ] {
+        let response = ok(&router, "GetAttributeValues", &body).await;
+        let actual = attribute_values(&response);
+        assert!(
+            actual.is_empty(),
+            "case {body}: expected no values, got {actual:?}"
+        );
+    }
 }
 
 /// Whether `document` satisfies the filter, by the comparison the `FilterType` member
@@ -382,15 +378,18 @@ async fn get_products_applies_every_filter_type() {
         "case two filters: expected {expected:?}, got {both:?}"
     );
 
-    // ServiceCode is a REQUIRED member of GetProducts, not a filter.
-    err(
+    // A ServiceCode the catalog publishes no offers for selects no product, which is an
+    // empty PriceList rather than a refusal.
+    let unknown = ok(
         &router,
         "GetProducts",
         &json!({ "ServiceCode": "NoSuchService" }),
-        400,
-        "NotFoundException",
     )
     .await;
+    assert!(
+        list_member(&unknown, "PriceList").is_empty(),
+        "case an unknown ServiceCode: expected an empty PriceList, got {unknown}"
+    );
     err(
         &router,
         "GetProducts",
@@ -710,9 +709,9 @@ async fn list_price_lists_selects_by_service_currency_region_and_effective_date(
         }
     }
 
-    // ServiceCode is a REQUIRED member here, so a code the catalog does not hold names
-    // no resource.
-    err(
+    // A code the catalog publishes no price lists for selects no record, which is an
+    // empty PriceLists list rather than a refusal.
+    let unknown = ok(
         &router,
         "ListPriceLists",
         &json!({
@@ -720,10 +719,12 @@ async fn list_price_lists_selects_by_service_currency_region_and_effective_date(
             "CurrencyCode": "USD",
             "EffectiveDate": JAN_1_2024,
         }),
-        400,
-        "NotFoundException",
     )
     .await;
+    assert!(
+        list_member(&unknown, "PriceLists").is_empty(),
+        "case an unknown ServiceCode: expected an empty PriceLists, got {unknown}"
+    );
 }
 
 /// The currencies every `pricePerUnit` in a price-list file is keyed by.

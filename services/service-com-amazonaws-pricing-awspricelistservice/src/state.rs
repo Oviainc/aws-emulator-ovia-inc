@@ -142,11 +142,6 @@ impl ServiceCatalog {
         }
     }
 
-    /// Whether this service publishes `attribute_name`.
-    pub fn has_attribute(&self, attribute_name: &str) -> bool {
-        self.attribute_names.iter().any(|name| name == attribute_name)
-    }
-
     /// The distinct values `attribute_name` takes across this service's products,
     /// in sorted order. Derived on read — never stored a second time.
     pub fn attribute_values(&self, attribute_name: &str) -> Vec<String> {

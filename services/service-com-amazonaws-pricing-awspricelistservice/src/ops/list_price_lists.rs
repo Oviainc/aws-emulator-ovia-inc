@@ -201,13 +201,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if state.catalog(&input.service_code).is_none() {
-            return Err(ListPriceListsErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("service code '{}' not found", input.service_code)),
-            })
-            .into());
-        }
-
+        // `ServiceCode`, `RegionCode` and `EffectiveDate` SELECT which stored price-list
+        // records the listing reports; none of them names a resource this operation
+        // resolves. So a service code the catalog publishes no price lists for selects no
+        // record and the answer is a successful empty `PriceLists` list, the same as a
+        // Region or an instant no record covers. The not-found errors this operation
+        // models stay reserved for a request that names one resource to resolve.
         // A price list is in effect at the requested instant when it took effect on or
         // before it; a RegionCode, when given, narrows the list to that Region.
         let effective_at = input.effective_date.secs();

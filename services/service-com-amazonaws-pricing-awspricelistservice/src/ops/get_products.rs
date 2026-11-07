@@ -182,12 +182,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let Some(catalog) = state.catalog(&input.service_code) else {
-            return Err(GetProductsErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("service code '{}' not found", input.service_code)),
-            })
-            .into());
-        };
+        // `ServiceCode` SELECTS which products the filters run over; it does not name a
+        // resource this operation resolves. The operation "returns a list of all products
+        // that match the filter criteria", so a code the catalog publishes no offers for
+        // selects no product and the answer is a successful empty `PriceList`, exactly
+        // like a filter that matches nothing. `NotFoundException` stays reserved for a
+        // request that names one resource the service must resolve, which this operation
+        // has none of.
+        let catalog = state.catalog(&input.service_code);
 
         let filters = input.filters.as_deref().unwrap_or_default();
         // The model declares `Filter.Type` as an enum, so the framework's constraint
@@ -212,14 +214,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A product is returned only when it satisfies EVERY filter, each matched
         // against the product's own stored attributes.
         let matched: Vec<&crate::state::Product> = catalog
-            .products
-            .iter()
-            .filter(|product| {
-                filters
+            .map(|catalog| {
+                catalog
+                    .products
                     .iter()
-                    .all(|filter| filter_matches(filter, catalog, product))
+                    .filter(|product| {
+                        filters
+                            .iter()
+                            .all(|filter| filter_matches(filter, catalog, product))
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
         // The token is bound to this exact query, filters included, so a token minted
         // for one filter set cannot page through another.

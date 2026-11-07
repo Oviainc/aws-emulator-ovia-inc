@@ -167,34 +167,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let state = state.lock();
 
-        let Some(catalog) = state.catalog(&input.service_code) else {
-            return Err(GetAttributeValuesErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(format!(
-                        "service code '{}' not found",
-                        input.service_code
-                    )),
-                },
-            )
-            .into());
-        };
-        // Only an attribute the service publishes — the same list DescribeServices
-        // reports in AttributeNames — has values to return.
-        if !catalog.has_attribute(&input.attribute_name) {
-            return Err(GetAttributeValuesErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(format!(
-                        "attribute '{}' is not available for service code '{}'",
-                        input.attribute_name, input.service_code
-                    )),
-                },
-            )
-            .into());
-        }
-
+        // `ServiceCode` and `AttributeName` SELECT the values to return rather than
+        // naming a resource this operation resolves, so a pair that selects nothing — a
+        // service the catalog publishes no offers for, or an attribute none of its
+        // products carries — is a successful empty `AttributeValues` list, not a refusal.
         // Derived from the products themselves, so these are exactly the values the
         // documents GetProducts returns carry for the attribute.
-        let values = catalog.attribute_values(&input.attribute_name);
+        let values = state
+            .catalog(&input.service_code)
+            .map(|catalog| catalog.attribute_values(&input.attribute_name))
+            .unwrap_or_default();
 
         let fingerprint = crate::state::query_fingerprint(&[
             Self::NAME,
