@@ -51,8 +51,7 @@
 //! `CreateTable` answers a table whose `TableStatus` is `CREATING` — "You can perform read
 //! and write operations only on an ACTIVE table" — but the table EXISTS from that moment, so
 //! the resource's creation is not held open on it ([`readiness`]): that span is DynamoDB's
-//! own transition, exactly as the `Pending` an `AWS::Lambda::Function` is reported created
-//! during is AWS Lambda's and the `creating` of an `AWS::RDS::DBInstance` is Amazon RDS's.
+//! own transition, exactly as the `creating` of an `AWS::RDS::DBInstance` is Amazon RDS's.
 //! What DOES hold the resource open is a declared SETTING that service has not put into
 //! force yet: the declaration is not applied while it is still being applied, so a client
 //! that reads the setting back the instant the stack completes is answered what the template
@@ -254,8 +253,8 @@ pub(super) async fn create(
 /// enabled is already registered under the ARN the create answered — and the `CREATING`
 /// window its own `TableStatus` reports ("You can perform read and write operations only on
 /// an ACTIVE table") is DynamoDB's own transition, not a resource that has yet to come into
-/// being. It is the case [`super::lambda_function::readiness`] states for a function and an
-/// `AWS::RDS::DBInstance` for a database.
+/// being. It is the case an `AWS::RDS::DBInstance` states for a database: the resource the
+/// create answered exists and takes the calls made on it.
 ///
 /// What IS waited for is a SETTING the DECLARATION asked for that this arm applied through a
 /// call of its own ([`settings`]): until that service's own read reports the setting in

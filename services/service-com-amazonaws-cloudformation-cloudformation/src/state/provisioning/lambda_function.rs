@@ -29,11 +29,12 @@
 //! `FunctionName` and the function a client then calls `GetFunction` with is the one the
 //! stack publishes.
 //!
-//! `CreateFunction` answers a function whose `State` is `Pending` — "During this time, you
-//! can't invoke or modify the function" — but the function EXISTS from that moment, so the
-//! resource's creation is not held open on it ([`readiness`]): that span is AWS Lambda's own
-//! transition, exactly as the `creating` an `AWS::RDS::DBInstance` is reported created
-//! during is Amazon RDS's.
+//! `CreateFunction` answers a function whose `State` is `Pending`, and in that window AWS
+//! Lambda refuses every call made on it — "During this time, you can't invoke or modify the
+//! function" — so the create does not answer until that service's own read reports the
+//! function out of it ([`await_settled`]). A client that reads the stack as complete, and
+//! another service that delivers to the function the moment it does, find a function AWS
+//! Lambda takes calls on rather than one it refuses every call on.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -70,9 +71,9 @@ const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValueException";
 const ROLE_PROPERTY: &str = "Role";
 
 /// The `State` member Lambda reports a function's lifecycle in: `Pending` while it is
-/// provisioning the function, `Active` once it can be invoked. Read by [`removal`], which
-/// reports it as the state the function is still being removed in; the resource's creation
-/// does not wait on it ([`readiness`]).
+/// provisioning the function, `Active` once it can be invoked. Read by [`await_settled`],
+/// which is what holds a create and a change open while it is `Pending`, and by [`removal`],
+/// which reports it as the state the function is still being removed in.
 const STATE_MEMBER: &str = "State";
 
 /// The member Lambda reports the progress of the LAST modification of a function in, beside
@@ -86,7 +87,7 @@ const LAST_UPDATE_STATUS_MEMBER: &str = "LastUpdateStatus";
 const STATE_PENDING: &str = "Pending";
 const LAST_UPDATE_STATUS_IN_PROGRESS: &str = "InProgress";
 
-/// How long [`await_modifiable`] waits between asking Lambda whether the function is out of
+/// How long [`await_settled`] waits between asking Lambda whether the function is out of
 /// those windows, and how many times it asks.
 ///
 /// The interval is short enough that a settled function is noticed about as soon as it
@@ -96,8 +97,8 @@ const LAST_UPDATE_STATUS_IN_PROGRESS: &str = "InProgress";
 /// failure of its own: what fails then is the call that needed the function modifiable,
 /// reported as Lambda's own refusal of it, so a function genuinely stuck fails the resource
 /// rather than holding the deployment open.
-const MODIFIABLE_CHECK_INTERVAL: Duration = Duration::from_millis(25);
-const MODIFIABLE_CHECKS: usize = 80;
+const SETTLE_CHECK_INTERVAL: Duration = Duration::from_millis(25);
+const SETTLE_CHECKS: usize = 80;
 
 /// Every property `AWS::Lambda::Function` publishes. A declared property this list does not
 /// carry is REFUSED rather than dropped, so a function is never reported created with less
@@ -230,6 +231,12 @@ pub(super) async fn create(
         return Err(refusal);
     }
 
+    // `CreateFunction` answers the function `Pending`, and in that window AWS Lambda refuses
+    // every call made on it: a resource reported created then is one its own service refuses
+    // to invoke, so the create does not answer until that service reports the function out of
+    // the window ([`await_settled`]).
+    await_settled(ctx, region, &name).await;
+
     let mut attributes = BTreeMap::new();
     if let Some(arn) = reported_text(&answered, "FunctionArn") {
         attributes.insert("Arn".to_string(), arn);
@@ -239,13 +246,10 @@ pub(super) async fn create(
 
 /// Whether Lambda reports the function this create made ready to be invoked.
 ///
-/// Nothing is asked, and nothing waits: the function EXISTS from the moment
-/// `CreateFunction` answers — `GetFunction` resolves it, every configuration call takes it
-/// — and the `Pending` window its own `State` reports ("During this time, you can't invoke
-/// or modify the function") is AWS Lambda's own transition, not a resource that has yet to
-/// come into being. It is the case an `AWS::RDS::DBInstance` already states: the database
-/// is reported created while Amazon RDS still has it `creating`, because the resource the
-/// create answered exists and takes the calls made on it.
+/// Nothing is asked here, because nothing is left to wait for: the create does not answer
+/// until that service's own read reports the function out of the `Pending` window
+/// ([`await_settled`]), so a resource this arm reports created is one AWS Lambda already
+/// takes calls on.
 pub(super) fn readiness() -> Readiness {
     Readiness::Ready
 }
@@ -275,8 +279,8 @@ pub(super) async fn update(
 
     // Each of the calls below modifies the SAME function, and Lambda refuses a modification
     // while the one before it is still being applied, so each is made only once that service
-    // reports the function out of that window ([`await_modifiable`]).
-    await_modifiable(ctx, region, &name).await;
+    // reports the function out of that window ([`await_settled`]).
+    await_settled(ctx, region, &name).await;
 
     let mut configuration = Map::new();
     for member in CREATE_MEMBERS {
@@ -312,7 +316,7 @@ pub(super) async fn update(
     if let Some(architectures) = declared_in(declared, "Architectures") {
         code.insert("Architectures".to_string(), architectures.clone());
     }
-    await_modifiable(ctx, region, &name).await;
+    await_settled(ctx, region, &name).await;
     call_rest_json(
         ctx,
         LAMBDA_SIGNING_NAME,
@@ -322,8 +326,13 @@ pub(super) async fn update(
         Some(&Value::Object(code)),
     )
     .await?;
-    await_modifiable(ctx, region, &name).await;
+    await_settled(ctx, region, &name).await;
     configure(ctx, region, &asked, &name).await?;
+
+    // The modification AWS Lambda last accepted is still being applied when it answers, and
+    // the same rule holds for a change as for a create: a resource the stack reports updated
+    // is one that service takes the next call on ([`await_settled`]).
+    await_settled(ctx, region, &name).await;
 
     let mut attributes = BTreeMap::new();
     if let Some(arn) = reported_text(&answered, "FunctionArn") {
@@ -583,27 +592,32 @@ async fn configure(
     Ok(())
 }
 
-/// Wait until Lambda reports the function MODIFIABLE — neither still being provisioned
+/// Wait until Lambda reports the function SETTLED — neither still being provisioned
 /// (`State` `Pending`) nor still applying the modification before this one
-/// (`LastUpdateStatus` `InProgress`) — which is what the next call on it needs.
+/// (`LastUpdateStatus` `InProgress`) — which is the state the function both takes the next
+/// call of this deployment in and serves a client's own calls in.
 ///
-/// Applying a changed declaration takes SEVERAL calls on one function
+/// Two things need it. Applying a changed declaration takes SEVERAL calls on one function
 /// (`UpdateFunctionConfiguration`, then `UpdateFunctionCode`, then the properties that are
 /// calls of their own), and Lambda refuses each of them inside the window the one before it
-/// opened. A deployment that makes the next call regardless fails the resource on that
-/// refusal, so the stack reports a resource it was perfectly able to update as failed — hence
-/// this wait, exactly as the proxy and stream arms of [`super::super::provisioner`] wait for
-/// the state the next call needs.
+/// opened; a deployment that makes the next call regardless fails the resource on that
+/// refusal, so the stack reports a resource it was perfectly able to update as failed. And a
+/// CREATE answers the function `Pending`, a state in which "you can't invoke or modify the
+/// function": a resource reported created then is one whose own service refuses every call
+/// made on it, so the client that reads the stack as complete — and the service that delivers
+/// to the function the moment it does — would be refused. Both are the same wait, exactly as
+/// the proxy and stream arms of [`super::super::provisioner`] wait for the state the next
+/// call needs.
 ///
-/// Returns as soon as the function is modifiable, and gives up after [`MODIFIABLE_CHECKS`]
+/// Returns as soon as the function is settled, and gives up after [`SETTLE_CHECKS`]
 /// checks. A refusal of the READ ends the wait the same way: it says nothing about whether
-/// the function is modifiable, and the call that follows is what reports Lambda's answer.
-async fn await_modifiable(
+/// the function is settled, and the call that follows is what reports Lambda's answer.
+async fn await_settled(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     name: &str,
 ) {
-    for _ in 0..MODIFIABLE_CHECKS {
+    for _ in 0..SETTLE_CHECKS {
         let Ok(answered) = call_rest_json(
             ctx,
             LAMBDA_SIGNING_NAME,
@@ -623,7 +637,7 @@ async fn await_modifiable(
         if !provisioning && !updating {
             return;
         }
-        ::tokio::time::sleep(MODIFIABLE_CHECK_INTERVAL).await;
+        ::tokio::time::sleep(SETTLE_CHECK_INTERVAL).await;
     }
 }
 

@@ -27,7 +27,6 @@ mod directory_data_plane_authorization;
 #[path = "all/ds_log_subscription_forwarding.rs"]
 mod ds_log_subscription_forwarding;
 // appended tail and the sorted `k…` span are both regions concurrently landing suites add
-// their line to.
 #[path = "all/kinesisvideo_discovered_data_plane.rs"]
 mod kinesisvideo_discovered_data_plane;
 // Declared here, in this same head region, for the reason the entry above records.
@@ -35,12 +34,10 @@ mod kinesisvideo_discovered_data_plane;
 mod cloudformation_ec2_cdk_vpc_estate;
 #[path = "all/greengrass_deployment_iot_job.rs"]
 mod greengrass_deployment_iot_job;
-// Declared here, in this same head region, for the reason the entry above records: the
 // appended tail and the sorted `c…` span (where every cloudformation suite lands) are both
 // regions concurrently landing suites add their line to.
 #[path = "all/cloudformation_sam_function_writes_its_table.rs"]
 mod cloudformation_sam_function_writes_its_table;
-// Declared here, in this same head region, for the reason the entry above records.
 // What S3's two address forms — path-style and virtual-hosted — mean to the router, which is
 // the rule every cross-service suite that stages an S3 object addresses its setup calls by.
 #[path = "all/s3_address_forms.rs"]
@@ -50,15 +47,12 @@ mod cloudformation_refuses_s3vectors_vector_buckets;
 // Declared here, in this same head region, for the reason the entries above record.
 #[path = "all/cloudfront_oac_kms_s3_origin_edge.rs"]
 mod cloudfront_oac_kms_s3_origin_edge;
-// Declared here, in this same head region, for the reason the entry above records: the
 // appended tail and the sorted `a…` span (where the other apigateway suites land) are both
-// regions concurrently landing suites add their line to.
 #[path = "all/apigateway_cognito_user_pools_authorizer.rs"]
 mod apigateway_cognito_user_pools_authorizer;
 #[path = "all/apigateway_iam_authorized_invoke.rs"]
 mod apigateway_iam_authorized_invoke;
 // appended tail and the sorted `e…` span are both regions concurrently landing suites add
-// their line to.
 #[path = "all/ebs_start_snapshot_resolves_its_kms_key.rs"]
 mod ebs_start_snapshot_resolves_its_kms_key;
 // appended tail and the sorted `s…` span (where every sqs suite lands) are both regions
@@ -518,13 +512,10 @@ mod sfn_task_target_authorization;
 // Declared beside the other Step Functions suites, for the reason the lines above give.
 #[path = "all/sfn_lambda_task_invocation.rs"]
 mod sfn_lambda_task_invocation;
-// Declared beside the other Step Functions suites, for the reason the lines above give.
 #[path = "all/sfn_integration_error_names.rs"]
 mod sfn_integration_error_names;
-// Declared beside the other Step Functions suites, for the reason the lines above give.
 #[path = "all/sfn_parallel_branch_cancellation.rs"]
 mod sfn_parallel_branch_cancellation;
-// Declared beside the other Step Functions suites, for the reason the lines above give.
 #[path = "all/cloudformation_sfn_fifo_queue_stack.rs"]
 mod cloudformation_sfn_fifo_queue_stack;
 // Declared HERE, in the sorted list at its own name, rather than at the head or the tail
@@ -541,7 +532,6 @@ mod sagemaker_feature_store_control_plane_handoff;
 // end of this file, for the same reason the line above gives.
 #[path = "all/sagemaker_feature_store_group_deletion.rs"]
 mod sagemaker_feature_store_group_deletion;
-// Declared beside the hand-off suite whose harness it drives, rather than appended at the
 // end of this file, for the same reason the two lines above give.
 #[path = "all/sagemaker_feature_store_default_ttl.rs"]
 mod sagemaker_feature_store_default_ttl;
@@ -683,9 +673,6 @@ mod logs_emf_declared_projections;
 // reason those entries record: the appended tail at the end of this file and the head of the
 #[path = "all/logs_export_task_destination_bucket.rs"]
 mod logs_export_task_destination_bucket;
-// Declared HERE, beside the sibling `logs_*` suites in the same quiet `n`/`o` gap, for the
-// reason those entries record: the appended tail at the end of this file and the head of the
-// list are both regions every concurrently landing router suite puts its line in.
 #[path = "all/logs_subscription_delivery_role.rs"]
 mod logs_subscription_delivery_role;
 #[path = "all/partnercentral_channel_target_routing.rs"]
@@ -929,3 +916,5 @@ mod apigateway_account_cloudwatch_role;
 mod zz_probe_whole_emulator;
 #[path = "all/cloudformation_provisions_cognito_identity_pools.rs"]
 mod cloudformation_provisions_cognito_identity_pools;
+#[path = "all/sns_lambda_cdk_subscription_delivery.rs"]
+mod sns_lambda_cdk_subscription_delivery;
