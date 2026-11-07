@@ -146,7 +146,10 @@ pub(crate) async fn iam(
 }
 
 /// The text of the first `<tag>` element of an XML body.
-fn element(body: &str, tag: &str) -> String {
+///
+/// `pub(crate)` because every suite that reads a value back out of an IAM answer reads it
+/// this one way (`tests/all/invoke_authorization.rs`).
+pub(crate) fn element(body: &str, tag: &str) -> String {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = body

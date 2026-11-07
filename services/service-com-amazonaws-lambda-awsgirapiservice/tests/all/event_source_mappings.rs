@@ -227,19 +227,49 @@ pub(crate) fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRou
     router
 }
 
-/// Dispatch one JSON request.
+/// Dispatch one JSON request, signed with the credential this harness publishes — a key no
+/// store holds, which is the account's own published credential.
 pub(crate) async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: &Value) -> Answer {
+    call_signed_by(router, None, method, uri, body, &[]).await
+}
+
+/// Dispatch one JSON request signed with the access key id `access_key_id` names, so the
+/// request speaks for whichever principal holds that key — `None` is this harness's own
+/// credential ([`call`]) — carrying the headers `headers` names beside the standing ones.
+///
+/// Which principal a request speaks for is what an authorization decision is made about, so
+/// a suite that drives one signs each row for itself: this is the one place the credential a
+/// test request presents is chosen.
+pub(crate) async fn call_signed_by(
+    router: &MultiServiceRouter,
+    access_key_id: Option<&str>,
+    method: &str,
+    uri: &str,
+    body: &Value,
+    headers: &[(&str, &str)],
+) -> Answer {
     let payload = if body.is_null() {
         Vec::new()
     } else {
         serde_json::to_vec(body).expect("the test request body must serialize")
     };
-    let request = http::Request::builder()
+    let authorization = match access_key_id {
+        None => AUTHORIZATION.to_string(),
+        Some(key) => format!(
+            "AWS4-HMAC-SHA256 Credential={key}/20260101/{REGION}/lambda/aws4_request, \
+             SignedHeaders=host, Signature=not-verified"
+        ),
+    };
+    let mut builder = http::Request::builder()
         .method(method)
         .uri(format!("http://lambda.us-east-1.amazonaws.com{uri}"))
         .header("host", "lambda.us-east-1.amazonaws.com")
-        .header("authorization", AUTHORIZATION)
-        .header("content-type", "application/json")
+        .header("authorization", authorization)
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder
         .body(bytes::Bytes::from(payload))
         .expect("the test request must build");
     let response = router.dispatch(request).await;
