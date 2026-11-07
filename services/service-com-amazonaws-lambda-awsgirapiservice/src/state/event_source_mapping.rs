@@ -229,16 +229,44 @@ pub fn event_source_vendor(event_source_arn: &str) -> Option<&str> {
     service_common::arn::vendor(event_source_arn)
 }
 
+/// Which of the SHARD sources an event source ARN's vendor field names — the kind of
+/// source whose records sit in shards, read from a position the mapping carries.
+///
+/// The two of them are the pair the model names together wherever it scopes a member to
+/// them: `ParallelizationFactor` and `TumblingWindowInSeconds` are "(Kinesis and DynamoDB
+/// Streams only)" and `StartingPosition` is "Required for Amazon Kinesis and Amazon
+/// DynamoDB Stream event sources". This enumeration is the ONE statement of that set:
+/// [`is_shard_source`] is derived from it, and it is what the reader of those sources
+/// dispatches on ([`crate::state::event_source_poller`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardSource {
+    /// An Amazon Kinesis data stream (`arn:…:kinesis:…:stream/<name>`).
+    Kinesis,
+    /// An Amazon DynamoDB table's stream
+    /// (`arn:…:dynamodb:…:table/<name>/stream/<label>`).
+    DynamoDbStream,
+}
+
+impl ShardSource {
+    /// The shard source `vendor` names, or `None` for a vendor whose records do not sit in
+    /// shards.
+    #[must_use]
+    pub fn of_vendor(vendor: &str) -> Option<Self> {
+        match vendor {
+            EVENT_SOURCE_VENDOR_KINESIS => Some(Self::Kinesis),
+            EVENT_SOURCE_VENDOR_DYNAMODB => Some(Self::DynamoDbStream),
+            _ => None,
+        }
+    }
+}
+
 /// Whether `vendor` names one of the two sources that deliver records per SHARD, which
 /// is the scope the model gives `ParallelizationFactor` and `TumblingWindowInSeconds`
 /// ("Kinesis and DynamoDB Streams only") and the two sources `StartingPosition` is
 /// "Required for".
 #[must_use]
 pub fn is_shard_source(vendor: Option<&str>) -> bool {
-    matches!(
-        vendor,
-        Some(EVENT_SOURCE_VENDOR_KINESIS | EVENT_SOURCE_VENDOR_DYNAMODB)
-    )
+    vendor.and_then(ShardSource::of_vendor).is_some()
 }
 
 /// Whether the event source is one of the STREAM sources the model scopes its error
@@ -455,8 +483,9 @@ pub fn queue_visibility_refusal(
 /// echoed straight back to its caller.
 ///
 /// A mapping on an Amazon SQS queue also POLLS that queue once it is enabled, which is
-/// what [`crate::state::sqs_poller`] does, and a mapping on an Amazon Kinesis data stream
-/// reads that stream's shards, which is what [`crate::state::event_source_poller`] does —
+/// what [`crate::state::sqs_poller`] does, and a mapping on a shard source — an Amazon
+/// Kinesis data stream or an Amazon DynamoDB table's stream — reads that stream's shards,
+/// which is what [`crate::state::event_source_poller`] does —
 /// so the record carries the result of the last attempt its poller made
 /// ([`Self::last_processing_result`]) and, for a shard source, the mapping's own READING
 /// position: where it reads next in each shard of its event source.

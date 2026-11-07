@@ -215,12 +215,6 @@ const MAX_FILTER_STEPS_PER_BATCH: u64 =
 /// The `eventSource` an Amazon SQS record envelope reports.
 const SQS_EVENT_SOURCE: &str = "aws:sqs";
 
-/// The `eventSource` a DynamoDB stream record envelope reports, and the `eventVersion` of
-/// the envelope this emulator builds — the version of the record FORMAT, which is what a
-/// consumer branches on.
-const DYNAMODB_EVENT_SOURCE: &str = "aws:dynamodb";
-const DYNAMODB_EVENT_VERSION: &str = "1.1";
-
 /// The ARN service namespaces the stages below address: an SQS queue, a DynamoDB table's
 /// stream, a Lambda function and a Step Functions state machine (`states`, the namespace
 /// Step Functions signs and publishes its endpoint under).
@@ -1107,7 +1101,13 @@ impl Polled {
             Self::Records(batch) => batch
                 .records
                 .iter()
-                .map(|record| stream_record_envelope(record, &run.source_arn, &run.source_region))
+                .map(|record| {
+                    ::service_common::dynamodb_stream_event::record_envelope(
+                        record,
+                        &run.source_arn,
+                        &run.source_region,
+                    )
+                })
                 .collect(),
         }
     }
@@ -1799,223 +1799,6 @@ fn queue_record_envelope(
         envelope[RECORD_MD5_OF_MESSAGE_ATTRIBUTES] = Value::String(digest);
     }
     envelope
-}
-
-/// One read DynamoDB stream record as the record envelope a pipe hands to its enrichment
-/// and its target: which change it was, where it came from, and the record's own
-/// `dynamodb` body — the item's keys and the images the stream's view type captures.
-///
-/// The member names are the stream record's own (`eventID`, `eventName`,
-/// `eventVersion`, `eventSource`, `awsRegion`, `dynamodb`, `eventSourceARN`), and the
-/// `dynamodb` body's are `StreamRecord`'s (`ApproximateCreationDateTime`, `Keys`,
-/// `NewImage`, `OldImage`, `SequenceNumber`, `SizeBytes`, `StreamViewType`), so a
-/// consumer written against a DynamoDB stream event reads what it expects. A member the
-/// record does not carry is absent rather than reported empty: `OldImage` is not there
-/// for an `INSERT`, and neither image is there for a `KEYS_ONLY` stream.
-fn stream_record_envelope(
-    record: &::aws_sdk_dynamodbstreams::types::Record,
-    source_arn: &str,
-    region: &str,
-) -> Result<Value, String> {
-    let mut envelope = ::serde_json::Map::new();
-    if let Some(id) = record.event_id.clone() {
-        envelope.insert("eventID".to_string(), Value::String(id));
-    }
-    if let Some(name) = record.event_name.as_ref() {
-        envelope.insert(
-            "eventName".to_string(),
-            Value::String(name.as_str().to_string()),
-        );
-    }
-    envelope.insert(
-        "eventVersion".to_string(),
-        Value::String(
-            record
-                .event_version
-                .clone()
-                .unwrap_or_else(|| DYNAMODB_EVENT_VERSION.to_string()),
-        ),
-    );
-    envelope.insert(
-        "eventSource".to_string(),
-        Value::String(
-            record
-                .event_source
-                .clone()
-                .unwrap_or_else(|| DYNAMODB_EVENT_SOURCE.to_string()),
-        ),
-    );
-    // The Region the record reports is the stream's own; the source ARN's is the fallback
-    // for a record that carries none.
-    envelope.insert(
-        "awsRegion".to_string(),
-        Value::String(
-            record
-                .aws_region
-                .clone()
-                .unwrap_or_else(|| region.to_string()),
-        ),
-    );
-    if let Some(body) = record.dynamodb.as_ref() {
-        let mut stream_record = ::serde_json::Map::new();
-        if let Some(at) = body.approximate_creation_date_time.as_ref() {
-            // "in Unix time seconds", as a stream record reports the instant a change was
-            // made.
-            stream_record.insert(
-                "ApproximateCreationDateTime".to_string(),
-                Value::from(at.secs()),
-            );
-        }
-        if let Some(keys) = body.keys.as_ref() {
-            stream_record.insert("Keys".to_string(), attribute_map_json(keys)?);
-        }
-        if let Some(image) = body.new_image.as_ref() {
-            stream_record.insert("NewImage".to_string(), attribute_map_json(image)?);
-        }
-        if let Some(image) = body.old_image.as_ref() {
-            stream_record.insert("OldImage".to_string(), attribute_map_json(image)?);
-        }
-        if let Some(sequence) = body.sequence_number.clone() {
-            stream_record.insert("SequenceNumber".to_string(), Value::String(sequence));
-        }
-        if let Some(size) = body.size_bytes {
-            stream_record.insert("SizeBytes".to_string(), Value::from(size));
-        }
-        if let Some(view) = body.stream_view_type.as_ref() {
-            stream_record.insert(
-                "StreamViewType".to_string(),
-                Value::String(view.as_str().to_string()),
-            );
-        }
-        envelope.insert("dynamodb".to_string(), Value::Object(stream_record));
-    }
-    envelope.insert(
-        "eventSourceARN".to_string(),
-        Value::String(source_arn.to_string()),
-    );
-    Ok(Value::Object(envelope))
-}
-
-/// One item image as the JSON a stream record carries it in: each attribute under its
-/// name, as [`attribute_json`] renders it.
-fn attribute_map_json(
-    image: &::std::collections::HashMap<String, ::aws_sdk_dynamodbstreams::types::AttributeValue>,
-) -> Result<Value, String> {
-    // Collected into an ordered map so one image always renders the same way, whatever
-    // order the hash map happens to iterate in.
-    let mut rendered: BTreeMap<String, Value> = BTreeMap::new();
-    for (name, value) in image {
-        rendered.insert(name.clone(), attribute_json(value)?);
-    }
-    Ok(::serde_json::json!(rendered))
-}
-
-/// One attribute value as the JSON DynamoDB carries one in: a single-member object whose
-/// name is the attribute's TYPE (`S`, `N`, `B`, `SS`, `NS`, `BS`, `M`, `L`, `NULL`,
-/// `BOOL`) — the same form a `PutItem` request writes it in, so a consumer reads the item
-/// back in the shape it wrote it.
-///
-/// ITERATIVE, over an explicit worklist, for the reason the DynamoDB-to-streams seam gives
-/// for its own walk over an image: `M` and `L` nest to a depth the client chose, and a
-/// recursive walk over it would overflow the thread stack, which in Rust aborts the
-/// process instead of unwinding.
-///
-/// A nesting value is met twice: once to put its members on the worklist, and once to
-/// rebuild it from the members converted since. A map's names are CARRIED from the pass
-/// that pushed its members rather than read off the map a second time, so the pairing does
-/// not depend on two iterations of one map agreeing.
-fn attribute_json(
-    root: &::aws_sdk_dynamodbstreams::types::AttributeValue,
-) -> Result<Value, String> {
-    use ::aws_sdk_dynamodbstreams::types::AttributeValue as Attribute;
-
-    /// What the walk still owes: a value to render, or a container to rebuild from the
-    /// members already rendered.
-    enum Step<'a> {
-        Render(&'a Attribute),
-        RebuildMap(Vec<&'a String>),
-        RebuildList(usize),
-    }
-
-    /// The base64 of one binary attribute, which is how JSON carries bytes.
-    fn encoded(bytes: &::aws_smithy_types::Blob) -> Value {
-        Value::String(::base64::Engine::encode(
-            &::base64::engine::general_purpose::STANDARD,
-            bytes.as_ref(),
-        ))
-    }
-
-    let mut worklist = vec![Step::Render(root)];
-    let mut rendered: Vec<Value> = Vec::new();
-    while let Some(step) = worklist.pop() {
-        match step {
-            Step::Render(Attribute::M(members)) => {
-                let mut names = Vec::with_capacity(members.len());
-                let mut values = Vec::with_capacity(members.len());
-                for (name, nested) in members {
-                    names.push(name);
-                    values.push(nested);
-                }
-                worklist.push(Step::RebuildMap(names));
-                worklist.extend(values.into_iter().map(Step::Render));
-            }
-            Step::Render(Attribute::L(members)) => {
-                worklist.push(Step::RebuildList(members.len()));
-                worklist.extend(members.iter().map(Step::Render));
-            }
-            Step::Render(Attribute::S(text)) => rendered.push(json!({ "S": text })),
-            Step::Render(Attribute::N(number)) => rendered.push(json!({ "N": number })),
-            Step::Render(Attribute::B(bytes)) => rendered.push(json!({ "B": encoded(bytes) })),
-            Step::Render(Attribute::Ss(members)) => rendered.push(json!({ "SS": members })),
-            Step::Render(Attribute::Ns(members)) => rendered.push(json!({ "NS": members })),
-            Step::Render(Attribute::Bs(members)) => rendered.push(json!({
-                "BS": members.iter().map(encoded).collect::<Vec<Value>>(),
-            })),
-            Step::Render(Attribute::Null(is_null)) => rendered.push(json!({ "NULL": is_null })),
-            Step::Render(Attribute::Bool(flag)) => rendered.push(json!({ "BOOL": flag })),
-            // The union is `#[non_exhaustive]`: a member this build of the SDK does not
-            // know is a record this emulator cannot render faithfully, so the batch fails
-            // and the records stay for a later pass rather than a record reaching a stage
-            // with an attribute missing.
-            Step::Render(_) => {
-                return Err("a stream record carries an attribute type this emulator does \
-                            not render"
-                    .to_string())
-            }
-            Step::RebuildMap(names) => {
-                let nested = take_rendered(&mut rendered, names.len())?;
-                rendered.push(json!({
-                    "M": names
-                        .into_iter()
-                        .cloned()
-                        .zip(nested.into_iter().rev())
-                        .collect::<BTreeMap<String, Value>>(),
-                }));
-            }
-            Step::RebuildList(count) => {
-                let mut nested = take_rendered(&mut rendered, count)?;
-                nested.reverse();
-                rendered.push(json!({ "L": nested }));
-            }
-        }
-    }
-    // The walk pushes exactly one value for the root, so this is it.
-    rendered
-        .pop()
-        .ok_or_else(|| "an attribute value rendered to no value".to_string())
-}
-
-/// The `count` values a container's members rendered to, taken off the top of the walk's
-/// stack. Every `Step::Render` pushes exactly one value, so the top `count` are this
-/// container's; a shorter stack would be a defect in that invariant, and the batch fails
-/// rather than a truncated container reaching a stage.
-fn take_rendered(rendered: &mut Vec<Value>, count: usize) -> Result<Vec<Value>, String> {
-    if rendered.len() < count {
-        return Err("a nested attribute value rendered to fewer values than it has members"
-            .to_string());
-    }
-    let from = rendered.len() - count;
-    Ok(rendered.split_off(from))
 }
 
 /// Hand the whole polled batch to the enrichment as ONE array, and read the events it

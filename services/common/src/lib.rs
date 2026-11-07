@@ -297,6 +297,10 @@ pub mod cfn_provisioning;
 /// services asked whether CloudWatch Logs could hold a name cannot answer differently.
 pub mod cloudwatch_logs;
 pub mod db_data_sources;
+/// The ONE rendering of a DynamoDB STREAM RECORD as the envelope a consumer of that stream
+/// is handed one in, for every service that reads a table's stream and passes its records on
+/// — so two consumers of the same record are handed the same document.
+pub mod dynamodb_stream_event;
 /// The ONE reading of how a client ADDRESSES an emulated service's DATA plane — the
 /// reserved path namespace, the first path segment, the host without its port, and whether
 /// a host names a service at all — for every service that serves one, so the planes cannot

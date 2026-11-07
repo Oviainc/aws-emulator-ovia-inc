@@ -225,12 +225,12 @@ pub use capacity_provider::{
 /// the mapped source and hand each batch to the function — lives beside the record, one
 /// module per KIND of source, because what a source hands over and how a reader keeps its
 /// place in it differ: [`sqs_poller`] for a mapping on an Amazon SQS queue, and
-/// [`event_source_poller`] for one on an Amazon Kinesis data stream, whose shards are read
-/// from a position the mapping carries. The CloudWatch series Lambda publishes about that
-/// work is in [`metrics`]. Each is re-exported here for the same reason as
-/// [`capacity_provider`]: the mapping record, its clock-owed transitions and the store
-/// that holds it stay in this module, and a handler still names a poller as
-/// `crate::state::…`.
+/// [`event_source_poller`] for one on a SHARD source — an Amazon Kinesis data stream or an
+/// Amazon DynamoDB table's stream — whose shards are read from a position the mapping
+/// carries. The CloudWatch series Lambda publishes about that work is in [`metrics`]. Each
+/// is re-exported here for the same reason as [`capacity_provider`]: the mapping record,
+/// its clock-owed transitions and the store that holds it stay in this module, and a
+/// handler still names a poller as `crate::state::…`.
 pub mod event_source_poller;
 pub mod metrics;
 pub use metrics::{invoked_resource, publish_invocation};
@@ -3081,7 +3081,7 @@ pub use event_source_mapping::{
     MAX_EVENT_SOURCE_MAPPINGS, MAX_EVENT_SOURCE_MAPPING_PAGE_SIZE,
     STARTING_POSITION_AT_TIMESTAMP, STARTING_POSITION_LATEST, STARTING_POSITION_TRIM_HORIZON,
 };
-pub use event_source_mapping::{EventSourceMappingRecord, ShardCursor};
+pub use event_source_mapping::{EventSourceMappingRecord, ShardCursor, ShardSource};
 
 /// Which functions Lambda SnapStart can be applied to, and the refusals for asking for it
 /// where it does not hold.

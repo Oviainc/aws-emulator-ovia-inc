@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The DATA PLANE of an event source mapping on an Amazon Kinesis DATA STREAM: what such
-//! a mapping does with no client action at all.
+//! The DATA PLANE of an event source mapping on a SHARD source — an Amazon Kinesis data
+//! stream or an Amazon DynamoDB table's stream: what such a mapping does with no client
+//! action at all.
 //!
 //! A mapping's control plane (the record, its UUID and ARN, its lifecycle states) lives in
 //! [`crate::state`]. This module is the other half for the stream sources whose records sit
 //! in SHARDS, as [`crate::state::sqs_poller`] is for a mapping on a queue: once a mapping on
-//! a Kinesis data stream is `Enabled`, Lambda itself reads that stream's shards and invokes
-//! the mapped function with the batch it read — no caller asks it to. The two sources need
-//! their own readers because what each hands over, and how a reader keeps its place in it,
-//! differ: a queue hides a message it hands over for its own visibility timeout, while a
-//! shard hands out the records after a POSITION the reader carries. The rules this one
-//! follows:
+//! one of those streams is `Enabled`, Lambda itself reads that stream's shards and invokes
+//! the mapped function with the batch it read — no caller asks it to. A queue needs a reader
+//! of its own because what it hands over, and how a reader keeps its place in it, differ: a
+//! queue hides a message it hands over for its own visibility timeout, while a shard hands
+//! out the records after a POSITION the reader carries. The two shard sources share this
+//! reader for the same reason — both are read per shard from a position the mapping carries
+//! — and differ only in how their shards are listed and what one record is handed over as,
+//! which is what [`kinesis_stream`] and [`dynamodb_stream`] each state for its own source.
+//! The rules this reader follows:
 //!
 //! * WHILE PAUSED, NOTHING IS READ. "When true, the event source mapping is active. When
 //!   false, Lambda pauses polling and invocation" (`Enabled`), so a `Disabled` mapping
@@ -49,24 +53,30 @@
 //!   refused for, and again the rule [`crate::state::sqs_poller`] holds a queue mapping to.
 //!
 //! Each pass reads what the shard holds and hands it over at once, so a mapping that
-//! configures a `MaximumBatchingWindowInSeconds` above the Kinesis default of 0 is not
+//! configures a `MaximumBatchingWindowInSeconds` above the stream default of 0 is not
 //! waited out here: that yields SMALLER batches than such a mapping would see on AWS,
 //! never a record that is not delivered.
 //!
 //! Every call this module makes goes to the emulator it is running inside, over the
 //! in-process callback ([`smithy_server_runtime::EmbeddedEmulator`]): the stream is read
-//! through the Kinesis surface of this same emulator (`ListShards`, `GetShardIterator`,
-//! `GetRecords`) and the function is invoked through its own (`Invoke`), so nothing is
-//! read or delivered that this emulator does not serve itself, and a record is consumed
-//! only through the data plane a client would consume it through.
+//! through the data-plane surface the source publishes in this same emulator and the
+//! function is invoked through its own (`Invoke`), so nothing is read or delivered that this
+//! emulator does not serve itself, and a record is consumed only through the data plane a
+//! client would consume it through.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
-use ::base64::Engine as _;
 use ::serde_json::{json, Value};
 
-use super::{metrics::FunctionMetrics, ComAmazonawsLambdaAwsgirapiserviceState, ShardCursor};
+use super::{
+    metrics::FunctionMetrics, ComAmazonawsLambdaAwsgirapiserviceState, ShardCursor, ShardSource,
+};
+
+/// How a DynamoDB table's stream is listed, read and handed over.
+pub mod dynamodb_stream;
+/// How a Kinesis data stream is listed, read and handed over.
+pub mod kinesis_stream;
 
 /// How long the poller waits before looking at an idle shard again. Short enough that a
 /// record put on the stream is delivered promptly, long enough not to spin.
@@ -105,19 +115,9 @@ const FAILURE_LOG_INTERVAL: u32 = 20;
 /// record.
 const MAX_RECORDS_PER_BATCH: i32 = 1_000;
 
-/// The most `ListShards` pages one pass walks, so a stream cannot keep the poller in its
-/// shard listing.
+/// The most pages of a stream's shard listing one pass walks, so a stream cannot keep the
+/// poller in its shard listing.
 const MAX_SHARD_PAGES: usize = 10;
-
-/// The `eventSource` a Kinesis record envelope reports, and the `eventName` each record
-/// carries, as the Kinesis event Lambda hands a function spells them.
-const KINESIS_EVENT_SOURCE: &str = "aws:kinesis";
-/// See [`KINESIS_EVENT_SOURCE`].
-const KINESIS_EVENT_NAME: &str = "aws:kinesis:record";
-/// The schema version of the `kinesis` member of one record envelope.
-const KINESIS_SCHEMA_VERSION: &str = "1.0";
-/// The version of the record envelope itself.
-const KINESIS_EVENT_VERSION: &str = "1.0";
 
 /// Start the in-process poller for the event source mapping `uuid` names, if one is not
 /// already running for it.
@@ -145,16 +145,17 @@ pub fn drive_mapping<Eng: Send + Sync + 'static>(
     };
     {
         let mut store = state.lock();
-        // The source this module reads is an Amazon Kinesis data stream; a mapping on any
-        // other source has no reader here, so no task is started for it at all.
-        let reads_kinesis = store
+        // The sources this module reads are the two whose records sit in shards; a mapping
+        // on any other source has no reader here, so no task is started for it at all.
+        let reads_shards = store
             .event_source_mappings
             .get(uuid)
             .and_then(|mapping| mapping.event_source_arn.clone())
             .as_deref()
             .and_then(super::event_source_vendor)
-            == Some(super::EVENT_SOURCE_VENDOR_KINESIS);
-        if !reads_kinesis || !store.claim_event_source_poller(uuid) {
+            .and_then(ShardSource::of_vendor)
+            .is_some();
+        if !reads_shards || !store.claim_event_source_poller(uuid) {
             return;
         }
     }
@@ -210,10 +211,31 @@ impl Drop for PollerClaim {
     }
 }
 
+/// One record of a batch as this reader carries it, whichever source it was read from: how
+/// the shard identifies it, when the source stamped it, and the envelope the function is
+/// handed for it.
+///
+/// The envelope is the SOURCE's own form — a Kinesis record and a DynamoDB stream record
+/// are handed to a function as different documents — built by the module that read it, so
+/// everything the poller itself does (metering the batch, delivering it, checkpointing past
+/// what was processed) is the one rule for both sources.
+struct ShardRecord {
+    /// "the sequence number of the data record in the shard": how a report of this source
+    /// names one record, and what the mapping's cursor reads on from.
+    sequence_number: String,
+    /// When the source stamped the record, which is what the age of a batch is measured
+    /// from; `None` for a record the source reports no instant for.
+    arrived_at: Option<::aws_smithy_types::DateTime>,
+    /// The envelope the function is handed for this record.
+    envelope: Value,
+}
+
 /// One mapping's configuration as ONE pass reads it: everything the pass needs, taken from
 /// the record under the store's lock and never held across a call.
 #[derive(Debug)]
-struct KinesisSourcedMapping {
+struct ShardSourcedMapping {
+    /// Which source the shards below are read from.
+    source: ShardSource,
     /// The stream the shards are read from.
     stream_arn: String,
     /// The Region that stream lives in, which is the Region it is reached in: a resource
@@ -242,7 +264,7 @@ struct KinesisSourcedMapping {
 enum Pass {
     /// The mapping is `Enabled`: read what its shards hold under this configuration. Boxed
     /// because it is far larger than the other answers, which most passes are.
-    Run(Box<KinesisSourcedMapping>),
+    Run(Box<ShardSourcedMapping>),
     /// The mapping is not reading: it is still settling into the state its `Enabled`
     /// setting asks for, it rests `Disabled`, which "pauses polling and invocation", or the
     /// function it invokes is not `Active`, so there is no invocation to read a batch for.
@@ -326,7 +348,17 @@ async fn poll_mapping(
                     ::tokio::time::sleep(retry_backoff(failures)).await;
                     continue;
                 }
-                match move_batches(callback, &mut clients, &state, &metrics, &uuid, &run).await {
+                match move_batches(
+                    callback,
+                    &mut clients,
+                    &state,
+                    &metrics,
+                    iam.as_ref(),
+                    &uuid,
+                    &run,
+                )
+                .await
+                {
                     Outcome::Delivered => failures = 0,
                     Outcome::Idle => {
                         failures = 0;
@@ -361,7 +393,7 @@ async fn poll_mapping(
 /// between two passes rather than inside the critical section either of them is decided in.
 fn withheld_shard_read(
     iam: Option<&::engine::ServiceState<super::event_source_authorization::IamState>>,
-    run: &KinesisSourcedMapping,
+    run: &ShardSourcedMapping,
 ) -> Option<String> {
     let role_arn = run.invoke_identity_arn.as_deref()?;
     super::event_source_authorization::unreadable_event_source_held(
@@ -431,19 +463,19 @@ fn next_pass(
 fn run_of(
     store: &ComAmazonawsLambdaAwsgirapiserviceState,
     mapping: &super::EventSourceMappingRecord,
-) -> Result<KinesisSourcedMapping, String> {
+) -> Result<ShardSourcedMapping, String> {
     let Some(stream_arn) = mapping.event_source_arn.clone() else {
         return Err("the mapping names no event source ARN to read".to_string());
     };
     let Some(parsed) = ::service_common::arn::parse(&stream_arn) else {
         return Err("the mapping's event source is not a resource ARN".to_string());
     };
-    if parsed.vendor != super::EVENT_SOURCE_VENDOR_KINESIS {
+    let Some(source) = ShardSource::of_vendor(parsed.vendor) else {
         return Err(format!(
             "an event source of the {} namespace has no reader in this emulator",
             parsed.vendor
         ));
-    }
+    };
     let region = parsed.region.to_string();
     // The role the invocation is attributed to, read from the VERSION this mapping
     // invokes: "The ARN of the Lambda function" the mapping carries may be qualified, and
@@ -456,7 +488,8 @@ fn run_of(
             .unwrap_or_else(|| super::VERSION_LATEST.to_string());
         function.config_of(&version).map(|config| config.role.clone())
     });
-    Ok(KinesisSourcedMapping {
+    Ok(ShardSourcedMapping {
+        source,
         stream_arn,
         region,
         function_arn: mapping.function_arn.clone(),
@@ -485,8 +518,9 @@ async fn move_batches(
     clients: &mut Clients,
     state: &::engine::ServiceState<ComAmazonawsLambdaAwsgirapiserviceState>,
     metrics: &FunctionMetrics,
+    iam: Option<&::engine::ServiceState<super::event_source_authorization::IamState>>,
     uuid: &str,
-    run: &KinesisSourcedMapping,
+    run: &ShardSourcedMapping,
 ) -> Outcome {
     let shards = match shard_ids(callback, clients, run).await {
         Ok(shards) => shards,
@@ -500,18 +534,11 @@ async fn move_batches(
             .get(&shard)
             .cloned()
             .unwrap_or_else(|| run.initial_cursor.clone());
-        let iterator = match shard_iterator(callback, clients, run, &shard, &cursor).await {
+        let records = match read_batch(callback, clients, run, &shard, &cursor).await {
             // "If the shard has been closed, the shard iterator can't return more data":
             // such a shard has no position left to read from.
             Ok(None) => continue,
-            Ok(Some(iterator)) => iterator,
-            Err(detail) => {
-                failure = Some(detail);
-                continue;
-            }
-        };
-        let records = match records_at(callback, clients, run, &iterator).await {
-            Ok(records) => records,
+            Ok(Some(records)) => records,
             Err(detail) => {
                 failure = Some(detail);
                 continue;
@@ -520,17 +547,26 @@ async fn move_batches(
         let Some(last) = records.last() else {
             continue;
         };
+        // The grant is asked about once more now that the batch is in hand, because the
+        // policies in force on the role decide this pass at the instant it acts rather than
+        // at the instant it started: a grant taken away while this pass was reading means
+        // nothing is handed over, nothing is metered and the shard's position does not move,
+        // so the records stay for the pass that follows the grant coming back.
+        if let Some(detail) = withheld_shard_read(iam, run) {
+            failure = Some(detail);
+            continue;
+        }
         // Every record of the batch, by the identifier a report of this source names one by:
         // "the sequence number of the data record in the shard".
         let sequence_numbers: Vec<String> = records
             .iter()
-            .map(|record| record.sequence_number().to_string())
+            .map(|record| record.sequence_number.clone())
             .collect();
         metrics.publish_iterator_age(
             &run.function_name,
-            iterator_age_millis(last.approximate_arrival_timestamp(), SystemTime::now()),
+            iterator_age_millis(last.arrived_at.as_ref(), SystemTime::now()),
         );
-        let payload = kinesis_event(&records, &shard, run);
+        let payload = batch_event(&records);
         match hand_over_batch(callback, clients, run, &payload, &sequence_numbers).await {
             Ok(processed) => {
                 // The mapping reads on from past the records the attempt processed, and the
@@ -597,6 +633,55 @@ async fn move_batches(
     }
 }
 
+/// The event ONE batch is handed over as: "Lambda reads items from the event source and
+/// invokes the function", and what it invokes the function with carries one envelope per
+/// record read, under `Records`, in the order the shard holds them.
+///
+/// Each envelope is the one the record's own source built for it ([`ShardRecord::envelope`]),
+/// so this composition is the one part of the hand-over that is the same for every source.
+fn batch_event(records: &[ShardRecord]) -> Value {
+    json!({
+        "Records": records
+            .iter()
+            .map(|record| record.envelope.clone())
+            .collect::<Vec<Value>>(),
+    })
+}
+
+/// Every open and closed shard of the mapped stream, in the order the stream reports them
+/// — through the listing the source's own data plane publishes.
+async fn shard_ids(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    clients: &mut Clients,
+    run: &ShardSourcedMapping,
+) -> Result<Vec<String>, String> {
+    match run.source {
+        ShardSource::Kinesis => kinesis_stream::shard_ids(callback, clients, run).await,
+        ShardSource::DynamoDbStream => dynamodb_stream::shard_ids(callback, clients, run).await,
+    }
+}
+
+/// The records one batch holds: what `shard` has at `cursor`, up to the mapping's batch
+/// size, each already rendered as the envelope its own source hands a record over as.
+///
+/// `None` for a shard that has no position left to read from.
+async fn read_batch(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    clients: &mut Clients,
+    run: &ShardSourcedMapping,
+    shard: &str,
+    cursor: &ShardCursor,
+) -> Result<Option<Vec<ShardRecord>>, String> {
+    match run.source {
+        ShardSource::Kinesis => {
+            kinesis_stream::read_batch(callback, clients, run, shard, cursor).await
+        }
+        ShardSource::DynamoDbStream => {
+            dynamodb_stream::read_batch(callback, clients, run, shard, cursor).await
+        }
+    }
+}
+
 /// Record what one processing attempt came to on the mapping itself, and — for an attempt
 /// that delivered its batch — move the shard's cursor past that batch.
 ///
@@ -606,7 +691,7 @@ async fn move_batches(
 fn checkpoint(
     state: &::engine::ServiceState<ComAmazonawsLambdaAwsgirapiserviceState>,
     uuid: &str,
-    run: &KinesisSourcedMapping,
+    run: &ShardSourcedMapping,
     shard: &str,
     delivered_through: Option<String>,
     result: &str,
@@ -632,111 +717,14 @@ fn checkpoint(
 /// in milliseconds: never negative, and 0 for a record this emulator holds no arrival
 /// instant for.
 fn iterator_age_millis(
-    arrived_at: Option<&::aws_sdk_kinesis::primitives::DateTime>,
+    arrived_at: Option<&::aws_smithy_types::DateTime>,
     read_at: SystemTime,
 ) -> f64 {
     let Some(arrived_at) = arrived_at else {
         return 0.0;
     };
-    let read_at = ::aws_sdk_kinesis::primitives::DateTime::from(read_at);
+    let read_at = ::aws_smithy_types::DateTime::from(read_at);
     ((read_at.as_secs_f64() - arrived_at.as_secs_f64()) * 1_000.0).max(0.0)
-}
-
-/// Every open and closed shard of the mapped stream, in the order the stream reports them.
-async fn shard_ids(
-    callback: &smithy_server_runtime::EmbeddedEmulator,
-    clients: &mut Clients,
-    run: &KinesisSourcedMapping,
-) -> Result<Vec<String>, String> {
-    let mut shards: Vec<String> = Vec::new();
-    let mut next_token: Option<String> = None;
-    for _ in 0..MAX_SHARD_PAGES {
-        let mut request = clients.kinesis(callback, &run.region).list_shards();
-        // "NextToken" and the stream the first page named are mutually exclusive: a
-        // continuation already carries the stream it is a continuation of.
-        request = match next_token.take() {
-            Some(token) => request.next_token(token),
-            None => request.stream_arn(&run.stream_arn),
-        };
-        let answer = request.send().await.map_err(|error| {
-            format!(
-                "the shards of {} could not be listed ({})",
-                run.stream_arn,
-                ::aws_smithy_types::error::display::DisplayErrorContext(&error)
-            )
-        })?;
-        shards.extend(
-            answer
-                .shards()
-                .iter()
-                .map(|shard| shard.shard_id().to_string()),
-        );
-        match answer.next_token() {
-            Some(token) => next_token = Some(token.to_string()),
-            None => break,
-        }
-    }
-    Ok(shards)
-}
-
-/// The iterator that reads `shard` from `cursor`, or `None` for a shard that has no
-/// position left to read from.
-async fn shard_iterator(
-    callback: &smithy_server_runtime::EmbeddedEmulator,
-    clients: &mut Clients,
-    run: &KinesisSourcedMapping,
-    shard: &str,
-    cursor: &ShardCursor,
-) -> Result<Option<String>, String> {
-    use ::aws_sdk_kinesis::types::ShardIteratorType;
-
-    let request = clients
-        .kinesis(callback, &run.region)
-        .get_shard_iterator()
-        .stream_arn(&run.stream_arn)
-        .shard_id(shard);
-    let request = match cursor {
-        ShardCursor::TrimHorizon => request.shard_iterator_type(ShardIteratorType::TrimHorizon),
-        ShardCursor::AtTimestamp(instant) => request
-            .shard_iterator_type(ShardIteratorType::AtTimestamp)
-            .timestamp(::aws_sdk_kinesis::primitives::DateTime::from(*instant)),
-        ShardCursor::AfterSequenceNumber(sequence_number) => request
-            .shard_iterator_type(ShardIteratorType::AfterSequenceNumber)
-            .starting_sequence_number(sequence_number),
-    };
-    let answer = request.send().await.map_err(|error| {
-        format!(
-            "no iterator could be taken on {shard} of {} ({})",
-            run.stream_arn,
-            ::aws_smithy_types::error::display::DisplayErrorContext(&error)
-        )
-    })?;
-    Ok(answer.shard_iterator().map(str::to_string))
-}
-
-/// The records one batch holds: what the shard has at `iterator`, up to the mapping's
-/// batch size.
-async fn records_at(
-    callback: &smithy_server_runtime::EmbeddedEmulator,
-    clients: &mut Clients,
-    run: &KinesisSourcedMapping,
-    iterator: &str,
-) -> Result<Vec<::aws_sdk_kinesis::types::Record>, String> {
-    let answer = clients
-        .kinesis(callback, &run.region)
-        .get_records()
-        .shard_iterator(iterator)
-        .limit(run.batch_size)
-        .send()
-        .await
-        .map_err(|error| {
-            format!(
-                "a batch could not be read from {} ({})",
-                run.stream_arn,
-                ::aws_smithy_types::error::display::DisplayErrorContext(&error)
-            )
-        })?;
-    Ok(answer.records)
 }
 
 /// Hand one batch to the function and read what became of the records it held: the ones the
@@ -748,7 +736,7 @@ async fn records_at(
 async fn hand_over_batch(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
-    run: &KinesisSourcedMapping,
+    run: &ShardSourcedMapping,
     payload: &Value,
     sequence_numbers: &[String],
 ) -> Result<Vec<String>, String> {
@@ -787,7 +775,7 @@ fn checkpointed_through(sequence_numbers: &[String], processed: &[String]) -> Op
 async fn invoke_function(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
-    run: &KinesisSourcedMapping,
+    run: &ShardSourcedMapping,
     payload: &Value,
 ) -> Result<Option<Vec<u8>>, String> {
     let answer = clients
@@ -820,49 +808,6 @@ async fn invoke_function(
     Ok(answer.payload.map(::aws_smithy_types::Blob::into_inner))
 }
 
-/// The event one batch is handed over as: the Kinesis record envelopes Lambda builds for a
-/// stream event source, one per record, each carrying the record's own data, partition key,
-/// sequence number and arrival instant.
-fn kinesis_event(
-    records: &[::aws_sdk_kinesis::types::Record],
-    shard: &str,
-    run: &KinesisSourcedMapping,
-) -> Value {
-    let envelopes: Vec<Value> = records
-        .iter()
-        .map(|record| {
-            let sequence_number = record.sequence_number();
-            let mut kinesis = json!({
-                "kinesisSchemaVersion": KINESIS_SCHEMA_VERSION,
-                "partitionKey": record.partition_key(),
-                "sequenceNumber": sequence_number,
-                // The record's data travels base64-encoded, as the event a function
-                // receives carries it.
-                "data": ::base64::engine::general_purpose::STANDARD.encode(record.data().as_ref()),
-            });
-            if let Some(arrived_at) = record.approximate_arrival_timestamp() {
-                kinesis["approximateArrivalTimestamp"] = json!(arrived_at.as_secs_f64());
-            }
-            let mut envelope = json!({
-                "kinesis": kinesis,
-                "eventSource": KINESIS_EVENT_SOURCE,
-                "eventVersion": KINESIS_EVENT_VERSION,
-                // The record is identified by the shard it came from and its own sequence
-                // number within that shard.
-                "eventID": format!("{shard}:{sequence_number}"),
-                "eventName": KINESIS_EVENT_NAME,
-                "awsRegion": run.region,
-                "eventSourceARN": run.stream_arn,
-            });
-            if let Some(identity) = run.invoke_identity_arn.as_deref() {
-                envelope["invokeIdentityArn"] = json!(identity);
-            }
-            envelope
-        })
-        .collect();
-    json!({ "Records": envelopes })
-}
-
 /// The clients this data plane reaches the other services of this emulator through, built
 /// on first use and then reused.
 ///
@@ -874,6 +819,7 @@ fn kinesis_event(
 #[derive(Default)]
 pub(crate) struct Clients {
     kinesis: Option<(String, ::aws_sdk_kinesis::Client)>,
+    dynamodbstreams: Option<(String, ::aws_sdk_dynamodbstreams::Client)>,
     lambda: Option<(String, ::aws_sdk_lambda::Client)>,
 }
 
@@ -927,6 +873,7 @@ macro_rules! callback_client {
 
 impl Clients {
     callback_client!(kinesis, aws_sdk_kinesis, "kinesis");
+    callback_client!(dynamodbstreams, aws_sdk_dynamodbstreams, "streams.dynamodb");
     callback_client!(lambda, aws_sdk_lambda, "lambda");
 }
 
@@ -934,28 +881,7 @@ impl Clients {
 mod tests {
     use std::time::{Duration, SystemTime};
 
-    use ::base64::Engine as _;
-
-    use super::{
-        checkpointed_through, iterator_age_millis, kinesis_event, KinesisSourcedMapping,
-        MAX_RECORDS_PER_BATCH,
-    };
-    use crate::state::ShardCursor;
-
-    /// A mapping configuration the envelope rows below are built against.
-    fn run() -> KinesisSourcedMapping {
-        KinesisSourcedMapping {
-            stream_arn: "arn:aws:kinesis:us-east-1:000000000000:stream/orders".to_string(),
-            region: "us-east-1".to_string(),
-            function_arn: "arn:aws:lambda:us-east-1:000000000000:function:consume".to_string(),
-            function_name: "consume".to_string(),
-            invoke_identity_arn: Some("arn:aws:iam::000000000000:role/consume".to_string()),
-            batch_size: MAX_RECORDS_PER_BATCH,
-            reports_batch_item_failures: false,
-            cursors: std::collections::BTreeMap::new(),
-            initial_cursor: ShardCursor::TrimHorizon,
-        }
-    }
+    use super::{batch_event, checkpointed_through, iterator_age_millis, ShardRecord};
 
     #[test]
     fn a_shard_reads_on_from_the_processed_run_at_the_head_of_the_batch() {
@@ -993,25 +919,6 @@ mod tests {
         }
     }
 
-    /// One record as the Kinesis data plane answers it.
-    fn record(
-        sequence_number: &str,
-        data: &[u8],
-        arrived_at: Option<SystemTime>,
-    ) -> ::aws_sdk_kinesis::types::Record {
-        let mut builder = ::aws_sdk_kinesis::types::Record::builder()
-            .sequence_number(sequence_number)
-            .partition_key("orders")
-            .data(::aws_sdk_kinesis::primitives::Blob::new(data.to_vec()));
-        if let Some(arrived_at) = arrived_at {
-            builder =
-                builder.approximate_arrival_timestamp(
-                    ::aws_sdk_kinesis::primitives::DateTime::from(arrived_at),
-                );
-        }
-        builder.build().expect("the record is well formed")
-    }
-
     /// RULE: the age one batch meters is how long the NEWEST record of that batch had been
     /// in the shard when the batch was read — never negative, and 0 for a record with no
     /// arrival instant to measure from.
@@ -1044,8 +951,8 @@ mod tests {
             ("no-arrival-instant", None, 0.0),
         ];
         for (case, arrived_at, expected) in rows {
-            let record = record("49590338271490256608559692538361571095921575989136588898", b"{}", arrived_at);
-            let actual = iterator_age_millis(record.approximate_arrival_timestamp(), read_at);
+            let arrived_at = arrived_at.map(::aws_smithy_types::DateTime::from);
+            let actual = iterator_age_millis(arrived_at.as_ref(), read_at);
             assert!(
                 (actual - expected).abs() < 1.0,
                 "case {case:?}: expected an age of {expected} ms, got {actual:?} ms"
@@ -1053,60 +960,46 @@ mod tests {
         }
     }
 
-    /// RULE: the event a batch is handed over as carries ONE envelope per record, each with
-    /// that record's own data base64-encoded, its partition key, its sequence number and
-    /// the stream it came from.
+    /// RULE: the event a batch is handed over as carries ONE envelope per record read,
+    /// under `Records`, in the order the shard holds them — each the envelope the record's
+    /// own source built for it.
     ///
     /// The rows differ along what the rule generalises over: how many records the batch
-    /// holds and what their data is.
+    /// holds (one, several, and — for completeness of the composition itself — none).
     #[test]
-    fn a_batch_is_handed_over_as_one_envelope_per_record() {
-        let run = run();
-        let arrived_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-        // (case, the records' data)
-        let rows: Vec<(&str, Vec<&[u8]>)> = vec![
-            ("one-record", vec![b"first"]),
-            ("three-records", vec![b"a", b"bb", b"ccc"]),
-            ("an-empty-payload", vec![b""]),
+    fn a_batch_is_handed_over_as_one_envelope_per_record_in_shard_order() {
+        // (case, the envelopes of the batch's records, in the order they were read)
+        let rows: Vec<(&str, Vec<::serde_json::Value>)> = vec![
+            ("no-record", Vec::new()),
+            (
+                "one-record",
+                vec![::serde_json::json!({ "eventID": "only" })],
+            ),
+            (
+                "three-records",
+                vec![
+                    ::serde_json::json!({ "eventID": "first" }),
+                    ::serde_json::json!({ "eventID": "second" }),
+                    ::serde_json::json!({ "eventID": "third" }),
+                ],
+            ),
         ];
-        for (case, payloads) in rows {
-            let records: Vec<::aws_sdk_kinesis::types::Record> = payloads
+        for (case, envelopes) in rows {
+            let records: Vec<ShardRecord> = envelopes
                 .iter()
                 .enumerate()
-                .map(|(index, data)| record(&format!("4959033827149025660855969253836157109592157598913658889{index}"), data, Some(arrived_at)))
+                .map(|(index, envelope)| ShardRecord {
+                    sequence_number: format!("1000000000000000000{index}"),
+                    arrived_at: None,
+                    envelope: envelope.clone(),
+                })
                 .collect();
-            let event = kinesis_event(&records, "shardId-000000000000", &run);
-            let envelopes = event["Records"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+            let event = batch_event(&records);
             assert_eq!(
-                envelopes.len(),
-                payloads.len(),
-                "case {case:?}: expected {} envelopes, got {envelopes:?}",
-                payloads.len()
+                event["Records"],
+                ::serde_json::json!(envelopes),
+                "case {case:?}: expected one envelope per record in shard order, got {event}"
             );
-            for (index, data) in payloads.iter().enumerate() {
-                let envelope = &envelopes[index];
-                let encoded = ::base64::engine::general_purpose::STANDARD
-                    .encode(data)
-                    ;
-                assert_eq!(
-                    envelope["kinesis"]["data"],
-                    ::serde_json::json!(encoded),
-                    "case {case:?}: record {index} must carry its own data base64-encoded, got {envelope:?}"
-                );
-                assert_eq!(
-                    envelope["eventSourceARN"],
-                    ::serde_json::json!(run.stream_arn),
-                    "case {case:?}: record {index} must name the stream it came from, got {envelope:?}"
-                );
-                assert_eq!(
-                    envelope["kinesis"]["sequenceNumber"],
-                    ::serde_json::json!(records[index].sequence_number()),
-                    "case {case:?}: record {index} must carry its own sequence number, got {envelope:?}"
-                );
-            }
         }
     }
 }

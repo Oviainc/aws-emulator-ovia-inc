@@ -14,6 +14,10 @@ aws-sdk-iam = { version = "1", default-features = false }
 # needed — the emulator supplies the transport, so the SDK's own HTTPS stack and runtime
 # are left out and the client can reach nothing off this process.
 aws-sdk-kinesis = { version = "1", default-features = false }
+# `dynamodb_stream_event`: the record TYPE a DynamoDB stream's data plane answers, which
+# the envelope rendered there is built from — taken from the SDK rather than re-declared,
+# for the same reason and with the same features left out.
+aws-sdk-dynamodbstreams = { version = "1", default-features = false }
 # `resolve_route_key` / `ROOT_PATH_SEGMENT`: the framework's own routing-key rule,
 # which this crate narrows rather than replaces.
 emulator-server = { workspace = true }

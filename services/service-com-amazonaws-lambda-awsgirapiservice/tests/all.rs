@@ -93,6 +93,8 @@ mod durable_execution_run;
 mod durable_execution_start;
 #[path = "all/durable_execution_stop.rs"]
 mod durable_execution_stop;
+#[path = "all/dynamodb_stream_event_source_delivery.rs"]
+mod dynamodb_stream_event_source_delivery;
 #[path = "all/event_invoke_config.rs"]
 mod event_invoke_config;
 #[path = "all/event_source_mapping_batch_item_failures.rs"]

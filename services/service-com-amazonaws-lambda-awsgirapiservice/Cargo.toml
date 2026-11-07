@@ -69,11 +69,12 @@ chrono-tz = { version = "0.10", default-features = false }
 uuid = { version = "1", features = ["v4"] }
 # The AWS SDK clients the event source mapping poller (`state::event_source_poller`)
 # reaches the other services of THIS emulator through, over the in-process callback
-# (`OperationContext::callback`): the mapped Kinesis data stream it reads
-# (`ListShards`/`GetShardIterator`/`GetRecords`) and the function it hands each batch to
-# (`Invoke`). Only the generated clients are needed: the emulator supplies the transport,
-# so the SDK's own HTTPS stack is left out.
+# (`OperationContext::callback`): the mapped Kinesis data stream or DynamoDB table stream
+# it reads (`ListShards`/`DescribeStream`, `GetShardIterator`, `GetRecords`) and the
+# function it hands each batch to (`Invoke`). Only the generated clients are needed: the
+# emulator supplies the transport, so the SDK's own HTTPS stack is left out.
 aws-sdk-kinesis = { version = "1", default-features = false }
+aws-sdk-dynamodbstreams = { version = "1", default-features = false }
 aws-sdk-lambda = { version = "1", default-features = false }
 # A function whose environment variables are encrypted with a customer managed key can
 # only be invoked while that key can decrypt them, and the key's state belongs to the key
@@ -175,13 +176,15 @@ tokio = { workspace = true, features = ["time"] }
 # The services a mapping's event source and its own metrics live in are mounted beside
 # lambda on ONE engine in the data-plane tests, because a delivery is asserted where a
 # client sees it: on the stream the records were put to, and in the series CloudWatch
-# reports for the function.
+# reports for the function. A DynamoDB table's stream is two of them: the table the item
+# is written to, and the stream surface its records are read through.
 service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
-service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
-# The sink a handler's OWN outbound call writes in the stream-driven pipeline test is a
-# DynamoDB table, mounted on that same engine so the item is read back where a client
-# reads it.
+# The same table is the sink a handler's OWN outbound call writes to in the stream-driven
+# pipeline test, mounted on that same engine so the item is read back where a client reads
+# it.
 service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
+service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810 = { workspace = true }
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 
 [lints]
 workspace = true

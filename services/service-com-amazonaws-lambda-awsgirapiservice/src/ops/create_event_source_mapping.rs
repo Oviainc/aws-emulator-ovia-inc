@@ -813,7 +813,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Standing the mapping's poller up is what this call started: "Lambda reads items
         // from the event source and invokes the function", and the reading is the poller's.
         // Which poller depends on the kind of source — the queue loop, or this mapping's own
-        // reader of a Kinesis data stream's shards — and each decides for itself whether it
+        // reader of a shard source's shards — and each decides for itself whether it
         // has anything to do. The store's lock is released first (each poller takes it
         // itself) and nothing here waits for a poll: they run on their own clock.
         drop(store);
