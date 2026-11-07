@@ -12910,6 +12910,7 @@ dependencies = [
  "md-5 0.10.6",
  "memory-stats",
  "nix",
+ "rand 0.9.5",
  "rquickjs",
  "rustpython-pylib",
  "rustpython-ruff_python_ast",

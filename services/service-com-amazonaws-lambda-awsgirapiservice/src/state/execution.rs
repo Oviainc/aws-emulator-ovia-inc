@@ -275,6 +275,10 @@ pub struct Invocation {
     pub tenant_id: Option<String>,
     /// This invocation's request id.
     pub request_id: String,
+    /// What the run reports as `AWS_LAMBDA_INITIALIZATION_TYPE`: which kind of execution
+    /// environment is serving this invocation, as the admission that let it in decided
+    /// ([`super::execution_slot`]).
+    pub initialization_type: &'static str,
     /// How the handler reaches the rest of this emulator through the AWS SDK this runtime
     /// supplies it ([`aws_api`]), or `None` where there is no seam to dispatch a call on.
     pub aws: Option<AwsAccess>,
@@ -830,7 +834,10 @@ fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap
         ),
         ("AWS_REGION", invocation.region.clone()),
         ("AWS_DEFAULT_REGION", invocation.region.clone()),
-        ("AWS_LAMBDA_INITIALIZATION_TYPE", "on-demand".to_string()),
+        (
+            "AWS_LAMBDA_INITIALIZATION_TYPE",
+            invocation.initialization_type.to_string(),
+        ),
         // "AWS_LAMBDA_RUNTIME_API – … The host and port of the runtime API", which a
         // managed runtime's own environment always names. This emulator serves the
         // invocation to the handler in process rather than over that interface, so the
@@ -1110,6 +1117,7 @@ mod tests {
             client_context: None,
             tenant_id: None,
             request_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            initialization_type: crate::state::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,
             aws: None,
         };
         let environment = runtime_environment(&invocation, SystemTime::UNIX_EPOCH);
@@ -1123,6 +1131,7 @@ mod tests {
             ("LAMBDA_TASK_ROOT", "/var/task"),
             ("_HANDLER", "lambda_function.lambda_handler"),
             ("AWS_EXECUTION_ENV", "AWS_Lambda_python3.12"),
+            ("AWS_LAMBDA_INITIALIZATION_TYPE", "on-demand"),
         ];
         for (name, expected) in cases {
             let actual = environment.get(*name).map(String::as_str);

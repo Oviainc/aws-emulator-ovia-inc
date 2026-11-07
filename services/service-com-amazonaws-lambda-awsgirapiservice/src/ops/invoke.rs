@@ -471,7 +471,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store guard lives in THIS block and no longer: everything the run needs is
         // copied out of the record here, and the run below happens with no guard held, so
         // one caller's handler cannot stall another caller's request.
-        let (invocation, function_name, resource, kms_key_arn) = {
+        let (invocation, slot, function_name, resource, kms_key_arn) = {
             let mut store = state.lock();
         let (record, version) = crate::state::resolve_function(
             &mut store,
@@ -543,16 +543,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ExecutedVersion` is "the version of the function that executed. When you invoke
         // a function with an alias, this indicates which version the alias resolved to" —
-        // so it is the version the qualifier RESOLVES to (a number, or `$LATEST`), never
-        // the alias name the call addressed.
+        // so it is the version the qualifier resolves to for THIS invocation (a number, or
+        // `$LATEST`), never the alias name the call addressed. An alias that splits its
+        // invocations between two versions resolves per invocation
+        // (`crate::state::alias_routing`), which is what makes a weighted alias reach both.
         let executed_version = record
-            .resolved_version(&version)
+            .routed_version(&version)
             .unwrap_or_else(|| version.clone());
         let function_arn = record.versioned_arn(&version);
         // The configuration the invocation RESOLVED — a published version's frozen one, or
-        // the unpublished version's — which is what the run is performed under.
+        // the unpublished version's — which is what the run is performed under. It is read
+        // for the version this invocation resolved to, so the configuration the run happens
+        // under belongs to the version it reports.
         let resolved_config = record
-            .config_of(&version)
+            .config_of(&executed_version)
             .cloned()
             .unwrap_or_else(|| record.config.clone());
 
@@ -615,7 +619,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if stopped {
                 record.record_stopped_async_invocation(
                     &version,
-                    &crate::state::mint_request_id(),
+                    &crate::service::request_id_header::starting_invocation(),
                     payload,
                     now,
                 );
@@ -683,12 +687,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .first()
                         .cloned()
                         .unwrap_or_default(),
-                    zip_bytes: record.code_of(&version).zip_bytes.clone(),
+                    zip_bytes: record.code_of(&executed_version).zip_bytes.clone(),
                     layer_zips: crate::state::layer_archives(&resolved_config.layers),
                     payload: payload.clone(),
                     client_context: client_context.clone(),
                     tenant_id: input.tenant_id.clone(),
-                    request_id: crate::state::mint_request_id(),
+                    request_id: crate::service::request_id_header::starting_invocation(),
+                    // A queued event is delivered off the response path, so no execution
+                    // environment has been chosen for it at this point and none of the
+                    // qualifier's provisioned ones is holding it: the delivery runs on an
+                    // environment Lambda initialises for it
+                    // (`crate::state::execution_slot`).
+                    initialization_type:
+                        crate::state::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,
                     // The AWS SDK this runtime supplies the handler reaches the rest of
                     // this emulator through, built from the callback the framework handed
                     // THIS request — the same seam a synchronous invocation's run gets.
@@ -736,16 +747,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The invocation is admitted to the function at this point, so it is metered before
-        // the run is attempted: the datapoint counts this invocation request, and reports
-        // nothing about what the execution produced.
-        //
         // Everything the RUN needs is copied out of the record first, because the run
         // happens with no store guard held: one caller's handler cannot stall another
         // caller's request.
-        let zip_bytes = record.code_of(&version).zip_bytes.clone();
+        // The package the run reads is the one of the version this invocation resolved to,
+        // so a weighted alias runs the code of the version it reports.
+        let zip_bytes = record.code_of(&executed_version).zip_bytes.clone();
         let kms_key_arn = resolved_config.kms_key_arn.clone();
         drop(store);
+        // Lambda ADMITS the invocation to the function only while the function's own
+        // concurrency pool has room for it — "Lambda returns TooManyRequestsException if
+        // running the function would cause you to exceed a concurrency limit at either the
+        // account level […] or function level" — so the slot is claimed before the run and
+        // held until this invocation is done, whatever it comes to
+        // (`crate::state::execution_slot`). The admission also decides which kind of
+        // execution environment serves it, which the run reports to the handler.
+        let admitted = crate::state::admit_invocation(&state, &function_name, &version, now)
+            .map_err(throttled)?;
         let invocation = crate::state::Invocation {
             function_name: function_name.clone(),
             executed_version: executed_version.clone(),
@@ -766,14 +784,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             payload,
             client_context: client_context.clone(),
             tenant_id: input.tenant_id.clone(),
-            request_id: crate::state::mint_request_id(),
+            // The invocation this call runs is the one its answer names: the id the run
+            // reports as `context.aws_request_id`, writes into its `START`/`END`/`REPORT`
+            // lines and carries in the error document of a handler that raised (see
+            // `crate::service::request_id_header`).
+            request_id: crate::service::request_id_header::starting_invocation(),
+            initialization_type: admitted.initialization_type,
             // The AWS SDK this runtime supplies the handler reaches the rest of this
             // emulator through the callback the framework handed THIS request.
             aws: crate::state::AwsAccess::new(ctx.callback().clone(), &region),
         };
-            (invocation, function_name, resource, kms_key_arn)
+            (invocation, admitted.slot, function_name, resource, kms_key_arn)
         };
+        // The slot this invocation holds, released when it goes out of scope — which is when
+        // this invocation is answered, however it ends.
+        let _slot = slot;
         let executed_version = invocation.executed_version.clone();
+        // The invocation is admitted to the function at this point, so it is metered before
+        // the run is attempted: the datapoint counts this invocation request, and reports
+        // nothing about what the execution produced.
         crate::state::publish_invocation(&*self.engine, &function_name, &resource);
 
         // A function whose environment variables are encrypted with a customer managed key
@@ -847,6 +876,25 @@ fn environment_key_refusal(fault: crate::state::EnvironmentKeyFault) -> InvokeEr
             })
         }
     }
+    .into()
+}
+
+/// How an invocation the function's concurrency pool had no room for is answered: the
+/// modelled 429, naming the limit that was reached.
+///
+/// "Lambda returns `TooManyRequestsException` if running the function would cause you to
+/// exceed a concurrency limit at either the account level
+/// (`ConcurrentInvocationLimitExceeded`) or function level
+/// (`ReservedFunctionConcurrentInvocationLimitExceeded`)": the `Reason` is the one the
+/// admission decided (`crate::state::execution_slot`), so a client can tell which pool it
+/// has to wait for.
+fn throttled(refused: crate::state::Throttled) -> InvokeError {
+    InvokeErrorModeled::TooManyRequestsException(TooManyRequestsException {
+        r#type: None,
+        message: Some(refused.message),
+        reason: Some(refused.reason.to_string()),
+        retry_after_seconds: None,
+    })
     .into()
 }
 

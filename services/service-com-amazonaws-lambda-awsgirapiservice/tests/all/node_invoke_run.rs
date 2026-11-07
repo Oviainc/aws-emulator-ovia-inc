@@ -119,7 +119,10 @@ async fn call(
 
 /// A .zip deployment package holding `entries`, written in memory the way a caller uploads
 /// one.
-fn package(entries: &[(&str, &str)]) -> Vec<u8> {
+///
+/// `pub(crate)` so a sibling suite that packages a node handler drives the same writer
+/// rather than a third copy of it.
+pub(crate) fn package(entries: &[(&str, &str)]) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);

@@ -2596,6 +2596,18 @@ impl AliasRecord {
     }
 }
 
+/// WHICH VERSION one invocation of an alias runs on: the traffic split an alias's routing
+/// configuration performs, applied per invocation. Implements
+/// [`AliasRecord::routed_version`] and [`FunctionRecord::routed_version`]; see the module's
+/// own header.
+pub mod alias_routing;
+
+/// The CONCURRENCY one invocation holds while it runs: the slot an admitted invocation takes,
+/// the admission that hands it out and the throttle for one that cannot be admitted; see the
+/// module's own header.
+pub mod execution_slot;
+pub use execution_slot::{admit_invocation, Admitted, ExecutionSlot, Throttled};
+
 /// The FUNCTION RECORD: one Lambda function as this emulator holds it, and everything a
 /// read of that function reports out of what is stored.
 ///

@@ -77,13 +77,25 @@ pub struct FunctionRecord {
     /// invocation counts from the moment Lambda hands it to an instance of this function
     /// until that run ends.
     ///
-    /// It is what the account's concurrency metering charges to this function's reservation,
-    /// or to the account's unreserved pool when it reserves nothing (see
-    /// [`crate::state::concurrency_metering`]). No invocation in this emulator runs a
-    /// deployment package — `Invoke` refuses the run ([`crate::ops::invoke`]) — so a
-    /// function whose runs were all refused is processing none of them, and the metering
-    /// reports that rather than a concurrency nothing was using.
+    /// It is what the function's RESERVATION bounds — "Concurrency settings apply to the
+    /// function as a whole, including all published versions and the unpublished version"
+    /// (`PutFunctionConcurrency`), so every qualifier of the function draws on the one count
+    /// — and what the account's concurrency metering charges to that reservation, or to the
+    /// account's unreserved pool when the function reserves nothing (see
+    /// [`crate::state::concurrency_metering`]). It is claimed and released by the slot one
+    /// admitted invocation holds ([`crate::state::execution_slot`]), so what it reports is
+    /// the runs that are really in flight.
     pub concurrent_executions: i32,
+    /// How many of those executions each QUALIFIER of this function is processing, keyed by
+    /// the qualifier the invocation addressed — an alias name, a published version number or
+    /// [`VERSION_LATEST`].
+    ///
+    /// Provisioned concurrency is allocated per alias or version
+    /// ([`Self::provisioned_concurrency_configs`]), so deciding whether an invocation is
+    /// served by one of those initialised environments is a question about that qualifier's
+    /// own in-flight count rather than about the function's. Held and released by the same
+    /// slot as [`Self::concurrent_executions`]; a qualifier processing nothing holds no entry.
+    pub in_flight_by_qualifier: BTreeMap<String, i32>,
     /// The ARN of the code signing configuration this function deploys under, when one
     /// has been associated with it. It is a function-level setting — the association is
     /// addressed by a `FunctionName` alone, with no qualifier member anywhere on

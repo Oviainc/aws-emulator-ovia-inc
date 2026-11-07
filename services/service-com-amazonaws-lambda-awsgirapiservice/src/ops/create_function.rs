@@ -649,6 +649,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ... and no execution running on it: an invocation is charged to the function
             // it runs on, and nothing has been handed to this one yet.
             concurrent_executions: 0,
+            in_flight_by_qualifier: ::std::collections::BTreeMap::new(),
             // The code signing configuration this function deploys under, when the
             // request named one; a function created without one is associated with none
             // until `PutFunctionCodeSigningConfig` associates one.

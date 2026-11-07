@@ -31,6 +31,8 @@ mod alias_name_constraint;
 mod alias_not_found_sentence;
 #[path = "all/alias_update.rs"]
 mod alias_update;
+#[path = "all/alias_weighted_routing.rs"]
+mod alias_weighted_routing;
 #[path = "all/alias_update_not_found_sentence.rs"]
 mod alias_update_not_found_sentence;
 #[path = "all/alias_version_not_found_sentence.rs"]
@@ -195,12 +197,16 @@ mod function_versions_by_capacity_provider;
 mod functions_by_code_signing_config;
 #[path = "all/handler_aws_sdk.rs"]
 mod handler_aws_sdk;
+#[path = "all/invocation_concurrency.rs"]
+mod invocation_concurrency;
 #[path = "all/invocation_count_series.rs"]
 mod invocation_count_series;
 #[path = "all/invocation_refusal_diagnostics.rs"]
 mod invocation_refusal_diagnostics;
 #[path = "all/invoke_addressed_function.rs"]
 mod invoke_addressed_function;
+#[path = "all/invoke_request_id.rs"]
+mod invoke_request_id;
 #[path = "all/invoke_authorization.rs"]
 mod invoke_authorization;
 #[path = "all/invoke_authorization_ceiling.rs"]

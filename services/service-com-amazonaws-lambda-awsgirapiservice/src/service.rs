@@ -287,8 +287,12 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     downloads: Downloads<Eng>,
     /// Serves `InvokeWithResponseStream`, whose `@streaming`-union output the generated
     /// routing-table entry declines; from the same shared engine, for the same reason.
-    response_stream: EventStreamRoute<
-        crate::ops::invoke_with_response_stream::ResponseStreamEntry<Eng>,
+    ///
+    /// It is served NAMING its request, as every other answer of this service is: a
+    /// response-streaming invocation is an invocation, so its answer carries the id of the
+    /// invocation it ran (see [`request_id_header`]).
+    response_stream: NamingItsRequest<
+        EventStreamRoute<crate::ops::invoke_with_response_stream::ResponseStreamEntry<Eng>>,
     >,
     /// Serves the FUNCTION URL endpoints `CreateFunctionUrlConfig` hands out, from the same
     /// shared engine, for the same reason as [`Downloads`]: a request to one names no
@@ -415,11 +419,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         );
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
-            response_stream: EventStreamRoute(
+            response_stream: NamingItsRequest(EventStreamRoute(
                 crate::ops::invoke_with_response_stream::ResponseStreamEntry::new(Arc::clone(
                     &engine,
                 )),
-            ),
+            )),
             downloads: Downloads {
                 engine: Arc::clone(&engine),
             },
@@ -427,6 +431,35 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             function_urls_aws_iam: function_url::FunctionUrlPlane::aws_iam(Arc::clone(&engine)),
             stated,
         }
+    }
+}
+
+/// Serves one operation that is NOT wrapped in [`StatedPerOperation`] — the
+/// response-streaming invocation, which implements no `smithy_server_runtime::Operation` to
+/// wrap — and names the request on its answer.
+///
+/// It adds nothing else: the request, the service and the context are handed to the inner
+/// entry unchanged, so its input check, its handler and its event-stream body are its own.
+/// The naming is the service's one rule for every answer it sends, including the id of an
+/// invocation the call ran (see [`request_id_header`]).
+struct NamingItsRequest<O>(O);
+
+impl<O: ErasedOperation + 'static> ErasedOperation for NamingItsRequest<O> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(request_id_header::naming_its_request(
+            self.0.run(svc, req, ctx),
+        ))
+    }
+
+    /// The inner entry's modelled auth schemes: naming a response must not change which
+    /// schemes sign the request.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.0.auth_schemes()
     }
 }
 
@@ -542,7 +575,11 @@ where
         req: &'r RtRequest,
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
-        Box::pin(async move {
+        // Every answer names the request it answered, and an answer that started an
+        // INVOCATION names that invocation (see [`request_id_header`]): the whole run is
+        // served inside that scope, so the operation can state the invocation it started at
+        // the moment it mints it.
+        Box::pin(request_id_header::naming_its_request(async move {
             // A request whose BODY is past the quota published for this operation is
             // refused on its size alone, before it is read as an input at all: that is
             // what makes the refusal a 413 about the request rather than a 400 about what
@@ -577,12 +614,8 @@ where
             // An INVOCATION's response body is the document the function produced, which
             // is announced as the JSON it is (see [`invoke_media_type`]).
             let answered = invoke_media_type::announced(O::NAME, answered);
-            // And every answer names the request it answered, which is where an SDK reads
-            // the `RequestId` of its response metadata from (see [`request_id_header`]).
-            request_id_header::with_request_id_header(fault_class::with_fault_class(
-                O::NAME, answered,
-            ))
-        })
+            fault_class::with_fault_class(O::NAME, answered)
+        }))
     }
 
     /// The wrapped operation's modelled auth schemes: wrapping an operation must not change

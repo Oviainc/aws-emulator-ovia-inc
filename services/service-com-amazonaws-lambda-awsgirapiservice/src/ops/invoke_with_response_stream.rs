@@ -312,7 +312,7 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
 
         // The store guard lives in THIS block and no longer: everything the run needs is
         // copied out of the record here, and the run below happens with no guard held.
-        let (invocation, function_name, resource, kms_key_arn, stopped) = {
+        let (mut invocation, function_name, resource, kms_key_arn, stopped, qualifier) = {
             let mut store = state.lock();
         let (record, version) = crate::state::resolve_function(
             &mut store,
@@ -381,14 +381,15 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
         }
 
         let function_arn = record.versioned_arn(&version);
-        // `ExecutedVersion` is the version the qualifier RESOLVES to, never the alias name
-        // the call addressed.
+        // `ExecutedVersion` is the version the qualifier resolves to for THIS invocation,
+        // never the alias name the call addressed; an alias that splits its invocations
+        // between two versions resolves per invocation (`crate::state::alias_routing`).
         let executed_version = record
-            .resolved_version(&version)
+            .routed_version(&version)
             .unwrap_or_else(|| version.clone());
         // The configuration the invocation RESOLVED, which is what the run happens under.
         let resolved_config = record
-            .config_of(&version)
+            .config_of(&executed_version)
             .cloned()
             .unwrap_or_else(|| record.config.clone());
 
@@ -430,24 +431,50 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
                 .first()
                 .cloned()
                 .unwrap_or_default(),
-            zip_bytes: record.code_of(&version).zip_bytes.clone(),
+            zip_bytes: record.code_of(&executed_version).zip_bytes.clone(),
             layer_zips: crate::state::layer_archives(&resolved_config.layers),
             payload: payload.to_vec(),
             client_context,
             tenant_id: input.tenant_id.clone(),
+            // The run's own id, minted here with the rest of what the run needs. It is
+            // stated as the invocation this answer names once the invocation is ADMITTED
+            // below, so a request refused instead keeps a response id of its own (see
+            // `crate::service::request_id_header`).
             request_id: crate::state::mint_request_id(),
+            // Which kind of environment serves it is the admission's to decide, below:
+            // nothing has been admitted while the store guard is still held.
+            initialization_type: crate::state::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,
             // The AWS SDK this runtime supplies the handler reaches the rest of this
             // emulator through the callback the framework handed THIS request.
             aws: crate::state::AwsAccess::new(ctx.callback().clone(), &region),
         };
         let kms_key_arn = resolved_config.kms_key_arn.clone();
-            (invocation, function_name, resource, kms_key_arn, stopped)
+            (
+                invocation,
+                function_name,
+                resource,
+                kms_key_arn,
+                stopped,
+                version,
+            )
         };
         let executed_version = invocation.executed_version.clone();
         if stopped {
             crate::state::publish_recursive_invocation_dropped(&*self.engine, &function_name);
             return Err(recursive_invocation());
         }
+        // Lambda admits the invocation to the function only while the function's own
+        // concurrency pool has room for it, and a response-streaming invocation draws on the
+        // SAME pool every other invocation of the function does — "concurrency settings
+        // apply to the function as a whole" (`PutFunctionConcurrency`). The slot is held
+        // until this invocation is answered, and the admission decides which kind of
+        // environment serves it (`crate::state::execution_slot`).
+        let admitted = crate::state::admit_invocation(&state, &function_name, &qualifier, now)
+            .map_err(throttled)?;
+        invocation.initialization_type = admitted.initialization_type;
+        let _slot = admitted.slot;
+        // The invocation this call runs is the one its answer names, exactly as on `Invoke`.
+        crate::service::request_id_header::serving_invocation(&invocation.request_id);
         // The invocation is admitted to the function at this point, so it is metered as one
         // `Invocations` datapoint of the function and of the resource this call addressed
         // (`crate::state::metrics`) before the run is attempted: the count is of invocation
@@ -622,6 +649,19 @@ fn environment_key_refusal(
             )
         }
     }
+    .into()
+}
+
+/// How an invocation the function's concurrency pool had no room for is answered: the
+/// modelled 429 naming the limit that was reached, exactly as `Invoke` answers one
+/// (`crate::state::execution_slot`).
+fn throttled(refused: crate::state::Throttled) -> InvokeWithResponseStreamError {
+    InvokeWithResponseStreamErrorModeled::TooManyRequestsException(TooManyRequestsException {
+        r#type: None,
+        message: Some(refused.message),
+        reason: Some(refused.reason.to_string()),
+        retry_after_seconds: None,
+    })
     .into()
 }
 

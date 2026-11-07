@@ -245,7 +245,7 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
             request_id: &request_id,
             received: ::std::time::SystemTime::now(),
         };
-        let prepared = match self.prepare(&target, &incoming, ctx) {
+        let mut prepared = match self.prepare(&target, &incoming, ctx) {
             Ok(prepared) => prepared,
             Err(response) => return *response,
         };
@@ -269,6 +269,37 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
             );
             return bad_gateway(&request_id);
         }
+        // A function URL request is an invocation of the function, so it draws on the SAME
+        // concurrency pool every other invocation does — "concurrency settings apply to the
+        // function as a whole, including all published versions and the unpublished version"
+        // (`PutFunctionConcurrency`). It is admitted the way `Invoke`'s is, holds its slot
+        // until the run ends however it ends, and a request the pool has no room for is
+        // answered as the throttle it is with nothing run
+        // (`crate::state::execution_slot`).
+        let _slot = match crate::state::service_state(&*self.engine).map(|state| {
+            crate::state::admit_invocation(
+                &state,
+                &prepared.invocation.function_name,
+                &prepared.qualifier,
+                ::std::time::SystemTime::now(),
+            )
+        }) {
+            Some(Ok(admitted)) => {
+                prepared.invocation.initialization_type = admitted.initialization_type;
+                Some(admitted.slot)
+            }
+            Some(Err(throttled)) => {
+                ::tracing::info!(
+                    request_id = %request_id,
+                    function = %prepared.invocation.function_name,
+                    reason = %throttled.reason,
+                    "a function URL request found the function's concurrency pool full, so \
+                     nothing ran"
+                );
+                return plane_error(THROTTLED_STATUS, &throttled.message);
+            }
+            None => None,
+        };
         // The invocation is admitted to the function at this point, so it is metered as one
         // `Invocations` datapoint of the function and of the resource the URL addressed,
         // before the run is attempted: the count is of invocation requests that reached the
@@ -396,14 +427,18 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
             crate::state::publish_recursive_invocation_dropped(&*self.engine, &function_name);
             return Err(Box::new(bad_gateway(request_id)));
         }
+        let function_name = record.config.name.clone();
+        // The version this invocation resolved to: a URL attached to an alias that splits its
+        // invocations between two versions resolves per invocation
+        // (`crate::state::alias_routing`), so the configuration and the package the run uses
+        // are the ones of the version it was routed to.
+        let executed_version = record
+            .routed_version(&version)
+            .unwrap_or_else(|| version.clone());
         let resolved_config = record
-            .config_of(&version)
+            .config_of(&executed_version)
             .cloned()
             .unwrap_or_else(|| record.config.clone());
-        let function_name = record.config.name.clone();
-        let executed_version = record
-            .resolved_version(&version)
-            .unwrap_or_else(|| version.clone());
         let invocation = crate::state::Invocation {
             function_name: function_name.clone(),
             executed_version: executed_version.clone(),
@@ -419,7 +454,7 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
                 .first()
                 .cloned()
                 .unwrap_or_default(),
-            zip_bytes: record.code_of(&version).zip_bytes.clone(),
+            zip_bytes: record.code_of(&executed_version).zip_bytes.clone(),
             layer_zips: crate::state::layer_archives(&resolved_config.layers),
             payload: self.event_for(target, incoming, ctx, &record.region),
             // A function URL request carries no `ClientContext` and no `TenantId`: both are
@@ -427,12 +462,16 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
             client_context: None,
             tenant_id: None,
             request_id: request_id.to_string(),
+            // Which kind of environment serves it is the admission's to decide, once this
+            // store guard is released (`crate::state::execution_slot`).
+            initialization_type: crate::state::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,
             // The AWS SDK this runtime supplies the handler reaches the rest of this
             // emulator through the callback the framework handed THIS request.
             aws: crate::state::AwsAccess::new(ctx.callback().clone(), &record.region),
         };
         Ok(Prepared {
             resource: crate::state::invoked_resource(&function_name, &version),
+            qualifier: version,
             kms_key_arn: resolved_config.kms_key_arn.clone(),
             invocation,
         })
@@ -504,6 +543,10 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
 /// The `AuthType` whose URLs are served to authenticated callers only.
 const AUTH_TYPE_AWS_IAM: &str = "AWS_IAM";
 
+/// The status a request the function's concurrency pool had no room for is answered with:
+/// the throttle AWS answers an invocation past a concurrency limit with.
+const THROTTLED_STATUS: u16 = 429;
+
 /// The status a request addressing a function URL this store no longer holds is answered
 /// with: the endpoint names nothing.
 const NOT_FOUND_STATUS: u16 = 404;
@@ -528,6 +571,9 @@ struct Prepared {
     invocation: crate::state::Invocation,
     /// The resource this invocation is metered against.
     resource: String,
+    /// The version label the URL addressed — the alias the URL is attached to, or the
+    /// unpublished version — which the invocation is admitted against.
+    qualifier: String,
     /// The key the function's environment variables are encrypted with, when it has one.
     kms_key_arn: Option<String>,
 }

@@ -365,15 +365,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let chain = crate::state::request_chain(ctx);
         let stopped = crate::state::guardrail(record, chain.as_deref(), now)
             == crate::state::Guardrail::Stopped;
+        // The version this invocation resolved to: an alias that splits its invocations
+        // between two versions resolves per invocation (`crate::state::alias_routing`), so
+        // the configuration, the package and the version reported are all that version's.
+        let executed_version = record
+            .routed_version(&version)
+            .unwrap_or_else(|| version.clone());
         // The configuration the invocation RESOLVED — a published version's frozen one, or
         // the unpublished version's — which is what the run is performed under.
         let resolved_config = record
-            .config_of(&version)
+            .config_of(&executed_version)
             .cloned()
             .unwrap_or_else(|| record.config.clone());
         let function_name = record.config.name.clone();
         let resource = crate::state::invoked_resource(&function_name, &version);
-        let request_id = crate::state::mint_request_id();
+        // The invocation this call accepts is the one its answer names: the id the run
+        // reports as `context.aws_request_id` and logs its own lines under (see
+        // `crate::service::request_id_header`).
+        let request_id = crate::service::request_id_header::starting_invocation();
         let delivered = if stopped {
             record.record_stopped_async_invocation(&version, &request_id, input.invoke_args, now);
             None
@@ -385,9 +394,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 function_name: function_name.clone(),
                 // "The version of the function that executed" — the version this call
                 // resolved, which for an unqualified `FunctionName` is the unpublished one.
-                executed_version: record
-                    .resolved_version(&version)
-                    .unwrap_or_else(|| version.clone()),
+                executed_version: executed_version.clone(),
                 invoked_function_arn: record.versioned_arn(&version),
                 region: region.clone(),
                 runtime: resolved_config.runtime.clone(),
@@ -400,7 +407,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .first()
                     .cloned()
                     .unwrap_or_default(),
-                zip_bytes: record.code_of(&version).zip_bytes.clone(),
+                zip_bytes: record.code_of(&executed_version).zip_bytes.clone(),
                 layer_zips: crate::state::layer_archives(&resolved_config.layers),
                 payload: input.invoke_args.clone(),
                 // This operation carries neither member, so the run is given neither: a
@@ -409,6 +416,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 client_context: None,
                 tenant_id: None,
                 request_id: request_id.clone(),
+                // A queued event is delivered off the response path, on an environment
+                // Lambda initialises for that delivery (`crate::state::execution_slot`).
+                initialization_type: crate::state::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,
                 // The AWS SDK this runtime supplies the handler reaches the rest of this
                 // emulator through, built from the callback the framework handed THIS
                 // request — the same seam a synchronous invocation's run gets.

@@ -251,13 +251,31 @@ pub fn with_request_id(mut resp: RtResponse) -> RtResponse {
 /// and two layers of one service cannot report two ids for one call. A header the HTTP
 /// layer will not carry is dropped rather than turned into a transport failure, which on
 /// an error path would replace a modelled 4xx with a 500 an SDK retries.
-pub fn with_request_id_header(mut resp: RtResponse) -> RtResponse {
+pub fn with_request_id_header(resp: RtResponse) -> RtResponse {
+    with_stated_request_id_header(resp, &new_request_id())
+}
+
+/// The response with `request_id` named as the request it answers, in that same header:
+/// the report for an answer whose service ALREADY knows which request it is.
+///
+/// [`with_request_id_header`] mints the id, because for almost every call the correlation
+/// id belongs to the response alone and nothing else holds one. Where the operation that
+/// served the call already has the id AWS reports for it — a call that started work which
+/// names its own id everywhere else it is observable — the response states THAT id instead
+/// of a second one, so a client correlating the call with the work it started reads one
+/// value in both places.
+///
+/// Idempotent and lossless exactly as [`with_request_id_header`] is: a response that
+/// already names its request keeps the id it has, the body, the status and every other
+/// header are left as the renderer wrote them, and a header the HTTP layer will not carry
+/// is dropped rather than turned into a transport failure.
+pub fn with_stated_request_id_header(mut resp: RtResponse, request_id: &str) -> RtResponse {
     if resp.headers().get(REQUEST_ID_HEADER).is_some() {
         return resp;
     }
     let _ = resp
         .headers_mut()
-        .try_insert(REQUEST_ID_HEADER, new_request_id());
+        .try_insert(REQUEST_ID_HEADER, request_id.to_string());
     resp
 }
 
@@ -868,6 +886,46 @@ mod tests {
             Some(stated),
             "a response that already names its request keeps that id"
         );
+    }
+
+    /// The STATED report names the id its caller holds, on every response, and keeps the id
+    /// a response already names — so a service whose call already knows which request it
+    /// answered reports that one id and no second one.
+    ///
+    /// The rows span the responses it is applied to: a success, an empty-bodied success and
+    /// an error document.
+    #[test]
+    fn the_stated_report_names_the_id_it_was_given() {
+        let stated = "11112222-3333-4444-5555-666677778888";
+        for (case, status, body) in [
+            ("a success", 200u16, "{\"ran\":true}"),
+            ("an empty-bodied success", 204, ""),
+            ("an error document", 429, "{\"message\":\"Rate Exceeded.\"}"),
+        ] {
+            let response = RtResponse::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(status)
+                    .expect("the test status is valid"),
+                SdkBody::from(body),
+            );
+            let named = with_stated_request_id_header(response, stated);
+            assert_eq!(
+                named.headers().get(REQUEST_ID_HEADER),
+                Some(stated),
+                "case {case:?}: expected the response to name the id it was given"
+            );
+            assert_eq!(
+                named.body().bytes(),
+                Some(body.as_bytes()),
+                "case {case:?}: the body must not change"
+            );
+            // And the header-only report leaves that id alone rather than minting a second.
+            let kept = with_request_id_header(named);
+            assert_eq!(
+                kept.headers().get(REQUEST_ID_HEADER),
+                Some(stated),
+                "case {case:?}: a response that already names its request keeps that id"
+            );
+        }
     }
 
     /// One response names ONE request: the id a rendered document already states is the id

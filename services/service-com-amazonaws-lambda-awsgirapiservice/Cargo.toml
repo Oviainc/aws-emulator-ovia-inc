@@ -150,6 +150,10 @@ rustpython-ruff_source_file = "=0.16.5"
 rustpython-ruff_text_size = "=0.16.5"
 nix = { version = "0.31", default-features = false, features = ["resource"] }
 memory-stats = "1"
+# The TRAFFIC SPLIT an alias with a `RoutingConfig` performs: one uniform draw per
+# invocation decides which of the two versions that invocation runs on
+# (`state::alias_routing`).
+rand = "0.9"
 # A deployment package is a .zip archive, and the handler's module is one entry in it.
 # Read with `deflate` alone — no other compression method is linked in — and never
 # extracted to a host path.
