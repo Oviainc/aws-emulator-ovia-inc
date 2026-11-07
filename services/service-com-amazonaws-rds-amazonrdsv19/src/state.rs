@@ -208,6 +208,9 @@ pub use tenant_databases::{
 // (two wire protocols and a SQL engine), and only the record the store holds and the
 // opener a create calls are reached from here.
 pub mod data_plane;
+// The subnets a request NAMES, resolved against the service that owns them: a subnet's
+// Availability Zone is Amazon EC2's fact, and this is the one place this crate asks for it.
+pub mod ec2_subnets;
 mod instances;
 mod clusters;
 // The Secrets Manager secret RDS manages for a resource's master user password: the
@@ -238,6 +241,7 @@ pub use data_plane::{
     capture_instance_storage, engine_wire, open_engine_endpoint, DbEngineEndpoint, EngineWire,
     ServedEndpoint,
 };
+pub use ec2_subnets::{subnet_zones, SubnetZones};
 
 /// Per-service state for com-amazonaws-rds-amazonrdsv19. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -1736,6 +1740,14 @@ pub struct DbSubnetGroupRecord {
     pub description: String,
     /// The EC2 subnet ids the request named, in the order it named them.
     pub subnet_ids: Vec<String>,
+    /// The Availability Zone of each of [`Self::subnet_ids`], as Amazon EC2 — the service
+    /// that owns subnets — reported it when the group was created or last modified
+    /// ([`crate::state::subnet_zones`]).
+    ///
+    /// A subnet EC2 answered for no zone (one the account does not have, or one asked about
+    /// where EC2 is not mounted) is simply absent: the group then reports no zone for that
+    /// subnet rather than one this service chose.
+    pub subnet_zones: BTreeMap<String, String>,
     pub tags: Vec<Tag>,
 }
 
@@ -1750,6 +1762,7 @@ impl DbSubnetGroupRecord {
             region: region.to_string(),
             description: DEFAULT_DB_SUBNET_GROUP.to_string(),
             subnet_ids: Vec::new(),
+            subnet_zones: BTreeMap::new(),
             tags: Vec::new(),
         }
     }
@@ -1780,12 +1793,15 @@ impl DbSubnetGroupRecord {
                         subnet_identifier: Some(id.clone()),
                         subnet_status: Some("Active".to_string()),
                         // The Availability Zone a subnet lies in is an EC2 fact RDS reads
-                        // off the subnet; this service resolves it from the subnet's own
-                        // id ([`subnet_availability_zone`]), so one subnet is always
-                        // reported in one zone and a client can tell which zones the
-                        // group covers.
-                        subnet_availability_zone: Some(AvailabilityZone {
-                            name: Some(subnet_availability_zone(&self.region, id)),
+                        // off the subnet, so it is the zone the owner of subnets answered
+                        // with for this very id ([`Self::subnet_zones`]) and never a value
+                        // built here. A subnet EC2 answered for no zone reports NONE: the
+                        // member is omitted rather than filled with a zone the subnet may
+                        // not be in.
+                        subnet_availability_zone: self.subnet_zones.get(id).map(|zone| {
+                            AvailabilityZone {
+                                name: Some(zone.clone()),
+                            }
                         }),
                         // `SubnetOutpost` describes a subnet on an Outpost. Nothing here
                         // is on one, so the element is reported EMPTY — which says the
@@ -2320,25 +2336,18 @@ pub enum SubnetListRejection {
     NotEnoughAvailabilityZones(String),
 }
 
-/// Refuse a `SubnetIds` list a DB subnet group cannot be made of, whichever operation
-/// carries it: a list that names no subnet at all ([`EMPTY_SUBNET_LIST_MESSAGE`]), the
-/// published allowance for ONE group ([`MAX_SUBNETS_PER_DB_SUBNET_GROUP`]), the EC2 subnet
-/// id form ([`check_subnet_id`]), and the documented coverage requirement ("DB subnet groups
-/// must contain at least one subnet in at least two AZs in the Amazon Web Services
-/// Region").
+/// Refuse a `SubnetIds` list THE REQUEST ALONE settles cannot make up a DB subnet group: a
+/// list that names no subnet at all ([`EMPTY_SUBNET_LIST_MESSAGE`]), one past the published
+/// allowance for ONE group ([`MAX_SUBNETS_PER_DB_SUBNET_GROUP`]), and a value that is not of
+/// the EC2 subnet id form ([`check_subnet_id`]).
 ///
-/// The order is the order the rules DEPEND on each other. A list with no entries is
-/// unusable as a list — there is no subnet to be of the wrong form and none to resolve a
-/// zone for — so it is refused as the list it is; the per-entry form comes next, and the
-/// Availability Zone coverage last, since coverage is a statement about subnets that are
-/// there.
-///
-/// A subnet lies in exactly ONE Availability Zone, so a list naming fewer than two DISTINCT
-/// subnets cannot cover two zones whatever those subnets are — which is what the request
-/// alone settles, and so what is refused here. The refusal NAMES the coverage those subnets
-/// resolve to ([`subnet_availability_zone`]), which is what RDS reports.
-pub fn check_db_subnet_group_subnets(
-    region: &str,
+/// Called BEFORE the subnets are resolved against the service that owns them
+/// ([`subnet_zones`]), and that order is the point: these three rules need nothing but the
+/// request, so a list that breaks one is refused without a single hop, and the number of
+/// identifiers that reach the resolution is capped by [`MAX_SUBNETS_PER_DB_SUBNET_GROUP`]
+/// rather than by what a caller chose to send. The coverage rule, which is a statement about
+/// the subnets' zones, follows in [`check_db_subnet_group_zone_coverage`].
+pub fn check_db_subnet_group_subnet_list(
     subnet_ids: &[String],
 ) -> Result<(), SubnetListRejection> {
     if subnet_ids.is_empty() {
@@ -2356,12 +2365,34 @@ pub fn check_db_subnet_group_subnets(
     for subnet_id in subnet_ids {
         check_subnet_id(subnet_id).map_err(SubnetListRejection::NotASubnet)?;
     }
+    Ok(())
+}
+
+/// Refuse a `SubnetIds` list whose subnets cover fewer Availability Zones than a DB subnet
+/// group must ("DB subnet groups must contain at least one subnet in at least two AZs in the
+/// Amazon Web Services Region"), whichever operation carries it.
+///
+/// A subnet lies in exactly ONE Availability Zone, and WHICH zone is Amazon EC2's fact: the
+/// coverage is therefore counted over the zones `zones` carries for the request's own
+/// subnets ([`subnet_zones`]), so two subnets of one zone cover one zone and two subnets of
+/// two zones cover two. The refusal NAMES the coverage those subnets add up to — the same
+/// zones the group's `Subnets` report — which is what RDS reports.
+///
+/// A subnet EC2 answered no zone for lies in a zone this service does not know, which is not
+/// evidence that the list covers too few: it counts as a zone that may be any of them, so
+/// nothing is refused on an assumed zone — and a deployment where the owner of subnets
+/// cannot be asked at all refuses nothing on that silence.
+///
+/// Comes after [`check_db_subnet_group_subnet_list`], whose rules the list has to pass
+/// first: coverage is a statement about subnets that are there.
+pub fn check_db_subnet_group_zone_coverage(
+    subnet_ids: &[String],
+    zones: &SubnetZones,
+) -> Result<(), SubnetListRejection> {
     let distinct: BTreeSet<&str> = subnet_ids.iter().map(String::as_str).collect();
-    if distinct.len() < MIN_DB_SUBNET_GROUP_AVAILABILITY_ZONES {
-        let covered: BTreeSet<String> = distinct
-            .iter()
-            .map(|subnet_id| subnet_availability_zone(region, subnet_id))
-            .collect();
+    let covered = zones.covered(distinct.iter().copied());
+    let unknown = zones.unresolved(distinct.iter().copied());
+    if covered.len().saturating_add(unknown) < MIN_DB_SUBNET_GROUP_AVAILABILITY_ZONES {
         return Err(SubnetListRejection::NotEnoughAvailabilityZones(
             db_subnet_group_az_coverage_message(&covered),
         ));
@@ -2828,28 +2859,16 @@ pub fn default_security_group_id(region: &str) -> String {
 /// (`vpc-0a1b2c3d4e5f60718`, `sg-0a1b2c3d4e5f60718`).
 const EC2_ID_WIDTH: usize = 17;
 
-/// The Availability Zone a subnet lies in: the zone of its region the subnet's own id maps
-/// to.
-///
-/// Derived from the subnet id alone, so ONE subnet is reported in one zone whichever group
-/// names it and however often it is read, and a group naming several subnets covers
-/// several zones — which is the fact a `DBSubnetGroupDoesNotCoverEnoughAZs` is about and
-/// the one a client reads `Subnet$SubnetAvailabilityZone` for.
-pub fn subnet_availability_zone(region: &str, subnet_id: &str) -> String {
-    use ::sha2::{Digest, Sha256};
-
-    let index = usize::from(Sha256::digest(subnet_id.as_bytes())[0]) % AVAILABILITY_ZONE_SUFFIXES.len();
-    format!("{region}{}", AVAILABILITY_ZONE_SUFFIXES[index])
-}
-
 /// How AWS names the Availability Zones of a region: the region's name and a letter.
 pub const AVAILABILITY_ZONE_SUFFIXES: [&str; 3] = ["a", "b", "c"];
 
 /// The Availability Zones of `region`, in the order the region publishes them.
 ///
-/// One list, so what a cluster reports as the zones it spans, what a subnet resolves into
-/// ([`subnet_availability_zone`]) and what a refusal names as the zones a DB subnet group
-/// does not cover are all the same set of zones.
+/// The zones a Region HAS, which is what a cluster reports as the zones it spans and what a
+/// refusal names as the zones a DB subnet group does not cover yet. Which of them a given
+/// SUBNET lies in is a different question, and not one this service answers: that is read
+/// off the subnet's own record in the service that owns subnets
+/// ([`crate::state::subnet_zones`]).
 pub fn region_availability_zones(region: &str) -> Vec<String> {
     AVAILABILITY_ZONE_SUFFIXES
         .iter()

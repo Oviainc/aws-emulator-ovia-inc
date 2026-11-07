@@ -557,15 +557,15 @@ fn assert_subnet_group(case: &str, label: &str, group: &str, subnets: &[&str]) {
             identifier, *expected,
             "case {case:?}: expected SubnetIdentifier {expected:?}, got {identifier:?}"
         );
-        let zone = text(subnet, "Name");
-        assert_eq!(
-            zone,
-            state::subnet_availability_zone(REGION, expected),
-            "case {case:?}: expected the Availability Zone of {expected:?}, got {zone:?}"
-        );
+        // The zone a subnet lies in is the fact of the service that OWNS subnets, and this
+        // harness mounts only Amazon RDS: the group reports NO zone for a subnet nobody
+        // answered for, rather than one of its own choosing. What it reports when the owner
+        // of subnets IS mounted beside it is the `db_subnet_group_ec2_zones` suite's rows.
+        let zone = subtrees(subnet, "SubnetAvailabilityZone");
         assert!(
-            zone.starts_with(REGION),
-            "case {case:?}: an Availability Zone is named after its region, got {zone:?}"
+            zone.is_empty(),
+            "case {case:?}: no zone was ever resolved for {expected:?}, so none may be \
+             reported, got {zone:?}"
         );
         // A subnet that is not on an Outpost reports the element EMPTY, which says exactly
         // that, rather than omitting it.
@@ -652,7 +652,8 @@ async fn every_subnet_group_envelope_projects_its_vpc_and_zones() {
 
     // The same resolution the group's `Subnets` report is what the coverage refusal names:
     // a request that cannot cover the two Availability Zones a group needs is refused with
-    // the coverage its own subnets add up to.
+    // the coverage its own subnets add up to — which, with no owner of subnets mounted to
+    // answer for them, is no zone at all.
     for (case, subnets) in [
         ("one subnet", vec!["subnet-0a1b2c3d4e5f60711"]),
         ("the same subnet twice", vec!["subnet-1a2b3c4d", "subnet-1a2b3c4d"]),
@@ -664,11 +665,13 @@ async fn every_subnet_group_envelope_projects_its_vpc_and_zones() {
             "DBSubnetGroupDoesNotCoverEnoughAZs",
         );
         let message = text(&refused, "Message");
-        let expected = format!(
-            "The DB subnet group doesn't meet Availability Zone (AZ) coverage requirement. \
-             Current AZ coverage: {}. Add subnets to cover at least 2 AZs.",
-            state::subnet_availability_zone(REGION, subnets[0])
-        );
+        // The sentence pair is fixed; its one variable part is the coverage the request's
+        // own subnets add up to, which here is empty because no zone was ever answered for
+        // them.
+        let expected = "The DB subnet group doesn't meet Availability Zone (AZ) coverage \
+                        requirement. Current AZ coverage: . Add subnets to cover at least \
+                        2 AZs."
+            .to_string();
         assert_eq!(
             message, expected,
             "case {case:?}: expected {expected:?}, got {message:?}"

@@ -54,6 +54,12 @@ sha1 = "0.10"
 # the operating system's own entropy, so the proof the client answers with cannot be
 # replayed.
 getrandom = "0.3"
+# The AWS SDK for EC2, driven over the in-process callback
+# (`OperationContext::callback`): the subnets a `CreateDBSubnetGroup` names are EC2's
+# resources, so `src/state/ec2_subnets.rs` asks EC2 which Availability Zone each one lies
+# in rather than deciding it here. Only the generated client is needed — the emulator
+# supplies the transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
 # `rds_cluster_parameters`: the cluster parameter catalog and the parameter rules the
 # Amazon RDS, DocumentDB and Neptune models of the one `rds` front door share
 # (`src/state.rs`).
@@ -83,6 +89,11 @@ hex = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The EC2 service, mounted beside this one in the test harness: that a DB subnet group
+# reports the zones of the subnets a client minted with `ec2:CreateSubnet` can only be
+# driven end to end with the owner of subnets on the same engine. DEV-ONLY: this crate
+# depends on no other service's crate outside its tests.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # The engine-endpoint tests drive a real client against the data plane in ONE process:
 # `sha1` computes the `mysql_native_password` proof a client sends, and
 # `rustls`/`tokio-rustls` run the client side of the in-band TLS upgrade the core's

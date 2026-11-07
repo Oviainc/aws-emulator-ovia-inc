@@ -1,13 +1,37 @@
 Issue-Severity: CRITICAL
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: rds.db-subnet-group-insufficient-azs-rejected rds.deep-rds-1-rds-engine-truth-aurora-postgres-constraint-and-lock-violations-rejected
+Issue-Trace-Ids: rds.db-subnet-group-insufficient-azs-rejected
 Issue-Shape-Id: com.amazonaws.rds#AmazonRDSv19
 Issue-Key: rds.db-subnet-group-insufficient-azs-rejected|run#7|AssertionError|assert message == (
-Issue-Key: rds.deep-rds-1-rds-engine-truth-aurora-postgres-constraint-and-lock-violations-rejected|_retry_delete#6|Timeout|time.sleep(interval_s)
 Issue-Commit: ed43c7c5e13b0f1212f82cf25816ea1e565f9817
 
-# rds: 2 net-new causes — the AZ-coverage refusal names an AZ that is not the supplied subnet's, and an Aurora PostgreSQL cluster endpoint never admits a SQL session
+# rds: the AZ-coverage refusal names the AZs of the supplied subnets (cause 1 of 2; cause 2, the Aurora cluster endpoint, is split out and still open)
+
+## Resolution
+
+Cause 1 is FIXED. Cause 2 is NOT fixed, and it has been SPLIT OUT into its own open report
+rather than counted as resolved here — its Issue-Key and its trace id moved with it, out of
+this record's header, into
+`issues/things-that-do-not-work/20261104T154127Z-rds-the-aurora-cluster-endpoint-admits-no-sql-session.md`.
+
+* Cause 1 — FIXED. A subnet's Availability Zone is now read off the Amazon EC2 subnet record
+  the request's identifier resolves to, asked over the in-process callback
+  (`services/service-com-amazonaws-rds-amazonrdsv19/src/state/ec2_subnets.rs`, the contract
+  in `services/common/src/network.rs`), and the group KEEPS the zone EC2 answered per subnet
+  (`DbSubnetGroupRecord::subnet_zones`). The `DBSubnetGroupDoesNotCoverEnoughAZs` message
+  therefore names the zones the request's own subnets cover, `DBSubnetGroup$Subnets` reports
+  the same zones, and the coverage requirement is counted in distinct ZONES rather than in
+  distinct identifiers, so two subnets of one zone no longer pass for two zones. The
+  identifier-hashing helper that invented a zone is deleted. Pinned by
+  `tests/all/db_subnet_group_ec2_zones.rs`, which mounts Amazon EC2 beside Amazon RDS on one
+  engine so every id is one EC2 minted and every expected zone one EC2 reported.
+* Cause 2 — NOT FIXED, and split out so it stays filed. An Aurora PostgreSQL cluster's
+  endpoint admits no SQL session because no listener is opened for a cluster, and a service
+  crate cannot open one that a recorded client could reach: the core's listener API binds a
+  port of its own choosing (`vendor/server/src/listeners.rs`, `Listeners::tcp_plaintext`),
+  while the client dials the engine's documented `DBCluster$Port`. See the split-out report
+  for the blocker and what was learned.
 
 > _Note: this issue was identified against the code base at commit `ed43c7c5e13b0f1212f82cf25816ea1e565f9817`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 

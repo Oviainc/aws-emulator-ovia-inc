@@ -1279,41 +1279,42 @@ const MULTI_AZ_CLUSTER_ZONES: usize = 3;
 /// Availability Zones; `Ok(())` when it can, so this reads like the `check_*` gates of
 /// `crate::state` it sits beside.
 ///
-/// What the refusal rests on is what the STORED GROUP settles on its own: a subnet lies in
-/// exactly one Availability Zone, so a group holding fewer than
-/// [`MULTI_AZ_CLUSTER_ZONES`] DISTINCT subnets cannot have one in three zones whichever
-/// zones its subnets are in — the same reading
-/// `crate::state::check_db_subnet_group_subnets` applies to the two-zone rule a group
-/// itself must meet. A group holding three or more is NOT refused: which zones those
-/// subnets lie in is EC2's fact (`service_common::network`), and this service does not hold
-/// it, so a group that could cover three zones is served rather than refused on an
-/// assumption. A group whose subnets this service does not hold at all — the account's
-/// `default` group, which comes with the default VPC — is in the same position and is
-/// served too.
+/// What the refusal rests on is what the STORED GROUP settles: a subnet lies in exactly one
+/// Availability Zone, and WHICH zone is the fact the group KEEPS for each of its subnets, as
+/// the service that owns subnets answered it (`crate::state::subnet_zones`). So the zones a
+/// group covers are those zones, and a group that covers fewer than
+/// [`MULTI_AZ_CLUSTER_ZONES`] of them cannot hold a subnet in three zones. A subnet the
+/// group has no zone for — one EC2 answered for none — may lie in any zone, so it is not
+/// evidence of a shortfall and is counted as a zone that could be missing one; a group whose
+/// subnets this service holds none of at all — the account's `default` group, which comes
+/// with the default VPC — is served rather than refused on an assumption.
 ///
 /// The sentence is fixed but for its last clause, which names the zones of the request's
 /// region the group does not cover: those are the zones a caller can add a subnet in to
-/// make the group placeable, read off the group's own subnets with the SAME resolution
-/// `DescribeDBSubnetGroups` reports each subnet's zone from
-/// (`crate::state::subnet_availability_zone`), so the refusal and the report cannot name
-/// different zones for one group. They come from the stored group and the region, never
-/// from the request.
+/// make the group placeable, read off the group's own stored subnet zones — the SAME zones
+/// `DescribeDBSubnetGroups` reports — so the refusal and the report cannot name different
+/// zones for one group. They come from the stored group and the region, never from the
+/// request.
 fn check_multi_az_subnet_coverage(
     region: &str,
     group: &crate::state::DbSubnetGroupRecord,
 ) -> Result<(), String> {
     let distinct: std::collections::BTreeSet<&str> =
         group.subnet_ids.iter().map(String::as_str).collect();
-    if distinct.is_empty() || distinct.len() >= MULTI_AZ_CLUSTER_ZONES {
+    let covered: std::collections::BTreeSet<&str> = distinct
+        .iter()
+        .filter_map(|subnet| group.subnet_zones.get(*subnet).map(String::as_str))
+        .collect();
+    let unknown = distinct
+        .iter()
+        .filter(|subnet| !group.subnet_zones.contains_key(**subnet))
+        .count();
+    if distinct.is_empty() || covered.len().saturating_add(unknown) >= MULTI_AZ_CLUSTER_ZONES {
         return Ok(());
     }
-    let covered: std::collections::BTreeSet<String> = distinct
-        .iter()
-        .map(|subnet| crate::state::subnet_availability_zone(region, subnet))
-        .collect();
     let uncovered: Vec<String> = crate::state::region_availability_zones(region)
         .into_iter()
-        .filter(|zone| !covered.contains(zone))
+        .filter(|zone| !covered.contains(zone.as_str()))
         .collect();
     Err(format!(
         "Can't create a Multi-AZ DB cluster because there aren't enough subnets available. \

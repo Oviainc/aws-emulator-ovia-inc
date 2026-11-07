@@ -174,6 +174,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // What the REQUEST alone settles about the list is checked before anything is
+        // resolved against another service: a list that cannot make a group at all is
+        // refused without a hop, and the identifiers that do get resolved are at most the
+        // group's own published allowance however long a list the caller sent.
+        crate::state::check_db_subnet_group_subnet_list(&input.subnet_ids)
+            .map_err(subnet_list_refusal)?;
+
+        // WHICH Availability Zone each subnet named lies in belongs to the service that
+        // owns subnets, so it is read off EC2's records BEFORE this service's own store is
+        // locked — one hop, no lock held across it (`crate::state::ec2_subnets`).
+        let zones = crate::state::subnet_zones(ctx, &region, &input.subnet_ids).await;
+
         // No store means this service was mounted on an engine it has no state in,
         // so it cannot serve the operation at all. Unreachable with the engine the
         // router builds; 501 is the honest answer, never a fabricated success.
@@ -204,34 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         // The subnets the modified group would cover are the same list
-        // `CreateDBSubnetGroup` takes, checked by the one rule in `crate::state` and
-        // mapped here onto THIS operation's modelled faults.
-        if let Err(rejection) =
-            crate::state::check_db_subnet_group_subnets(&region, &input.subnet_ids)
-        {
-            return Err(match rejection {
-                crate::state::SubnetListRejection::TooManySubnets(message) => {
-                    ModifyDBSubnetGroupErrorModeled::DBSubnetQuotaExceededFault(
-                        DBSubnetQuotaExceededFault {
-                            message: Some(message),
-                        },
-                    )
-                }
-                crate::state::SubnetListRejection::NotASubnet(message) => {
-                    ModifyDBSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
-                        message: Some(message),
-                    })
-                }
-                crate::state::SubnetListRejection::NotEnoughAvailabilityZones(message) => {
-                    ModifyDBSubnetGroupErrorModeled::DBSubnetGroupDoesNotCoverEnoughAZs(
-                        DBSubnetGroupDoesNotCoverEnoughAZs {
-                            message: Some(message),
-                        },
-                    )
-                }
-            }
-            .into());
-        }
+        // `CreateDBSubnetGroup` takes, held to the one coverage rule in `crate::state` and
+        // mapped onto THIS operation's modelled faults.
+        crate::state::check_db_subnet_group_zone_coverage(&input.subnet_ids, &zones)
+            .map_err(subnet_list_refusal)?;
 
         // `SubnetIds` is required, so the modified group covers exactly the subnets this
         // request names, in the order it names them. `DBSubnetGroupDescription` is NOT
@@ -239,6 +227,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than blanking a value the caller said nothing about.
         if let Some(record) = store.db_subnet_groups.get_mut(&key) {
             record.subnet_ids = input.subnet_ids;
+            // The zones go with the subnets they belong to: the group reports the zones EC2
+            // answered with for the list this modification leaves it holding.
+            record.subnet_zones = zones.into_zones_by_subnet();
             if let Some(description) = input.db_subnet_group_description {
                 record.description = description;
             }
@@ -259,4 +250,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into(),
         )
     }
+}
+
+/// How this operation ANSWERS a `SubnetIds` list it cannot leave the group holding: each
+/// rejection `crate::state` raises, mapped onto the modelled fault of this operation.
+///
+/// One mapping for both gates — the one over what the request alone settles
+/// (`check_db_subnet_group_subnet_list`) and the one over the zones the named subnets cover
+/// (`check_db_subnet_group_zone_coverage`) — so a refusal cannot be worded one way by the
+/// first and another way by the second.
+fn subnet_list_refusal(rejection: crate::state::SubnetListRejection) -> ModifyDBSubnetGroupError {
+    match rejection {
+        crate::state::SubnetListRejection::TooManySubnets(message) => {
+            ModifyDBSubnetGroupErrorModeled::DBSubnetQuotaExceededFault(
+                DBSubnetQuotaExceededFault {
+                    message: Some(message),
+                },
+            )
+        }
+        crate::state::SubnetListRejection::NotASubnet(message) => {
+            ModifyDBSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
+                message: Some(message),
+            })
+        }
+        crate::state::SubnetListRejection::NotEnoughAvailabilityZones(message) => {
+            ModifyDBSubnetGroupErrorModeled::DBSubnetGroupDoesNotCoverEnoughAZs(
+                DBSubnetGroupDoesNotCoverEnoughAZs {
+                    message: Some(message),
+                },
+            )
+        }
+    }
+    .into()
 }

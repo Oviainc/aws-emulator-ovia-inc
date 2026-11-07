@@ -77,17 +77,20 @@ fn subnets(count: usize) -> Vec<String> {
 }
 
 /// The zones of [`REGION`] the group made of `subnets` does not cover, in the order the
-/// region publishes them: what the refusal's last clause names, read with the service's own
-/// subnet-to-zone resolution.
+/// region publishes them: what the refusal's last clause names, read off the zones the group
+/// KEEPS for its subnets.
+///
+/// Which zone a subnet lies in is the fact of the service that OWNS subnets, and this
+/// harness mounts only Amazon RDS: no zone was ever answered for the ids below, so the group
+/// covers none of the Region's zones and every one of them is a zone a caller could add a
+/// subnet in. The zones a group reports when the owner of subnets IS mounted beside it are
+/// the `db_subnet_group_ec2_zones` suite's rows.
 fn uncovered_zones(subnets: &[String]) -> Vec<String> {
-    let covered: Vec<String> = subnets
-        .iter()
-        .map(|subnet| state::subnet_availability_zone(REGION, subnet))
-        .collect();
+    assert!(
+        !subnets.is_empty(),
+        "a group under test names at least one subnet"
+    );
     state::region_availability_zones(REGION)
-        .into_iter()
-        .filter(|zone| !covered.contains(zone))
-        .collect()
 }
 
 #[tokio::test]

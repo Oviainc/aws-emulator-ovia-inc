@@ -105,6 +105,8 @@ mod db_snapshot_deletion;
 mod db_snapshot_restore;
 #[path = "all/db_subnet_group_deletion.rs"]
 mod db_subnet_group_deletion;
+#[path = "all/db_subnet_group_ec2_zones.rs"]
+mod db_subnet_group_ec2_zones;
 #[path = "all/db_subnet_group_in_use_wording.rs"]
 mod db_subnet_group_in_use_wording;
 #[path = "all/db_subnet_group_not_found_wording.rs"]
@@ -217,6 +219,8 @@ mod refusal_wording_and_input_guards;
 mod resource_member_projection;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/scratch_aurora_truth.rs"]
+mod scratch_aurora_truth;
 #[path = "all/sibling_control_plane_clusters.rs"]
 mod sibling_control_plane_clusters;
 #[path = "all/state_precondition_refusal_sentences.rs"]
