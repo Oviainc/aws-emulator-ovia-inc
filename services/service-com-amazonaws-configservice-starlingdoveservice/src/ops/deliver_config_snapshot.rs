@@ -5,17 +5,19 @@
 //! request names, mints the `configSnapshotId` of the snapshot being created and
 //! records the delivery on that channel in [`crate::state`], where
 //! `DescribeDeliveryChannelStatus` reads it back as the channel's last snapshot
-//! delivery attempt — and, once the delivery is due to have completed, as its last
-//! successful delivery.
+//! delivery attempt — and, once the delivery has been performed, as its outcome.
 //!
-//! What this handler does NOT do is the delivery LEG itself: writing the snapshot
-//! object into the channel's Amazon S3 bucket and streaming the start/completion
-//! notifications to its Amazon SNS topic. Config's recording and delivery side
-//! effects are a cross-service pipeline with an issue of its own
-//! (`issues/things-that-do-not-work/20261022T190340Z-config-has-no-recording-delivery-side-effects-and.md`,
-//! cause 3), so nothing here fabricates one: the control plane this operation owns —
-//! the preconditions, the snapshot id and the delivery status the channel reports —
-//! is real, and no object or notification is claimed for work nothing performed.
+//! The delivery LEG itself — writing the gzip-framed snapshot object into the channel's
+//! Amazon S3 bucket — is work the clock owes rather than work this call does, so this
+//! handler starts it ([`crate::state::drive_snapshot_delivery`]) and answers with the
+//! snapshot id, which is all the operation models. What that work writes, and the
+//! `lastStatus`/`lastErrorCode` the channel then reports for it, is
+//! `crate::state::snapshot_delivery`'s.
+//!
+//! Streaming the start/completion notifications to the channel's Amazon SNS topic is a
+//! cross-service pipeline with an issue of its own
+//! (`issues/things-that-do-not-work/20261022T190340Z-config-has-no-recording-delivery-side-effects-and.md`),
+//! so nothing here fabricates one.
 //!
 //! ## Shape of an operation
 //!
@@ -163,10 +165,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
         })?;
+        let region = crate::state::request_region(ctx);
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -239,6 +241,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The sequence advances only for a delivery that was actually scheduled, so a
         // refused call consumes no snapshot id.
         store.next_config_snapshot_seq = seq.wrapping_add(1);
+        drop(store);
+
+        // The delivery itself — the snapshot object written into the channel's bucket —
+        // is work the clock owes, so it is started here, with the store's lock released,
+        // and runs at the instant the entry above falls due. What it writes, and what
+        // became of that write, is `crate::state::snapshot_delivery`'s; this call reports
+        // only the id of the snapshot being created, which is all the operation models.
+        crate::state::drive_snapshot_delivery(ctx, &self.engine, &region);
 
         Ok(DeliverConfigSnapshotOutput {
             config_snapshot_id: Some(config_snapshot_id),

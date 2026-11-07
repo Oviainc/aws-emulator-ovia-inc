@@ -41,6 +41,9 @@ sqlparser = "0.59"
 # superset of) CloudFormation template, so one YAML parser reads both spellings and
 # `PutConformancePack` judges the template it IS. Pure Rust, no `unsafe`, no C.
 yaml-rust2 = { version = "0.10", default-features = false }
+# `flate2`: a delivered configuration snapshot is a gzip-framed object, so the snapshot
+# delivery writes its payload through this crate's gzip encoder.
+flate2 = "1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

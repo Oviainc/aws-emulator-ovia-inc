@@ -7,10 +7,15 @@
 //! scheduling a snapshot delivery for a delivery channel this account holds, while a
 //! customer managed configuration recorder is recording, answers with a snapshot id
 //! distinct per call and records the delivery as THAT channel's last snapshot delivery
-//! attempt — which becomes its last successful delivery once the delivery completes —
-//! while leaving the channel's configuration and its periodic schedule, anchored at
-//! the channel's creation, untouched; and the call is refused with the modelled 400
-//! whenever one of its three preconditions does not hold.
+//! attempt — whose outcome, once Config has performed the delivery, is what the channel
+//! reports — while leaving the channel's configuration and its periodic schedule,
+//! anchored at the channel's creation, untouched; and the call is refused with the
+//! modelled 400 whenever one of its three preconditions does not hold.
+//!
+//! Config is served here on its own, so the write a delivery makes into the channel's
+//! bucket cannot land: what this suite pins is the FAILED outcome that earns, beside the
+//! control plane. The delivered object and the successful outcome of a delivery into a
+//! bucket that is there are `config_snapshot_delivery`'s, which mounts S3 beside Config.
 //!
 //! The harness (`Emulator`, `recorder_request`) is the one `config_setup_and_rule_loop`
 //! builds, and the frequency table and timestamp readers are
@@ -31,12 +36,15 @@ use crate::config_setup_and_rule_loop::{recorder_request, Emulator, ROLE_ARN};
 /// without one, which is the channel every case here delivers through.
 const DEFAULT_NAME: &str = "default";
 
-/// The `DeliveryStatus` value a completed delivery reports, from
-/// `smithy_query(query="shape", shape="DeliveryStatus")`: `Success`, `Failure`,
-/// `Not_Applicable`.
-const SUCCESS: &str = "Success";
+/// The `lastStatus` a delivery whose write was refused reports.
+///
+/// RECORDED behaviour, pinned as a LITERAL here rather than read from the service, so
+/// this assertion fails if the spelling regresses to the model enum's `Failure`
+/// (`com.amazonaws.configservice#DeliveryStatus` spells its members `Success`, `Failure`,
+/// `Not_Applicable`; the service answers them upper-cased).
+const FAILURE: &str = "FAILURE";
 
-/// How long after the scheduling call the snapshot delivery completes, in seconds —
+/// How long after the scheduling call the snapshot delivery is performed, in seconds —
 /// the span the emulator documents on
 /// `crate::state::SNAPSHOT_DELIVERY_SETTLE_AFTER`, read from the service itself so
 /// this suite cannot drift from it.
@@ -44,7 +52,7 @@ fn settle_seconds() -> f64 {
     SNAPSHOT_DELIVERY_SETTLE_AFTER.as_secs_f64()
 }
 
-/// Long enough after a scheduling call that the delivery it scheduled has completed.
+/// Long enough after a scheduling call that the delivery it scheduled has been performed.
 fn past_the_delivery() -> Duration {
     SNAPSHOT_DELIVERY_SETTLE_AFTER + Duration::from_millis(200)
 }
@@ -224,13 +232,14 @@ async fn a_scheduled_snapshot_is_recorded_as_the_channels_last_delivery_attempt(
 }
 
 #[tokio::test]
-async fn the_delivery_completes_and_is_reported_as_the_last_successful_delivery() {
+async fn a_delivery_whose_write_fails_is_reported_as_a_failed_delivery() {
+    // This emulator serves Config alone, so the channel's bucket is not there to be
+    // written: the delivery is PERFORMED and refused, which is what the channel reports.
     // Rows differ along the channel's snapshot frequency: the delivery a CALL schedules
-    // completes on its own span, whatever schedule the channel carries, and the
-    // frequency is then the gap to the next delivery.
+    // is performed on its own span, whatever schedule the channel carries.
     for (case, frequency, interval) in frequency_cases() {
         let emulator = emulator_for(Setup::Recording, frequency).await;
-        // The schedule the channel's creation anchors, before any delivery completes.
+        // The schedule the channel's creation anchors, before any delivery is performed.
         let (anchored, _) = snapshot_info(&emulator, &case).await;
         let next_before = instant(
             &case,
@@ -243,9 +252,18 @@ async fn the_delivery_completes_and_is_reported_as_the_last_successful_delivery(
         let (info, _) = snapshot_info(&emulator, &case).await;
         assert_eq!(
             info["lastStatus"],
-            json!(SUCCESS),
-            "case {case:?}: a completed snapshot delivery reports {SUCCESS}, got {info}"
+            json!(FAILURE),
+            "case {case:?}: a snapshot delivery whose write failed reports {FAILURE}, \
+             got {info}"
         );
+        for member in ["lastErrorCode", "lastErrorMessage"] {
+            let reported = info[member].as_str().unwrap_or_default();
+            assert!(
+                !reported.is_empty(),
+                "case {case:?}: a failed delivery reports why, expected a non-empty \
+                 {member}, got {info}"
+            );
+        }
         let attempt = instant(
             &case,
             "configSnapshotDeliveryInfo.lastAttemptTime",
@@ -253,40 +271,26 @@ async fn the_delivery_completes_and_is_reported_as_the_last_successful_delivery(
         );
         assert!(
             attempt >= before && attempt <= after,
-            "case {case:?}: the completed delivery keeps the instant it was attempted, \
+            "case {case:?}: the failed delivery keeps the instant it was attempted, \
              expected an instant in [{before}, {after}], got {attempt}"
         );
-        let successful = instant(
-            &case,
-            "configSnapshotDeliveryInfo.lastSuccessfulTime",
-            &info["lastSuccessfulTime"],
-        );
-        assert!(
-            (successful - attempt - settle_seconds()).abs() < 0.01,
-            "case {case:?}: the delivery completed {} after it was attempted at \
-             {attempt}, expected {}, got {successful}",
-            settle_seconds(),
-            attempt + settle_seconds()
-        );
 
-        // The frequency BOUNDS the next delivery time: the next snapshot delivery falls
-        // exactly one frequency interval after the delivery that just completed.
+        // Nothing was delivered, so there is no successful delivery to report and the
+        // next delivery is still the one the channel's creation anchored.
+        assert!(
+            info.get("lastSuccessfulTime").is_none(),
+            "case {case:?}: a delivery that wrote nothing is no successful delivery, \
+             got {info}"
+        );
         let next = instant(
             &case,
             "configSnapshotDeliveryInfo.nextDeliveryTime",
             &info["nextDeliveryTime"],
         );
         assert!(
-            (next - successful - interval as f64).abs() < 0.01,
-            "case {case:?}: the next snapshot delivery falls one {interval}s interval \
-             after the delivery that completed at {successful}, expected {}, got {next}",
-            successful + interval as f64
-        );
-        assert!(
-            next > next_before,
-            "case {case:?}: a completed delivery moves the next delivery time on from \
-             the one the channel's creation anchored, expected more than {next_before}, \
-             got {next}"
+            (next - next_before).abs() < 0.01,
+            "case {case:?}: a failed delivery leaves the {interval}s schedule the \
+             channel's creation anchored, expected {next_before}, got {next}"
         );
 
         // Reading the status writes nothing, so a second read of a settled channel

@@ -183,3 +183,5 @@ mod config_refusal_identifier_and_position;
 mod refusals_that_share_an_error_code;
 #[path = "all/config_refusal_class_and_wording.rs"]
 mod config_refusal_class_and_wording;
+#[path = "all/config_snapshot_delivery.rs"]
+mod config_snapshot_delivery;
