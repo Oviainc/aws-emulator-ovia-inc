@@ -255,6 +255,8 @@ mod object_write_tagging_header;
 mod objects;
 #[path = "all/partial_read_checksums.rs"]
 mod partial_read_checksums;
+#[path = "all/post_object_form_upload.rs"]
+mod post_object_form_upload;
 #[path = "all/presigned_object_reads.rs"]
 mod presigned_object_reads;
 #[path = "all/presigned_query_authentication.rs"]

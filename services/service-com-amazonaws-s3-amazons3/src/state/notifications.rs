@@ -100,6 +100,8 @@ const EVENT_WILDCARD_SUFFIX: &str = ":*";
 pub enum ObjectEventKind {
     /// `s3:ObjectCreated:Put` — a `PutObject` wrote the object.
     CreatedByPut,
+    /// `s3:ObjectCreated:Post` — a browser-form `POST Object` upload wrote it.
+    CreatedByPost,
     /// `s3:ObjectCreated:Copy` — a `CopyObject` wrote it.
     CreatedByCopy,
     /// `s3:ObjectCreated:CompleteMultipartUpload` — a multipart upload completed into it.
@@ -136,6 +138,7 @@ impl ObjectEventKind {
     pub fn event_value(self) -> &'static str {
         match self {
             Self::CreatedByPut => "s3:ObjectCreated:Put",
+            Self::CreatedByPost => "s3:ObjectCreated:Post",
             Self::CreatedByCopy => "s3:ObjectCreated:Copy",
             Self::CreatedByMultipartUpload => "s3:ObjectCreated:CompleteMultipartUpload",
             Self::Removed => "s3:ObjectRemoved:Delete",
@@ -172,9 +175,10 @@ impl ObjectEventKind {
     #[must_use]
     pub fn event_bridge_detail_type(self) -> Option<&'static str> {
         match self {
-            Self::CreatedByPut | Self::CreatedByCopy | Self::CreatedByMultipartUpload => {
-                Some("Object Created")
-            }
+            Self::CreatedByPut
+            | Self::CreatedByPost
+            | Self::CreatedByCopy
+            | Self::CreatedByMultipartUpload => Some("Object Created"),
             Self::Removed | Self::DeleteMarkerCreated => Some("Object Deleted"),
             Self::TaggingPut => Some("Object Tags Added"),
             Self::TaggingDelete => Some("Object Tags Deleted"),
@@ -190,6 +194,11 @@ impl ObjectEventKind {
     fn event_bridge_reason(self) -> &'static str {
         match self {
             Self::CreatedByPut => "PutObject",
+            // The browser-based upload is the one object write the reference names by its
+            // HTTP form rather than by an API name: the `reason` of an "Object Created"
+            // event the form POST produced is "POST Object", which is what a rule scoped to
+            // one of the two reasons is matched against.
+            Self::CreatedByPost => "POST Object",
             Self::CreatedByCopy => "CopyObject",
             Self::CreatedByMultipartUpload => "CompleteMultipartUpload",
             Self::Removed | Self::DeleteMarkerCreated => "DeleteObject",

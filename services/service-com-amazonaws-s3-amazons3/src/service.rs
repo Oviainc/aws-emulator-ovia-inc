@@ -73,6 +73,10 @@ pub mod object_write;
 // Whether every identity a bucket policy grants to is one this account's IAM can resolve —
 // see `service/policy_principals.rs`.
 pub mod policy_principals;
+// What the BROWSER-FORM upload of an object is — the `POST` of a `multipart/form-data`
+// document to a bucket, which no modelled operation is bound to — see
+// `service/post_object.rs`.
+pub mod post_object;
 // WHO a signed request speaks for, and whether the identity-based documents in force on that
 // principal and the bucket's own policy let it perform the action it asks for — see
 // `service/request_authorization.rs`.
@@ -122,6 +126,11 @@ const PEER_PATH_SEGMENTS: &[&str] = &["v20180820"];
 /// `s3` — the emulator's own signature verification already treats the two as one family —
 /// so a request carrying that scope is this service's, and is claimed as such.
 const S3_EXPRESS_SIGNING_NAME: &str = "s3express";
+
+/// The header a request announces the media type of its payload in, which is what tells a
+/// BROWSER-FORM upload from every other `POST` addressed to a bucket
+/// ([`EmulatedService::addresses_form_post_upload`]).
+const CONTENT_TYPE_HEADER: &str = "content-type";
 
 /// The first `/`-separated segment of `path`, or `None` for a path with no non-empty
 /// first segment (`"/"`, `""`).
@@ -853,6 +862,10 @@ const TAGGING_DIRECTIVE_HEADER: &str = "x-amz-tagging-directive";
 ///   answer of this service carries, named by the pair of ids S3 mints
 ///   ([`EmulatedService::worded_refusal`]); the framework's own renderer mints ids of a
 ///   different shape, which a client, a log correlator and a support request all read.
+///
+/// The table also holds the one operation this service serves that the model does not
+/// declare at all — the BROWSER-FORM upload ([`post_object`]) — because this is where the
+/// operations this service resolves itself are kept.
 fn front_door<Eng: Send + Sync + 'static>(
     engine: &Arc<Eng>,
 ) -> smithy_server_runtime::OperationRoutingTable {
@@ -907,6 +920,15 @@ fn front_door<Eng: Send + Sync + 'static>(
             )
             .wording_uri(uri_value_wording),
         ),
+    );
+    // The BROWSER-FORM upload, which is not a modelled operation at all: no routing-table
+    // entry is bound to `POST /{Bucket}`, so such a request resolved to nothing and the
+    // framework answered it as unwritten. It is held in this table because that is where
+    // this service keeps the operations it resolves itself, under a key the model's own
+    // protocol never produces ([`post_object::POST_OBJECT`]).
+    table.add_operation(
+        post_object::POST_OBJECT,
+        Box::new(post_object::PostObject::new(Arc::clone(engine))),
     );
     table
 }
@@ -1041,6 +1063,33 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 .bucket(name)
                 .is_some_and(|bucket| !bucket.is_directory())
         })
+    }
+
+    /// Whether `req` is the BROWSER-FORM upload of an object: "the POST operation adds an
+    /// object to a specified bucket by using HTML forms" (Amazon S3 API Reference, *POST
+    /// Object*), which is a `POST` of a `multipart/form-data` document to the bucket itself.
+    ///
+    /// Four things make it that request and nothing else, and the model can express none of
+    /// them: the METHOD, an address naming the BUCKET rather than an object (read in the
+    /// PATH-STYLE form every route of this service is bound in, so a virtual-hosted-style
+    /// form POST — which carries its bucket in the host and `/` as its whole path —
+    /// resolves the same way), a query naming NO subresource (`POST /{Bucket}?delete` is
+    /// `DeleteObjects`, a modelled operation), and the form document as the payload.
+    ///
+    /// Nothing is read out of the store here, so this costs one method comparison for every
+    /// request that is not a `POST`.
+    fn addresses_form_post_upload(&self, req: &RtRequest) -> bool {
+        if req.method() != http::Method::POST {
+            return false;
+        }
+        if !wire::request_query(req.uri()).is_empty() {
+            return false;
+        }
+        if !post_object::carries_form_payload(req.headers().get(CONTENT_TYPE_HEADER)) {
+            return false;
+        }
+        let path = self.path_style_path(req);
+        first_path_segment(&path).is_some() && !addresses_object(&path)
     }
 
     /// The operation a request on an ID-ADDRESSED bucket configuration subresource names
@@ -1349,6 +1398,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 .entry
                 .routing_table()
                 .get(LISTING_WITHOUT_SUBRESOURCE);
+        }
+        // The BROWSER-FORM upload of an object, which the model's routing table cannot name
+        // at all: no operation is bound at `POST /{Bucket}`, so the request resolved to
+        // nothing and was answered as unwritten. See
+        // [`Self::addresses_form_post_upload`] for what makes a request that one, and
+        // [`post_object`] for what serving it is.
+        if self.addresses_form_post_upload(req) {
+            return self.door.get(post_object::POST_OBJECT);
         }
         // A write or a delete addressing an ID-ADDRESSED bucket configuration subresource
         // that states no `id` is that subresource's call with an id missing, never the

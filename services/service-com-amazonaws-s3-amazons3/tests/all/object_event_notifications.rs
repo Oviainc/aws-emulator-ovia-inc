@@ -101,6 +101,12 @@ impl Answer {
         String::from_utf8_lossy(&self.body).to_string()
     }
 
+    /// The body's own BYTES — what a served object read answers with, which text cannot
+    /// stand in for when the object holds bytes that are not UTF-8.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.body
+    }
+
     /// A response header's value — among them the entity tag an uploaded part is
     /// recorded with.
     pub(crate) fn header(&self, name: &str) -> Option<String> {

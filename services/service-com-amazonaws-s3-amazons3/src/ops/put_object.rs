@@ -341,9 +341,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        mut input: Self::Input,
+        input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The write itself is [`PutObject::write`], which every call that stores an object
+        // through this operation's rules goes through. THIS call is the `PUT`, so the event
+        // it publishes is the `s3:ObjectCreated:Put` whose reason is `PutObject`; the
+        // BROWSER-FORM upload performs the same write and names its own event
+        // (`crate::service::post_object`).
+        self.write(
+            input,
+            ctx,
+            crate::state::notifications::ObjectEventKind::CreatedByPut,
+        )
+        .await
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
+    /// Store the object `input` names, and publish the event `created` says this write is.
+    ///
+    /// The whole of S3's object write — the key, the ACL, the encryption, the conditional
+    /// headers, the lock, the checksums, the authorization and the notifications the
+    /// bucket's configuration owes — lives HERE rather than in the modelled handler above,
+    /// because two calls of this service perform it: `PutObject` and the browser-form
+    /// upload (`crate::service::post_object`), which is not a modelled operation and whose
+    /// form fields fill the same input. The ONE thing that differs between them is the
+    /// event the write publishes — "`s3:ObjectCreated:Put`" against
+    /// "`s3:ObjectCreated:Post`", whose EventBridge detail reports a different `reason` —
+    /// so that is what the caller states and nothing else is duplicated.
+    pub async fn write(
+        &self,
+        mut input: PutObjectInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        created: crate::state::notifications::ObjectEventKind,
+    ) -> Result<PutObjectOutput, PutObjectError> {
         // The pair of ids that name this request: the response below carries them in its
         // `x-amz-request-id` / `x-amz-id-2` headers, and every notification this write
         // owes names the call it came of by them.
@@ -998,17 +1030,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // notification configuration owes for it — rendered while the store is still
         // held, off the version this write left at the key, and delivered once the answer
         // is settled and the store released. A bucket with no notifications configured
-        // owes none.
-        let created = crate::state::notifications::ObjectEvent::new(
-            crate::state::notifications::ObjectEventKind::CreatedByPut,
-            &input.key,
-        );
+        // owes none. WHICH event it is, is the call this write is serving ([`Self::write`]).
+        let event = crate::state::notifications::ObjectEvent::new(created, &input.key);
         let created = match store
             .bucket(&input.bucket)
             .and_then(|bucket| bucket.object(&input.key))
         {
-            Some(object) => created.of_object(object),
-            None => created,
+            Some(object) => event.of_object(object),
+            None => event,
         };
         let pending =
             crate::state::notifications::pending(&store, &input.bucket, &[created], &correlation);

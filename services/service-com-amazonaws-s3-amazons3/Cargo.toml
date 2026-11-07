@@ -62,6 +62,18 @@ percent-encoding = "2"
 # attribute the API publishes and the element the framework's XML codec binds
 # (`src/service/wire.rs`), rather than editing XML documents as strings.
 quick-xml = "0.41"
+# The payload of a BROWSER-FORM upload is a `multipart/form-data` document
+# (`src/service/post_object.rs`), read with a maintained parser for that media type rather
+# than by slicing the body by hand.
+multer = "3.1"
+# The one-chunk stream that parser reads the already-buffered request body from.
+futures-util = { version = "0.3", default-features = false }
+# The policy a browser-form upload carries is "a UTF-8 and base64-encoded document written
+# in JSON" (`src/service/post_object.rs`), so decoding it needs that codec.
+base64 = "0.22"
+# And verifying the signature of that policy is the SigV4 key derivation, which is a chain
+# of HMAC-SHA256 over the secret of the credential the form named.
+hmac = "0.12"
 # The AWS SDKs for the four destinations a bucket's event notification configuration
 # publishes to, driven over the in-process callback (`OperationContext::callback`): an
 # object event becomes a `PutEvents` onto the default event bus, a `SendMessage`, a
