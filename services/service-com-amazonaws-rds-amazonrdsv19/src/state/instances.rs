@@ -36,6 +36,11 @@ pub struct DbInstanceRecord {
     /// password, for an instance created or modified with `ManageMasterUserPassword`
     /// turned on; `None` for one whose password the caller supplied, which has no managed
     /// secret to report.
+    ///
+    /// Only an operation that CREATES the secret for this instance sets it, so what is
+    /// named here is the instance's OWN secret: an instance that inherits another's master
+    /// credential — a read replica, an instance restored from a snapshot — manages none
+    /// and reports none.
     pub master_user_secret: Option<ManagedMasterSecret>,
     pub endpoint_port: i32,
     /// Where the instance's own engine listener accepts connections, for the engines

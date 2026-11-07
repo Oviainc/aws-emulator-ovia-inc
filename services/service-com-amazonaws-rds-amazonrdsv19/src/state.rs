@@ -214,6 +214,9 @@ mod clusters;
 // record a resource stores for it, and the minting a request that turns
 // `ManageMasterUserPassword` on depends on.
 mod managed_master_secret;
+// WHO OWNS that secret: it goes with the resource it was minted for, and a resource that
+// merely inherits another's master credential owns none.
+mod master_user_credentials;
 mod published_values;
 mod minted_values;
 mod engine_defaults;
@@ -230,6 +233,7 @@ pub use published_values::*;
 pub use clusters::*;
 pub use instances::*;
 pub use managed_master_secret::*;
+pub use master_user_credentials::*;
 pub use data_plane::{
     capture_instance_storage, engine_wire, open_engine_endpoint, DbEngineEndpoint, EngineWire,
     ServedEndpoint,

@@ -230,6 +230,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(DeleteDBInstanceError::internal_failure)?,
             None => None,
         };
+        // Everything this delete decides and writes under the state lock happens in this
+        // block, and the lock is released at the end of it: retiring the managed master
+        // user secret below is Secrets Manager's work, reached asynchronously, and a state
+        // guard cannot be held across an await.
+        let (db_instance, managed_secret) = {
         let mut store = state.lock();
         store.settle_due_transitions(&region);
 
@@ -389,6 +394,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.begin_deletion();
         let dbi_resource_id = record.dbi_resource_id.clone();
         let instance_arn = record.arn();
+        // The secret RDS manages for the instance's master user password, if it has one:
+        // it is the instance's own, so it goes with the instance (deleted below, with the
+        // store unlocked) — see [`crate::state::owned_master_user_secret`].
+        let managed_secret = crate::state::owned_master_user_secret(record);
         let db_instance = record.to_wire();
         let replicated_source = record.read_replica_source_db_instance_identifier.clone();
         let replicas = record.read_replica_db_instance_identifiers.clone();
@@ -430,6 +439,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // being deleted is still one of ours.
         if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
             directory.lock().forget(&dbi_resource_id);
+        }
+
+        (db_instance, managed_secret)
+        };
+        // The delete is accepted, so the Secrets Manager secret RDS manages for the
+        // instance's master user password is deleted with it: that secret exists for this
+        // instance alone, and one left behind would hold the credential of a database
+        // nothing can reach. Carried out with the store UNLOCKED, because the secret is
+        // another service's resource — reached over the emulator's own in-process callback
+        // — and this service's lock may not be held across that call. The delete of the
+        // instance "can't be canceled or reverted after it begins", so it is not undone
+        // when the secret cannot be deleted: that failure is recorded and the instance
+        // still goes ([`crate::state::release_orphaned_master_user_secret`]).
+        if let Some(secret_arn) = managed_secret {
+            crate::state::release_orphaned_master_user_secret(ctx, &region, &secret_arn).await;
         }
 
         Ok(DeleteDBInstanceOutput {

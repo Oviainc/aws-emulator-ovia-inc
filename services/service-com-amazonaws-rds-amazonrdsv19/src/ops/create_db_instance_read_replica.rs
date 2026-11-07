@@ -782,6 +782,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 engine_started_at: crate::state::now_as_wire_timestamp(),
                 tags,
                 engine_log: crate::state::InstanceLog::default(),
+                // A read replica manages NO Secrets Manager secret of its own: this
+                // operation has no `ManageMasterUserPassword` member, so nothing creates a
+                // secret for the replica, and the source's secret belongs to the source —
+                // publishing it here would report a secret as the replica's that no call
+                // created for it, and deleting the replica would delete the source's
+                // credential (see [`crate::state::DbInstanceRecord::master_user_secret`]).
+                // Named explicitly so the source's is not swept in by the update below.
+                master_user_secret: None,
                 // Everything else is the source's, and is never the request's: the engine
                 // and its version, the database the replica serves and the master credential
                 // a login is verified against are all the source's by definition — a replica

@@ -980,9 +980,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             database_insights_mode: Some(record.database_insights_mode.clone()),
         };
         let renamed_key = (region.clone(), record.identifier.clone());
-        store
-            .db_instances
-            .insert((region, record.identifier.clone()), record);
+        store.db_instances.insert(renamed_key.clone(), record);
         // A rename moves the instance to a new key, and its engine endpoint moves with
         // it: the listener a client is connected to stays the endpoint this instance
         // publishes, whatever it is now called.

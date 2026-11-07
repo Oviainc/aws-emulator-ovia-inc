@@ -696,7 +696,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 master_username: source.master_username.clone(),
                 // The secret RDS manages for the master user password is minted once this
                 // scope has released the store's guard (`ManageMasterUserPassword` below),
-                // so a record built here carries none yet.
+                // so a record built here carries none yet — and the SOURCE's secret is
+                // never carried over, since it belongs to the instance it was minted for
+                // (see [`crate::state::DbInstanceRecord::master_user_secret`]).
                 master_user_secret: None,
                 endpoint_port,
                 // Filled in below, once the core has assigned the engine listener its

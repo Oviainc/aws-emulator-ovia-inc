@@ -162,7 +162,9 @@ async fn held_credentials(
 
 /// The one `<MasterUserSecret>` subtree of a resource envelope, or `None` when the
 /// resource reports none.
-fn master_user_secret(case: &str, xml: &str) -> Option<String> {
+///
+/// `pub(crate)` for the same reason as [`emulator`].
+pub(crate) fn master_user_secret(case: &str, xml: &str) -> Option<String> {
     let found = subtrees(xml, "MasterUserSecret");
     assert!(
         found.len() <= 1,
