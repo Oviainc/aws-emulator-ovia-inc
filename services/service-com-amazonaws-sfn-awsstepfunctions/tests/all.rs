@@ -103,6 +103,8 @@ mod jsonata_states;
 mod lambda_task_control_flow;
 #[path = "all/list_state_machine_aliases_pages.rs"]
 mod list_state_machine_aliases_pages;
+#[path = "all/map_item_batcher.rs"]
+mod map_item_batcher;
 #[path = "all/map_item_reader.rs"]
 mod map_item_reader;
 #[path = "all/map_run_failure_budget.rs"]

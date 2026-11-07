@@ -2270,6 +2270,9 @@ fn interpret(
         waiting: None,
         parked: None,
         abandoned: Vec::new(),
+        // Nothing has failed beside this walk: it is the execution's own, not a branch
+        // of a `Parallel` state.
+        cancel_after: None,
         // The concurrent states this walk has to re-enter to reach the state a job's
         // outcome answers; empty for every other walk.
         resume_frames,
@@ -2712,6 +2715,17 @@ struct Interpreter<'tasks> {
     /// around the task that started one failed before the job could finish: what
     /// [`Run::abandoned`] reports, for the caller to stop.
     abandoned: Vec<ParkedJob>,
+    /// The instant a branch of the `Parallel` state the walk is currently inside
+    /// FAILED, for the branches of it that are still to be walked.
+    ///
+    /// "If any branch fails … the entire Parallel state is considered to have failed",
+    /// and the branches that were still running are stopped there: a state of a sibling
+    /// branch that would begin at or after that instant is not entered at all, so
+    /// whatever that state would have done is not done either. Set by
+    /// [`Interpreter::run_branches`] for the branches it has not walked yet and
+    /// restored to the enclosing state's own value after them, so it bounds exactly the
+    /// branches of the state that failed and the work nested inside them.
+    cancel_after: Option<Duration>,
     /// The concurrent states the walk has to re-enter to reach the task a job's
     /// outcome answers, outermost first ([`ParkedJob::frames`]): taken level by level
     /// as the walk descends into them, so each one is applied by the state it names.
@@ -2989,8 +3003,10 @@ impl Interpreter<'_> {
     ///
     /// "If any branch fails ... the entire Parallel state is considered to have
     /// failed", and it failed at the instant that branch did: the branches that were
-    /// still running are STOPPED there ([`Interpreter::abort_units`]), so no state of
-    /// a surviving branch is entered after the state the Parallel failed with. A
+    /// still running are STOPPED there, so no state of a surviving branch is ENTERED
+    /// from that instant on ([`Interpreter::stopped_by_a_sibling`]) — a call such a
+    /// state would have made is not made, and the events of what a stopped branch had
+    /// already run are cut back to that instant ([`Interpreter::abort_units`]). A
     /// branch that had PARKED at a job when that happened is stopped too, which is
     /// what [`Interpreter::abandoned`] carries.
     ///
@@ -3034,6 +3050,11 @@ impl Interpreter<'_> {
         let mut units: Vec<Unit> = Vec::with_capacity(count);
         let mut failed: Option<(Failure, Duration)> = None;
         let mut suspended: Option<usize> = None;
+        // What stops the branches still to be walked, for the branches of a state
+        // ENCLOSING this one that has already failed: this state's own branches are
+        // stopped by its own failure below, and the enclosing bound is put back once
+        // they have run.
+        let enclosing_cancel = self.cancel_after;
         for (index, (states, start_at)) in plan.branches.iter().enumerate() {
             if done.get(index).is_some_and(Option::is_some) {
                 continue;
@@ -3075,9 +3096,17 @@ impl Interpreter<'_> {
                 Ok(value) => {
                     match measure_payload(&value, "a 'Parallel' branch") {
                         Ok(bytes) => results_bytes = results_bytes.saturating_add(bytes),
-                        Err(failure) => return (Err(failure), end.max(branch.end)),
+                        Err(failure) => {
+                            // Leaving by any path puts back the bound the state was
+                            // entered under: what stops a branch belongs to the state
+                            // whose branch failed, not to the walk that goes on after
+                            // it.
+                            self.cancel_after = enclosing_cancel;
+                            return (Err(failure), end.max(branch.end));
+                        }
                     }
                     if results_bytes > MAX_PAYLOAD_BYTES {
+                        self.cancel_after = enclosing_cancel;
                         return (
                             Err(named(
                                 DATA_LIMIT_ERROR,
@@ -3101,9 +3130,20 @@ impl Interpreter<'_> {
                     if failed.as_ref().is_none_or(|(_, when)| branch.end < *when) {
                         failed = Some((failure, branch.end));
                     }
+                    // "If any branch fails … all the branches are stopped": from this
+                    // instant on the state has failed, so the branches still to be
+                    // walked do not enter a state that begins at or after it — and no
+                    // call such a state would have made is made
+                    // ([`Interpreter::stopped_by_a_sibling`]).
+                    let stop = failed.as_ref().map_or(branch.end, |(_, when)| *when);
+                    self.cancel_after = Some(match enclosing_cancel {
+                        Some(enclosing) => enclosing.min(stop),
+                        None => stop,
+                    });
                 }
             }
         }
+        self.cancel_after = enclosing_cancel;
         if let Some((failure, when)) = failed {
             // A branch of this state failed, so the state has failed — and a sibling
             // parked at a job is not waited for any longer: the job it started is
@@ -4389,8 +4429,10 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         waiting: None,
         parked: None,
         // `TestState` tests one state, so there is no concurrent state around it to
-        // park inside and no job of its own to abandon.
+        // park inside, no job of its own to abandon and no sibling branch whose
+        // failure could stop it.
         abandoned: Vec::new(),
+        cancel_after: None,
         resume_frames: Vec::new(),
         map_depth: 0,
         // `TestState` starts nothing: it reports what one state computes, and the

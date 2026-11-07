@@ -304,7 +304,7 @@ async fn a_caught_states_exited_event_carries_the_error_output_it_left_with() {
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: expected the caught error in {output}"));
     assert!(
-        error.starts_with("SFN."),
+        error.starts_with("StepFunctions."),
         "case {case:?}: expected the invoked service's own error name, got {error:?}"
     );
 }

@@ -25,6 +25,12 @@
 //! `Resource` names, which family names it (the optimized one and the AWS SDK one,
 //! which make the same call on the same resource), and the form the request addresses
 //! the target in (a queue's url, a function's ARN, a function's bare name).
+//!
+//! The harness this suite builds — the four services on one engine, the role, the queue,
+//! the state machine and the execution reader — is `pub(crate)`, because
+//! `all/sfn_integration_error_names.rs` asks a second question of the same four
+//! services and `tests/all.rs` is one crate root: one wiring, reached through
+//! `crate::sfn_task_target_authorization`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -41,10 +47,10 @@ use crate::cloudfront_key_value_store_handshake::segment as form_encode;
 use crate::query_wire::element;
 
 /// The region every request below is signed for.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The account id every ARN this emulator mints carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// How long a row waits for an execution to leave `RUNNING`.
 const PATIENCE: Duration = Duration::from_secs(20);
@@ -58,7 +64,7 @@ const REFUSAL_CODE: &str = "Error Code: AccessDeniedException";
 const TASK_FAILED: &str = "TaskFailed";
 
 /// The four services this question spans, over ONE shared engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -124,16 +130,16 @@ async fn rpc(
     parsed
 }
 
-async fn sfn(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn sfn(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     rpc(router, "states", "AWSStepFunctions", "1.0", operation, body).await
 }
 
-async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     rpc(router, "sqs", "AmazonSQS", "1.0", operation, body).await
 }
 
 /// The text a member of a response carries.
-fn string(body: &Value, name: &str) -> String {
+pub(crate) fn string(body: &Value, name: &str) -> String {
     body.get(name)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("expected a {name} in {body}"))
@@ -181,7 +187,7 @@ fn trust_document() -> Value {
 }
 
 /// An IAM role carrying `policy` as its inline policy, by its own ARN.
-async fn role(router: &MultiServiceRouter, name: &str, policy: &Value) -> String {
+pub(crate) async fn role(router: &MultiServiceRouter, name: &str, policy: &Value) -> String {
     let created = iam(
         router,
         "CreateRole",
@@ -206,9 +212,17 @@ async fn role(router: &MultiServiceRouter, name: &str, policy: &Value) -> String
 }
 
 /// A queue called `name`; answers its url and the ARN a policy names it by.
-async fn queue(router: &MultiServiceRouter, name: &str) -> (String, String) {
+pub(crate) async fn queue(router: &MultiServiceRouter, name: &str) -> (String, String) {
     let created = sqs(router, "CreateQueue", &json!({ "QueueName": name })).await;
-    let url = string(&created, "QueueUrl");
+    queue_handles(router, &created).await
+}
+
+/// The url and the ARN of the queue a `CreateQueue` answered.
+pub(crate) async fn queue_handles(
+    router: &MultiServiceRouter,
+    created: &Value,
+) -> (String, String) {
+    let url = string(created, "QueueUrl");
     let attributes = sqs(
         router,
         "GetQueueAttributes",
@@ -223,7 +237,7 @@ async fn queue(router: &MultiServiceRouter, name: &str) -> (String, String) {
 }
 
 /// How many messages are waiting on the queue at `url`.
-async fn waiting(router: &MultiServiceRouter, url: &str) -> usize {
+pub(crate) async fn waiting(router: &MultiServiceRouter, url: &str) -> usize {
     let received = sqs(
         router,
         "ReceiveMessage",
@@ -250,7 +264,7 @@ fn definition(resource: &str, parameters: &Value) -> String {
 }
 
 /// Create a state machine under `role_arn` and return its ARN.
-async fn machine(
+pub(crate) async fn machine(
     router: &MultiServiceRouter,
     name: &str,
     resource: &str,
@@ -271,7 +285,11 @@ async fn machine(
 }
 
 /// Start one execution and report it once it has left `RUNNING`.
-async fn ran(router: &MultiServiceRouter, machine_arn: &str, case: &str) -> (String, Value) {
+pub(crate) async fn ran(
+    router: &MultiServiceRouter,
+    machine_arn: &str,
+    case: &str,
+) -> (String, Value) {
     let started = sfn(
         router,
         "StartExecution",
@@ -299,7 +317,11 @@ async fn ran(router: &MultiServiceRouter, machine_arn: &str, case: &str) -> (Str
 }
 
 /// The details of the one `TaskFailed` event of an execution's history.
-async fn task_failure(router: &MultiServiceRouter, execution_arn: &str, case: &str) -> Value {
+pub(crate) async fn task_failure(
+    router: &MultiServiceRouter,
+    execution_arn: &str,
+    case: &str,
+) -> Value {
     let answered = sfn(
         router,
         "GetExecutionHistory",
@@ -327,13 +349,13 @@ async fn task_failure(router: &MultiServiceRouter, execution_arn: &str, case: &s
 }
 
 /// A statement allowing `action` on `resource`.
-fn allow(action: &str, resource: &str) -> Value {
+pub(crate) fn allow(action: &str, resource: &str) -> Value {
     json!({ "Effect": "Allow", "Action": action, "Resource": resource })
 }
 
 /// The statement every role below carries whatever else it does: the log writes a state
 /// machine makes, which say nothing about any integration call.
-fn logs_only() -> Value {
+pub(crate) fn logs_only() -> Value {
     json!({
         "Effect": "Allow",
         "Action": ["logs:CreateLogDelivery", "logs:PutLogEvents"],

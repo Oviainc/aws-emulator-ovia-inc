@@ -274,6 +274,17 @@ const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 /// (`<target prefix>.<OperationName>`).
 const TARGET_HEADER: &str = "x-amz-target";
 
+/// The header a client of a QUERY-COMPATIBLE service asks for the legacy query code of
+/// a refusal with, and the header such a service answers it in.
+///
+/// `aws.protocols#awsQueryCompatible` keeps a service's old query vocabulary alive for
+/// clients that once spoke it: the error class is named by its shape in the body and by
+/// its legacy code in [`QUERY_ERROR_HEADER`], whose value is `<code>;<fault>`. Step
+/// Functions reaches such a service through a client of that kind, which is why the
+/// code a failed task's cause reports is the legacy one.
+const QUERY_MODE_HEADER: &str = "x-amzn-query-mode";
+const QUERY_ERROR_HEADER: &str = "x-amzn-query-error";
+
 /// How one service's API is reached on the wire: the facts of that service's own
 /// model that a request to it is built from.
 ///
@@ -296,10 +307,30 @@ pub struct Api {
     /// error ([`Failed::error`]) and — lower-cased — the token an AWS SDK
     /// integration's `Resource` names this service by ([`Api::sdk_token`]).
     pub sdk_id: &'static str,
+    /// The name Step Functions writes for this service in the error name of a failed
+    /// `Task` (`SQS.QueueDoesNotExistException`): the service's SDK id for all but
+    /// Step Functions itself, whose integration failures name it by its full service
+    /// name rather than by the `SFN` id its SDK carries.
+    pub error_prefix: &'static str,
+    /// The name this service's SDK CLIENT carries, which is the name an exception it
+    /// raises reports the service under ([`sdk_exception_cause`]). It follows the
+    /// model's own service shape for most services and the SDK's own class name where
+    /// the two differ, so it is stated per entry rather than derived.
+    pub sdk_client: &'static str,
+    /// The BASE exception class of that client: the one its deserializer falls back to
+    /// for an error code no error shape of this service's model declares, which is the
+    /// error name a `Task` state then reports ([`Api::exception_of`]).
+    pub sdk_exception: &'static str,
     /// How its model spells the members of an operation's input
     /// ([`MemberCase`]), which is what decides the spelling the document a `Task`
     /// state built goes on the wire under.
     pub member_case: MemberCase,
+    /// Whether its model carries the `aws.protocols#awsQueryCompatible` modifier, so
+    /// its errors have a LEGACY QUERY code beside their shape — the code a client that
+    /// once spoke the query protocol still matches on, and the one such a service's own
+    /// exceptions report. A client asks for it with [`QUERY_MODE_HEADER`], which is why
+    /// the call made for a `Task` state asks for it too.
+    pub query_compatible: bool,
 }
 
 impl Api {
@@ -347,7 +378,96 @@ impl Api {
             .flat_map(char::to_lowercase)
             .collect()
     }
+
+    /// The exception class this service's SDK raises for the error shape `shape` an
+    /// answer named, which is the error half of a failed task's error name.
+    ///
+    /// A shape of the service's own model is deserialized into that shape's own class,
+    /// whose name is the shape name with the `Exception` suffix the SDKs give it — a
+    /// shape already spelled with it keeps the one it has. Two kinds of answer name no
+    /// shape of that model, so no client has a class for either and the base exception
+    /// is what carries it: a shape of the request-handling framework that fronts the
+    /// service ([`FRAMEWORK_NAMESPACES`]), and one of the errors EVERY service answers
+    /// ([`COMMON_WIRE_CODES`]).
+    fn exception_of(&self, shape: &str) -> String {
+        let namespace = shape.rsplit_once('#').map(|(namespace, _)| namespace);
+        let named = bare_name(shape);
+        if namespace.is_some_and(|namespace| FRAMEWORK_NAMESPACES.contains(&namespace))
+            || COMMON_WIRE_CODES.contains(&named)
+        {
+            return self.sdk_exception.to_string();
+        }
+        match named.ends_with(EXCEPTION_SUFFIX) {
+            true => named.to_string(),
+            false => format!("{named}{EXCEPTION_SUFFIX}"),
+        }
+    }
+
+    /// The error name a `Task` state reports for a refusal this service answered under
+    /// the error shape `shape`: this service as Step Functions names it in a task
+    /// error, and the SDK exception that shape is deserialized into.
+    pub fn task_error(&self, shape: &str) -> String {
+        format!("{}.{}", self.error_prefix, self.exception_of(shape))
+    }
+
+    /// The error name a `Task` state reports when this service refuses a call with an
+    /// error none of its own shapes declares: this service as Step Functions names it
+    /// in a task error, and its base SDK exception.
+    pub fn base_error(&self) -> String {
+        format!("{}.{}", self.error_prefix, self.sdk_exception)
+    }
 }
+
+/// The suffix the AWS SDKs give an error shape's own exception class.
+const EXCEPTION_SUFFIX: &str = "Exception";
+
+/// The namespaces of the request-handling framework that fronts an AWS service, which a
+/// parameter-level refusal names its shape under.
+///
+/// A shape in one of them belongs to no service's model: it is raised before the
+/// operation is reached (a required parameter the request did not carry, a value the
+/// request framework rejects), so no SDK carries a class for it and a client
+/// deserializes it into the service's base exception. The legacy code such an answer
+/// also carries is what a query-compatible client matches on
+/// ([`Api::query_compatible`]).
+const FRAMEWORK_NAMESPACES: &[&str] = &[
+    "com.amazon.coral.service",
+    "com.amazon.coral.validate",
+    "smithy.framework",
+];
+
+/// The wire error codes AWS answers for EVERY service — its common errors, the ones
+/// the request framework raises rather than any one API.
+///
+/// None of them is an error shape of a service's model, so no SDK has a class for one:
+/// a client deserializes it into the service's base exception ([`Api::sdk_exception`]),
+/// which is the error name Step Functions then reports for the task. They are the codes
+/// AWS documents as a service's common errors, which no `smithy_query` on a service
+/// model carries because no shape of that model declares them.
+///
+/// Every one of them is spelled WITHOUT the `Exception` suffix a modelled error shape
+/// carries, which is what tells the two apart: a code spelled with the suffix is a
+/// shape's own name (`ConditionalCheckFailedException`, `ResourceNotFoundException`)
+/// and names that shape's class, so no such code belongs here.
+const COMMON_WIRE_CODES: &[&str] = &[
+    "IncompleteSignature",
+    "InternalFailure",
+    "InvalidAction",
+    "InvalidClientTokenId",
+    "InvalidParameterCombination",
+    "InvalidParameterValue",
+    "InvalidQueryParameter",
+    "MalformedQueryString",
+    "MissingAction",
+    "MissingAuthenticationToken",
+    "MissingParameter",
+    "NotAuthorized",
+    "OptInRequired",
+    "RequestExpired",
+    "ServiceUnavailable",
+    "Throttling",
+    "ValidationError",
+];
 
 /// How a request to one service is bound to HTTP, which is what its model's protocol
 /// decides.
@@ -507,8 +627,14 @@ pub const APIS: &[Api] = &[
             version: "1.1",
         },
         sdk_id: "Athena",
+        error_prefix: "Athena",
+        // The client class `AmazonAthenaClient`, whose base exception is
+        // `AmazonAthenaException` — the model's service shape `AmazonAthena`.
+        sdk_client: "AmazonAthena",
+        sdk_exception: "AmazonAthenaException",
         // `StartQueryExecution`'s input: `QueryString`, `WorkGroup`.
         member_case: MemberCase::Pascal,
+        query_compatible: false,
     },
     // `services/service-com-amazonaws-dynamodb-dynamodb-20120810/smithy-model/
     // com-amazonaws-dynamodb-dynamodb-20120810.json`: awsJson1_0, sigv4Name
@@ -523,8 +649,16 @@ pub const APIS: &[Api] = &[
             version: "1.0",
         },
         sdk_id: "DynamoDB",
+        error_prefix: "DynamoDB",
+        // The one client whose names follow neither the model's service shape
+        // (`DynamoDB_20120810`) nor its SDK id: the client is `AmazonDynamoDBv2` and
+        // its base exception `AmazonDynamoDBException`, which is how a DynamoDB
+        // refusal already reports itself to a `Task` state.
+        sdk_client: "AmazonDynamoDBv2",
+        sdk_exception: "AmazonDynamoDBException",
         // `PutItem`'s input: `TableName`, `Item`.
         member_case: MemberCase::Pascal,
+        query_compatible: false,
     },
     // `services/service-com-amazonaws-sqs-amazonsqs/smithy-model/
     // com-amazonaws-sqs-amazonsqs.json`: awsJson1_0, sigv4Name `sqs`,
@@ -538,8 +672,18 @@ pub const APIS: &[Api] = &[
             version: "1.0",
         },
         sdk_id: "SQS",
+        error_prefix: "SQS",
+        // The client class `AmazonSQSClient`, whose base exception is
+        // `AmazonSQSException` — the model's service shape `AmazonSQS`.
+        sdk_client: "AmazonSQS",
+        sdk_exception: "AmazonSQSException",
         // `SendMessage`'s input: `QueueUrl`, `MessageBody`.
         member_case: MemberCase::Pascal,
+        // Amazon SQS is the one service here whose model carries
+        // `aws.protocols#awsQueryCompatible`, the modifier that keeps its errors'
+        // legacy query codes (`AWS.SimpleQueueService.NonExistentQueue`) beside their
+        // shapes.
+        query_compatible: true,
     },
     // `services/service-com-amazonaws-eventbridge-awsevents/smithy-model/
     // com-amazonaws-eventbridge-awsevents.json`: awsJson1_1, sigv4Name `events`,
@@ -553,8 +697,15 @@ pub const APIS: &[Api] = &[
             version: "1.1",
         },
         sdk_id: "EventBridge",
+        error_prefix: "EventBridge",
+        // The client the events API is reached through is
+        // `AmazonCloudWatchEventsClient`, whose base exception is
+        // `AmazonCloudWatchEventsException`.
+        sdk_client: "AmazonCloudWatchEvents",
+        sdk_exception: "AmazonCloudWatchEventsException",
         // `PutEvents`' input: `Entries`, `EndpointId`.
         member_case: MemberCase::Pascal,
+        query_compatible: false,
     },
     // This service itself, for a task that starts another execution:
     // `services/service-com-amazonaws-sfn-awsstepfunctions/smithy-model/
@@ -569,8 +720,17 @@ pub const APIS: &[Api] = &[
             version: "1.0",
         },
         sdk_id: "SFN",
+        // A failed `states:startExecution` task is reported under the service's own
+        // name rather than under the `SFN` id its SDK carries
+        // (`StepFunctions.AWSStepFunctionsException` for a refusal it does not model).
+        error_prefix: "StepFunctions",
+        // The client class `AWSStepFunctionsClient`, whose base exception is
+        // `AWSStepFunctionsException` — the model's service shape `AWSStepFunctions`.
+        sdk_client: "AWSStepFunctions",
+        sdk_exception: "AWSStepFunctionsException",
         // `StartExecution`'s input: `stateMachineArn`, `name`, `input`.
         member_case: MemberCase::LowerCamel,
+        query_compatible: false,
     },
     // `services/service-com-amazonaws-kinesis-kinesis-20131202/smithy-model/
     // com-amazonaws-kinesis-kinesis-20131202.json`: awsJson1_1, sigv4Name
@@ -585,8 +745,14 @@ pub const APIS: &[Api] = &[
             version: "1.1",
         },
         sdk_id: "Kinesis",
+        error_prefix: "Kinesis",
+        // The client class `AmazonKinesisClient`, whose base exception is
+        // `AmazonKinesisException`.
+        sdk_client: "AmazonKinesis",
+        sdk_exception: "AmazonKinesisException",
         // `PutRecord`'s input: `StreamName`, `Data`, `PartitionKey`.
         member_case: MemberCase::Pascal,
+        query_compatible: false,
     },
     // `services/service-com-amazonaws-ssm-amazonssm/smithy-model/
     // com-amazonaws-ssm-amazonssm.json`: awsJson1_1, sigv4Name `ssm`,
@@ -600,8 +766,14 @@ pub const APIS: &[Api] = &[
             version: "1.1",
         },
         sdk_id: "SSM",
+        error_prefix: "SSM",
+        // The client class `AmazonSSMClient`, whose base exception is
+        // `AmazonSSMException` — the model's service shape `AmazonSSM`.
+        sdk_client: "AmazonSSM",
+        sdk_exception: "AmazonSSMException",
         // `GetParameter`'s input: `Name`, `WithDecryption`.
         member_case: MemberCase::Pascal,
+        query_compatible: false,
     },
     // `services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/
     // smithy-model/com-amazonaws-ecs-amazonec2containerservicev20141113.json`:
@@ -616,8 +788,15 @@ pub const APIS: &[Api] = &[
             version: "1.1",
         },
         sdk_id: "ECS",
+        error_prefix: "ECS",
+        // The client class `AmazonECSClient`, whose base exception is
+        // `AmazonECSException`; the model's service shape carries the API's date
+        // (`AmazonEC2ContainerServiceV20141113`), which the SDK's own names do not.
+        sdk_client: "AmazonECS",
+        sdk_exception: "AmazonECSException",
         // `RunTask`'s input: `cluster`, `taskDefinition`, `overrides`.
         member_case: MemberCase::LowerCamel,
+        query_compatible: false,
     },
     // `services/service-com-amazonaws-glue-awsglue/smithy-model/
     // com-amazonaws-glue-awsglue.json`: awsJson1_1, sigv4Name `glue`, endpointPrefix
@@ -631,8 +810,14 @@ pub const APIS: &[Api] = &[
             version: "1.1",
         },
         sdk_id: "Glue",
+        error_prefix: "Glue",
+        // The client class `AWSGlueClient`, whose base exception is
+        // `AWSGlueException` — the model's service shape `AWSGlue`.
+        sdk_client: "AWSGlue",
+        sdk_exception: "AWSGlueException",
         // `StartJobRun`'s input: `JobName`, `Arguments`, `Timeout`.
         member_case: MemberCase::Pascal,
+        query_compatible: false,
     },
     // `services/service-com-amazonaws-lambda-awsgirapiservice/smithy-model/
     // com-amazonaws-lambda-awsgirapiservice.json`: restJson1, sigv4Name `lambda`,
@@ -644,8 +829,14 @@ pub const APIS: &[Api] = &[
         endpoint_prefix: LAMBDA_NAMESPACE,
         wire: Wire::Rest(LAMBDA_REST),
         sdk_id: "Lambda",
+        error_prefix: "Lambda",
+        // The client class `AWSLambdaClient`, whose base exception is
+        // `AWSLambdaException` — the model's service shape `AWSLambda`.
+        sdk_client: "AWSLambda",
+        sdk_exception: "AWSLambdaException",
         // `Invoke`'s input: `FunctionName`, `Payload`, `InvocationType`.
         member_case: MemberCase::Pascal,
+        query_compatible: false,
     },
     // `services/service-com-amazonaws-sts-awssecuritytokenservicev20110615/
     // smithy-model/com-amazonaws-sts-awssecuritytokenservicev20110615.json`: awsQuery,
@@ -660,8 +851,18 @@ pub const APIS: &[Api] = &[
             version: "2011-06-15",
         },
         sdk_id: "STS",
+        error_prefix: "STS",
+        // The client class `AWSSecurityTokenServiceClient`, whose base exception is
+        // `AWSSecurityTokenServiceException` — the model's service shape
+        // `AWSSecurityTokenServiceV20110615` without the version it carries.
+        sdk_client: "AWSSecurityTokenService",
+        sdk_exception: "AWSSecurityTokenServiceException",
         // `AssumeRole`'s input: `RoleArn`, `RoleSessionName`, `DurationSeconds`.
         member_case: MemberCase::Pascal,
+        // Its model declares the `awsQuery` protocol itself rather than the
+        // compatibility modifier, so an error of it is named by its own query code and
+        // there is no second name to ask for.
+        query_compatible: false,
     },
 ];
 
@@ -684,8 +885,13 @@ static S3_API: Api = Api {
     endpoint_prefix: S3_NAMESPACE,
     wire: Wire::Rest(S3_REST),
     sdk_id: "S3",
+    error_prefix: "S3",
+    // The client class `AmazonS3Client`, whose base exception is `AmazonS3Exception`.
+    sdk_client: "AmazonS3",
+    sdk_exception: "AmazonS3Exception",
     // `GetObject`'s input: `Bucket`, `Key`; `ListObjectsV2`'s: `Bucket`, `Prefix`.
     member_case: MemberCase::Pascal,
+    query_compatible: false,
 };
 
 /// S3's ARN namespace, its signing name and its endpoint prefix, which are the same
@@ -898,13 +1104,6 @@ pub struct TargetResource {
     pub member: &'static str,
     /// How that member spells the resource it names ([`TargetNaming`]).
     pub named: TargetNaming,
-    /// The error name a `Task` state reports when the invoked service refuses this
-    /// call with an error its own operation does not model: the service as Step
-    /// Functions names it in a task error, and that service's base SDK exception.
-    pub refusal_error: &'static str,
-    /// The name that refusal's own metadata names the service under, which is the
-    /// name its SDK client carries rather than anything in its model.
-    pub refusal_service: &'static str,
 }
 
 /// How the member of an integration's request that names the call's target SPELLS it.
@@ -1067,14 +1266,12 @@ pub const TARGET_RESOURCES: &[TargetResource] = &[
     // own model: `stateMachineArn` is the ARN "of the state machine to execute").
     // A refusal this operation does not model is reported under this service's own
     // base SDK exception, the one the AWS SDKs deserialize an unmodelled Step
-    // Functions error into.
+    // Functions error into ([`Api::base_error`]).
     TargetResource {
         integration: "states:startExecution",
         action: None,
         member: "StateMachineArn",
         named: TargetNaming::Arn,
-        refusal_error: "StepFunctions.AWSStepFunctionsException",
-        refusal_service: "AWSStepFunctions",
     },
     // DynamoDB's item-level integrations each act on ONE table, the one their
     // `TableName` parameter names: "The name of the table to contain the item" /
@@ -1094,32 +1291,24 @@ pub const TARGET_RESOURCES: &[TargetResource] = &[
         action: None,
         member: "TableName",
         named: DYNAMODB_TABLE,
-        refusal_error: DYNAMODB_REFUSAL_ERROR,
-        refusal_service: DYNAMODB_REFUSAL_SERVICE,
     },
     TargetResource {
         integration: "dynamodb:getItem",
         action: None,
         member: "TableName",
         named: DYNAMODB_TABLE,
-        refusal_error: DYNAMODB_REFUSAL_ERROR,
-        refusal_service: DYNAMODB_REFUSAL_SERVICE,
     },
     TargetResource {
         integration: "dynamodb:updateItem",
         action: None,
         member: "TableName",
         named: DYNAMODB_TABLE,
-        refusal_error: DYNAMODB_REFUSAL_ERROR,
-        refusal_service: DYNAMODB_REFUSAL_SERVICE,
     },
     TargetResource {
         integration: "dynamodb:deleteItem",
         action: None,
         member: "TableName",
         named: DYNAMODB_TABLE,
-        refusal_error: DYNAMODB_REFUSAL_ERROR,
-        refusal_service: DYNAMODB_REFUSAL_SERVICE,
     },
     // `arn:aws:states:::sqs:sendMessage` sends to the queue its `QueueUrl` parameter
     // addresses, which is the queue `sqs:SendMessage` is taken on
@@ -1134,8 +1323,6 @@ pub const TARGET_RESOURCES: &[TargetResource] = &[
         action: None,
         member: "QueueUrl",
         named: TargetNaming::QueueUrl,
-        refusal_error: "SQS.AmazonSQSException",
-        refusal_service: "AmazonSQS",
     },
     // `arn:aws:states:::lambda:invoke` invokes the function its `FunctionName`
     // parameter names. The action is `lambda:InvokeFunction` — the permission Lambda
@@ -1150,8 +1337,6 @@ pub const TARGET_RESOURCES: &[TargetResource] = &[
         action: Some("lambda:InvokeFunction"),
         member: "FunctionName",
         named: TargetNaming::FunctionName,
-        refusal_error: "Lambda.AWSLambdaException",
-        refusal_service: "AWSLambda",
     },
 ];
 
@@ -1160,13 +1345,6 @@ const DYNAMODB_TABLE: TargetNaming = TargetNaming::Named {
     service: "dynamodb",
     prefix: "table/",
 };
-
-/// The error name a `Task` state reports for a DynamoDB refusal the invoked operation
-/// does not model, and the name that refusal's metadata names the service under: the
-/// service as Step Functions writes it in a task error, and DynamoDB's base SDK
-/// exception and client name.
-const DYNAMODB_REFUSAL_ERROR: &str = "DynamoDB.AmazonDynamoDBException";
-const DYNAMODB_REFUSAL_SERVICE: &str = "AmazonDynamoDBv2";
 
 impl TargetResource {
     /// The ARN of the resource this call's `request` names, in the Region `region`
@@ -2710,6 +2888,8 @@ pub async fn call_api(
                         answered.status,
                         answered.error_type.as_deref(),
                         &answered.payload,
+                        answered.header(REQUEST_ID_HEADER).as_deref(),
+                        answered.query_error_code().as_deref(),
                     ),
                 },
             };
@@ -2919,9 +3099,17 @@ fn with_sdk_envelope(document: Value, answered: &Answered) -> Value {
 /// A 2xx answers the response document, which IS the state's result; an operation
 /// whose output carries no member answers an empty body, which is the empty
 /// document. Anything else is a refusal, reported as the error name Step Functions
-/// gives a failed service call — the service's own id and the error code it
-/// answered — so a definition's `Retry` and `Catch` match on the service's error.
+/// gives a failed service call — the service as it names it in a task error, and the
+/// SDK exception the code it answered is deserialized into ([`Api::task_error`]) — so
+/// a definition's `Retry` and `Catch` match on the error the service's own client
+/// raises. The cause is that exception's own message ([`sdk_exception_cause`]).
 /// A refusal with no code at all is left as ASL's own [`TASK_FAILED_ERROR`].
+///
+/// `request_id` is the identifier the answer named the request it refused by, which
+/// the SDK reports in the exception's metadata; `None` for an answer that named none,
+/// and nothing is invented to fill the field. `query_code` is the legacy query code the
+/// answer named the class by for a service whose model is query-compatible
+/// ([`Api::query_compatible`]), which is the code such a service's own client reports.
 ///
 /// Pure, so the reading of every answer form is pinned by this module's own tests.
 fn answer_of(
@@ -2930,6 +3118,8 @@ fn answer_of(
     status: u16,
     error_type: Option<&str>,
     payload: &[u8],
+    request_id: Option<&str>,
+    query_code: Option<&str>,
 ) -> Answer {
     let document: Option<Value> = if payload.is_empty() {
         None
@@ -2945,14 +3135,14 @@ fn answer_of(
     if (200..300).contains(&status) {
         return Ok(document.unwrap_or_else(|| Value::Object(Map::new())));
     }
-    let code = error_code(error_type, document.as_ref());
+    let shape = error_shape(error_type, document.as_ref());
     let message = document
         .as_ref()
         .and_then(error_message)
         .unwrap_or_default();
     // A gap in this emulator is not the service refusing the call: nothing was run
     // for the task, which is what it reports.
-    if code.as_deref() == Some(NOT_IMPLEMENTED_CODE) {
+    if shape.as_deref().map(bare_name) == Some(NOT_IMPLEMENTED_CODE) {
         return Err(Failed {
             error: super::asl::RUNTIME_ERROR.to_string(),
             cause: format!(
@@ -2962,14 +3152,20 @@ fn answer_of(
             ),
         });
     }
-    let (error, cause) = match code {
-        Some(code) => (
-            format!("{}.{code}", api.sdk_id),
-            if message.is_empty() {
-                format!("{} refused the '{operation}' call with {code}", api.sdk_id)
-            } else {
-                message
-            },
+    let (error, cause) = match shape {
+        Some(shape) => (
+            api.task_error(&shape),
+            // The code the exception reports is the one that service's own client
+            // matches the class on: the legacy query code where the service names
+            // one, and the error shape's name where it does not.
+            sdk_exception_cause(
+                api,
+                &message,
+                query_code.unwrap_or_else(|| bare_name(&shape)),
+                status,
+                request_id,
+                operation,
+            ),
         ),
         None => (
             TASK_FAILED_ERROR.to_string(),
@@ -3012,13 +3208,65 @@ const RESULT_SUFFIX: &str = "Result";
 /// See [`RESULT_SUFFIX`].
 const RESPONSE_METADATA_ELEMENT: &str = "ResponseMetadata";
 
-/// The error code an AWS JSON refusal carries: the `X-Amzn-Errortype` header, else
-/// the body's `__type` discriminator, else its `code` member.
+/// The cause a failed `Task` reports for a refusal: the message the exception the
+/// invoked service's SDK raised carries.
 ///
-/// Each of those spellings may carry decoration an error NAME does not — a shape
-/// id's namespace before `#`, a URL after `:` — so the code is the bare shape name
-/// between them.
-fn error_code(error_type: Option<&str>, document: Option<&Value>) -> Option<String> {
+/// An AWS SDK renders a service exception as the service's own message followed by the
+/// metadata that answer carried — the client the call was made with, the status, the
+/// error code and the identifier of the request — and that rendering is what Step
+/// Functions puts in the task's cause, which is why a `Catch` path reading the cause
+/// finds the service's error code in it. The ONE rendering of it: a refusal the
+/// authorization gate makes on the service's behalf is reported the same way, through
+/// [`sdk_exception_message`] below. A fact the answer did not carry is left out rather
+/// than invented: a refusal naming no request is reported without one, and a refusal
+/// carrying no message of its own says which call of which service came back under that
+/// code.
+fn sdk_exception_cause(
+    api: &Api,
+    message: &str,
+    code: &str,
+    status: u16,
+    request_id: Option<&str>,
+    operation: &str,
+) -> String {
+    let message = match message.is_empty() {
+        true => format!("{} refused the '{operation}' call with {code}", api.sdk_id),
+        false => message.to_string(),
+    };
+    sdk_exception_message(api.sdk_client, &message, code, status, request_id)
+}
+
+/// One SDK exception as its own client renders it: the service's sentence, then the
+/// metadata the answer carried.
+///
+/// Public to this crate because a refusal the emulator answers FOR the invoked service
+/// ([`super::task_authorization`]) is the same exception reaching the state the same
+/// way: one rendering, so the two cannot drift. `client` is the name that service's own
+/// SDK client carries ([`Api::sdk_client`]), which is what an exception reports the
+/// service under; `request_id` is the identifier the answer named the request by, left
+/// out where there is none — a call that was never made has no request to name.
+pub fn sdk_exception_message(
+    client: &str,
+    message: &str,
+    code: &str,
+    status: u16,
+    request_id: Option<&str>,
+) -> String {
+    let request = request_id.map_or_else(String::new, |id| format!("Request ID: {id}; "));
+    format!(
+        "{message} (Service: {client}; Status Code: {status}; Error Code: {code}; \
+         {request}Proxy: null)"
+    )
+}
+
+/// The error SHAPE an AWS JSON refusal names: the `X-Amzn-Errortype` header, else the
+/// body's `__type` discriminator, else its `code` member.
+///
+/// The NAMESPACE is kept, because it is what says whose shape the class belongs to: a
+/// service's own model, or the request-handling framework in front of it
+/// ([`FRAMEWORK_NAMESPACES`]). Only the decoration that is no part of a shape id — a URL
+/// after `:` — is dropped.
+fn error_shape(error_type: Option<&str>, document: Option<&Value>) -> Option<String> {
     let discriminator = error_type.map(str::to_string).or_else(|| {
         let document = document?;
         ["__type", "code", "Code"]
@@ -3030,11 +3278,15 @@ fn error_code(error_type: Option<&str>, document: Option<&Value>) -> Option<Stri
         .split(':')
         .next()
         .unwrap_or_default()
-        .rsplit('#')
-        .next()
-        .unwrap_or_default()
-        .trim();
-    (!named.is_empty()).then(|| named.to_string())
+        .trim()
+        .to_string();
+    (!named.is_empty()).then_some(named)
+}
+
+/// The bare name of a shape id: what follows its namespace, read through the tree's one
+/// reading of a shape id ([`::service_common::shape_local_name`]).
+fn bare_name(shape: &str) -> &str {
+    ::service_common::shape_local_name(shape)
 }
 
 /// The message an AWS JSON refusal carries, under either of the member spellings the
@@ -3070,6 +3322,11 @@ async fn dispatch(
     }
     if let Some(target) = &built.target {
         builder = builder.header(TARGET_HEADER, target);
+    }
+    // A query-compatible service names a refusal by its legacy query code as well as
+    // by its shape, and only for a client that asks for it.
+    if api.query_compatible {
+        builder = builder.header(QUERY_MODE_HEADER, "true");
     }
     for (field, value) in &built.headers {
         builder = builder.header(*field, value);
@@ -3146,6 +3403,16 @@ impl Answered {
             .iter()
             .find(|(carried, _)| carried.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.clone())
+    }
+
+    /// The LEGACY query code a query-compatible service named this refusal's class by,
+    /// out of [`QUERY_ERROR_HEADER`]'s `<code>;<fault>`; `None` for an answer that
+    /// carried none, which is every answer of a service that is not query-compatible
+    /// and every class such a service's model states no legacy code for.
+    fn query_error_code(&self) -> Option<String> {
+        let carried = self.header(QUERY_ERROR_HEADER)?;
+        let code = carried.split(';').next().unwrap_or_default().trim();
+        (!code.is_empty()).then(|| code.to_string())
     }
 }
 
@@ -3524,7 +3791,7 @@ mod tests {
             .find(|api| api.namespace == "dynamodb")
             .expect("DynamoDB is a service a task calls");
         // (case, status, the error-type header, the body, the expected answer)
-        let rows: [AnswerRow; 8] = [
+        let rows: [AnswerRow; 11] = [
             (
                 "a response document is the state's result",
                 200,
@@ -3581,10 +3848,48 @@ mod tests {
                 r#"{"message":"not implemented"}"#,
                 Err(super::super::asl::RUNTIME_ERROR),
             ),
+            (
+                // DynamoDB models `TransactionConflict` without the suffix its SDK
+                // class carries, which is the half of the rule a shape already
+                // spelled `…Exception` does not exercise.
+                "a modelled shape the SDK suffixes",
+                400,
+                Some("TransactionConflict"),
+                r#"{"message":"the transaction conflicted"}"#,
+                Err("DynamoDB.TransactionConflictException"),
+            ),
+            (
+                // One of AWS's common errors: no shape of any service's model
+                // declares it, so the client's base exception carries it.
+                "a common error every service answers",
+                400,
+                Some("MissingParameter"),
+                r#"{"message":"The request must contain the parameter TableName."}"#,
+                Err("DynamoDB.AmazonDynamoDBException"),
+            ),
+            (
+                // A parameter-level refusal names the shape of the request framework
+                // in front of the service, which belongs to no service's model: the
+                // base exception carries that too.
+                "a shape of the framework in front of the service",
+                400,
+                None,
+                r#"{"__type":"com.amazon.coral.service#MissingRequiredParameterException",
+                    "message":"The request must contain the parameter TableName."}"#,
+                Err("DynamoDB.AmazonDynamoDBException"),
+            ),
         ];
 
         for (case, status, error_type, body, expected) in rows {
-            let answer = answer_of(api, "PutItem", status, error_type, body.as_bytes());
+            let answer = answer_of(
+                api,
+                "PutItem",
+                status,
+                error_type,
+                body.as_bytes(),
+                Some("a-request-id"),
+                None,
+            );
             match (&answer, expected) {
                 (Ok(result), Ok(document)) => {
                     let expected: Value =
@@ -3603,9 +3908,77 @@ mod tests {
                         !failed.cause.is_empty(),
                         "case {case:?}: a failed task must say what happened, got {failed:?}"
                     );
+                    // A refusal the service itself answered is reported as its SDK
+                    // exception's own message: the service's sentence, then the
+                    // metadata that answer carried.
+                    if error.starts_with("DynamoDB.") {
+                        assert!(
+                            failed.cause.contains("(Service: AmazonDynamoDBv2; Status Code: ")
+                                && failed
+                                    .cause
+                                    .ends_with("Request ID: a-request-id; Proxy: null)"),
+                            "case {case:?}: expected the SDK exception's own message, got \
+                             {failed:?}"
+                        );
+                    }
                 }
                 _ => panic!("case {case:?}: expected {expected:?}, got {answer:?}"),
             }
+        }
+    }
+
+    /// A QUERY-COMPATIBLE service names a refusal twice — by its error shape and by the
+    /// legacy query code its old vocabulary knows the class as — and each name is read
+    /// for what it decides: the shape decides the exception class the error name
+    /// carries, the legacy code is what that exception reports as the code.
+    #[test]
+    fn a_query_compatible_refusal_is_named_by_its_shape_and_reports_its_legacy_code() {
+        let api = APIS
+            .iter()
+            .find(|api| api.namespace == "sqs")
+            .expect("Amazon SQS is a service a task calls");
+        // (case, the error shape, the legacy code, the error name, the code reported)
+        let rows: [(&str, &str, &str, &str, &str); 2] = [
+            (
+                "a shape the service's own model declares",
+                "QueueDoesNotExist",
+                "AWS.SimpleQueueService.NonExistentQueue",
+                "SQS.QueueDoesNotExistException",
+                "AWS.SimpleQueueService.NonExistentQueue",
+            ),
+            (
+                "a parameter-level refusal, which belongs to no model of the service",
+                "com.amazon.coral.service#MissingRequiredParameterException",
+                "MissingParameter",
+                "SQS.AmazonSQSException",
+                "MissingParameter",
+            ),
+        ];
+
+        for (case, shape, legacy, error, reported) in rows {
+            let body = format!(r#"{{"__type":"{shape}","message":"refused."}}"#);
+            let answer = answer_of(
+                api,
+                "SendMessage",
+                400,
+                None,
+                body.as_bytes(),
+                None,
+                Some(legacy),
+            );
+            let failed = answer.expect_err("a 400 is a refusal");
+            assert_eq!(
+                failed.error, error,
+                "case {case:?}: expected the error {error}, got {failed:?}"
+            );
+            assert_eq!(
+                failed.cause,
+                format!(
+                    "refused. (Service: AmazonSQS; Status Code: 400; Error Code: {reported}; \
+                     Proxy: null)"
+                ),
+                "case {case:?}: expected the SDK exception's own message, got {failed:?}"
+            );
         }
     }
 

@@ -514,6 +514,15 @@ mod sfn_task_target_authorization;
 // Declared beside the other Step Functions suites, for the reason the lines above give.
 #[path = "all/sfn_lambda_task_invocation.rs"]
 mod sfn_lambda_task_invocation;
+// Declared beside the other Step Functions suites, for the reason the lines above give.
+#[path = "all/sfn_integration_error_names.rs"]
+mod sfn_integration_error_names;
+// Declared beside the other Step Functions suites, for the reason the lines above give.
+#[path = "all/sfn_parallel_branch_cancellation.rs"]
+mod sfn_parallel_branch_cancellation;
+// Declared beside the other Step Functions suites, for the reason the lines above give.
+#[path = "all/cloudformation_sfn_fifo_queue_stack.rs"]
+mod cloudformation_sfn_fifo_queue_stack;
 // Declared HERE, in the sorted list at its own name, rather than at the head or the tail
 // of this file: both of those are where every concurrently landing suite puts its line, so
 // a declaration there conflicts with all of them, while these neighbouring lines are

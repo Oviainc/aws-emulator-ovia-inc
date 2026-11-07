@@ -119,6 +119,46 @@ impl Interpreter<'_> {
         branch
     }
 
+    /// Whether this branch is one a SIBLING branch's failure has stopped, for a state
+    /// about to be ENTERED at `at`, and the failure that says so.
+    ///
+    /// "If any branch fails, the entire Parallel state is considered to have failed and
+    /// all the branches are stopped": the state's own outcome is the failure of the
+    /// branch that failed ([`Interpreter::run_branches`] keeps the earliest), so this
+    /// failure is never what a caller reads — what it decides is that the states of a
+    /// stopped branch are not entered.
+    ///
+    /// The branches of a `Parallel` all BEGIN together, so a state due at the very
+    /// instant a sibling failed had already begun: it is entered and then aborted, as
+    /// every other state the failure caught in flight is. What a stopped branch does
+    /// NOT do is the WORK of such a state ([`Interpreter::stopped_before_working`]).
+    pub(super) fn stopped_before_entering(&self, at: Duration) -> Option<Failure> {
+        self.stopped_by_a_sibling(at, false)
+    }
+
+    /// Whether this branch is one a sibling branch's failure has stopped, for the WORK
+    /// of a state entered at `at`: the call a `Task` state would make.
+    ///
+    /// Work the failure caught IN FLIGHT does not finish — "a send that had not
+    /// completed does not occur" — so the call of a state entered at or after that
+    /// instant is not made at all, and the task is stopped instead.
+    pub(super) fn stopped_before_working(&self, at: Duration) -> Option<Failure> {
+        self.stopped_by_a_sibling(at, true)
+    }
+
+    /// The failure a stopped branch's state carries, when `at` is past the instant a
+    /// sibling failed — `inclusive` for the work of a state, which the failure catches
+    /// in flight, and exclusive for entering one.
+    fn stopped_by_a_sibling(&self, at: Duration, inclusive: bool) -> Option<Failure> {
+        let when = self.cancel_after?;
+        (at > when || (inclusive && at == when)).then(|| {
+            runtime(
+                "a branch of the enclosing 'Parallel' state failed, so this branch was stopped"
+                    .to_string(),
+            )
+        })
+    }
+
     /// Walk `states` from `start_at`, with `input` as the first state's input and
     /// `at` as the offset into the run at which this branch begins.
     pub(super) fn walk(
@@ -143,6 +183,16 @@ impl Interpreter<'_> {
                         error: Some(super::TIMEOUT_ERROR.to_string()),
                         cause: None,
                     }),
+                    end: at,
+                    suspended: false,
+                };
+            }
+            // A branch of the enclosing `Parallel` state has already FAILED, so the
+            // state is failing and the work that had not begun does not begin: a state
+            // due after that instant is not entered at all.
+            if let Some(stopped) = self.stopped_before_entering(at) {
+                return Branch {
+                    outcome: Err(stopped),
                     end: at,
                     suspended: false,
                 };
@@ -1607,6 +1657,12 @@ impl Interpreter<'_> {
                         (Err(failure), at)
                     }
                 };
+            }
+            // A branch of the enclosing `Parallel` state has already failed, so this
+            // state's work was stopped in flight: the call is NOT made, nothing is
+            // scheduled for it, and nothing it would have done is done.
+            if let Some(stopped) = me.stopped_before_working(at) {
+                return (Err(stopped), at);
             }
             // This attempt's own request reads `$$.State.RetryCount`, so the payload
             // template is rendered with the context of the attempt it is on. A

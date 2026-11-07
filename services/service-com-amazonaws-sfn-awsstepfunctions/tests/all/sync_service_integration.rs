@@ -433,12 +433,12 @@ async fn a_job_that_could_not_be_started_reports_the_services_own_refusal() {
         (
             "a request the service refuses",
             json!({ "input": "{}" }),
-            "SFN.ValidationException",
+            "StepFunctions.ValidationException",
         ),
         (
             "a request naming a state machine the service does not hold",
             json!({ "stateMachineArn": absent }),
-            "SFN.StateMachineDoesNotExist",
+            "StepFunctions.StateMachineDoesNotExistException",
         ),
     ];
 

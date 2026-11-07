@@ -191,7 +191,9 @@ pub fn role_gate<Eng: Send + Sync + 'static>(
         if let Some(refused) = &unassumable {
             return Some(refused.clone());
         }
-        let targets = call.targets?;
+        // Only a call whose target this module can name is decided here; anything else
+        // is left to the invoked operation's own answer.
+        call.targets?;
         let iam = iam_state(&*engine)?;
         let (action, resource) = access_request(call, request, &region)?;
         let refused = refusal(
@@ -199,10 +201,13 @@ pub fn role_gate<Eng: Send + Sync + 'static>(
             &role_arn,
             &action,
             &resource,
-            targets.refusal_service,
+            call.api.sdk_client,
         )?;
+        // The invoked operation models no access-denied error of its own, so the
+        // refusal reaches the state under the invoked service's BASE SDK exception,
+        // which is what its client deserializes an unmodelled code into.
         Some(Failed {
-            error: targets.refusal_error.to_string(),
+            error: call.api.base_error(),
             cause: refused,
         })
     }))
@@ -245,10 +250,12 @@ pub fn role_denial<Eng: Send + Sync + 'static>(
 /// shown (see the module docs for the cases that show nothing).
 ///
 /// It is the refusal AS THE SDK REPORTS IT to the state: the service's own
-/// not-authorized sentence, followed by the metadata that answer carried — the
-/// service it came from, the status and the error code. The identifier of the refused
-/// request is not among them: no call was made, so there is no request to name, and
-/// nothing is invented to fill the field.
+/// not-authorized sentence, followed by the metadata that answer carried — rendered by
+/// the ONE renderer of an SDK exception's message
+/// ([`super::integration::sdk_exception_message`]), so a refusal this gate answers for
+/// the service reads exactly as one the service answered itself. The identifier of the
+/// refused request is not among them: no call was made, so there is no request to name,
+/// and nothing is invented to fill the field.
 fn refusal(
     iam: &IamState,
     role_arn: &str,
@@ -303,9 +310,15 @@ fn refusal(
     };
     // The acting principal is the role itself: the emulator assumes no session for a
     // `Task` state's call, so there is no session name to report it under.
-    Some(format!(
+    let sentence = format!(
         "User: {role_arn} is not authorized to perform: {action} on resource: {resource} \
-         {because} (Service: {service}; Status Code: {ACCESS_DENIED_STATUS}; Error Code: \
-         {ACCESS_DENIED_CODE}; Proxy: null)"
+         {because}"
+    );
+    Some(super::integration::sdk_exception_message(
+        service,
+        &sentence,
+        ACCESS_DENIED_CODE,
+        ACCESS_DENIED_STATUS,
+        None,
     ))
 }
