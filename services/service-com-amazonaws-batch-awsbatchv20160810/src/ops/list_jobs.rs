@@ -213,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store's lock lives in THIS block and no longer, so nothing holds it while
         // the transitions it materialised are published below (that call reaches another
         // service in-process).
-        let mut jobs: Vec<batch::Job> = {
+        let (mut jobs, array_summaries): (Vec<batch::Job>, ArraySummaries) = {
             let mut state = state.lock();
             state.materialize_due(now);
 
@@ -257,8 +257,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // hold — an unknown job queue, or an array / multi-node parent id that names
             // no job — selects NOTHING: it is an empty page, not a refusal, so a caller
             // may poll a queue before it exists or list by array id defensively.
-            match input.job_queue.as_deref() {
-                Some(reference) => match state.job_queue(reference) {
+            let selected: Vec<batch::Job> = match (input.job_queue.as_deref(), input.array_job_id.as_deref()) {
+                (Some(reference), _) => match state.job_queue(reference) {
                     Some(queue) => {
                         let queue_arn = queue.arn.clone();
                         state
@@ -272,12 +272,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                     None => Vec::new(),
                 },
-                // The children of an array or multi-node parent. `SubmitJob` creates none
-                // (it answers 501 for `arrayProperties`/`nodeOverrides`), so a parent
-                // that exists has no children to list and one that does not exist selects
-                // nothing: both are the same empty page.
-                None => Vec::new(),
-            }
+                // `arrayJobId`: "Specifying an array job ID with this parameter lists all
+                // child jobs from within the specified array." A parent this store holds
+                // answers with its children, in index order; an id that names no array
+                // parent selects nothing.
+                (None, Some(parent_id)) => {
+                    state.array_children(parent_id).into_iter().cloned().collect()
+                }
+                // A multi-node parent's children, which `SubmitJob` creates none of (it
+                // answers 501 for `nodeOverrides`), so a parent that exists has no
+                // children to list and one that does not exist selects nothing: both are
+                // the same empty page.
+                (None, None) => Vec::new(),
+            };
+            // The summary of each selected ARRAY PARENT, counted from its children's own
+            // records while the store is still held, so a parent's page entry reports the
+            // same summary a `DescribeJobs` of it would.
+            let summaries: ArraySummaries = selected
+                .iter()
+                .filter_map(|job| {
+                    state
+                        .array_status_summary(&job.job_id)
+                        .map(|summary| (job.job_id.clone(), summary))
+                })
+                .collect();
+            (selected, summaries)
         };
         batch::publish_job_state_changes(ctx, &*self.engine, &batch::request_region(ctx)).await;
 
@@ -363,27 +382,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let job_summary_list = page
             .into_iter()
-            .map(|job| JobSummary {
-                job_arn: Some(job.job_arn),
-                job_id: job.job_id,
-                job_name: job.job_name,
-                capacity_usage: None,
-                created_at: Some(job.created_at),
-                scheduled_at: None,
-                share_identifier: job.share_identifier,
-                status: Some(job.status),
-                status_reason: job.status_reason,
-                started_at: job.started_at,
-                stopped_at: job.stopped_at,
-                container: job.container.map(|container| ContainerSummary {
-                    exit_code: container.exit_code,
-                    reason: container.reason,
-                }),
-                array_properties: None,
-                node_properties: None,
-                job_definition: Some(job.job_definition_arn),
-                is_cancelled: Some(job.is_cancelled),
-                is_terminated: Some(job.is_terminated),
+            .map(|job| {
+                let array_properties = array_properties(&job, &array_summaries);
+                JobSummary {
+                    job_arn: Some(job.job_arn),
+                    job_id: job.job_id,
+                    job_name: job.job_name,
+                    capacity_usage: None,
+                    created_at: Some(job.created_at),
+                    scheduled_at: None,
+                    share_identifier: job.share_identifier,
+                    status: Some(job.status),
+                    status_reason: job.status_reason,
+                    started_at: job.started_at,
+                    stopped_at: job.stopped_at,
+                    container: job.container.map(|container| ContainerSummary {
+                        exit_code: container.exit_code,
+                        reason: container.reason,
+                    }),
+                    array_properties,
+                    node_properties: None,
+                    job_definition: Some(job.job_definition_arn),
+                    is_cancelled: Some(job.is_cancelled),
+                    is_terminated: Some(job.is_terminated),
+                }
             })
             .collect();
 
@@ -392,4 +414,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
         })
     }
+}
+
+/// The array-job summary of each selected parent, keyed by its job id: how many of its
+/// children are in each `JobStatus`, and the latest instant one of them moved
+/// (`state::ComAmazonawsBatchAwsbatchv20160810State::array_status_summary`).
+type ArraySummaries = ::std::collections::HashMap<
+    String,
+    (::std::collections::HashMap<String, i32>, i64),
+>;
+
+/// `JobSummary$arrayProperties` for one listed job.
+///
+/// A PARENT reports the `size` its submit named and the `statusSummary` its children add
+/// up to (both documented "returned for parent array jobs"); a CHILD reports its own
+/// `index` ("returned for children of array jobs"); every other job reports no array
+/// properties at all.
+fn array_properties(
+    job: &crate::state::Job,
+    summaries: &ArraySummaries,
+) -> Option<ArrayPropertiesSummary> {
+    if let Some((status_summary, last_updated_at)) = summaries.get(&job.job_id) {
+        return Some(ArrayPropertiesSummary {
+            size: job.array_size,
+            index: None,
+            status_summary: Some(status_summary.clone()),
+            status_summary_last_updated_at: Some(*last_updated_at),
+        });
+    }
+    job.array_index.map(|index| ArrayPropertiesSummary {
+        size: None,
+        index: Some(index),
+        status_summary: None,
+        status_summary_last_updated_at: None,
+    })
 }

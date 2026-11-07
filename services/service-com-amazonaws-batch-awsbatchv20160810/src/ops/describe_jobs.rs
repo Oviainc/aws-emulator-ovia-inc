@@ -210,7 +210,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     container: job.container.clone(),
                     node_details: None,
                     node_properties: job.node_properties.clone(),
-                    array_properties: None,
+                    // "The array properties of the job, if it's an array job"
+                    // (`JobDetail$arrayProperties`): the `size` and the summary its
+                    // children add up to for a PARENT, the `index` for a CHILD, and the
+                    // member absent for every job that is neither.
+                    array_properties: array_properties(&state, job),
                     timeout: job.timeout.clone(),
                     tags: batch::materialized_tags(&job.tags),
                     propagate_tags: job.propagate_tags,
@@ -230,4 +234,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             jobs: Some(details),
         })
     }
+}
+
+/// `JobDetail$arrayProperties` for one stored job: "The array properties of the job, if
+/// it's an array job."
+///
+/// A PARENT reports the `size` its submit named and the `statusSummary` its children add
+/// up to ("A summary of the number of array job children in each available job status.
+/// This parameter is returned for parent array jobs"), with the instant one of them last
+/// moved; a CHILD reports its own `index` ("This parameter is returned for array job
+/// children"); every other job reports no array properties at all. Each member is read off
+/// the stored records, so none of them can disagree with the jobs it describes.
+fn array_properties(
+    state: &crate::state::ComAmazonawsBatchAwsbatchv20160810State,
+    job: &crate::state::Job,
+) -> Option<ArrayPropertiesDetail> {
+    if let Some((status_summary, last_updated_at)) = state.array_status_summary(&job.job_id) {
+        return Some(ArrayPropertiesDetail {
+            status_summary: Some(status_summary),
+            status_summary_last_updated_at: Some(last_updated_at),
+            size: job.array_size,
+            index: None,
+        });
+    }
+    job.array_index.map(|index| ArrayPropertiesDetail {
+        status_summary: None,
+        status_summary_last_updated_at: None,
+        size: None,
+        index: Some(index),
+    })
 }

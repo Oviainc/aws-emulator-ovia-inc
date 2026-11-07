@@ -24,9 +24,16 @@
 //! any transition the clock had already made due
 //! (`state::publish_job_state_changes`).
 //!
+//! A submit carrying `arrayProperties` "becomes an array job": the id answered is the
+//! array's PARENT and `size` children are created under it, each with its own
+//! `ArrayPropertiesDetail.index` and the per-index `dependsOn` the array dependency forms
+//! document (`state::array_child_dependencies`). The documented bound on the size
+//! ("between 2 and 10,000") is enforced here, and room for the whole array is made before
+//! any of it is stored.
+//!
 //! Parts of the surface this slice does NOT implement answer 501 rather than accept a
-//! request they would then answer wrongly: `arrayProperties` and `nodeOverrides` (an
-//! array or multi-node parent whose children nothing would create), and
+//! request they would then answer wrongly: `nodeOverrides` (a multi-node parent whose
+//! children nothing would create), and
 //! `ecsPropertiesOverride`/`eksPropertiesOverride` or a job definition whose body is
 //! `ecsProperties`/`eksProperties` (their detail projection is not built here).
 //!
@@ -257,15 +264,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut state = state.lock();
             state.materialize_due(now);
 
-            if input
+            let array_size = input
                 .array_properties
                 .as_ref()
-                .and_then(|properties| properties.size)
-                .is_some()
+                .and_then(|properties| properties.size);
+            // `SubmitJob$arrayProperties`: "The array size can be between 2 and 10,000."
+            // The member targets a plain `Integer`, so the documented bound is applied
+            // here, before anything is stored.
+            if array_size
+                .is_some_and(|size| !(batch::MIN_ARRAY_SIZE..=batch::MAX_ARRAY_SIZE).contains(&size))
             {
-                return Err(crate::scaffolded::Scaffolded::not_implemented(
-                    "SubmitJob with arrayProperties",
-                ));
+                return Err(SubmitJobErrorModeled::ClientException(
+                    batch::client_exception_enveloped(batch::array_size_refusal()),
+                )
+                .into());
             }
             if input.node_overrides.is_some() {
                 return Err(crate::scaffolded::Scaffolded::not_implemented(
@@ -381,6 +393,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 status: batch::JOB_SUBMITTED.to_string(),
                 status_reason: None,
                 created_at: now,
+                status_since: now,
                 started_at: None,
                 stopped_at: None,
                 ended_at: None,
@@ -413,15 +426,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .consumable_resource_properties_override
                     .or(definition.consumable_resource_properties),
                 tags: input.tags,
+                // Filled below for a submit that named `arrayProperties`: this record is
+                // then the array's PARENT and the children hang off it by index.
+                array_size,
+                array_index: None,
+                array_parent_id: None,
             };
-            // The jobs store is bounded (`state::limits::MAX_JOBS`): room is made by
-            // evicting the jobs that have been terminal longest, and a store full of live
-            // jobs refuses the submit with the modelled 400 rather than growing.
-            state.insert_job(job).map_err(|message| {
-                SubmitJobError::from(SubmitJobErrorModeled::ClientException(
-                    batch::client_exception(message),
-                ))
-            })?;
+            match array_size {
+                // "If you specify array properties for a job, it becomes an array job"
+                // (`SubmitJob$arrayProperties`): the answer still names ONE job — the
+                // parent — and the `size` children it spawns are created with it, each
+                // carrying its own index and, where the submit's `dependsOn` names an
+                // array form, the per-index dependency that form documents
+                // (`state::array_child_dependencies`).
+                Some(size) => {
+                    // Room for the WHOLE array or nothing at all: a half-created array
+                    // would leave a parent whose children nothing can complete. Asked for
+                    // BEFORE the children are built, so the records this request
+                    // materialises are bounded by the store's own cap
+                    // (`state::limits::MAX_JOBS`) and never by the `size` it names.
+                    let wanted = usize::try_from(size).unwrap_or(usize::MAX).saturating_add(1);
+                    state.make_room_for_jobs(wanted).map_err(|message| {
+                        SubmitJobError::from(SubmitJobErrorModeled::ClientException(
+                            batch::client_exception(message),
+                        ))
+                    })?;
+                    let children: Vec<batch::Job> = (0..size)
+                        .map(|index| {
+                            let child_id = batch::array_child_job_id(&job_id, index);
+                            batch::Job {
+                                job_arn: batch::job_arn(&region, &child_id),
+                                job_id: child_id,
+                                depends_on: batch::array_child_dependencies(
+                                    job.depends_on.as_ref(),
+                                    &job_id,
+                                    index,
+                                    |candidate| state.jobs.contains_key(candidate),
+                                ),
+                                array_size: None,
+                                array_index: Some(index),
+                                array_parent_id: Some(job_id.clone()),
+                                ..job.clone()
+                            }
+                        })
+                        .collect();
+                    state.insert_array_job(job, children).map_err(|message| {
+                        SubmitJobError::from(SubmitJobErrorModeled::ClientException(
+                            batch::client_exception(message),
+                        ))
+                    })?;
+                }
+                // The jobs store is bounded (`state::limits::MAX_JOBS`): room is made by
+                // evicting the jobs that have been terminal longest, and a store full of
+                // live jobs refuses the submit with the modelled 400 rather than growing.
+                None => {
+                    state.insert_job(job).map_err(|message| {
+                        SubmitJobError::from(SubmitJobErrorModeled::ClientException(
+                            batch::client_exception(message),
+                        ))
+                    })?;
+                }
+            }
             (arn, job_id, input.job_name)
         };
         batch::publish_job_state_changes(ctx, &*self.engine, &region).await;

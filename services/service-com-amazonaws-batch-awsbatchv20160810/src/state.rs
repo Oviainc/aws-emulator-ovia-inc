@@ -29,12 +29,21 @@
 //! A job's container is NOT run: this emulator has no container runtime, and the
 //! engine contract (`vendor/engine/src/lib.rs`) forbids reporting a status,
 //! duration or exit code for work nothing ran. `RUNNABLE` is where a job waits to be
-//! placed on compute capacity, and a job is placed only by a scheduler that has such
-//! capacity, so a job here RESTS in `RUNNABLE`: it owes nothing further, it is never
-//! advanced to `STARTING`, and no `startedAt`, `stoppedAt`, attempt or `exitCode` is
-//! invented for it. Only a caller ends it — `CancelJob`, `TerminateJob`, or the
-//! deletion of its queue. Everything around it — accepting, resolving, scheduling,
-//! listing, cancelling, terminating — is real.
+//! placed on compute capacity, so what happens next is decided by the compute
+//! environments behind the job's queue ([`ComAmazonawsBatchAwsbatchv20160810State::job_is_placeable`]):
+//! a queue with no capacity of its own to offer — one whose environments are all
+//! `UNMANAGED`, `DISABLED` or not created yet — leaves the job RESTING in `RUNNABLE`,
+//! where only a caller ends it (`CancelJob`, `TerminateJob`, or the deletion of its
+//! queue), while a queue whose MANAGED environment can hold it PLACES it one span later
+//! and the placement ends in the modelled failure state with
+//! [`NO_CONTAINER_RUNTIME_REASON`]. Either way no `startedAt`, `stoppedAt`, attempt or
+//! `exitCode` is invented, and no job is ever advanced to `STARTING` or `RUNNING`.
+//! Everything around it — accepting, resolving, scheduling, listing, cancelling,
+//! terminating — is real.
+//!
+//! An ARRAY job's parent runs no container of its own, so it is never placed: its status
+//! is what its children add up to
+//! ([`ComAmazonawsBatchAwsbatchv20160810State::advance_array_parents`]).
 //!
 //! A SERVICE job's work is not run either, for the same reason: nothing here runs
 //! SageMaker AI, so a service job `SubmitServiceJob` accepted walks the same
@@ -61,6 +70,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod array_jobs;
+mod placement;
+
+pub use array_jobs::*;
+pub use placement::*;
 
 use crate::ops::types::{
     CapacityLimit, ClientException, ComputeEnvironmentOrder, ComputeResource,
@@ -982,6 +997,15 @@ pub fn job_state_change_detail(job: &Job) -> ::serde_json::Value {
     if let Some(tags) = &job.tags {
         detail.insert("tags".to_string(), json!(tags));
     }
+    // The array properties the RECORD holds: a child's own index, a parent's size. The
+    // parent's `statusSummary` is counted from the children's records and so is not a
+    // member of the job this detail is about; it is reported by the readers that can see
+    // them (`DescribeJobs`, `ListJobs`).
+    if let Some(index) = job.array_index {
+        detail.insert("arrayProperties".to_string(), json!({ "index": index }));
+    } else if let Some(size) = job.array_size {
+        detail.insert("arrayProperties".to_string(), json!({ "size": size }));
+    }
     detail.insert("isCancelled".to_string(), json!(job.is_cancelled));
     detail.insert("isTerminated".to_string(), json!(job.is_terminated));
     Value::Object(detail)
@@ -1548,6 +1572,28 @@ pub struct Job {
     pub platform_capabilities: Option<Vec<String>>,
     pub consumable_resource_properties: Option<ConsumableResourceProperties>,
     pub tags: Option<HashMap<String, String>>,
+    /// `ArrayPropertiesDetail$size` — "The size of the array job. This parameter is
+    /// returned for parent array jobs": how many children the submit that created this
+    /// job spawned for it. `None` for every job that is not an array parent, which is what
+    /// tells a parent apart from a plain job.
+    pub array_size: Option<i32>,
+    /// `ArrayPropertiesDetail$index` — "The job index within the array that's associated
+    /// with this job. This parameter is returned for array job children". `None` for every
+    /// job that is not a child of an array parent.
+    pub array_index: Option<i32>,
+    /// The id of the array parent that spawned this child, `None` for every other job.
+    ///
+    /// Internal bookkeeping, not a modelled member: it is what a child's own records are
+    /// aggregated into ([`ComAmazonawsBatchAwsbatchv20160810State::array_status_summary`])
+    /// and what keeps a child from being evicted while its parent is still live.
+    pub array_parent_id: Option<String>,
+    /// When this job's CURRENT status was written, in epoch milliseconds.
+    ///
+    /// Internal bookkeeping: it is what an array parent reports as its summary's
+    /// `statusSummaryLastUpdatedAt` — the latest instant one of its children last moved —
+    /// so that instant is read off the records the summary counts instead of being taken
+    /// from the clock when somebody reads it.
+    pub status_since: i64,
 }
 
 /// A consumable resource, exactly as `CreateConsumableResource` stored it.
@@ -2762,13 +2808,23 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         // call put it into `DELETING`, stops existing: the same clock-owed transition,
         // so they are materialised in the same pass.
         let mut deleted_environments: Vec<String> = Vec::new();
+        // The earliest instant at which a compute environment settled into a status that
+        // can hold a job, in THIS pass: the jobs resting in its queues are owed their
+        // placement from that instant ([`Self::rearm_resting_jobs`]), never from the
+        // instant somebody happened to call.
+        let mut capacity_at: Option<i64> = None;
         for environment in self.compute_environments.values_mut() {
-            if environment.status_due_at.is_some_and(|due| due <= now) {
+            if let Some(due) = environment.status_due_at.filter(|due| *due <= now) {
                 environment.status_due_at = None;
                 if environment.status == STATUS_DELETING {
                     deleted_environments.push(environment.name.clone());
                 } else {
                     environment.status = STATUS_VALID.to_string();
+                    if environment.ce_type == CE_TYPE_MANAGED
+                        && environment.state == STATE_ENABLED
+                    {
+                        capacity_at = Some(capacity_at.map_or(due, |earliest: i64| earliest.min(due)));
+                    }
                 }
             }
         }
@@ -2776,6 +2832,9 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             if let Some(removed) = self.compute_environments.remove(&name) {
                 self.compute_environments_by_arn.remove(&removed.arn);
             }
+        }
+        if let Some(at) = capacity_at {
+            self.rearm_resting_jobs(at);
         }
         // A queue leaves its transient status (`CREATING` after a create, `UPDATING`
         // after an update) for `VALID` once the span the clock owes has elapsed, and
@@ -2805,7 +2864,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                         if let Some(job) = self.jobs.get_mut(&id) {
                             job.is_terminated = true;
                         }
-                        self.finish_job(&id, JOB_FAILED, JOB_QUEUE_DELETED_REASON, now);
+                        self.finish_job(&id, JOB_FAILED, Some(JOB_QUEUE_DELETED_REASON), now);
                     }
                 }
                 // The quota shares that hang off the queue go with it: their ARNs are
@@ -2876,6 +2935,9 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             }
         }
         self.advance_jobs(now);
+        // An array parent's status is what its children add up to, so it is recomputed
+        // after they have moved and never before.
+        self.advance_array_parents(now);
         self.advance_service_jobs(now);
     }
 
@@ -3028,6 +3090,14 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         if is_terminal_status(&job.status) {
             return None;
         }
+        // An array PARENT walks no chain of its own: it runs no container, it is never
+        // placed, and its status is what its children add up to
+        // ([`Self::advance_array_parents`], which runs once the children of this pass have
+        // moved). So the clock owes the parent record nothing.
+        if job.array_size.is_some() {
+            self.set_job_due(id, None);
+            return None;
+        }
         // What a PENDING job owes is decided by the jobs it depends on, recomputed from
         // their stop instants on every look, so the answer never depends on WHEN it was
         // looked at: released once they have all succeeded, failed when one failed, and
@@ -3062,20 +3132,20 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                     None
                 }
                 DependencyOutcome::Unresolvable => {
-                    self.finish_job(id, JOB_FAILED, DEPENDENCY_UNRESOLVABLE_REASON, now);
+                    self.finish_job(id, JOB_FAILED, Some(DEPENDENCY_UNRESOLVABLE_REASON), now);
                     Some(Advanced::Terminal)
                 }
                 DependencyOutcome::Failed(at) => {
-                    self.finish_job(id, JOB_FAILED, DEPENDENT_JOB_FAILED_REASON, at);
+                    self.finish_job(id, JOB_FAILED, Some(DEPENDENT_JOB_FAILED_REASON), at);
                     Some(Advanced::Terminal)
                 }
                 DependencyOutcome::Satisfied(at) => {
                     // The job may be placed one span after the last dependency stopped,
-                    // and then rests in `RUNNABLE` like every other released job.
+                    // and then waits for the scheduler like every other released job.
                     let released = at + JOB_PHASE_MILLIS;
                     if released <= now {
                         self.set_job_status(id, JOB_RUNNABLE, released);
-                        self.set_job_due(id, None);
+                        self.arm_placement(id, released);
                         Some(Advanced::Moved)
                     } else {
                         self.set_job_due(id, Some(released));
@@ -3095,17 +3165,26 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                     }
                     JOB_SUBMITTED => {
                         self.set_job_status(id, JOB_RUNNABLE, due);
-                        // `RUNNABLE` is where a job waits for the scheduler to place it,
-                        // and nothing here has compute capacity to place it on, so the
-                        // job RESTS: the clock owes it nothing more.
-                        self.set_job_due(id, None);
+                        // `RUNNABLE` is where a job waits for the scheduler to place it:
+                        // the placement is owed one span later by the queue's own compute
+                        // capacity, and a queue with none to offer leaves the job resting
+                        // here ([`Self::arm_placement`]).
+                        self.arm_placement(id, due);
                         Some(Advanced::Moved)
                     }
-                    // A job already resting in `RUNNABLE` owes nothing: only a caller
-                    // (`CancelJob`, `TerminateJob`, `DeleteJobQueue`) ends it.
+                    // A job resting in `RUNNABLE` owes nothing unless its queue's compute
+                    // capacity placed it, which is what this due instant says happened.
                     JOB_RUNNABLE => {
-                        self.set_job_due(id, None);
-                        None
+                        if self.job_is_placeable(id) {
+                            // Placed — and nothing here can RUN the container the attempt
+                            // would start, so the placed job ends in the modelled failure
+                            // state saying exactly that (see [`NO_CONTAINER_RUNTIME_REASON`]).
+                            self.finish_job(id, JOB_FAILED, Some(NO_CONTAINER_RUNTIME_REASON), due);
+                            Some(Advanced::Terminal)
+                        } else {
+                            self.set_job_due(id, None);
+                            None
+                        }
                     }
                     _ => None,
                 }
@@ -3118,14 +3197,11 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     ///
     /// Makes room first by evicting the jobs that have been terminal longest — a terminal
     /// job is one no later call can move again — and answers `Err(message)`, for the
-    /// modelled `ClientException`, when every job in a full store is still live.
+    /// modelled `ClientException`, when every job in a full store is still live. ONE place
+    /// decides that bound for every job this store holds
+    /// ([`Self::make_room_for_jobs`]).
     pub fn insert_job(&mut self, job: Job) -> Result<(), String> {
-        if self.jobs.len() >= limits::MAX_JOBS {
-            self.evict_terminal_jobs(self.jobs.len() + 1 - limits::MAX_JOBS);
-        }
-        if self.jobs.len() >= limits::MAX_JOBS {
-            return Err(quota_message("jobs", limits::MAX_JOBS));
-        }
+        self.make_room_for_jobs(1)?;
         let id = job.job_id.clone();
         let queue_arn = job.job_queue_arn.clone();
         let due = job.next_phase_due_at;
@@ -3352,12 +3428,22 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         if is_terminal_status(&job.status) {
             return true;
         }
-        let running = matches!(job.status.as_str(), JOB_STARTING | JOB_RUNNING);
+        // "When you try to cancel an array parent job in PENDING, Batch attempts to cancel
+        // all child jobs" (`CancelJob`): an ending a caller asks of an array PARENT is
+        // asked of every child it spawned, whichever call asks it. A child has no children
+        // of its own, so this goes one level deep.
+        for child_id in self.array_child_ids(id) {
+            self.terminate_job(&child_id, reason, now);
+        }
+        let running = self
+            .jobs
+            .get(id)
+            .is_some_and(|job| matches!(job.status.as_str(), JOB_STARTING | JOB_RUNNING));
         if let Some(job) = self.jobs.get_mut(id) {
             job.is_terminated = running;
             job.is_cancelled = !running;
         }
-        self.finish_job(id, JOB_FAILED, reason, now);
+        self.finish_job(id, JOB_FAILED, Some(reason), now);
         true
     }
 
@@ -3377,6 +3463,13 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         if is_terminal_status(&job.status) {
             return CancelOutcome::AlreadyTerminal;
         }
+        // The children of an array parent are cancelled with it, as above.
+        for child_id in self.array_child_ids(id) {
+            self.cancel_job(&child_id, reason, now);
+        }
+        let Some(job) = self.jobs.get(id) else {
+            return CancelOutcome::Unknown;
+        };
         match job.status.as_str() {
             // A `PENDING` job is cancelled from the caller's point of view straight away
             // — AWS is recorded to report `isCancelled` on it while it is still `PENDING`
@@ -3393,7 +3486,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                 if let Some(job) = self.jobs.get_mut(id) {
                     job.is_cancelled = true;
                 }
-                self.finish_job(id, JOB_FAILED, reason, now);
+                self.finish_job(id, JOB_FAILED, Some(reason), now);
                 CancelOutcome::Cancelled
             }
             // STARTING and RUNNING: cancelling does not touch them.
@@ -3412,7 +3505,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         if let Some(job) = self.jobs.get_mut(id) {
             job.is_cancelled = true;
         }
-        self.finish_job(id, JOB_FAILED, &reason, stopped_at);
+        self.finish_job(id, JOB_FAILED, Some(&reason), stopped_at);
     }
 
     /// Set `id`'s status at `at`, leaving what the clock owes it alone.
@@ -3424,6 +3517,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         if let Some(job) = self.jobs.get_mut(id) {
             let entering_queue = status == JOB_RUNNABLE && job.status != JOB_RUNNABLE;
             job.status = status.to_string();
+            job.status_since = at;
             if entering_queue {
                 job.at_position_since = Some(at);
             }
@@ -3534,6 +3628,10 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// Put `id` in a terminal `status` at `ended_at` with `reason` as its
     /// `statusReason` (and its container's `reason`), and clear what the clock owed it.
     ///
+    /// `reason` is `None` where nothing is known to report: a status AWS Batch sends with
+    /// no `statusReason` leaves the member absent rather than carrying prose this emulator
+    /// authored.
+    ///
     /// `stoppedAt` is written only for a job that had actually STARTED: the member is
     /// documented as the `RUNNING` -> terminal transition, so a job nothing ran reports
     /// none ([`Job::stopped_at`]). [`Job::ended_at`] records the instant either way.
@@ -3543,7 +3641,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// waiting gets this instant as its due instant, which puts it back in the due index,
     /// and the next `materialize_due` recomputes what its dependencies now allow. One
     /// release path, both callers.
-    fn finish_job(&mut self, id: &str, status: &str, reason: &str, ended_at: i64) {
+    fn finish_job(&mut self, id: &str, status: &str, reason: Option<&str>, ended_at: i64) {
         self.set_job_due(id, None);
         // A job leaving the queue's `RUNNABLE` ordering moves the jobs behind it forward,
         // so each of those reaches its new position at this instant. Read BEFORE the
@@ -3557,14 +3655,15 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         }
         if let Some(job) = self.jobs.get_mut(id) {
             job.status = status.to_string();
-            job.status_reason = Some(reason.to_string());
+            job.status_since = ended_at;
+            job.status_reason = reason.map(str::to_string);
             job.ended_at = Some(ended_at);
             job.at_position_since = None;
             if job.started_at.is_some() {
                 job.stopped_at = Some(ended_at);
             }
             if let Some(container) = job.container.as_mut() {
-                container.reason = Some(reason.to_string());
+                container.reason = reason.map(str::to_string);
             }
         }
         self.record_job_state_change(id, ended_at);
@@ -3581,13 +3680,17 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
 
     /// Drop up to `wanted` of the jobs that have been terminal longest, with every index
     /// entry that named them. A job a live job still depends on is kept, so a dependency
-    /// never vanishes from under a dependent that is still waiting for it.
+    /// never vanishes from under a dependent that is still waiting for it, and so is the
+    /// child of an array parent that is still live, whose status the parent's own summary
+    /// is counted from ([`Self::array_status_summary`]).
     fn evict_terminal_jobs(&mut self, wanted: usize) {
         let mut evictable: Vec<(i64, String)> = self
             .jobs
             .values()
             .filter(|job| {
-                is_terminal_status(&job.status) && !self.has_live_dependent(&job.job_id)
+                is_terminal_status(&job.status)
+                    && !self.has_live_dependent(&job.job_id)
+                    && !self.is_child_of_live_array_parent(job)
             })
             .map(|job| (job.ended_at.unwrap_or(job.created_at), job.job_id.clone()))
             .collect();

@@ -372,8 +372,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(arn) = scheduling_policy_arn {
             queue.scheduling_policy_arn = Some(arn);
         }
+        let mut compute_environments_changed = false;
         if let Some(order) = compute_environment_order {
             queue.compute_environment_order = order;
+            compute_environments_changed = true;
         }
         let mut service_environments_changed = false;
         if let Some(order) = service_environment_order {
@@ -400,6 +402,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `RUNNABLE` due.
         if service_environments_changed {
             state.rearm_resting_service_jobs(now);
+        }
+        // The same holds for a CONTAINER job and the compute environments this queue
+        // orders: a queue given capacity it did not have before is what makes the
+        // placement of a job resting in `RUNNABLE` due
+        // (`state::ComAmazonawsBatchAwsbatchv20160810State::rearm_resting_jobs`).
+        if compute_environments_changed {
+            state.rearm_resting_jobs(now);
         }
 
         Ok(answered)
