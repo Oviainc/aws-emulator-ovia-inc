@@ -1005,11 +1005,12 @@ pub struct AccessKeyRecord {
 /// [`ComAmazonawsIamAwsidentitymanagementv20100508State::access_keys`]. A credential STS
 /// vends for an assumed role is the other half of that same question: the permissions in
 /// force on such a session are the ROLE's ("the temporary security credentials … have the
-/// permissions of the role", `AssumeRole`), so an authorization decision taken on a
-/// request signed with it has to reach the role the session is of. The session itself
-/// belongs to STS, which is why only the two facts an IAM decision needs are recorded
-/// here — the principal the refusal names, and the role whose policies it is judged on —
-/// written by the operation that mints the session.
+/// permissions of the role", `AssumeRole`), capped by whatever the mint scoped the
+/// credential down to, so an authorization decision taken on a request signed with it has
+/// to reach the role the session is of and the scope it was minted with. The session itself
+/// belongs to STS, which is why only the three facts an IAM decision needs are recorded
+/// here — the principal the refusal names, the role whose policies it is judged on, and the
+/// session policies that cap them — written by the operation that mints the session.
 #[derive(Debug, Clone)]
 pub struct RoleSessionRecord {
     /// The session's own principal, as `sts:AssumeRole` reports it:
@@ -1023,6 +1024,111 @@ pub struct RoleSessionRecord {
     /// it. A record past it speaks for nobody: the credential is withdrawn at that
     /// instant, and the record is kept only until this store next prunes it.
     pub expires: ::aws_smithy_types::DateTime,
+    /// The session policies the mint passed, which SCOPE what a request signed with this
+    /// credential may do; see [`SessionPolicies`]. Empty for a mint that passed none,
+    /// which is a session no document scopes.
+    pub scope: SessionPolicies,
+}
+
+/// The session policies ONE mint of a temporary credential passed, which scope the
+/// session's permissions down.
+///
+/// "The resulting session's permissions are the intersection of the role's identity-based
+/// policy and the session policies… You cannot use session policies to grant more
+/// permissions than those allowed by the identity-based policy of the role that is being
+/// assumed" (`AssumeRoleRequest$PolicyArns`, the STS model): what a request signed with the
+/// credential may do is what the identity's own policies allow AND what these documents
+/// allow, and an explicit `Deny` in any of them refuses whatever a grant says. A managed
+/// session policy named by ARN narrows exactly as an inline document does.
+///
+/// They live beside the role-session record ([`RoleSessionRecord::scope`]) because the
+/// credential is the only thing a later request carries, and this store is what the service
+/// deciding that request reads the principal out of. The inline document is held exactly as
+/// the mint passed it; a managed session policy is held by ARN instead, because what it says
+/// is what its DEFAULT version says at the instant of the request, which is read then
+/// ([`session_scoping_documents`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionPolicies {
+    /// The inline session policy document the mint passed, if any.
+    pub inline: Option<String>,
+    /// The managed session policies the mint named, by ARN, in the order it named them.
+    pub managed_arns: Vec<String>,
+}
+
+/// The session policy DOCUMENTS in force on a credential, read for one request.
+#[derive(Debug, Clone, Default)]
+pub struct ScopingPolicies {
+    /// Every scoping document that could be read, in the order the mint named them.
+    pub documents: Vec<String>,
+    /// Set when the mint named a managed session policy whose document this emulator does
+    /// not hold — an entry of AWS's catalog it does not carry — so the scope may allow
+    /// more than [`Self::documents`] shows.
+    pub unreadable: bool,
+}
+
+impl ScopingPolicies {
+    /// What this scope says about one request.
+    ///
+    /// A session policy CAPS what the identity's own documents grant and grants nothing of
+    /// its own: "the resulting session's permissions are the intersection of the role's
+    /// identity-based policy and the session policies" (`AssumeRoleRequest$PolicyArns`, the
+    /// STS model), and "you cannot use session policies to grant more permissions than
+    /// those allowed by the identity-based policy of the role that is being assumed". So
+    /// the answer is read exactly as a permissions boundary's is by the gate that asks:
+    /// an explicit `Deny` refuses whatever any grant says, a call this does not allow is
+    /// refused even where the identity's documents allow it, and a call only this allows is
+    /// refused as if it had allowed nothing.
+    ///
+    /// A credential NO mint scoped — every long-term access key, and every session minted
+    /// without session policies — is capped by nothing, which is the position of a scope
+    /// that allows the call. A credential scoped by a managed session policy whose document
+    /// this emulator does not hold ([`Self::unreadable`]) is in that same position:
+    /// refusing on evidence it does not have would deny access AWS permits, while a `Deny`
+    /// in a document it CAN read still refuses.
+    ///
+    /// The ONE reading of a resolved scope, so this service's gate and every other service
+    /// that decides a request signed with such a credential cannot cap one differently.
+    #[must_use]
+    pub fn decision(
+        &self,
+        request: &::service_common::iam_authorization::Request<'_>,
+    ) -> ::service_common::iam_authorization::Decision {
+        use ::service_common::iam_authorization::{identity_decision, Decision};
+
+        let stated = identity_decision(&self.documents, request);
+        if stated != Decision::Denied && (self.documents.is_empty() || self.unreadable) {
+            return Decision::Allowed;
+        }
+        stated
+    }
+}
+
+/// The documents the session policies `policies` stand for, as they read at the instant of
+/// the request: the inline document the mint passed, and the version of each managed
+/// session policy that is in force now ([`ComAmazonawsIamAwsidentitymanagementv20100508State::default_version_document`]).
+///
+/// The ONE resolution of "what scopes this session down", so this service's own gate and
+/// every other service that decides a request signed with such a credential read the same
+/// documents. `store` is the account's IAM records, or `None` where there are none to read —
+/// in which case every managed session policy is unreadable, while the inline document the
+/// mint passed scopes the session whether or not a store is there.
+#[must_use]
+pub fn session_scoping_documents(
+    store: Option<&ComAmazonawsIamAwsidentitymanagementv20100508State>,
+    policies: &SessionPolicies,
+) -> ScopingPolicies {
+    let mut documents: Vec<String> = policies.inline.iter().cloned().collect();
+    let mut unreadable = false;
+    for policy_arn in &policies.managed_arns {
+        match store.and_then(|store| store.default_version_document(policy_arn)) {
+            Some(document) => documents.push(document),
+            None => unreadable = true,
+        }
+    }
+    ScopingPolicies {
+        documents,
+        unreadable,
+    }
 }
 
 /// One X.509 signing certificate an IAM user holds, keyed in

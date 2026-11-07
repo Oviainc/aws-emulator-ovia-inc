@@ -19,7 +19,7 @@
 //! every other refusal, and any refusal explained by an explicit `Deny` (the statement the
 //! reason already names IS the explanation), ends at the reason.
 //!
-//! The four pieces, each held in exactly one place:
+//! The five pieces, each held in exactly one place:
 //!
 //! 1. **who** — the principal the request's SigV4 access key id speaks for: the IAM user
 //!    that holds a LONG-TERM key, read out of
@@ -43,7 +43,15 @@
 //!    the policy that is the boundary where a statement of it explicitly denied the call —
 //!    while a call only the boundary allows is refused as if the boundary had allowed
 //!    nothing;
-//! 4. **the decision** — [`::service_common::iam_authorization`], the tree's ONE
+//! 4. **what the CREDENTIAL itself was scoped to** — the session policies the mint of a
+//!    temporary credential passed, recorded on the role session beside the role
+//!    ([`super::RoleSessionRecord::scope`]) and resolved to their documents at the instant
+//!    of the call ([`super::session_scoping_documents`]). They SCOPE the permissions of the
+//!    role down and grant nothing of their own — "the resulting session's permissions are
+//!    the intersection of the role's identity-based policy and the session policies" — so
+//!    they are read exactly as the boundary is ([`super::ScopingPolicies::decision`]), and a
+//!    credential no mint scoped is capped by nothing;
+//! 5. **the decision** — [`::service_common::iam_authorization`], the tree's ONE
 //!    evaluation of IAM policy documents against `(action, resource)`, so IAM and every
 //!    other service handed the same documents decide alike.
 //!
@@ -104,7 +112,10 @@ use ::service_common::iam_authorization::{self as iam, Decision};
 use crate::ops::types::{DelegationRequest, Role, Tag, User};
 use crate::scaffolded::AccessDenied;
 
-use super::{ComAmazonawsIamAwsidentitymanagementv20100508State as IamState, PrincipalPolicies};
+use super::{
+    ComAmazonawsIamAwsidentitymanagementv20100508State as IamState, PrincipalPolicies,
+    ScopingPolicies,
+};
 
 /// The `iam:<Operation>` action name each operation is authorized on, in the one list
 /// this gate decides, re-exported so a handler names one as
@@ -494,6 +505,7 @@ pub fn authorize_written(
         caller,
         arn: principal,
         policies,
+        scope,
     } = signer;
     let (context, published) = request_context(store, caller, resource, written);
 
@@ -506,6 +518,11 @@ pub fn authorize_written(
         .with_context(&context)
         .with_published_keys(&published);
     let decided = iam::identity_decision(&policies.documents, &request);
+    // What the SCOPE the credential itself was minted with says about the call
+    // ([`ScopingPolicies::decision`]). It caps what the identity's documents grant and
+    // grants nothing of its own, so it is read for every call and a credential no mint
+    // scoped is capped by nothing.
+    let scoped = scope.decision(&request);
     // Whether the documents in force grant the call at all. An attachment whose
     // document the account does not hold is a grant this emulator cannot read, so it
     // cannot be the basis of a refusal — but it cannot overturn one either: an explicit
@@ -533,31 +550,36 @@ pub fn authorize_written(
             None => (Decision::Allowed, None),
         }
     };
-    if granted && capped == Decision::Allowed {
+    if granted && capped == Decision::Allowed && scoped == Decision::Allowed {
         return Ok(());
     }
 
     // Why the call was refused: an explicit `Deny` that is about the request — stated in
-    // an identity-based policy or in the boundary, and either wins over every `Allow` —
-    // or the absence of an `Allow`, which names the DOCUMENT that withheld it: the
-    // boundary where the identity-based policies did allow the call, and the
-    // identity-based policies where nothing allowed it at all. They are different facts
-    // about the policies in force, and AWS words each of them differently, because they
-    // need different fixes. The boundary's explicit deny is the one of the four that also
+    // an identity-based policy, in a session policy or in the boundary, and each wins over
+    // every `Allow` — or the absence of an `Allow`, which names the DOCUMENT that withheld
+    // it: the boundary where the identity-based policies did allow the call, the session
+    // policies where the identity's did and the scope the credential was minted with did
+    // not, and the identity-based policies where nothing allowed it at all. They are
+    // different facts about the policies in force, and AWS words each of them differently,
+    // because they need different fixes. The boundary's explicit deny is the one that also
     // names the policy the deciding statement came from, because in an account carrying
     // several boundaries that ARN is the only thing in the message identifying which
     // ceiling refused the call.
     let reason = if decided == Decision::Denied {
         "with an explicit deny in an identity-based policy".to_string()
+    } else if scoped == Decision::Denied {
+        "with an explicit deny in a session policy".to_string()
     } else if capped == Decision::Denied {
         match &boundary {
             Some(arn) => format!("with an explicit deny in a permissions boundary: {arn}"),
             None => "with an explicit deny in a permissions boundary".to_string(),
         }
-    } else if granted {
-        format!("because no permissions boundary allows the {action} action")
-    } else {
+    } else if !granted {
         format!("because no identity-based policy allows the {action} action")
+    } else if scoped != Decision::Allowed {
+        format!("because no session policy allows the {action} action")
+    } else {
+        format!("because no permissions boundary allows the {action} action")
     };
     // Audit record for the refusal: the acting principal, what it asked for and the
     // decision, so the refusal is reviewable after the fact. The policy documents
@@ -568,7 +590,9 @@ pub fn authorize_written(
         principal = %principal,
         action = %action,
         resource = %resource,
-        explicit_deny = decided == Decision::Denied || capped == Decision::Denied,
+        explicit_deny = decided == Decision::Denied
+            || scoped == Decision::Denied
+            || capped == Decision::Denied,
         "the policies in force on the caller do not permit this call"
     );
     // AWS's refusal is the sentence that ENDS at the reason, which is what this gate
@@ -581,7 +605,9 @@ pub fn authorize_written(
     // either way, and it is the one the pointer names. A refusal explained by an explicit
     // `Deny` is explained by that statement, which the reason already names, so it ends at
     // the reason whichever action it refused.
-    let withheld = decided != Decision::Denied && capped != Decision::Denied;
+    let withheld = decided != Decision::Denied
+        && scoped != Decision::Denied
+        && capped != Decision::Denied;
     if withheld && NAMES_AUTHORIZATION_DETAILS.contains(&action) {
         return Err(not_authorized_with_details(
             &principal,
@@ -770,6 +796,7 @@ pub fn delegation_permission_check(
         caller,
         arn: principal,
         policies,
+        scope,
     } = signer;
 
     let principals = [principal];
@@ -788,7 +815,15 @@ pub fn delegation_permission_check(
         if decided == Decision::Denied {
             return PERMISSION_CHECK_DENIED;
         }
-        if !iam::is_allowed(decided, Decision::NotStated) {
+        // The scope the CREDENTIAL was minted with caps every ask the same way it caps a
+        // call this gate decides ([`ScopingPolicies::decision`]): an ask the session
+        // policies deny is a denied ask, and one they merely do not allow is an ask the
+        // caller is short of.
+        let scoped = scope.decision(&request);
+        if scoped == Decision::Denied {
+            return PERMISSION_CHECK_DENIED;
+        }
+        if !iam::is_allowed(decided, Decision::NotStated) || scoped != Decision::Allowed {
             short_of_an_ask = true;
         }
     }
@@ -827,6 +862,10 @@ struct SigningPrincipal<'a> {
     /// The identity-based documents in force on it, and the attachments whose documents
     /// the account does not hold.
     policies: PrincipalPolicies,
+    /// The session policy documents the mint of this credential scoped it with, as they
+    /// read at the instant of this request. Empty for a credential no mint scoped — every
+    /// long-term access key, and every session minted without session policies.
+    scope: ScopingPolicies,
 }
 
 /// The principal the access key id `access_key_id` speaks for, or `None` when the account
@@ -850,6 +889,8 @@ fn signing_principal<'a>(
             caller: Caller::User(user),
             arn: user.arn.clone(),
             policies,
+            // A long-term key is the identity's own credential: no mint scoped it.
+            scope: ScopingPolicies::default(),
         });
     }
     let session = store.role_session(access_key_id, super::now())?;
@@ -868,5 +909,8 @@ fn signing_principal<'a>(
         },
         arn: session.session_arn.clone(),
         policies,
+        // What the CREDENTIAL itself was scoped to, resolved at the instant of the request
+        // so a managed session policy edited since the mint scopes by what it says NOW.
+        scope: super::session_scoping_documents(Some(store), &session.scope),
     })
 }

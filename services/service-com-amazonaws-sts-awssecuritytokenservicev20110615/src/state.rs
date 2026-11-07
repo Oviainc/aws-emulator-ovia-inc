@@ -127,67 +127,25 @@ pub enum SessionKind {
     FederationToken,
 }
 
-/// The session policies ONE mint passed, which scope the session's permissions down.
+/// The session policies ONE mint passed, which scope the session's permissions down, and
+/// the resolution of what they SAY at the instant of a request.
 ///
 /// "Passing policies to this operation returns new temporary credentials. The resulting
 /// session's permissions are the intersection of the role's identity-based policies and the
 /// session policies" (`AssumeRoleRequest$Policy`, this service's model): what a request
 /// signed with the credential may do is what the identity's own policies allow AND what
 /// these documents allow, and an explicit `Deny` in any of them refuses whatever a grant
-/// says. They are kept on the session because the credential is the only thing the later
-/// request carries, so the service deciding that request reads them from here
-/// ([`Caller::session_policies`]).
+/// says.
 ///
-/// The inline document is held exactly as the mint passed it. A managed session policy is
-/// held by ARN instead, because what it says is what its DEFAULT version says at the
-/// instant of the request — the version "that is in effect for the IAM users, groups, and
-/// roles to which the policy is attached" — which is read then
-/// ([`session_scoping_documents`]).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SessionPolicies {
-    /// The inline session policy document the mint passed, if any.
-    pub inline: Option<String>,
-    /// The managed session policies the mint named, by ARN, in the order it named them.
-    pub managed_arns: Vec<String>,
-}
-
-/// The session policy DOCUMENTS in force on a credential, read for one request.
-#[derive(Debug, Clone, Default)]
-pub struct ScopingPolicies {
-    /// Every scoping document that could be read, in the order the mint named them.
-    pub documents: Vec<String>,
-    /// Set when the mint named a managed session policy whose document this emulator does
-    /// not hold — an entry of AWS's catalog it does not carry — so the scope may allow
-    /// more than [`Self::documents`] shows.
-    pub unreadable: bool,
-}
-
-/// The documents the session policies `policies` stand for, as they read at the instant of
-/// the request: the inline document the mint passed, and the version of each managed
-/// session policy that is in force now ([`IamState::default_version_document`]).
-///
-/// The one resolution of "what scopes this session down", so every service that decides a
-/// request signed with such a credential reads the same documents. `iam` is the IAM store
-/// of the same engine, or `None` when the engine carries none — where a managed session
-/// policy names a document nothing here holds.
-#[must_use]
-pub fn session_scoping_documents(
-    iam: Option<&IamState>,
-    policies: &SessionPolicies,
-) -> ScopingPolicies {
-    let mut documents: Vec<String> = policies.inline.iter().cloned().collect();
-    let mut unreadable = false;
-    for policy_arn in &policies.managed_arns {
-        match iam.and_then(|iam| iam.default_version_document(policy_arn)) {
-            Some(document) => documents.push(document),
-            None => unreadable = true,
-        }
-    }
-    ScopingPolicies {
-        documents,
-        unreadable,
-    }
-}
+/// Both the record and its resolution live in the IAM store's module, because the documents
+/// a managed session policy stands for are IAM's and the gate that decides a call against
+/// them is IAM's too ([`IamState`]) — one definition, so this service, IAM's own gate and
+/// every other service handed the same credential read one scope. They are re-exported here
+/// because a session is this service's: [`Session::policies`] is what a mint records, and
+/// [`Caller::session_policies`] is what the credential presented by a later request carries.
+pub use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::{
+    session_scoping_documents, ScopingPolicies, SessionPolicies,
+};
 
 /// One minted session, keyed in [`ComAmazonawsStsAwssecuritytokenservicev20110615State::sessions`]
 /// by the access key id it was minted under.
@@ -1126,9 +1084,10 @@ pub fn iam_state<Eng: Send + Sync + 'static>(
 /// registry `iam:CreateAccessKey` wrote, and a TEMPORARY credential of a role session
 /// through this record ([`IamState::record_role_session`]) — the permissions in force on
 /// such a session are the role's ("the temporary security credentials … have the
-/// permissions of the role", `AssumeRole`). The session itself stays this service's, which
-/// is why only the two facts an IAM decision needs travel: the principal the session is,
-/// and the role it is of.
+/// permissions of the role", `AssumeRole`), capped by the session policies the mint passed.
+/// The session itself stays this service's, which is why only the three facts an IAM
+/// decision needs travel: the principal the session is, the role it is of, and the scope it
+/// was minted with.
 ///
 /// Nothing is recorded for a session that is not a role's — `GetSessionToken` and
 /// `GetFederationToken` vend no `role_arn` — and nothing at all when the engine carries no
@@ -1148,6 +1107,10 @@ pub fn publish_role_session(
             session_arn: minted.session.identity.arn.clone(),
             role_arn: role_arn.clone(),
             expires: ::aws_smithy_types::DateTime::from_secs(unix_seconds(minted.session.expires_at)),
+            // The scope the mint passed travels with the session, because a session policy
+            // caps what the role's own policies grant and the gate that reads those
+            // policies is the one that has to read this too (see [`SessionPolicies`]).
+            scope: minted.session.policies.clone(),
         },
         ::aws_smithy_types::DateTime::from_secs(unix_seconds(now)),
     );

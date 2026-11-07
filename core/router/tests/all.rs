@@ -553,6 +553,8 @@ mod iam_role_id_agrees_with_sts;
 mod iam_access_key_signs_as_its_user;
 #[path = "all/iam_authorizes_an_assumed_role_session.rs"]
 mod iam_authorizes_an_assumed_role_session;
+#[path = "all/iam_session_policy_scopes_an_assumed_role.rs"]
+mod iam_session_policy_scopes_an_assumed_role;
 #[path = "all/iam_session_refusal_audit_documents.rs"]
 mod iam_session_refusal_audit_documents;
 #[path = "all/iam_signing_name_routing.rs"]

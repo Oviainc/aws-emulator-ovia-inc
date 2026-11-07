@@ -26,7 +26,9 @@
 //!    with the matcher above.
 //! 4. **what the CREDENTIAL itself was scoped to** — the session policies the mint of the
 //!    credential passed, which STS holds on the session the access key id names
-//!    ([`sts_store::session_scoping_documents`]). They SCOPE the permissions of the
+//!    ([`sts_store::session_scoping_documents`]) and which are read by the one reading of a
+//!    resolved scope ([`sts_store::ScopingPolicies::decision`]). They SCOPE the permissions
+//!    of the
 //!    identity down and grant nothing of their own: "the resulting session's permissions
 //!    are the intersection of the role's identity-based policies and the session policies"
 //!    (`AssumeRoleRequest$Policy`). A long-term access key is scoped by none.
@@ -117,13 +119,10 @@ pub struct Caller {
     /// The identity-based policy documents in force on the principal.
     pub documents: Vec<String>,
     /// The session policy documents the mint of this credential scoped it with, as they
-    /// read at the instant of this request (see the module docs). Empty for a credential
+    /// read at the instant of this request, and whether a managed one among them names a
+    /// document the IAM store does not hold (see the module docs). Empty for a credential
     /// no mint scoped.
-    pub session_policies: Vec<String>,
-    /// Set when the credential is scoped by a managed session policy whose document the
-    /// IAM store does not hold, so the scope may allow more than
-    /// [`Self::session_policies`] shows (see the module docs).
-    pub unreadable_session_policy: bool,
+    pub scope: sts_store::ScopingPolicies,
     /// Set when this request presents the account's own published credential, which holds
     /// no IAM policies (see the module docs).
     pub account_credential: bool,
@@ -242,8 +241,7 @@ pub fn request_caller<Eng: Send + Sync + 'static>(
     // managed scoping policy edited since the mint scopes by what it says NOW; the inline
     // document the mint passed scopes it whether or not a store is there to read.
     let scoping = sts_store::session_scoping_documents(held.as_deref(), &session_policies);
-    caller.session_policies = scoping.documents;
-    caller.unreadable_session_policy = scoping.unreadable;
+    caller.scope = scoping;
     caller
 }
 
@@ -441,19 +439,14 @@ pub fn denial_addressing(
         .with_context(&context)
         .with_published_keys(&published);
 
-    // What the SCOPE the credential was minted with says about the request. A session
-    // policy caps what the identity's policies grant and grants nothing itself, so a
-    // request it explicitly denies is refused whatever any grant says — which is the
+    // What the SCOPE the credential was minted with says about the request, read by the
+    // tree's one reading of a resolved scope ([`sts_store::ScopingPolicies::decision`]). A
+    // session policy caps what the identity's policies grant and grants nothing itself, so
+    // a request it explicitly denies is refused whatever any grant says — which is the
     // decision taken here, before the grants are read, because no grant overturns it. A
     // credential scoped by no document this emulator can read is scoped by nothing, which
     // is the position of a session policy that allows the request.
-    let stated = iam::identity_decision(&caller.session_policies, &granting);
-    let unscoped = caller.session_policies.is_empty() || caller.unreadable_session_policy;
-    let scoped = if unscoped && stated != Decision::Denied {
-        Decision::Allowed
-    } else {
-        stated
-    };
+    let scoped = caller.scope.decision(&granting);
     if scoped == Decision::Denied {
         return refusal("with an explicit deny in a session policy");
     }
