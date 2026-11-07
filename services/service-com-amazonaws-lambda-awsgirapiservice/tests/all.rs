@@ -293,3 +293,5 @@ mod vpc_config_execution_role_permissions;
 mod async_invocation_delivery;
 #[path = "all/event_source_mapping_processed_batch.rs"]
 mod event_source_mapping_processed_batch;
+#[path = "all/invoke_caller_authorization.rs"]
+mod invoke_caller_authorization;
