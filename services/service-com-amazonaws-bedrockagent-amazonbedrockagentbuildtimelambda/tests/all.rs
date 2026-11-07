@@ -19,6 +19,8 @@ mod client_error_fidelity;
 mod data_source_lifecycle;
 #[path = "all/delete_removes_the_resource.rs"]
 mod delete_removes_the_resource;
+#[path = "all/flow_alias_deployment.rs"]
+mod flow_alias_deployment;
 #[path = "all/flow_definition_validation.rs"]
 mod flow_definition_validation;
 #[path = "all/flow_lifecycle.rs"]
@@ -29,6 +31,8 @@ mod flow_preparation;
 mod flow_version_listing;
 #[path = "all/flow_version_minting.rs"]
 mod flow_version_minting;
+#[path = "all/flow_version_prepare_ordering.rs"]
+mod flow_version_prepare_ordering;
 #[path = "all/flow_version_snapshots.rs"]
 mod flow_version_snapshots;
 #[path = "all/immutable_configuration_members.rs"]

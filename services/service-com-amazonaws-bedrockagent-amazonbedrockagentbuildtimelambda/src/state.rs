@@ -92,6 +92,21 @@
 //! [`not_found_document_detail`] as the only two projections any document
 //! operation reports. A document's status advances on the CLOCK alone, through
 //! the same `materialise_due_transitions`.
+//!
+//! A flow's aliases (`CreateFlowAlias`, `GetFlowAlias`, `ListFlowAliases`) are
+//! backed by the
+//! [`flow_aliases`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::flow_aliases)
+//! map and live in the `flow_aliases` module beside this one, together with
+//! the record -> wire projections ([`FlowAliasRecord::to_create_output`] /
+//! [`FlowAliasRecord::to_get_output`] / [`FlowAliasRecord::to_summary`]) and the
+//! one rule that resolves an alias's routing target against the versions its
+//! flow holds.
+
+/// The flow-alias slice of this state: its records, their projections, and the
+/// resolution of an alias identifier and of an alias's routing target.
+mod flow_aliases;
+
+pub use flow_aliases::*;
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -341,6 +356,16 @@ impl FlowStatus {
     }
 }
 
+/// The one `FlowStatus` a numbered version is cut from.
+///
+/// `CreateFlowVersion` is documented "Creates a version of the flow that you can
+/// deploy", and what makes the DRAFT deployable is the preparation `PrepareFlow`
+/// performs ("Prepares the DRAFT version of a flow so that it can be invoked");
+/// so a flow the service has not driven to this status has nothing to cut a
+/// deployable version from, and the call is refused with the operation's
+/// modelled `ConflictException`.
+pub const FLOW_STATUS_VERSIONS_ARE_CUT_FROM: FlowStatus = FlowStatus::Prepared;
+
 /// The outcome of a preparation `PrepareFlow` has already accepted, and the
 /// instant the clock makes it due.
 ///
@@ -523,16 +548,39 @@ pub fn flow_id_from_identifier(identifier: &str) -> Option<&str> {
     is_flow_id(id).then_some(id)
 }
 
-/// The `ResourceNotFoundException` message a flow operation answers when the
-/// flow the request names is not stored.
+/// The `ResourceNotFoundException` message an operation answers when a resource
+/// it was asked to resolve is not stored.
 ///
-/// The sentence is the flow family's, with `operation` — the operation the caller
-/// invoked — filling its one variable part; the requested identifier is not part
+/// The sentence is this service's, with two variable parts: `operation`, the
+/// operation the caller invoked, and `resource_type`, the type of the resource
+/// that could not be resolved. The identifier that failed to resolve is not part
 /// of it.
-pub fn flow_not_found_message(operation: &str) -> String {
+pub fn resource_not_found_message(operation: &str, resource_type: &str) -> String {
     format!(
         "Couldn't perform {operation} operation. Failed to retrieve resource type \
-         Flow because it doesn't exist. Check the resource ID and retry your request."
+         {resource_type} because it doesn't exist. Check the resource ID and retry \
+         your request."
+    )
+}
+
+/// The `ResourceNotFoundException` message a flow operation answers when the
+/// flow the request names is not stored.
+pub fn flow_not_found_message(operation: &str) -> String {
+    resource_not_found_message(operation, "Flow")
+}
+
+/// The `ConflictException` message an operation answers when the resource it
+/// addresses is in a status that does not serve the operation at all.
+///
+/// The sentence is this service's, with two variable parts: `operation`, the
+/// operation the caller invoked, and `status`, the status token the addressed
+/// resource is currently stored in. Which statuses serve which operation is the
+/// operation's own question; this is only how the refusal is worded.
+pub fn resource_status_conflict_message(operation: &str, status: &str) -> String {
+    format!(
+        "Couldn't perform {operation} operation. The resource that you specified is \
+         currently in status {status}. Retry your request after the resource changes \
+         to a valid status."
     )
 }
 
@@ -2106,6 +2154,17 @@ pub struct ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     /// key carries the flow the replay is read at, so one token reused for
     /// another flow cannot displace the version it already names.
     pub flow_version_client_tokens: HashMap<(String, String), u32>,
+    /// Every alias of every flow, keyed by the `flowId` it was created on and
+    /// its own `flowAliasId`. The pair is the alias's identity — every modelled
+    /// alias operation addresses it as that pair — so one flow never reports
+    /// another flow's alias.
+    pub flow_aliases: HashMap<(String, String), FlowAliasRecord>,
+    /// `(flowId, clientToken)` -> the `flowAliasId` that request created, so a
+    /// retried `CreateFlowAlias` carrying the same `@idempotencyToken` returns
+    /// the alias it already created rather than creating a second one. The key
+    /// carries the flow the replay is read at, so one token reused for another
+    /// flow cannot displace the alias it already names.
+    pub flow_alias_client_tokens: HashMap<(String, String), String>,
     /// Every knowledge base that exists, keyed by its 10-character
     /// `knowledgeBaseId`.
     pub knowledge_bases: HashMap<String, KnowledgeBaseRecord>,
@@ -2612,10 +2671,11 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
         Some(record)
     }
 
-    /// Forget a flow, the versions cut from it and the index that let a repeated
-    /// create replay it.
+    /// Forget a flow, the versions cut from it, the aliases created on it and
+    /// the index that let a repeated create replay it.
     pub fn remove_flow(&mut self, flow_id: &str) -> Option<FlowRecord> {
         let record = self.flows.remove(flow_id)?;
+        self.remove_flow_aliases(flow_id);
         self.flow_versions
             .retain(|(versioned_flow_id, _), _| versioned_flow_id != flow_id);
         self.flow_version_client_tokens

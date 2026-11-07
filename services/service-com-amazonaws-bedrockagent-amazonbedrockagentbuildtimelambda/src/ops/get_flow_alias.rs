@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFlowAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFlowAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFlowAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one alias of one flow, exactly as [`crate::state`] holds it: the
+//! alias is addressed by the flow it belongs to and its own identifier, so a
+//! flow never reports another flow's alias.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +162,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFlowAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFlowAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFlowAlias"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetFlowAliasErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the bedrock-agent store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The modelled `FlowIdentifier` admits a flow ARN or a bare flow id and
+        // nothing else. The boundary validator lets other values through — the
+        // pattern's top-level alternation leaves the second branch anchored only
+        // at its end — so an identifier of neither form is refused here as the
+        // bad request it is, rather than reported as a missing flow.
+        let Some(flow_id) = crate::state::flow_id_from_identifier(&input.flow_identifier) else {
+            return Err(GetFlowAliasErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::flow_identifier_pattern_message(
+                        &input.flow_identifier,
+                    )),
+                    field_list: None,
+                },
+            )
+            .into());
+        };
+
+        // The modelled `FlowAliasIdentifier` admits an alias ARN or a bare alias
+        // id, and its pattern has the same unanchored alternation, so a value of
+        // neither form is likewise refused here as a bad request.
+        let Some((arn_flow_id, alias_id)) =
+            crate::state::flow_alias_from_identifier(&input.alias_identifier)
+        else {
+            return Err(GetFlowAliasErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::flow_alias_identifier_pattern_message(
+                        &input.alias_identifier,
+                    )),
+                    field_list: None,
+                },
+            )
+            .into());
+        };
+
+        // A read: the alias is reported as it stands. The one write is the
+        // materialising of a status change the CLOCK had already made due, which
+        // every reader of this store performs alike.
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialise_due_transitions(now);
+
+        if !state.flows.contains_key(flow_id) {
+            return Err(GetFlowAliasErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::flow_not_found_message(Self::NAME)),
+                },
+            )
+            .into());
+        }
+
+        // An alias ARN naming another flow than the one addressed names an alias
+        // this flow does not hold, which is a missing resource rather than a bad
+        // request.
+        let aliased_flow_matches = arn_flow_id.is_none_or(|from_arn| from_arn == flow_id);
+        let Some(record) = aliased_flow_matches
+            .then(|| state.flow_alias_of(flow_id, alias_id))
+            .flatten()
+        else {
+            return Err(GetFlowAliasErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::flow_alias_not_found_message(Self::NAME)),
+                },
+            )
+            .into());
+        };
+
+        Ok(record.to_get_output())
     }
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFlowAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFlowAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFlowAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one alias of a flow: a named pointer to a version of that flow,
+//! stored in [`crate::state`] so `GetFlowAlias` and `ListFlowAliases` report it.
+//! The alias's single routing entry must name a version the addressed flow
+//! actually holds, so an alias never points at a version that does not exist.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +179,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFlowAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFlowAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFlowAliasErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the bedrock-agent store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The modelled `FlowIdentifier` admits a flow ARN or a bare flow id and
+        // nothing else. The boundary validator lets other values through — the
+        // pattern's top-level alternation leaves the second branch anchored only
+        // at its end — so an identifier of neither form is refused here as the
+        // bad request it is, rather than reported as a missing flow.
+        let Some(flow_id) = crate::state::flow_id_from_identifier(&input.flow_identifier) else {
+            return Err(CreateFlowAliasErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::flow_identifier_pattern_message(
+                        &input.flow_identifier,
+                    )),
+                    field_list: None,
+                },
+            )
+            .into());
+        };
+        let flow_id = flow_id.to_string();
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialise_due_transitions(now);
+
+        // `clientToken` is an @idempotencyToken: a repeat of the same request
+        // reports the alias it already created rather than creating a second one.
+        if let Some(existing) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| {
+                state
+                    .flow_alias_client_tokens
+                    .get(&(flow_id.clone(), token.to_string()))
+                    .cloned()
+            })
+            .and_then(|alias_id| state.flow_alias_of(&flow_id, &alias_id))
+        {
+            return Ok(existing.to_create_output());
+        }
+
+        let Some(flow) = state.flows.get(&flow_id) else {
+            return Err(CreateFlowAliasErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::flow_not_found_message(Self::NAME)),
+                },
+            )
+            .into());
+        };
+        let flow_arn = flow.arn.clone();
+
+        // An alias ROUTES to a version of the flow it belongs to, so every
+        // version its routing configuration names must be one that flow holds:
+        // the flow's DRAFT version, or a number `CreateFlowVersion` has cut and
+        // nothing has deleted. A reference to anything else — a version the flow
+        // does not hold, or an entry naming no version at all — resolves to no
+        // flow version, which is the modelled 404: the resource that could not
+        // be resolved is the flow version, not the flow. Nothing is written for
+        // it.
+        if input
+            .routing_configuration
+            .iter()
+            .any(|entry| {
+                entry
+                    .flow_version
+                    .as_deref()
+                    .is_none_or(|version| !state.flow_version_exists(&flow_id, version))
+            })
+        {
+            return Err(CreateFlowAliasErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::flow_version_not_found_message(Self::NAME)),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded per flow: past the bound a create is refused
+        // rather than adding another record, and `ServiceQuotaExceededException`
+        // is the modelled refusal for exactly that. Checked AFTER the idempotency
+        // replay above, so a retry of an accepted create is still served.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFlowAlias"))
+        // No name check: the modelled `Name` carries no uniqueness constraint
+        // (only its pattern), and an alias's identity is the minted
+        // `flowAliasId` its ARN carries — so two aliases of one flow may share a
+        // name and the modelled `ConflictException` is not owed here.
+        if state.flow_alias_count(&flow_id) >= crate::state::FLOW_ALIAS_QUOTA {
+            return Err(CreateFlowAliasErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this flow already holds the maximum of {} aliases",
+                        crate::state::FLOW_ALIAS_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(alias_id) = state.mint_flow_alias_id(&flow_id, now) else {
+            return Err(CreateFlowAliasErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("could not mint an unused flowAliasId".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let record = crate::state::FlowAliasRecord {
+            // The modelled `FlowAliasArn` is the flow's own ARN with the alias
+            // segment appended, so the alias is built from the ARN the flow is
+            // stored with rather than from a second rendering of it.
+            arn: format!("{flow_arn}/alias/{alias_id}"),
+            flow_id: flow_id.clone(),
+            alias_id: alias_id.clone(),
+            name: input.name,
+            description: input.description,
+            routing_configuration: input.routing_configuration,
+            concurrency_configuration: input.concurrency_configuration,
+            tags: input.tags.unwrap_or_default(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let output = record.to_create_output();
+        if let Some(token) = input.client_token {
+            state
+                .flow_alias_client_tokens
+                .insert((flow_id.clone(), token), alias_id.clone());
+        }
+        state.flow_aliases.insert((flow_id, alias_id), record);
+
+        Ok(output)
     }
 }

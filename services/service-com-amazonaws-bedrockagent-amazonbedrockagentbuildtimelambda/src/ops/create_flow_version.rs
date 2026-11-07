@@ -240,6 +240,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Versioning is ordered behind preparation: a numbered version is a
+        // snapshot of the DRAFT as a deployable package, and only a DRAFT that
+        // `PrepareFlow` has driven to `Prepared` is one. A flow in any other
+        // modelled `FlowStatus` — never prepared, still being prepared, or left
+        // `Failed` by a preparation a defect in the definition stopped — is
+        // refused with the modelled `ConflictException`, which names the status
+        // the flow is stored in so the caller knows what to wait for. The
+        // refusal is taken BEFORE anything is written, so no version number is
+        // consumed and the flow's listing gains no entry.
+        if flow.status != crate::state::FLOW_STATUS_VERSIONS_ARE_CUT_FROM {
+            return Err(CreateFlowVersionErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::resource_status_conflict_message(
+                        Self::NAME,
+                        flow.status.as_wire(),
+                    )),
+                },
+            )
+            .into());
+        }
+
         // Two bounds stop a flow's version state growing without end, and
         // `ServiceQuotaExceededException` is the modelled refusal for either: the
         // store's own bound on the versions one flow holds, and the model's — a

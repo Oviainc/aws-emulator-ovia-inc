@@ -391,8 +391,7 @@ async fn create_flow_version_cuts_incrementally_numbered_versions_the_listing_en
 }
 
 /// A numbered version is a SNAPSHOT: each summary reports the status of its own
-/// version, and a later change to the DRAFT moves the DRAFT alone. A version cut
-/// from a DRAFT still being prepared settles with that preparation.
+/// version, and a later change to the DRAFT moves the DRAFT alone.
 #[tokio::test]
 async fn each_summary_reports_its_own_version_status_as_the_draft_moves_on() {
     let case = "the DRAFT moves while its versions stand";
@@ -409,8 +408,10 @@ async fn each_summary_reports_its_own_version_status_as_the_draft_moves_on() {
         .await;
     let flow_id = flow.string(&["id"]);
 
-    // A version cut from a DRAFT that has never been prepared carries the only
-    // status that DRAFT has ever had.
+    // A version is cut from the prepared DRAFT, so it carries the one status a
+    // version is ever cut in.
+    emulator.prepare_flow(case, &flow_id).await;
+    emulator.make_preparation_due(case, &flow_id);
     let first = emulator.create_flow_version(&flow_id, json!({})).await;
     assert_eq!(
         first.status, 201,
@@ -419,48 +420,15 @@ async fn each_summary_reports_its_own_version_status_as_the_draft_moves_on() {
     assert_eq!(
         emulator.list_flow_versions(&flow_id).await.listed_statuses(),
         vec![
-            ("DRAFT".to_string(), "NotPrepared".to_string()),
-            ("1".to_string(), "NotPrepared".to_string()),
-        ],
-        "case {case}: a version cut from an unprepared DRAFT reports NotPrepared"
-    );
-
-    // Preparing the DRAFT moves the DRAFT. The version already cut does not
-    // move with it: it packages the definition it was cut from.
-    emulator.prepare_flow(case, &flow_id).await;
-    assert_eq!(
-        emulator.list_flow_versions(&flow_id).await.listed_statuses(),
-        vec![
-            ("DRAFT".to_string(), "Preparing".to_string()),
-            ("1".to_string(), "NotPrepared".to_string()),
-        ],
-        "case {case}: preparing the DRAFT leaves an already-cut version where it was"
-    );
-
-    // A version cut WHILE the DRAFT is being prepared packages the very
-    // definition being prepared, so it reports that transient status and then
-    // settles with it rather than standing in it for ever.
-    let second = emulator.create_flow_version(&flow_id, json!({})).await;
-    assert_eq!(
-        second.string(&["status"]),
-        "Preparing",
-        "case {case}: a version cut mid-preparation snapshots the DRAFT's status, \
-         got {second:?}"
-    );
-    emulator.make_preparation_due(case, &flow_id);
-    assert_eq!(
-        emulator.list_flow_versions(&flow_id).await.listed_statuses(),
-        vec![
             ("DRAFT".to_string(), "Prepared".to_string()),
-            ("1".to_string(), "NotPrepared".to_string()),
-            ("2".to_string(), "Prepared".to_string()),
+            ("1".to_string(), "Prepared".to_string()),
         ],
-        "case {case}: the preparation's outcome is reported for the DRAFT and for the \
-         version cut from it"
+        "case {case}: a version cut from the prepared DRAFT reports Prepared"
     );
 
-    // Updating the flow moves the DRAFT back to NotPrepared, and neither
-    // numbered version moves with it.
+    // Updating the flow moves the DRAFT back to NotPrepared, and the version
+    // already cut does not move with it: it packages the definition it was cut
+    // from.
     emulator
         .update_flow(
             case,
@@ -476,10 +444,39 @@ async fn each_summary_reports_its_own_version_status_as_the_draft_moves_on() {
         emulator.list_flow_versions(&flow_id).await.listed_statuses(),
         vec![
             ("DRAFT".to_string(), "NotPrepared".to_string()),
-            ("1".to_string(), "NotPrepared".to_string()),
-            ("2".to_string(), "Prepared".to_string()),
+            ("1".to_string(), "Prepared".to_string()),
         ],
         "case {case}: updating the DRAFT moves the DRAFT alone"
+    );
+
+    // Preparing the DRAFT again moves the DRAFT through its transient status,
+    // and the version already cut stands where it was through both legs.
+    emulator.prepare_flow(case, &flow_id).await;
+    assert_eq!(
+        emulator.list_flow_versions(&flow_id).await.listed_statuses(),
+        vec![
+            ("DRAFT".to_string(), "Preparing".to_string()),
+            ("1".to_string(), "Prepared".to_string()),
+        ],
+        "case {case}: preparing the DRAFT leaves an already-cut version where it was"
+    );
+    emulator.make_preparation_due(case, &flow_id);
+
+    // The next cut is taken from the DRAFT as that preparation left it.
+    let second = emulator.create_flow_version(&flow_id, json!({})).await;
+    assert_eq!(
+        second.string(&["status"]),
+        "Prepared",
+        "case {case}: a version snapshots the prepared DRAFT's status, got {second:?}"
+    );
+    assert_eq!(
+        emulator.list_flow_versions(&flow_id).await.listed_statuses(),
+        vec![
+            ("DRAFT".to_string(), "Prepared".to_string()),
+            ("1".to_string(), "Prepared".to_string()),
+            ("2".to_string(), "Prepared".to_string()),
+        ],
+        "case {case}: every version the flow holds is listed with its own status"
     );
 }
 
@@ -503,7 +500,10 @@ async fn create_flow_version_replays_a_retried_cut_and_refuses_an_unknown_flow()
         .await;
     let flow_id = flow.string(&["id"]);
     let flow_arn = flow.string(&["arn"]);
-
+    // Every cut below is taken from a prepared DRAFT, the one status a version
+    // is cut from.
+    emulator.prepare_flow(case, &flow_id).await;
+    emulator.make_preparation_due(case, &flow_id);
     // The modelled `ClientToken` is `length 33..256, pattern
     // ^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,256}$`.
     let token = "idempotency-token-for-flow-version-1";
