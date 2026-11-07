@@ -1,0 +1,48 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudformation__sqs__ssm.change-set-disable-rollback-execute-leaves-create-failed-and-is-updatable cloudformation__sqs__ssm.cdk-deploy-no-rollback-keeps-create-failed-then-fixed-redeploy-completes
+Issue-Key: cloudformation__sqs__ssm.change-set-disable-rollback-execute-leaves-create-failed-and-is-updatable|run#29|AssertionError|assert sorted(by_id) == ["Bad", "Keep", "Queue"], f"the fixing change set's entries: {by_id!r}"
+Issue-Key: cloudformation__sqs__ssm.cdk-deploy-no-rollback-keeps-create-failed-then-fixed-redeploy-completes|run#25|AssertionError|assert rc == 0, f"the fixed redeploy exited {rc}; output tail {out[-800:]!r}"
+Issue-Commit: 486a0852ab6c107011e8dec7ea6574940ef62e53
+
+# cloudformation__sqs__ssm: 2 net-new causes — an UPDATE change set on a stack parked in CREATE_FAILED omits every tags-only resource change, and the fixing --no-rollback redeploy of the parked stack is refused as a replacement
+
+> _Note: this issue was identified against the code base at commit `486a0852ab6c107011e8dec7ea6574940ef62e53`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateChangeSet
+
+## Description
+Two independent net-new root causes in the change-set surface of a stack parked in CREATE_FAILED with rollback disabled. Both must be closed. Related open issue 20261106T153504Z-cloudformation-sqs-ssm-a-change-set-created-stack.md owns the earlier cause on one of these checks (the stack never leaving REVIEW_IN_PROGRESS after ExecuteChangeSet); that leg now passes — the stack does park in CREATE_FAILED with DisableRollback=true and the correct StackStatusReason — and neither cause below is described there.
+
+=== Cause 1 of 2: the UPDATE change set that fixes a parked stack lists only the changed resource and omits the tags-only entries for the stack's other taggable resources ===
+AWS: Smithy: DescribeChangeSet.Changes[].ResourceChange with Action (ChangeAction enum: Add|Modify|Remove|Import|Dynamic|SyncWithActual), Replacement (Replacement enum: True|False|Conditional) and Scope (list of ResourceAttribute: Properties|Metadata|CreationPolicy|UpdatePolicy|DeletionPolicy|UpdateReplacePolicy|Tags). Recorded behavior: when the change set carries stack Tags, CloudFormation plans a tag re-application for EVERY taggable resource in the stack, so an UPDATE change set over a stack whose template changes one resource lists that resource AND one entry per other taggable resource, each Action=Modify, Replacement="False", Scope=["Tags"]. For the parked stack (a queue `Queue`, a good parameter `Keep`, a failed parameter `Bad`) the fixing change set lists exactly the logical ids Bad, Keep and Queue: Bad with Replacement="True" and Scope=["Properties"] (its Name property requires recreation), Queue and Keep with Replacement="False" and Scope=["Tags"].
+Emulator: DescribeChangeSet returns a single change — {'PolicyAction': 'ReplaceAndDelete', 'Action': 'Modify', 'LogicalResourceId': 'Bad', 'ResourceType': 'AWS::SSM::Parameter', 'Replacement': 'True', 'Scope': ['Properties'], 'Details': [{'Target': {'Attribute': 'Properties', 'Name': 'Name', 'RequiresRecreation': 'Always'}, 'Evaluation': 'Static', 'ChangeSource': 'DirectModification'}]} — the tags-only entries for Queue and Keep are absent, so the change set is incomplete (the entry for the property change itself matches AWS).
+Why: a change set is the preview a client approves before execution. Tooling (CDK, approval gates, drift/diff reviewers) that enumerates Changes is told that the execution touches one resource when it will in fact re-tag every taggable resource in the stack, and a client that counts or filters by Scope==["Tags"] cannot see tag propagation at all.
+Fix: the CreateChangeSet handler's change computation (the stack-tag propagation diff that must emit a Modify/Replacement=False/Scope=[Tags] entry per other taggable resource) and the DescribeChangeSet Changes serializer.
+Traces: cloudformation__sqs__ssm.change-set-disable-rollback-execute-leaves-create-failed-and-is-updatable.
+
+=== Cause 2 of 2: the corrected `cdk deploy --no-rollback` over a stack parked in CREATE_FAILED is rejected, so a parked stack can never be repaired ===
+AWS: recorded behavior only (CloudFormation models no error for this path: CreateChangeSet models only AlreadyExistsException, InsufficientCapabilitiesException and LimitExceededException). A `cdk deploy --no-rollback` whose app no longer collides updates the SAME stack id out of CREATE_FAILED: the CLI exits 0, DescribeStacks reports the same StackId with StackStatus UPDATE_COMPLETE, the already-created queue keeps its CreatedTimestamp (not re-created), the good parameter stays at Value=keep Version=1, and the previously failed parameter now exists with its corrected name and value.
+Emulator: the CDK CLI aborts with exit 1 and `❌ <stack> failed to deploy` / `TtyNotAttached: Stack is in a paused fail state (CREATE_FAILED) and change includes a replacement which cannot be deployed with "--no-rollback", but terminal (TTY) is not attached so we are unable to get a confirmation from the user` — the stack is left in CREATE_FAILED and the corrected parameter is never created. Hypothesis: the UPDATE change set the emulator computes against the parked stack presents the resource that never got created as a replacement of a live resource (the sibling check above shows exactly that entry: Action=Modify, Replacement='True', PolicyAction='ReplaceAndDelete'), which is what trips the CLI's paused-fail-state replacement gate that the recorded AWS run does not trip.
+Why: the documented recovery path for `--no-rollback` (park on failure, fix the template, redeploy the same stack) is unreachable: every parked stack is a dead end that can only be deleted, and the CLI's refusal is not even an API error a client can classify.
+Fix: the CreateChangeSet handler's change computation for a stack parked in CREATE_FAILED with rollback disabled — a resource that failed to create carries no live physical resource and must not be planned as a replacement of one — together with the ExecuteChangeSet/update path that must advance the same stack id to UPDATE_COMPLETE without re-creating the resources that did succeed.
+Traces: cloudformation__sqs__ssm.cdk-deploy-no-rollback-keeps-create-failed-then-fixed-redeploy-completes.
+
+## Evidence
+Cause 1 — cloudformation__sqs__ssm.change-set-disable-rollback-execute-leaves-create-failed-and-is-updatable:
+Expected (AWS): sorted(DescribeChangeSet Changes by LogicalResourceId) == ['Bad', 'Keep', 'Queue'], with Bad Replacement='True' Scope=['Properties'] and {'Queue': ('False', ['Tags']), 'Keep': ('False', ['Tags'])}.
+Actual (emulator): AssertionError: the fixing change set's entries: {'Bad': {'PolicyAction': 'ReplaceAndDelete', 'Action': 'Modify', 'LogicalResourceId': 'Bad', 'ResourceType': 'AWS::SSM::Parameter', 'Replacement': 'True', 'Scope': ['Properties'], 'Details': [{'Target': {'Attribute': 'Properties', 'Name': 'Name', 'RequiresRecreation': 'Always'}, 'Evaluation': 'Static', 'ChangeSource': 'DirectModification'}]}} — only one entry.
+
+Cause 2 — cloudformation__sqs__ssm.cdk-deploy-no-rollback-keeps-create-failed-then-fixed-redeploy-completes:
+Expected (AWS): the fixed redeploy exits 0 and DescribeStacks shows (StackId unchanged, StackStatus 'UPDATE_COMPLETE'), the queue's CreatedTimestamp unchanged, the good parameter still Value 'keep' / Version 1, and the corrected parameter present with Value 'bad'.
+Actual (emulator): AssertionError: the fixed redeploy exited 1; output tail '… <stack>: creating CloudFormation changeset...\n<stack>: deploying... [1/1]\n❌  <stack> failed to deploy\n‣ TtyNotAttached: Stack is in a paused fail state (CREATE_FAILED) and change includes a replacement which cannot be deployed with "--no-rollback", but terminal (TTY) is not attached so we are unable to get a confirmation from the user'.
+In both checks the parking leg matched AWS: StackStatus CREATE_FAILED, StackStatusReason 'The following resource(s) failed to create: [Bad]. ', DisableRollback true, and the queue and good parameter live.
+
+## Steps to Reproduce
+Shared setup: a template with Queue (AWS::SQS::Queue, QueueName), Keep (AWS::SSM::Parameter, Name=/<keep>, Value=keep) and Bad (AWS::SSM::Parameter, DependsOn Keep) whose Name is {"Ref": "Keep"} while broken and "/<keep>-fixed" when fixed.
+
+Cause 1: CreateChangeSet(StackName=<new>, ChangeSetType=CREATE, TemplateBody=<broken>, Tags=[{Key: sim2real, Value: <check>}]); ExecuteChangeSet(DisableRollback=True); wait for CREATE_FAILED. Then CreateChangeSet(StackName=<stack id>, ChangeSetType=UPDATE, TemplateBody=<fixed>, Tags=[same]) and DescribeChangeSet: AWS lists Bad, Keep and Queue (Keep/Queue as Replacement 'False', Scope ['Tags']); the emulator lists only Bad. Replay cloudformation__sqs__ssm.change-set-disable-rollback-execute-leaves-create-failed-and-is-updatable.
+
+Cause 2: `cdk deploy <stack> --require-approval never --no-rollback` of the broken app (exits 1, stack parks CREATE_FAILED/DisableRollback=true), then the same `cdk deploy ... --no-rollback` with the fixed context: AWS exits 0 and the stack reaches UPDATE_COMPLETE on the same StackId with the queue and good parameter untouched; the emulator's run exits 1 with the TtyNotAttached/paused-fail-state-replacement refusal. Replay cloudformation__sqs__ssm.cdk-deploy-no-rollback-keeps-create-failed-then-fixed-redeploy-completes.
