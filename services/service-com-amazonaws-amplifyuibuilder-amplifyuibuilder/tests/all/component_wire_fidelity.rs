@@ -18,10 +18,14 @@
 //!    (its creation, until something updates it) and `tags` is a map — empty when the
 //!    create named none — rather than an omitted member.
 //!
-//! Case 1 is checked both end to end over HTTP (the `Component` payload of
-//! `CreateComponent`/`GetComponent`/`UpdateComponent`) and directly on the member
-//! schemas, which is the only reach the shapes whose operations are still scaffolded 501s
-//! (`Theme`) have.
+//! Case 1 is checked both end to end over HTTP — every operation this service implements
+//! that reports one of those four shapes: the `Component` payload of
+//! `CreateComponent`/`GetComponent`/`UpdateComponent` and the `entities` of
+//! `ExportComponents`, the `Theme` payload of `CreateTheme`/`GetTheme`/`UpdateTheme` and
+//! the `entities` of `ExportThemes`, the `CodegenJob` payload of
+//! `StartCodegenJob`/`GetCodegenJob` and the `CodegenJobSummary` `entities` of
+//! `ListCodegenJobs` — and directly on the member schemas, which is the reach that
+//! survives when a shape has no operation to drive it through.
 
 use std::sync::Arc;
 
@@ -115,8 +119,74 @@ async fn update(router: &MultiServiceRouter, id: &str, patch: Value) -> Answer {
     call(router, "PATCH", &uri, Some(patch)).await
 }
 
+fn themes_uri() -> String {
+    format!("/app/{APP_ID}/environment/{ENVIRONMENT}/themes")
+}
+
+fn codegen_jobs_uri() -> String {
+    format!("/app/{APP_ID}/environment/{ENVIRONMENT}/codegen-jobs")
+}
+
+/// The `@http` URI the export operations are bound to, for the collection named — from
+/// `smithy_query(query="operation", operation="ExportComponents,ExportThemes")`:
+/// `/export/app/{appId}/environment/{environmentName}/components` and `.../themes`.
+fn export_uri(collection: &str) -> String {
+    format!("/export/app/{APP_ID}/environment/{ENVIRONMENT}/{collection}")
+}
+
+async fn create_theme(router: &MultiServiceRouter, data: Value) -> Answer {
+    call(router, "POST", &themes_uri(), Some(data)).await
+}
+
+async fn get_theme(router: &MultiServiceRouter, id: &str) -> Answer {
+    call(router, "GET", &format!("{}/{id}", themes_uri()), None).await
+}
+
+async fn update_theme(router: &MultiServiceRouter, id: &str, patch: Value) -> Answer {
+    call(router, "PATCH", &format!("{}/{id}", themes_uri()), Some(patch)).await
+}
+
+async fn start_codegen_job(router: &MultiServiceRouter, data: Value) -> Answer {
+    call(router, "POST", &codegen_jobs_uri(), Some(data)).await
+}
+
+async fn get_codegen_job(router: &MultiServiceRouter, id: &str) -> Answer {
+    call(router, "GET", &format!("{}/{id}", codegen_jobs_uri()), None).await
+}
+
+async fn list_codegen_jobs(router: &MultiServiceRouter) -> Answer {
+    call(router, "GET", &codegen_jobs_uri(), None).await
+}
+
+async fn export(router: &MultiServiceRouter, collection: &str) -> Answer {
+    call(router, "GET", &export_uri(collection), None).await
+}
+
 fn at(value: &Value, pointer: &str) -> Value {
     value.pointer(pointer).cloned().unwrap_or(Value::Null)
+}
+
+/// The `entities` a paginated answer carries — `@required` on every one of this service's
+/// list and export outputs — panicking when the answer is not a page.
+fn entities(answer: &Answer, operation: &str) -> Vec<Value> {
+    answer.body["entities"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "{operation} must answer a page carrying the required entities list, got {} \
+                 with {:?}",
+                answer.status, answer.body
+            )
+        })
+        .clone()
+}
+
+/// The id an answer whose `@httpPayload` IS the resource reports, or the empty string.
+fn reported_id(answer: &Answer) -> String {
+    at(&answer.body, "/id")
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// The instant a `date-time` member names, in seconds since the epoch, or the reason the
@@ -335,12 +405,277 @@ async fn an_update_moves_modified_at_in_the_same_wire_form() {
     }
 }
 
+/// The theme payloads the end-to-end rows drive, each with the patch that updates it.
+/// Rows differ along what the rule generalises over: how many `values` entries the create
+/// supplies, how deeply they nest, and whether the optional `overrides` and `tags` are
+/// present at all. A theme name identifies a theme within its app environment, so every
+/// row carries its own.
+fn theme_rows() -> Vec<(&'static str, Value, Value)> {
+    vec![
+        (
+            "only the required members, with an empty values list",
+            json!({"name": "WireBare", "values": []}),
+            json!({"values": [{"key": "primaryColor", "value": {"value": "#047d95"}}]}),
+        ),
+        (
+            "flat values and tags",
+            json!({
+                "name": "WireFlat",
+                "values": [
+                    {"key": "primaryColor", "value": {"value": "#047d95"}},
+                    {"key": "borderRadius", "value": {"value": "4px"}},
+                ],
+                "tags": {"env": "test"},
+            }),
+            json!({"name": "WireFlatV2", "values": []}),
+        ),
+        (
+            "values nested two levels deep, plus overrides",
+            json!({
+                "name": "WireNested",
+                "values": [
+                    {
+                        "key": "tokens",
+                        "value": {
+                            "children": [
+                                {"key": "space", "value": {"value": "8px"}},
+                            ],
+                        },
+                    },
+                ],
+                "overrides": [
+                    {"key": "dark", "value": {"value": "#ffffff"}},
+                ],
+            }),
+            json!({
+                "values": [{"key": "space", "value": {"value": "16px"}}],
+                "overrides": [],
+            }),
+        ),
+    ]
+}
+
+/// The codegen job payloads the end-to-end rows drive. `renderConfig` is
+/// `StartCodegenJobData`'s only `@required` member
+/// (`smithy_query(query="shape", shape="StartCodegenJobData")`), so the rows differ in
+/// which of the optional members they add.
+fn codegen_job_rows() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "only the required renderConfig",
+            json!({"renderConfig": {"react": {}}}),
+        ),
+        (
+            "a configured render, autogenerated forms and tags",
+            json!({
+                "renderConfig": {"react": {"module": "es2020", "target": "es2020", "script": "tsx"}},
+                "autoGenerateForms": true,
+                "tags": {"env": "test"},
+            }),
+        ),
+    ]
+}
+
+/// Over HTTP, every shape this service models with a `@timestampFormat("date-time")`
+/// member reports those members as date-time STRINGS, through each operation that reports
+/// the shape — the create, the read, the update, the list and the export alike — and an
+/// update never moves `createdAt`.
+///
+/// This is the catalog of the schema case below, driven end to end instead of read off the
+/// member schemas.
+#[tokio::test]
+async fn every_date_time_shape_reports_date_time_strings_over_http() {
+    let router = emulator();
+    // Each observation: the shape, the operation and case that reported it, and the JSON
+    // object carrying its timestamp members.
+    let mut observed: Vec<(&str, String, Value)> = Vec::new();
+
+    // `Component`: the `@httpPayload` of the create, the read and the update, and an
+    // `entities` entry of the export.
+    for (index, (case, tags)) in [
+        ("no tags member at all", None),
+        ("one tag", Some(json!({"env": "test"}))),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let created = create(&router, create_data(&format!("Wire{index}"), tags)).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected HTTP 200 from CreateComponent, got {} with {:?}",
+            created.status, created.body
+        );
+        let id = reported_id(&created);
+
+        let read = get(&router, &id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: expected HTTP 200 from GetComponent, got {} with {:?}",
+            read.status, read.body
+        );
+
+        let updated = update(&router, &id, json!({"name": format!("Wire{index}V2")})).await;
+        assert_eq!(
+            updated.status, 200,
+            "case {case:?}: expected HTTP 200 from UpdateComponent, got {} with {:?}",
+            updated.status, updated.body
+        );
+        assert_eq!(
+            at(&updated.body, "/createdAt"),
+            at(&created.body, "/createdAt"),
+            "case {case:?}: UpdateComponent must not move createdAt, got {:?} against {:?}",
+            at(&updated.body, "/createdAt"),
+            at(&created.body, "/createdAt")
+        );
+
+        for (operation, body) in [
+            ("CreateComponent", created.body),
+            ("GetComponent", read.body),
+            ("UpdateComponent", updated.body),
+        ] {
+            observed.push(("Component", format!("{operation}, {case}"), body));
+        }
+    }
+
+    let exported_components = export(&router, "components").await;
+    for (position, entity) in entities(&exported_components, "ExportComponents")
+        .into_iter()
+        .enumerate()
+    {
+        observed.push((
+            "Component",
+            format!("ExportComponents entity {position}"),
+            entity,
+        ));
+    }
+
+    // `Theme`: the same reach, through the theme operations.
+    for (case, data, patch) in theme_rows() {
+        let created = create_theme(&router, data).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected HTTP 200 from CreateTheme, got {} with {:?}",
+            created.status, created.body
+        );
+        let id = reported_id(&created);
+
+        let read = get_theme(&router, &id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: expected HTTP 200 from GetTheme, got {} with {:?}",
+            read.status, read.body
+        );
+        assert_eq!(
+            read.body, created.body,
+            "case {case:?}: GetTheme must report exactly what CreateTheme persisted"
+        );
+
+        let updated = update_theme(&router, &id, patch).await;
+        assert_eq!(
+            updated.status, 200,
+            "case {case:?}: expected HTTP 200 from UpdateTheme, got {} with {:?}",
+            updated.status, updated.body
+        );
+        assert_eq!(
+            at(&updated.body, "/createdAt"),
+            at(&created.body, "/createdAt"),
+            "case {case:?}: UpdateTheme must not move createdAt, got {:?} against {:?}",
+            at(&updated.body, "/createdAt"),
+            at(&created.body, "/createdAt")
+        );
+
+        for (operation, body) in [
+            ("CreateTheme", created.body),
+            ("GetTheme", read.body),
+            ("UpdateTheme", updated.body),
+        ] {
+            observed.push(("Theme", format!("{operation}, {case}"), body));
+        }
+    }
+
+    let exported_themes = export(&router, "themes").await;
+    for (position, entity) in entities(&exported_themes, "ExportThemes")
+        .into_iter()
+        .enumerate()
+    {
+        observed.push(("Theme", format!("ExportThemes entity {position}"), entity));
+    }
+
+    // `CodegenJob`, and the `CodegenJobSummary` the list reports for each one.
+    for (case, data) in codegen_job_rows() {
+        let started = start_codegen_job(&router, data).await;
+        assert_eq!(
+            started.status, 200,
+            "case {case:?}: expected HTTP 200 from StartCodegenJob, got {} with {:?}",
+            started.status, started.body
+        );
+        let id = reported_id(&started);
+
+        let read = get_codegen_job(&router, &id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: expected HTTP 200 from GetCodegenJob, got {} with {:?}",
+            read.status, read.body
+        );
+
+        for (operation, body) in [
+            ("StartCodegenJob", started.body),
+            ("GetCodegenJob", read.body),
+        ] {
+            observed.push(("CodegenJob", format!("{operation}, {case}"), body));
+        }
+    }
+
+    let listed_jobs = list_codegen_jobs(&router).await;
+    for (position, entity) in entities(&listed_jobs, "ListCodegenJobs")
+        .into_iter()
+        .enumerate()
+    {
+        observed.push((
+            "CodegenJobSummary",
+            format!("ListCodegenJobs entity {position}"),
+            entity,
+        ));
+    }
+
+    // Every shape of the catalog was reached over the wire, so no row of the schema case
+    // below is schema-only by accident.
+    for shape in ["Component", "Theme", "CodegenJob", "CodegenJobSummary"] {
+        assert!(
+            observed.iter().any(|(reported, _, _)| *reported == shape),
+            "case {shape:?}: no operation reported this shape over HTTP, so its \
+             @timestampFormat members went unchecked on the wire"
+        );
+    }
+
+    for (shape, case, body) in &observed {
+        for member in ["createdAt", "modifiedAt"] {
+            let value = at(body, &format!("/{member}"));
+            let seconds = date_time_seconds(&value)
+                .unwrap_or_else(|reason| panic!("case {case:?}: {shape}${member}: {reason}"));
+            assert!(
+                seconds > 0.0,
+                "case {case:?}: {shape}${member} must name a real instant, got {value:?}"
+            );
+        }
+        let created_at = date_time_seconds(&at(body, "/createdAt"))
+            .unwrap_or_else(|reason| panic!("case {case:?}: {shape}$createdAt: {reason}"));
+        let modified_at = date_time_seconds(&at(body, "/modifiedAt"))
+            .unwrap_or_else(|reason| panic!("case {case:?}: {shape}$modifiedAt: {reason}"));
+        assert!(
+            modified_at >= created_at,
+            "case {case:?}: {shape} reports modifiedAt at or after createdAt, got \
+             {modified_at} against {created_at}"
+        );
+    }
+}
+
 /// The member schema the codec reads the wire form off: every member this service models
 /// `@timestampFormat("date-time")` reports that format, and a member the model leaves
 /// alone reports none.
 ///
-/// This is the only reach the shapes whose operations are still scaffolded 501s
-/// (`Theme`) have, and it is what would fail if the schemas went back to the vendored
+/// This is the same catalog the end-to-end case above drives over HTTP, read here off the
+/// schemas instead, and it is what would fail if the schemas went back to the vendored
 /// codegen's output.
 #[test]
 fn every_modelled_date_time_member_carries_the_date_time_format() {
