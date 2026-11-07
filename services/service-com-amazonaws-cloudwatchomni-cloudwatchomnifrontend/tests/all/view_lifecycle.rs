@@ -11,13 +11,20 @@
 //!
 //! * a view IS the SQL query it is defined by, so `CreateView` admits a `definition` a
 //!   SQL parser reads as ONE query — whatever form that query takes — and refuses one it
-//!   does not with `ValidationException` (400), persisting nothing for the refusal;
+//!   does not with `ValidationException` (400) carrying the parser's own diagnosis of the
+//!   submitted text, persisting nothing for the refusal (the diagnosis itself is
+//!   asserted row by row in `view_definition_diagnosis`);
 //! * a created view is persisted and `GetView` answers from that same store, reporting
 //!   the definition, the description, the `USER` type, the ARN and the timestamps the
 //!   create reported;
 //! * a view's name is its identity within the account and region, so a second view under
 //!   a live name is a `ConflictException` (409) and leaves the first one as it was;
 //! * an unknown name resolves to nothing: `ResourceNotFoundException` (404);
+//! * `ListViews` reports the views the store holds, in creation order, as summaries
+//!   without their definitions, restricted to the ownership category the request names
+//!   and paged at `maxResults` with a `nextToken` that resumes where the page stopped;
+//! * `DeleteView` releases the view its name identifies, so the name resolves to nothing
+//!   and is free again, and a name the store holds nothing under is a 404;
 //! * `@idempotencyToken` replays return the original view rather than minting a second.
 //!
 //! Each assertion names its case and the actual value, so a failure identifies the row
@@ -36,14 +43,16 @@ use smithy_server_runtime::{
 use service_com_amazonaws_cloudwatchomni_cloudwatchomnifrontend as omni;
 
 use omni::ops::create_view::{CreateView, CreateViewError};
+use omni::ops::delete_view::{DeleteView, DeleteViewError};
 use omni::ops::get_view::{GetView, GetViewError};
+use omni::ops::list_views::{ListViews, ListViewsError};
 use omni::ops::types::{
-    CreateViewInput, CreateViewOutput, GetViewInput, GetViewOutput, CREATE_VIEW_INPUT_SCHEMA,
-    GET_VIEW_INPUT_SCHEMA, VIEW_TYPE_VALUES,
+    CreateViewInput, CreateViewOutput, DeleteViewInput, DeleteViewOutput, GetViewInput,
+    GetViewOutput, ListViewsInput, ListViewsOutput, CREATE_VIEW_INPUT_SCHEMA,
+    GET_VIEW_INPUT_SCHEMA, LIST_VIEWS_INPUT_SCHEMA, VIEW_TYPE_VALUES,
 };
 use omni::state::{
-    view_definition_rejection, NOT_A_QUERY, NOT_A_QUERY_STATEMENT, VIEW_ARN_RESOURCE_TYPE,
-    VIEW_TYPE_USER,
+    view_definition_rejection, INVALID_VIEW_DEFINITION, VIEW_ARN_RESOURCE_TYPE, VIEW_TYPE_USER,
 };
 
 /// The region the suite signs for; the handlers record the signed region on each
@@ -74,7 +83,7 @@ fn signed_request_parts() -> http::request::Parts {
 
 /// One emulator: one shared engine, the service mounted on a router, and the request
 /// metadata a handler reads.
-struct Omni {
+pub(crate) struct Omni {
     engine: Arc<engine::InMemoryEngine>,
     service: omni::EmulatedService<engine::InMemoryEngine>,
     router: MultiServiceRouter,
@@ -82,7 +91,7 @@ struct Omni {
 }
 
 impl Omni {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -105,7 +114,7 @@ impl Omni {
         )
     }
 
-    async fn create_view(
+    pub(crate) async fn create_view(
         &self,
         input: &CreateViewInput,
     ) -> Result<CreateViewOutput, CreateViewError> {
@@ -114,7 +123,7 @@ impl Omni {
             .await
     }
 
-    async fn get_view(&self, name: &str) -> Result<GetViewOutput, GetViewError> {
+    pub(crate) async fn get_view(&self, name: &str) -> Result<GetViewOutput, GetViewError> {
         GetView::new(Arc::clone(&self.engine))
             .handle(
                 GetViewInput {
@@ -125,8 +134,31 @@ impl Omni {
             .await
     }
 
+    pub(crate) async fn list_views(
+        &self,
+        input: &ListViewsInput,
+    ) -> Result<ListViewsOutput, ListViewsError> {
+        ListViews::new(Arc::clone(&self.engine))
+            .handle(input.clone(), &self.ctx())
+            .await
+    }
+
+    pub(crate) async fn delete_view(
+        &self,
+        name: &str,
+    ) -> Result<DeleteViewOutput, DeleteViewError> {
+        DeleteView::new(Arc::clone(&self.engine))
+            .handle(
+                DeleteViewInput {
+                    name: name.to_string(),
+                },
+                &self.ctx(),
+            )
+            .await
+    }
+
     /// Dispatch one rpcv2Cbor request over HTTP and return the status and body.
-    async fn over_the_wire<I: SerializableStruct>(
+    pub(crate) async fn over_the_wire<I: SerializableStruct>(
         &self,
         operation: &str,
         input_schema: &Schema,
@@ -156,7 +188,7 @@ impl Omni {
 }
 
 /// Require a modelled failure with the status and error code the model declares for it.
-fn expect_modelled_error<O: std::fmt::Debug, E: OperationError + std::fmt::Debug>(
+pub(crate) fn expect_modelled_error<O: std::fmt::Debug, E: OperationError + std::fmt::Debug>(
     case: &str,
     result: Result<O, E>,
     expected_status: u16,
@@ -183,7 +215,7 @@ fn expect_modelled_error<O: std::fmt::Debug, E: OperationError + std::fmt::Debug
 }
 
 /// The smallest view request the model admits, for `name` and `definition`.
-fn create_input(name: &str, definition: &str) -> CreateViewInput {
+pub(crate) fn create_input(name: &str, definition: &str) -> CreateViewInput {
     CreateViewInput {
         name: name.to_string(),
         definition: definition.to_string(),
@@ -232,94 +264,30 @@ const ONE_QUERY: &[(&str, &str)] = &[
     ),
 ];
 
-/// Which of the three refusals a definition earns, so a row asserts the message its
-/// class carries rather than only the error code.
-enum Refusal {
-    /// Nothing a SQL parser reads as a query.
-    NotAQuery,
-    /// One statement, which is not a query.
-    NotAQueryStatement,
-    /// More than one statement, and how many.
-    Statements(usize),
-}
-
-impl Refusal {
-    /// The message this class of refusal carries.
-    fn message(&self) -> String {
-        match self {
-            Self::NotAQuery => NOT_A_QUERY.to_string(),
-            Self::NotAQueryStatement => NOT_A_QUERY_STATEMENT.to_string(),
-            Self::Statements(count) => format!(
-                "The view definition must be a single SQL query, not {count} statements."
-            ),
-        }
-    }
-}
-
 /// Definitions a SQL parser does NOT read as one query, so `CreateView` refuses them.
 ///
 /// The rows differ along WHY: the text is not SQL at all, it carries no statement, it is
 /// a statement that is not a query, or it is more than one statement.
-const NOT_ONE_QUERY: &[(&str, &str, Refusal)] = &[
-    ("prose", "the daily error count", Refusal::NotAQuery),
-    (
-        "a JSON document",
-        "{\"query\": \"SELECT 1\"}",
-        Refusal::NotAQuery,
-    ),
-    ("a truncated query", "SELECT * FROM", Refusal::NotAQuery),
-    (
-        "an unclosed string",
-        "SELECT * FROM logs WHERE level = 'ER",
-        Refusal::NotAQuery,
-    ),
-    (
-        "an unbalanced parenthesis",
-        "SELECT count(* FROM logs",
-        Refusal::NotAQuery,
-    ),
-    ("whitespace only", "   ", Refusal::NotAQuery),
-    (
-        "a comment only",
-        "-- nothing but a comment",
-        Refusal::NotAQuery,
-    ),
-    (
-        "a delete",
-        "DELETE FROM logs WHERE level = 'ERROR'",
-        Refusal::NotAQueryStatement,
-    ),
-    (
-        "an insert",
-        "INSERT INTO logs (id) VALUES (1)",
-        Refusal::NotAQueryStatement,
-    ),
-    (
-        "an update",
-        "UPDATE logs SET level = 'INFO'",
-        Refusal::NotAQueryStatement,
-    ),
-    (
-        "a DDL statement",
-        "CREATE TABLE logs (id INT)",
-        Refusal::NotAQueryStatement,
-    ),
-    ("two queries", "SELECT 1; SELECT 2", Refusal::Statements(2)),
-    (
-        "a query followed by a mutation",
-        "SELECT * FROM logs; DROP TABLE logs",
-        Refusal::Statements(2),
-    ),
-    (
-        "three statements",
-        "SELECT 1; SELECT 2; SELECT 3",
-        Refusal::Statements(3),
-    ),
+const NOT_ONE_QUERY: &[(&str, &str)] = &[
+    ("prose", "the daily error count"),
+    ("a JSON document", "{\"query\": \"SELECT 1\"}"),
+    ("a truncated query", "SELECT * FROM"),
+    ("an unclosed string", "SELECT * FROM logs WHERE level = 'ER"),
+    ("an unbalanced parenthesis", "SELECT count(* FROM logs"),
+    ("whitespace only", "   "),
+    ("a comment only", "-- nothing but a comment"),
+    ("a delete", "DELETE FROM logs WHERE level = 'ERROR'"),
+    ("an insert", "INSERT INTO logs (id) VALUES (1)"),
+    ("an update", "UPDATE logs SET level = 'INFO'"),
+    ("a DDL statement", "CREATE TABLE logs (id INT)"),
+    ("two queries", "SELECT 1; SELECT 2"),
+    ("a query followed by a mutation", "SELECT * FROM logs; DROP TABLE logs"),
+    ("three statements", "SELECT 1; SELECT 2; SELECT 3"),
 ];
 
 /// A view name satisfying `ViewName`'s `^view\.[a-z0-9][a-z0-9_-]{0,250}$` with its
 /// `@length(6..256)`, from `smithy_query(query="shape",shape="ViewName")`.
-fn view_name(suffix: &str) -> String {
+pub(crate) fn view_name(suffix: &str) -> String {
     format!("view.{suffix}")
 }
 
@@ -419,21 +387,26 @@ async fn a_definition_that_is_one_sql_query_is_persisted_and_read_back() {
 #[tokio::test]
 async fn a_definition_that_is_not_one_sql_query_is_refused_and_persists_nothing() {
     let omni = Omni::new();
-    for (index, (case, definition, refusal)) in NOT_ONE_QUERY.iter().enumerate() {
+    for (index, (case, definition)) in NOT_ONE_QUERY.iter().enumerate() {
         let name = view_name(&format!("refused-{index}"));
         let result = omni.create_view(&create_input(&name, definition)).await;
-        // The refusal says which of the three things is wrong, so a caller learns what
-        // to fix from the message alone.
+        // The refusal carries the parser's own reading of the submitted text under the
+        // fixed prefix, so a caller learns what is wrong with THIS definition from the
+        // message alone.
         let rendered = format!("{result:?}");
-        let expected = refusal.message();
+        let reason = view_definition_rejection(definition)
+            .unwrap_or_else(|| panic!("case {case:?}: the definition rule must refuse this text"));
         assert!(
-            rendered.contains(&expected),
-            "case {case:?}: expected the refusal to carry {expected:?}, got {rendered}"
+            reason.starts_with(INVALID_VIEW_DEFINITION),
+            "case {case:?}: expected the refusal to open with {INVALID_VIEW_DEFINITION:?}, got {reason:?}"
         );
-        assert_eq!(
-            view_definition_rejection(definition),
-            Some(expected.clone()),
-            "case {case:?}: expected the definition rule to answer {expected:?}"
+        assert!(
+            reason.len() > INVALID_VIEW_DEFINITION.len(),
+            "case {case:?}: expected the parser's diagnosis after the prefix, got {reason:?}"
+        );
+        assert!(
+            rendered.contains(&reason),
+            "case {case:?}: expected the refusal to carry {reason:?}, got {rendered}"
         );
         expect_modelled_error(case, result, 400, "ValidationException");
         // Nothing was persisted for the refused request, so the name resolves to
@@ -624,5 +597,316 @@ async fn the_view_lifecycle_over_the_rpcv2cbor_wire() {
     assert_eq!(
         status, 409,
         "a second view under a live name must be refused with 409"
+    );
+
+    // The listing travels over the same wire and reports the view the create persisted.
+    let (status, body) = omni
+        .over_the_wire(
+            "ListViews",
+            LIST_VIEWS_INPUT_SCHEMA,
+            &ListViewsInput::default(),
+        )
+        .await;
+    assert_eq!(status, 200, "ListViews over the wire: expected 200");
+    let mut deserializer = codec.create_deserializer(&body);
+    let listed = ListViewsOutput::deserialize(&mut deserializer)
+        .expect("the ListViews response deserializes");
+    assert!(
+        listed.items.iter().any(|item| item.name == name),
+        "ListViews over the wire must report the created view, got {listed:?}"
+    );
+}
+
+/// `ViewType`'s value that is not [`VIEW_TYPE_USER`], read off the modelled enum
+/// (`VIEW_TYPE_VALUES`, generated from `ViewType`) rather than written out here: AWS
+/// provisions views of that category, so this store holds none of them.
+fn the_other_view_type() -> &'static str {
+    VIEW_TYPE_VALUES
+        .iter()
+        .copied()
+        .find(|value| *value != VIEW_TYPE_USER)
+        .expect("ViewType declares a category other than USER")
+}
+
+#[tokio::test]
+async fn the_listing_reports_the_views_the_store_holds_in_creation_order() {
+    let omni = Omni::new();
+    // Created in a known order, with a description on some of them, so the listing's
+    // order and its member set are both observable.
+    let mut created: Vec<String> = Vec::new();
+    for (index, (case, definition)) in ONE_QUERY.iter().enumerate() {
+        let name = view_name(&format!("listed-{index}"));
+        omni.create_view(&CreateViewInput {
+            description: (index % 2 == 0).then(|| format!("the {case} view")),
+            ..create_input(&name, definition)
+        })
+        .await
+        .unwrap_or_else(|error| panic!("case {case:?}: CreateView failed: {error:?}"));
+        created.push(name);
+    }
+
+    let listed = omni
+        .list_views(&ListViewsInput::default())
+        .await
+        .expect("ListViews answers");
+    assert_eq!(
+        listed
+            .items
+            .iter()
+            .map(|item| item.name.clone())
+            .collect::<Vec<String>>(),
+        created,
+        "the listing must report every view in creation order, got {listed:?}"
+    );
+    assert_eq!(
+        listed.next_token, None,
+        "a listing that reported every view must carry no nextToken, got {:?}",
+        listed.next_token
+    );
+
+    // A summary is the view's member set WITHOUT the definition, read off the same
+    // record `GetView` answers from.
+    for item in &listed.items {
+        let read = omni
+            .get_view(&item.name)
+            .await
+            .unwrap_or_else(|error| panic!("case {:?}: GetView failed: {error:?}", item.name));
+        assert_eq!(
+            (
+                item.r#type.as_str(),
+                item.description.as_deref(),
+                item.created_at,
+                item.updated_at
+            ),
+            (
+                read.r#type.as_str(),
+                read.description.as_deref(),
+                read.created_at,
+                read.updated_at
+            ),
+            "case {:?}: the summary and the view must agree, got {item:?}",
+            item.name
+        );
+    }
+
+    // Listing is reporting: the second listing answers exactly what the first did.
+    let again = omni
+        .list_views(&ListViewsInput::default())
+        .await
+        .expect("the second ListViews answers");
+    assert_eq!(
+        again
+            .items
+            .iter()
+            .map(|item| (item.name.clone(), item.updated_at))
+            .collect::<Vec<_>>(),
+        listed
+            .items
+            .iter()
+            .map(|item| (item.name.clone(), item.updated_at))
+            .collect::<Vec<_>>(),
+        "listing views must not change them, got {again:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_listing_is_restricted_to_the_ownership_category_the_request_names() {
+    let omni = Omni::new();
+    let names = ["categorised-a", "categorised-b", "categorised-c"];
+    for name in names {
+        omni.create_view(&create_input(&view_name(name), "SELECT 1"))
+            .await
+            .unwrap_or_else(|error| panic!("case {name:?}: CreateView failed: {error:?}"));
+    }
+
+    for (case, requested, expected) in [
+        ("no filter", None, names.len()),
+        ("the created category", Some(VIEW_TYPE_USER), names.len()),
+        ("the other category", Some(the_other_view_type()), 0),
+    ] {
+        let listed = omni
+            .list_views(&ListViewsInput {
+                r#type: requested.map(str::to_string),
+                ..ListViewsInput::default()
+            })
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: ListViews failed: {error:?}"));
+        assert_eq!(
+            listed.items.len(),
+            expected,
+            "case {case:?}: expected {expected} views for type {requested:?}, got {listed:?}"
+        );
+        for item in &listed.items {
+            assert!(
+                requested.is_none_or(|category| item.r#type == category),
+                "case {case:?}: a filtered listing must report only {requested:?}, got {item:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_listing_pages_at_max_results_and_resumes_where_the_page_stopped() {
+    let omni = Omni::new();
+    let total = 7;
+    let mut created: Vec<String> = Vec::new();
+    for index in 0..total {
+        let name = view_name(&format!("paged-{index}"));
+        omni.create_view(&create_input(&name, "SELECT 1"))
+            .await
+            .unwrap_or_else(|error| panic!("case {name:?}: CreateView failed: {error:?}"));
+        created.push(name);
+    }
+
+    // The rows span the page sizes around the collection: smaller than it, a divisor of
+    // it, one short of it, exactly it, larger than it, and the modelled maximum.
+    for page_size in [1, 2, 3, total - 1, total, total + 1, 100] {
+        let case = format!("maxResults {page_size}");
+        let mut seen: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = omni
+                .list_views(&ListViewsInput {
+                    max_results: Some(page_size as i32),
+                    next_token: token.clone(),
+                    ..ListViewsInput::default()
+                })
+                .await
+                .unwrap_or_else(|error| panic!("case {case:?}: ListViews failed: {error:?}"));
+            pages += 1;
+            assert!(
+                page.items.len() <= page_size,
+                "case {case:?}: a page must hold at most {page_size} views, got {page:?}"
+            );
+            assert!(
+                pages <= total + 1,
+                "case {case:?}: paging must terminate, got {pages} pages"
+            );
+            seen.extend(page.items.iter().map(|item| item.name.clone()));
+            match page.next_token {
+                None => break,
+                Some(next) => token = Some(next),
+            }
+        }
+        assert_eq!(
+            seen, created,
+            "case {case:?}: the pages together must be every view in creation order"
+        );
+        assert_eq!(
+            pages,
+            total.div_ceil(page_size),
+            "case {case:?}: expected {} pages for {total} views, got {pages}",
+            total.div_ceil(page_size)
+        );
+    }
+
+    // A token this service did not mint names no resume point, so it is a bad request
+    // rather than an empty page.
+    for (case, token) in [
+        ("not hex", "not-a-token"),
+        ("hex that decodes to other text", "6e6f70652d31"),
+    ] {
+        expect_modelled_error(
+            case,
+            omni.list_views(&ListViewsInput {
+                next_token: Some(token.to_string()),
+                ..ListViewsInput::default()
+            })
+            .await,
+            400,
+            "ValidationException",
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_deleted_view_resolves_to_nothing_and_frees_its_name() {
+    let omni = Omni::new();
+    // The rows differ along what else the view carries, because what a delete releases
+    // is the view its NAME identifies: a bare view, one with a description, and one a
+    // client token minted.
+    let cases: Vec<(&str, CreateViewInput)> = vec![
+        (
+            "a bare view",
+            create_input(&view_name("deleted-bare"), "SELECT 1"),
+        ),
+        (
+            "a described view",
+            CreateViewInput {
+                description: Some("the described view".to_string()),
+                ..create_input(&view_name("deleted-described"), "SELECT 2")
+            },
+        ),
+        (
+            "a view a token minted",
+            CreateViewInput {
+                client_token: Some("deleted-token".to_string()),
+                ..create_input(&view_name("deleted-tokened"), "SELECT 3")
+            },
+        ),
+    ];
+
+    for (case, request) in &cases {
+        let created = omni
+            .create_view(request)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: CreateView failed: {error:?}"));
+        omni.delete_view(&created.name)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: DeleteView failed: {error:?}"));
+
+        // The view is gone from both readers: the one that resolves a name and the one
+        // that enumerates the store.
+        expect_modelled_error(
+            case,
+            omni.get_view(&created.name).await,
+            404,
+            "ResourceNotFoundException",
+        );
+        let listed = omni
+            .list_views(&ListViewsInput::default())
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: ListViews failed: {error:?}"));
+        assert!(
+            !listed.items.iter().any(|item| item.name == created.name),
+            "case {case:?}: a deleted view must not be listed, got {listed:?}"
+        );
+
+        // Deleting it again is a miss: the name holds no view now.
+        expect_modelled_error(
+            case,
+            omni.delete_view(&created.name).await,
+            404,
+            "ResourceNotFoundException",
+        );
+
+        // The name is free again, token and all: the same request creates a new view
+        // rather than resurrecting the deleted one.
+        let recreated = omni
+            .create_view(request)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: the recreate failed: {error:?}"));
+        assert_eq!(
+            recreated.name, created.name,
+            "case {case:?}: the freed name must be usable again, got {:?}",
+            recreated.name
+        );
+        assert_eq!(
+            omni.get_view(&created.name)
+                .await
+                .unwrap_or_else(|error| panic!("case {case:?}: GetView failed: {error:?}"))
+                .definition,
+            recreated.definition,
+            "case {case:?}: the recreated view must be the one the store now holds"
+        );
+    }
+
+    // A name no view was ever created under is a miss too.
+    expect_modelled_error(
+        "never created",
+        omni.delete_view(&view_name("never-created")).await,
+        404,
+        "ResourceNotFoundException",
     );
 }

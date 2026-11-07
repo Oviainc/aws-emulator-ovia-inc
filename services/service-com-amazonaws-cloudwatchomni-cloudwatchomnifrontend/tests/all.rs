@@ -27,5 +27,7 @@ mod omni_dashboard_lifecycle;
 mod probe;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/view_definition_diagnosis.rs"]
+mod view_definition_diagnosis;
 #[path = "all/view_lifecycle.rs"]
 mod view_lifecycle;

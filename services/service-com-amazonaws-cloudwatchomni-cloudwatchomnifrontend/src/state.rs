@@ -443,6 +443,21 @@ impl ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
         selected
     }
 
+    /// Every stored view in creation order, restricted to one ownership category when
+    /// the request names a `type`, and skipping everything at or before `after_seq`.
+    ///
+    /// Linear in the number of stored views, which [`VIEW_QUOTA`] bounds.
+    pub fn views_after(&self, r#type: Option<&str>, after_seq: u64) -> Vec<&StoredView> {
+        let mut selected: Vec<&StoredView> = self
+            .views
+            .values()
+            .filter(|stored| stored.seq > after_seq)
+            .filter(|stored| r#type.is_none_or(|category| stored.r#type == category))
+            .collect();
+        selected.sort_by_key(|stored| stored.seq);
+        selected
+    }
+
     /// The access profile `space_id` holds under `name`, if the store holds one.
     ///
     /// Linear in the number of stored profiles, which [`ACCESS_PROFILE_QUOTA`] bounds.
@@ -1162,7 +1177,7 @@ mod dashboard_body;
 /// definition applies the same rule to it.
 mod view_definition;
 
-pub use view_definition::{view_definition_rejection, NOT_A_QUERY, NOT_A_QUERY_STATEMENT};
+pub use view_definition::{view_definition_rejection, INVALID_VIEW_DEFINITION};
 
 pub use dashboard_body::{
     dashboard_body_rejection, dashboard_body_violations, DashboardBodyViolation,
@@ -1229,6 +1244,20 @@ pub fn encode_omni_dashboard_page_token(seq: u64) -> String {
 /// minted for a dashboard listing.
 pub fn decode_omni_dashboard_page_token(token: &str) -> Option<u64> {
     decode_page_token(OMNI_DASHBOARD_PAGE_TOKEN_PREFIX, token)
+}
+
+/// The prefix a view-list page token carries, for the same reason.
+const VIEW_PAGE_TOKEN_PREFIX: &str = "views:";
+
+/// Mint the opaque `nextToken` that resumes a view listing after `seq`.
+pub fn encode_view_page_token(seq: u64) -> String {
+    encode_page_token(VIEW_PAGE_TOKEN_PREFIX, seq)
+}
+
+/// Read a view-list `nextToken` back, or `None` when it is not one this service minted
+/// for a view listing.
+pub fn decode_view_page_token(token: &str) -> Option<u64> {
+    decode_page_token(VIEW_PAGE_TOKEN_PREFIX, token)
 }
 
 #[cfg(test)]
