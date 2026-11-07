@@ -270,9 +270,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `SchemaVersionErrors` reports "the error details for an operation on a schema
         // version". Every version the span named was either deleted or was already absent,
         // and an absent version is nothing to report an error about, so this answer carries
-        // no per-version failure.
+        // no per-version failure — an EMPTY list of them rather than none at all, so a
+        // client that inspects per-version errors reads zero errors instead of having to
+        // tell an absent member from an unparsed response.
         Ok(DeleteSchemaVersionsOutput {
-            schema_version_errors: None,
+            schema_version_errors: Some(Vec::new()),
         })
     }
 }

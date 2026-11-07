@@ -40,12 +40,24 @@ const KEY_ARN: &str = "arn:aws:kms:us-east-1:000000000000:key/1234abcd-12ab-34cd
 const SERVICE_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/GlueCatalogEncryption";
 
 /// The settings a catalog nothing has configured reports: both of them, each at its own
-/// default.
+/// default, beside the catalog-search encryption state every read carries.
 fn default_settings() -> Value {
-    json!({
+    as_reported(json!({
         "EncryptionAtRest": { "CatalogEncryptionMode": "DISABLED" },
         "ConnectionPasswordEncryption": { "ReturnConnectionPasswordEncrypted": false }
-    })
+    }))
+}
+
+/// The published settings `configured` as a READ reports them: with
+/// `EncryptedCatalogSearchStatus` beside them.
+///
+/// The Data Catalog reports the state of encrypted catalog search with its encryption
+/// settings, and no operation of this service turns that on — the published
+/// `DataCatalogEncryptionSettings` carries no member for it — so every catalog reports it
+/// `NOT_ENABLED`, as a value rather than as an absence.
+fn as_reported(mut configured: Value) -> Value {
+    configured["EncryptedCatalogSearchStatus"] = json!("NOT_ENABLED");
+    configured
 }
 
 /// The `DataCatalogEncryptionSettings` body a read reports, for the catalog `request`
@@ -92,10 +104,10 @@ fn round_trip_rows() -> Vec<SettingsRow> {
         (
             "encryption at rest turned off explicitly",
             json!({ "EncryptionAtRest": { "CatalogEncryptionMode": "DISABLED" } }),
-            json!({
+            as_reported(json!({
                 "EncryptionAtRest": { "CatalogEncryptionMode": "DISABLED" },
                 "ConnectionPasswordEncryption": { "ReturnConnectionPasswordEncrypted": false }
-            }),
+            })),
         ),
         (
             // The recorded case: catalog encryption enforced under a customer key
@@ -107,13 +119,13 @@ fn round_trip_rows() -> Vec<SettingsRow> {
                     "SseAwsKmsKeyId": "alias/aws/glue"
                 }
             }),
-            json!({
+            as_reported(json!({
                 "EncryptionAtRest": {
                     "CatalogEncryptionMode": "SSE-KMS",
                     "SseAwsKmsKeyId": "alias/aws/glue"
                 },
                 "ConnectionPasswordEncryption": { "ReturnConnectionPasswordEncrypted": false }
-            }),
+            })),
         ),
         (
             "encryption at rest under a key ARN and a service role",
@@ -124,14 +136,14 @@ fn round_trip_rows() -> Vec<SettingsRow> {
                     "CatalogEncryptionServiceRole": SERVICE_ROLE_ARN
                 }
             }),
-            json!({
+            as_reported(json!({
                 "EncryptionAtRest": {
                     "CatalogEncryptionMode": "SSE-KMS-WITH-SERVICE-ROLE",
                     "SseAwsKmsKeyId": KEY_ARN,
                     "CatalogEncryptionServiceRole": SERVICE_ROLE_ARN
                 },
                 "ConnectionPasswordEncryption": { "ReturnConnectionPasswordEncrypted": false }
-            }),
+            })),
         ),
         (
             "connection password encryption alone, enabled under a key",
@@ -141,13 +153,13 @@ fn round_trip_rows() -> Vec<SettingsRow> {
                     "AwsKmsKeyId": "alias/glue-connections"
                 }
             }),
-            json!({
+            as_reported(json!({
                 "EncryptionAtRest": { "CatalogEncryptionMode": "DISABLED" },
                 "ConnectionPasswordEncryption": {
                     "ReturnConnectionPasswordEncrypted": true,
                     "AwsKmsKeyId": "alias/glue-connections"
                 }
-            }),
+            })),
         ),
         (
             "connection password encryption alone, disabled but keyed",
@@ -157,13 +169,13 @@ fn round_trip_rows() -> Vec<SettingsRow> {
                     "AwsKmsKeyId": KEY_ARN
                 }
             }),
-            json!({
+            as_reported(json!({
                 "EncryptionAtRest": { "CatalogEncryptionMode": "DISABLED" },
                 "ConnectionPasswordEncryption": {
                     "ReturnConnectionPasswordEncrypted": false,
                     "AwsKmsKeyId": KEY_ARN
                 }
-            }),
+            })),
         ),
         (
             "both settings at once",
@@ -177,7 +189,7 @@ fn round_trip_rows() -> Vec<SettingsRow> {
                     "AwsKmsKeyId": KEY_ARN
                 }
             }),
-            json!({
+            as_reported(json!({
                 "EncryptionAtRest": {
                     "CatalogEncryptionMode": "SSE-KMS",
                     "SseAwsKmsKeyId": KEY_ARN
@@ -186,7 +198,7 @@ fn round_trip_rows() -> Vec<SettingsRow> {
                     "ReturnConnectionPasswordEncrypted": true,
                     "AwsKmsKeyId": KEY_ARN
                 }
-            }),
+            })),
         ),
     ]
 }
@@ -336,10 +348,10 @@ async fn a_second_write_replaces_the_record_rather_than_merging_into_it() {
                 }
             }),
             json!({ "EncryptionAtRest": { "CatalogEncryptionMode": "DISABLED" } }),
-            json!({
+            as_reported(json!({
                 "EncryptionAtRest": { "CatalogEncryptionMode": "DISABLED" },
                 "ConnectionPasswordEncryption": { "ReturnConnectionPasswordEncrypted": false }
-            }),
+            })),
         ),
         (
             "encryption at rest, then password encryption alone",
@@ -351,10 +363,10 @@ async fn a_second_write_replaces_the_record_rather_than_merging_into_it() {
                 }
             }),
             json!({ "ConnectionPasswordEncryption": { "ReturnConnectionPasswordEncrypted": true } }),
-            json!({
+            as_reported(json!({
                 "EncryptionAtRest": { "CatalogEncryptionMode": "DISABLED" },
                 "ConnectionPasswordEncryption": { "ReturnConnectionPasswordEncrypted": true }
-            }),
+            })),
         ),
         (
             "a configured catalog, then an empty structure",
@@ -373,10 +385,10 @@ async fn a_second_write_replaces_the_record_rather_than_merging_into_it() {
             json!({
                 "EncryptionAtRest": { "CatalogEncryptionMode": "SSE-KMS", "SseAwsKmsKeyId": "alias/second" }
             }),
-            json!({
+            as_reported(json!({
                 "EncryptionAtRest": { "CatalogEncryptionMode": "SSE-KMS", "SseAwsKmsKeyId": "alias/second" },
                 "ConnectionPasswordEncryption": { "ReturnConnectionPasswordEncrypted": false }
-            }),
+            })),
         ),
     ];
 
@@ -541,9 +553,10 @@ async fn the_settings_record_lives_beside_the_catalog_resources() {
     );
 
     let reported = get_settings(&router, &json!({})).await;
+    let expected = as_reported(settings);
     assert_eq!(
-        reported, settings,
+        reported, expected,
         "creating catalog resources must not change the settings record; expected \
-         {settings}, got {reported}"
+         {expected}, got {reported}"
     );
 }

@@ -155,9 +155,9 @@ async fn a_version_span_deletes_exactly_the_versions_it_names() {
         let answered = ok(&router, "DeleteSchemaVersions", &delete_body(versions)).await;
         assert_eq!(
             answered.get("SchemaVersionErrors"),
-            None,
+            Some(&json!([])),
             "case {case:?}: every named version was deleted or already absent, so the \
-             answer must carry no per-version error, got {answered}"
+             answer must carry an empty list of per-version errors, got {answered}"
         );
 
         let held = held_versions(&engine);

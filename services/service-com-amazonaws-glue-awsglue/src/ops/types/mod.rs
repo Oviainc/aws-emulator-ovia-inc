@@ -322,8 +322,16 @@ pub mod update_usage_profile_types;
 pub mod update_user_defined_function_types;
 pub mod update_workflow_types;
 
+/// Hand-written, output-only projections for the responses that carry a member the
+/// published shape does not bind. Declared here beside the generated modules; the glob
+/// re-export below is what makes them resolve through `use super::types::*` like any other
+/// shape.
+pub mod reported_types;
+
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use associate_glossary_terms_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use reported_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use batch_create_partition_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

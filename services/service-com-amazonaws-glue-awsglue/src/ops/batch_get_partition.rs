@@ -297,8 +297,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // No key went unanswered: the whole batch is read under one lock, with no
             // response-size truncation and no per-request work budget to run out of. A key
             // whose partition does not exist is not an unprocessed key — see the module
-            // docs for why reporting it here would say something this read did not do.
-            unprocessed_keys: None,
+            // docs for why reporting it here would say something this read did not do. So
+            // the list of unprocessed keys is EMPTY rather than absent: the batch caller's
+            // retry loop reads it to decide whether to re-request, and reads zero keys.
+            unprocessed_keys: Some(Vec::new()),
         })
     }
 }

@@ -255,13 +255,28 @@ async fn created_security_configurations_are_read_back_from_the_store() {
     // never overwrote another.
     for (case, request) in &cases {
         let read = get(&router, case_name(request)).await;
+        let expected = as_reported(&request["EncryptionConfiguration"]);
         assert_eq!(
             read.get("EncryptionConfiguration"),
-            request.get("EncryptionConfiguration"),
+            Some(&expected),
             "case {case}: each configuration keeps its own EncryptionConfiguration, got \
              {read}"
         );
     }
+}
+
+/// The `EncryptionConfiguration` `configured` states, as a READ reports it: with
+/// `EnforceJdbcSsl` beside the members the request carried.
+///
+/// The service reports whether a configuration enforces SSL on the JDBC connections made
+/// under it inside every encryption configuration it answers with. The published
+/// `EncryptionConfiguration` carries no member a create could state it from, so every
+/// stored configuration reports it `false` — a value rather than an absence, so a client
+/// auditing JDBC SSL enforcement has something to read.
+fn as_reported(configured: &Value) -> Value {
+    let mut reported = configured.clone();
+    reported["EnforceJdbcSsl"] = json!(false);
+    reported
 }
 
 /// Two reads of one configuration agree, and a read is not a write: the creation instant

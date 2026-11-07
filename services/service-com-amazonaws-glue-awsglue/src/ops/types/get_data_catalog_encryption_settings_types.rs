@@ -17,9 +17,63 @@ pub struct GetDataCatalogEncryptionSettingsInput {
     pub catalog_id: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#GetDataCatalogEncryptionSettingsResponse")]
+/// `GetDataCatalogEncryptionSettingsResponse`: the catalog's encryption settings as the last
+/// write left them.
+///
+/// Hand-declared rather than generated from the shape by
+/// `#[smithy_macros::smithy(shape = ...)]`, because the settings are reported through
+/// [`ReportedDataCatalogEncryptionSettings`], which carries one member more than the
+/// published `DataCatalogEncryptionSettings` binds. The shape id, the member name and the
+/// member type below are the wire ones, and the member keeps the target the model gives it
+/// (`DataCatalogEncryptionSettings`).
+///
+/// Only the SERIALIZE direction is implemented: an operation's output shape is written by
+/// this server and never read back by it, so there is no `DeserializableStruct` here.
 #[derive(Debug, Clone, Default)]
 pub struct GetDataCatalogEncryptionSettingsOutput {
     pub data_catalog_encryption_settings: Option<DataCatalogEncryptionSettings>,
+}
+
+#[allow(non_upper_case_globals)]
+impl GetDataCatalogEncryptionSettingsOutput {
+    const M_DATA_CATALOG_ENCRYPTION_SETTINGS: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.glue#GetDataCatalogEncryptionSettingsResponse$DataCatalogEncryptionSettings",
+                "com.amazonaws.glue",
+                "DataCatalogEncryptionSettings",
+            ),
+            ::aws_smithy_schema::ShapeType::Structure,
+            "DataCatalogEncryptionSettings",
+            0,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.glue#GetDataCatalogEncryptionSettingsResponse",
+            "com.amazonaws.glue",
+            "GetDataCatalogEncryptionSettingsResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_DATA_CATALOG_ENCRYPTION_SETTINGS],
+    );
+}
+
+pub static GET_DATA_CATALOG_ENCRYPTION_SETTINGS_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetDataCatalogEncryptionSettingsOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetDataCatalogEncryptionSettingsOutput {
+    fn serialize_members(
+        &self,
+        __s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(__v) = self.data_catalog_encryption_settings.as_ref() {
+            __s.write_struct(
+                &Self::M_DATA_CATALOG_ENCRYPTION_SETTINGS,
+                &ReportedDataCatalogEncryptionSettings(__v),
+            )?;
+        }
+        Ok(())
+    }
 }
 

@@ -444,8 +444,10 @@ async fn the_workflow_graph_is_built_from_the_triggers_bound_to_it() {
         );
 
         // A `TRIGGER` node carries the trigger it stands for ("details of the Trigger when
-        // the node represents a Trigger"), and the components it works with carry no
-        // trigger — and no run or crawl, because nothing in this workflow has run them.
+        // the node represents a Trigger"), and the components it works with carry the
+        // details structure of their OWN kind — a job node its `JobDetails`, a crawl node
+        // its `CrawlerDetails` — with no run or crawl inside it, because nothing in this
+        // workflow has run them.
         for ((node_type, name), node) in &reported {
             if node_type == NODE_TYPE_TRIGGER {
                 let trigger = node
@@ -464,11 +466,31 @@ async fn the_workflow_graph_is_built_from_the_triggers_bound_to_it() {
                     Some(workflow.as_str()),
                     "case {case}: the node's trigger is bound to this workflow, got {trigger}"
                 );
-            } else {
-                for absent in ["TriggerDetails", "JobDetails", "CrawlerDetails"] {
+            }
+            // (the node kind, the details member that kind carries)
+            let own_details = [
+                (NODE_TYPE_TRIGGER, "TriggerDetails"),
+                (NODE_TYPE_JOB, "JobDetails"),
+                (NODE_TYPE_CRAWLER, "CrawlerDetails"),
+            ];
+            for (kind, details) in own_details {
+                let reported_details = node.get(details).filter(|value| !value.is_null());
+                if kind == node_type {
+                    let reported_details = reported_details.unwrap_or_else(|| {
+                        panic!("case {case}: a {node_type} node reports its {details}, got {node}")
+                    });
+                    if kind != NODE_TYPE_TRIGGER {
+                        assert_eq!(
+                            reported_details,
+                            &json!({}),
+                            "case {case}: nothing has run in this workflow, so a {node_type} \
+                             node's {details} carries no run, got {node}"
+                        );
+                    }
+                } else {
                     assert!(
-                        node.get(absent).is_none_or(Value::is_null),
-                        "case {case}: a {node_type} node reports no {absent}, got {node}"
+                        reported_details.is_none(),
+                        "case {case}: a {node_type} node reports no {details}, got {node}"
                     );
                 }
             }

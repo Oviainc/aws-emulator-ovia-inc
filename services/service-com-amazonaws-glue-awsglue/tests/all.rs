@@ -237,6 +237,8 @@ mod partitions;
 mod registries;
 #[path = "all/registry_listing.rs"]
 mod registry_listing;
+#[path = "all/reported_members.rs"]
+mod reported_members;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
 #[path = "all/resource_tagging.rs"]

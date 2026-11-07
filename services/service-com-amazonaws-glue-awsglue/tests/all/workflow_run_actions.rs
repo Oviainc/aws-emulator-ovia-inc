@@ -179,19 +179,22 @@ fn node_of(case: &str, graph: &Value, node_type: &str, name: &str) -> Option<Val
 }
 
 /// The `Id` of every run the `JOB` node for `job` reports under `JobDetails.JobRuns`, and
-/// an empty set when the node reports no `JobDetails` — which is what a node with no run of
-/// this workflow run has to report.
+/// an empty set when that node's `JobDetails` carries no `JobRuns` — which is what a node
+/// with no run of this workflow run has to report.
 fn job_node_run_ids(case: &str, graph: &Value, job: &str) -> BTreeSet<String> {
     let Some(node) = node_of(case, graph, NODE_TYPE_JOB, job) else {
         return BTreeSet::new();
     };
-    let Some(details) = node.get("JobDetails") else {
+    let details = node
+        .get("JobDetails")
+        .filter(|details| !details.is_null())
+        .unwrap_or_else(|| panic!("case {case:?}: a JOB node must carry JobDetails, got {node}"));
+    let Some(runs) = details.get("JobRuns") else {
         return BTreeSet::new();
     };
-    let runs = details
-        .get("JobRuns")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("case {case:?}: JobDetails must carry JobRuns, got {node}"));
+    let runs = runs
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: JobRuns must be a list, got {node}"));
     runs.iter()
         .map(|run| {
             assert_eq!(

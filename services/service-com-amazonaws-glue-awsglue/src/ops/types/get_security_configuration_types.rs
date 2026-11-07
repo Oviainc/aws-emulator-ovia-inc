@@ -17,9 +17,62 @@ pub struct GetSecurityConfigurationInput {
     pub name: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#GetSecurityConfigurationResponse")]
+/// `GetSecurityConfigurationResponse`: the stored security configuration as the create left
+/// it.
+///
+/// Hand-declared rather than generated from the shape by
+/// `#[smithy_macros::smithy(shape = ...)]`, because the configuration is reported through
+/// [`ReportedSecurityConfiguration`], which carries one member more than the published
+/// `EncryptionConfiguration` binds. The shape id, the member name and the member type below
+/// are the wire ones, and the member keeps the target the model gives it
+/// (`SecurityConfiguration`).
+///
+/// Only the SERIALIZE direction is implemented: an operation's output shape is written by
+/// this server and never read back by it, so there is no `DeserializableStruct` here.
 #[derive(Debug, Clone, Default)]
 pub struct GetSecurityConfigurationOutput {
     pub security_configuration: Option<SecurityConfiguration>,
 }
 
+#[allow(non_upper_case_globals)]
+impl GetSecurityConfigurationOutput {
+    const M_SECURITY_CONFIGURATION: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.glue#GetSecurityConfigurationResponse$SecurityConfiguration",
+                "com.amazonaws.glue",
+                "SecurityConfiguration",
+            ),
+            ::aws_smithy_schema::ShapeType::Structure,
+            "SecurityConfiguration",
+            0,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.glue#GetSecurityConfigurationResponse",
+            "com.amazonaws.glue",
+            "GetSecurityConfigurationResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_SECURITY_CONFIGURATION],
+    );
+}
+
+pub static GET_SECURITY_CONFIGURATION_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetSecurityConfigurationOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetSecurityConfigurationOutput {
+    fn serialize_members(
+        &self,
+        __s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(__v) = self.security_configuration.as_ref() {
+            __s.write_struct(
+                &Self::M_SECURITY_CONFIGURATION,
+                &ReportedSecurityConfiguration(__v),
+            )?;
+        }
+        Ok(())
+    }
+}

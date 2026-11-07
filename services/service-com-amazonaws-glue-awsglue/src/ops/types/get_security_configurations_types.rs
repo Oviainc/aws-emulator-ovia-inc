@@ -18,10 +18,84 @@ pub struct GetSecurityConfigurationsInput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#GetSecurityConfigurationsResponse")]
+/// `GetSecurityConfigurationsResponse`: one page of the stored security configurations.
+///
+/// Hand-declared rather than generated from the shape by
+/// `#[smithy_macros::smithy(shape = ...)]` for the reason
+/// [`GetSecurityConfigurationOutput`] gives: every listed configuration is reported through
+/// [`ReportedSecurityConfiguration`], so a listing reports each configuration exactly as the
+/// single read reports it. The shape id, the member names and the member types below are the
+/// wire ones, and both members keep the targets the model gives them
+/// (`SecurityConfigurationList`, `GenericString`).
+///
+/// Only the SERIALIZE direction is implemented: an operation's output shape is written by
+/// this server and never read back by it, so there is no `DeserializableStruct` here.
 #[derive(Debug, Clone, Default)]
 pub struct GetSecurityConfigurationsOutput {
     pub security_configurations: Option<Vec<SecurityConfiguration>>,
     pub next_token: Option<String>,
 }
 
+#[allow(non_upper_case_globals)]
+impl GetSecurityConfigurationsOutput {
+    const M_SECURITY_CONFIGURATIONS: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.glue#GetSecurityConfigurationsResponse$SecurityConfigurations",
+                "com.amazonaws.glue",
+                "SecurityConfigurations",
+            ),
+            ::aws_smithy_schema::ShapeType::List,
+            "SecurityConfigurations",
+            0,
+        );
+
+    const M_NEXT_TOKEN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.glue#GetSecurityConfigurationsResponse$NextToken",
+            "com.amazonaws.glue",
+            "NextToken",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "NextToken",
+        1,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.glue#GetSecurityConfigurationsResponse",
+            "com.amazonaws.glue",
+            "GetSecurityConfigurationsResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_SECURITY_CONFIGURATIONS, &Self::M_NEXT_TOKEN],
+    );
+}
+
+pub static GET_SECURITY_CONFIGURATIONS_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetSecurityConfigurationsOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetSecurityConfigurationsOutput {
+    fn serialize_members(
+        &self,
+        __s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(__v) = self.security_configurations.as_ref() {
+            __s.write_list(&Self::M_SECURITY_CONFIGURATIONS, &|__sl| {
+                for __it in __v.iter() {
+                    // A struct element names its own shape's schema, as the generated
+                    // list serializers do.
+                    __sl.write_struct(
+                        &ReportedSecurityConfiguration::SCHEMA,
+                        &ReportedSecurityConfiguration(__it),
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(__v) = self.next_token.as_ref() {
+            __s.write_string(&Self::M_NEXT_TOKEN, __v.as_str())?;
+        }
+        Ok(())
+    }
+}
