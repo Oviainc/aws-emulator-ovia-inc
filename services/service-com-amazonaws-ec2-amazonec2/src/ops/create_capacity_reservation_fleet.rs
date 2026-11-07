@@ -525,18 +525,34 @@ fn catalog_word<E>(
 /// `FleetCapacityReservations` rather than `InstanceTypeSpecifications` — so this is a
 /// PROJECTION of the one stored view, never a second copy of it: the create and the describe
 /// cannot report one Fleet differently.
+///
+/// The projection is the Fleet as the SUBMIT answers it. A create answers a Fleet in
+/// `submitted`, where "Amazon Elastic Compute Cloud is preparing to create the Capacity
+/// Reservations" (`CapacityReservationFleet$State`) — so at the instant this result is
+/// written the Fleet holds no Capacity Reservation a caller can be told about and nothing of
+/// its target capacity is fulfilled yet: `FleetCapacityReservations` is empty and
+/// "The capacity units that have been fulfilled" (`$TotalFulfilledCapacity`) is zero. What
+/// the Fleet went on to reserve is what `DescribeCapacityReservationFleets` reports, off
+/// this same record.
 fn fleet_created(view: &CapacityReservationFleet) -> CreateCapacityReservationFleetOutput {
     CreateCapacityReservationFleetOutput {
         capacity_reservation_fleet_id: view.capacity_reservation_fleet_id.clone(),
         state: view.state.clone(),
         total_target_capacity: view.total_target_capacity,
-        total_fulfilled_capacity: view.total_fulfilled_capacity,
+        total_fulfilled_capacity: Some(SUBMITTED_FULFILLED_CAPACITY),
         instance_match_criteria: view.instance_match_criteria.clone(),
         allocation_strategy: view.allocation_strategy.clone(),
         create_time: view.create_time,
         end_date: view.end_date,
         tenancy: view.tenancy.clone(),
-        fleet_capacity_reservations: view.instance_type_specifications.clone(),
+        // Reported as an EMPTY set rather than left out: EC2's ec2Query XML carries the set
+        // element for an empty list, so a client reading it finds it where it expects it.
+        fleet_capacity_reservations: Some(Vec::new()),
         tags: view.tags.clone(),
     }
 }
+
+/// The capacity a Fleet has fulfilled at the instant it is submitted: none of it — EC2 is
+/// still "preparing to create the Capacity Reservations" that fulfil it
+/// (`CapacityReservationFleet$State`).
+const SUBMITTED_FULFILLED_CAPACITY: f64 = 0.0;

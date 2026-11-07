@@ -18,10 +18,11 @@
 //!
 //! - `override_protocol` — the wire protocol the dispatch sequence runs. This
 //!   service overrides it with [`Ec2QueryEnvelope`], which is the framework's
-//!   ec2Query protocol plus the three parts of EC2's response envelope the Smithy
+//!   ec2Query protocol plus the parts of EC2's response envelope the Smithy
 //!   protocol definition does not describe: the `<return>` success flag, the
-//!   `<RequestID>` element of a refusal, and the media type's `charset`
-//!   parameter. It reaches every response this service renders and none of the
+//!   `<RequestID>` element of a refusal, the media type's `charset`
+//!   parameter, and the decimal form every floating-point member is written in.
+//!   It reaches every response this service renders and none of the
 //!   ones the framework renders in front of it; see `RESPONSE_CONTENT_TYPE` for
 //!   exactly where the line falls.
 //!
@@ -63,6 +64,7 @@ use aws_smithy_schema_server::{
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
+use service_common::query_decimal_floats::DecimalFloatsRef;
 use std::sync::Arc;
 
 /// The `com-amazonaws-ec2-amazonec2` emulated service: the generated [`ServiceDefinition`] plus
@@ -437,7 +439,7 @@ impl SerializableStruct for WithReturnFlag<'_> {
 }
 
 /// EC2's ec2Query protocol: the framework's [`QueryServerProtocol`] plus the
-/// three parts of EC2's envelope the Smithy protocol definition does not
+/// parts of EC2's envelope the Smithy protocol definition does not
 /// describe.
 ///
 /// Request reading and routing are the framework's unchanged, and so is the shape of
@@ -520,17 +522,25 @@ impl ServerProtocol for Ec2QueryEnvelope {
         operation_name: &str,
         success_status: u16,
     ) -> Result<RtResponse, ProtocolError> {
-        let mut response = if Self::writes_return_flag(operation_name, output_schema) {
-            self.inner.serialize_output(
-                &WithReturnFlag { inner: output },
-                output_schema,
-                operation_name,
-                success_status,
-            )?
+        let flagged = WithReturnFlag { inner: output };
+        let body: &dyn SerializableStruct = if Self::writes_return_flag(operation_name, output_schema)
+        {
+            &flagged
         } else {
-            self.inner
-                .serialize_output(output, output_schema, operation_name, success_status)?
+            output
         };
+        // Every FLOATING-POINT member of the body carries a fractional part, which is how
+        // AWS writes a Smithy `double` or `float` in an XML response and what the
+        // framework's writer drops for a whole value (see
+        // [`service_common::query_decimal_floats`]). This is the one place a success body of
+        // this service is written, so the rule reaches every operation and every depth
+        // rather than being restated per shape; nothing else about the walk changes.
+        let mut response = self.inner.serialize_output(
+            &DecimalFloatsRef(body),
+            output_schema,
+            operation_name,
+            success_status,
+        )?;
         response
             .headers_mut()
             .insert("content-type", RESPONSE_CONTENT_TYPE);

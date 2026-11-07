@@ -47,6 +47,10 @@
 //! The wrapper runs the framework's own deserialize -> validate -> handle -> serialize
 //! sequence ([`smithy_server_runtime::run_operation_http`]) and forwards the wrapped
 //! operation's modelled auth schemes, so no status, code or message is this module's.
+//!
+//! A service that renders its own protocol envelope instead of serving each operation
+//! behind a wrapper reaches the same rule at that one seam, where its output is a
+//! `&dyn SerializableStruct`: [`DecimalFloatsRef`].
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
@@ -95,13 +99,18 @@ impl<T: SerializableStruct> SerializableStruct for DecimalFloats<T> {
     }
 }
 
-/// One structure NESTED under a wrapped output, re-wrapped so the rule reaches every
-/// depth: the member that carries a double is rarely the output's own (it sits inside a
-/// reported resource, inside a list of them), and the framework's codec walks a nested
-/// structure with its OWN serializer, so the wrapper has to re-enter at each level.
-struct Nested<'a>(&'a dyn SerializableStruct);
+/// One BORROWED structure serialized with the same rule.
+///
+/// Two callers need it. A structure NESTED under a wrapped output is re-wrapped so the
+/// rule reaches every depth: the member that carries a double is rarely the output's own
+/// (it sits inside a reported resource, inside a list of them), and the framework's codec
+/// walks a nested structure with its OWN serializer, so the wrapper has to re-enter at
+/// each level. And a service that renders its whole protocol envelope itself — rather
+/// than serving each operation behind [`DecimalFloatsOperation`] — reaches its output as a
+/// `&dyn SerializableStruct` and wraps it here.
+pub struct DecimalFloatsRef<'a>(pub &'a dyn SerializableStruct);
 
-impl SerializableStruct for Nested<'_> {
+impl SerializableStruct for DecimalFloatsRef<'_> {
     fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
         self.0.serialize_members(&mut DecimalFloatSerializer { inner: s })
     }
@@ -120,7 +129,7 @@ impl ShapeSerializer for DecimalFloatSerializer<'_> {
         schema: &Schema,
         value: &dyn SerializableStruct,
     ) -> Result<(), SerdeError> {
-        self.inner.write_struct(schema, &Nested(value))
+        self.inner.write_struct(schema, &DecimalFloatsRef(value))
     }
 
     fn write_list(

@@ -404,7 +404,10 @@ pub fn spot_fleet_fulfilled_capacity(
                 .is_some_and(|record| record.view.instance_id.is_some())
         })
         .map(|placement| placement.weighted_capacity)
-        .sum()
+        // Folded from a POSITIVE zero rather than summed: `Sum` for `f64` folds from a
+        // negative zero, so a fleet that has launched nothing would report a capacity of
+        // `-0.0` — not a value a capacity takes, nor one AWS writes.
+        .fold(0.0, |fulfilled, capacity| fulfilled + capacity)
 }
 
 /// Every Spot Instance one Spot Fleet's `placements` launched, in placement order: the

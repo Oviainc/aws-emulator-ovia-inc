@@ -1006,6 +1006,20 @@ pub const CAPACITY_RESERVATION_FLEET_MODIFIABLE_STATES: [&str; 4] = [
 /// both the only value a request may name and the strategy a request that names none gets.
 pub const FLEET_ALLOCATION_STRATEGY_PRIORITIZED: &str = "prioritized";
 
+/// The priority a Capacity Reservation of a Fleet carries when the instance type
+/// specification that asked for it assigned none.
+///
+/// `FleetCapacityReservation$Priority` is "The priority of the instance type in the Capacity
+/// Reservation Fleet" — a member EC2 reports for EVERY reservation of a Fleet, whether or
+/// not the request assigned one, so a specification that assigned none is reported with the
+/// Fleet's default. Recorded behaviour for the value itself: EC2 answers `9999`, which is
+/// above every priority a request can assign (the Instance type priority the User Guide
+/// documents runs 0 … 999), and "A lower value indicates a high priority"
+/// (`ReservationFleetInstanceSpecification$Priority`) — so a defaulted specification is
+/// ordered behind every prioritized one, which is exactly how the `prioritized` strategy
+/// already treats it ([`prioritized_fleet_specification`]).
+pub const DEFAULT_FLEET_INSTANCE_PRIORITY: i32 = 9_999;
+
 /// The capacity units one instance provides when a specification names no `Weight`.
 ///
 /// "The number of capacity units provided by the specified instance type. This value,
@@ -1114,6 +1128,19 @@ pub fn capacity_reservation_fleet_limit_exceeded<E>() -> Scaffolded<E> {
 /// be stored — never a request's text.
 pub type CapacityReservationFleetTransition = ClockTransition<&'static str>;
 
+/// How long a Capacity Reservation Fleet takes to reach `active`.
+///
+/// A Fleet is a COMPOSITE resource: "`submitted` - The Capacity Reservation Fleet request
+/// has been submitted and Amazon Elastic Compute Cloud is preparing to create the Capacity
+/// Reservations", and only once those exist has it "fulfilled its total target capacity",
+/// which is what `active` reports (`CapacityReservationFleet$State`). So the Fleet's own
+/// move is owed after the Capacity Reservations it reserves through are themselves ready,
+/// rather than at the single [`TRANSITION_DELAY`] a resource that waits on nothing takes:
+/// a client flow that creates a Fleet and then describes, modifies or cancels it is still
+/// inside that preparation, which is the state EC2 reports to such a flow, so the span is
+/// wide enough to cover one.
+pub const CAPACITY_RESERVATION_FLEET_ACTIVATION_DELAY: Duration = Duration::from_secs(2);
+
 /// One Capacity Reservation Fleet: the modelled [`CapacityReservationFleet`] every operation
 /// that reports one answers with, plus the two facts that shape carries no member for.
 ///
@@ -1121,7 +1148,8 @@ pub type CapacityReservationFleetTransition = ClockTransition<&'static str>;
 /// `CancelCapacityReservationFleets` all report the same Fleet, so the one stored view is
 /// what all of them answer from and they cannot describe one Fleet differently — the create
 /// result's flat member set is a projection of this view
-/// ([`CapacityReservationFleetRecord::view`]), not a second copy of it.
+/// ([`CapacityReservationFleetRecord::view`]), not a second copy of it, taken as the submit
+/// answers the Fleet.
 #[derive(Debug, Clone)]
 pub struct CapacityReservationFleetRecord {
     /// The Fleet as the model shapes it, carrying the state reached so far and the Capacity
@@ -1234,6 +1262,8 @@ impl CapacityReservationFleetRecord {
             reservation.weight = Some(weight);
             reservation.total_instance_count = Some(instance_count);
             reservation.fulfilled_capacity = Some(f64::from(instance_count) * weight);
+            reservation.priority =
+                Some(reservation.priority.unwrap_or(DEFAULT_FLEET_INSTANCE_PRIORITY));
             if reserved_here {
                 if reservation.capacity_reservation_id.is_none() {
                     reservation.capacity_reservation_id = minted_reservation_id.clone();
@@ -1255,17 +1285,13 @@ impl CapacityReservationFleetRecord {
     /// `active` is where the Fleet "has fulfilled its total target capacity and it is
     /// attempting to maintain this capacity" (`CapacityReservationFleet$State`): the capacity
     /// was reserved by the create, so reaching it changes the Fleet's state word and nothing
-    /// else. `cancelled` is the end of a cancellation, where "The individual Capacity
-    /// Reservations in the Fleet are cancelled" (`CancelCapacityReservationFleets`) — so the
-    /// Fleet then holds no capacity and reports no reservations.
+    /// else. `cancelled` is the end of a cancellation, which is the Fleet's own state word
+    /// too: the Fleet's COMPOSITION — the instance type specifications it reserved on, the
+    /// Capacity Reservations they held, the instances they counted and the capacity they
+    /// fulfilled — is what EC2 keeps reporting for a cancelled Fleet, so an audit or
+    /// teardown flow can still read what was reserved.
     pub(super) fn apply_due_move(&mut self, to: &'static str) {
         self.view.state = Some(to.to_string());
-        if to == CAPACITY_RESERVATION_FLEET_STATE_CANCELLED {
-            self.view.total_fulfilled_capacity = Some(0.0);
-            // The set is still reported, now empty: EC2's ec2Query XML carries a set element
-            // for an empty list, and a cancelled Fleet holds no Capacity Reservation.
-            self.view.instance_type_specifications = Some(Vec::new());
-        }
         self.pending = None;
     }
 }
@@ -1294,11 +1320,15 @@ pub(super) fn fleet_instance_count(total_target_capacity: i32, weight: f64) -> i
 /// "The capacity units that have been fulfilled"
 /// (`CapacityReservationFleet$TotalFulfilledCapacity`): the sum of what each of the Fleet's
 /// Capacity Reservations fulfils, so the Fleet's total and its reservations cannot disagree.
+///
+/// Folded from a POSITIVE zero rather than summed: `Sum` for `f64` folds from a negative
+/// zero, so a Fleet holding no Capacity Reservation would report a capacity of `-0.0` — not
+/// a value a capacity takes, nor one AWS writes.
 pub fn fleet_fulfilled_capacity(reservations: &[FleetCapacityReservation]) -> f64 {
     reservations
         .iter()
         .filter_map(|reservation| reservation.fulfilled_capacity)
-        .sum()
+        .fold(0.0, |fulfilled, capacity| fulfilled + capacity)
 }
 
 /// Which of a Capacity Reservation Fleet's instance type specifications the Fleet reserves
@@ -1454,7 +1484,14 @@ impl ComAmazonawsEc2Amazonec2State {
                 ebs_optimized: Some(instance_spec.ebs_optimized),
                 create_date: reserved_here.then(|| system_time_to_date_time(created_at)),
                 weight: Some(weight),
-                priority: instance_spec.priority,
+                // Every reservation of a Fleet reports a priority; one whose specification
+                // assigned none reports the Fleet's default
+                // ([`DEFAULT_FLEET_INSTANCE_PRIORITY`]).
+                priority: Some(
+                    instance_spec
+                        .priority
+                        .unwrap_or(DEFAULT_FLEET_INSTANCE_PRIORITY),
+                ),
             });
         }
         reservations
@@ -1466,18 +1503,17 @@ impl ComAmazonawsEc2Amazonec2State {
     /// starts in, the Capacity Reservations it reserves through, the move the clock owes it
     /// and the bytes it charges cannot be built two ways.
     ///
-    /// The CALL reserves the capacity: "Creates a Capacity Reservation Fleet"
-    /// (`CreateCapacityReservationFleet`) answers with the
-    /// `FleetCapacityReservations` it created and the capacity they fulfil, so those are
-    /// facts of the create rather than of a later instant. What the Fleet still owes the
-    /// clock is its own STATE word: a Fleet is answered in the non-terminal `submitted`,
-    /// where "Amazon Elastic Compute Cloud is preparing to create the Capacity Reservations"
-    /// (`CapacityReservationFleet$State`), and reaches `active` one [`TRANSITION_DELAY`]
-    /// later.
+    /// The CALL reserves the capacity: the Capacity Reservations the Fleet's allocation
+    /// strategy chooses, and the capacity they fulfil, are stored by this write, so a reader
+    /// of the Fleet reports them from here on. What the Fleet still owes the clock is its own
+    /// STATE word: a Fleet is stored in the non-terminal `submitted`, where "Amazon Elastic
+    /// Compute Cloud is preparing to create the Capacity Reservations"
+    /// (`CapacityReservationFleet$State`), and reaches `active`
+    /// one [`CAPACITY_RESERVATION_FLEET_ACTIVATION_DELAY`] later.
     ///
-    /// What comes back is the stored view itself, so a create answers exactly what a later
-    /// `DescribeCapacityReservationFleets` will report without reading the store a second
-    /// time.
+    /// What comes back is the stored view itself, so what a later
+    /// `DescribeCapacityReservationFleets` reports is read off this one record without
+    /// reading the store a second time.
     pub fn insert_capacity_reservation_fleet(
         &mut self,
         spec: CapacityReservationFleetSpec,
@@ -1515,8 +1551,9 @@ impl ComAmazonawsEc2Amazonec2State {
             fleet_id,
             CapacityReservationFleetRecord {
                 view,
-                pending: Some(CapacityReservationFleetTransition::starting_now(
+                pending: Some(CapacityReservationFleetTransition::due_in(
                     CAPACITY_RESERVATION_FLEET_STATE_ACTIVE,
+                    CAPACITY_RESERVATION_FLEET_ACTIVATION_DELAY,
                 )),
             },
         );

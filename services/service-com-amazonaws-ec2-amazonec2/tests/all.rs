@@ -599,6 +599,11 @@ mod capacity_reservation_billing_requests;
 mod capacity_reservation_cancellation_quotes;
 #[path = "all/capacity_reservation_fleets.rs"]
 mod capacity_reservation_fleets;
+// How a Capacity Reservation Fleet's floating-point members reach the ec2Query wire — the
+// decimal form AWS writes a double in, which is the response envelope's rule rather than
+// this shape's — and the priority every Capacity Reservation of a Fleet reports.
+#[path = "all/capacity_reservation_fleet_wire_values.rs"]
+mod capacity_reservation_fleet_wire_values;
 #[path = "all/carrier_gateways.rs"]
 mod carrier_gateways;
 // What `DescribeClassicLinkInstances` reports out of the ClassicLink link store, and how the

@@ -12,11 +12,13 @@
 //!    weights, priorities, tenancy, matching criteria, end date, tags) round-trips, and the
 //!    members the service owns (the Fleet id, its ARN, its state, its create time, the
 //!    Capacity Reservations it reserves through and the capacity they fulfil) are DERIVED
-//!    rather than taken;
+//!    rather than taken — the create's own result answering the Fleet as SUBMITTED, which
+//!    holds no Capacity Reservation yet and fulfils none of its target capacity;
 //! 2. the CLOCK, not a caller, moves a Fleet `submitted` -> `active`: the capacity is
 //!    reserved by the create, so activation moves the Fleet's state word and nothing else;
 //! 3. `CancelCapacityReservationFleets` moves a Fleet into `cancelling`, reporting the state
-//!    it came from, and the clock moves it on to `cancelled`, where it holds no capacity;
+//!    it came from, and the clock moves it on to `cancelled`, where it still reports the
+//!    composition it reserved;
 //! 4. an id that is not a Capacity Reservation Fleet id at all is refused for the WHOLE
 //!    request with `InvalidCapacityReservationFleetId.Malformed`, before any Fleet is looked
 //!    up or moved, while a well-formed id that names no Fleet is reported PER FLEET by the
@@ -42,9 +44,10 @@ use ec2::ops::types::{
     FLEET_INSTANCE_MATCH_CRITERIA_VALUES,
 };
 use ec2::state::{
-    ComAmazonawsEc2Amazonec2State as Ec2State, CAPACITY_RESERVATION_FLEET_STATE_ACTIVE,
-    CAPACITY_RESERVATION_FLEET_STATE_CANCELLED, CAPACITY_RESERVATION_FLEET_STATE_CANCELLING,
-    CAPACITY_RESERVATION_FLEET_STATE_SUBMITTED, FLEET_ALLOCATION_STRATEGY_PRIORITIZED,
+    ComAmazonawsEc2Amazonec2State as Ec2State, CAPACITY_RESERVATION_FLEET_ACTIVATION_DELAY,
+    CAPACITY_RESERVATION_FLEET_STATE_ACTIVE, CAPACITY_RESERVATION_FLEET_STATE_CANCELLED,
+    CAPACITY_RESERVATION_FLEET_STATE_CANCELLING, CAPACITY_RESERVATION_FLEET_STATE_SUBMITTED,
+    DEFAULT_FLEET_INSTANCE_PRIORITY, FLEET_ALLOCATION_STRATEGY_PRIORITIZED,
     RESOURCE_TYPE_CAPACITY_RESERVATION_FLEET, TRANSITION_DELAY,
 };
 
@@ -59,10 +62,16 @@ const REGION: &str = "us-west-2";
 /// mint counts from one, so a high counter value names nothing.
 const UNKNOWN_FLEET_ID: &str = "crf-0eeeeeeeeeeeeeeee";
 
-/// How long a clock-owed transition takes to fall due: the service's own span, plus a margin
-/// so a slow machine cannot read the state before it is due.
+/// How long every clock-owed move of a Fleet takes to fall due: the longest span the
+/// service gives one — the Fleet's own activation, which waits on the Capacity Reservations
+/// it reserves through ([`CAPACITY_RESERVATION_FLEET_ACTIVATION_DELAY`]) — plus a margin so
+/// a slow machine cannot read the state before it is due.
 async fn past_the_transition() {
-    tokio::time::sleep(TRANSITION_DELAY + Duration::from_millis(400)).await;
+    tokio::time::sleep(
+        CAPACITY_RESERVATION_FLEET_ACTIVATION_DELAY.max(TRANSITION_DELAY)
+            + Duration::from_millis(400),
+    )
+    .await;
 }
 
 /// One `action` call carrying `params`, as its HTTP status and XML body.
@@ -478,6 +487,26 @@ async fn create_round_trips_and_the_clock_activates_the_fleet() {
         .await;
         let created = created_fleet(case, &body);
 
+        // The create answers the Fleet as SUBMITTED: "Amazon Elastic Compute Cloud is
+        // preparing to create the Capacity Reservations", so the result holds none of them
+        // and reports none of the target capacity as fulfilled. What the Fleet went on to
+        // reserve is what the describe below reports.
+        assert!(
+            created.reservations.is_empty(),
+            "case {case:?}: the create result of a submitted Fleet holds no Capacity \
+             Reservation, got {:?}",
+            created.reservations
+        );
+        assert_eq!(
+            created.total_fulfilled_capacity, 0.0,
+            "case {case:?}: a submitted Fleet has fulfilled no capacity yet, got {}",
+            created.total_fulfilled_capacity
+        );
+
+        // The describe reports the STORE the create wrote: the Fleet, and the Capacity
+        // Reservations it reserves its target capacity through.
+        let stored = described_fleet(case, &router, &created.id).await;
+
         // What the `prioritized` strategy reserves through: the specification with the
         // lowest `Priority` value, covering the whole target capacity at its own weight.
         let (chosen_type, chosen_weight, chosen_priority) = row.chosen();
@@ -497,14 +526,14 @@ async fn create_round_trips_and_the_clock_activates_the_fleet() {
             created.state
         );
         assert_eq!(
-            created.reservations.len(),
+            stored.reservations.len(),
             row.instance_types.len(),
             "case {case:?}: every instance type specification is reported, got {:?}",
-            created.reservations
+            stored.reservations
         );
         // The specification the `prioritized` strategy reserved on carries the Capacity
         // Reservation; the others carry none, and reserve nothing.
-        for (index, reservation) in created.reservations.iter().enumerate() {
+        for (index, reservation) in stored.reservations.iter().enumerate() {
             let is_chosen = row.instance_types[index] == chosen_type
                 && row.weights[index] == chosen_weight
                 && row.priorities[index] == chosen_priority;
@@ -526,7 +555,11 @@ async fn create_round_trips_and_the_clock_activates_the_fleet() {
                     zone_name.as_str(),
                     zone_id.as_str(),
                     expected_count_here,
-                    row.priorities[index],
+                    // Every reservation reports a priority: the one the specification
+                    // assigned, or the Fleet's default where it assigned none.
+                    Some(
+                        row.priorities[index].unwrap_or(DEFAULT_FLEET_INSTANCE_PRIORITY),
+                    ),
                     if row.ebs_optimized { "true" } else { "false" },
                 ),
                 "case {case:?}: specification {index} must report its own facts, \
@@ -559,15 +592,15 @@ async fn create_round_trips_and_the_clock_activates_the_fleet() {
             }
         }
         assert!(
-            (created.total_fulfilled_capacity - expected_capacity).abs() < 1e-9,
+            (stored.total_fulfilled_capacity - expected_capacity).abs() < 1e-9,
             "case {case:?}: the Fleet's fulfilled capacity is its reservations', \
              expected {expected_capacity}, got {}",
-            created.total_fulfilled_capacity
+            stored.total_fulfilled_capacity
         );
         assert!(
-            created.total_fulfilled_capacity >= row.total_target_capacity as f64,
+            stored.total_fulfilled_capacity >= row.total_target_capacity as f64,
             "case {case:?}: the create reserves at least the target capacity, got {}",
-            created.total_fulfilled_capacity
+            stored.total_fulfilled_capacity
         );
         // What the REQUEST set round-trips.
         assert_eq!(
@@ -616,10 +649,10 @@ async fn create_round_trips_and_the_clock_activates_the_fleet() {
             }
         }
 
-        // The describe reports THAT store: the create result and the describe cannot differ.
-        let described = described_fleet(case, &router, &created.id).await;
+        // The describe reports THAT store: the members the request set are reported the same
+        // by the create result and by the describe.
         assert_eq!(
-            described.arn.as_deref(),
+            stored.arn.as_deref(),
             Some(
                 format!(
                     "arn:aws:ec2:{REGION}:000000000000:{RESOURCE_TYPE_CAPACITY_RESERVATION_FLEET}/{}",
@@ -628,19 +661,18 @@ async fn create_round_trips_and_the_clock_activates_the_fleet() {
                 .as_str()
             ),
             "case {case:?}: expected an EC2 ARN in the signed Region, got {:?}",
-            described.arn
+            stored.arn
         );
         assert_eq!(
             (
-                described.state.clone(),
-                described.total_target_capacity,
-                described.tenancy.clone(),
-                described.instance_match_criteria.clone(),
-                described.allocation_strategy.clone(),
-                described.create_time.clone(),
-                described.end_date.clone(),
-                described.tags.clone(),
-                described.reservations.clone(),
+                stored.state.clone(),
+                stored.total_target_capacity,
+                stored.tenancy.clone(),
+                stored.instance_match_criteria.clone(),
+                stored.allocation_strategy.clone(),
+                stored.create_time.clone(),
+                stored.end_date.clone(),
+                stored.tags.clone(),
             ),
             (
                 created.state.clone(),
@@ -651,10 +683,9 @@ async fn create_round_trips_and_the_clock_activates_the_fleet() {
                 created.create_time.clone(),
                 created.end_date.clone(),
                 created.tags.clone(),
-                created.reservations.clone(),
             ),
             "case {case:?}: the describe must report the Fleet the create stored, \
-             got {described:?} against {created:?}"
+             got {stored:?} against {created:?}"
         );
 
         // RULE 2: the clock, not a caller, activates the Fleet — and activation is a state
@@ -673,9 +704,9 @@ async fn create_round_trips_and_the_clock_activates_the_fleet() {
                 active.create_time.clone(),
             ),
             (
-                created.reservations.clone(),
-                created.total_target_capacity,
-                created.create_time.clone(),
+                stored.reservations.clone(),
+                stored.total_target_capacity,
+                stored.create_time.clone(),
             ),
             "case {case:?}: activation moves the state word and nothing else, got {active:?}"
         );
@@ -698,8 +729,7 @@ async fn create_round_trips_and_the_clock_activates_the_fleet() {
 // ---------------------------------------------------------------------------
 
 /// RULE 3: a cancel reports the state the Fleet came from and leaves it `cancelling`, and
-/// the CLOCK moves it on to `cancelled`, where it holds no capacity and reports no Capacity
-/// Reservations.
+/// the CLOCK moves it on to `cancelled`, where it still reports the composition it reserved.
 ///
 /// The rows are the two states a Fleet of this emulator can be cancelled from: the
 /// `submitted` it is created in, and the `active` the clock moves it to.
@@ -774,20 +804,27 @@ async fn cancelling_a_fleet_moves_it_through_cancelling_to_cancelled() {
             "case {case:?}: the clock owes a cancelling Fleet cancelled, got {:?}",
             cancelled.state
         );
+        // Cancelling is a state WORD: the Fleet's composition — the specifications it
+        // reserved on, the Capacity Reservations they held and the capacity they fulfilled —
+        // is still reported, so a teardown flow can read what was reserved.
         assert_eq!(
-            cancelled.total_fulfilled_capacity, 0.0,
-            "case {case:?}: a cancelled Fleet holds no capacity, got {}",
-            cancelled.total_fulfilled_capacity
+            (
+                cancelled.reservations.clone(),
+                cancelled.total_fulfilled_capacity,
+                cancelled.total_target_capacity,
+            ),
+            (
+                cancelling.reservations.clone(),
+                cancelling.total_fulfilled_capacity,
+                cancelling.total_target_capacity,
+            ),
+            "case {case:?}: a cancelled Fleet still reports what it reserved, \
+             got {cancelled:?}"
         );
         assert!(
-            cancelled.reservations.is_empty(),
-            "case {case:?}: a cancelled Fleet's Capacity Reservations are cancelled too, \
-             got {:?}",
-            cancelled.reservations
-        );
-        assert_eq!(
-            cancelled.total_target_capacity, cancelling.total_target_capacity,
-            "case {case:?}: cancelling does not rewrite what the Fleet asked for"
+            !cancelled.reservations.is_empty() && cancelled.total_fulfilled_capacity > 0.0,
+            "case {case:?}: the Fleet under test reserved capacity, so the cancelled Fleet \
+             has something to report, got {cancelled:?}"
         );
     }
 }

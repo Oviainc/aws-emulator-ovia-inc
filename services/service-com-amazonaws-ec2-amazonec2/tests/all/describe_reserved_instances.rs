@@ -44,6 +44,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::ec2_query::{as_timestamp, call, error_code, error_message, filters, indexed};
 use super::wire::{Param, document, param, set_items};
+use service_common::query_decimal_floats::decimal_float_text;
 
 /// The Region every call here is signed for.
 const REGION: &str = "us-east-1";
@@ -526,8 +527,13 @@ async fn every_member_of_a_stored_purchase_reads_back() {
             ("offeringType", row.offering_type.to_string()),
             ("productDescription", row.product_description.to_string()),
             ("state", row.state.to_string()),
-            ("fixedPrice", row.fixed_price.to_string()),
-            ("usagePrice", row.usage_price.to_string()),
+            // A PRICE is a floating-point member, which this service's XML writes as a
+            // decimal carrying a fractional part the way AWS does — so a whole price reads
+            // `500.0` rather than `500`. The expected text is derived from the stored value
+            // through the one rendering
+            // ([`service_common::query_decimal_floats`]) rather than written out here.
+            ("fixedPrice", decimal_float_text(row.fixed_price)),
+            ("usagePrice", decimal_float_text(row.usage_price)),
             (
                 "currencyCode",
                 RESERVED_INSTANCE_CURRENCY_CODE.to_string(),

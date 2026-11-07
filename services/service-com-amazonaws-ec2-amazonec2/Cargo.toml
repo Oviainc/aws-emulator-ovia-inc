@@ -31,6 +31,9 @@ jpeg-encoder = "0.6"
 font8x8 = "0.3"
 # `GetConsoleScreenshotResult$ImageData` carries the image as base64 text.
 base64 = "0.22"
+# The shared XML rendering of a floating-point member, which AWS writes as a decimal
+# carrying a fractional part where Rust's own rendering drops it.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

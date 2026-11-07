@@ -1312,10 +1312,20 @@ impl<T> ClockTransition<T> {
     /// A move to `to`, due [`TRANSITION_DELAY`] from now: the span this crate gives every
     /// clock-owed transition, recorded rather than slept for.
     pub fn starting_now(to: T) -> Self {
+        Self::due_in(to, TRANSITION_DELAY)
+    }
+
+    /// A move to `to`, due `delay` from now.
+    ///
+    /// One span ([`TRANSITION_DELAY`]) is what a resource whose readiness depends on
+    /// nothing else takes; a resource that provisions OTHERS reaches its own state only
+    /// once those are ready, which is one further span per level it depends on — so the
+    /// delay is a multiple of that one span rather than a number of its own.
+    pub fn due_in(to: T, delay: Duration) -> Self {
         Self {
             to,
-            due_at: Instant::now() + TRANSITION_DELAY,
-            at: SystemTime::now() + TRANSITION_DELAY,
+            due_at: Instant::now() + delay,
+            at: SystemTime::now() + delay,
         }
     }
 }
