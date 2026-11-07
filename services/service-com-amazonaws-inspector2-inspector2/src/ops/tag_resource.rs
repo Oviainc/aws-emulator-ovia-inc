@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: merges the request's tags into the tag set STORED on the resource
+//! `resourceArn` names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A key the resource already carries takes the new value and every other stored key
+//! stays ("Adds tags to a resource"), so the call is idempotent as the model says. An ARN
+//! naming no resource this service stores is a 404 `ResourceNotFoundException`; a tag
+//! carrying the reserved key prefix the model's `TagKey` pattern excludes, or a merge that
+//! would take the resource past [`crate::state::MAX_TAGS_PER_RESOURCE`] tags, is a 400
+//! `BadRequestException` and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +145,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        // Every tag key's length (1..128) and every value's (at most 256) are modelled
+        // constraints, already refused by the centralized walk before this body runs. What
+        // is left to judge here is the RESERVED prefix: `TagMap`'s key carries no pattern,
+        // while the service's own `TagKey` excludes `aws:` with a negative lookahead, so a
+        // caller-supplied key carrying it is not a valid tag.
+        if input
+            .tags
+            .keys()
+            .any(|key| key.starts_with(crate::state::RESERVED_TAG_KEY_PREFIX))
+        {
+            return Err(TagResourceErrorModeled::BadRequestException(BadRequestException {
+                message: crate::state::INVALID_TAGS_MESSAGE.to_string(),
+            })
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "Amazon Inspector resource tag state is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        let mut guard = state.lock();
+        // The tags live on the record the ARN names, so an ARN naming no stored resource
+        // has no tag set to write to: a 404, not a tag set made out of the request.
+        let slot = guard
+            .resource_tag_slot_mut(&input.resource_arn)
+            .ok_or_else(|| {
+                TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::TAGGED_RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                })
+            })?;
+
+        // A MERGE, not a replacement: a key the request names takes its value, and every
+        // key it does not name keeps the value the resource already carried.
+        let mut merged = slot.clone().unwrap_or_default();
+        merged.extend(
+            input
+                .tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+
+        // Checked BEFORE the write, so a refused request leaves the stored tag set exactly
+        // as it was.
+        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::BadRequestException(BadRequestException {
+                message: crate::state::too_many_tags_message(merged.len()),
+            })
+            .into());
+        }
+
+        *slot = Some(merged);
+        Ok(TagResourceOutput {})
     }
 }

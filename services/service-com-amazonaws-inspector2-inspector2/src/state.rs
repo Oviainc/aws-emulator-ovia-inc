@@ -24,6 +24,12 @@
 //!   `DeleteCodeSecurityScanConfiguration`.
 //! * `org_package_paths` — the organization-wide deep inspection custom paths both deep
 //!   inspection reads report alongside an account's own.
+//!
+//! A resource's tags live on that resource's own record, never in a map beside it, so the
+//! tagging operations and the reads that echo a record's tags can never report two
+//! different tag sets for one resource:
+//! [`ComAmazonawsInspector2Inspector2State::resource_tag_slot_mut`] is the one place a
+//! `resourceArn` is resolved to the record whose tags a tagging call reads or writes.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -140,6 +146,43 @@ pub fn too_many_accounts_message() -> String {
 /// retry, which is what the token exists for, follows its original call closely, and
 /// nothing can accumulate tokens without bound.
 pub const MAX_CLIENT_TOKENS_PER_ACCOUNT: usize = 64;
+
+/// The most tags one resource carries. The model fixes how many tag keys a single
+/// `UntagResource` call may name — `TagKeyList` has length 0..50 — which is the size of
+/// the tag set one call has to be able to clear, so a resource's tag set is held to that
+/// same 50 here: a caller looping `TagResource` with fresh keys cannot grow a stored
+/// record without bound.
+/// Source: `smithy_query(query="shape", shape="TagKeyList")`.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The tag-key prefix Amazon Web Services reserves for its own tags. The model's own
+/// `TagKey` pattern excludes it with a negative lookahead, so a caller-supplied key
+/// carrying it is not a valid tag key for this service.
+/// Source: `smithy_query(query="shape", shape="TagKey")` — `^(?!aws:)[a-zA-Z+-=._:/]+$`.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// What a tagging write states when a tag it carries is not a valid tag: the sentence the
+/// service documents for that failure class, which states the class and nothing about the
+/// request, so every invalid tag is refused the same way.
+/// Source: `smithy_query(query="shape", shape="BadRequestException")`.
+pub const INVALID_TAGS_MESSAGE: &str =
+    "One or more tags submitted as part of the request is not valid.";
+
+/// What every tagging call states for a `resourceArn` naming no resource this service
+/// stores: the sentence the service documents for that failure class.
+/// Source: `smithy_query(query="shape", shape="ResourceNotFoundException")`.
+pub const TAGGED_RESOURCE_NOT_FOUND_MESSAGE: &str =
+    "The operation tried to access an invalid resource. Make sure the resource is \
+     specified correctly.";
+
+/// The refusal text for a tagging write that would leave the resource carrying
+/// `requested` tags, past [`MAX_TAGS_PER_RESOURCE`].
+pub fn too_many_tags_message(requested: usize) -> String {
+    format!(
+        "A resource can carry at most {MAX_TAGS_PER_RESOURCE} tags; this request would \
+         leave it carrying {requested}."
+    )
+}
 
 /// One stored findings filter: exactly what `CreateFilter`/`UpdateFilter` were given,
 /// plus the ARN the service minted and the two timestamps it maintains.
@@ -467,6 +510,46 @@ pub fn tag_map(
 pub type EncryptionKeyScope = (String, String);
 
 impl ComAmazonawsInspector2Inspector2State {
+    /// The `tags` member of the record `resource_arn` names, as the SLOT a tagging write
+    /// replaces: `None` when this service stores no resource under that ARN, and
+    /// otherwise that record's own tags — themselves absent while the create that minted
+    /// it carried no `tags` member at all.
+    ///
+    /// Every taggable resource of this service answers here, so one ARN resolves to one
+    /// tag set however it is reached.
+    pub fn resource_tag_slot_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Option<&mut Option<BTreeMap<String, String>>> {
+        if let Some(filter) = self.filters.get_mut(resource_arn) {
+            return Some(&mut filter.tags);
+        }
+        if let Some(configuration) = self.cis_scan_configurations.get_mut(resource_arn) {
+            return Some(&mut configuration.tags);
+        }
+        self.code_security_scan_configurations
+            .get_mut(resource_arn)
+            .map(|configuration| &mut configuration.tags)
+    }
+
+    /// The tag set of the resource `resource_arn` names, EMPTY for a stored resource
+    /// carrying no tags, and `None` when this service stores no resource under that ARN —
+    /// which is what tells "this resource carries no tags" from "there is no such
+    /// resource".
+    pub fn resource_tags(&self, resource_arn: &str) -> Option<BTreeMap<String, String>> {
+        let stored = if let Some(filter) = self.filters.get(resource_arn) {
+            &filter.tags
+        } else if let Some(configuration) = self.cis_scan_configurations.get(resource_arn) {
+            &configuration.tags
+        } else {
+            &self
+                .code_security_scan_configurations
+                .get(resource_arn)?
+                .tags
+        };
+        Some(stored.clone().unwrap_or_default())
+    }
+
     /// The customer managed KMS key ARN configured for the `resource_type` /
     /// `scan_type` pair, or `None` when that pair is encrypted with an Amazon Web
     /// Services owned key.

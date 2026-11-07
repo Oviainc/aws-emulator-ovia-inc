@@ -29,6 +29,8 @@ mod filters_and_enablement;
 mod finding_aggregations;
 #[path = "all/pattern_refusal_wording.rs"]
 mod pattern_refusal_wording;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/usage_totals.rs"]
