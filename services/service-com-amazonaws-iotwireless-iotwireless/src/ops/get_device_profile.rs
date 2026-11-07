@@ -154,11 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let profile = store.device_profiles.get(&input.id).ok_or_else(|| {
             GetDeviceProfileError::from(GetDeviceProfileErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("DeviceProfile {} not found", input.id)),
-                    resource_id: Some(input.id.clone()),
-                    resource_type: Some("DeviceProfile".to_string()),
-                },
+                crate::state::device_profile_not_found(&input.id),
             ))
         })?;
 

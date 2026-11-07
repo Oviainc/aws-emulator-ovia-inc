@@ -233,6 +233,70 @@ pub struct DeviceProfile {
     pub tags: Vec<Tag>,
 }
 
+/// The `RfRegion` a device profile carries when its create named none: the frequency
+/// band this service defaults a LoRaWAN device profile to, one of the modelled
+/// `SupportedRfRegion` values.
+pub const DEFAULT_DEVICE_PROFILE_RF_REGION: &str = "US915";
+
+/// The `RxDelay1` a device profile carries when its create named none: the LoRaWAN
+/// RECEIVE_DELAY1 of one second, the delay between the end of an uplink and the opening
+/// of the first downlink window.
+pub const DEFAULT_RX_DELAY1: i32 = 1;
+
+/// The `RxDrOffset1` a device profile carries when its create named none: the first
+/// downlink window uses the uplink data rate unshifted.
+pub const DEFAULT_RX_DR_OFFSET1: i32 = 0;
+
+/// The `MaxDutyCycle` a device profile carries when its create named none.
+pub const DEFAULT_MAX_DUTY_CYCLE: i32 = 10;
+
+/// Whether a device profile supports over-the-air activation when its create named no
+/// `SupportsJoin`: it does, which is how a device joins without pre-provisioned session
+/// keys.
+pub const DEFAULT_SUPPORTS_JOIN: bool = true;
+
+/// The settings a created device profile carries: the ones the request named, kept
+/// exactly as submitted, and this service's default for each radio parameter it left
+/// out.
+///
+/// One function, so the stored resource — and therefore every reader of it — carries the
+/// same settings whether or not the create spelled them out. The members with no default
+/// here (`MacVersion`, `RegParamsRevision`, `MaxEirp`, the class B/C and ping-slot
+/// members) are reported only when the create named them: the service fills in the
+/// parameters that describe the frequency plan and the downlink windows, not the ones
+/// that describe the device's own capabilities.
+///
+/// A radio parameter the plan of ONE band decides — the second receive window's data
+/// rate and frequency, and the join channels — is taken from the band the profile
+/// resolves to ([`region_device_profile_plan`]), never from a fixed set: filling a
+/// profile in one band with another band's channel would report a channel no device in
+/// it listens on. A band this service holds no plan for leaves those three unset for the
+/// same reason, while the parameters no band decides are still filled in.
+pub fn device_profile_settings(requested: &LoRaWANDeviceProfile) -> LoRaWANDeviceProfile {
+    // The band is resolved first, because the plan the rest comes from hangs off it.
+    let rf_region = requested
+        .rf_region
+        .clone()
+        .unwrap_or_else(|| DEFAULT_DEVICE_PROFILE_RF_REGION.to_string());
+    let plan = region_device_profile_plan(&rf_region);
+    LoRaWANDeviceProfile {
+        rx_delay1: Some(requested.rx_delay1.unwrap_or(DEFAULT_RX_DELAY1)),
+        rx_dr_offset1: Some(requested.rx_dr_offset1.unwrap_or(DEFAULT_RX_DR_OFFSET1)),
+        max_duty_cycle: Some(requested.max_duty_cycle.unwrap_or(DEFAULT_MAX_DUTY_CYCLE)),
+        supports_join: Some(requested.supports_join.unwrap_or(DEFAULT_SUPPORTS_JOIN)),
+        rx_data_rate2: requested
+            .rx_data_rate2
+            .or(plan.map(|plan| plan.rx_data_rate2)),
+        rx_freq2: requested.rx_freq2.or(plan.map(|plan| plan.rx_freq2)),
+        factory_preset_freqs_list: requested.factory_preset_freqs_list.clone().or_else(|| {
+            plan.map(|plan| plan.join_channels.to_vec())
+                .filter(|channels| !channels.is_empty())
+        }),
+        rf_region: Some(rf_region),
+        ..requested.clone()
+    }
+}
+
 /// The sentence this service's 409 carries when a create claims a `DevEui` another
 /// device in the account already holds: FIXED text with no variable part, so a client
 /// can tell this conflict from the idempotency-token conflict the same operation raises
@@ -824,6 +888,15 @@ pub fn wireless_gateway_task_definition_not_found(id: &str) -> ResourceNotFoundE
     resource_not_found("WirelessGatewayTaskDefinition", id)
 }
 
+/// The `ResourceNotFoundException` body for a device profile the account does not hold.
+///
+/// One function, so every operation that addresses a device profile by `Id` — its
+/// reader and its delete — refuses a missing one with the same body, worded as
+/// [`resource_not_found`] words this error class.
+pub fn device_profile_not_found(id: &str) -> ResourceNotFoundException {
+    resource_not_found("DeviceProfile", id)
+}
+
 /// A wireless gateway task: the task definition one wireless gateway was asked to apply.
 ///
 /// `GetWirelessGatewayTask` and `DeleteWirelessGatewayTask` address a task by the
@@ -989,6 +1062,114 @@ pub fn complete_default_session_parameters(lorawan: &mut LoRaWANMulticast) {
     let parameters = lorawan.default_session_parameters.get_or_insert_default();
     parameters.dl_dr = parameters.dl_dr.or(Some(*dl_dr));
     parameters.dl_freq = parameters.dl_freq.or(Some(*dl_freq));
+}
+
+/// How many hertz one unit of a device profile's frequency members is: their modelled
+/// ranges (`RxFreq2` and `PresetFreq`, 1000000..16700000) count in hundreds of hertz,
+/// while [`REGION_DOWNLINK_DEFAULTS`] above — a multicast group's `DlFreq`, modelled
+/// 100000000..1000000000 — counts in hertz, so the one published channel serves both
+/// members through this conversion rather than being written down twice.
+const HERTZ_PER_DEVICE_PROFILE_FREQUENCY: i32 = 100;
+
+/// The part of each LoRaWAN regional plan a DEVICE PROFILE reports, as
+/// `(SupportedRfRegion, second receive window's data rate, default join channels)` with
+/// every frequency in the hundreds-of-hertz unit the device-profile members use.
+///
+/// One row per value of `SupportedRfRegion`
+/// (`smithy_query(query="shape", shape="SupportedRfRegion")`), like
+/// [`REGION_DOWNLINK_DEFAULTS`], so every band a profile can name is answered from the
+/// catalog and none is served by a special case; the const assertion below fails the
+/// build if the model adds a band this table does not answer for.
+///
+/// Sources, column by column:
+///
+/// * the data rate is the one each plan publishes for its second receive window: the
+///   lowest data rate (0) in the 125 kHz plans, 2 in the AS923 plans and in IN865, and 8
+///   — the first downlink-only data rate — in the two 500 kHz plans (US915, AU915).
+///   `REGION_DOWNLINK_DEFAULTS` carries a different value for those two because it
+///   answers for a class B/C multicast session rather than a device's RX2 window;
+/// * the channels are the plan's published default (join) channels: 868.1/868.3/868.5
+///   MHz for EU868, 923.2/923.4 MHz for AS923-1 shifted by that plan's published
+///   per-group offsets for AS923-2/3/4 (-1.80, -6.60 and -5.90 MHz), 433.175/433.375/
+///   433.575 MHz for EU433, 779.5/779.7/779.9 MHz for CN779, 868.9/869.1 MHz for RU864,
+///   922.1/922.3/922.5 MHz for KR920, 865.0625/865.4025/865.985 MHz for IN865, and for
+///   the two 500 kHz plans the eight 125 kHz channels of the sub-band this service
+///   operates them on plus that sub-band's 500 kHz channel (903.9–905.3 MHz and 904.6
+///   MHz for US915; 916.8–918.2 MHz and 917.5 MHz for AU915).
+/// * CN470 has NO row of channels: its published default channel set is far longer than
+///   the twenty entries `FactoryPresetFreqsList` models (`@length 0..20`), so a profile
+///   in that band reports no channel list rather than a truncated plan no device
+///   follows.
+///
+/// Every data rate is inside `RxDataRate2`'s published range (0..15) and every channel
+/// inside `PresetFreq`'s (1000000..16700000).
+const REGION_DEVICE_PROFILE_PLANS: &[(&str, i32, &[i32])] = &[
+    ("EU868", 0, &[8_681_000, 8_683_000, 8_685_000]),
+    (
+        "US915",
+        8,
+        &[
+            9_039_000, 9_041_000, 9_043_000, 9_045_000, 9_047_000, 9_049_000, 9_051_000,
+            9_053_000, 9_046_000,
+        ],
+    ),
+    (
+        "AU915",
+        8,
+        &[
+            9_168_000, 9_170_000, 9_172_000, 9_174_000, 9_176_000, 9_178_000, 9_180_000,
+            9_182_000, 9_175_000,
+        ],
+    ),
+    ("AS923-1", 2, &[9_232_000, 9_234_000]),
+    ("AS923-2", 2, &[9_214_000, 9_216_000]),
+    ("AS923-3", 2, &[9_166_000, 9_168_000]),
+    ("AS923-4", 2, &[9_173_000, 9_175_000]),
+    ("EU433", 0, &[4_331_750, 4_333_750, 4_335_750]),
+    ("CN470", 0, &[]),
+    ("CN779", 0, &[7_795_000, 7_797_000, 7_799_000]),
+    ("RU864", 0, &[8_689_000, 8_691_000]),
+    ("KR920", 0, &[9_221_000, 9_223_000, 9_225_000]),
+    ("IN865", 2, &[8_650_625, 8_654_025, 8_659_850]),
+];
+
+/// The table above answers for the WHOLE modelled catalog, checked at compile time
+/// against the model-generated value list so a band a later model adds cannot silently
+/// fall through to no plan.
+const _: () = assert!(
+    REGION_DEVICE_PROFILE_PLANS.len() == crate::ops::types::SUPPORTED_RF_REGION_VALUES.len()
+);
+
+/// What one band's regional plan decides about a device profile: the second receive
+/// window's data rate and frequency, and the band's default join channels.
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceProfilePlan {
+    /// `RxDataRate2`: the data rate the second receive window uses in this band.
+    pub rx_data_rate2: i32,
+    /// `RxFreq2`: that window's frequency, in the hundreds-of-hertz unit the member is
+    /// modelled in.
+    pub rx_freq2: i32,
+    /// `FactoryPresetFreqsList`: the band's default join channels, in the same unit.
+    /// EMPTY for a band whose published set does not fit the modelled list.
+    pub join_channels: &'static [i32],
+}
+
+/// The plan `rf_region` names, or `None` for a band this service holds no plan for —
+/// `RfRegion` is a free-form string in the model (`length 0..64`), so a profile may name
+/// one the regional catalog does not list, and inventing a channel for it would report a
+/// frequency no device listens on.
+pub fn region_device_profile_plan(rf_region: &str) -> Option<DeviceProfilePlan> {
+    let (_, rx_data_rate2, join_channels) = REGION_DEVICE_PROFILE_PLANS
+        .iter()
+        .find(|(region, _, _)| *region == rf_region)?;
+    let (_, _, rx2_hertz) = REGION_DOWNLINK_DEFAULTS
+        .iter()
+        .find(|(region, _, _)| *region == rf_region)?;
+    Some(DeviceProfilePlan {
+        rx_data_rate2: *rx_data_rate2,
+        rx_freq2: rx2_hertz / HERTZ_PER_DEVICE_PROFILE_FREQUENCY,
+        join_channels,
+    })
 }
 
 /// A FUOTA task: the firmware image a set of wireless devices is updated with, and the
@@ -1868,6 +2049,16 @@ impl ComAmazonawsIotwirelessIotwirelessState {
             MAX_DEVICE_PROFILE_TOKENS,
             token,
             record,
+        );
+    }
+
+    /// Drop every idempotency token that minted device profile `id`, so a token never
+    /// outlives the resource it names.
+    pub fn forget_device_profile_tokens_for(&mut self, id: &str) {
+        forget_tokens_for(
+            &mut self.device_profile_tokens,
+            &mut self.device_profile_token_order,
+            id,
         );
     }
 

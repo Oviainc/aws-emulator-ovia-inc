@@ -263,7 +263,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             id: id.clone(),
             name: input.name.clone(),
             profile_type: profile_type.to_string(),
-            lorawan: input.lo_ra_wan.clone(),
+            // A LoRaWAN profile is STORED with its frequency-plan and downlink-window
+            // parameters resolved, so the record a reader projects carries the settings
+            // the profile really has — the submitted ones unchanged, and this service's
+            // default for each one the request left out.
+            lorawan: input
+                .lo_ra_wan
+                .as_ref()
+                .map(crate::state::device_profile_settings),
             tags: input.tags.clone().unwrap_or_default(),
         };
         let output = CreateDeviceProfileOutput {

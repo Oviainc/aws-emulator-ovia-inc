@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDeviceProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDeviceProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDeviceProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes a stored device profile by `Id`, so the next reader cannot see
+//! it. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -142,20 +135,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDeviceProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDeviceProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDeviceProfile"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteDeviceProfileError::from(
+                DeleteDeviceProfileErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the iotwireless store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let mut store = state.lock();
+        // A device's `LoRaWAN.DeviceProfileId` is deliberately left pointing at the
+        // deleted id rather than cleared or refused: the model documents no dependency
+        // between the two, and clearing it would silently discard caller-supplied
+        // configuration. The profile itself is REMOVED, so every reader of it — this
+        // service's own `GetDeviceProfile` among them — refuses it from the next call on.
+        if store.device_profiles.remove(&input.id).is_none() {
+            // The one body every operation that addresses a device profile by this id
+            // refuses a missing one with, so two refusals of the same condition cannot
+            // drift apart.
+            return Err(
+                DeleteDeviceProfileErrorModeled::ResourceNotFoundException(
+                    crate::state::device_profile_not_found(&input.id),
+                )
+                .into(),
+            );
+        }
+        // Release the idempotency tokens that minted this profile, so a token never
+        // outlives the resource it names and a create/delete loop cannot grow the token
+        // store.
+        store.forget_device_profile_tokens_for(&input.id);
+        Ok(DeleteDeviceProfileOutput {})
     }
 }
