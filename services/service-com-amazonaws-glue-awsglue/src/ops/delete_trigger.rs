@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTrigger
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTrigger`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTrigger::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +136,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTrigger` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTriggerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTrigger"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // An unreachable store is an internal fault of the emulator rather than
+            // anything the caller sent, so it is reported through this operation's own
+            // modelled server error.
+            return Err(DeleteTriggerErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue trigger store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // `Name` is `@required` with `length 1..255` and a pattern, every one of them
+        // refused at the boundary, so identity is all this handler settles.
+        let region = crate::state::request_region(ctx.parts());
+        // A trigger is served only through the endpoint that created it, so a delete
+        // addressed to another Region's endpoint names no trigger of this one. Removing
+        // the entry removes the WHOLE record — the definition, the state a start or stop
+        // left it in, the tags the create carried and any open event batch are all held on
+        // it — so the name it frees carries nothing into the next create under it, and
+        // every projection built from the stored triggers (the listings, the batch read,
+        // the graph of the workflow it belonged to) stops reporting it.
+        let mut store = state.lock();
+        let removed = store
+            .triggers
+            .get_mut(&region)
+            .and_then(|triggers| triggers.remove(&input.name))
+            .is_some();
+        ::tracing::info!(
+            operation = "DeleteTrigger",
+            trigger = %input.name,
+            region = %region,
+            removed,
+            "served a Glue trigger delete"
+        );
+
+        Ok(DeleteTriggerOutput {
+            // "The name of the trigger that was deleted." A name this Region held no
+            // trigger under is answered the same way rather than refused, because the
+            // operation documents the delete as idempotent: "If the trigger is not found,
+            // no exception is thrown."
+            name: Some(input.name),
+        })
     }
 }
