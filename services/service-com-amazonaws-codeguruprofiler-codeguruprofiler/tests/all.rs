@@ -63,6 +63,8 @@ mod message_timestamp_rendering;
 mod minted_ids_follow_applied_writes;
 #[path = "all/not_found_surfaces.rs"]
 mod not_found_surfaces;
+#[path = "all/notification_channel_uri_identity.rs"]
+mod notification_channel_uri_identity;
 #[path = "all/notification_channels.rs"]
 mod notification_channels;
 #[path = "all/notification_configuration.rs"]

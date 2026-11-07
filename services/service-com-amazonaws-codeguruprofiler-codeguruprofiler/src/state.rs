@@ -1014,10 +1014,10 @@ pub struct ProfilingGroup {
     /// [`ProfilingGroup::remember_profile_token`], which is the only writer.
     pub seen_profile_tokens: VecDeque<String>,
     /// This group's anomaly-notification channels, in the order they were added —
-    /// what `GetNotificationConfiguration` reports, `AddNotificationChannels` appends
-    /// to and `RemoveNotificationChannel` deletes from. Bounded at
-    /// [`MAX_NOTIFICATION_CHANNELS_PER_GROUP`] by
-    /// [`ProfilingGroup::add_notification_channels`], which is the only writer.
+    /// what `GetNotificationConfiguration` reports, `AddNotificationChannels` stores
+    /// into and `RemoveNotificationChannel` deletes from. At most one channel per
+    /// `uri`, and bounded at [`MAX_NOTIFICATION_CHANNELS_PER_GROUP`], by
+    /// [`ProfilingGroup::store_notification_channels`], which is the only writer.
     pub notification_channels: Vec<NotificationChannel>,
     /// The group's resource-based policy, or `None` while it has none — a group is
     /// created without one, and the permission writers
@@ -1224,26 +1224,75 @@ impl ProfilingGroup {
             .any(|channel| channel.id == id)
     }
 
-    /// Append a batch of notification channels, ALL or nothing: `false` — and nothing
-    /// stored — unless every channel fits, i.e. no channel repeats an id this group or
-    /// an earlier channel of the batch already holds, and the group stays within
+    /// The channel this group holds for `uri`, or `None` when no stored channel reports
+    /// to it.
+    ///
+    /// A `uri` identifies at most one channel of a configuration: it is the destination
+    /// the group's anomaly notifications are published to, and a configuration holding
+    /// two channels for one destination would publish every notification to it twice.
+    pub fn notification_channel_for_uri(&self, uri: &str) -> Option<&NotificationChannel> {
+        self.notification_channels
+            .iter()
+            .find(|channel| channel.uri == uri)
+    }
+
+    /// Whether this group already holds a channel reporting to `uri`.
+    pub fn has_notification_channel_for_uri(&self, uri: &str) -> bool {
+        self.notification_channel_for_uri(uri).is_some()
+    }
+
+    /// Store a batch of notification channels, ALL or nothing: `false` — and nothing
+    /// stored — unless every channel fits.
+    ///
+    /// A channel whose `uri` a stored channel (or an earlier channel of the same batch)
+    /// already reports to REPLACES that channel in place, keeping its position and
+    /// taking the id, uri and publishers of the replacement: one destination holds one
+    /// channel, so storing a destination the group already has is idempotent at the uri
+    /// level and consumes none of the group's channel capacity. Every other channel is
+    /// appended.
+    ///
+    /// It is refused when a channel's id names a DIFFERENT stored channel (one for
+    /// another uri) or repeats an id of another channel of the batch for another uri, or
+    /// when the channels that are net new to this group would push it past
     /// [`MAX_NOTIFICATION_CHANNELS_PER_GROUP`]. The only writer, so the stored
-    /// configuration never leaves what the model's `Channels` list allows and a refused
-    /// add is never a partial one.
-    pub fn add_notification_channels(&mut self, channels: Vec<NotificationChannel>) -> bool {
-        if self.notification_channels.len() + channels.len() > MAX_NOTIFICATION_CHANNELS_PER_GROUP {
+    /// configuration never leaves what the model's `Channels` list allows, never holds
+    /// two channels for one uri, and a refused store is never a partial one.
+    pub fn store_notification_channels(&mut self, channels: Vec<NotificationChannel>) -> bool {
+        // What the configuration's uris would be once the whole batch is stored: a uri
+        // already covered replaces, so only a uri nobody covers yet grows the group.
+        let mut uris: Vec<&str> = self
+            .notification_channels
+            .iter()
+            .map(|channel| channel.uri.as_str())
+            .collect();
+        for channel in &channels {
+            if !uris.contains(&channel.uri.as_str()) {
+                uris.push(channel.uri.as_str());
+            }
+        }
+        if uris.len() > MAX_NOTIFICATION_CHANNELS_PER_GROUP {
             return false;
         }
         let repeated = channels.iter().enumerate().any(|(index, channel)| {
-            self.has_notification_channel(&channel.id)
-                || channels[..index]
-                    .iter()
-                    .any(|earlier| earlier.id == channel.id)
+            self.notification_channels.iter().any(|stored| {
+                stored.id == channel.id && stored.uri != channel.uri
+            }) || channels[..index]
+                .iter()
+                .any(|earlier| earlier.id == channel.id && earlier.uri != channel.uri)
         });
         if repeated {
             return false;
         }
-        self.notification_channels.extend(channels);
+        for channel in channels {
+            match self
+                .notification_channels
+                .iter_mut()
+                .find(|stored| stored.uri == channel.uri)
+            {
+                Some(stored) => *stored = channel,
+                None => self.notification_channels.push(channel),
+            }
+        }
         true
     }
 

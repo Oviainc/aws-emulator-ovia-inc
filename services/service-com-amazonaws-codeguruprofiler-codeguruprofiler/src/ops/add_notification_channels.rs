@@ -2,10 +2,12 @@
 
 //! @op AddNotificationChannels
 //!
-//! Appends anomaly-notification channels to the named profiling group's stored
-//! configuration and reports the configuration that results. Each added channel keeps
-//! the request's `id` or gets a fresh random UUID, and a group holds at most two
-//! channels — what the model's `Channels` list allows.
+//! Stores anomaly-notification channels into the named profiling group's configuration
+//! and reports the configuration that results. Each stored channel keeps the request's
+//! `id` or gets a fresh random UUID; a channel whose `uri` the configuration already
+//! covers REPLACES that channel rather than joining it, so one destination holds one
+//! channel, and a group holds at most two channels — what the model's `Channels` list
+//! allows.
 //!
 //! ## Shape of an operation
 //!
@@ -274,15 +276,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // A channel id already in the configuration names a channel that exists: adding
-        // it again would conflict with the stored state rather than add anything. Only an
-        // id the request named can name a stored channel; the ids this operation mints
-        // are minted after this check and name none.
-        if let Some(duplicate) = requested
-            .iter()
-            .filter_map(|channel| channel.id.as_deref())
-            .find(|id| group.has_notification_channel(id))
-        {
+        // A channel id already in the configuration names a channel that EXISTS for
+        // another destination: storing the requested channel would have to take an id
+        // off a channel the caller did not ask about, so it conflicts with the stored
+        // state. An id that names the very channel this request supersedes (the one
+        // stored for the same uri) conflicts with nothing: that channel is being
+        // replaced. Only an id the request named can name a stored channel; the ids this
+        // operation mints are minted after this check and name none.
+        if let Some(duplicate) = requested.iter().find_map(|channel| {
+            let named = channel.id.as_deref()?;
+            let supersedes_it = group
+                .notification_channel_for_uri(&channel.uri)
+                .is_some_and(|stored| stored.id == named);
+            (group.has_notification_channel(named) && !supersedes_it).then_some(named)
+        }) {
             return Err(AddNotificationChannelsErrorModeled::ConflictException(
                 ConflictException {
                     message: format!(
@@ -294,22 +301,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "Add up to 2 anomaly notifications channels for a profiling group": the
-        // stored configuration cannot hold more than the model's `Channels` list
-        // allows, and the operation's own ServiceQuotaExceededException is that answer.
-        if group.notification_channels.len() + requested.len()
-            > crate::state::MAX_NOTIFICATION_CHANNELS_PER_GROUP
-        {
+        // "Add up to 2 anomaly notifications channels for a profiling group": the stored
+        // configuration cannot hold more than the model's `Channels` list allows, and the
+        // operation's own ServiceQuotaExceededException is that answer. Only a channel
+        // whose destination the configuration does not already cover grows it — one that
+        // replaces a stored channel leaves the channel count where it was — so what is
+        // measured against the limit is how many destinations the group would report to
+        // once the whole batch is stored.
+        let mut projected: Vec<&str> = group
+            .notification_channels
+            .iter()
+            .map(|channel| channel.uri.as_str())
+            .collect();
+        for channel in &requested {
+            if !projected.contains(&channel.uri.as_str()) {
+                projected.push(channel.uri.as_str());
+            }
+        }
+        if projected.len() > crate::state::MAX_NOTIFICATION_CHANNELS_PER_GROUP {
             return Err(
                 AddNotificationChannelsErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
+                        // The sentence this error class states, with the service limit
+                        // this operation is bounded by as its only variable part: it
+                        // reports WHICH limit was hit, not what the request asked for.
                         message: format!(
-                            "profiling group {} already has {} of {} notification channels; \
-                             remove one before adding {}",
-                            input.profiling_group_name,
-                            group.notification_channels.len(),
-                            crate::state::MAX_NOTIFICATION_CHANNELS_PER_GROUP,
-                            requested.len()
+                            "Channel limit exceeded: Only {} channels allowed per profiling group",
+                            crate::state::MAX_NOTIFICATION_CHANNELS_PER_GROUP
                         ),
                     },
                 )
@@ -322,7 +340,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // minted: a channel the request named no id for gets one from the STORE, the way
         // every UUID-shaped id this crate hands out is minted
         // (`state::mint_channel_id`), so no second way of making one is introduced here
-        // and no refused request moves the store's mint count.
+        // and no refused request moves the store's mint count. A channel that REPLACES a
+        // stored one is minted an id the same way, so the replacement is a channel of
+        // this call rather than the one it supersedes.
         //
         // `Channel$id`: "A random UUID for channelId is used when adding a channel to the
         // notification configuration if not specified in the request."
@@ -353,10 +373,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // `false` is unreachable while the two checks above hold — they are exactly the
-        // setter's own two refusals (a repeated id, the channel bound), and the ids
-        // minted after them repeat nothing — and answering the modelled server error for
-        // it keeps a dropped write from ever being reported as a stored one.
-        if !group.add_notification_channels(channels) {
+        // setter's own two refusals (an id that names another destination's channel, the
+        // channel bound on the destinations stored) and the ids minted after them name
+        // nothing — and answering the modelled server error for it keeps a dropped write
+        // from ever being reported as a stored one.
+        if !group.store_notification_channels(channels) {
             return Err(
                 AddNotificationChannelsErrorModeled::InternalServerException(
                     InternalServerException {
