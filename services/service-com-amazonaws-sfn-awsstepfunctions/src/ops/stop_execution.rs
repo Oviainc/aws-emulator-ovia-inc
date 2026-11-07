@@ -218,16 +218,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // names an execution this action is not for, which is a defect in the
             // REQUEST rather than an execution that is absent or a combination of
             // members that cannot hold together — so it is the ARN error every
-            // execution reader of this service refuses an ARN it does not serve with
-            // (`crate::state::read_execution_arn` answers the same `InvalidArn` for
-            // the `express` resource type a synchronous Express execution ARN
-            // carries), worded through the one ARN envelope.
+            // execution reader of this service refuses an ARN it does not serve with,
+            // naming the RESOURCE TYPE an Express execution's ARN carries
+            // ([`crate::state::EXPRESS_EXECUTION_RESOURCE`]), which is the one thing
+            // about the ARN that is not valid here.
             if express {
                 return Err(StopExecutionErrorModeled::InvalidArn(InvalidArn {
-                    message: Some(crate::state::invalid_arn_message(format!(
-                        "StopExecution is not supported by {} state machines: {}",
-                        crate::state::STATE_MACHINE_TYPE_EXPRESS, input.execution_arn
-                    ))),
+                    message: Some(crate::state::resource_type_not_valid_message(
+                        crate::state::EXPRESS_EXECUTION_RESOURCE,
+                    )),
                 })
                 .into());
             }

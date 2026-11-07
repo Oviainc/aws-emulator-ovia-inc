@@ -780,6 +780,44 @@ fn is_aws_managed_policy(arn: &str) -> bool {
         .is_some_and(|policy| policy.account == iam_store::AWS_MANAGED_POLICY_ACCOUNT)
 }
 
+/// The principal an IAM ROLE is, with the documents in force on it: the caller of a
+/// request another AWS service makes AS a role one of its own resources names — a state
+/// machine's execution role, which is the identity Step Functions uses that state
+/// machine's key as.
+///
+/// Such a caller holds exactly what a session of the role holds: the role's ARN is the
+/// spelling a key-policy statement names it by, the role's own identity-based policies
+/// are the documents in force on it, and a statement naming the ACCOUNT delegates the
+/// decision to those documents — the same two halves [`authorize_use`] weighs for a
+/// session. It presents no credential of the account's own, so nothing about it is
+/// unbounded: a role the IAM store holds no record for carries no documents, which
+/// leaves the key's own policy as the only authority over it.
+///
+/// Call it BEFORE this service's store is locked: it takes IAM's own.
+#[must_use]
+pub fn role_caller<Eng: Send + Sync + 'static>(engine: &Eng, role_arn: &str) -> Caller {
+    let mut caller = Caller {
+        arn: role_arn.to_string(),
+        principals: vec![role_arn.to_string()],
+        account: iam::account_principals(role_arn),
+        documents: Vec::new(),
+        account_credential: false,
+        unreadable_attachment: false,
+        on_behalf_of: None,
+    };
+    let Some(iam_state) = iam_store::service_state(engine) else {
+        return caller;
+    };
+    let store = iam_state.lock();
+    if let Some(policies) = store.principal_policies(role_arn) {
+        caller.documents = policies.documents;
+        // An attachment the collection resolved no document for is an entry of AWS's own
+        // catalog this emulator does not carry: a grant it cannot read.
+        caller.unreadable_attachment = !policies.uncarried.is_empty();
+    }
+    caller
+}
+
 /// The role name an STS assumed-role session ARN names.
 ///
 /// `sts:AssumeRole` reports the session as

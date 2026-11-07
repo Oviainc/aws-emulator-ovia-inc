@@ -128,6 +128,18 @@ use super::types::*;
 /// the member names the request spells them with.
 const MISSING_EXECUTION_FILTER: &str = "Must provide a StateMachine ARN or MapRun ARN";
 
+/// What this operation answers a request that combines `redriveFilter` with
+/// `stateMachineArn`.
+///
+/// `redriveFilter`'s own documentation states the rule and the outcome: "If you
+/// provide a state machine ARN in redriveFilter, the API returns a validation
+/// exception" — the filter is about the child workflow executions a Map Run redrove,
+/// so it is served only for the `mapRunArn` selector. The sentence is fixed text: the
+/// two members that cannot hold together are named in the service's own words, with
+/// nothing read from the request.
+const REDRIVE_FILTER_WITH_STATE_MACHINE: &str =
+    "RedriveFilter cannot be applied to ListExecutions call with StateMachine ARN";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -320,6 +332,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // "If you provide a state machine ARN in redriveFilter, the API returns a
+        // validation exception": the filter selects CHILD workflow executions by
+        // whether a Map Run redrove them, so it holds together only with the Map Run
+        // selector. The combination is judged on the REQUEST, before the state machine
+        // it names is resolved, so the refusal is the same whatever that state machine
+        // is and whether it exists at all.
+        if input.redrive_filter.is_some() {
+            return Err(ListExecutionsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(REDRIVE_FILTER_WITH_STATE_MACHINE.to_string()),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
         let Some(offset) = crate::state::page_offset(input.next_token.as_deref()) else {
             return Err(ListExecutionsErrorModeled::InvalidToken(InvalidToken {
                 message: Some(crate::state::invalid_token_message()),
@@ -373,10 +401,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `redriveFilter` selects by whether an execution was redriven, which the
-        // execution's own `redriveCount` records: `RedriveExecution` moves it, so
-        // `REDRIVEN` selects the executions a redrive was performed on.
-        let redrive_filter = input.redrive_filter.as_deref();
+        // A state machine's own listing is filtered by `statusFilter` alone:
+        // `redriveFilter` is refused above for this selector, so no execution is
+        // selected by a redrive state here.
         let matching: Vec<&crate::state::Execution> = store
             .executions_newest_first(&reference.state_machine_arn)
             .into_iter()
@@ -385,11 +412,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .status_filter
                     .as_deref()
                     .is_none_or(|status| execution.status == status)
-                    && match redrive_filter {
-                        Some("REDRIVEN") => execution.redrive_count > 0,
-                        Some("NOT_REDRIVEN") => execution.redrive_count == 0,
-                        _ => true,
-                    }
                     // A qualified ARN selects the executions that reference started:
                     // an execution is associated with the version it ran and, when it
                     // was started through one, with that alias.

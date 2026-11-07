@@ -121,6 +121,7 @@ use super::types::*;
 // this service names them: the store that writes them.
 use crate::state::{
     EVENT_EXECUTION_ABORTED, EVENT_EXECUTION_SUCCEEDED, EVENT_EXECUTION_TIMED_OUT,
+    STATE_ENTERED_SUFFIX, STATE_EXITED_SUFFIX,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -260,17 +261,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "This API action is not supported by EXPRESS state machines": an Express
         // execution keeps no history this API reads, so the ARN names an execution
         // this action is not for — a defect in the REQUEST rather than an execution
-        // that is absent.
+        // that is absent. It is refused by the RESOURCE TYPE an Express execution's
+        // ARN carries ([`crate::state::EXPRESS_EXECUTION_RESOURCE`]), the one refusal
+        // every reader of an ARN this service does not serve answers with.
         let express = store
             .state_machines
             .get(&execution.state_machine_arn)
             .is_some_and(|machine| machine.sm_type == crate::state::STATE_MACHINE_TYPE_EXPRESS);
         if express {
             return Err(GetExecutionHistoryErrorModeled::InvalidArn(InvalidArn {
-                message: Some(crate::state::invalid_arn_message(format!(
-                    "GetExecutionHistory is not supported by {} state machines: {}",
-                    crate::state::STATE_MACHINE_TYPE_EXPRESS, input.execution_arn
-                ))),
+                message: Some(crate::state::resource_type_not_valid_message(
+                    crate::state::EXPRESS_EXECUTION_RESOURCE,
+                )),
             })
             .into());
         }
@@ -663,15 +665,8 @@ fn iteration(stored: &crate::state::HistoryEvent) -> MapIterationEventDetails {
     }
 }
 
-/// The suffix every `<Type>StateEntered` event's type carries, which is what makes
-/// `stateEnteredEventDetails` the detail that event reports.
-const STATE_ENTERED_SUFFIX: &str = "StateEntered";
-
 /// A bound the scheduling state declared, as the modelled `timeoutInSeconds` and
 /// `heartbeatInSeconds` carry it.
 fn seconds(bound: Option<u64>) -> Option<i64> {
     bound.map(|seconds| i64::try_from(seconds).unwrap_or(i64::MAX))
 }
-
-/// The same for `<Type>StateExited`.
-const STATE_EXITED_SUFFIX: &str = "StateExited";

@@ -561,6 +561,20 @@ pub const EVENT_EXECUTION_ABORTED: &str = "ExecutionAborted";
 /// ends on.
 pub const EVENT_EXECUTION_TIMED_OUT: &str = "ExecutionTimedOut";
 
+/// The history event a `Fail` state writes on being entered, which is the definition
+/// itself declaring the run failed — the one error-tier event whose type name does not
+/// end the way the other failure events' do
+/// ([`observability::delivered_at_level`]).
+pub const EVENT_FAIL_STATE_ENTERED: &str = "FailStateEntered";
+
+/// The suffix every `<Type>StateEntered` event's type carries, which is what makes
+/// `stateEnteredEventDetails` the detail that event reports — in the history API and
+/// in the event as a logging configuration vends it alike.
+pub const STATE_ENTERED_SUFFIX: &str = "StateEntered";
+
+/// The same for `<Type>StateExited` and `stateExitedEventDetails`.
+pub const STATE_EXITED_SUFFIX: &str = "StateExited";
+
 // ---------------------------------------------------------------------------
 // Store bounds
 //

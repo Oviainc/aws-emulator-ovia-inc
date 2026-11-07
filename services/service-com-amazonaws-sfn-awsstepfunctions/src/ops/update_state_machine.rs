@@ -360,6 +360,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            // The same gate `CreateStateMachine` applies, over the role the state
+            // machine will RUN as once this update is applied: the one this request
+            // replaces it with, else the one the record already carries. The store is
+            // read for that one value and released before IAM's own is taken.
+            let role_arn = match input.role_arn.clone() {
+                Some(role_arn) => Some(role_arn),
+                None => {
+                    let store = state.lock();
+                    store
+                        .state_machines
+                        .get(&input.state_machine_arn)
+                        .map(|machine| machine.role_arn.clone())
+                }
+            };
+            if let Some(role_arn) = role_arn {
+                if crate::state::observability::log_destination_denied(
+                    &*self.engine,
+                    configuration,
+                    &role_arn,
+                ) {
+                    return Err(crate::scaffolded::Scaffolded::access_denied(
+                        crate::state::observability::LOG_DESTINATION_ACCESS_DENIED,
+                    ));
+                }
+            }
         }
 
         // `versionDescription`'s own documentation: "You can only specify the

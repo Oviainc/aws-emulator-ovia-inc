@@ -215,17 +215,22 @@ pub const MAX_CALL_CHAIN_DEPTH: u8 = 3;
 
 /// The longest the walk waits for ONE integration call to answer.
 ///
-/// Emulator bound: the call is served in THIS process, so a real one answers in
-/// microseconds, and the walk's own deadline cannot bound the time spent inside a
-/// call because the walk is blocked there rather than transitioning. A call that has
-/// not answered inside this fails the task with ASL's own timeout error instead of
-/// holding the blocking thread the walk runs on, which also clamps a target that
-/// holds its answer on purpose: `GetActivityTask` is a long poll, and this is what
-/// stops one from pinning a thread for its hold.
+/// Emulator bound: the call is served in THIS process, so a call that only reads or
+/// writes another service's store answers in microseconds, and the walk's own deadline
+/// cannot bound the time spent inside a call because the walk is blocked there rather
+/// than transitioning. A call that has not answered inside this fails the task with
+/// ASL's own timeout error instead of holding the blocking thread the walk runs on,
+/// which also clamps a target that holds its answer on purpose: `GetActivityTask` is a
+/// long poll, and this is what stops one from pinning a thread for its hold.
 ///
-/// It is the interpretation's own deadline, because a call that outlasts the time
-/// this emulator interprets a whole definition in has already lost its run.
-pub const MAX_CALL_DURATION: Duration = super::asl::MAX_INTERPRET_DURATION;
+/// It is WIDER than the interpretation's own deadline, because one call is not
+/// interpretation: a `lambda:invoke` task's call RUNS the caller's own function, which
+/// Lambda bounds by that function's `Timeout` and not by anything of this service's —
+/// so a ceiling at the interpreter's deadline would decide a slow function's outcome
+/// HERE, reporting the state's own timeout for a run the function's timeout ended.
+/// What bounds the thread a run holds across every call it makes is
+/// [`super::asl::MAX_CALL_WAIT_DURATION`], which this stays well inside.
+pub const MAX_CALL_DURATION: Duration = Duration::from_secs(10);
 
 /// The ARN namespace every service-integration `Resource` is written under: the
 /// `Resource` names Step Functions' own integration, not the target resource.

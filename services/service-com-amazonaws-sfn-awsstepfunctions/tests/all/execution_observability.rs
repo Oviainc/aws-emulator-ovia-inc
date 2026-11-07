@@ -48,13 +48,17 @@ const WAITING_DEFINITION: &str =
     r#"{"StartAt":"Hold","States":{"Hold":{"Type":"Wait","Seconds":30,"Next":"Done"},"Done":{"Type":"Succeed"}}}"#;
 
 /// Step Functions, CloudWatch and CloudWatch Logs over ONE engine.
-struct Observed {
+///
+/// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so a sibling
+/// suite that has to read what an execution DELIVERED mounts the three services through
+/// this rather than carrying a second copy of the setup.
+pub(crate) struct Observed {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Observed {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -79,7 +83,7 @@ impl Observed {
     }
 
     /// Call one Step Functions operation, requiring a 200.
-    async fn ok(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -89,7 +93,7 @@ impl Observed {
     }
 
     /// Call one CloudWatch Logs operation, requiring a 200.
-    async fn logs(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn logs(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self
             .dispatch("logs", "Logs_20140328", "1.1", operation, body)
             .await;
@@ -172,7 +176,7 @@ fn log_group_arn(name: &str) -> String {
 }
 
 /// A `loggingConfiguration` delivering to `name` at `level`.
-fn logging(level: &str, name: &str, include_execution_data: bool) -> Value {
+pub(crate) fn logging(level: &str, name: &str, include_execution_data: bool) -> Value {
     json!({
         "level": level,
         "includeExecutionData": include_execution_data,
@@ -181,7 +185,7 @@ fn logging(level: &str, name: &str, include_execution_data: bool) -> Value {
 }
 
 /// Create a state machine, answering its ARN.
-async fn create(
+pub(crate) async fn create(
     observed: &Observed,
     name: &str,
     definition: &str,
@@ -437,7 +441,7 @@ async fn a_logging_level_selects_the_events_delivered() {
         (
             "ERROR logs the failures alone",
             Some(observability::LOG_LEVEL_ERROR),
-            vec!["ExecutionFailed"],
+            vec!["FailStateEntered", "ExecutionFailed"],
         ),
         (
             "FATAL logs the execution-level failures",
@@ -527,15 +531,17 @@ async fn a_logging_level_selects_the_events_delivered() {
     }
 }
 
-/// `includeExecutionData` decides whether the data an event carries is delivered with
-/// it: the same run, logged at `ALL`, carries the failure's error and cause only where
-/// the configuration asks for them.
+/// `includeExecutionData` decides whether the PAYLOAD an event carries is delivered
+/// with it: the same run, logged at `ALL`, carries the document it was started with only
+/// where the configuration asks for it — while the failure's own error and cause, which
+/// are the transition rather than the payload, are delivered either way.
 #[tokio::test]
 async fn execution_data_is_delivered_only_where_it_is_asked_for() {
     let observed = Observed::new();
-    for (index, (case, include, carries_data)) in [
-        ("the configuration includes execution data", true, true),
-        ("the configuration excludes it", false, false),
+    let marker = "payload-marker";
+    for (index, (case, include)) in [
+        ("the configuration includes execution data", true),
+        ("the configuration excludes it", false),
     ]
     .into_iter()
     .enumerate()
@@ -552,7 +558,11 @@ async fn execution_data_is_delivered_only_where_it_is_asked_for() {
         let started = observed
             .ok(
                 "StartExecution",
-                &json!({ "stateMachineArn": machine, "name": "run" }),
+                &json!({
+                    "stateMachineArn": machine,
+                    "name": "run",
+                    "input": format!("{{\"marker\":\"{marker}\"}}"),
+                }),
             )
             .await;
         let execution = string(&started, "executionArn");
@@ -577,11 +587,17 @@ async fn execution_data_is_delivered_only_where_it_is_asked_for() {
             !messages.is_empty(),
             "case {case:?}: expected the run's events to be delivered, got {found:?}"
         );
-        let names_the_error = messages.iter().any(|message| message.contains("Boom"));
+        let carries_payload = messages.iter().any(|message| message.contains(marker));
         assert_eq!(
-            names_the_error, carries_data,
-            "case {case:?}: expected the delivered data to be present={carries_data}, got \
+            carries_payload, include,
+            "case {case:?}: expected the execution data to be present={include}, got \
              {messages:?}"
+        );
+        // The error and the cause of the failure are not execution data, so they are
+        // delivered whatever the configuration says about the payload.
+        assert!(
+            messages.iter().any(|message| message.contains("Boom")),
+            "case {case:?}: expected the failure's error to be delivered, got {messages:?}"
         );
     }
 }

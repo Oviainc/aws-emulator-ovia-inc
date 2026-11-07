@@ -397,7 +397,7 @@ impl Interpreter<'_> {
                 Ok(StateStep {
                     value,
                     at,
-                    next: self.next_of(name, state).map_err(|failure| failure.at(at))?,
+                    next: self.next_of(state).map_err(|failure| failure.at(at))?,
                 })
             }
             "Wait" => {
@@ -413,7 +413,7 @@ impl Interpreter<'_> {
                 Ok(StateStep {
                     value,
                     at,
-                    next: self.next_of(name, state).map_err(|failure| failure.at(at))?,
+                    next: self.next_of(state).map_err(|failure| failure.at(at))?,
                 })
             }
             "Choice" => {
@@ -450,7 +450,7 @@ impl Interpreter<'_> {
                 })
             }
             "Fail" => {
-                self.push_entered("FailStateEntered", name, at, &raw);
+                self.push_entered(super::super::EVENT_FAIL_STATE_ENTERED, name, at, &raw);
                 // A `Fail` state ends the execution with the error and cause it
                 // declares, both of which ASL leaves optional and either of which
                 // may instead be read from the state's input — through a `*Path` in
@@ -770,7 +770,7 @@ impl Interpreter<'_> {
                 )
                 .map_err(|failure| failure.at(at))?;
             self.push_exited("TaskStateExited", name, at, &value);
-            let next = self.next_of(name, state).map_err(|failure| failure.at(at))?;
+            let next = self.next_of(state).map_err(|failure| failure.at(at))?;
             return Ok(StateStep { value, at, next });
         }
         self.waiting = Some(ScheduledActivity {
@@ -1075,7 +1075,7 @@ impl Interpreter<'_> {
                     .produced(state, language, raw, effective, Some(result), context, true)
                     .map_err(|failure| failure.at(at))?;
                 self.push_exited("TaskStateExited", name, at, &value);
-                let next = self.next_of(name, state).map_err(|failure| failure.at(at))?;
+                let next = self.next_of(state).map_err(|failure| failure.at(at))?;
                 Ok(StateStep { value, at, next })
             }
             Err(failure) => {
@@ -1113,19 +1113,17 @@ impl Interpreter<'_> {
     }
 
     /// Where the walk goes after a state that carries `Next` or `"End": true`.
-    pub(super) fn next_of(
-        &self,
-        name: &str,
-        state: &Map<String, Value>,
-    ) -> Result<Next, Failure> {
+    ///
+    /// A state carrying neither decided no next state, which is the same failure to
+    /// transition an unmatched `Choice` without a `Default` is ([`NO_NEXT_STATE`]), so
+    /// it is reported with the same diagnosis — the state names itself around it.
+    pub(super) fn next_of(&self, state: &Map<String, Value>) -> Result<Next, Failure> {
         if state.get("End").and_then(Value::as_bool) == Some(true) {
             return Ok(Next::EndBranch);
         }
         match state.get("Next").and_then(Value::as_str) {
             Some(next) => Ok(Next::Named(next.to_string())),
-            None => Err(runtime(format!(
-                "state '{name}' carries neither 'Next' nor \"End\": true"
-            ))),
+            None => Err(runtime(NO_NEXT_STATE.to_string())),
         }
     }
 
@@ -1366,7 +1364,7 @@ impl Interpreter<'_> {
                     )
                     .map_err(jsonata_failure)?
                 }
-                _ => condition_matches(rule, input, context)?,
+                _ => condition_matches(rule, input, context).map_err(choice_condition_failure)?,
             };
             if !matched {
                 continue;
@@ -1404,21 +1402,21 @@ impl Interpreter<'_> {
                 next: default.to_string(),
                 output: None,
             }),
-            // A `Choice` that no rule matched and that declares no `Default` has
-            // nowhere to go, so the execution ends at it — under the name the
-            // interpreter raises every failure of its own under
-            // ([`RUNTIME_ERROR`]), which is the name RECORDED for this outcome,
-            // with the cause saying what could not be decided.
-            None => Err(runtime(
-                "no choice rule matched the state's input and the state declares no 'Default'"
-                    .to_string(),
-            )),
+            // A `Choice` that no rule matched and that declares no `Default` decided
+            // no next state, so the execution ends AT it — under the name the
+            // interpreter raises every failure of its own under ([`RUNTIME_ERROR`]),
+            // which is the name RECORDED for this outcome, with the one diagnosis
+            // every state that cannot be left reports ([`NO_NEXT_STATE`]): the state
+            // names itself around it, so the cause carries the stuck state and the
+            // event it was entered at.
+            None => Err(runtime(NO_NEXT_STATE.to_string())),
         }
     }
 
     // -----------------------------------------------------------------------
     // Task
     // -----------------------------------------------------------------------
+
 
     /// Run a `Task` state: do the work its `Resource` names, and place what came of
     /// it.
@@ -1873,7 +1871,7 @@ impl Interpreter<'_> {
                     value,
                     at: end,
                     next: self
-                        .next_of(name, state)
+                        .next_of(state)
                         .map_err(|failure| failure.at(end))?,
                 })
             }
@@ -2077,7 +2075,7 @@ impl Interpreter<'_> {
                     value,
                     at: end,
                     next: self
-                        .next_of(name, state)
+                        .next_of(state)
                         .map_err(|failure| failure.at(end))?,
                 })
             }
@@ -2843,5 +2841,29 @@ impl Interpreter<'_> {
                 "'{member}' must be a non-negative number, not {value}"
             ))
         })
+    }
+}
+
+/// A `Choice` rule's condition failure as the state reports it.
+///
+/// A rule reads the state's input through paths — the `Variable` it compares and the
+/// `*Path` form of a comparator's operand — and a path that resolves to nothing is a
+/// failure of the CONDITION rather than of the state's own data flow, which is why it
+/// is reported under the service's choice-condition diagnosis
+/// ([`CHOICE_CONDITION_PATH_INVALID`]) and not under the path diagnosis every other
+/// member of a state reports ([`no_results_for_path`]). Every other reason a condition
+/// could not be evaluated — a comparator the service does not define, an operand of the
+/// wrong type — already says what it was, so it is carried as raised.
+fn choice_condition_failure(failure: Failure) -> Failure {
+    let unresolved_path = failure
+        .cause
+        .as_deref()
+        .is_some_and(|cause| cause.starts_with(INVALID_PATH_OPENING));
+    if !unresolved_path {
+        return failure;
+    }
+    Failure {
+        error: failure.error,
+        cause: Some(CHOICE_CONDITION_PATH_INVALID.to_string()),
     }
 }

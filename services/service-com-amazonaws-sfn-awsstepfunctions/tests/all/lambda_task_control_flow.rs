@@ -110,12 +110,16 @@ const SFN_TARGET_PREFIX: &str = "AWSStepFunctions";
 
 /// Step Functions and Lambda over ONE engine, so the invocation a task makes is served
 /// by the very function the test created.
-struct Chain {
+///
+/// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so a sibling
+/// suite that drives a Lambda task mounts the two services through this rather than
+/// carrying a second copy of the setup.
+pub(crate) struct Chain {
     router: MultiServiceRouter,
 }
 
 impl Chain {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -137,7 +141,7 @@ impl Chain {
     }
 
     /// One Step Functions call, requiring a 200.
-    async fn sfn(&self, case: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn sfn(&self, case: &str, operation: &str, body: &Value) -> Value {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -180,19 +184,29 @@ impl Chain {
     /// The poller's function, waited out to [`FUNCTION_ACTIVE`] so an invocation of it
     /// is one Lambda admits; answers its ARN.
     async fn given_function(&self, name: &str) -> String {
-        let (status, created) = self
-            .lambda(
-                "POST",
-                FUNCTIONS_URI,
-                &json!({
-                    "FunctionName": name,
-                    "Role": LAMBDA_ROLE_ARN,
-                    "Runtime": RUNTIME,
-                    "Handler": HANDLER,
-                    "Code": { "ZipFile": package(HANDLER_SOURCE) },
-                }),
-            )
-            .await;
+        self.given_function_of(name, HANDLER_SOURCE, None).await
+    }
+
+    /// [`Self::given_function`] over a package of `source` and the function's own
+    /// `Timeout` where one is asked for, for a suite whose rule is about what the
+    /// function's own bounds do to the task that invoked it.
+    pub(crate) async fn given_function_of(
+        &self,
+        name: &str,
+        source: &str,
+        timeout_seconds: Option<u64>,
+    ) -> String {
+        let mut request = json!({
+            "FunctionName": name,
+            "Role": LAMBDA_ROLE_ARN,
+            "Runtime": RUNTIME,
+            "Handler": HANDLER,
+            "Code": { "ZipFile": package(source) },
+        });
+        if let Some(seconds) = timeout_seconds {
+            request["Timeout"] = json!(seconds);
+        }
+        let (status, created) = self.lambda("POST", FUNCTIONS_URI, &request).await;
         assert_eq!(
             status, 201,
             "CreateFunction must answer 201, got {status} with {created}"
@@ -226,7 +240,13 @@ impl Chain {
 
     /// Create `definition` as a state machine, start one execution of it with `input`,
     /// and report that execution once it has left `RUNNING`.
-    async fn ran(&self, case: &str, name: &str, definition: &Value, input: &Value) -> Value {
+    pub(crate) async fn ran(
+        &self,
+        case: &str,
+        name: &str,
+        definition: &Value,
+        input: &Value,
+    ) -> Value {
         let created = self
             .sfn(
                 case,

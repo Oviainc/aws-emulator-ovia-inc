@@ -37,7 +37,7 @@ use service_com_amazonaws_sfn_awsstepfunctions::state::{
 };
 
 use crate::state_machine_lifecycle::{
-    create_machine, discriminated, string, Emulator, HELLO_DEFINITION, ROLE_ARN,
+    create_machine, discriminated, error_code, string, Emulator, HELLO_DEFINITION, ROLE_ARN,
 };
 
 /// Long enough that an outcome the clock owed has become due.
@@ -370,8 +370,7 @@ async fn redrive_refuses_what_the_projection_reports_as_not_redrivable() {
 /// A redrive re-runs the execution and is RECORDED on it: the count moves by one per
 /// redrive, `redriveDate` is the instant the call answered and does not change
 /// between reads, the execution is non-terminal again until the clock makes the
-/// re-run's outcome due, and `ListExecutions`' `redriveFilter` selects by the same
-/// record.
+/// re-run's outcome due, and `ListExecutions` reports the same record.
 #[tokio::test]
 async fn a_redrive_is_recorded_on_the_execution_and_read_back() {
     let emulator = Emulator::new();
@@ -478,39 +477,47 @@ async fn a_redrive_is_recorded_on_the_execution_and_read_back() {
         previous_date = Some(answered);
     }
 
-    // `ListExecutions` reports the same record, and its `redriveFilter` selects by
-    // it: REDRIVEN names this execution, NOT_REDRIVEN names none.
-    for (case, filter, expected) in [
-        ("no filter", None, 1),
-        ("REDRIVEN", Some("REDRIVEN"), 1),
-        ("NOT_REDRIVEN", Some("NOT_REDRIVEN"), 0),
-    ] {
-        let mut request = json!({ "stateMachineArn": machine });
-        if let Some(filter) = filter {
-            request["redriveFilter"] = json!(filter);
-        }
-        let listed = emulator.ok("ListExecutions", &request).await;
-        let executions = listed
-            .get("executions")
-            .and_then(Value::as_array)
-            .unwrap_or_else(|| panic!("case {case:?}: expected an executions list in {listed:?}"));
+    // `ListExecutions` reports the same record, and the listing scoped to the state
+    // machine names no `redriveFilter`: "if you provide a state machine ARN in
+    // redriveFilter, the API returns a validation exception", so the filter is served
+    // for the Map Run selector alone.
+    let listed = emulator
+        .ok("ListExecutions", &json!({ "stateMachineArn": machine }))
+        .await;
+    let executions = listed
+        .get("executions")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("expected an executions list in {listed:?}"));
+    assert_eq!(
+        executions.len(),
+        1,
+        "expected the one execution of the state machine, got {listed:?}"
+    );
+    for item in executions {
         assert_eq!(
-            executions.len(),
-            expected,
-            "case {case:?}: expected {expected} execution(s), got {listed:?}"
+            item.get("redriveCount").and_then(Value::as_i64),
+            Some(2),
+            "the list item carries the stored redriveCount, got {item:?}"
         );
-        for item in executions {
-            assert_eq!(
-                item.get("redriveCount").and_then(Value::as_i64),
-                Some(2),
-                "case {case:?}: the list item carries the stored redriveCount, got {item:?}"
-            );
-            assert_eq!(
-                item.get("redriveDate"),
-                previous_date.as_ref(),
-                "case {case:?}: the list item carries the stored redriveDate, got {item:?}"
-            );
-        }
+        assert_eq!(
+            item.get("redriveDate"),
+            previous_date.as_ref(),
+            "the list item carries the stored redriveDate, got {item:?}"
+        );
+    }
+    for filter in ["REDRIVEN", "NOT_REDRIVEN"] {
+        let (status, answered) = emulator
+            .call(
+                "ListExecutions",
+                &json!({ "stateMachineArn": machine, "redriveFilter": filter }),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (400, "ValidationException"),
+            "case {filter:?}: expected the filter to be refused beside a state machine ARN, got \
+             {status} {answered:?}"
+        );
     }
 }
 

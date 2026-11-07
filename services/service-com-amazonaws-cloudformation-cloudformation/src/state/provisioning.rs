@@ -993,7 +993,8 @@ impl Owner {
                 .await
             }
             Self::StepFunctionsStateMachine => {
-                step_functions_state_machine::update(ctx, region, resource, declared).await
+                step_functions_state_machine::update(ctx, region, resource, declared, propagated)
+                    .await
             }
         }
     }
@@ -2015,8 +2016,34 @@ pub async fn reconcile(
                     // ENDS the resource is pushed after the tags are in step too, below, so
                     // `UPDATE_COMPLETE` means both halves of the change landed.
                     Ok(Some(updated)) => {
+                        // An update that answers with a DIFFERENT physical id did not
+                        // change the resource that was there: it REPLACED it. The stack
+                        // publishes the id the owning service just minted, and the resource
+                        // it replaced is taken down below — the cleanup CloudFormation
+                        // performs for the old physical resource of a replacement, whose
+                        // documented default is to delete it (the `UpdateReplacePolicy`
+                        // values that say otherwise are not recorded on a resource yet, so
+                        // none is read here).
+                        let superseded = match &updated.physical_resource_id {
+                            Some(minted) if *minted != resource.physical_resource_id => {
+                                let replaced = resource.clone();
+                                resource.physical_resource_id = minted.clone();
+                                Some(replaced)
+                            }
+                            _ => None,
+                        };
                         resource.attributes.extend(updated.attributes);
                         resource.properties = declared_properties.clone();
+                        if let Some(replaced) = superseded {
+                            if let Some(owner) = owner_for(&replaced.resource_type) {
+                                // What the owning service answers changes nothing about
+                                // this deployment: the replacement is already in force, and
+                                // a resource it could not take down is not a resource the
+                                // stack still publishes.
+                                let _taken_down =
+                                    owner.delete(ctx, region, &replaced, None).await;
+                            }
+                        }
                         // ...and whether the change has been CARRIED OUT is that service's
                         // to say, exactly as it is for a create: a change it accepted
                         // without having applied it yet holds the resource — and so the

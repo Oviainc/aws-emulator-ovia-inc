@@ -275,6 +275,31 @@ fn no_results_for_path(path: &str) -> String {
     format!("{INVALID_PATH_OPENING}{path}' : No results for path: {path}")
 }
 
+/// The diagnosis for a state the walk reached and could not LEAVE: the state decided
+/// no next state, so the execution ends at it.
+///
+/// It is one diagnosis for every way a state can fail to transition — a `Choice` no
+/// rule matched and that declares no `Default`, and a state carrying neither `Next`
+/// nor `"End": true` — because what a reader has to be told is the same in each: the
+/// run stopped at this state because nothing said where to go next. The state names
+/// itself around it ([`executing_state`], through [`names_its_state`]), so the cause
+/// carries the stuck state and the id of the event it was entered at, which is what
+/// tells it apart from the other failures raised under [`RUNTIME_ERROR`].
+const NO_NEXT_STATE: &str =
+    "Failed to transition out of the state. The state does not point to a next state.";
+
+/// The diagnosis for a `Choice` rule whose condition reads a path the state's input
+/// does not resolve.
+///
+/// RECORDED text: the service does not quote the path back for this one — it states
+/// that the condition path of the choice state references a value that is not there,
+/// which is a different outcome from the state deciding no transition
+/// ([`NO_NEXT_STATE`]), so a caller classifying a [`RUNTIME_ERROR`] by its cause can
+/// tell a condition it could not evaluate from a `Choice` that matched nothing. The
+/// state names itself around it ([`executing_state`], through [`names_its_state`]).
+const CHOICE_CONDITION_PATH_INVALID: &str =
+    "The choice state's condition path references an invalid value.";
+
 /// `fault` as the state it happened IN reports it: a diagnosis this module worded
 /// about that state's own expression is reported under [`executing_state`], naming the
 /// state and the event id it was entered at.
@@ -303,11 +328,14 @@ fn diagnosed(name: &str, entered_at: i64, fault: Fault) -> Fault {
     }
 }
 
-/// Whether `cause` is a diagnosis this module worded about the expression of the state
-/// being executed, so that state names itself around it ([`diagnosed`]) rather than
-/// carrying a name of its own.
+/// Whether `cause` is a diagnosis this module worded about the state being executed —
+/// its own expression, the condition path of a `Choice` rule, or its failure to
+/// transition out of it — so that state names itself around it ([`diagnosed`]) rather
+/// than carrying a name of its own.
 fn names_its_state(cause: &str) -> bool {
     cause.starts_with(INVALID_PATH_OPENING)
+        || cause == NO_NEXT_STATE
+        || cause == CHOICE_CONDITION_PATH_INVALID
 }
 
 /// What a `Wait` state's members failing to evaluate reports.
@@ -2975,9 +3003,7 @@ impl Interpreter<'_> {
                 Ok(StateStep {
                     value,
                     at: end,
-                    next: self
-                        .next_of(name, state)
-                        .map_err(|failure| failure.at(end))?,
+                    next: self.next_of(state).map_err(|failure| failure.at(end))?,
                 })
             }
             Err(failure) => self.catch_or_fail(

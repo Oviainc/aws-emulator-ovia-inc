@@ -375,6 +375,8 @@ mod stack_tag_propagation;
 mod stack_teardown_events;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/step_functions_state_machine_replacement.rs"]
+mod step_functions_state_machine_replacement;
 #[path = "all/stop_stack_set_operation.rs"]
 mod stop_stack_set_operation;
 #[path = "all/stored_stack_policy_validation.rs"]

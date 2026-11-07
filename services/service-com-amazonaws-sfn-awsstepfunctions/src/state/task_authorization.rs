@@ -83,7 +83,12 @@ pub const SERVICE_PRINCIPAL: &str = "states.amazonaws.com";
 /// The REGIONAL service principal of the same service, which a trust policy may name
 /// instead: the service assumes the role as either, so a role trusting the Region's own
 /// principal is one it can act as.
-fn regional_service_principal(region: &str) -> String {
+///
+/// It is also the service's REGIONAL ENDPOINT name, which is the value of the
+/// `kms:ViaService` condition key for a use of a key this service makes on the
+/// account's behalf ([`super::encryption`]): the two are the same string, so it is
+/// spelled in one place.
+pub fn regional_service_principal(region: &str) -> String {
     format!("states.{region}.amazonaws.com")
 }
 
@@ -245,6 +250,48 @@ pub fn role_denial<Eng: Send + Sync + 'static>(
     denial
 }
 
+/// Whether this account HOLDS a role under `role_arn`, which is what makes a decision
+/// about that role's permissions possible at all.
+///
+/// A role no IAM record answers for — and an engine carrying no IAM store — is evidence
+/// of nothing, so neither can be the basis of a refusal: the deploy-time/run-time split
+/// this service exposes lets a state machine carry a `roleArn` the account does not
+/// hold, and nothing is refused on documents that cannot be read (see the module docs).
+#[must_use]
+pub fn iam_holds_role<Eng: Send + Sync + 'static>(engine: &Eng, role_arn: &str) -> bool {
+    let Some(iam) = iam_state(engine) else {
+        return false;
+    };
+    let iam = iam.lock();
+    iam.roles.values().any(|role| role.arn == role_arn)
+}
+
+/// Whether the role `role_arn` may not perform EVERY one of `actions` on `resource`.
+///
+/// The same reading as [`role_denial`], for a decision whose own refusal is not an
+/// invoked service's message but a sentence of THIS service's: a capability a state
+/// machine's role needs is often several actions at once, and the role has it only
+/// when its documents allow all of them. `false` wherever nothing can be shown — an
+/// engine with no IAM store, a role this account does not hold, a role carrying a
+/// grant this emulator cannot read — exactly as that function reports it.
+pub fn role_is_denied<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    role_arn: &str,
+    actions: &[&str],
+    resource: &str,
+) -> bool {
+    if role_arn.is_empty() {
+        return false;
+    }
+    let Some(iam) = iam_state(engine) else {
+        return false;
+    };
+    let iam = iam.lock();
+    actions
+        .iter()
+        .any(|action| not_authorized(&iam, role_arn, action, resource).is_some())
+}
+
 /// The sentence the invoked service refuses the call with when the role `role_arn`
 /// may not perform `action` on `resource`, or `None` when nothing of the kind can be
 /// shown (see the module docs for the cases that show nothing).
@@ -262,6 +309,29 @@ fn refusal(
     action: &str,
     resource: &str,
     service: &str,
+) -> Option<String> {
+    let sentence = not_authorized(iam, role_arn, action, resource)?;
+    Some(super::integration::sdk_exception_message(
+        service,
+        &sentence,
+        ACCESS_DENIED_CODE,
+        ACCESS_DENIED_STATUS,
+        None,
+    ))
+}
+
+/// IAM's own not-authorized sentence for the role `role_arn` performing `action` on
+/// `resource`, or `None` when nothing of the kind can be shown (see the module docs for
+/// the cases that show nothing).
+///
+/// The ONE decision about a state machine's role in this crate: whatever the refusal is
+/// then reported AS — an invoked service's SDK exception ([`refusal`]), or a sentence
+/// this service words itself — the documents are read here, in this order.
+fn not_authorized(
+    iam: &IamState,
+    role_arn: &str,
+    action: &str,
+    resource: &str,
 ) -> Option<String> {
     iam.roles.values().find(|role| role.arn == role_arn)?;
     // The documents in force on the role. The collection is bounded by IAM's own
@@ -310,15 +380,8 @@ fn refusal(
     };
     // The acting principal is the role itself: the emulator assumes no session for a
     // `Task` state's call, so there is no session name to report it under.
-    let sentence = format!(
+    Some(format!(
         "User: {role_arn} is not authorized to perform: {action} on resource: {resource} \
          {because}"
-    );
-    Some(super::integration::sdk_exception_message(
-        service,
-        &sentence,
-        ACCESS_DENIED_CODE,
-        ACCESS_DENIED_STATUS,
-        None,
     ))
 }

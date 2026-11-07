@@ -7,10 +7,14 @@
 //!
 //! The rule under test: a path a state could not resolve fails the execution with
 //! `States.Runtime`, and the cause names the STATE that was being executed, the id of
-//! the history event that state was entered at, and the path — "An error occurred
-//! while executing the state '<name>' (entered at the event id #<id>). Invalid path
-//! '<path>' : No results for path: <path>" — so a definition carrying many states that
-//! read the same path still says which one failed and where in the history it failed.
+//! the history event that state was entered at, and then what could not be resolved —
+//! "An error occurred while executing the state '<name>' (entered at the event id
+//! #<id>). <diagnosis>" — so a definition carrying many states that read the same path
+//! still says which one failed and where in the history it failed. The diagnosis is the
+//! path itself ("Invalid path '<path>' : No results for path: <path>") for every member
+//! of a state, and the service's own choice-condition sentence for a path a `Choice`
+//! rule's condition reads, which is the one place the service does not quote the path
+//! back.
 //!
 //! The rows differ along what the rule generalises over: which MEMBER names the path (a
 //! `Choice` rule's `Variable`, the same rule's `*Path` operand, `OutputPath`, a `Wait`
@@ -61,6 +65,9 @@ struct Row {
     /// then has to declare: a state no state reaches is not a definition this service
     /// accepts.
     transitions_to_done: bool,
+    /// Whether the path is one a `Choice` rule's CONDITION reads, which the service
+    /// reports with its own choice-condition sentence rather than by quoting the path.
+    in_a_choice_condition: bool,
 }
 
 fn rows() -> Vec<Row> {
@@ -76,6 +83,7 @@ fn rows() -> Vec<Row> {
             path: "$.status",
             entered_event: "ChoiceStateEntered",
             transitions_to_done: true,
+            in_a_choice_condition: true,
         },
         Row {
             case: "a Choice rule's *Path operand, a nested member the input stops short of",
@@ -93,6 +101,7 @@ fn rows() -> Vec<Row> {
             path: "$.expected.count",
             entered_event: "ChoiceStateEntered",
             transitions_to_done: true,
+            in_a_choice_condition: true,
         },
         Row {
             case: "an OutputPath over what the state produced",
@@ -102,6 +111,7 @@ fn rows() -> Vec<Row> {
             path: "$['chosen']",
             entered_event: "PassStateEntered",
             transitions_to_done: false,
+            in_a_choice_condition: false,
         },
         Row {
             case: "a Wait state's SecondsPath",
@@ -111,6 +121,7 @@ fn rows() -> Vec<Row> {
             path: "$.delay",
             entered_event: "WaitStateEntered",
             transitions_to_done: false,
+            in_a_choice_condition: false,
         },
         Row {
             case: "a Fail state's CausePath",
@@ -120,6 +131,7 @@ fn rows() -> Vec<Row> {
             path: "$.why",
             entered_event: "FailStateEntered",
             transitions_to_done: false,
+            in_a_choice_condition: false,
         },
         Row {
             case: "a Map state's ItemsPath",
@@ -137,6 +149,7 @@ fn rows() -> Vec<Row> {
             path: "$.items",
             entered_event: "MapStateEntered",
             transitions_to_done: false,
+            in_a_choice_condition: false,
         },
         Row {
             case: "a path into the context object the execution carries no value for",
@@ -146,6 +159,7 @@ fn rows() -> Vec<Row> {
             path: "$$.Map.Item.Value",
             entered_event: "PassStateEntered",
             transitions_to_done: false,
+            in_a_choice_condition: false,
         },
     ]
 }
@@ -176,12 +190,22 @@ fn definition(row: &Row) -> String {
 
 /// The cause the service words for a path that selected no value in state `name`,
 /// entered at event `entered`.
-fn expected_cause(name: &str, entered: i64, path: &str) -> String {
-    format!(
-        "An error occurred while executing the state '{name}' (entered at the event id \
-         #{entered}). Invalid path '{path}' : No results for path: {path}"
-    )
+///
+/// `in_a_choice_condition` selects the diagnosis: a path a `Choice` rule's condition
+/// reads is reported as the condition referencing a value that is not there, and every
+/// other member of a state is reported with the path itself.
+fn expected_cause(name: &str, entered: i64, path: &str, in_a_choice_condition: bool) -> String {
+    let diagnosis = if in_a_choice_condition {
+        CHOICE_CONDITION_DIAGNOSIS.to_string()
+    } else {
+        format!("Invalid path '{path}' : No results for path: {path}")
+    };
+    format!("An error occurred while executing the state '{name}' (entered at the event id #{entered}). {diagnosis}")
 }
+
+/// What the service states about a path a `Choice` rule's condition could not resolve.
+const CHOICE_CONDITION_DIAGNOSIS: &str =
+    "The choice state's condition path references an invalid value.";
 
 /// The id of the one event of `event_type` naming the state `name`.
 fn entered_event_id(events: &[Value], case: &str, event_type: &str, name: &str) -> i64 {
@@ -245,7 +269,7 @@ async fn an_unresolved_path_names_the_state_and_the_event_it_was_entered_at() {
             "case {case:?}: expected the state to be entered at event #{expected_entered}, got \
              #{entered} in {events:?}"
         );
-        let expected = expected_cause(FAILING, entered, row.path);
+        let expected = expected_cause(FAILING, entered, row.path, row.in_a_choice_condition);
         let cause = string(&described, "cause");
         assert_eq!(
             cause, expected,
@@ -300,7 +324,7 @@ async fn a_nested_state_names_itself_rather_than_the_map_around_it() {
     );
     let events = history(&emulator, &execution, json!({})).await;
     let entered = entered_event_id(&events, case, "ChoiceStateEntered", FAILING);
-    let expected = expected_cause(FAILING, entered, "$.status");
+    let expected = expected_cause(FAILING, entered, "$.status", true);
     let cause = string(&described, "cause");
     assert_eq!(
         cause, expected,

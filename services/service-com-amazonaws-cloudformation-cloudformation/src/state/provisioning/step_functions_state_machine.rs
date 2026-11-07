@@ -176,13 +176,16 @@ pub(super) fn readiness() -> Readiness {
 /// `UpdateStateMachine` — which takes "the Amazon States Language definition", the
 /// `roleArn`, and the logging, tracing and encryption configurations.
 ///
-/// `Ok(None)` is a change that call cannot make, so the deployment reports it as not applied
-/// rather than as a success that dropped it:
+/// A change to a property that cannot be made on the machine that exists is applied by
+/// REPLACING it ([`REPLACEMENT_PROPERTIES`], [`replacement`]): the machine's NAME and its
+/// TYPE are its identity, which `UpdateStateMachine` carries neither of, so a declaration
+/// that changes either is deployed as a new machine whose ARN the stack then publishes.
 ///
-/// * the machine's NAME and its TYPE are its identity (both require the resource to be
-///   replaced), and `UpdateStateMachine` carries neither;
-/// * a changed `Tags` set, which that call does not carry either — a state machine's tags
-///   are written by `TagResource`/`UntagResource`, which no arm here makes yet;
+/// `Ok(None)` is left for a change neither call can make, so the deployment reports it as
+/// not applied rather than as a success that dropped it:
+///
+/// * a changed `Tags` set, which `UpdateStateMachine` does not carry — a state machine's
+///   tags are written by `TagResource`/`UntagResource`, which no arm here makes yet;
 /// * a configuration the new declaration DROPS (`LoggingConfiguration`,
 ///   `TracingConfiguration`, `EncryptionConfiguration`): `UpdateStateMachine` leaves a member
 ///   it does not carry as it was, so there is no call in it that resets one to its default.
@@ -191,13 +194,18 @@ pub(super) async fn update(
     region: &str,
     resource: &StoredResource,
     declared: &Value,
+    propagated: &[(String, String)],
 ) -> Result<Option<Created>, Refusal> {
     refuse_unmapped_declaration(&resource.resource_type, declared)?;
-    if text_property(declared, "StateMachineName") != text_property(&resource.properties, "StateMachineName")
-        || text_property(declared, "StateMachineType")
-            != text_property(&resource.properties, "StateMachineType")
-        || declared.get("Tags") != resource.properties.get("Tags")
-    {
+    let replaced = REPLACEMENT_PROPERTIES.iter().any(|property| {
+        text_property(declared, property) != text_property(&resource.properties, property)
+    });
+    if replaced {
+        return replacement(ctx, region, resource, declared, propagated)
+            .await
+            .map(Some);
+    }
+    if declared.get("Tags") != resource.properties.get("Tags") {
         return Ok(None);
     }
     let mut request = Map::new();
@@ -238,6 +246,79 @@ pub(super) async fn update(
     // every attribute read off it — is unchanged.
     Ok(Some(Created::default()))
 }
+
+/// The properties of this type that cannot be changed on the machine that EXISTS, so a
+/// declaration changing one of them is deployed by replacing the machine.
+///
+/// Both are the machine's identity: `StateMachineName` is the name its ARN is built from,
+/// and `StateMachineType` is fixed at creation ("determines whether a Standard or Express
+/// state machine is created") — `CreateStateMachine` takes each and `UpdateStateMachine`
+/// takes neither.
+const REPLACEMENT_PROPERTIES: &[&str] = &["StateMachineName", "StateMachineType"];
+
+/// Deploy the declaration as a NEW state machine, which is what a changed
+/// [`REPLACEMENT_PROPERTIES`] property asks for: the create is the same one a first
+/// deployment makes ([`create`]), over the properties this deployment declares, and the ARN
+/// it answers with is reported as the resource's physical id so the stack publishes the
+/// machine that really carries the declared configuration.
+///
+/// The replacement is created under a name of its own ([`replacement_name`]), because this
+/// type's identity IS its name: a machine created under the name the old one still holds
+/// would be the same resource, and Step Functions refuses a second machine of that name.
+async fn replacement(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut replacement = resource.clone();
+    replacement.properties = declared.clone();
+    replacement
+        .attributes
+        .insert("Name".to_string(), replacement_name(resource, declared));
+    let mut created = create(ctx, region, &replacement, propagated).await?;
+    // The machine the stack now publishes is the one this create minted, so the resource's
+    // physical id is its ARN rather than the id the replaced machine had.
+    created.physical_resource_id = created.attributes.get("Arn").cloned();
+    Ok(created)
+}
+
+/// The NAME the replacement is created under: the one the declaration states, and otherwise
+/// the generated name the replaced machine carried with a fresh unique segment.
+///
+/// CloudFormation generates a name for a resource the template does not name, and a
+/// REPLACEMENT gets a new one — the old machine still holds the old name until the
+/// replacement has been created. The segment is derived from the replaced machine's own ARN
+/// and the declaration being deployed, so the same deployment asked for twice names the same
+/// replacement (nothing here is drawn fresh per call) while a declaration that replaces the
+/// machine again names another.
+fn replacement_name(resource: &StoredResource, declared: &Value) -> String {
+    if let Some(declared_name) = text_property(declared, "StateMachineName") {
+        return declared_name;
+    }
+    let unique = crate::state::template::content_digest(
+        &resource.physical_resource_id,
+        &declared.to_string(),
+        REPLACEMENT_DIGEST_CHARS,
+    );
+    let replaced = state_machine_name(resource);
+    // The name is `@length 1..80`, so the stem gives up the characters the fresh segment
+    // and its separator need.
+    let room = MAX_STATE_MACHINE_NAME_CHARS.saturating_sub(unique.chars().count() + 1);
+    let stem: String = replaced.chars().take(room).collect();
+    format!("{stem}-{unique}")
+}
+
+/// How many characters the unique segment of a [`replacement_name`] carries: the width the
+/// generated names of this crate use, which is wide enough that two replacements of one
+/// machine cannot collide.
+const REPLACEMENT_DIGEST_CHARS: usize = 12;
+
+/// The most characters a state machine's name may carry: the modelled `Name` shape's own
+/// `length` maximum (`smithy_query(query="operation",operation="CreateStateMachine")` gives
+/// 1..80).
+const MAX_STATE_MACHINE_NAME_CHARS: usize = 80;
 
 /// Delete the state machine a stack created, addressed by its ARN — this resource's physical
 /// id, which is what `Ref` returns for the type.

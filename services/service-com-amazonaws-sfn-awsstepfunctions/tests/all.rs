@@ -103,6 +103,8 @@ mod intrinsic_functions;
 mod json_parse_diagnostics;
 #[path = "all/jsonata_states.rs"]
 mod jsonata_states;
+#[path = "all/lambda_function_timeout.rs"]
+mod lambda_function_timeout;
 #[path = "all/lambda_task_control_flow.rs"]
 mod lambda_task_control_flow;
 #[path = "all/list_state_machine_aliases_pages.rs"]
@@ -135,6 +137,8 @@ mod refusal_vocabulary;
 mod resource_tags;
 #[path = "all/response_request_id.rs"]
 mod response_request_id;
+#[path = "all/role_log_and_key_authorization.rs"]
+mod role_log_and_key_authorization;
 #[path = "all/run_a_job_pattern_calls.rs"]
 mod run_a_job_pattern_calls;
 #[path = "all/running_execution_history.rs"]
@@ -161,6 +165,8 @@ mod state_machine_version_publish;
 mod state_machine_versions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stuck_state_cause.rs"]
+mod stuck_state_cause;
 #[path = "all/sync_execution.rs"]
 mod sync_execution;
 #[path = "all/sync_service_integration.rs"]
@@ -179,5 +185,9 @@ mod terminal_runtime_errors;
 mod test_state;
 #[path = "all/unresolved_path_cause.rs"]
 mod unresolved_path_cause;
+#[path = "all/unserved_request_refusals.rs"]
+mod unserved_request_refusals;
 #[path = "all/update_state_machine_alias_effects.rs"]
 mod update_state_machine_alias_effects;
+#[path = "all/vended_log_event_members.rs"]
+mod vended_log_event_members;

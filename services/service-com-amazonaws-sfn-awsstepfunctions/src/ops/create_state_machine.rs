@@ -337,6 +337,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            // The events are delivered AS the state machine's role, so a role that
+            // may not set the delivery up and put the events is a configuration this
+            // service cannot apply: the call is refused, and nothing is created, which
+            // is what keeps a state machine that can never log from being reported as
+            // healthy. See `crate::state::observability::log_destination_denied`.
+            if crate::state::observability::log_destination_denied(
+                &*self.engine,
+                configuration,
+                &input.role_arn,
+            ) {
+                return Err(crate::scaffolded::Scaffolded::access_denied(
+                    crate::state::observability::LOG_DESTINATION_ACCESS_DENIED,
+                ));
+            }
         }
 
         let tags = input.tags.clone().unwrap_or_default();

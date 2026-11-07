@@ -49,9 +49,15 @@
 //! Two approximations are deliberate here, so a later reader does not take them for
 //! the service's exact rule. Which of the two calls a given write makes depends on
 //! how long ago a data key was minted, which no caller chooses, so a write asks for
-//! both rather than for whichever one this instant would have made. And the decision
-//! is taken against the identity that signed the REQUEST: the emulator has no
-//! execution role to assume, so the caller stands in for it.
+//! both rather than for whichever one this instant would have made. And a read or a
+//! write of an execution's own data is decided against the identity that signed the
+//! REQUEST, which stands in for the caller the service makes that call as.
+//!
+//! STARTING an execution is not one of those: sealing the execution's data is work the
+//! service does as the state machine's EXECUTION ROLE ("the IAM role to use for this
+//! state machine"), so that use of the key is decided for the role, against both
+//! authorities KMS weighs over it — the key's own resource-based policy and the role's
+//! identity-based policies.
 //!
 //! The key is resolved in the KMS service's OWN store and the decision is KMS's own
 //! ([`kms_authorization::authorize`]), so this service reads exactly what KMS's
@@ -323,38 +329,78 @@ pub fn execution_start_denied<Eng: Send + Sync + 'static>(
         let store = state.lock();
         state_machine_key(&store, state_machine_arn)?
     };
-    let kms = kms_store::service_state(engine)?;
-    // What the key itself answers, read under the KMS guard and nothing else: the
-    // guard is released before the role's documents are read.
-    let (customer_managed, key_arn) = {
-        let store = kms.lock();
-        let kms_store::KeyRef::Found(found) = store.resolve(region, &key) else {
-            return None;
-        };
-        (
-            found.key_manager == kms_store::KEY_MANAGER_CUSTOMER,
-            found.arn.clone(),
-        )
-    };
-    // An Amazon Web Services managed key's policy is managed by AWS for the service
-    // that owns it, so no identity needs a grant of its own on it.
-    if !customer_managed {
-        return None;
-    }
-    super::task_authorization::role_denial(
+    role_key_denied(
         engine,
+        region,
+        &key,
         role_arn,
-        GENERATE_DATA_KEY_ACTION,
-        &key_arn,
-        KMS_SERVICE_NAME,
+        &[GENERATE_DATA_KEY_OPERATION],
     )
-    .map(|why| KeyRefusal::AccessDenied(relayed(&why)))
 }
 
-/// The IAM action minting the data key a payload is sealed with: the KMS operation
-/// `kmsDataKeyReusePeriodSeconds` names, under the `kms` action namespace a policy
-/// grants it in.
-const GENERATE_DATA_KEY_ACTION: &str = "kms:GenerateDataKey";
+/// Why the role `role_arn` cannot have `key` used for `operations`, as KMS words that
+/// refusal, or `None` when the authorities in force let the use through.
+///
+/// The decision is KMS's OWN, taken for the ROLE as the principal
+/// ([`kms_authorization::role_caller`]): the key's resource-based policy and the role's
+/// identity-based policies are the two authorities over such a use, either of which can
+/// grant it — a key policy naming the role grants it outright, and one naming the
+/// account delegates to the role's own documents — and an explicit deny in either
+/// refuses it. Reading only one of the two is what makes a key granted the documented
+/// way (its own policy) read as granting nothing.
+///
+/// The use is one Step Functions makes on the account's behalf rather than one the
+/// account asked KMS for directly, so it is judged as arriving THROUGH this service
+/// ([`kms_authorization::RequestedUse::through_service`]), which is what a key policy
+/// scoped by `kms:ViaService` is written against.
+///
+/// `None` wherever nothing of the kind can be shown: an engine carrying no KMS store, an
+/// identifier naming no key KMS holds, an Amazon Web Services managed key, whose policy
+/// AWS manages for the service that owns it, and a role this account holds no record for,
+/// whose documents cannot be read at all. Call it with no store of this service locked.
+fn role_key_denied<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    key: &str,
+    role_arn: &str,
+    operations: &[&str],
+) -> Option<KeyRefusal> {
+    let kms = kms_store::service_state(engine)?;
+    // A role the account does not hold is evidence of nothing: there are no documents to
+    // weigh against the key's policy, so the use is not refused on them.
+    if !super::task_authorization::iam_holds_role(engine, role_arn) {
+        return None;
+    }
+    // The role's own documents are read BEFORE the KMS store is locked, so the IAM store
+    // is never reached while another service's guard is held.
+    let caller = kms_authorization::role_caller(engine, role_arn);
+    let via_service = super::task_authorization::regional_service_principal(region);
+    let store = kms.lock();
+    let kms_store::KeyRef::Found(found) = store.resolve(region, key) else {
+        return None;
+    };
+    // An Amazon Web Services managed key's policy is managed by AWS for the service that
+    // owns it, so no identity needs a grant of its own on it.
+    if found.key_manager != kms_store::KEY_MANAGER_CUSTOMER {
+        return None;
+    }
+    operations.iter().find_map(|operation| {
+        kms_authorization::authorize_use(
+            &caller,
+            &store,
+            region,
+            found,
+            kms_authorization::RequestedUse::through_service(operation, &via_service),
+            // No encryption context is presented, so a grant constrained to one does
+            // not permit this use: the authority it carries is not claimed rather than
+            // assumed.
+            None,
+            None,
+        )
+        .err()
+        .map(|why| KeyRefusal::AccessDenied(relayed(&why)))
+    })
+}
 
 /// The customer managed key the state machine `arn` names is encrypted under.
 ///

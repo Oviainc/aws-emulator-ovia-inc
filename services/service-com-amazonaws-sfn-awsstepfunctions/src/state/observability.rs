@@ -216,7 +216,8 @@ fn completion_metric(status: &str) -> Option<&'static str> {
 ///   was aborted or timed out reports;
 /// * ERROR is every other event reporting that something did not succeed — a task, an
 ///   activity, an iteration, a branch or a map run that failed, timed out or was
-///   aborted, whose type names end the same way the execution-level ones do;
+///   aborted, whose type names end the same way the execution-level ones do, and
+///   entering a `Fail` state, which is the definition declaring the run failed;
 /// * everything else is the ordinary progress of the run, which only `ALL` logs.
 #[must_use]
 pub fn delivered_at_level(level: &str, event_type: &str) -> bool {
@@ -227,6 +228,7 @@ pub fn delivered_at_level(level: &str, event_type: &str) -> bool {
             | super::EVENT_EXECUTION_TIMED_OUT
     );
     let error = fatal
+        || event_type == super::EVENT_FAIL_STATE_ENTERED
         || event_type.ends_with("Failed")
         || event_type.ends_with("TimedOut")
         || event_type.ends_with("Aborted");
@@ -271,6 +273,73 @@ pub fn log_group_of(configuration: &crate::ops::types::LoggingConfiguration) -> 
     (!name.is_empty()).then_some((region, name))
 }
 
+/// The IAM actions a state machine's own role must hold for its logging
+/// configuration to deliver anything.
+///
+/// Step Functions does not write a vended log as the caller: it sets a DELIVERY up
+/// and writes the events as the state machine's role, so the role is what needs the
+/// CloudWatch Logs permissions the service's logging guidance publishes — creating the
+/// delivery, and putting the events. A role that holds neither cannot deliver one
+/// event, which is why the control plane decides it when the configuration is given
+/// rather than letting a state machine that can never log be reported as healthy.
+pub const LOG_DELIVERY_ACTIONS: &[&str] = &["logs:CreateLogDelivery", "logs:PutLogEvents"];
+
+/// The resource those actions are taken on: the log destination the configuration
+/// names, which is what the refusal is about.
+///
+/// It is the qualified log group ARN the destination carries, so a policy that grants
+/// the delivery actions on every resource and one that grants them on the group the
+/// configuration names both authorize the delivery, while a policy that grants neither
+/// authorizes nothing.
+fn log_delivery_resource(
+    configuration: &crate::ops::types::LoggingConfiguration,
+) -> Option<String> {
+    configuration
+        .destinations
+        .as_deref()?
+        .first()?
+        .cloud_watch_logs_log_group
+        .as_ref()?
+        .log_group_arn
+        .clone()
+}
+
+/// What a control-plane call answers when the role it names cannot deliver to the log
+/// destination the configuration carries.
+///
+/// Fixed service text: the sentence states the relationship that does not hold — the
+/// state machine's role against the log destination — and carries no value from the
+/// request, so neither the role nor the group is quoted back.
+pub const LOG_DESTINATION_ACCESS_DENIED: &str =
+    "The state machine IAM Role is not authorized to access the Log Destination";
+
+/// Whether the role `role_arn` may NOT deliver the events `configuration` asks for, so
+/// the call that named them both is refused ([`LOG_DESTINATION_ACCESS_DENIED`]).
+///
+/// A configuration that delivers nothing — one whose level is `OFF`, or that names no
+/// log group — needs no permission at all, so nothing is decided for it. Everything
+/// else is the one reading of what a state machine's role may do
+/// ([`super::task_authorization::role_is_denied`]), which shows a refusal only where
+/// the account really holds that role and the documents it holds for it withhold the
+/// delivery actions.
+///
+/// Call it with no store of this service locked: it takes IAM's own.
+#[must_use]
+pub fn log_destination_denied<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    configuration: &crate::ops::types::LoggingConfiguration,
+    role_arn: &str,
+) -> bool {
+    let level = configuration.level.as_deref().unwrap_or(super::LOG_LEVEL_OFF);
+    if level == super::LOG_LEVEL_OFF {
+        return false;
+    }
+    let Some(resource) = log_delivery_resource(configuration) else {
+        return false;
+    };
+    super::task_authorization::role_is_denied(engine, role_arn, LOG_DELIVERY_ACTIONS, &resource)
+}
+
 /// The stream one execution's events are delivered to.
 ///
 /// Step Functions writes a stream per execution under the `states/` prefix every
@@ -284,21 +353,39 @@ fn log_stream_of(state_machine_name: &str, execution_name: &str) -> String {
 
 /// One history event as a delivered log message.
 ///
-/// The members are the event's own identity — the id, the type, the event it follows
-/// and the instant it happened — beside the execution it belongs to, which is what
-/// makes a delivered event traceable back to the history it came from. The execution
-/// DATA an event carries (the input it was handed, the output it produced, the error
-/// and cause of a failure) is included only when the configuration's
-/// `includeExecutionData` asks for it: "determines whether execution data is included
-/// in your log".
+/// The envelope members are the event's own identity — the id, the type, the event it
+/// follows and the instant it happened — beside the execution it belongs to and how
+/// many times that execution has been redriven, which is what makes a delivered event
+/// traceable back to the history it came from and tells a redriven run from a first
+/// one. Every one of them is carried as TEXT, which is the form a vended event's
+/// numeric members are delivered in.
+///
+/// `details` is the event's own detail object ([`log_details`]), the same detail
+/// `GetExecutionHistory` reports for that event type, so a consumer can join a log
+/// event to the history event it mirrors member for member. The execution DATA inside
+/// it (the document a step was handed or produced) is delivered only when the
+/// configuration's `includeExecutionData` asks for it: "determines whether execution
+/// data is included in your log" — the rest of the detail, which is the transition
+/// rather than the payload, is delivered either way.
 fn log_message(
     event: &super::HistoryEvent,
-    execution_arn: &str,
+    execution: &super::Execution,
     include_execution_data: bool,
 ) -> String {
     let mut message = ::serde_json::Map::new();
     message.insert("id".to_string(), event.id.to_string().into());
     message.insert("type".to_string(), event.event_type.clone().into());
+    let mut details = log_details(event, execution);
+    if let Some(details) = details.as_mut() {
+        if !include_execution_data {
+            for member in PAYLOAD_DETAIL_MEMBERS {
+                details.remove(*member);
+            }
+        }
+    }
+    if let Some(details) = details {
+        message.insert("details".to_string(), ::serde_json::Value::Object(details));
+    }
     message.insert(
         "previous_event_id".to_string(),
         event.previous_event_id.to_string().into(),
@@ -307,24 +394,279 @@ fn log_message(
         "event_timestamp".to_string(),
         epoch_millis(event.timestamp).to_string().into(),
     );
-    message.insert("execution_arn".to_string(), execution_arn.to_string().into());
-    if include_execution_data {
-        let mut details = ::serde_json::Map::new();
-        for (member, value) in [
-            ("input", event.details.input.as_deref()),
-            ("output", event.details.output.as_deref()),
-            ("error", event.details.error.as_deref()),
-            ("cause", event.details.cause.as_deref()),
-        ] {
-            if let Some(value) = value {
-                details.insert(member.to_string(), value.to_string().into());
-            }
+    message.insert(
+        "execution_arn".to_string(),
+        execution.arn.to_string().into(),
+    );
+    message.insert(
+        "redrive_count".to_string(),
+        execution.redrive_count.to_string().into(),
+    );
+    ::serde_json::Value::Object(message).to_string()
+}
+
+/// The members of a vended event's `details` that carry the execution's own PAYLOAD.
+///
+/// "Determines whether execution data is included in your log": the data is the
+/// document a step was handed or produced — the input, the output, and the request a
+/// task's payload template built — together with the `*Details` member that states
+/// whether that document was truncated, which the event carries only for the members
+/// the model gives one and which says nothing once the document itself is not
+/// delivered. Everything else an event reports (the state it happened in, the work it
+/// named, the error and the cause of a failure) is the TRANSITION rather than the
+/// payload, so a configuration that excludes execution data still delivers it.
+const PAYLOAD_DETAIL_MEMBERS: &[&str] = &[
+    "input",
+    "inputDetails",
+    "output",
+    "outputDetails",
+    "parameters",
+];
+
+/// The detail object one history event carries in the log, under the member names the
+/// model gives that event type's own detail structure — or `None` for an event type the
+/// model gives no detail structure at all.
+///
+/// It is the SAME detail `GetExecutionHistory` reports for the event, read off the same
+/// stored record, because the vended log "mirrors" the execution history: the event
+/// type decides which members there are, and a member the record does not carry is left
+/// out rather than delivered empty. The two differ only in form — this one is the JSON
+/// object a log message carries, that one the modelled structure an API response does.
+///
+/// The object is reported even when it ends up EMPTY, because the event type having a
+/// detail object is a fact of the type rather than of what that event carried: a
+/// configuration that excludes the execution data leaves the detail of an event whose
+/// only members are the payload with nothing in it, and that is still the event's
+/// detail.
+fn log_details(
+    event: &super::HistoryEvent,
+    execution: &super::Execution,
+) -> Option<::serde_json::Map<String, ::serde_json::Value>> {
+    let mut details = ::serde_json::Map::new();
+    let stored = &event.details;
+    let event_type = event.event_type.as_str();
+    if let Some(name) = event.state_name.as_deref() {
+        if event_type.ends_with(super::STATE_ENTERED_SUFFIX) {
+            text(&mut details, "name", Some(name));
+            payload(&mut details, "input", stored.input.as_deref());
+            return Some(details);
         }
-        if !details.is_empty() {
-            message.insert("details".to_string(), ::serde_json::Value::Object(details));
+        if event_type.ends_with(super::STATE_EXITED_SUFFIX) {
+            text(&mut details, "name", Some(name));
+            payload(&mut details, "output", stored.output.as_deref());
+            // "Map of variable name and value as a serialized JSON representation":
+            // the variables in scope as the state left, for a state whose own `Assign`
+            // wrote any.
+            if !stored.assigned_variables.is_empty() {
+                let assigned: ::serde_json::Map<String, ::serde_json::Value> = stored
+                    .assigned_variables
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone().into()))
+                    .collect();
+                details.insert(
+                    "assignedVariables".to_string(),
+                    ::serde_json::Value::Object(assigned),
+                );
+                details.insert("assignedVariablesDetails".to_string(), not_truncated());
+            }
+            return Some(details);
         }
     }
-    ::serde_json::Value::Object(message).to_string()
+    match event_type {
+        super::EVENT_EXECUTION_STARTED => {
+            // The input is the one the execution was STARTED with and the role the one
+            // it RUNS under, both read off the record for the same reason the history
+            // API reads them there: they belong to the execution for its whole life.
+            payload(&mut details, "input", Some(&execution.input));
+            text(
+                &mut details,
+                "roleArn",
+                Some(execution.ran.role_arn.as_str()).filter(|role| !role.is_empty()),
+            );
+            text(
+                &mut details,
+                "stateMachineAliasArn",
+                execution.state_machine_alias_arn.as_deref(),
+            );
+            text(
+                &mut details,
+                "stateMachineVersionArn",
+                execution.state_machine_version_arn.as_deref(),
+            );
+        }
+        super::EVENT_EXECUTION_SUCCEEDED => {
+            payload(&mut details, "output", stored.output.as_deref());
+        }
+        super::EVENT_EXECUTION_FAILED
+        | super::EVENT_EXECUTION_ABORTED
+        | super::EVENT_EXECUTION_TIMED_OUT => {
+            failure(&mut details, stored);
+        }
+        super::EVENT_EXECUTION_REDRIVEN => {
+            number(
+                &mut details,
+                "redriveCount",
+                stored.redrive_count.map(i64::from),
+            );
+        }
+        super::EVENT_ACTIVITY_SCHEDULED => {
+            // `resource` is the activity the task was scheduled for and is required, so
+            // an event whose record does not name it carries no detail at all — exactly
+            // as the history API reports it.
+            stored.resource.as_deref()?;
+            text(&mut details, "resource", stored.resource.as_deref());
+            payload(&mut details, "input", stored.input.as_deref());
+            bounds(&mut details, stored);
+        }
+        super::EVENT_ACTIVITY_STARTED => {
+            text(&mut details, "workerName", stored.worker_name.as_deref());
+        }
+        super::EVENT_ACTIVITY_SUCCEEDED => {
+            payload(&mut details, "output", stored.output.as_deref());
+        }
+        super::EVENT_ACTIVITY_FAILED | super::EVENT_ACTIVITY_TIMED_OUT => {
+            failure(&mut details, stored);
+        }
+        // A `Task` state's own work: every one of its events names the work — both
+        // members are required, so an event whose record names neither carries no
+        // detail — and the request its payload template built is reported under
+        // `parameters` rather than under `input`, exactly as the history API reports it.
+        super::EVENT_TASK_SCHEDULED => {
+            work(&mut details, stored)?;
+            details.insert(
+                "region".to_string(),
+                super::arn_region(&execution.arn).into(),
+            );
+            // `parameters` is the request the state's payload template built. The model
+            // gives it no `*Details` companion — unlike `input` and `output` — so none
+            // is delivered beside it.
+            text(&mut details, "parameters", stored.input.as_deref());
+            bounds(&mut details, stored);
+        }
+        super::EVENT_TASK_STARTED => {
+            work(&mut details, stored)?;
+        }
+        super::EVENT_TASK_SUCCEEDED | super::EVENT_TASK_SUBMITTED => {
+            work(&mut details, stored)?;
+            payload(&mut details, "output", stored.output.as_deref());
+        }
+        super::EVENT_TASK_FAILED
+        | super::EVENT_TASK_TIMED_OUT
+        | super::EVENT_TASK_SUBMIT_FAILED => {
+            work(&mut details, stored)?;
+            failure(&mut details, stored);
+        }
+        // "The size of the array for Map state iterations", which the state knew when
+        // it started iterating. It is required, so a record carrying none reports the
+        // member's own default.
+        super::EVENT_MAP_STATE_STARTED => {
+            number(
+                &mut details,
+                "length",
+                Some(stored.length.map_or(0, i64::from)),
+            );
+        }
+        // One `Map` iteration reports its parent state and the index it was handed, and
+        // the index is required in the same way.
+        super::EVENT_MAP_ITERATION_STARTED
+        | super::EVENT_MAP_ITERATION_SUCCEEDED
+        | super::EVENT_MAP_ITERATION_FAILED
+        | super::EVENT_MAP_ITERATION_ABORTED => {
+            text(&mut details, "name", event.state_name.as_deref());
+            number(
+                &mut details,
+                "index",
+                Some(stored.index.map_or(0, i64::from)),
+            );
+        }
+        // Every other event type the model gives no detail structure at all.
+        _ => return None,
+    }
+    Some(details)
+}
+
+/// `member` as the detail carries it, for a value the record holds; nothing for one it
+/// does not.
+fn text(
+    into: &mut ::serde_json::Map<String, ::serde_json::Value>,
+    member: &str,
+    value: Option<&str>,
+) {
+    if let Some(value) = value {
+        into.insert(member.to_string(), value.to_string().into());
+    }
+}
+
+/// The same for a member that carries a figure.
+fn number(
+    into: &mut ::serde_json::Map<String, ::serde_json::Value>,
+    member: &str,
+    value: Option<i64>,
+) {
+    if let Some(value) = value {
+        into.insert(member.to_string(), value.into());
+    }
+}
+
+/// A PAYLOAD member and the `*Details` member that accompanies it: a document the
+/// record holds is delivered whole, so the accompanying member states that it was not
+/// truncated.
+fn payload(
+    into: &mut ::serde_json::Map<String, ::serde_json::Value>,
+    member: &str,
+    value: Option<&str>,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    into.insert(member.to_string(), value.to_string().into());
+    into.insert(format!("{member}Details"), not_truncated());
+}
+
+/// What a `*Details` member states about a document delivered whole: "indicates whether
+/// input or output was included in the response", which it was, since nothing here is
+/// truncated.
+fn not_truncated() -> ::serde_json::Value {
+    let mut details = ::serde_json::Map::new();
+    details.insert("truncated".to_string(), false.into());
+    ::serde_json::Value::Object(details)
+}
+
+/// The error and the cause a failed event reports.
+fn failure(
+    into: &mut ::serde_json::Map<String, ::serde_json::Value>,
+    stored: &super::EventDetails,
+) {
+    text(into, "error", stored.error.as_deref());
+    text(into, "cause", stored.cause.as_deref());
+}
+
+/// The work a `Task` state's event names: "the service name of the resource in a task
+/// state" and "the action of the resource called by a task state". Both are required,
+/// so `None` — which ends the detail — for an event whose record names neither.
+fn work(
+    into: &mut ::serde_json::Map<String, ::serde_json::Value>,
+    stored: &super::EventDetails,
+) -> Option<()> {
+    let resource_type = stored.resource_type.as_deref()?;
+    let resource = stored.resource.as_deref()?;
+    text(into, "resourceType", Some(resource_type));
+    text(into, "resource", Some(resource));
+    Some(())
+}
+
+/// The bounds the scheduling state declared for the work.
+fn bounds(
+    into: &mut ::serde_json::Map<String, ::serde_json::Value>,
+    stored: &super::EventDetails,
+) {
+    let seconds = |bound: Option<u64>| bound.map(|bound| i64::try_from(bound).unwrap_or(i64::MAX));
+    number(into, "timeoutInSeconds", seconds(stored.timeout_seconds));
+    number(
+        into,
+        "heartbeatInSeconds",
+        seconds(stored.heartbeat_seconds),
+    );
 }
 
 impl ComAmazonawsSfnAwsstepfunctionsState {
@@ -421,7 +763,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
                 .map(|event| {
                     (
                         epoch_millis(event.timestamp),
-                        log_message(event, &execution.arn, configuration.include_execution_data),
+                        log_message(event, execution, configuration.include_execution_data),
                     )
                 })
                 .collect();
