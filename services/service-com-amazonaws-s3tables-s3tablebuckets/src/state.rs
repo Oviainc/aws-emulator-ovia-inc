@@ -191,6 +191,41 @@ impl StorageClass {
     }
 }
 
+/// The storage class a table or table bucket is stored in when nothing has
+/// named one: the general-purpose class, which is what the model means by "the
+/// service default storage class will be used"
+/// (`smithy_query(query="doc", shape="CreateTableBucketRequest",
+/// member="storageClassConfiguration")`). The other modeled class optimises an
+/// access pattern a caller has to ask for, so it is never what a caller that
+/// asked for nothing gets.
+pub const DEFAULT_STORAGE_CLASS: StorageClass = StorageClass::Standard;
+
+/// The storage class a table bucket's new tables are created in: the
+/// configuration a create or a put persisted for the bucket, else
+/// [`DEFAULT_STORAGE_CLASS`].
+///
+/// A table bucket ALWAYS has a default storage class, so a read reports one
+/// whether or not a configuration was ever set on it — the stored `None` means
+/// "no caller has named one", not "this bucket has no default".
+pub fn effective_bucket_storage_class(stored: Option<StorageClass>) -> StorageClass {
+    stored.unwrap_or(DEFAULT_STORAGE_CLASS)
+}
+
+/// The storage class a table is stored in: the one resolved for the table when
+/// it was created, else — for a record that carries none — the default of the
+/// bucket that holds it.
+///
+/// A table's class is settled at creation (the create's own
+/// `storageClassConfiguration`, else the bucket's default at that moment), so a
+/// later change to the bucket's default is the default for the tables created
+/// AFTER it and moves no table that already exists.
+pub fn effective_table_storage_class(
+    table: Option<StorageClass>,
+    table_bucket: Option<StorageClass>,
+) -> StorageClass {
+    effective_bucket_storage_class(table.or(table_bucket))
+}
+
 /// The stored form of the `EncryptionConfiguration` structure: the algorithm a
 /// create named, and the KMS key when it named one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -701,10 +736,14 @@ pub struct Namespace {
 
 /// A table, as this emulator stores it.
 ///
-/// `encryption` and `storage_class` are `None` when the create named neither,
-/// for the same reason as on [`TableBucket`]: which default applies belongs to
-/// the operations that report it, so what is persisted is what the caller asked
-/// for. `metadata_location` is `Some` only once a metadata file exists for the
+/// `encryption` is `None` when the create named none, for the same reason as on
+/// [`TableBucket`]: which default applies belongs to the operation that reports
+/// it, so what is persisted is what the caller asked for. `storage_class` is
+/// different — a table is created IN a storage class, so the create settles it
+/// (the request's own, else the bucket's default at that moment) and persists
+/// the result, which is why a later change to the bucket's default moves no
+/// table that already exists. `metadata_location` is `Some` only once a metadata
+/// file exists for the
 /// table — the create writes one when the request carries table metadata, and
 /// `UpdateTableMetadataLocation` is what moves it afterwards.
 #[derive(Debug, Clone)]

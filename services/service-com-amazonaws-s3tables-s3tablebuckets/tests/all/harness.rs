@@ -214,6 +214,56 @@ impl Emulator {
         .await
     }
 
+    /// `PutTableBucketStorageClass`: the bucket's ARN is a path label and the
+    /// configuration travels as the body's `storageClassConfiguration`.
+    pub async fn put_table_bucket_storage_class(
+        &self,
+        region: &str,
+        arn: &str,
+        configuration: &Value,
+    ) -> Reply {
+        self.call(
+            "PUT",
+            &format!("/buckets/{}/storage-class", encode(arn)),
+            region,
+            Some(&serde_json::json!({ "storageClassConfiguration": configuration })),
+        )
+        .await
+    }
+
+    pub async fn get_table_bucket_storage_class(&self, region: &str, arn: &str) -> Reply {
+        self.call(
+            "GET",
+            &format!("/buckets/{}/storage-class", encode(arn)),
+            region,
+            None,
+        )
+        .await
+    }
+
+    /// `GetTableStorageClass`: the bucket's ARN, the namespace and the table's
+    /// name are path labels.
+    pub async fn get_table_storage_class(
+        &self,
+        region: &str,
+        arn: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Reply {
+        self.call(
+            "GET",
+            &format!(
+                "/tables/{}/{}/{}/storage-class",
+                encode(arn),
+                encode(namespace),
+                encode(name)
+            ),
+            region,
+            None,
+        )
+        .await
+    }
+
     /// `PutTableBucketReplication`: the bucket's ARN and an optional
     /// `versionToken` travel as query members, the configuration as the body's
     /// `configuration`.

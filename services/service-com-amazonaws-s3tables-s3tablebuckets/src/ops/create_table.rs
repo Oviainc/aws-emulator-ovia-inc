@@ -228,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(bad_request)?,
             ),
         };
-        let storage_class = match input.storage_class_configuration {
+        let storage_class_requested = match input.storage_class_configuration {
             None => None,
             Some(configuration) => Some(
                 crate::state::stored_storage_class(&configuration.storage_class)
@@ -252,6 +252,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| not_found(crate::state::BUCKET_NOT_FOUND_MESSAGE))?;
         let bucket_arn = bucket.arn.clone();
         let bucket_id = bucket.bucket_id.clone();
+        // A table is created IN a storage class: the one this request names,
+        // else the bucket's own default — which is what the bucket's
+        // configuration is FOR — else the service default. It is settled here
+        // and persisted, so a later change to the bucket's default is the
+        // default for the tables created after it and moves no table that
+        // already exists.
+        let storage_class = Some(storage_class_requested.unwrap_or_else(|| {
+            crate::state::effective_bucket_storage_class(bucket.storage_class)
+        }));
         let namespace = bucket
             .namespaces
             .get(&input.namespace)
