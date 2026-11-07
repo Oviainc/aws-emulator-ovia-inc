@@ -344,44 +344,53 @@ async fn the_response_payload_is_what_the_handler_returned() {
 }
 
 /// An exception the handler raised is still an HTTP 200, carrying the error document and
-/// the `Unhandled` signal — one row per way a handler fails.
+/// the `Unhandled` signal — one row per way a handler fails, and per phase of the run the
+/// failure was raised in: a failure the invocation was bound to names that invocation,
+/// while one raised while the handler was still being resolved names no invocation at all.
 #[tokio::test]
 async fn an_unhandled_handler_error_is_a_two_hundred_with_the_error_document() {
-    let cases: &[(&str, &str, &str, &str)] = &[
+    // The case, the module source, the error class, the words of the message, and whether
+    // an invocation was bound to the run when it failed.
+    let cases: &[(&str, &str, &str, &str, bool)] = &[
         (
             "a raised exception",
             "def lambda_handler(event, context):\n    raise ValueError('boom')\n",
             "ValueError",
             "boom",
+            true,
         ),
         (
             "a failed computation",
             "def lambda_handler(event, context):\n    return 1 / 0\n",
             "ZeroDivisionError",
             "division by zero",
+            true,
         ),
         (
             "a handler the module does not define",
             "def other(event, context):\n    return 1\n",
             "Runtime.HandlerNotFound",
             "lambda_handler",
+            false,
         ),
         (
             "a module that does not import",
             "import no_such_module_at_all\n",
             "Runtime.ImportModuleError",
             "Unable to import module",
+            false,
         ),
         (
             "a value that cannot be marshalled",
             "def lambda_handler(event, context):\n    return {'s': set()}\n",
             "Runtime.MarshalError",
             "Unable to marshal response",
+            true,
         ),
     ];
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
-    for (case, source, error_type, expected) in cases {
+    for (case, source, error_type, expected, bound) in cases {
         let name = "probe-raise";
         create_function(&router, name, source, "python3.12", json!({})).await;
         let answered = invoke(&router, name, b"{}", &[]).await;
@@ -416,8 +425,13 @@ async fn an_unhandled_handler_error_is_a_two_hundred_with_the_error_document() {
             document
                 .get("requestId")
                 .and_then(Value::as_str)
-                .is_some_and(|id| id.len() == 36),
-            "case {case}: expected the invocation's request id, got {document}"
+                .is_some_and(|id| if *bound { id.len() == 36 } else { id.is_empty() }),
+            "case {case}: expected {}, got {document}",
+            if *bound {
+                "the invocation's request id"
+            } else {
+                "no request id, for a failure raised before one was bound"
+            }
         );
         assert!(
             document.get("stackTrace").is_some_and(Value::is_array),

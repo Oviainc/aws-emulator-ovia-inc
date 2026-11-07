@@ -616,19 +616,30 @@ fn answered(
             error_document(
                 error_message,
                 Some(error_type),
-                request_id,
+                // A failure the runtime raised while it was still RESOLVING the handler
+                // belongs to no invocation: the execution environment is initialized
+                // before a request is bound to it, so the document names no request at
+                // all.
+                if raised_during_initialization(error_type) {
+                    ""
+                } else {
+                    request_id
+                },
                 stack_trace,
                 engine,
             ),
             Some(FUNCTION_ERROR_UNHANDLED.to_string()),
         ),
+        // A run the sandbox ended at the function's own `Timeout` is reported as that
+        // class of failure: the error names the sandbox timeout, and the message states
+        // the invocation and the timeout it ran past.
         Completion::Stopped(Stop::Deadline) => (
             error_document(
                 &format!(
                     "{request_id} Task timed out after {:.2} seconds",
                     budget.wall_clock.as_secs_f64()
                 ),
-                None,
+                Some(SANDBOX_TIMEDOUT),
                 request_id,
                 &[],
                 engine,
@@ -709,6 +720,11 @@ fn answered(
 /// The `errorType` of a run whose runtime ended instead of answering.
 const RUNTIME_EXIT_ERROR: &str = "Runtime.ExitError";
 
+/// The `errorType` of a run the SANDBOX ended because it ran past the function's own
+/// `Timeout`. The failure is the sandbox's rather than the handler's, so it is the class
+/// AWS reports for it rather than one of the runtime's own.
+const SANDBOX_TIMEDOUT: &str = "Sandbox.Timedout";
+
 /// The `errorType` of a run whose answer was larger than an invocation may return. The
 /// failure is the RESPONSE's, so it is attributed to the function's response rather than
 /// reported as a runtime that exited.
@@ -716,6 +732,31 @@ const RESPONSE_SIZE_TOO_LARGE: &str = "Function.ResponseSizeTooLarge";
 
 /// What AWS reports as the message of such a run when the sandbox ended it.
 const RUNTIME_KILLED: &str = "Runtime exited with error: signal: killed";
+
+/// The `errorType` classes a runtime reports for a failure of the INITIALIZATION phase:
+/// the phase in which it reads the configured handler name, imports the module that name
+/// resolves to, and finds the entry point on it. Each is raised by the runtime itself
+/// before it has an invocation in hand — `MalformedHandlerName` for a name it cannot
+/// split, `UserCodeSyntaxError` for a module that does not compile, `ImportModuleError`
+/// for one that does not import (including one whose own top-level code raised), and
+/// `HandlerNotFound` for a module that does not define the entry point — which is what
+/// makes a failure of any of them one no invocation is bound to.
+///
+/// They are the classes BOTH runtimes report ([`python`], [`node`]); a class a handler's
+/// own exception carries can never be one of them, because an exception type name holds no
+/// `.`.
+const INITIALIZATION_ERROR_TYPES: &[&str] = &[
+    "Runtime.MalformedHandlerName",
+    "Runtime.UserCodeSyntaxError",
+    "Runtime.ImportModuleError",
+    "Runtime.HandlerNotFound",
+];
+
+/// Whether `error_type` is a failure of the initialization phase
+/// ([`INITIALIZATION_ERROR_TYPES`]) rather than of the run.
+fn raised_during_initialization(error_type: &str) -> bool {
+    INITIALIZATION_ERROR_TYPES.contains(&error_type)
+}
 
 /// The member the error document carries the handler's stack under, which is the one the
 /// function's own runtime reports it under: `stackTrace` for a Python handler, `trace` for
@@ -1021,6 +1062,33 @@ fn release_abandoned_run() {
 mod tests {
     use super::*;
 
+    /// One invocation of a Python function, as [`run_invocation`] builds one, for the tests
+    /// that report on an invocation rather than run one.
+    fn probe_invocation() -> Invocation {
+        Invocation {
+            function_name: "probe".to_string(),
+            executed_version: "7".to_string(),
+            invoked_function_arn: "arn:aws:lambda:us-west-2:000000000000:function:probe:7"
+                .to_string(),
+            region: "us-west-2".to_string(),
+            runtime: Some("python3.12".to_string()),
+            handler: Some("lambda_function.lambda_handler".to_string()),
+            variables: BTreeMap::new(),
+            memory_size: 256,
+            timeout: 3,
+            architecture: "x86_64".to_string(),
+            zip_bytes: None,
+            layer_zips: Vec::new(),
+            payload: Vec::new(),
+            client_context: None,
+            tenant_id: None,
+            request_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            initialization_type: crate::state::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,
+            aws: None,
+            logs: None,
+        }
+    }
+
     /// The runtimes this emulator can run a package for, and which engine runs each — one
     /// row per class of `Runtime` value the model declares (source:
     /// `smithy_query(query="shape", shape="Runtime")`).
@@ -1109,6 +1177,229 @@ mod tests {
         }
     }
 
+    /// A run the sandbox ended at the function's own `Timeout` is reported as that class of
+    /// failure, with a message stating the timeout the run was given — one row per
+    /// `Timeout` and per engine, so neither the class nor the message is one run's.
+    #[test]
+    fn a_timed_out_runs_document_names_the_sandbox_timeout_class() {
+        let request_id = "11111111-2222-3333-4444-555555555555";
+        let cases: &[(Engine, i32, &str)] = &[
+            (Engine::Python, 1, "1.00"),
+            (Engine::Python, 3, "3.00"),
+            (Engine::Python, 29, "29.00"),
+            (Engine::Node, 1, "1.00"),
+            (Engine::Node, 3, "3.00"),
+        ];
+        for (engine, timeout, rendered) in cases {
+            let budget = run_budget(*timeout);
+            let finished = Finished {
+                completion: Completion::Stopped(Stop::Deadline),
+                log: String::new(),
+                elapsed: budget.wall_clock,
+            };
+            let invoked = answered(
+                finished,
+                request_id,
+                &probe_invocation(),
+                budget,
+                *engine,
+                SystemTime::UNIX_EPOCH,
+            );
+            let parsed: ::serde_json::Value =
+                ::serde_json::from_slice(&invoked.payload).expect("the error document is JSON");
+            let case = format!("{engine:?} with a {timeout} s timeout");
+            assert_eq!(
+                invoked.function_error.as_deref(),
+                Some(FUNCTION_ERROR_UNHANDLED),
+                "case {case}: a timed-out run is reported as a function error, got {:?}",
+                invoked.function_error
+            );
+            assert_eq!(
+                parsed.get("errorType").and_then(::serde_json::Value::as_str),
+                Some(SANDBOX_TIMEDOUT),
+                "case {case}: expected the sandbox timeout class, got {parsed}"
+            );
+            let expected = format!("{request_id} Task timed out after {rendered} seconds");
+            assert_eq!(
+                parsed
+                    .get("errorMessage")
+                    .and_then(::serde_json::Value::as_str),
+                Some(expected.as_str()),
+                "case {case}: expected the message {expected:?}, got {parsed}"
+            );
+        }
+    }
+
+    /// The request id the error document names is the INVOCATION's only for a failure the
+    /// invocation was bound to: one the runtime raised while it was still RESOLVING the
+    /// handler names none — one row per error class a runtime reports for each phase, per
+    /// engine (the node document names no request at all, which is its own runtime's rule).
+    #[test]
+    fn an_initialization_failures_document_names_no_invocation() {
+        let request_id = "11111111-2222-3333-4444-555555555555";
+        // The class the runtime reported, and the request id the document must name for a
+        // Python function — `None` where the member is absent, as it is for a node one.
+        let cases: &[(&str, Option<&str>, Option<&str>)] = &[
+            ("ValueError", Some(request_id), None),
+            ("KeyError", Some(request_id), None),
+            ("Runtime.MarshalError", Some(request_id), None),
+            ("Runtime.InvalidEvent", Some(request_id), None),
+            ("Runtime.MalformedHandlerName", Some(""), None),
+            ("Runtime.ImportModuleError", Some(""), None),
+            ("Runtime.UserCodeSyntaxError", Some(""), None),
+            ("Runtime.HandlerNotFound", Some(""), None),
+        ];
+        for (error_type, python, node) in cases {
+            for (engine, expected) in [(Engine::Python, python), (Engine::Node, node)] {
+                let finished = Finished {
+                    completion: Completion::Raised {
+                        error_type: (*error_type).to_string(),
+                        error_message: "the run did not answer".to_string(),
+                        stack_trace: Vec::new(),
+                    },
+                    log: String::new(),
+                    elapsed: Duration::ZERO,
+                };
+                let invoked = answered(
+                    finished,
+                    request_id,
+                    &probe_invocation(),
+                    run_budget(3),
+                    engine,
+                    SystemTime::UNIX_EPOCH,
+                );
+                let parsed: ::serde_json::Value = ::serde_json::from_slice(&invoked.payload)
+                    .expect("the error document is JSON");
+                let actual = parsed
+                    .get("requestId")
+                    .and_then(::serde_json::Value::as_str);
+                assert_eq!(
+                    actual, *expected,
+                    "case {engine:?} reporting {error_type}: expected the request id \
+                     {expected:?}, got {parsed}"
+                );
+            }
+        }
+    }
+
+    /// Every frame of the stack a Python run's error document carries is ONE frame as the
+    /// runtime renders it: its location line, which names the source FILE by path, and the
+    /// source line at that location — with no fine-grained error-location anchors under it.
+    /// One row per shape of stack, including one that reaches a module the RUNTIME itself
+    /// supplies, whose frame names that module's file under the runtime's own library
+    /// directory rather than the bare module name it was compiled under.
+    #[test]
+    fn a_reported_frame_is_a_location_and_its_source_line() {
+        // The library directory of the runtime the probe function is configured with, where
+        // a managed runtime keeps the standard library it ships.
+        let library = "/var/lang/lib/python3.12/";
+        let cases: &[(&str, &str, usize, Option<&str>)] = &[
+            (
+                "a subscript of a key the event does not hold",
+                "def handler(event, context):\n    return event[\"absent\"]\n",
+                1,
+                None,
+            ),
+            (
+                "a raise two calls deep in the package's own module",
+                "def inner(value):\n    raise ValueError(\"no good: %s\" % value)\n\n\
+                 def handler(event, context):\n    return inner(7)\n",
+                2,
+                None,
+            ),
+            (
+                "a read of an environment variable the function does not set",
+                "import os\n\n\
+                 def handler(event, context):\n    return os.environ[\"ABSENT\"]\n",
+                2,
+                Some(library),
+            ),
+        ];
+        for (case, source, least, within) in cases {
+            let frames = python_run_frames(source);
+            assert!(
+                frames.len() >= *least,
+                "case {case}: expected at least {least} frames, got {frames:?}"
+            );
+            for (index, frame) in frames.iter().enumerate() {
+                let lines: Vec<&str> =
+                    frame.strip_suffix('\n').unwrap_or(frame).split('\n').collect();
+                assert!(
+                    lines.len() <= 2 && frame.ends_with('\n'),
+                    "case {case}: frame {index} is a location and at most its source line, \
+                     each ended, got {frame:?}"
+                );
+                let file = lines[0]
+                    .strip_prefix("  File \"")
+                    .and_then(|rest| rest.split_once("\", line "))
+                    .map(|(file, _)| file)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {case}: frame {index} must open with its location, got \
+                             {frame:?}"
+                        )
+                    });
+                assert!(
+                    file.starts_with('/') && file.ends_with(".py"),
+                    "case {case}: frame {index} must name a source file by path, got {file:?}"
+                );
+                for line in lines.iter().skip(1) {
+                    let marks = line.trim();
+                    assert!(
+                        marks.is_empty()
+                            || !marks.chars().all(|mark| matches!(mark, '~' | '^')),
+                        "case {case}: frame {index} carries an error-location anchor, which \
+                         no frame of a reported stack does, got {line:?}"
+                    );
+                }
+            }
+            if let Some(within) = within {
+                let expected = format!("  File \"{within}");
+                assert!(
+                    frames.iter().any(|frame| frame.starts_with(&expected)),
+                    "case {case}: expected a frame naming a source file in {within:?}, got \
+                     {frames:?}"
+                );
+            }
+        }
+    }
+
+    /// The frames of the stack a Python handler's own failure reports, out of a run of
+    /// `source` as the one module of a package — driven through the interpreter on a thread
+    /// with the stack a run is given, the way [`run_invocation`] drives one.
+    fn python_run_frames(source: &str) -> Vec<String> {
+        let modules = vec![package::PackageModule {
+            path: "lambda_function.py".to_string(),
+            source: source.to_string(),
+        }];
+        // The environment a run of the probe function really sees, which is where the
+        // runtime reads the library directory of its own modules from.
+        let environment = runtime_environment(&probe_invocation(), SystemTime::UNIX_EPOCH);
+        let finished = ::std::thread::Builder::new()
+            .stack_size(RUN_STACK_BYTES)
+            .spawn(move || {
+                python::run(&python::Run {
+                    modules: &modules,
+                    handler: "lambda_function.handler",
+                    environment: &environment,
+                    event: None,
+                    request_id: "11111111-2222-3333-4444-555555555555",
+                    invoked_function_arn: "arn:aws:lambda:us-west-2:000000000000:function:probe",
+                    client_context: None,
+                    tenant_id: None,
+                    budget: run_budget(5),
+                    aws: None,
+                })
+            })
+            .expect("a run thread")
+            .join()
+            .expect("the run thread ended");
+        match finished.completion {
+            Completion::Raised { stack_trace, .. } => stack_trace,
+            other => panic!("expected the handler's own failure, got {other:?}"),
+        }
+    }
+
     /// A stored `Timeout` is clamped into the range the model allows before it bounds a
     /// run, and never past this module's own ceiling — one row per bound and one past each.
     #[test]
@@ -1164,30 +1455,10 @@ mod tests {
     /// runtime sets, and nothing of the host.
     #[test]
     fn the_run_environment_is_the_functions_own_plus_the_runtimes() {
-        let mut variables = BTreeMap::new();
-        variables.insert("SECRET".to_string(), "value".to_string());
-        let invocation = Invocation {
-            function_name: "probe".to_string(),
-            executed_version: "7".to_string(),
-            invoked_function_arn: "arn:aws:lambda:us-west-2:000000000000:function:probe:7"
-                .to_string(),
-            region: "us-west-2".to_string(),
-            runtime: Some("python3.12".to_string()),
-            handler: Some("lambda_function.lambda_handler".to_string()),
-            variables,
-            memory_size: 256,
-            timeout: 3,
-            architecture: "x86_64".to_string(),
-            zip_bytes: None,
-            layer_zips: Vec::new(),
-            payload: Vec::new(),
-            client_context: None,
-            tenant_id: None,
-            request_id: "11111111-2222-3333-4444-555555555555".to_string(),
-            initialization_type: crate::state::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,
-            aws: None,
-            logs: None,
-        };
+        let mut invocation = probe_invocation();
+        invocation
+            .variables
+            .insert("SECRET".to_string(), "value".to_string());
         let environment = runtime_environment(&invocation, SystemTime::UNIX_EPOCH);
         let cases: &[(&str, &str)] = &[
             ("SECRET", "value"),

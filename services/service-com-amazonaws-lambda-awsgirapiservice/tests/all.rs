@@ -213,6 +213,8 @@ mod invocation_log_group_search;
 mod invocation_refusal_diagnostics;
 #[path = "all/invoke_addressed_function.rs"]
 mod invoke_addressed_function;
+#[path = "all/invoke_function_error_document.rs"]
+mod invoke_function_error_document;
 #[path = "all/invoke_request_id.rs"]
 mod invoke_request_id;
 #[path = "all/invoke_authorization.rs"]

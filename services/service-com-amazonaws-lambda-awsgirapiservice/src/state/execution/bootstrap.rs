@@ -199,11 +199,64 @@ def _raised(error_type, error_message, stack_trace):
     }
 
 
+def _runtime_library(environment):
+    """The directory the modules of the RUNTIME ITSELF are reported under.
+
+    A managed runtime keeps the standard library it ships under the library directory of
+    its own language installation, named for the runtime the function is configured with
+    — which the invocation's environment states, as ``AWS_EXECUTION_ENV`` is
+    ``AWS_Lambda_<runtime>``.
+    """
+
+    marker = "AWS_Lambda_"
+    execution_env = environment.get("AWS_EXECUTION_ENV") or ""
+    if not execution_env.startswith(marker):
+        return ""
+    return "/var/lang/lib/" + execution_env[len(marker):]
+
+
+def _frame_file(filename, library):
+    """The FILE a traceback frame names.
+
+    A frame of the deployment package's own module already names its path under the task
+    root, and a frame the interpreter renders as a pseudo-file (``<string>``) has no path
+    to name. Everything else is a module of the runtime's own standard library, whose
+    frame names that module's source file under the runtime's library directory rather
+    than the bare module name it was compiled under.
+    """
+
+    if not library or filename.startswith("/") or filename.startswith("<"):
+        return filename
+    path = filename[:-3] if filename.endswith(".py") else filename
+    return "%s/%s.py" % (library, path.replace(".", "/"))
+
+
+def _frames(trace, library):
+    """One rendered frame per entry of ``trace``, as the error document carries them.
+
+    A frame is its location line and the source line at that location, and nothing else:
+    the fine-grained error-location anchors (the ``~`` and ``^`` run under the source
+    line) this interpreter can render are not part of the frame the runtime reports.
+    """
+
+    rendered = []
+    for frame in traceback.extract_tb(trace):
+        text = '  File "%s", line %s, in %s\n' % (
+            _frame_file(frame.filename, library),
+            frame.lineno,
+            frame.name,
+        )
+        if frame.line:
+            text += "    %s\n" % frame.line.strip()
+        rendered.append(text)
+    return rendered
+
+
 def _bounded_sleep(seconds):
     return _host.sleep(float(seconds))
 
 
-def _run(request):
+def _run(request, library):
     sources = request["modules"]
     sys.meta_path.insert(0, _PackageFinder(sources, importlib.util.spec_from_loader))
     # The modules the RUNTIME supplies — the AWS SDK a managed runtime ships — are
@@ -263,7 +316,7 @@ def _run(request):
         return _raised(
             type(error).__name__,
             str(error),
-            traceback.format_tb(trace) if trace is not None else [],
+            _frames(trace, library) if trace is not None else [],
         )
 
     try:
@@ -282,14 +335,16 @@ def _main(payload):
         request = json.loads(payload)
     except BaseException as error:
         return json.dumps(_raised("Runtime.InternalError", str(error), []))
+    # Where this runtime's OWN modules are, which a frame of one of them names.
+    library = _runtime_library(request.get("environment") or {})
     try:
-        return json.dumps(_run(request))
+        return json.dumps(_run(request, library))
     except BaseException as error:
         return json.dumps(
             _raised(
                 type(error).__name__,
                 str(error),
-                traceback.format_tb(error.__traceback__),
+                _frames(error.__traceback__, library),
             )
         )
 

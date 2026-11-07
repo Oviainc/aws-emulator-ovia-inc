@@ -101,7 +101,7 @@ impl Answer {
 }
 
 /// Whether `id` has the 8-4-4-4-12 lowercase-hex form every AWS request id carries.
-fn is_request_id(id: &str) -> bool {
+pub(crate) fn is_request_id(id: &str) -> bool {
     let mut groups = id.split('-');
     for width in [8usize, 4, 4, 4, 12] {
         let Some(group) = groups.next() else {
@@ -373,6 +373,7 @@ async fn an_invocations_answer_names_the_invocation_it_ran() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
     let mut named: Vec<String> = Vec::new();
+    let mut read = 0_usize;
     for row in rows {
         let name = "probe-request-id";
         create_function(&router, name, row.source, row.runtime).await;
@@ -386,6 +387,11 @@ async fn an_invocations_answer_names_the_invocation_it_ran() {
             Vec::new()
         };
         let answered = invoke_run(&router, &reference, &headers).await;
+        if is_host_bound(answered.status, &answered.text()) {
+            delete_function(&router, row.case, name).await;
+            continue;
+        }
+        read += 1;
         assert_eq!(
             answered.status,
             200,
@@ -443,51 +449,107 @@ async fn an_invocations_answer_names_the_invocation_it_ran() {
             row.case
         );
         named.push(stated);
-        let deleted = call(
-            &router,
-            "DELETE",
-            &format!("{FUNCTIONS_URI}/{name}"),
-            &[],
-            &[],
-        )
-        .await;
-        assert_eq!(
-            deleted.status, 204,
-            "case {}: the function must be removable between rows",
-            row.case
-        );
+        delete_function(&router, row.case, name).await;
     }
+    assert!(
+        read > 0,
+        "no row of this table was answered by a run at all: every one was ended by this \
+         process's own host bounds, so the rule was never observed"
+    );
+}
+
+/// Remove the function `name`, so the next row of a table creates its own.
+async fn delete_function(router: &MultiServiceRouter, case: &str, name: &str) {
+    let deleted = call(router, "DELETE", &format!("{FUNCTIONS_URI}/{name}"), &[], &[]).await;
+    assert_eq!(
+        deleted.status, 204,
+        "case {case}: the function must be removable between rows, got {} {}",
+        deleted.status,
+        deleted.text()
+    );
+}
+
+/// Whether an answer of `status` carrying `body` reports one of the EMULATOR's own host
+/// bounds instead of what the run came to.
+///
+/// Two of those bounds are shared by every suite of this test binary and belong to none of
+/// them: the run slots an invocation waits for, whose refusal says to retry the request,
+/// and the memory bound read from the WHOLE process, which stops whichever run is in
+/// flight once the test binary as a whole is over it ([`stopped_by_the_host`], which reads
+/// the same answer off a parsed document). Neither says anything about what a run came to,
+/// so a row answered with one has nothing of a run to read.
+///
+/// `pub(crate)` so the sibling suites that read what a RUN answered share this one reading
+/// of it.
+pub(crate) fn is_host_bound(status: u16, body: &str) -> bool {
+    if status != 200 {
+        return body.contains("invocations are running in this emulator");
+    }
+    body.contains(RUNTIME_EXIT_ERROR) && body.contains(RUNTIME_KILLED)
+}
+
+/// Whether `class` is an error class a runtime reports for a failure it raised while it
+/// was still RESOLVING the handler — reading the handler name, importing its module,
+/// finding the entry point on it — rather than while an invocation was running (the same
+/// classes `state::execution` reads the phase from).
+fn initialization_class(class: &str) -> bool {
+    matches!(
+        class,
+        "Runtime.MalformedHandlerName"
+            | "Runtime.ImportModuleError"
+            | "Runtime.UserCodeSyntaxError"
+            | "Runtime.HandlerNotFound"
+    )
 }
 
 /// A handler that RAISED is answered with its own error document, which names the same
-/// invocation the response header does — one row per way a run fails.
+/// invocation the response header does — one row per way a run fails, and per phase the
+/// failure was raised in. A failure the runtime raised while it was still RESOLVING the
+/// handler is bound to no invocation, so its document names none while the answer still
+/// names the request it answered.
 #[tokio::test]
 async fn a_failed_runs_error_document_names_the_invocation_the_answer_names() {
     let _stream = one_invocation_stream_at_a_time().await;
-    let cases: &[(&str, &str)] = &[
+    // The case, the module source, the error class the run comes to, and whether an
+    // invocation was bound to the run when it failed.
+    let cases: &[(&str, &str, &str, bool)] = &[
         (
             "a raised exception",
             "def lambda_handler(event, context):\n    raise ValueError('boom')\n",
+            "ValueError",
+            true,
         ),
         (
             "a failed computation",
             "def lambda_handler(event, context):\n    return 1 / 0\n",
+            "ZeroDivisionError",
+            true,
         ),
         (
             "a handler the module does not define",
             "def other(event, context):\n    return 1\n",
+            "Runtime.HandlerNotFound",
+            false,
         ),
         (
             "a module that does not import",
             "import no_such_module_at_all\n",
+            "Runtime.ImportModuleError",
+            false,
         ),
     ];
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
-    for (case, source) in cases {
+    let mut read = 0_usize;
+    for (case, source, error_type, bound) in cases {
         let name = "probe-raise-request-id";
         create_function(&router, name, source, "python3.12").await;
         let answered = invoke(&router, name, &[("x-amz-log-type", "Tail")]).await;
+        if is_host_bound(answered.status, &answered.text()) {
+            delete_function(&router, case, name).await;
+            continue;
+        }
+        read += 1;
         assert_eq!(
             answered.status,
             200,
@@ -496,36 +558,58 @@ async fn a_failed_runs_error_document_names_the_invocation_the_answer_names() {
             answered.text()
         );
         let stated = answered.request_id();
-        let reported = answered
-            .json()
+        let document = answered.json();
+        let reported = document
             .get("requestId")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let class = document
+            .get("errorType")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         assert_eq!(
-            reported, stated,
-            "case {case}: the error document names the invocation as {reported:?}, so the \
-             answer must name that invocation, got {stated:?}"
+            class, *error_type,
+            "case {case}: expected the error class {error_type}, got {document}"
         );
+        assert_eq!(
+            initialization_class(&class),
+            !*bound,
+            "case {case}: {error_type} is reported for the {} phase",
+            if *bound { "run's own" } else { "initialization" }
+        );
+        if *bound {
+            assert_eq!(
+                reported, stated,
+                "case {case}: the error document names the invocation as {reported:?}, so the \
+                 answer must name that invocation, got {stated:?}"
+            );
+        } else {
+            assert_eq!(
+                reported, "",
+                "case {case}: {error_type} is raised while the handler is still being \
+                 resolved, before any invocation is bound to it, so its document names none, \
+                 got {reported:?}"
+            );
+            assert!(
+                is_request_id(&stated),
+                "case {case}: the answer still names the request it answered, got {stated:?}"
+            );
+        }
         let log = answered.log_tail();
         let expected = format!("REPORT RequestId: {stated}");
         assert!(
             log.contains(&expected),
             "case {case}: expected the log line {expected:?}, got {log:?}"
         );
-        let deleted = call(
-            &router,
-            "DELETE",
-            &format!("{FUNCTIONS_URI}/{name}"),
-            &[],
-            &[],
-        )
-        .await;
-        assert_eq!(
-            deleted.status, 204,
-            "case {case}: the function must be removable between rows"
-        );
+        delete_function(&router, case, name).await;
     }
+    assert!(
+        read > 0,
+        "no row of this table was answered by a run at all: every one was ended by this \
+         process's own host bounds, so the rule was never observed"
+    );
 }
 
 /// A response-streaming invocation is an invocation: its answer names the invocation it ran,
