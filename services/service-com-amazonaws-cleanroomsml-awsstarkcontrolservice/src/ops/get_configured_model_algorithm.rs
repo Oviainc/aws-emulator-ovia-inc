@@ -187,7 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(
                 GetConfiguredModelAlgorithmErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(&input.configured_model_algorithm_arn),
+                    crate::state::resource_not_found(
+                        crate::state::KIND_CONFIGURED_MODEL_ALGORITHM,
+                        &input.configured_model_algorithm_arn,
+                    ),
                 )
                 .into(),
             );

@@ -32,12 +32,18 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
+// Clean Rooms' own store, which is where a membership lives: Clean Rooms ML
+// resources are created under a membership, and a membership is a Clean Rooms
+// resource, so this service reads one from the service that owns it rather than
+// keeping a second copy of it here.
+use ::service_com_amazonaws_cleanrooms_awsbastioncontrolplaneservicelambda::state as cleanrooms;
+
 use crate::ops::types::{
     CollaborationConfiguredModelAlgorithmAssociationSummary, CollaborationMLInputChannelSummary,
     CollaborationTrainedModelInferenceJobSummary, CollaborationTrainedModelSummary,
-    ConflictException, ContainerConfig, Dataset, IncrementalTrainingDataChannelOutput,
-    InferenceContainerConfig, InferenceOutputConfiguration, PayerConfiguration,
-    ResourceNotFoundException, TrainingDatasetSummary,
+    ConfiguredModelAlgorithmAssociationSummary, ConflictException, ContainerConfig, Dataset,
+    IncrementalTrainingDataChannelOutput, InferenceContainerConfig, InferenceOutputConfiguration,
+    PayerConfiguration, PrivacyConfiguration, ResourceNotFoundException, TrainingDatasetSummary,
 };
 
 /// The region a minted ARN names when the request carries no SigV4 credential
@@ -632,6 +638,69 @@ pub fn collaboration_page_where<'a, Record: CollaborationScoped + 'a>(
     (page, next_token)
 }
 
+/// What a record a MEMBERSHIP-scoped list reports says about itself: the same
+/// walk as [`CollaborationScoped`], over the membership a record was created
+/// under rather than the collaboration it is visible in.
+///
+/// `ListConfiguredModelAlgorithmAssociations` and its sibling membership-scoped
+/// lists serve one rule — report the records of one membership that the
+/// endpoint's own region holds, ARN order, one page at a time — so the walk lives
+/// once in [`membership_page`] and each record says here what that walk needs of
+/// it. A record reported by both kinds of list implements both traits, each with
+/// its own summary projection, because the two lists return different shapes.
+pub trait MembershipScoped {
+    /// The summary projection that list returns, one per reported record.
+    type Summary;
+
+    /// The ARN this record is keyed by, which is the pagination token.
+    fn page_key(&self) -> &str;
+    /// The region the record was created in.
+    fn scope_region(&self) -> &str;
+    /// The membership the record was created under.
+    fn scope_membership(&self) -> &str;
+    /// Materialise the status change the clock owes this record, if any is due.
+    fn settle_now(&mut self, now: SystemTime);
+    /// The summary projection of this record.
+    fn summary(&self) -> Self::Summary;
+}
+
+/// One page of the membership-scoped `records`, and the token the next page
+/// resumes at when the membership holds more.
+///
+/// The same walk as [`collaboration_page`], and for the same reasons: `records`
+/// is iterated in the store's ARN order, which is the one stable total order the
+/// token indexes into, the page starts at the first ARN at or after the token the
+/// request carried, and a record is reported only through its own membership and
+/// its own region's endpoint, carrying the status the clock owes it at `now`.
+pub fn membership_page<'a, Record: MembershipScoped + 'a>(
+    records: impl Iterator<Item = &'a mut Record>,
+    membership_identifier: &str,
+    region: &str,
+    page_size: usize,
+    resume_at: Option<&str>,
+    now: SystemTime,
+) -> (Vec<Record::Summary>, Option<String>) {
+    let mut page = Vec::with_capacity(page_size);
+    let mut next_token = None;
+    for record in records {
+        if resume_at.is_some_and(|token| record.page_key() < token) {
+            continue;
+        }
+        if record.scope_region() != region || record.scope_membership() != membership_identifier {
+            continue;
+        }
+        // Settled before the page-full check names it as the next token: the
+        // transition was owed at `now` regardless of this call.
+        record.settle_now(now);
+        if page.len() == page_size {
+            next_token = Some(record.page_key().to_string());
+            break;
+        }
+        page.push(record.summary());
+    }
+    (page, next_token)
+}
+
 /// One Clean Rooms ML configured model algorithm, as this emulator persists it.
 ///
 /// The resource is container configuration plus the role that reads the
@@ -694,8 +763,15 @@ pub struct ConfiguredModelAlgorithmAssociation {
     /// The configured model algorithm the association points at.
     pub configured_model_algorithm_arn: String,
     pub description: Option<String>,
+    /// The privacy configuration the create named, held as the request carried it
+    /// so a read reports exactly what was stored.
+    pub privacy_configuration: Option<PrivacyConfiguration>,
     /// The account of the member that created the association.
     pub creator_account_id: String,
+    /// The association's tags. `TaggableArn` admits a configured model algorithm
+    /// association, so this is the one copy of them the tagging operations read
+    /// and write, exactly as every other taggable record here holds its own.
+    pub tags: BTreeMap<String, String>,
     pub create_time: SystemTime,
     pub update_time: SystemTime,
 }
@@ -716,6 +792,23 @@ impl ConfiguredModelAlgorithmAssociation {
             collaboration_identifier: self.collaboration_identifier.clone(),
             configured_model_algorithm_arn: self.configured_model_algorithm_arn.clone(),
             creator_account_id: self.creator_account_id.clone(),
+        }
+    }
+
+    /// The `ConfiguredModelAlgorithmAssociationSummary` projection
+    /// `ListConfiguredModelAlgorithmAssociations` returns — the membership-scoped
+    /// list, whose summary names no creator account because every association it
+    /// reports was created under the one membership the request addressed.
+    pub fn to_summary(&self) -> ConfiguredModelAlgorithmAssociationSummary {
+        ConfiguredModelAlgorithmAssociationSummary {
+            create_time: ::aws_smithy_types::DateTime::from(self.create_time),
+            update_time: ::aws_smithy_types::DateTime::from(self.update_time),
+            configured_model_algorithm_association_arn: self.arn.clone(),
+            configured_model_algorithm_arn: self.configured_model_algorithm_arn.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            membership_identifier: self.membership_identifier.clone(),
+            collaboration_identifier: self.collaboration_identifier.clone(),
         }
     }
 }
@@ -744,6 +837,30 @@ impl CollaborationScoped for ConfiguredModelAlgorithmAssociation {
     }
 }
 
+impl MembershipScoped for ConfiguredModelAlgorithmAssociation {
+    type Summary = ConfiguredModelAlgorithmAssociationSummary;
+
+    fn page_key(&self) -> &str {
+        &self.arn
+    }
+
+    fn scope_region(&self) -> &str {
+        &self.region
+    }
+
+    fn scope_membership(&self) -> &str {
+        &self.membership_identifier
+    }
+
+    /// Nothing, for the same reason as the collaboration-scoped walk: the
+    /// association carries no status.
+    fn settle_now(&mut self, _now: SystemTime) {}
+
+    fn summary(&self) -> Self::Summary {
+        self.to_summary()
+    }
+}
+
 /// Which kind of resource a `TaggableArn` names a record of in this store.
 ///
 /// `TaggableArn` is one pattern over every resource Clean Rooms ML tags, and
@@ -755,6 +872,7 @@ pub enum TaggedResourceKind {
     TrainingDataset,
     AudienceModel,
     ConfiguredModelAlgorithm,
+    ConfiguredModelAlgorithmAssociation,
     MlInputChannel,
     TrainedModel,
     TrainedModelInferenceJob,
@@ -851,6 +969,19 @@ impl ComAmazonawsCleanroomsmlAwsstarkcontrolserviceState {
             .filter(|algorithm| algorithm.region == region)
     }
 
+    /// The configured model algorithm association `arn` names, if the endpoint
+    /// `region` serves it — the same regional scope as
+    /// [`Self::training_dataset`].
+    pub fn configured_model_algorithm_association(
+        &self,
+        arn: &str,
+        region: &str,
+    ) -> Option<&ConfiguredModelAlgorithmAssociation> {
+        self.configured_model_algorithm_associations
+            .get(arn)
+            .filter(|association| association.region == region)
+    }
+
     /// Which kind of resource the endpoint `region`'s store holds `arn` under,
     /// or `None` when it holds none.
     ///
@@ -875,6 +1006,16 @@ impl ComAmazonawsCleanroomsmlAwsstarkcontrolserviceState {
                         record.region.as_str(),
                     )
                 })
+            })
+            .or_else(|| {
+                self.configured_model_algorithm_associations
+                    .get(arn)
+                    .map(|record| {
+                        (
+                            TaggedResourceKind::ConfiguredModelAlgorithmAssociation,
+                            record.region.as_str(),
+                        )
+                    })
             })
             .or_else(|| {
                 self.ml_input_channels
@@ -910,6 +1051,9 @@ impl ComAmazonawsCleanroomsmlAwsstarkcontrolserviceState {
             TaggedResourceKind::ConfiguredModelAlgorithm => {
                 &self.configured_model_algorithms.get(arn)?.tags
             }
+            TaggedResourceKind::ConfiguredModelAlgorithmAssociation => {
+                &self.configured_model_algorithm_associations.get(arn)?.tags
+            }
             TaggedResourceKind::MlInputChannel => &self.ml_input_channels.get(arn)?.tags,
             TaggedResourceKind::TrainedModel => &self.trained_models.get(arn)?.tags,
             TaggedResourceKind::TrainedModelInferenceJob => {
@@ -930,6 +1074,12 @@ impl ComAmazonawsCleanroomsmlAwsstarkcontrolserviceState {
             TaggedResourceKind::AudienceModel => &mut self.audience_models.get_mut(arn)?.tags,
             TaggedResourceKind::ConfiguredModelAlgorithm => {
                 &mut self.configured_model_algorithms.get_mut(arn)?.tags
+            }
+            TaggedResourceKind::ConfiguredModelAlgorithmAssociation => {
+                &mut self
+                    .configured_model_algorithm_associations
+                    .get_mut(arn)?
+                    .tags
             }
             TaggedResourceKind::MlInputChannel => &mut self.ml_input_channels.get_mut(arn)?.tags,
             TaggedResourceKind::TrainedModel => &mut self.trained_models.get_mut(arn)?.tags,
@@ -1175,12 +1325,52 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// The `ResourceNotFoundException` payload for an ARN that names no persisted
-/// resource. `ResourceNotFoundException` models `message` and nothing else, so
-/// the message is where the ARN that was asked about goes.
-pub fn resource_not_found(arn: &str) -> ResourceNotFoundException {
+/// The identifier of the collaboration the membership `membership_identifier`
+/// belongs to, or `None` when the endpoint `region` serves no such membership.
+///
+/// A configured model algorithm association is created under a membership and is
+/// visible to every member of the collaboration that membership belongs to, so
+/// the collaboration is READ from the membership Clean Rooms persisted — never
+/// derived from the identifier the request carried. A membership's ARN names the
+/// region it was created in, and a Clean Rooms ML endpoint serves its own region
+/// only, so a membership from another region is invisible here.
+pub fn membership_collaboration<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    membership_identifier: &str,
+    region: &str,
+) -> Option<String> {
+    let state = cleanrooms::service_state(engine)?;
+    let store = state.lock();
+    let membership = store.memberships.get(membership_identifier)?;
+    (membership.arn == cleanrooms::membership_arn(region, membership_identifier))
+        .then(|| membership.collaboration_id.clone())
+}
+
+/// The name Clean Rooms ML gives each kind of resource in the refusal
+/// [`resource_not_found`] builds: the service's own display name for the kind,
+/// as its model names the shape the identifier belongs to.
+pub const KIND_TRAINING_DATASET: &str = "Training Dataset";
+/// See [`KIND_TRAINING_DATASET`].
+pub const KIND_AUDIENCE_MODEL: &str = "Audience Model";
+/// See [`KIND_TRAINING_DATASET`].
+pub const KIND_CONFIGURED_MODEL_ALGORITHM: &str = "Configured Model Algorithm";
+/// See [`KIND_TRAINING_DATASET`].
+pub const KIND_CONFIGURED_MODEL_ALGORITHM_ASSOCIATION: &str =
+    "Configured Model Algorithm Association";
+/// See [`KIND_TRAINING_DATASET`].
+pub const KIND_MEMBERSHIP: &str = "Membership";
+
+/// The `ResourceNotFoundException` payload for an identifier that names no
+/// persisted resource of `kind`.
+///
+/// `ResourceNotFoundException` models `message` and nothing else, so the message
+/// is where both go: Clean Rooms ML words this refusal as the KIND of resource
+/// that was looked for, then the identifier the request carried for it, then
+/// `not found.` — one wording for the whole class, each refusal naming its own
+/// kind and the value the caller sent.
+pub fn resource_not_found(kind: &str, identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("Resource {arn} not found"),
+        message: format!("{kind}: {identifier} not found."),
     }
 }
 

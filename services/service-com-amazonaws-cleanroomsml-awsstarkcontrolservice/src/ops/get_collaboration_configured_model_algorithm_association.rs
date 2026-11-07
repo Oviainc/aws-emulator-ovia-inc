@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCollaborationConfiguredModelAlgorithmAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCollaborationConfiguredModelAlgorithmAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCollaborationConfiguredModelAlgorithmAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the configured model algorithm association the ARN in the path names, as a
+//! member of the collaboration in the path sees it: the same record
+//! `CreateConfiguredModelAlgorithmAssociation` persisted in [`crate::state`], reported
+//! through the collaboration it was created in — which is why this read also names the
+//! account of the member that created it. An ARN this regional endpoint holds no
+//! association for, or one created in another collaboration, is the modelled
+//! `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +177,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCollaborationConfiguredModelAlgorithmAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCollaborationConfiguredModelAlgorithmAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCollaborationConfiguredModelAlgorithmAssociation"))
+        // This operation reports on the store; the region the request was signed for is
+        // the endpoint it reached, and a Clean Rooms ML endpoint is regional.
+        let region = crate::state::request_region(ctx.parts());
+        // See `CreateTrainingDataset` for why an engine with no store for this service
+        // answers the scaffold's 501.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        let store = state.lock();
+        // An association is visible to this read only through the collaboration it was
+        // created in, so the collaboration in the path is part of the address: a record
+        // of another collaboration is not the one this request addresses, even though
+        // its ARN is well formed and the store holds it.
+        let association = store
+            .configured_model_algorithm_association(
+                &input.configured_model_algorithm_association_arn,
+                &region,
+            )
+            .filter(|association| {
+                association.collaboration_identifier == input.collaboration_identifier
+            });
+        let Some(association) = association else {
+            return Err(
+                GetCollaborationConfiguredModelAlgorithmAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::KIND_CONFIGURED_MODEL_ALGORITHM_ASSOCIATION,
+                        &input.configured_model_algorithm_association_arn,
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetCollaborationConfiguredModelAlgorithmAssociationOutput {
+            create_time: ::aws_smithy_types::DateTime::from(association.create_time),
+            update_time: ::aws_smithy_types::DateTime::from(association.update_time),
+            configured_model_algorithm_association_arn: association.arn.clone(),
+            membership_identifier: association.membership_identifier.clone(),
+            collaboration_identifier: association.collaboration_identifier.clone(),
+            configured_model_algorithm_arn: association.configured_model_algorithm_arn.clone(),
+            name: association.name.clone(),
+            description: association.description.clone(),
+            creator_account_id: association.creator_account_id.clone(),
+            privacy_configuration: association.privacy_configuration.clone(),
+        })
     }
 }

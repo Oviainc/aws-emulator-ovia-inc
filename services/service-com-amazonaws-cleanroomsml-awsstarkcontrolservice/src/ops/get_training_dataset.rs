@@ -170,7 +170,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(dataset) = store.training_dataset(&input.training_dataset_arn, &region) else {
             return Err(GetTrainingDatasetErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(&input.training_dataset_arn),
+                crate::state::resource_not_found(
+                    crate::state::KIND_TRAINING_DATASET,
+                    &input.training_dataset_arn,
+                ),
             )
             .into());
         };

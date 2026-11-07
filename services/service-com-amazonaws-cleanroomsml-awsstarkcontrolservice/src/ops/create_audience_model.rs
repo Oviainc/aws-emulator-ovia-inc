@@ -192,7 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_none()
         {
             return Err(CreateAudienceModelErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(&input.training_dataset_arn),
+                crate::state::resource_not_found(
+                    crate::state::KIND_TRAINING_DATASET,
+                    &input.training_dataset_arn,
+                ),
             )
             .into());
         }

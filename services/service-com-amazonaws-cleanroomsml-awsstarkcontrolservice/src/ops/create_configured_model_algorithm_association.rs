@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfiguredModelAlgorithmAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConfiguredModelAlgorithmAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Associates a persisted configured model algorithm with the collaboration the
+//! membership in the path belongs to: the record this operation writes into
+//! [`crate::state`] is what the collaboration-scoped reads report, and the ARN it mints
+//! is the only name a later call accepts for the association. Neither the
+//! `CollaborationConfiguredModelAlgorithmAssociationSummary` projection nor
+//! `GetConfiguredModelAlgorithmAssociationResponse` models a status member, so the
+//! association is ready the moment this call returns and the clock owes it nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConfiguredModelAlgorithmAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The membership is a Clean Rooms resource, not one of this service's: the
+//! collaboration the association becomes visible in is read from the membership Clean
+//! Rooms persisted ([`crate::state::membership_collaboration`]), so a membership that
+//! service does not hold in this region is refused with the modelled
+//! `ResourceNotFoundException`, as is a `configuredModelAlgorithmArn` this endpoint
+//! serves no algorithm for.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +181,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConfiguredModelAlgorithmAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConfiguredModelAlgorithmAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfiguredModelAlgorithmAssociation"))
+        // See `CreateTrainingDataset` for why an engine with no store for this service
+        // answers the scaffold's 501.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+
+        // The association is created under a membership and is visible to every member
+        // of the collaboration that membership belongs to, so the collaboration is read
+        // from the membership Clean Rooms holds. A membership that service does not hold
+        // in this region names no resource to associate under: the modelled
+        // `ResourceNotFoundException` (404) is the refusal. Read before this service's
+        // store is locked, so only one store is ever held at a time.
+        let Some(collaboration_identifier) = crate::state::membership_collaboration(
+            &*self.engine,
+            &input.membership_identifier,
+            &region,
+        ) else {
+            return Err(
+                CreateConfiguredModelAlgorithmAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::KIND_MEMBERSHIP,
+                        &input.membership_identifier,
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+
+        // The algorithm is what the association points at, so one this endpoint does not
+        // serve cannot be associated: the same modelled refusal, not an association whose
+        // `configuredModelAlgorithmArn` names nothing visible here.
+        if store
+            .configured_model_algorithm(&input.configured_model_algorithm_arn, &region)
+            .is_none()
+        {
+            return Err(
+                CreateConfiguredModelAlgorithmAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::KIND_CONFIGURED_MODEL_ALGORITHM,
+                        &input.configured_model_algorithm_arn,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // The store is bounded: past its quota a create is refused rather than adding
+        // another record. `ServiceQuotaExceededException` is the modelled refusal for
+        // exactly this, and it reports what the bound is.
+        if store.configured_model_algorithm_associations.len() >= crate::state::RESOURCE_QUOTA {
+            return Err(
+                CreateConfiguredModelAlgorithmAssociationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this account already holds the maximum of {} configured model \
+                             algorithm associations; delete one before creating another",
+                            crate::state::RESOURCE_QUOTA
+                        ),
+                        // Named for what it bounds: an AWS quota code or name is an
+                        // identifier Service Quotas issues, which this emulator does not
+                        // model, so the bound reported here is the emulator's own.
+                        quota_name: Some(
+                            "ConfiguredModelAlgorithmAssociationsPerAccount".to_string(),
+                        ),
+                        quota_value: Some(crate::state::RESOURCE_QUOTA as f64),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.mint_resource_id();
+        let arn = crate::state::configured_model_algorithm_association_arn(
+            &input.membership_identifier,
+            &id,
+            &region,
+        );
+        store.configured_model_algorithm_associations.insert(
+            arn.clone(),
+            crate::state::ConfiguredModelAlgorithmAssociation {
+                arn: arn.clone(),
+                region,
+                membership_identifier: input.membership_identifier,
+                collaboration_identifier,
+                name: input.name,
+                configured_model_algorithm_arn: input.configured_model_algorithm_arn,
+                description: input.description,
+                privacy_configuration: input.privacy_configuration,
+                // The member that created the association is the one account this
+                // emulator authenticates every caller as.
+                creator_account_id: ::engine::emulator_account_id().to_string(),
+                tags: input.tags.unwrap_or_default().into_iter().collect(),
+                create_time: now,
+                update_time: now,
+            },
+        );
+
+        Ok(CreateConfiguredModelAlgorithmAssociationOutput {
+            configured_model_algorithm_association_arn: arn,
+        })
     }
 }

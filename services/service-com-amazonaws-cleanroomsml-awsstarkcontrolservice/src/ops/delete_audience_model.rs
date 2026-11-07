@@ -187,7 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_none_or(|model| model.region != region)
         {
             return Err(DeleteAudienceModelErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(&input.audience_model_arn),
+                crate::state::resource_not_found(
+                    crate::state::KIND_AUDIENCE_MODEL,
+                    &input.audience_model_arn,
+                ),
             )
             .into());
         }

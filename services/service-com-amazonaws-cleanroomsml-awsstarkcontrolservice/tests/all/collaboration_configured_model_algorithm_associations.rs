@@ -85,7 +85,9 @@ fn association(
         name: format!("association-{id}"),
         configured_model_algorithm_arn: configured_model_algorithm_arn(id, region),
         description: None,
+        privacy_configuration: None,
         creator_account_id: ACCOUNT.to_string(),
+        tags: Default::default(),
         create_time: instant(1_762_000_000),
         update_time: instant(1_762_000_060),
     }

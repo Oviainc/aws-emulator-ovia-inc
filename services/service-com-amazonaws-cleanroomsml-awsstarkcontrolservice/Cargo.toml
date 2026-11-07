@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Clean Rooms owns collaborations and memberships; a Clean Rooms ML resource is
+# created under a membership, so this crate reads that membership from the store
+# the owning service keeps.
+service-com-amazonaws-cleanrooms-awsbastioncontrolplaneservicelambda = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

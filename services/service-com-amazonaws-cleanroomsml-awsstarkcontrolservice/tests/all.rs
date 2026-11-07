@@ -21,6 +21,8 @@ mod collaboration_trained_model_inference_jobs;
 mod collaboration_trained_models;
 #[path = "all/configured_model_algorithm.rs"]
 mod configured_model_algorithm;
+#[path = "all/configured_model_algorithm_associations.rs"]
+mod configured_model_algorithm_associations;
 #[path = "all/ops_name_bindings.rs"]
 mod ops_name_bindings;
 #[path = "all/resource_tags.rs"]

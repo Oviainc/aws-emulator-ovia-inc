@@ -181,7 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(model) = store.settled_audience_model_mut(&input.audience_model_arn, &region, now)
         else {
             return Err(GetAudienceModelErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(&input.audience_model_arn),
+                crate::state::resource_not_found(
+                    crate::state::KIND_AUDIENCE_MODEL,
+                    &input.audience_model_arn,
+                ),
             )
             .into());
         };
