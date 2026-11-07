@@ -456,19 +456,55 @@ pub fn decode_page_token(token: &str) -> Option<u64> {
     u64::from_str_radix(cursor, 16).ok()
 }
 
-/// Why [`decode_page_token`] refuses a value: this decoder's own reason, which the
-/// service's pagination-token sentence carries (see [`pagination_token_message`]).
-const PAGE_TOKEN_REFUSAL_REASON: &str = "the token was not issued by this service";
-
-/// The message this service answers a pagination-token failure with: the fixed
-/// sentence `Pagination token exception in operation '<operation>': `, the
-/// operation taken from the request, then the reason the cursor was refused.
+/// The message a paginated read of this service refuses an unreadable `NextToken`
+/// with: the fixed sentence `Pagination token exception in operation '<operation>':
+/// invalid payload wrapping schema <n>`, where the operation is the one the token
+/// was presented to and `<n>` is the wrapping schema the presented token's own
+/// payload declares ([`payload_wrapping_schema`]).
 ///
-/// One wording for every list operation of this service, so a client matching on
-/// the text of this error class does not meet two sentences for it.
-pub fn pagination_token_message(operation: &str) -> String {
-    format!("Pagination token exception in operation '{operation}': {PAGE_TOKEN_REFUSAL_REASON}")
+/// Both variable parts come from the request and nothing of the token's own text
+/// travels in it, so an opaque value a caller sent is not echoed back. One wording
+/// for every list operation of this service, so a client matching on the text of
+/// this error class does not meet two sentences for it.
+pub fn pagination_token_message(operation: &str, next_token: &str) -> String {
+    format!(
+        "Pagination token exception in operation '{operation}': invalid payload wrapping \
+         schema {}",
+        payload_wrapping_schema(next_token)
+    )
 }
+
+/// The wrapping schema a pagination token's own payload declares: the first 16 bits
+/// of that payload, read as a big-endian SIGNED integer.
+///
+/// A continuation token carries a WRAPPED payload whose leading field states which
+/// schema the rest of it is written under, and a decoder handed a schema it does not
+/// write reports the value it read — so the number is a function of the token
+/// presented and of nothing else. A token is base64 text, so only its first group of
+/// [`BASE64_GROUP`] characters carries those bits: a token shorter than one group is
+/// read as if padded with zero sextets ([`ZERO_SEXTET`]), and leading characters that
+/// are not base64 at all carry no payload to read a schema out of, which is the zero
+/// this answers.
+fn payload_wrapping_schema(next_token: &str) -> i16 {
+    let mut leading: String = next_token.chars().take(BASE64_GROUP).collect();
+    while leading.chars().count() < BASE64_GROUP {
+        leading.push(ZERO_SEXTET);
+    }
+    // The base64url codec this workspace already reads opaque token payloads with,
+    // so this service introduces no second decoder.
+    let octets = ::service_common::jwt::decode_base64url(&leading).unwrap_or_default();
+    i16::from_be_bytes([
+        octets.first().copied().unwrap_or_default(),
+        octets.get(1).copied().unwrap_or_default(),
+    ])
+}
+
+/// The number of characters one base64 group spells three octets in (RFC 4648 §4).
+const BASE64_GROUP: usize = 4;
+
+/// The base64 character for six zero bits, which a token shorter than one group is
+/// read as if padded with.
+const ZERO_SEXTET: char = 'A';
 
 /// The page a list operation of this service must serve: how many records it may
 /// return, and the `seq` it starts past.

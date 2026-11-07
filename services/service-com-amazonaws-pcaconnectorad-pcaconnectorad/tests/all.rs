@@ -19,5 +19,7 @@ mod directory_registration_lifecycle;
 // router, the request builder, the `@httpLabel` encoding and the error-code read.
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/pagination_token_refusals.rs"]
+mod pagination_token_refusals;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

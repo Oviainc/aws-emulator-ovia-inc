@@ -413,7 +413,7 @@ async fn list_directory_registrations_refuses_a_next_token_it_never_issued() {
             code, "ValidationException",
             "case {token}: expected ValidationException, got {code:?} / {parsed}"
         );
-        let message = parsed["Message"].as_str().unwrap_or_default();
+        let message = parsed["message"].as_str().unwrap_or_default();
         assert!(
             message.starts_with("Pagination token exception in operation \
                                  'ListDirectoryRegistrations': "),

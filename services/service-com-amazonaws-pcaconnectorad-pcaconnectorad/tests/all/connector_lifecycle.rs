@@ -463,9 +463,10 @@ async fn list_connectors_refuses_a_next_token_it_never_issued() {
         );
         // One wording for this error class across this service's list operations
         // (`state::pagination_token_message`): the fixed sentence, the operation
-        // from the request, then the decoder's reason.
+        // from the request, then the schema the presented token declares. The
+        // layer that reads the token keys it at the lowercase `message` member.
         assert!(
-            parsed["Message"]
+            parsed["message"]
                 .as_str()
                 .unwrap_or_default()
                 .starts_with("Pagination token exception in operation 'ListConnectors': "),

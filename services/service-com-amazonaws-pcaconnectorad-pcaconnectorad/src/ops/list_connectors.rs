@@ -169,14 +169,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The page this call asks for: the shared bounds every list operation of
         // this service serves pages by. `None` is a `NextToken` the service never
         // issued, which is refused rather than honoured as a cursor.
+        //
+        // A pagination-token failure is answered by the layer that READS the token,
+        // not by this operation's own modelled error shape: it carries the same
+        // status and error code, and its body keys the text at the lowercase
+        // `message` member that layer writes (`crate::scaffolded`) — which is where
+        // a client reads this class of refusal out of. Every other refusal of this
+        // operation is the modelled `ValidationException`.
         let (page_size, after) =
             crate::state::page_bounds(input.max_results, input.next_token.as_deref()).ok_or_else(
                 || {
-                    ListConnectorsError::from(ListConnectorsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: crate::state::pagination_token_message(Self::NAME),
-                            reason: Some("FIELD_VALIDATION_FAILED".to_string()),
-                        },
+                    ListConnectorsError::validation(crate::state::pagination_token_message(
+                        Self::NAME,
+                        input.next_token.as_deref().unwrap_or_default(),
                     ))
                 },
             )?;
