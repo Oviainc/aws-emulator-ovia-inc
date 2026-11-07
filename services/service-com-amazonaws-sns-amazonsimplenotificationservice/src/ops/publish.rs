@@ -150,6 +150,19 @@
 use super::types::*;
 use crate::state::{self, MessageRequest, PublishedMessage};
 
+/// The `lambda`-protocol half of this operation's fan-out, which is reached from the same
+/// two functions the `sqs` half is ([`subscription_deliveries`] and
+/// [`deliver_to_subscribers`]): a subscribed FUNCTION is addressed by another service's API
+/// and governed by that function's own resource policy, so it is one concern of its own
+/// rather than more branches in this file.
+///
+/// The path is explicit for the reason the generated `ops/mod.rs` gives for its own
+/// declarations: this operation's module is itself declared with a `#[path]`, so a bare
+/// `mod` item here would be looked for beside this file rather than under it — and a file
+/// directly in `ops/` is read as an operation of its own by the build.
+#[path = "publish/function_delivery.rs"]
+mod function_delivery;
+
 /// Refuse the request with `InvalidParameterException`, the error SNS uses for a
 /// parameter that "does not comply with the associated constraints".
 fn invalid_parameter(message: String) -> PublishError {
@@ -338,12 +351,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut store = store.lock();
             publish_into_store(&mut store, input, &destination)?
         };
-        deliver_to_queues(ctx, &deliveries).await;
+        deliver_to_subscribers(ctx, &deliveries).await;
         Ok(output)
     }
 }
 
-/// Record the publish in the store, and report the deliveries it owes to the SQS queues
+/// Record the publish in the store, and report the deliveries it owes to the endpoints
 /// subscribed to the topic.
 ///
 /// The whole store-touching half of the operation, so the one place that holds the store's
@@ -352,7 +365,7 @@ fn publish_into_store(
     store: &mut crate::state::ComAmazonawsSnsAmazonsimplenotificationserviceState,
     input: PublishInput,
     destination: &str,
-) -> Result<(PublishOutput, Vec<QueueDelivery>), PublishError> {
+) -> Result<(PublishOutput, Deliveries), PublishError> {
     let Some(topic) = store.topics.get(destination).cloned() else {
         return Err(PublishErrorModeled::NotFoundException(NotFoundException {
             message: Some(state::TOPIC_DOES_NOT_EXIST.to_string()),
@@ -392,7 +405,7 @@ fn publish_into_store(
                 message_id: Some(accepted.message_id),
                 sequence_number: accepted.sequence_number,
             },
-            Vec::new(),
+            Deliveries::default(),
         ));
     }
     // Only a FIFO topic is sequenced: "This response element applies only to FIFO
@@ -431,7 +444,8 @@ fn publish_into_store(
         .filter(|sub| state::filter_policy::admits(sub, &published, &mut matching))
         .cloned()
         .collect();
-    let deliveries = queue_deliveries(&subscriptions, &published, &mut DeliveryBudget::new());
+    let deliveries =
+        subscription_deliveries(&subscriptions, &published, &mut DeliveryBudget::new());
     for subscription in &subscriptions {
         store.record_delivery(&subscription.arn, ::std::sync::Arc::clone(&published));
     }
@@ -465,6 +479,33 @@ pub(crate) const SQS_ARN_NAMESPACE: &str = "sqs";
 /// The subscription protocol whose endpoint is an SQS queue: "sqs – delivery of JSON-encoded
 /// message to an Amazon SQS queue" (`SubscribeInput$Protocol`).
 pub(crate) const SQS_PROTOCOL: &str = "sqs";
+
+/// Everything ONE publishing request owes the subscribers of the topic it published to,
+/// grouped by the KIND of endpoint each delivery is made to.
+///
+/// SNS "delivers the message to each endpoint that is subscribed to the topic" (`Publish`
+/// doc), and each endpoint kind is reached through its own service's API — a queue by
+/// `SendMessage`, a function by `Invoke` — so one publish carries both out of the store
+/// together and performs each with the store's lock released.
+#[derive(Debug, Default)]
+pub struct Deliveries {
+    /// The messages owed to the queues subscribed over the `sqs` protocol.
+    queues: Vec<QueueDelivery>,
+    /// The invocations owed to the functions subscribed over the `lambda` protocol.
+    functions: Vec<function_delivery::FunctionDelivery>,
+}
+
+impl Deliveries {
+    /// Take on everything `other` owes, keeping each delivery in the order it was produced.
+    ///
+    /// `pub(crate)`: `PublishBatch` publishes several messages in one request and a replay
+    /// redelivers several, so each accumulates the fan-out of every message into one set
+    /// rather than delivering them a message at a time.
+    pub(crate) fn absorb(&mut self, other: Self) {
+        self.queues.extend(other.queues);
+        self.functions.extend(other.functions);
+    }
+}
 
 /// One message this publish owes to one SQS queue subscribed to the topic.
 ///
@@ -599,88 +640,123 @@ impl DeliveryBudget {
     }
 }
 
-/// The body an SQS subscriber of `published` receives: the message as published, or —
-/// when it was published with `MessageStructure` of `json` — the branch that document
-/// names for the `sqs` protocol, falling back to its `default` branch.
+/// The body a subscriber over `protocol` receives of `published`: the message as published,
+/// or — when it was published with `MessageStructure` of `json` — the branch that document
+/// names for that protocol, falling back to its `default` branch.
 ///
-/// The queues of one topic all deliver over the same protocol, so one publish selects
-/// this body once.
-fn protocol_body(published: &PublishedMessage) -> String {
+/// The subscribers of ONE protocol all receive the same body, so one publish selects it once
+/// per protocol it fans out over.
+fn protocol_body(published: &PublishedMessage, protocol: &str) -> String {
     state::structured_message_body(
         &published.message,
         published.message_structure.as_deref(),
-        SQS_PROTOCOL,
+        protocol,
     )
 }
 
-/// The deliveries `published` owes to the SQS queues among `subscriptions` — the
-/// subscriptions that RECEIVE this message, which its caller has already decided —
-/// within what `budget` has left.
+/// Say that this request has spent its delivery budget, and that the subscriptions it has not
+/// reached yet receive nothing.
+fn report_exhausted_budget(subscription_arn: &str) {
+    ::tracing::warn!(
+        subscription = %subscription_arn,
+        deliveries = MAX_DELIVERIES_PER_REQUEST,
+        bytes = MAX_DELIVERED_BYTES_PER_REQUEST,
+        "this request reached the emulator's delivery budget; the remaining \
+         subscriptions of the topic are not delivered to"
+    );
+}
+
+/// The deliveries `published` owes to the endpoints of `subscriptions` — the subscriptions
+/// that RECEIVE this message, which its caller has already decided — within what `budget` has
+/// left.
 ///
-/// The RAW form of the body is rendered at most once and shared by every raw subscriber, so a
-/// fan-out does not re-serialize it per subscriber; the ENVELOPED form is rendered per
-/// subscription, because it carries that subscription's own unsubscribe link.
-/// `pub(crate)` with [`deliver_to_queues`]: `PublishBatch` publishes the same messages to the
-/// same subscriptions, so it goes through this one definition of the envelope and the fan-out
-/// rather than a second copy, and shares one budget across its entries.
-pub(crate) fn queue_deliveries(
+/// Each protocol is delivered over by its own endpoint kind's API, so a subscription is
+/// dispatched on its `Protocol`: a queue over `sqs`, a function over `lambda`
+/// ([`function_delivery`]). A protocol with no delivery path here receives nothing — the
+/// message is still RECORDED against the subscription, so nothing claims a delivery that did
+/// not happen.
+///
+/// The body of one protocol is rendered at most once per publish, and the RAW form of it is
+/// shared by every raw subscriber, so a fan-out does not re-serialize it per subscriber; the
+/// ENVELOPED form is rendered per subscription, because it carries that subscription's own
+/// unsubscribe link.
+/// `pub(crate)` with [`deliver_to_subscribers`]: `PublishBatch` publishes the same messages to
+/// the same subscriptions, so it goes through this one definition of the envelope and the
+/// fan-out rather than a second copy, and shares one budget across its entries.
+pub(crate) fn subscription_deliveries(
     subscriptions: &[state::SubscriptionRecord],
     published: &PublishedMessage,
     budget: &mut DeliveryBudget,
-) -> Vec<QueueDelivery> {
-    // The body the subscribers of THIS protocol receive: the whole published message,
-    // unless it was published with a per-protocol structure, in which case it is the
-    // branch that structure names for the protocol. Every queue of a topic is subscribed
-    // over the same protocol, so one fan-out selects it once — the envelope around it is
-    // still rendered per subscription, because it carries that subscription's own
-    // unsubscribe link.
-    let body_lazily: ::std::cell::OnceCell<String> = ::std::cell::OnceCell::new();
+) -> Deliveries {
+    // The body the subscribers of each protocol receive, rendered on first use: the whole
+    // published message, unless it was published with a per-protocol structure, in which
+    // case it is the branch that structure names for that protocol.
+    let queue_body: ::std::cell::OnceCell<String> = ::std::cell::OnceCell::new();
+    let function_body: ::std::cell::OnceCell<String> = ::std::cell::OnceCell::new();
     let mut raw_body: Option<::std::sync::Arc<str>> = None;
-    let mut deliveries: Vec<QueueDelivery> = Vec::new();
+    let mut deliveries = Deliveries::default();
     for subscription in subscriptions {
-        let Some(target) = QueueTarget::of(subscription) else {
-            continue;
-        };
-        let protocol_body = body_lazily.get_or_init(|| protocol_body(published));
-        let body = if target.raw {
-            raw_body
-                .get_or_insert_with(|| ::std::sync::Arc::from(protocol_body.as_str()))
-                .clone()
-        } else {
-            ::std::sync::Arc::from(notification_envelope(
-                published,
-                protocol_body,
-                &subscription.arn,
-            ))
-        };
-        if !budget.charge(body.len()) {
-            ::tracing::warn!(
-                subscription = %subscription.arn,
-                deliveries = MAX_DELIVERIES_PER_REQUEST,
-                bytes = MAX_DELIVERED_BYTES_PER_REQUEST,
-                "this request reached the emulator's delivery budget; the remaining \
-                 subscriptions of the topic are not delivered to"
-            );
-            return deliveries;
+        match subscription.protocol.as_str() {
+            SQS_PROTOCOL => {
+                let Some(target) = QueueTarget::of(subscription) else {
+                    continue;
+                };
+                let protocol_body =
+                    queue_body.get_or_init(|| protocol_body(published, SQS_PROTOCOL));
+                let body = if target.raw {
+                    raw_body
+                        .get_or_insert_with(|| ::std::sync::Arc::from(protocol_body.as_str()))
+                        .clone()
+                } else {
+                    ::std::sync::Arc::from(notification_envelope(
+                        published,
+                        protocol_body,
+                        &subscription.arn,
+                    ))
+                };
+                if !budget.charge(body.len()) {
+                    report_exhausted_budget(&subscription.arn);
+                    return deliveries;
+                }
+                deliveries.queues.push(QueueDelivery {
+                    subscription_arn: subscription.arn.clone(),
+                    target: target.location,
+                    topic_arn: published.topic_arn.clone(),
+                    body,
+                    attributes: if target.raw {
+                        published
+                            .message_attributes
+                            .iter()
+                            .map(|(name, value)| (name.clone(), queue_attribute(value)))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
+                    message_group_id: published.message_group_id.clone(),
+                    message_deduplication_id: published.message_deduplication_id.clone(),
+                    dead_letter: target.dead_letter,
+                });
+            }
+            function_delivery::LAMBDA_PROTOCOL => {
+                let protocol_body = function_body
+                    .get_or_init(|| protocol_body(published, function_delivery::LAMBDA_PROTOCOL));
+                let Some(delivery) = function_delivery::FunctionDelivery::of(
+                    subscription,
+                    published,
+                    protocol_body,
+                ) else {
+                    continue;
+                };
+                if !budget.charge(delivery.payload_len()) {
+                    report_exhausted_budget(&subscription.arn);
+                    return deliveries;
+                }
+                deliveries.functions.push(delivery);
+            }
+            // Every other protocol (`http`, `email`, `firehose`, …) needs its own delivery
+            // path, which is not implemented here.
+            _ => continue,
         }
-        deliveries.push(QueueDelivery {
-            subscription_arn: subscription.arn.clone(),
-            target: target.location,
-            topic_arn: published.topic_arn.clone(),
-            body,
-            attributes: if target.raw {
-                published
-                    .message_attributes
-                    .iter()
-                    .map(|(name, value)| (name.clone(), queue_attribute(value)))
-                    .collect()
-            } else {
-                Vec::new()
-            },
-            message_group_id: published.message_group_id.clone(),
-            message_deduplication_id: published.message_deduplication_id.clone(),
-            dead_letter: target.dead_letter,
-        });
     }
     deliveries
 }
@@ -701,13 +777,13 @@ pub(crate) fn queue_deliveries(
 /// the replay the same way — `Subscribe` and `SetSubscriptionAttributes` — through this
 /// one definition, so the redelivery does not depend on which call configured it. The
 /// deliveries are returned rather than performed: they are handed to
-/// [`deliver_to_queues`] with the store's lock released, exactly as a publish's are.
+/// [`deliver_to_subscribers`] with the store's lock released, exactly as a publish's are.
 pub(crate) fn replay_deliveries(
     store: &mut crate::state::ComAmazonawsSnsAmazonsimplenotificationserviceState,
     subscription_arn: &str,
-) -> Vec<QueueDelivery> {
+) -> Deliveries {
     let Some(subscription) = store.subscriptions.get(subscription_arn).cloned() else {
-        return Vec::new();
+        return Deliveries::default();
     };
     let Some(policy) = subscription.attributes.get(state::REPLAY_POLICY_ATTRIBUTE) else {
         // The subscription asks for no replay — its policy was removed, or it never had
@@ -715,7 +791,7 @@ pub(crate) fn replay_deliveries(
         if let Some(held) = store.subscriptions.get_mut(subscription_arn) {
             held.replay = None;
         }
-        return Vec::new();
+        return Deliveries::default();
     };
     let started_at = ::std::time::SystemTime::now();
     let Some((from, until)) = state::replay_window(policy) else {
@@ -727,7 +803,7 @@ pub(crate) fn replay_deliveries(
                 window_was_readable: false,
             });
         }
-        return Vec::new();
+        return Deliveries::default();
     };
     let archived = store.archived_messages(&subscription.topic_arn, from, until);
     // ONE budget for the whole replay, so the (archived messages x body bytes) product it
@@ -735,13 +811,13 @@ pub(crate) fn replay_deliveries(
     // filter evaluation the replay costs is capped the way a publish's is.
     let mut budget = DeliveryBudget::new();
     let mut matching = state::filter_policy::MatchBudget::new();
-    let mut deliveries: Vec<QueueDelivery> = Vec::new();
+    let mut deliveries = Deliveries::default();
     let recipients = [subscription.clone()];
     for message in archived {
         if !state::filter_policy::admits(&subscription, &message, &mut matching) {
             continue;
         }
-        deliveries.extend(queue_deliveries(&recipients, &message, &mut budget));
+        deliveries.absorb(subscription_deliveries(&recipients, &message, &mut budget));
         store.record_delivery(subscription_arn, ::std::sync::Arc::clone(&message));
     }
     if let Some(held) = store.subscriptions.get_mut(subscription_arn) {
@@ -853,19 +929,20 @@ impl QueueTarget {
     }
 }
 
-/// Deliver each queued message to the queue its subscription names, and park the ones that
-/// cannot be delivered in that subscription's dead-letter queue.
+/// Deliver each message this publish owes to the endpoint its subscription names, and park
+/// the ones that could not be delivered in that subscription's dead-letter queue.
 ///
-/// A queue is reached the way any emulated service reaches another: through the in-process
-/// callback ([`smithy_server_runtime::OperationContext::callback`]), so this crate names no
-/// other service crate. The delivery's outcome is not part of this operation's answer, so a
-/// queue that cannot be reached is logged and changes nothing about what the caller is told.
+/// An endpoint is reached the way any emulated service reaches another: through the
+/// in-process callback ([`smithy_server_runtime::OperationContext::callback`]), so this crate
+/// names no other service crate. The delivery's outcome is not part of this operation's
+/// answer, so an endpoint that cannot be reached is logged and changes nothing about what the
+/// caller is told.
 ///
-/// A delivery is made only where the queue's OWN policy grants it: see
-/// [`delivery_is_authorized`]. The queue's policy is read once per queue per request, because
-/// one publish may owe several messages to the same queue — so the reads this adds are
-/// bounded by the same [`MAX_DELIVERIES_PER_REQUEST`] the deliveries are, and so is the
-/// per-request table they are remembered in.
+/// A delivery is made only where the ENDPOINT's own resource policy grants it: see
+/// [`resource_policy_allows`]. That document is read once per endpoint per request, because
+/// one publish may owe several messages to the same endpoint — so the reads this adds are
+/// bounded by the same [`MAX_DELIVERIES_PER_REQUEST`] the deliveries are, and so are the
+/// per-request tables they are remembered in.
 ///
 /// A delivery that could NOT be made to a subscription carrying a `RedrivePolicy` is written
 /// to the queue that policy names instead: "sends undeliverable messages to the specified
@@ -874,34 +951,58 @@ impl QueueTarget {
 /// queue for further analysis or reprocessing"
 /// (`SetSubscriptionAttributesInput$AttributeName`). The copy is the body the subscription
 /// itself would have received, in that subscription's own delivery format, because that is
-/// the message that could not be delivered.
-pub(crate) async fn deliver_to_queues(
+/// the message that could not be delivered — whichever endpoint kind the subscription
+/// addresses.
+pub(crate) async fn deliver_to_subscribers(
     ctx: &smithy_server_runtime::OperationContext<'_>,
-    deliveries: &[QueueDelivery],
+    deliveries: &Deliveries,
 ) {
     let mut queues = Queues::new(ctx);
-    for delivery in deliveries {
+    for delivery in &deliveries.queues {
         if queues.hand_over(&delivery.target, delivery).await {
             continue;
         }
         let Some(dead_letter) = delivery.dead_letter.as_ref() else {
             continue;
         };
-        if queues.hand_over(dead_letter, delivery).await {
-            ::tracing::info!(
-                subscription = %delivery.subscription_arn,
-                queue = %dead_letter.queue_url,
-                "the notification could not be delivered, so it was held in the \
-                 subscription's dead-letter queue"
-            );
-        } else {
-            ::tracing::warn!(
-                subscription = %delivery.subscription_arn,
-                queue = %dead_letter.queue_url,
-                "the notification could not be delivered and its subscription's \
-                 dead-letter queue could not be written to either"
-            );
+        park_in_dead_letter(&mut queues, dead_letter, delivery).await;
+    }
+    if deliveries.functions.is_empty() {
+        return;
+    }
+    let mut functions = function_delivery::Functions::new(ctx);
+    for delivery in &deliveries.functions {
+        if functions.invoke(delivery).await {
+            continue;
         }
+        let Some(parked) = delivery.dead_letter_copy() else {
+            continue;
+        };
+        park_in_dead_letter(&mut queues, &parked.target, &parked).await;
+    }
+}
+
+/// Hold the message of a delivery that could not be made in `dead_letter`, the queue the
+/// subscription's own `RedrivePolicy` names, and say which of the two it came to.
+async fn park_in_dead_letter(
+    queues: &mut Queues<'_, '_>,
+    dead_letter: &QueueLocation,
+    parked: &QueueDelivery,
+) {
+    if queues.hand_over(dead_letter, parked).await {
+        ::tracing::info!(
+            subscription = %parked.subscription_arn,
+            queue = %dead_letter.queue_url,
+            "the notification could not be delivered, so it was held in the \
+             subscription's dead-letter queue"
+        );
+    } else {
+        ::tracing::warn!(
+            subscription = %parked.subscription_arn,
+            queue = %dead_letter.queue_url,
+            "the notification could not be delivered and its subscription's \
+             dead-letter queue could not be written to either"
+        );
     }
 }
 
@@ -1041,15 +1142,15 @@ impl<'ctx, 'op> Queues<'ctx, 'op> {
     }
 }
 
-/// The service principal an SNS delivery performs its `SendMessage` as: the identity a
-/// queue's own policy has to grant for a notification to reach it.
+/// The service principal an SNS delivery is performed as: the identity a subscribed
+/// endpoint's own policy has to grant for a notification to reach it.
 const SNS_SERVICE_PRINCIPAL: &str = "sns.amazonaws.com";
 
 /// The IAM action a delivery to a subscribed queue performs on that queue.
 const SEND_MESSAGE_ACTION: &str = "sqs:SendMessage";
 
 /// The condition key naming the resource a cross-service request came FROM — the topic
-/// published to — which is what a queue policy scopes its grant to.
+/// published to — which is what an endpoint's policy scopes its grant to.
 const SOURCE_ARN_CONDITION_KEY: &str = "aws:SourceArn";
 
 /// The condition key naming the ACCOUNT that resource belongs to.
@@ -1058,22 +1159,33 @@ const SOURCE_ACCOUNT_CONDITION_KEY: &str = "aws:SourceAccount";
 /// The same account under the key SNS's own documented queue policy uses for it.
 const SOURCE_OWNER_CONDITION_KEY: &str = "aws:SourceOwner";
 
-/// Whether the queue's own policy allows this delivery.
+/// Whether the SUBSCRIBED ENDPOINT's own resource policy allows this delivery: may this
+/// service perform `action` on `resource` for a message published to `topic_arn`?
 ///
-/// A queue is a resource of another service, and SNS reaches it as the service principal
-/// `sns.amazonaws.com` rather than as the queue's owner: "you must ensure that the Amazon SQS
-/// queue policy allows the Amazon SNS topic to send messages to the queue" — so a queue whose
-/// policy states no such grant receives nothing, and a client that repairs the policy sees
-/// the next notification arrive. That is the ordinary IAM question — may this principal
-/// perform this action on this resource? — so it is answered by the shared evaluation of
-/// policy documents rather than by a reading of its own, over the queue's `Policy` attribute
-/// as the queue reports it. The principal is a service, not an identity with policies of its
-/// own, so the queue's resource policy is the only document in force: with none at all the
-/// implicit deny stands.
+/// A subscribed endpoint is a resource of another service, and SNS reaches it as the service
+/// principal `sns.amazonaws.com` rather than as that resource's owner: "you must ensure that
+/// the Amazon SQS queue policy allows the Amazon SNS topic to send messages to the queue" for
+/// a queue, and a function's resource-based policy has to grant `lambda:InvokeFunction` to the
+/// same principal — so an endpoint whose policy states no such grant receives nothing, and a
+/// client that repairs the policy sees the next notification arrive. That is the ordinary IAM
+/// question — may this principal perform this action on this resource? — so it is answered by
+/// the shared evaluation of policy documents rather than by a reading of its own, over the
+/// document the endpoint's own service reports. The principal is a service, not an identity
+/// with policies of its own, so the endpoint's resource policy is the only document in force:
+/// with none at all the implicit deny stands.
+///
+/// ONE reading for every endpoint kind, because the question and the principal are the same
+/// for each; only the action and the resource differ.
 ///
 /// The request carries the keys such a grant is scoped by — the topic's ARN and the account
-/// it belongs to — so a policy conditioned on them is decided rather than left undecided.
-fn delivery_is_authorized(policy: Option<&str>, queue_arn: &str, topic_arn: &str) -> bool {
+/// it belongs to — so a policy conditioned on them is decided rather than left undecided, and
+/// a grant scoped to one topic admits that topic's notifications alone.
+fn resource_policy_allows(
+    policy: Option<&str>,
+    action: &str,
+    resource: &str,
+    topic_arn: &str,
+) -> bool {
     let Some(policy) = policy else {
         return false;
     };
@@ -1094,12 +1206,7 @@ fn delivery_is_authorized(policy: Option<&str>, queue_arn: &str, topic_arn: &str
         SOURCE_ACCOUNT_CONDITION_KEY,
         SOURCE_OWNER_CONDITION_KEY,
     ];
-    let request =
-        ::service_common::iam_authorization::Request::new(
-            SEND_MESSAGE_ACTION,
-            queue_arn,
-            &principals,
-        )
+    let request = ::service_common::iam_authorization::Request::new(action, resource, &principals)
         .with_context(&context)
         .with_published_keys(&published);
     let stated = ::service_common::iam_authorization::resource_decision(policy, &request);
@@ -1109,6 +1216,13 @@ fn delivery_is_authorized(policy: Option<&str>, queue_arn: &str, topic_arn: &str
         ::service_common::iam_authorization::Decision::NotStated,
         stated,
     )
+}
+
+/// Whether the queue's own policy allows this delivery: the endpoint-policy question
+/// ([`resource_policy_allows`]) asked about the `SendMessage` a notification to a subscribed
+/// queue performs.
+fn delivery_is_authorized(policy: Option<&str>, queue_arn: &str, topic_arn: &str) -> bool {
+    resource_policy_allows(policy, SEND_MESSAGE_ACTION, queue_arn, topic_arn)
 }
 
 /// What the queue at `queue_url` answered when its `Policy` was read: the document it
@@ -1188,6 +1302,32 @@ fn notification_envelope(
     body: &str,
     subscription_arn: &str,
 ) -> String {
+    let mut envelope = notification_members(published, body);
+    if let Some(url) = unsubscribe_url(&published.topic_arn, subscription_arn) {
+        envelope.insert("UnsubscribeURL".to_string(), serde_json::Value::from(url));
+    }
+    serde_json::Value::Object(envelope).to_string()
+}
+
+/// The members every notification of `published` carries, whichever subscriber receives it:
+/// its type, id, topic, subject, body, sequence number, attributes and the instant it was
+/// published.
+///
+/// ONE rendering of the notification, because every enveloped delivery carries the same
+/// metadata of the same published message; what differs per endpoint kind is only the way
+/// the notification is wrapped and the member its unsubscribe link is named by, so each
+/// caller adds that around these members ([`notification_envelope`] for a queue,
+/// [`function_delivery`] for a function).
+///
+/// The `body` wrapped is the message the SUBSCRIBER's protocol receives, which is the whole
+/// published message unless it was published as a structure of per-protocol branches. There
+/// are NO signature members (`Signature`, `SigningCertURL`): nothing signs a message in this
+/// emulator, and a member that looked like a signature would be one a subscriber could not
+/// verify.
+fn notification_members(
+    published: &PublishedMessage,
+    body: &str,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut envelope = serde_json::Map::new();
     envelope.insert(
         "Type".to_string(),
@@ -1213,9 +1353,6 @@ fn notification_envelope(
             "SequenceNumber".to_string(),
             serde_json::Value::from(sequence_number),
         );
-    }
-    if let Some(url) = unsubscribe_url(&published.topic_arn, subscription_arn) {
-        envelope.insert("UnsubscribeURL".to_string(), serde_json::Value::from(url));
     }
     if !published.message_attributes.is_empty() {
         // "MessageAttributes": {"<name>": {"Type": "<data type>", "Value": "<value>"}} — the
@@ -1249,7 +1386,7 @@ fn notification_envelope(
             serde_json::Value::Object(rendered),
         );
     }
-    serde_json::Value::Object(envelope).to_string()
+    envelope
 }
 
 /// The call that cancels ONE subscription, as the notification delivered to it carries it:

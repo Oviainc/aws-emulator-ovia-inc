@@ -842,6 +842,8 @@ mod cloudformation_provisions_sns_topics;
 mod cloudformation_provisions_sns_subscriptions;
 #[path = "all/cloudformation_sns_topic_policy_admits_s3_notifications.rs"]
 mod cloudformation_sns_topic_policy_admits_s3_notifications;
+#[path = "all/sns_lambda_subscription_permission_boundary.rs"]
+mod sns_lambda_subscription_permission_boundary;
 #[path = "all/cloudformation_provisions_waf_regional_ip_sets.rs"]
 mod cloudformation_provisions_waf_regional_ip_sets;
 #[path = "all/cloudformation_provisions_grafana_workspaces.rs"]

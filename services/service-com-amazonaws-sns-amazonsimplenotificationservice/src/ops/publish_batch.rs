@@ -123,7 +123,9 @@
 use super::types::*;
 // The SQS fan-out of a publish is defined ONCE, by `Publish`: a batched publish delivers the
 // same envelope to the same subscriptions.
-use super::publish::{deliver_to_queues, queue_deliveries, DeliveryBudget, QueueDelivery};
+use super::publish::{
+    deliver_to_subscribers, subscription_deliveries, Deliveries, DeliveryBudget,
+};
 use crate::state::{self, MessageRequest, PublishedMessage};
 
 /// "Publishes up to 10 messages to the specified topic in a single batch. … If you
@@ -435,7 +437,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut successful: Vec<PublishBatchResultEntry> =
                 Vec::with_capacity(entries.len());
             let failed: Vec<BatchResultErrorEntry> = Vec::new();
-            let mut deliveries: Vec<QueueDelivery> = Vec::new();
+            let mut deliveries = Deliveries::default();
             // ONE delivery budget for the whole batch, so the (entries x subscriptions x body
             // bytes) product one request can fan out to is capped rather than each factor on
             // its own, and ONE matching budget, which caps the (entries x subscriptions x
@@ -486,7 +488,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     sequence_number: sequence_number.clone(),
                     published_at: std::time::SystemTime::now(),
                 });
-                // The deliveries this entry owes to the SQS queues subscribed to the topic,
+                // The deliveries this entry owes to the endpoints subscribed to the topic,
                 // built through `Publish`'s one definition of the envelope, within the
                 // batch's shared budget, and performed below with the lock released. A
                 // subscription whose filter policy withholds this entry is not among them.
@@ -495,7 +497,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .filter(|sub| state::filter_policy::admits(sub, &published, &mut matching))
                     .cloned()
                     .collect();
-                deliveries.extend(queue_deliveries(&accepted, &published, &mut budget));
+                deliveries.absorb(subscription_deliveries(&accepted, &published, &mut budget));
                 for recipient in &accepted {
                     store.record_delivery(&recipient.arn, ::std::sync::Arc::clone(&published));
                 }
@@ -517,7 +519,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             (successful, failed, deliveries)
         };
-        deliver_to_queues(ctx, &deliveries).await;
+        deliver_to_subscribers(ctx, &deliveries).await;
 
         Ok(PublishBatchOutput {
             successful: Some(successful),

@@ -37,6 +37,11 @@ service-common = { path = "../common" }
 # client is needed — the emulator supplies the transport, so the SDK's own HTTPS stack and
 # runtime are left out.
 aws-sdk-sqs = { version = "1", default-features = false }
+# The AWS SDK for Lambda, driven over the same in-process callback: a subscription whose
+# protocol is `lambda` has a function for an endpoint, which `Publish` invokes
+# asynchronously and whose resource-based policy it reads first
+# (`ops::publish::function_delivery`).
+aws-sdk-lambda = { version = "1", default-features = false }
 # The `cidr` matcher of a subscription's filter policy asks whether an address lies in a
 # network, which this parses rather than splitting the text by hand
 # (`state::message_filter`).
@@ -50,6 +55,14 @@ emulator-core-build-support = { workspace = true }
 # `sqs` subscription's endpoint is a queue and a delivery is asserted where a client sees
 # it: on the queue.
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# Lambda is mounted beside SNS on one engine in the lambda-subscription delivery tests,
+# because a `lambda` subscription's endpoint is a function and an invocation is observed
+# where that service holds it: on the function's asynchronous queue.
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# A deployment package the delivery test uploads is a .zip archive it writes in memory, as
+# `FunctionCode$ZipFile` carries it: base64 of a .zip.
+zip = { version = "9", default-features = false, features = ["deflate"] }
+base64 = "0.22"
 
 [lints]
 workspace = true

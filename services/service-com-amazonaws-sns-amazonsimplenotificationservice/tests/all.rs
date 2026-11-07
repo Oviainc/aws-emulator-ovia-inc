@@ -59,6 +59,9 @@ mod filter_policy_wildcard_operator;
 #[path = "all/invalid_next_token_sentence.rs"]
 mod invalid_next_token_sentence;
 
+#[path = "all/lambda_subscription_delivery.rs"]
+mod lambda_subscription_delivery;
+
 #[path = "all/list_subscriptions.rs"]
 mod list_subscriptions;
 

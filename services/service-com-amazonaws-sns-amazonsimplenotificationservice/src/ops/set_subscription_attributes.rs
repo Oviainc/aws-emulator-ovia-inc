@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an in-process call into another service, which must not run under this store's
         // lock.
         let replay = self.write_attribute(input, &state::request_region(ctx.parts()))?;
-        super::publish::deliver_to_queues(ctx, &replay).await;
+        super::publish::deliver_to_subscribers(ctx, &replay).await;
         Ok(SetSubscriptionAttributesOutput)
     }
 }
@@ -191,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SetSubscriptionAt
         &self,
         input: SetSubscriptionAttributesInput,
         region: &str,
-    ) -> Result<Vec<super::publish::QueueDelivery>, SetSubscriptionAttributesError> {
+    ) -> Result<super::publish::Deliveries, SetSubscriptionAttributesError> {
         let invalid_parameter = |message: String| -> SetSubscriptionAttributesError {
             SetSubscriptionAttributesErrorModeled::InvalidParameterException(
                 InvalidParameterException {
@@ -341,7 +341,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SetSubscriptionAt
         let replay = if input.attribute_name == state::REPLAY_POLICY_ATTRIBUTE {
             super::publish::replay_deliveries(&mut store, &input.subscription_arn)
         } else {
-            Vec::new()
+            super::publish::Deliveries::default()
         };
 
         Ok(replay)
