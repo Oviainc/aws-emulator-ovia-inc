@@ -23,12 +23,22 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Encodes/decodes the opaque pagination tokens ListDatasets/ListJobRuns hand out.
 hex = { workspace = true }
+# The Amazon S3 client a recipe-job run reads its dataset's `S3InputDefinition` through,
+# over the in-process callback into this same emulator (no network client feature: the
+# transport is the emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# Reads the header record of a CSV dataset, so a run is judged against the columns the
+# data really carries (quoting and escaping included).
+csv = "1.3"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# The Amazon S3 service, mounted beside databrew on one engine so a dataset object staged
+# with `PutObject` is the one a job run reads its columns from.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

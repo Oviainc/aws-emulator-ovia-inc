@@ -22,6 +22,12 @@ use crate::ops::types::{
     Sample,
 };
 
+/// What a recipe-job run DOES: the dataset columns it reads, the recipe steps it applies
+/// to them, and the terminal state that pair decides.
+pub mod job_execution;
+
+pub use job_execution::{apply_steps, dataset_columns, recipe_step_error_message, RunOutcome};
+
 /// The resource kinds DataBrew states a refusal about in its SHORT form: the kind, the
 /// identifier the request carried and the bare predicate, with no terminating period
 /// (`Schedule nightly not found`, `Schedule nightly already exists`). Every other kind
@@ -535,6 +541,10 @@ pub struct JobRunRecord {
     pub recipe_reference: Option<RecipeReference>,
     pub log_subscription: Option<String>,
     pub log_group_name: Option<String>,
+    /// The terminal state this run is owed once it has executed, decided when the run was
+    /// admitted from the dataset it reads and the recipe version it applies
+    /// ([`RunOutcome`]). [`JobRunRecord::advance_to`] is what materialises it.
+    pub outcome: RunOutcome,
 }
 
 /// Per-service state for com-amazonaws-databrew-awsgluedatabrew. A handler reaches it through [`service_state`].
@@ -1034,6 +1044,11 @@ impl ScheduleRecord {
 impl JobRunRecord {
     /// Materialise the transitions the clock owes this run by `now`.
     ///
+    /// The terminal transition takes the state the run's EXECUTION is owed
+    /// ([`RunOutcome`], decided when the run was admitted): a run whose recipe applies to
+    /// its data ends `SUCCEEDED` reporting no `ErrorMessage`, and one whose recipe could
+    /// not be applied ends `FAILED` reporting the diagnosis of the step that stopped it.
+    ///
     /// `ExecutionTime` is the whole seconds the run consumed (model:
     /// "The amount of time, in seconds, during which the job run consumed
     /// resources"), measured from `StartedOn` to the instant the run completed.
@@ -1043,7 +1058,13 @@ impl JobRunRecord {
         }
         if self.state == "RUNNING" && now >= self.started_on + RUN_TERMINAL_DUE_AFTER {
             let completed_on = self.started_on + RUN_TERMINAL_DUE_AFTER;
-            self.state = "SUCCEEDED".to_string();
+            match &self.outcome {
+                RunOutcome::Succeeded => self.state = "SUCCEEDED".to_string(),
+                RunOutcome::Failed(diagnosis) => {
+                    self.state = "FAILED".to_string();
+                    self.error_message = Some(diagnosis.clone());
+                }
+            }
             self.completed_on = Some(completed_on);
             self.execution_time = completed_on
                 .duration_since(self.started_on)

@@ -6,6 +6,12 @@
 //! outputs and recipe reference copied in, and returns that same id — so the
 //! `DescribeJobRun`/`ListJobRuns` that follow resolve it.
 //!
+//! The run's WORK is decided here too: the referenced recipe version's steps are applied
+//! to the columns of the job's dataset, so a run whose recipe names a column its dataset
+//! does not have is owed the terminal `FAILED` state and the diagnosis of the step that
+//! stopped it (`crate::state::job_execution`). The run is still ADMITTED — a schema
+//! mismatch is a failure of the run, not a refusal of the start.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -143,7 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartJobRunErrorModeled::InternalServerException(InternalServerException {
@@ -154,15 +160,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let started_by = crate::state::request_principal();
         let started_on = ::std::time::SystemTime::now();
 
+        // What the run will EXECUTE, read off the store under one lock: the job, the
+        // dataset it reads and the steps of the exact recipe version it references.
+        let (job, dataset, steps) = {
+            let store = state.lock();
+            let Some(job) = store.jobs.get(&input.name).cloned() else {
+                return Err(StartJobRunErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::not_found_message("Job", &input.name)),
+                    },
+                )
+                .into());
+            };
+            let dataset = job
+                .dataset_name
+                .as_deref()
+                .and_then(|name| store.datasets.get(name))
+                .cloned();
+            let steps = job.recipe_reference.as_ref().and_then(|reference| {
+                store
+                    .recipes
+                    .get(&reference.name)
+                    .and_then(|recipe| recipe.resolve_version(reference.recipe_version.as_deref()))
+                    .map(|version| version.steps.clone())
+            });
+            (job, dataset, steps)
+        };
+
+        // The run's work: the referenced recipe version's steps against the dataset's own
+        // columns, which is what lets a recipe that does not fit its dataset be diagnosed
+        // at all. Reading the dataset object is an await, so it happens with NO lock
+        // held. A dataset whose columns this emulator cannot establish, or a job
+        // referencing no recipe version, leaves the run owed the outcome it is owed with
+        // no step to judge.
+        let outcome = match (dataset, steps) {
+            (Some(dataset), Some(steps)) => {
+                match crate::state::dataset_columns(ctx, &dataset).await {
+                    Some(columns) => crate::state::apply_steps(&steps, &columns),
+                    None => crate::state::RunOutcome::Succeeded,
+                }
+            }
+            _ => crate::state::RunOutcome::Succeeded,
+        };
+
         let mut store = state.lock();
-        let Some(job) = store.jobs.get(&input.name).cloned() else {
+        // The job is re-read under the lock the run is recorded under: a delete that
+        // landed while the dataset was being read leaves nothing to run.
+        if !store.jobs.contains_key(&job.name) {
             return Err(StartJobRunErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::not_found_message("Job", &input.name)),
                 },
             )
             .into());
-        };
+        }
 
         // The id is minted from the stored counter and the run is stored under it, so
         // the id handed back is the one a later describe resolves.
@@ -188,6 +239,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_deref()
                 .filter(|subscription| *subscription == "ENABLE")
                 .map(|_| crate::state::log_group_name(&job.name)),
+            // The terminal state the run's own execution is owed, materialised by the
+            // clock rather than by whoever polls it.
+            outcome,
         };
         // Stored through `record_run`, which evicts the oldest runs past the retained
         // ceiling, so repeated starts grow the store to a fixed bound and no further.
