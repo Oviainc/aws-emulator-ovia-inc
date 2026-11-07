@@ -21,11 +21,12 @@
 //!
 //! The concrete host and port are the environment's and nothing here asserts them. What
 //! the cases assert is the shape of the value, that the address accepts a connection and
-//! is answered by this emulator's own front door, the partition of the published
-//! `APIName` set it induces, and its independence from the address the request came in
-//! on — over a table whose rows differ in the API asked for, the stream named, the form
-//! the stream is named by, the region of the credential scope, and the host the request
-//! arrives on (an AWS-form control-plane host and a bare loopback listener).
+//! is answered by this emulator's own front door over the transport its scheme names, the
+//! partition of the published `APIName` set it induces, and its independence from the
+//! address the request came in on — over a table whose rows differ in the API asked for,
+//! the stream named, the form the stream is named by, the region of the credential scope,
+//! and the host the request arrives on (an AWS-form control-plane host and a bare loopback
+//! listener).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -153,9 +154,10 @@ async fn data_endpoint(
 /// name appended. The client needs to add the API name to the returned endpoint", so
 /// anything after the host would be appended to rather than replaced.
 fn base_url_authority(case: &str, endpoint: &str) -> String {
-    let rest = endpoint
-        .strip_prefix("https://")
-        .unwrap_or_else(|| panic!("case {case:?}: expected an https base URL, got {endpoint:?}"));
+    let scheme = format!("{}://", kvs::state::DATA_PLANE_SCHEME);
+    let rest = endpoint.strip_prefix(&scheme).unwrap_or_else(|| {
+        panic!("case {case:?}: expected a {scheme} base URL, got {endpoint:?}")
+    });
     assert!(
         !rest.is_empty() && !rest.contains('/') && !rest.contains('?') && !rest.contains('#'),
         "case {case:?}: expected scheme and host only with no path, got {endpoint:?}"
@@ -216,29 +218,6 @@ async fn connect(case: &str, endpoint: &str) -> tokio::net::TcpStream {
     })
 }
 
-/// Run the client side of the TLS handshake the core terminates on its listeners.
-///
-/// The verifier accepts the certificate the EMULATOR'S OWN core generated for them,
-/// which is self-signed: this client is the emulator's own test, connecting to a port
-/// the same process opened, so there is no authority to check it against.
-async fn upgrade_to_tls(
-    stream: tokio::net::TcpStream,
-) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
-        .with_safe_default_protocol_versions()
-        .expect("the provider supports the default protocol versions")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptTheEmulatorsCertificate(provider)))
-        .with_no_client_auth();
-    let server_name =
-        rustls::pki_types::ServerName::try_from("localhost").expect("localhost is a server name");
-    tokio_rustls::TlsConnector::from(Arc::new(config))
-        .connect(server_name, stream)
-        .await
-        .expect("the emulator's listener must complete the TLS handshake")
-}
-
 /// The answer a dialled endpoint gave: the status of the response, and its raw tail (the
 /// bytes after the header block, which a close-delimited or chunked body both carry).
 #[derive(Debug)]
@@ -250,6 +229,11 @@ struct DialedAnswer {
 /// Send one HTTP/1.1 request to `endpoint` as a client that was handed that endpoint
 /// does, and read the whole answer.
 ///
+/// The request goes onto the connection as it stands, with nothing negotiated first: the
+/// announced origin's scheme names the transport the client speaks, which is the whole
+/// point of announcing it — a default-configured client has no trust material for this
+/// emulator beyond what it was given for the endpoint the control call arrived on.
+///
 /// `Connection: close` is what makes the answer end at EOF, so no body framing has to be
 /// re-implemented here: the tail is searched for what the case expects to find in it.
 async fn send_to_endpoint(
@@ -260,7 +244,7 @@ async fn send_to_endpoint(
     body: serde_json::Value,
 ) -> DialedAnswer {
     let authority = base_url_authority(case, endpoint);
-    let mut conn = upgrade_to_tls(connect(case, endpoint).await).await;
+    let mut conn = connect(case, endpoint).await;
     let body = serde_json::to_vec(&body).expect("the request body serializes");
     let head = format!(
         "POST {path} HTTP/1.1\r\n\
@@ -300,58 +284,6 @@ async fn send_to_endpoint(
     DialedAnswer {
         status,
         tail: tail.to_string(),
-    }
-}
-
-/// Accepts the self-signed certificate the emulator's core generates for its own
-/// listeners — see [`upgrade_to_tls`].
-#[derive(Debug)]
-struct AcceptTheEmulatorsCertificate(Arc<rustls::crypto::CryptoProvider>);
-
-impl rustls::client::danger::ServerCertVerifier for AcceptTheEmulatorsCertificate {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0
-            .signature_verification_algorithms
-            .supported_schemes()
     }
 }
 
@@ -396,7 +328,7 @@ async fn each_api_name_resolves_to_a_reachable_endpoint_of_the_plane_that_serves
 
                     assert_ne!(
                         endpoint,
-                        format!("https://{}", control.authority),
+                        format!("{}://{}", kvs::state::DATA_PLANE_SCHEME, control.authority),
                         "case {case:?}: the data endpoint must not be the control-plane \
                          endpoint the call was made to, got {endpoint:?}"
                     );
@@ -454,6 +386,103 @@ async fn each_api_name_resolves_to_a_reachable_endpoint_of_the_plane_that_serves
                 control.authority
             );
         }
+    }
+}
+
+/// Send one request to `endpoint` with the head written out verbatim and no body, and read
+/// the whole answer — for the cases whose point is a header a well-behaved client does not
+/// send.
+async fn send_head_to_endpoint(case: &str, endpoint: &str, head: &str) -> DialedAnswer {
+    let mut conn = connect(case, endpoint).await;
+    conn.write_all(head.as_bytes())
+        .await
+        .unwrap_or_else(|error| panic!("case {case:?}: writing to {endpoint:?} failed: {error}"));
+    conn.flush()
+        .await
+        .unwrap_or_else(|error| panic!("case {case:?}: writing to {endpoint:?} failed: {error}"));
+    let mut answer = Vec::new();
+    conn.read_to_end(&mut answer)
+        .await
+        .unwrap_or_else(|error| panic!("case {case:?}: reading {endpoint:?} failed: {error}"));
+    let answer = String::from_utf8_lossy(&answer).to_string();
+    let (head, tail) = answer.split_once("\r\n\r\n").unwrap_or_else(|| {
+        panic!("case {case:?}: expected an HTTP response from {endpoint:?}, got {answer:?}")
+    });
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse::<u16>().ok())
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected an HTTP status line from {endpoint:?}, got {head:?}")
+        });
+    DialedAnswer {
+        status,
+        tail: tail.to_string(),
+    }
+}
+
+/// The transport-safety refusals an announced endpoint applies before anything of this
+/// emulator is reached, which are the ones the core applies to its own HTTP listeners: a
+/// request naming a host this emulator is not bound on (the guard a browser needs against
+/// a rebound name), a request naming no host at all, a WebSocket upgrade, and a request a
+/// browser sent from another site.
+///
+/// The rows differ in what the request carries, and every one of them is a request no
+/// client of a data plane sends.
+#[tokio::test]
+async fn an_announced_endpoint_refuses_what_a_core_listener_refuses() {
+    let control = CONTROL_PLANES[1];
+    let router = harness();
+    create_stream(&router, control, "guarded").await;
+    let endpoint = data_endpoint(
+        &router,
+        control,
+        "guarded",
+        serde_json::json!({ "StreamName": "guarded" }),
+        PUT_MEDIA,
+    )
+    .await;
+    let authority = base_url_authority("guarded", &endpoint);
+
+    // (case, the head sent, the status it earns).
+    let cases: Vec<(&str, String, u16)> = vec![
+        (
+            "a host this emulator is not bound on",
+            "POST /putMedia HTTP/1.1\r\nhost: kinesisvideo.us-east-1.amazonaws.com\r\n\
+             content-length: 0\r\nconnection: close\r\n\r\n"
+                .to_string(),
+            421,
+        ),
+        (
+            "no host at all",
+            "POST /putMedia HTTP/1.0\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                .to_string(),
+            421,
+        ),
+        (
+            "a WebSocket upgrade",
+            format!(
+                "GET /putMedia HTTP/1.1\r\nhost: {authority}\r\nconnection: close, Upgrade\r\n\
+                 upgrade: websocket\r\nsec-websocket-version: 13\r\n\r\n"
+            ),
+            501,
+        ),
+        (
+            "a request a browser sent from another site",
+            format!(
+                "POST /putMedia HTTP/1.1\r\nhost: {authority}\r\norigin: https://evil.example\r\n\
+                 sec-fetch-site: cross-site\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            ),
+            403,
+        ),
+    ];
+
+    for (case, head, expected) in &cases {
+        let answer = send_head_to_endpoint(case, &endpoint, head).await;
+        assert_eq!(
+            answer.status, *expected,
+            "case {case:?}: expected HTTP {expected} from the announced endpoint, got {answer:?}"
+        );
     }
 }
 
@@ -552,7 +581,7 @@ async fn a_panic_behind_an_announced_endpoint_is_contained_as_an_internal_failur
                 "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/kinesisvideo/\
                  aws4_request, SignedHeaders=host, Signature=0",
             )
-            .body(body.to_vec())
+            .body(bytes::Bytes::copy_from_slice(body))
             .expect("a well-formed request");
         let answer = kvs::state::serve_on_data_plane(transport.clone(), request).await;
         assert_eq!(

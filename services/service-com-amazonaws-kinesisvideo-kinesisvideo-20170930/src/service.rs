@@ -45,8 +45,12 @@
 //! `override_operation` serves every routable request through
 //! [`error_message_member::ErrorMessageMemberOperation`], so the text of a failure reaches
 //! the caller in the body member this service's model declares for it — see
-//! [`error_message_member`] for that rule and why the refusal seam cannot state it.
+//! [`error_message_member`] for that rule and why the refusal seam cannot state it. That
+//! same seam SCOPES this service's routes to the endpoint a control call arrives on: a call
+//! that reached an address this service announced for a data plane is answered as the
+//! unrouted path it is ([`data_plane_address`]).
 
+pub mod data_plane_address;
 pub mod error_message_member;
 
 use aws_smithy_schema_server::Violation;
@@ -102,9 +106,15 @@ fn can_handle_parts(parts: &http::request::Parts) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The shared engine, held beside the entry so the seams below can read this store —
+    /// which is where the addresses this service announced for its data planes live.
+    engine: Arc<Eng>,
     /// The wrapper `override_operation` hands back. Stateless, and held here rather than
     /// built per request, because the seam answers a reference borrowed from `&self`.
     error_message_member: error_message_member::ErrorMessageMemberOperation,
+    /// What a control-plane call that reached a data plane's address is answered with.
+    /// Stateless, and held for the same reason.
+    unrouted_on_data_plane_address: data_plane_address::UnroutedOnDataPlaneAddress,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -113,8 +123,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
             error_message_member: error_message_member::ErrorMessageMemberOperation,
+            unrouted_on_data_plane_address: data_plane_address::UnroutedOnDataPlaneAddress,
         }
     }
 }
@@ -147,6 +159,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // it answered in the body member this service's error shapes declare (see
         // [`error_message_member`]). A request the table cannot serve is declined here, so
         // the router answers it as the unroutable request it is.
+        //
+        // Before that: a control call that reached an address this service announced for a
+        // DATA plane reached an endpoint that binds no control route, so it is answered as
+        // the unrouted path it is and no operation of this service runs for it (see
+        // [`data_plane_address`]).
+        if data_plane_address::addressed_a_data_plane(&*self.engine, req) {
+            return Some(&self.unrouted_on_data_plane_address as &dyn ErasedOperation);
+        }
         error_message_member::routes(&self.entry, req)
             .then_some(&self.error_message_member as &dyn ErasedOperation)
     }

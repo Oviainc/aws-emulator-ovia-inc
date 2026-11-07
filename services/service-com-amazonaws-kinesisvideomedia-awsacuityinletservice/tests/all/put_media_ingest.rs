@@ -101,16 +101,18 @@ fn uint_body(value: u64) -> Vec<u8> {
 /// One submitted Cluster: its timecode, and the frames it carries with their offsets
 /// from it.
 #[derive(Debug, Clone)]
-struct Cluster {
+pub(crate) struct Cluster {
     /// The Cluster's `Timestamp`, in the container's timecode scale.
     timecode: u64,
+    /// The track number every `SimpleBlock` of this Cluster is written on.
+    track: u64,
     /// `(offset from the Cluster timecode, frame bytes)` per frame.
     frames: Vec<(i16, Vec<u8>)>,
 }
 
 /// One submitted container.
 #[derive(Debug, Clone)]
-struct Container {
+pub(crate) struct Container {
     /// Nanoseconds per timecode tick, as `Info/TimestampScale` declares it.
     timecode_scale_nanos: u64,
     /// Whether the `Segment` is written with an unknown size, as a live producer writes
@@ -121,7 +123,7 @@ struct Container {
 
 impl Container {
     /// A container of `clusters` with a millisecond timecode scale and a sized segment.
-    fn of(clusters: Vec<Cluster>) -> Self {
+    pub(crate) fn of(clusters: Vec<Cluster>) -> Self {
         Self {
             timecode_scale_nanos: MILLISECOND_SCALE_NANOS,
             unknown_size_segment: false,
@@ -130,7 +132,7 @@ impl Container {
     }
 
     /// The container's bytes.
-    fn bytes(&self) -> Vec<u8> {
+    pub(crate) fn bytes(&self) -> Vec<u8> {
         let mut document = Vec::new();
         let mut header = Vec::new();
         push_ebml_element(&mut header, ID_DOC_TYPE, b"matroska");
@@ -161,7 +163,7 @@ impl Container {
                 // A `SimpleBlock` body is the track number as a variable-size integer,
                 // the frame's signed 16-bit offset from the Cluster timecode, one flags
                 // byte, then the frame itself.
-                let mut block = vec![0x80 | (TRACK_NUMBER as u8)];
+                let mut block = vec![0x80 | (cluster.track as u8)];
                 block.extend_from_slice(&offset.to_be_bytes());
                 block.push(0x80);
                 block.extend_from_slice(frame);
@@ -182,10 +184,24 @@ impl Container {
 }
 
 /// A Cluster at `timecode` carrying `frames` frames of `spacing` milliseconds, whose
-/// bytes carry `marker` so one Cluster's frames cannot be mistaken for another's.
-fn cluster(timecode: u64, frames: usize, spacing: i16, marker: u8) -> Cluster {
+/// bytes carry `marker` so one Cluster's frames cannot be mistaken for another's. Its
+/// frames are written on the track the container declares.
+pub(crate) fn cluster(timecode: u64, frames: usize, spacing: i16, marker: u8) -> Cluster {
+    cluster_on_track(timecode, TRACK_NUMBER, frames, spacing, marker)
+}
+
+/// [`cluster`] with its frames written on `track`, so a case can submit a block on a
+/// track the container's `Tracks` does not declare.
+pub(crate) fn cluster_on_track(
+    timecode: u64,
+    track: u64,
+    frames: usize,
+    spacing: i16,
+    marker: u8,
+) -> Cluster {
     Cluster {
         timecode,
+        track,
         frames: (0..frames)
             .map(|index| {
                 let offset = spacing * (index as i16);
@@ -475,10 +491,10 @@ fn delivered_fragment_numbers(case: &str, payload: &[u8], chunks: &[Vec<u8>]) ->
 }
 
 /// The ingest headers of one request: the `(name, value)` pairs a producer sends.
-type IngestHeaders = Vec<(&'static str, String)>;
+pub(crate) type IngestHeaders = Vec<(&'static str, String)>;
 
 /// The ingest headers of one session.
-fn ingest_headers(
+pub(crate) fn ingest_headers(
     addressing: (&'static str, String),
     timecode_type: &str,
     producer_start: SystemTime,
@@ -825,6 +841,85 @@ async fn successive_sessions_extend_one_streams_archive() {
     );
 }
 
+/// RULE: the producer start timestamp is what a RELATIVE Cluster timecode is an offset
+/// FROM, so a RELATIVE session cannot be read without it — while an ABSOLUTE Cluster
+/// timecode already names the instant its fragment was captured at, so a session that
+/// states none is ingested as it stands and its fragments land at the instants its
+/// timecodes name.
+///
+/// The rows differ in what the session declares: ABSOLUTE with the header and without it
+/// (the same fragments either way, since nothing in such a session reads it), and RELATIVE
+/// without it, which is the one refusal.
+#[tokio::test]
+async fn the_producer_start_timestamp_is_read_only_by_a_relative_session() {
+    // Epoch milliseconds the absolute Clusters name — in the past, as a producer's own
+    // capture instants are.
+    const FIRST_MILLIS: u64 = 1_761_000_000_000;
+    const SECOND_MILLIS: u64 = 1_761_000_002_000;
+
+    // (case, the timecode type, whether the session states a producer start timestamp,
+    // the expected status, the producer timestamps the fragments must land on).
+    let rows: Vec<(&str, &str, bool, u16, Vec<u64>)> = vec![
+        (
+            "ABSOLUTE stating a producer start timestamp",
+            "ABSOLUTE",
+            true,
+            200,
+            vec![FIRST_MILLIS, SECOND_MILLIS],
+        ),
+        (
+            "ABSOLUTE stating none",
+            "ABSOLUTE",
+            false,
+            200,
+            vec![FIRST_MILLIS, SECOND_MILLIS],
+        ),
+        ("RELATIVE stating none", "RELATIVE", false, 400, Vec::new()),
+    ];
+
+    for (index, (case, timecode_type, states_start, expected_status, expected_millis)) in
+        rows.into_iter().enumerate()
+    {
+        let harness = Harness::new();
+        let name = format!("ingest-probe-start-{index}");
+        let arn = harness.create_stream(&name).await;
+        let producer_start = SystemTime::UNIX_EPOCH + Duration::from_millis(FIRST_MILLIS);
+        let headers = {
+            let stated = ingest_headers(
+                ("x-amzn-stream-name", name.clone()),
+                timecode_type,
+                producer_start,
+            );
+            if states_start {
+                stated
+            } else {
+                stated
+                    .into_iter()
+                    .filter(|(header, _)| *header != "x-amzn-producer-start-timestamp")
+                    .collect()
+            }
+        };
+        let container = Container::of(vec![
+            cluster(FIRST_MILLIS, 2, 30, 0x66),
+            cluster(SECOND_MILLIS, 1, 0, 0x67),
+        ]);
+        let response = harness.put_media(&headers, container.bytes()).await;
+        assert_eq!(
+            status(&response),
+            expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {} ({}) {}",
+            status(&response),
+            error_code(&response),
+            text(&response)
+        );
+        let landed = producer_timestamps(&harness, &arn);
+        assert_eq!(
+            landed, expected_millis,
+            "case {case:?}: expected the fragments at {expected_millis:?}, got {landed:?}"
+        );
+    }
+}
+
 /// RULE: a fault in the REQUEST is answered as an HTTP error in this service's modelled
 /// error vocabulary, and nothing is ingested.
 #[tokio::test]
@@ -955,54 +1050,108 @@ async fn a_request_level_fault_is_refused_and_ingests_nothing() {
     );
 }
 
-/// RULE: a fault in the submitted CONTAINER is reported in band — inside the same
-/// `200`, as an `ERROR` acknowledgement naming the fault — and the Clusters accepted
-/// before it stay ingested while nothing after it is taken.
+/// RULE: a fault in the submitted MEDIA is reported in band — inside the same `200`, as
+/// an `ERROR` acknowledgement naming the fault — and it ENDS the session at the Cluster
+/// that carried it: the Clusters taken before it stay ingested, nothing after it is taken,
+/// and the session reports no `PERSISTED` acknowledgement at all, because a producer reads
+/// those only while its session is live.
+///
+/// The rows span the fault classes: a Cluster timecode that goes back, a frame on a track
+/// the container never declared, a producer timestamp that names an instant which has not
+/// happened, and three shapes of container that do not read as Matroska at all.
 #[tokio::test]
-async fn a_container_fault_is_reported_in_band() {
-    let producer_start = SystemTime::UNIX_EPOCH + Duration::from_millis(1_761_000_300_000);
+async fn a_media_fault_is_reported_in_band() {
+    /// One fault case.
+    struct Case {
+        name: &'static str,
+        body: Vec<u8>,
+        /// How far the session's producer start timestamp is from now, in milliseconds:
+        /// negative for a producer that has been running, positive for one whose clock
+        /// names a moment that has not happened.
+        producer_start_offset_millis: i64,
+        /// The `ErrorCode` the acknowledgement stream must carry.
+        expected_code: &'static str,
+        /// How many fragments survive in the store, which the fault did not take back.
+        surviving: usize,
+    }
 
-    // (case, body, expected ERROR code, how many fragments survive)
-    let rows: Vec<(&str, Vec<u8>, &str, usize)> = vec![
-        (
-            "a cluster timecode that goes back",
-            Container::of(vec![
+    let cases: Vec<Case> = vec![
+        Case {
+            name: "a cluster timecode that goes back",
+            body: Container::of(vec![
                 cluster(0, 2, 30, 0x41),
                 cluster(2000, 2, 30, 0x42),
                 cluster(1000, 2, 30, 0x43),
                 cluster(3000, 2, 30, 0x44),
             ])
             .bytes(),
-            "FRAGMENT_TIMECODE_LESSER_THAN_PREVIOUS",
-            2,
-        ),
-        (
-            "bytes that are not Matroska at all",
-            b"this is not a matroska document".to_vec(),
-            "INVALID_MKV_DATA",
-            0,
-        ),
-        (
-            "an empty body",
-            Vec::new(),
-            "INVALID_MKV_DATA",
-            0,
-        ),
-        (
-            "a truncated container",
-            {
+            producer_start_offset_millis: -600_000,
+            expected_code: "FRAGMENT_TIMECODE_LESSER_THAN_PREVIOUS",
+            surviving: 2,
+        },
+        Case {
+            name: "a frame on a track the container did not declare",
+            body: Container::of(vec![
+                cluster(0, 2, 30, 0x46),
+                cluster_on_track(1000, TRACK_NUMBER + 1, 2, 30, 0x47),
+            ])
+            .bytes(),
+            producer_start_offset_millis: -600_000,
+            expected_code: "TRACK_NUMBER_MISMATCH",
+            surviving: 1,
+        },
+        Case {
+            name: "a producer timestamp that has not happened yet",
+            body: Container::of(vec![cluster(0, 2, 30, 0x48)]).bytes(),
+            // Well beyond any clock difference between a producer and this service: the
+            // allowance exists for skew, not for a producer naming a day it has not
+            // reached.
+            producer_start_offset_millis: 400 * 24 * 3_600_000,
+            expected_code: "INVALID_PRODUCER_TIMESTAMP",
+            surviving: 0,
+        },
+        Case {
+            name: "bytes that are not Matroska at all",
+            body: b"this is not a matroska document".to_vec(),
+            producer_start_offset_millis: -600_000,
+            expected_code: "INVALID_MKV_DATA",
+            surviving: 0,
+        },
+        Case {
+            name: "an empty body",
+            body: Vec::new(),
+            producer_start_offset_millis: -600_000,
+            expected_code: "INVALID_MKV_DATA",
+            surviving: 0,
+        },
+        Case {
+            name: "a truncated container",
+            body: {
                 let whole = Container::of(vec![cluster(0, 3, 30, 0x45)]).bytes();
                 whole[..whole.len() - 4].to_vec()
             },
-            "INVALID_MKV_DATA",
-            0,
-        ),
+            producer_start_offset_millis: -600_000,
+            expected_code: "INVALID_MKV_DATA",
+            surviving: 0,
+        },
     ];
 
-    for (index, (case, body, expected_code, surviving)) in rows.into_iter().enumerate() {
+    for (index, case) in cases.into_iter().enumerate() {
+        let Case {
+            name: case,
+            body,
+            producer_start_offset_millis,
+            expected_code,
+            surviving,
+        } = case;
         let harness = Harness::new();
         let name = format!("ingest-probe-fault-{index}");
         let arn = harness.create_stream(&name).await;
+        let producer_start = if producer_start_offset_millis >= 0 {
+            SystemTime::now() + Duration::from_millis(producer_start_offset_millis.unsigned_abs())
+        } else {
+            SystemTime::now() - Duration::from_millis(producer_start_offset_millis.unsigned_abs())
+        };
         let response = harness
             .put_media(
                 &ingest_headers(
@@ -1016,7 +1165,7 @@ async fn a_container_fault_is_reported_in_band() {
         assert_eq!(
             status(&response),
             200,
-            "case {case:?}: a container fault is reported in band, so the status stays \
+            "case {case:?}: a media fault is reported in band, so the status stays \
              200, got {} ({}) {}",
             status(&response),
             error_code(&response),
@@ -1045,11 +1194,24 @@ async fn a_container_fault_is_reported_in_band() {
             "case {case:?}: an ERROR acknowledgement states its ErrorId, got {}",
             text(&response)
         );
+        // The session ended at the fault, so it reports no PERSISTED acknowledgement —
+        // whatever it had already taken.
         let persisted_numbers = persisted(&acks);
+        assert!(
+            persisted_numbers.is_empty(),
+            "case {case:?}: a session a fault ended reports no PERSISTED acknowledgement, \
+             got {persisted_numbers:?}"
+        );
+        let received: Vec<&serde_json::Value> = acks
+            .iter()
+            .filter(|ack| event_type(ack) == "RECEIVED")
+            .collect();
         assert_eq!(
-            persisted_numbers.len(),
+            received.len(),
             surviving,
-            "case {case:?}: expected {surviving} accepted fragment(s), got {persisted_numbers:?}"
+            "case {case:?}: expected {surviving} fragment(s) acknowledged as received, \
+             got {}",
+            text(&response)
         );
         let listed = harness
             .list_fragments(&serde_json::json!({ "StreamName": name }))
@@ -1121,9 +1283,13 @@ async fn a_producer_reaches_the_ingest_plane_at_the_announced_write_endpoint() {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let announced_scheme = format!("{}://", control_plane::state::DATA_PLANE_SCHEME);
         assert!(
-            endpoint.starts_with("https://") && !endpoint[8..].contains('/'),
-            "case {authority:?}: expected a bare origin with no path, got {endpoint:?}"
+            endpoint
+                .strip_prefix(&announced_scheme)
+                .is_some_and(|origin| !origin.is_empty() && !origin.contains('/')),
+            "case {authority:?}: expected a bare {announced_scheme} origin with no path, \
+             got {endpoint:?}"
         );
 
         // The producer appends the API name to what it was handed, exactly as the

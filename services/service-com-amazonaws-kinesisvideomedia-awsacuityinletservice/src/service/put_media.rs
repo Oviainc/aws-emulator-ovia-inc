@@ -53,6 +53,7 @@ use std::time::SystemTime;
 
 use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use ::aws_smithy_types::body::SdkBody;
+use ::service_com_amazonaws_kinesisvideo_kinesisvideo_20170930::state as control_plane;
 use ::service_com_amazonaws_kinesisvideoarchivedmedia_awsacuityreader::state as archive;
 use ::smithy_server_runtime::{http, BoxFuture, ErasedOperation, OperationContext, Service};
 
@@ -145,8 +146,10 @@ struct SubmittedSession {
     stream_arn: Option<String>,
     /// How the container's Cluster timecodes are to be read.
     timecode_type: TimecodeType,
-    /// The producer's clock at the start of the session, in epoch milliseconds.
-    producer_start_millis: i64,
+    /// The producer's clock at the start of the session, in epoch milliseconds, when the
+    /// request stated one. A RELATIVE Cluster timecode is an offset from it, so a RELATIVE
+    /// session carries it; an ABSOLUTE one names the instant itself and needs none.
+    producer_start_millis: Option<i64>,
 }
 
 impl SubmittedSession {
@@ -164,6 +167,7 @@ impl SubmittedSession {
         let millis = match self.timecode_type {
             TimecodeType::Relative => self
                 .producer_start_millis
+                .unwrap_or_default()
                 .saturating_add(cluster.timecode_millis),
             TimecodeType::Absolute => cluster.timecode_millis,
         };
@@ -204,6 +208,15 @@ impl<Eng> PutMediaIngest<Eng> {
     /// Build the ingest plane from the shared engine.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self { engine }
+    }
+}
+
+impl<Eng: Send + Sync + 'static> PutMediaIngest<Eng> {
+    /// Whether this plane is the one the request's own ADDRESS serves, by the rule
+    /// [`ingest_served_at`] states. Read through the shared engine this plane holds,
+    /// which is where the control plane records the address it announced for each plane.
+    pub fn serves_the_addressed_plane(&self, req: &RtRequest) -> bool {
+        ingest_served_at(&*self.engine, req)
     }
 }
 
@@ -292,6 +305,10 @@ impl<Eng: Send + Sync + 'static> PutMediaIngest<Eng> {
         let mut previous: Option<u64> = None;
         let mut ingested_frames = 0usize;
         for cluster in clusters {
+            // The number this fragment was RECEIVED under, which every acknowledgement of
+            // it carries — the fault acknowledgements below included, since the fault was
+            // found in a fragment the service had already taken in.
+            let received_as = store.received_fragment_number(&*self.engine, name, arn);
             // "A cluster timecode moving backwards" ends the session at that Cluster:
             // the fragment log is ordered by time, so a fragment that goes back cannot
             // be appended to it. The Clusters already taken stay ingested.
@@ -300,11 +317,43 @@ impl<Eng: Send + Sync + 'static> PutMediaIngest<Eng> {
                     FRAGMENT_TIMECODE_LESSER_THAN_PREVIOUS,
                     FRAGMENT_TIMECODE_LESSER_THAN_PREVIOUS_ID,
                     Some(cluster.timecode),
+                    received_as.as_deref(),
+                ));
+                break;
+            }
+            // A frame on a track the container never declared cannot be played back: a
+            // reader handed the chunk has no `TrackEntry` to decode it with. The session
+            // ends at that Cluster.
+            if let Some(track) = cluster.undeclared_track {
+                ::tracing::debug!(
+                    operation = "PutMedia",
+                    track,
+                    "a submitted block names a track the container did not declare"
+                );
+                fault = Some(error_acknowledgement(
+                    TRACK_NUMBER_MISMATCH,
+                    TRACK_NUMBER_MISMATCH_ID,
+                    Some(cluster.timecode),
+                    received_as.as_deref(),
                 ));
                 break;
             }
             previous = Some(cluster.timecode);
             let producer_instant = session.producer_instant(&cluster);
+            // A fragment cannot have been captured at an instant the service has not
+            // reached: the timecode names a moment that has not happened, so there is no
+            // instant to record it at and the session ends at that Cluster. The service's
+            // own clock is the only reference it has for "now", and a producer's runs a
+            // little ahead or behind it ([`PRODUCER_CLOCK_SKEW_ALLOWANCE`]).
+            if producer_instant > received_at + PRODUCER_CLOCK_SKEW_ALLOWANCE {
+                fault = Some(error_acknowledgement(
+                    INVALID_PRODUCER_TIMESTAMP,
+                    INVALID_PRODUCER_TIMESTAMP_ID,
+                    Some(cluster.timecode),
+                    received_as.as_deref(),
+                ));
+                break;
+            }
             let Some(fragment_number) = store.ingest_fragment(
                 &*self.engine,
                 name,
@@ -335,9 +384,17 @@ impl<Eng: Send + Sync + 'static> PutMediaIngest<Eng> {
             ingested_frames += cluster.frames;
         }
         drop(store);
-        acknowledgements.extend(persisted);
+        // The PERSISTED acknowledgements of the session, which a producer reads only
+        // while the session is live: a fault ENDS it at the Cluster that carried the
+        // fault, so a session that ended that way reports none at all. What it had
+        // already taken stays ingested — the fragments are stored, it is the session the
+        // fault closed.
+        if fault.is_none() {
+            acknowledgements.extend(persisted);
+        }
         // The fault that ended the session is the last thing the producer reads: every
-        // fragment taken before it is acknowledged, and nothing after it was taken.
+        // fragment taken before it is acknowledged as received, and nothing after it was
+        // taken.
         acknowledgements.extend(fault);
 
         tracing::debug!(
@@ -380,6 +437,34 @@ const INVALID_MKV_DATA: &str = "INVALID_MKV_DATA";
 /// `ErrorId` of [`INVALID_MKV_DATA`].
 const INVALID_MKV_DATA_ID: u64 = 4006;
 
+/// `ErrorCode` of a fragment whose producer timestamp names an instant that has not
+/// happened yet.
+const INVALID_PRODUCER_TIMESTAMP: &str = "INVALID_PRODUCER_TIMESTAMP";
+
+/// `ErrorId` of [`INVALID_PRODUCER_TIMESTAMP`].
+const INVALID_PRODUCER_TIMESTAMP_ID: u64 = 4007;
+
+/// `ErrorCode` of a frame written on a track number the container's `Tracks` never
+/// declared.
+const TRACK_NUMBER_MISMATCH: &str = "TRACK_NUMBER_MISMATCH";
+
+/// `ErrorId` of [`TRACK_NUMBER_MISMATCH`].
+const TRACK_NUMBER_MISMATCH_ID: u64 = 4010;
+
+/// How far ahead of this service's own clock a fragment's producer timestamp may be and
+/// still be taken.
+///
+/// A producer stamps its fragments from ITS clock, which runs a little ahead or behind the
+/// service's, and the fragments of a live session are stamped as they are captured — so a
+/// producer timestamp slightly ahead of the instant the service reads it is ordinary and
+/// is ingested as sent. What is refused is a timestamp no clock difference accounts for.
+///
+/// AWS publishes no figure for that allowance, so this span is CHOSEN: wide enough that no
+/// difference between two machines' clocks, or the span of one session, can earn a
+/// refusal.
+const PRODUCER_CLOCK_SKEW_ALLOWANCE: ::std::time::Duration =
+    ::std::time::Duration::from_secs(60 * 60);
+
 /// One acknowledgement of an accepted fragment: the event it reports, the Cluster
 /// timecode the producer sent, and the fragment number this service minted.
 ///
@@ -405,12 +490,13 @@ fn fragment_acknowledgement(
 }
 
 /// One acknowledgement of a fault in the submitted media: the code and id a producer
-/// branches on, and the timecode of the Cluster that carried it when the fault names
-/// one.
+/// branches on, the timecode of the Cluster that carried it when the fault names one, and
+/// the number the fragment it was found in was received under.
 fn error_acknowledgement(
     error_code: &str,
     error_id: u64,
     fragment_timecode: Option<u64>,
+    fragment_number: Option<&str>,
 ) -> ::serde_json::Value {
     let mut acknowledgement = ::serde_json::Map::new();
     acknowledgement.insert("EventType".to_string(), EVENT_ERROR.into());
@@ -418,6 +504,11 @@ fn error_acknowledgement(
     // not parse has none, and a zero would name the session's first instant.
     if let Some(timecode) = fragment_timecode {
         acknowledgement.insert("FragmentTimecode".to_string(), timecode.into());
+    }
+    // The fragment number likewise: a fault in a fragment the service took in names that
+    // fragment, while a container it could not read holds no fragment to name.
+    if let Some(number) = fragment_number {
+        acknowledgement.insert("FragmentNumber".to_string(), number.into());
     }
     acknowledgement.insert("ErrorId".to_string(), error_id.into());
     acknowledgement.insert("ErrorCode".to_string(), error_code.into());
@@ -428,7 +519,10 @@ fn error_acknowledgement(
 fn container_fault(fault: ContainerFault) -> ::serde_json::Value {
     match fault {
         ContainerFault::Unreadable => {
-            error_acknowledgement(INVALID_MKV_DATA, INVALID_MKV_DATA_ID, None)
+            // No fragment was taken in: a container whose tree does not read holds no
+            // Cluster this plane could receive, so the fault names neither a timecode nor
+            // a fragment number.
+            error_acknowledgement(INVALID_MKV_DATA, INVALID_MKV_DATA_ID, None, None)
         }
     }
 }
@@ -471,18 +565,14 @@ fn store_unavailable() -> Refusal {
 }
 
 /// `ResourceNotFoundException` for the stream this session named.
-fn stream_not_found(session: &SubmittedSession) -> Refusal {
-    let identifier = session
-        .stream_name
-        .as_deref()
-        .or(session.stream_arn.as_deref())
-        .unwrap_or_default();
+fn stream_not_found(_session: &SubmittedSession) -> Refusal {
     Refusal {
         status: 404,
         code: RESOURCE_NOT_FOUND,
-        // The same sentence this crate's `GetMedia` states for the same condition, so
-        // both planes of one stream report a missing stream the one way.
-        message: format!("No such stream: {identifier}."),
+        // The one sentence this family states for a stream that is not there to serve,
+        // held by the archive read plane and stated by the control plane too — fixed text
+        // carrying nothing from the request, as the recorded refusal carries nothing.
+        message: archive::STREAM_NOT_FOUND_MESSAGE.to_string(),
     }
 }
 
@@ -526,16 +616,28 @@ fn submitted_session(req: &RtRequest) -> Result<SubmittedSession, Refusal> {
         )));
     };
 
-    let Some(producer_start) = header(PRODUCER_START_TIMESTAMP_HEADER) else {
-        return Err(invalid_argument(format!(
-            "{PRODUCER_START_TIMESTAMP_HEADER} must be specified."
-        )));
+    // The producer start timestamp is what a RELATIVE Cluster timecode is an offset FROM,
+    // so a RELATIVE session cannot be read without it. An ABSOLUTE timecode already names
+    // the instant its fragment was captured at, so nothing in such a session reads the
+    // producer's start and a session that states none is taken as it stands.
+    let producer_start_millis = match header(PRODUCER_START_TIMESTAMP_HEADER) {
+        Some(producer_start) => Some(epoch_seconds_as_millis(&producer_start).ok_or_else(
+            || {
+                invalid_argument(format!(
+                    "{PRODUCER_START_TIMESTAMP_HEADER} must be a timestamp in epoch seconds."
+                ))
+            },
+        )?),
+        None => match timecode_type {
+            TimecodeType::Relative => {
+                return Err(invalid_argument(format!(
+                    "{PRODUCER_START_TIMESTAMP_HEADER} must be specified when \
+                     {TIMECODE_TYPE_HEADER} is {TIMECODE_TYPE_RELATIVE}."
+                )))
+            }
+            TimecodeType::Absolute => None,
+        },
     };
-    let producer_start_millis = epoch_seconds_as_millis(&producer_start).ok_or_else(|| {
-        invalid_argument(format!(
-            "{PRODUCER_START_TIMESTAMP_HEADER} must be a timestamp in epoch seconds."
-        ))
-    })?;
 
     Ok(SubmittedSession {
         stream_name,
@@ -568,6 +670,47 @@ fn invalid_argument(message: String) -> Refusal {
         code: INVALID_ARGUMENT,
         message,
     }
+}
+
+/// Whether the ADDRESS a request arrived on is one the ingest route is served at.
+///
+/// A Kinesis Video Streams media API belongs to ONE access mode and is served at the
+/// address announced for that mode — "Caller used wrong endpoint to write data to a
+/// stream. On receiving such an exception, the user must call `GetDataEndpoint` with
+/// `AccessMode` set to \"READ\"" — so the ingest route is bound on the address
+/// `GetDataEndpoint(APIName=PUT_MEDIA)` hands a producer and on no other address of this
+/// emulator. A producer that skipped discovery, cached the control-plane endpoint or
+/// addressed the read plane has reached an endpoint that does not route `/putMedia`, and
+/// is answered as such ([`unrouted_address_response`]) with nothing ingested.
+///
+/// Which plane an address IS comes from the control plane that announced it
+/// ([`control_plane::published_plane`]): this emulator knows the plane of the addresses it
+/// published and of no others, so a request that reached a host NAMING a service — a
+/// caller resolving AWS's own data hosts rather than an address this emulator handed out —
+/// is left to the route's own claim.
+fn ingest_served_at<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> bool {
+    let host = req.headers().get(::http::header::HOST.as_str());
+    let Some(address) =
+        ::service_common::data_plane_addressing::reached_emulator_endpoint(req.uri(), host)
+    else {
+        return true;
+    };
+    control_plane::published_plane(engine, &address) == Some(control_plane::DataPlane::Write)
+}
+
+/// What an address that does not route `/putMedia` answers a producer that sent one
+/// there: the refusal an endpoint gives a path it binds no operation for — HTTP 404, the
+/// bare `UnknownOperationException` element as the whole body, and no error-type header,
+/// because no operation was identified to name one for. Nothing is read from the request
+/// and nothing is ingested.
+///
+/// The body is the framework's own ([`::smithy_server_runtime::UNRECOGNISED_PROTOCOL_BODY`]),
+/// which is the one wording this emulator states an unrouted path in.
+pub fn unrouted_address_response() -> RtResponse {
+    RtResponse::new(
+        StatusCode::try_from(404).expect("the status is a constant of this module"),
+        SdkBody::from(::smithy_server_runtime::UNRECOGNISED_PROTOCOL_BODY),
+    )
 }
 
 /// Whether the buffered request parts address the ingest plane: a `POST` whose first URI

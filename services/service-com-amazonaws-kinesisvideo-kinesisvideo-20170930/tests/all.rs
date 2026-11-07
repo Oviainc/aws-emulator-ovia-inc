@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/boundary_refusal_wording.rs"]
 mod boundary_refusal_wording;
+#[path = "all/data_plane_addresses.rs"]
+mod data_plane_addresses;
 #[path = "all/route_claims.rs"]
 mod route_claims;
 #[path = "all/signaling_channel_lifecycle.rs"]

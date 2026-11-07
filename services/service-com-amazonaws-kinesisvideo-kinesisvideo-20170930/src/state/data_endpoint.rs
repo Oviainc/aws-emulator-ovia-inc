@@ -12,32 +12,37 @@
 //! and use the endpoint Kinesis Video returns in the next `GetMedia` call." Which
 //! endpoint is REPORTED therefore follows from the access mode the requested API needs.
 //!
-//! So the value reported is a bare `https://<authority>` base URL — scheme and host
+//! So the value reported is a bare `<scheme>://<authority>` base URL — scheme and host
 //! only, no path, because the client appends the API name itself — of the plane the
 //! requested `APIName` needs. Every API of one access mode resolves to one endpoint,
 //! the two modes resolve to different ones, and neither is the control-plane endpoint
 //! the call arrived on.
 //!
-//! What this module decides is which endpoint each API is TOLD to use. SCOPING a
-//! plane's address to that plane's own operations — the `InvalidEndpointException` a
-//! wrong-plane write earns, and the refusal a control-plane call to a data address
-//! earns — is a separate rule nothing here implements: every address of this emulator
-//! is served by its one front door, which resolves the target service from the SigV4
-//! signing name and the modelled path and not from the host. Each plane's address is
-//! reachable and serves this emulator's whole surface.
+//! What this module decides is which endpoint each API is TOLD to use, and which plane
+//! an address that arrives on a request BELONGS to ([`published_plane`]) — the reading a
+//! plane's own routes are scoped by, so the ingest route is served at the address
+//! announced for it and nowhere else.
 //!
-//! # The announced authority is one this emulator ANSWERS on
+//! # The announced authority is one this emulator ANSWERS on, over a transport the
+//! calling client can dial
 //!
 //! A `DataEndpoint` is not a label: it is an address the client then DIALS ("To read
 //! data from the stream or to write data to it, specify this endpoint in your
 //! application"), with no host rewriting in between — a producer SDK, `kvssink` or a
 //! client configured with `endpoint_url=DataEndpoint` resolves exactly the name handed
-//! back. A public AWS hostname therefore resolves off this machine and the discovered
-//! data plane cannot be reached at all, so each plane is published as an address this
-//! emulator serves: one of the core's own listeners
-//! ([`::emulator_server::Listeners::http`], bound on the emulator's interface —
-//! loopback by default — with the core owning the socket and its TLS), opened once per
-//! plane and reported as `https://host:port`.
+//! back, with the configuration it already has. A public AWS hostname therefore resolves
+//! off this machine and the discovered data plane cannot be reached at all, so each
+//! plane is published as an address this emulator serves: one of the core's own
+//! listeners ([`::emulator_server::Listeners::tcp_plaintext`], bound on the emulator's
+//! interface — loopback by default — with the core owning the socket, the connection
+//! caps and their lifetime), opened once per plane, spoken HTTP/1.1 on
+//! ([`super::data_plane_serving`]) and reported as `http://host:port`.
+//!
+//! The SCHEME is part of being dialable rather than a decoration: the announced origin
+//! has to be one the client that just made the control call reaches with no extra trust
+//! material, and the only certificate such a client has been given is the emulator's own
+//! front-door one — see [`super::data_plane_serving`] for why a plane is therefore
+//! served in the clear.
 //!
 //! The two planes differ by PORT, which is what keeps them distinct from each other and
 //! from the control-plane address while all three stay reachable; the particular port is
@@ -50,9 +55,9 @@
 //! same panic containment the control-plane front door applies), so the media and
 //! archived-media routes this emulator registers — `/getMedia`, `/listFragments`,
 //! `/getMediaForFragmentList`, `/getClip`, the HLS/DASH session URLs — are bound on the
-//! announced authority, exactly as they are on the endpoint the control call arrived on.
-//! Nothing is synthesised here: a request forwarded to the router is answered by
-//! whichever service claims it, or by the router's own refusal when none does.
+//! announced authority. Nothing is synthesised here: a request forwarded to the router
+//! is answered by whichever service claims it, or by the router's own refusal when none
+//! does.
 //!
 //! Two consequences of holding that handle are worth stating. The plane is served by the
 //! router that answered the call which opened the listener, so an engine mounted behind
@@ -61,9 +66,6 @@
 //! callback chain of that one control call rather than starting a fresh chain — immaterial
 //! at the core's chain limit, which is two orders of magnitude above any chain this
 //! service makes.
-
-use std::future::Future;
-use std::pin::Pin;
 
 use ::aws_smithy_runtime_api::client::http::{HttpConnector, SharedHttpConnector};
 use ::aws_smithy_runtime_api::http::Request as RtRequest;
@@ -128,9 +130,12 @@ pub fn service_host(region: &str) -> String {
 /// The state OWNS the listener: dropping it closes the port, so it must outlive every
 /// endpoint handed out, which is the whole life of the store.
 pub struct DataPlaneEndpoint {
-    /// `https://host:port`, the whole value `GetDataEndpoint` reports for this plane.
+    /// `http://host:port`, the whole value `GetDataEndpoint` reports for this plane.
     base_url: String,
-    /// Held only to keep the port open; the core owns the socket and its TLS.
+    /// `host:port` alone: the authority a request to this plane ARRIVES on, which is
+    /// what [`published_plane`] reads a request's address against.
+    authority: String,
+    /// Held only to keep the port open; the core owns the socket and its lifetime.
     _listener: ::emulator_server::ResourceListener,
 }
 
@@ -141,6 +146,7 @@ impl std::fmt::Debug for DataPlaneEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DataPlaneEndpoint")
             .field("base_url", &self.base_url)
+            .field("authority", &self.authority)
             .finish()
     }
 }
@@ -177,18 +183,13 @@ pub async fn ensure_data_endpoint<Eng: Send + Sync + 'static>(
 
     let listener = super::shared_engine(engine)?
         .listeners()
-        .http(
-            DataPlaneFrontDoor {
-                emulator: emulator.clone(),
-            },
-            ::emulator_server::HttpPolicy::default(),
-        )
+        .tcp_plaintext(super::data_plane_serving::DataPlaneFrontDoor::new(
+            emulator.clone(),
+        ))
         .await
         .ok()?;
-    let base_url = format!(
-        "https://{}",
-        ::service_common::data_plane_addressing::listener_authority(&listener)
-    );
+    let authority = ::service_common::data_plane_addressing::listener_authority(&listener);
+    let base_url = format!("{DATA_PLANE_SCHEME}://{authority}");
 
     let mut store = state.lock();
     // Another request may have opened one while this one was binding; keep the first,
@@ -201,30 +202,34 @@ pub async fn ensure_data_endpoint<Eng: Send + Sync + 'static>(
         plane,
         DataPlaneEndpoint {
             base_url: base_url.clone(),
+            authority,
             _listener: listener,
         },
     );
     Some(base_url)
 }
 
-/// Serves one plane's announced address: this emulator's own front door, on a port of
-/// its own. The core runs the browser checks and owns CORS; this only hands the request
-/// on to the router.
-struct DataPlaneFrontDoor {
-    /// The emulator the control call that opened this listener was served by — the same
-    /// router, the same engine, the same state. It is an IN-PROCESS handle: a request
-    /// this listener accepts is dispatched inside this process and nothing here dials
-    /// out, so the only address involved is the one the core bound.
-    emulator: EmbeddedEmulator,
-}
+/// The scheme an announced data endpoint is published under: the one the transport its
+/// listener speaks names, so the value is an origin the calling client dials as it stands
+/// (see [`super::data_plane_serving`]).
+pub const DATA_PLANE_SCHEME: &str = "http";
 
-impl ::emulator_server::HttpHandler for DataPlaneFrontDoor {
-    fn handle(
-        &self,
-        req: ::http::Request<Vec<u8>>,
-    ) -> Pin<Box<dyn Future<Output = ::http::Response<Vec<u8>>> + Send>> {
-        Box::pin(serve_on_data_plane(self.emulator.http_connector(), req))
-    }
+/// Which plane of THIS store the authority `authority` is the published address of, or
+/// `None` for an address no plane of it was announced at.
+///
+/// This is the reading a plane's routes are SCOPED by: a route belongs to one access mode
+/// ("Caller used wrong endpoint to write data to a stream"), so the address announced for
+/// that mode is the address it is served at, and a request for it that arrived somewhere
+/// else reached an endpoint that does not route it. `None` is every address that is not a
+/// plane's — this emulator's control-plane front door among them.
+pub fn published_plane<Eng: Send + Sync + 'static>(engine: &Eng, authority: &str) -> Option<DataPlane> {
+    let state = super::service_state(engine)?;
+    let store = state.lock();
+    store
+        .data_endpoints
+        .iter()
+        .find(|(_, endpoint)| endpoint.authority == authority)
+        .map(|(plane, _)| *plane)
 }
 
 /// What a request to an announced data endpoint is answered with: whatever this
@@ -238,7 +243,7 @@ impl ::emulator_server::HttpHandler for DataPlaneFrontDoor {
 /// it, and the next request is served normally.
 pub async fn serve_on_data_plane(
     transport: SharedHttpConnector,
-    req: ::http::Request<Vec<u8>>,
+    req: ::http::Request<::bytes::Bytes>,
 ) -> ::http::Response<Vec<u8>> {
     let facts = ::emulator_server::RequestFacts::from_request(&req);
     ::emulator_server::contain_panics(facts, forward_to_router(transport, req)).await
@@ -249,16 +254,15 @@ pub async fn serve_on_data_plane(
 /// Method, path, headers and body all travel unchanged — the `Host` header included, so
 /// the signature the client computed over them still verifies, and so the service the
 /// router resolves from the SigV4 signing name and the modelled path is the one the API
-/// belongs to.
+/// belongs to. The body travels as the buffer it was read into, so a session's media is
+/// not copied again on its way to the router.
 async fn forward_to_router(
     transport: SharedHttpConnector,
-    req: ::http::Request<Vec<u8>>,
+    req: ::http::Request<::bytes::Bytes>,
 ) -> ::http::Response<Vec<u8>> {
     let (parts, body) = req.into_parts();
-    let forwarded = ::http::Request::from_parts(
-        parts,
-        ::aws_smithy_types::body::SdkBody::from(::bytes::Bytes::from(body)),
-    );
+    let forwarded =
+        ::http::Request::from_parts(parts, ::aws_smithy_types::body::SdkBody::from(body));
     let Ok(forwarded) = RtRequest::try_from(forwarded) else {
         return data_plane_response(400, MALFORMED_DATA_PLANE_REQUEST);
     };

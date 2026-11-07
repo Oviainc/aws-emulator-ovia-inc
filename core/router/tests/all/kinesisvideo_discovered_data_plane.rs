@@ -146,13 +146,21 @@ async fn data_endpoint(router: &MultiServiceRouter, api_name: &str) -> String {
         .to_string()
 }
 
-/// The authority of an announced `https://host:port` origin, failing the case when the
-/// value carries a path: "The returned endpoint does not have the API name appended. The
-/// client needs to add the API name to the returned endpoint."
+/// The authority of an announced origin, failing the case when the value carries a path:
+/// "The returned endpoint does not have the API name appended. The client needs to add the
+/// API name to the returned endpoint."
+///
+/// The scheme is the one the plane's listener speaks, which the control plane publishes as
+/// `DATA_PLANE_SCHEME`: the announced origin has to be one the calling client dials as it
+/// stands.
 fn announced_authority(case: &str, endpoint: &str) -> String {
-    let authority = endpoint
-        .strip_prefix("https://")
-        .unwrap_or_else(|| panic!("case {case:?}: expected an https origin, got {endpoint:?}"));
+    let scheme = format!(
+        "{}://",
+        service_com_amazonaws_kinesisvideo_kinesisvideo_20170930::state::DATA_PLANE_SCHEME
+    );
+    let authority = endpoint.strip_prefix(&scheme).unwrap_or_else(|| {
+        panic!("case {case:?}: expected a {scheme} origin, got {endpoint:?}")
+    });
     assert!(
         !authority.is_empty()
             && !authority.contains('/')

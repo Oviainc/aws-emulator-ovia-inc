@@ -42,6 +42,10 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# One case dials the address `GetDataEndpoint` announces, in THIS process, as a producer
+# handed that address does: tokio's socket and byte-stream halves carry the HTTP exchange
+# on the transport the announced scheme names.
+tokio = { workspace = true, features = ["io-util", "net"] }
 
 [lints]
 workspace = true

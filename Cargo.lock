@@ -12715,11 +12715,12 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "http",
- "rustls",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde_json",
  "service-common",
  "tokio",
- "tokio-rustls",
  "tracing",
 ]
 

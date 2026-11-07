@@ -278,6 +278,30 @@ impl ComAmazonawsKinesisvideomediaAwsacuityinletserviceState {
         Some(fragment_number)
     }
 
+    /// The fragment number the NEXT fragment received on the stream
+    /// `stream_name`/`stream_arn` names will carry.
+    ///
+    /// A fragment number is minted when the service RECEIVES the fragment, which is why
+    /// the acknowledgement stream reports one for a fragment it has not stored yet —
+    /// including the acknowledgement of a FAULT found in that fragment, which names the
+    /// fragment it was found in. Reading it mints nothing and consumes nothing: the next
+    /// fragment stored still takes this number, and a stream nothing has been produced to
+    /// yet is not created by the read.
+    pub fn received_fragment_number<Eng: Send + Sync + 'static>(
+        &self,
+        engine: &Eng,
+        stream_name: Option<&str>,
+        stream_arn: Option<&str>,
+    ) -> Option<String> {
+        let registered = registered_stream_record(engine, stream_name, stream_arn)?;
+        Some(
+            self.streams
+                .get(&registered.arn)
+                .map_or(1, |stream| stream.next_fragment_number)
+                .to_string(),
+        )
+    }
+
     /// Forget every continuation token of the stream `stream_arn` names whose fragment
     /// has been dropped off the log's oldest end.
     ///

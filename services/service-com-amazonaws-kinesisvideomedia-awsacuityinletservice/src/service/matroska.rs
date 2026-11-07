@@ -18,6 +18,7 @@
 //! frame carries are that crate's business, not this emulator's. What this module owns is
 //! the Kinesis Video Streams reading of that tree.
 
+use std::collections::BTreeSet;
 use std::io::Cursor;
 
 use ::webm_iterable::matroska_spec::{Master, MatroskaSpec};
@@ -59,6 +60,25 @@ pub const MAX_CLUSTERS_PER_REQUEST: usize = 1024;
 /// left unread, exactly as the count ceiling leaves them.
 pub const MAX_INGESTED_BYTES_PER_REQUEST: usize = 25_000_000;
 
+/// The most EBML elements one submitted container is read for: the step budget of the read.
+///
+/// The Cluster and byte ceilings above are checked when a Cluster ENDS, so neither bounds
+/// the work a container can ask for between two Clusters — or before the first one. This
+/// one is checked on every element, so the whole read is bounded whatever shape the
+/// submitted tree has. It is far above any producer's session (one Cluster carries its
+/// timecode and its frames), so no honest ingest reaches it, and the elements past it are
+/// left unread exactly as the ceilings above leave their Clusters.
+const MAX_ELEMENTS_PER_REQUEST: usize = 1_000_000;
+
+/// The most elements the submitted container's HEADER may carry — the elements before the
+/// first Cluster, which every chunk is written with.
+///
+/// A producer's header is its EBML header, its segment information and its track
+/// declarations: tens of elements. It is held for the whole session and copied in front of
+/// every chunk, so a container that carries thousands of them is not a session this plane
+/// can take, and is reported as the unreadable container it is rather than read.
+const MAX_HEADER_ELEMENTS: usize = 4_096;
+
 /// One submitted Cluster: one fragment.
 #[derive(Debug, Clone)]
 pub struct SubmittedCluster {
@@ -74,6 +94,14 @@ pub struct SubmittedCluster {
     pub span_millis: u64,
     /// How many frames (`SimpleBlock`s) the Cluster carries.
     pub frames: usize,
+    /// The track number of the first frame in this Cluster written on a track the
+    /// container's `Tracks` never declared, if any.
+    ///
+    /// A `SimpleBlock`'s header names the track its frame belongs to, and a reader decodes
+    /// that frame with the `TrackEntry` of that number: a block naming a track the
+    /// container never declared carries a frame nothing can decode, which is a fault in
+    /// the submitted media rather than in the EBML tree — the tree reads perfectly well.
+    pub undeclared_track: Option<u64>,
     /// This Cluster as a standalone Matroska document: the submitted header elements
     /// followed by this one Cluster.
     pub document: Vec<u8>,
@@ -105,6 +133,11 @@ pub fn read_clusters(body: &[u8]) -> Result<Vec<SubmittedCluster>, ContainerFaul
     // and the track declarations. Each chunk carries them in front of its own Cluster,
     // which is what makes the chunk a document of its own.
     let mut header: Vec<MatroskaSpec> = Vec::new();
+    // The track numbers the container has DECLARED, as a set: built once as the
+    // declarations are read, so the membership test one frame's block header earns is a
+    // lookup rather than a walk of the declarations, however many of either a container
+    // carries.
+    let mut declared: BTreeSet<u64> = BTreeSet::new();
     // The Cluster being read, with its own elements, or `None` between Clusters.
     let mut open: Option<Vec<MatroskaSpec>> = None;
     let mut clusters: Vec<SubmittedCluster> = Vec::new();
@@ -112,8 +145,16 @@ pub fn read_clusters(body: &[u8]) -> Result<Vec<SubmittedCluster>, ContainerFaul
     // What the Clusters read so far will persist, against the byte half of the work
     // ceiling.
     let mut document_bytes = 0usize;
+    // What the read has cost so far, against the step budget.
+    let mut elements = 0usize;
 
     for read in WebmIterator::new(Cursor::new(body), &[]) {
+        // The step budget, checked before anything is done with the element: the elements
+        // past it are not read, so nothing is acknowledged for them.
+        elements = elements.saturating_add(1);
+        if elements > MAX_ELEMENTS_PER_REQUEST {
+            return Ok(clusters);
+        }
         let tag = read.map_err(|_| ContainerFault::Unreadable)?;
         match tag {
             MatroskaSpec::Cluster(Master::Start) => {
@@ -126,7 +167,7 @@ pub fn read_clusters(body: &[u8]) -> Result<Vec<SubmittedCluster>, ContainerFaul
             MatroskaSpec::Cluster(Master::End) => {
                 let mut elements = open.take().ok_or(ContainerFault::Unreadable)?;
                 elements.push(MatroskaSpec::Cluster(Master::End));
-                let cluster = cluster_of(&header, &elements, scale_nanos)
+                let cluster = cluster_of(&header, &elements, &declared, scale_nanos)
                     .ok_or(ContainerFault::Unreadable)?;
                 document_bytes = document_bytes.saturating_add(cluster.document.len());
                 clusters.push(cluster);
@@ -143,7 +184,17 @@ pub fn read_clusters(body: &[u8]) -> Result<Vec<SubmittedCluster>, ContainerFaul
                 }
                 match &mut open {
                     Some(elements) => elements.push(other),
-                    None => header.push(other),
+                    None => {
+                        // A track declaration is read into the set as it is seen, so one
+                        // walk of the container answers every block's track.
+                        if let MatroskaSpec::TrackNumber(number) = &other {
+                            declared.insert(*number);
+                        }
+                        if header.len() >= MAX_HEADER_ELEMENTS {
+                            return Err(ContainerFault::Unreadable);
+                        }
+                        header.push(other);
+                    }
                 }
             }
         }
@@ -163,12 +214,14 @@ pub fn read_clusters(body: &[u8]) -> Result<Vec<SubmittedCluster>, ContainerFaul
 fn cluster_of(
     header: &[MatroskaSpec],
     elements: &[MatroskaSpec],
+    declared: &BTreeSet<u64>,
     scale_nanos: u64,
 ) -> Option<SubmittedCluster> {
     let mut timecode: Option<u64> = None;
     let mut earliest: Option<i64> = None;
     let mut latest: Option<i64> = None;
     let mut frames = 0usize;
+    let mut undeclared_track: Option<u64> = None;
     for element in elements {
         match element {
             MatroskaSpec::Timestamp(ticks) => timecode = Some(*ticks),
@@ -176,6 +229,11 @@ fn cluster_of(
                 let block = ::webm_iterable::matroska_spec::SimpleBlock::try_from(element).ok()?;
                 let at = i64::from(block.timestamp);
                 frames += 1;
+                // The first block on an undeclared track is what the fault names; a later
+                // one does not change it, because the session ends at this Cluster.
+                if undeclared_track.is_none() && !declared.contains(&block.track) {
+                    undeclared_track = Some(block.track);
+                }
                 earliest = Some(earliest.map_or(at, |held: i64| held.min(at)));
                 latest = Some(latest.map_or(at, |held: i64| held.max(at)));
             }
@@ -190,6 +248,7 @@ fn cluster_of(
         span_millis: u64::try_from(ticks_as_millis(span_ticks.unsigned_abs(), scale_nanos))
             .unwrap_or_default(),
         frames,
+        undeclared_track,
         document: standalone_document(header, elements)?,
     })
 }

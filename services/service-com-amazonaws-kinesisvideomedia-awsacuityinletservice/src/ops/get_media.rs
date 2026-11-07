@@ -454,10 +454,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let stream = store
                 .resolve_stream(&*self.engine, name, arn)
                 .ok_or_else(|| {
-                    resource_not_found(format!(
-                        "No such stream: {}.",
-                        name.or(arn).unwrap_or_default()
-                    ))
+                    // The one sentence this family states for a stream that is not there
+                    // to serve, held by the archive read plane and stated by the control
+                    // plane too: fixed text carrying nothing from the request.
+                    resource_not_found(
+                        ::service_com_amazonaws_kinesisvideoarchivedmedia_awsacuityreader::state::STREAM_NOT_FOUND_MESSAGE
+                            .to_string(),
+                    )
                 })?;
             let fragments = stream.fragments;
             let start = match selector_type {

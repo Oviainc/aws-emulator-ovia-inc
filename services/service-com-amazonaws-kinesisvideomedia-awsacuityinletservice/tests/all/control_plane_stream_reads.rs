@@ -278,8 +278,12 @@ async fn a_stream_the_control_plane_created_is_readable_on_the_media_plane() {
         // was bound on — rather than a public AWS name: a reader dials exactly the value
         // it is handed. (The owning crate's own suite is what dials it.)
         let endpoint = harness.data_endpoint(&name).await;
-        let authority = endpoint.strip_prefix("https://").unwrap_or_else(|| {
-            panic!("case \"produced {produced}\": expected an https origin, got {endpoint:?}")
+        let announced_scheme = format!("{}://", control_plane::state::DATA_PLANE_SCHEME);
+        let authority = endpoint.strip_prefix(&announced_scheme).unwrap_or_else(|| {
+            panic!(
+                "case \"produced {produced}\": expected a {announced_scheme} origin, \
+                 got {endpoint:?}"
+            )
         });
         let (host, port) = authority.rsplit_once(':').unwrap_or_else(|| {
             panic!(

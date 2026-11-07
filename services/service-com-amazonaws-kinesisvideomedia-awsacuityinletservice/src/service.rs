@@ -54,7 +54,10 @@
 //!   `404 UnknownService` for the endpoint `GetDataEndpoint` handed out.
 //! - [`Service::override_operation`] serves it as an [`ErasedOperation`]
 //!   ([`put_media::PutMediaIngest`]) which declares SigV4, so the emulator verifies the
-//!   producer's signature before any media is taken.
+//!   producer's signature before any media is taken — but only at the ADDRESS the write
+//!   plane is announced at. At any other address of this emulator the path is bound to no
+//!   operation, and [`Service::override_routing_error`] answers it as the unrouted path it
+//!   is, with nothing ingested.
 //!
 //! The Matroska container a producer submits is read by [`matroska`].
 
@@ -170,7 +173,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // `POST /putMedia` is that case: the ingest plane carries no `X-Amz-Target` and
         // no modelled URI names it, so it is named here — which is also what has the
         // router verify the producer's SigV4 signature before the operation runs.
-        if put_media::claims_request(req) {
+        //
+        // It is named only for a request that reached the ADDRESS the ingest plane is
+        // announced at ([`put_media::ingest_served_at`]): a producer that sent it to this
+        // emulator's control-plane front door, or to the read plane's address, reached an
+        // endpoint that binds no operation for the path, so no operation is named for it
+        // and `override_routing_error` below answers it as the unrouted path it is.
+        if put_media::claims_request(req) && self.ingest.serves_the_addressed_plane(req) {
             return Some(&self.ingest as &dyn ErasedOperation);
         }
         None
@@ -200,7 +209,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
         // word that routing failure in your own envelope instead.
-        let _ = req;
+        //
+        // The ingest path is worded here: an address that does not serve the ingest
+        // plane binds no operation for `/putMedia`, which an endpoint answers as an
+        // unknown operation rather than as this service's own 501
+        // ([`put_media::unrouted_address_response`]). Nothing is read from the request,
+        // so nothing is ingested.
+        if put_media::claims_request(req) {
+            return Some(put_media::unrouted_address_response());
+        }
         None
     }
 

@@ -12,10 +12,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// What a stream's media APIs are addressed at, which is not this service's own
 /// endpoint — see the module's own header.
 pub mod data_endpoint;
+/// What answers at an announced data endpoint, and over which transport.
+pub mod data_plane_serving;
 
 pub use data_endpoint::{
-    data_plane_of, ensure_data_endpoint, serve_on_data_plane, service_host, DataPlane,
-    DataPlaneEndpoint,
+    data_plane_of, ensure_data_endpoint, published_plane, serve_on_data_plane, service_host,
+    DataPlane, DataPlaneEndpoint, DATA_PLANE_SCHEME,
 };
 
 use crate::ops::types::{

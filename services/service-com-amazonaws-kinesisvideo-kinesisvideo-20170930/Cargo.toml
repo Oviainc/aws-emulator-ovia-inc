@@ -16,9 +16,19 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `sync` and `time` beside the workspace features: one request on an announced data
+# endpoint is read under an in-flight permit and the core's own request deadline
+# (`src/state/data_plane_serving.rs`).
+tokio = { workspace = true, features = ["sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
+# Speaks HTTP/1.1 on the raw connection the core hands an announced data plane, which is
+# what makes the announced origin one a stock client dials
+# (`src/state/data_plane_serving.rs`). `hyper-util` carries the tokio IO and timer
+# adapters for it, `http-body-util` the bounded body reader and the one-shot body.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # `service-common` carries the workspace's ONE AWS wording of a constraint-violation
@@ -32,12 +42,10 @@ service-common = { path = "../common" }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-# The data-endpoint tests dial the address `GetDataEndpoint` announces, in THIS process:
-# `rustls`/`tokio-rustls` run the client side of the TLS the core's listener terminates,
-# and tokio's socket and byte-stream halves carry the HTTP exchange on top. All are the
-# versions this workspace already builds.
-rustls = { workspace = true }
-tokio-rustls = "0.26"
+# The data-endpoint tests dial the address `GetDataEndpoint` announces, in THIS process,
+# as a client handed that address does: tokio's socket and byte-stream halves carry the
+# HTTP exchange on the transport the announced scheme names. Both are the versions this
+# workspace already builds.
 tokio = { workspace = true, features = ["io-util", "net", "time"] }
 
 [lints]
