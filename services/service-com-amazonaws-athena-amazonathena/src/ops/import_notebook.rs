@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportNotebook
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportNotebook`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportNotebook::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Imports an ipynb file into a Spark enabled workgroup, from the request's own payload or
+//! from the Amazon S3 location it names, and stores it as that workgroup's notebook.
 //!
 //! ## Shape of an operation
 //!
@@ -161,20 +154,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportNotebook` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportNotebookErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Resolve the CONTENT first, before any lock is taken: the object store is the
+        // other store this reads, and it is read with no guard of this service's own held
+        // (the lock order `crate::state::notebook_file_at` documents).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportNotebook"))
+        // "To import the notebook, the request must specify a value for either Payload or
+        // NoteBookS3LocationUri. If neither is specified or both are specified, an
+        // InvalidRequestException occurs."
+        let location = input.notebook_s3_location_uri.as_deref();
+        let payload = match (input.payload.as_deref(), location) {
+            (Some(payload), None) => payload.to_string(),
+            (None, Some(uri)) => match crate::state::notebook_file_at(&*self.engine, uri) {
+                crate::state::NotebookFile::Content(content) => content,
+                crate::state::NotebookFile::Absent => {
+                    return Err(invalid_request(crate::state::notebook_file_not_found(uri)))
+                }
+                crate::state::NotebookFile::NotText => {
+                    return Err(invalid_request(crate::state::notebook_file_not_ipynb(uri)))
+                }
+                crate::state::NotebookFile::TooLarge(bytes) => {
+                    return Err(invalid_request(crate::state::notebook_file_too_large(bytes)))
+                }
+            },
+            _ => {
+                return Err(invalid_request(
+                    crate::state::NOTEBOOK_SOURCE_REQUIRED.to_string(),
+                ))
+            }
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ImportNotebookErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("Athena state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // `ClientRequestToken` is "a unique case-sensitive string used to ensure the
+        // request to import the notebook is idempotent (executes only once)", so a repeat
+        // under the same token answers with the notebook that token already minted and
+        // imports nothing further. A token reused for OTHER parameters describes another
+        // import, which is what this service's `ClientRequestToken` refusal reports.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if let Some(minted) = store.notebooks.notebook_of_token(token) {
+                if minted.name != input.name
+                    || minted.work_group != input.work_group
+                    || minted.notebook_type != input.r#type
+                    || minted.payload != payload
+                {
+                    return Err(invalid_request(
+                        crate::state::IDEMPOTENT_PARAMETERS_DO_NOT_MATCH.to_string(),
+                    ));
+                }
+                return Ok(ImportNotebookOutput {
+                    notebook_id: Some(minted.id.clone()),
+                });
+            }
+        }
+
+        // A notebook lives in a workgroup, so one this account does not hold holds no
+        // notebooks either.
+        if !store.holds_work_group(&input.work_group) {
+            return Err(invalid_request(crate::state::work_group_not_found(
+                &input.work_group,
+            )));
+        }
+        // "Imports a single ipynb file to a Spark enabled workgroup": an Athena SQL
+        // workgroup runs no notebook engine, and Athena's own default workgroup is one.
+        let spark_enabled = store
+            .work_groups
+            .get(&input.work_group)
+            .is_some_and(crate::state::is_spark_enabled);
+        if !spark_enabled {
+            return Err(invalid_request(
+                crate::state::work_group_not_spark_enabled(&input.work_group),
+            ));
+        }
+
+        // "If an ipynb file with the same name already exists in the workgroup, throws an
+        // error": a second import under that name would either replace a notebook this
+        // call never imported or report success for one it did not create.
+        if store.notebooks.holds_name(&input.work_group, &input.name) {
+            return Err(invalid_request(crate::state::notebook_name_exists(
+                &input.work_group,
+                &input.name,
+            )));
+        }
+
+        if store.notebooks.would_exceed_capacity(payload.len()) {
+            return Err(invalid_request(format!(
+                "Cannot import another notebook: this emulator holds at most {} notebooks \
+                 and {} bytes of notebook content.",
+                crate::state::MAX_NOTEBOOKS,
+                crate::state::MAX_NOTEBOOK_BYTES_TOTAL
+            )));
+        }
+
+        // Athena hands back a notebook that can already be exported, so there is no
+        // transition the clock owes afterwards: the record is stored complete.
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::NotebookRecord {
+            id: crate::state::new_notebook_id(),
+            name: input.name,
+            work_group: input.work_group,
+            notebook_type: input.r#type,
+            payload,
+            created_at: now,
+            last_modified_at: now,
+        };
+        let notebook_id = record.id.clone();
+        store.notebooks.insert(record, input.client_request_token);
+
+        Ok(ImportNotebookOutput {
+            notebook_id: Some(notebook_id),
+        })
     }
+}
+
+/// The operation's own client error (HTTP 400), carrying `message`.
+///
+/// Every refusal above is a bad request rather than an unwritten operation, and
+/// `InvalidRequestException` is the client error this operation models: "Indicates that
+/// something is wrong with the input to the request." It is also the error
+/// `ImportNotebook` documents by name for a request that names neither source or both.
+fn invalid_request(message: String) -> ImportNotebookError {
+    ImportNotebookErrorModeled::InvalidRequestException(InvalidRequestException {
+        athena_error_code: None,
+        message: Some(message),
+    })
+    .into()
 }

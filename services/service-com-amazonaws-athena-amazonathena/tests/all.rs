@@ -20,6 +20,9 @@ mod engine_run_bound;
 #[path = "all/harness.rs"]
 mod harness;
 
+#[path = "all/notebook_import_export.rs"]
+mod notebook_import_export;
+
 #[path = "all/query_execution_identity.rs"]
 mod query_execution_identity;
 

@@ -12,6 +12,10 @@ engine = { workspace = true }
 # operations read the databases and tables out of Glue's own store rather than keeping a
 # second copy of them here.
 service-com-amazonaws-glue-awsglue = { workspace = true }
+# A notebook imported from a `NotebookS3LocationUri` IS the object that location names, so
+# the import reads it out of the one object store this emulator has rather than reporting
+# success for content nothing holds.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 # `page_tokens`: the authenticated continuation token every paginated read here hands
 # back, so a `NextToken` this process did not mint names no page.
 service-common = { path = "../common" }

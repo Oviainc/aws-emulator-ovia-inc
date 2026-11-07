@@ -31,9 +31,19 @@
 //! ([`QueryExecutionRecord::state_at`]), so a query a caller reads straight back is
 //! still QUEUED, is RUNNING a moment later and is terminal from its completion instant
 //! on, and no read ever has to write to move it.
+//!
+//! NOTEBOOKS are kept in the [`NotebookRegistry`] of
+//! [`ComAmazonawsAthenaAmazonathenaState::notebooks`]: `ImportNotebook` stores the ipynb
+//! content it was given (or read out of the one object store, for a request that named an
+//! Amazon S3 location) and `ExportNotebook` answers with that same content, so an export
+//! reports what an import persisted rather than anything rebuilt from the reading request.
 
 /// The SQL engine a query execution runs on, and the result set it produces.
 pub mod query_engine;
+
+/// The notebooks a Spark enabled workgroup holds, and the ipynb content of each.
+mod notebooks;
+pub use notebooks::*;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
@@ -1310,6 +1320,10 @@ pub struct ComAmazonawsAthenaAmazonathenaState {
     /// The engine databases queries run in, keyed by the catalog and database they
     /// address. Opened on demand by [`Self::query_database`], never by a read.
     query_databases: BTreeMap<String, query_engine::DatabaseHandle>,
+    /// Every notebook this account holds, with the import tokens that minted them.
+    /// `ImportNotebook` writes it and `ExportNotebook` reads it; see
+    /// [`NotebookRegistry`].
+    pub notebooks: NotebookRegistry,
     /// The secret this store's page tokens are authenticated under, so a `NextToken`
     /// this store did not mint names no page. Drawn from the system's randomness when
     /// the store is created and never reported.
