@@ -67,8 +67,13 @@
 //! A session's workspace is a growth site too — `InvokeCodeInterpreter`'s `writeFiles`
 //! tool chooses both the paths and the bytes — so it is bounded on the WRITE path by
 //! [`MAX_SESSION_FILES`] and [`MAX_SESSION_FILE_BYTES`], and a write that would pass
-//! either is refused rather than evicting a file a caller still expects to read. Each
-//! stop a `clientToken` replays is recorded too, bounded by
+//! either is refused rather than evicting a file a caller still expects to read. Those
+//! two bound ONE session, so the payload-carrying tools-plane state is bounded ACROSS the
+//! whole store as well, by [`MAX_STORED_SESSION_BYTES`] over every session's workspace and
+//! execution context together — the tools plane's equivalent of [`MAX_STORED_EVENTS`],
+//! without which the product of the per-session ceilings and the session counts would be
+//! what a caller looping on start-session and `writeFiles` could grow this process to.
+//! Each stop a `clientToken` replays is recorded too, bounded by
 //! [`MAX_STOP_TOKENS_PER_SESSION`].
 //!
 //! The AgentCore A/B TESTING plane is a concern of its own, so it lives in
@@ -148,6 +153,32 @@ pub const MAX_SESSION_FILES: usize = 1_024;
 /// the modelled `content` member admits 100 MB per block, which no in-memory workspace
 /// can take per request.
 pub const MAX_SESSION_FILE_BYTES: usize = 8 * 1024 * 1024;
+
+/// The most bytes EVERY code interpreter session in this emulator holds AT ONCE, across
+/// every workspace and every execution context, [as accounted
+/// here](CodeInterpreterSessionRecord::accounted_bytes).
+///
+/// The companion of [`MAX_SESSION_FILE_BYTES`] and [`MAX_CONTEXT_BYTES`], which bound ONE
+/// session: without a whole-store ceiling the PRODUCT of those and the session counts
+/// ([`MAX_CODE_INTERPRETERS`] times [`MAX_CODE_INTERPRETER_SESSIONS`]) is what a caller
+/// looping on start-session and `writeFiles` could grow this process's heap to, which is
+/// orders of magnitude past any host the emulator runs on. The memory plane is bounded the
+/// same way, per level AND across the store ([`MAX_STORED_EVENTS`],
+/// [`MAX_STORED_INGESTIONS`], [`MAX_STORED_MEMORY_RECORDS`]); this is the tools plane's
+/// equivalent for the state that carries caller-chosen payloads.
+///
+/// A write that would pass it is refused exactly as a full workspace is
+/// ([`WorkspaceFull::StoreBytes`]) — nothing already stored is dropped.
+pub const MAX_STORED_SESSION_BYTES: usize = 64 * 1024 * 1024;
+
+/// What ONE workspace entry is charged beside its content in the whole-store accounting
+/// ([`MAX_STORED_SESSION_BYTES`]): the map entry holding it, on top of the key and the
+/// bytes, both of which the caller chooses.
+///
+/// Without it a caller could store millions of EMPTY files for free, whose entries are
+/// real heap even though their content is not, so the accounting charges every file a
+/// fixed overhead as well as what it holds.
+pub const SESSION_FILE_ENTRY_OVERHEAD_BYTES: usize = 256;
 
 /// The most replayed-stop `clientToken` records one session keeps, so a caller looping
 /// on `StopCodeInterpreterSession` with a fresh token cannot grow the record.
@@ -279,10 +310,11 @@ pub struct ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
     /// `codeInterpreterIdentifier` the caller named. Bounded by
     /// [`MAX_CODE_INTERPRETERS`].
     ///
-    /// A code interpreter is registered here by the first `StartCodeInterpreterSession`
-    /// that names it, for the same reason a memory container is registered by its first
-    /// event: the interpreter itself is created through the CONTROL plane, a different
-    /// service.
+    /// An entry here is this plane's INDEX of the sessions started on an interpreter,
+    /// not a claim that the interpreter exists: the interpreter itself is created
+    /// through the CONTROL plane, a different service, and whether this account holds
+    /// one is answered by the shared inventory ([`holds_code_interpreter`]) before any
+    /// call that starts a session writes here.
     pub code_interpreters: HashMap<String, CodeInterpreterStore>,
     /// Every workload access token this service issued and has not pruned.
     pub workload_access_tokens: IssuedWorkloadAccessTokens,
@@ -432,11 +464,13 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
         Ok(removed)
     }
 
-    /// Persist one event — registering its memory, actor and session on the way — and
+    /// Persist one event — indexing its memory, actor and session on the way — and
     /// hold every bound in [the module's ceiling](self#the-store-has-an-explicit-ceiling).
     ///
-    /// The memory container is registered here rather than created by its own call
-    /// because the container is created through the CONTROL plane, a different service.
+    /// The memory container's entry is this plane's INDEX of what is stored inside it, not
+    /// a claim that the container exists: the container is created through the CONTROL
+    /// plane, and the caller of this method has already resolved it against the shared
+    /// inventory ([`holds_memory`]).
     pub fn insert_event(&mut self, event: StoredEvent, client_token: Option<String>) {
         let key = EventKey {
             memory_id: event.memory_id.clone(),
@@ -882,6 +916,35 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
         let interpreter = self.code_interpreters.get(code_interpreter_identifier)?;
         let session_id = &interpreter.idempotency.get(client_token)?.session_id;
         interpreter.sessions.get(session_id)
+    }
+
+    /// What every code interpreter session OTHER than `(code_interpreter_identifier,
+    /// session_id)` holds, [as the whole-store accounting charges
+    /// it](CodeInterpreterSessionRecord::accounted_bytes).
+    ///
+    /// Read under the same guard as the write it bounds, and handed to the session's own
+    /// write path, so a write holds [`MAX_STORED_SESSION_BYTES`] across the store as well
+    /// as this session's own ceilings. The walk is over the sessions the store holds,
+    /// which [`MAX_CODE_INTERPRETERS`], [`MAX_CODE_INTERPRETER_SESSIONS`] and
+    /// [`MAX_STORED_SESSION_BYTES`] together bound.
+    pub fn session_bytes_elsewhere(
+        &self,
+        code_interpreter_identifier: &str,
+        session_id: &str,
+    ) -> usize {
+        self.code_interpreters
+            .iter()
+            .flat_map(|(identifier, interpreter)| {
+                interpreter
+                    .sessions
+                    .iter()
+                    .map(move |(held, session)| (identifier, held, session))
+            })
+            .filter(|(identifier, held, _)| {
+                identifier.as_str() != code_interpreter_identifier || held.as_str() != session_id
+            })
+            .map(|(_, _, session)| session.accounted_bytes())
+            .fold(0usize, usize::saturating_add)
     }
 
     /// Persist one code interpreter session — registering its code interpreter on the
@@ -1409,6 +1472,9 @@ pub enum WorkspaceFull {
     Files(usize),
     /// [`MAX_SESSION_FILE_BYTES`] would have been passed.
     Bytes(usize),
+    /// [`MAX_STORED_SESSION_BYTES`] would have been passed: this session has room, but
+    /// the sessions of this emulator together do not.
+    StoreBytes(usize),
 }
 
 /// Why a tool's `path` addresses no file in a workspace.
@@ -1577,15 +1643,29 @@ impl CodeInterpreterSessionRecord {
     /// The whole batch is weighed at once, with the bytes each key already holds
     /// discounted, so a caller is told the workspace is full BEFORE any of its files is
     /// stored rather than part-way through.
-    pub fn room_for(&self, batch: &[(String, usize)]) -> Result<(), WorkspaceFull> {
+    ///
+    /// `bytes_elsewhere` is what every OTHER session of the store holds
+    /// ([`ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState::session_bytes_elsewhere`]),
+    /// so the whole-store ceiling [`MAX_STORED_SESSION_BYTES`] is weighed on the same
+    /// write path as this session's own.
+    pub fn room_for(
+        &self,
+        batch: &[(String, usize)],
+        bytes_elsewhere: usize,
+    ) -> Result<(), WorkspaceFull> {
         let mut added_keys = 0usize;
         let mut bytes = self.workspace_bytes();
+        let mut accounted = self.accounted_bytes();
         for (key, size) in batch {
             match self.files.get(key) {
-                Some(held) => bytes = bytes.saturating_sub(held.bytes.len()),
+                Some(held) => {
+                    bytes = bytes.saturating_sub(held.bytes.len());
+                    accounted = accounted.saturating_sub(accounted_file_bytes(key, held.bytes.len()));
+                }
                 None => added_keys = added_keys.saturating_add(1),
             }
             bytes = bytes.saturating_add(*size);
+            accounted = accounted.saturating_add(accounted_file_bytes(key, *size));
         }
         if self.files.len().saturating_add(added_keys) > MAX_SESSION_FILES {
             return Err(WorkspaceFull::Files(MAX_SESSION_FILES));
@@ -1593,20 +1673,25 @@ impl CodeInterpreterSessionRecord {
         if bytes > MAX_SESSION_FILE_BYTES {
             return Err(WorkspaceFull::Bytes(MAX_SESSION_FILE_BYTES));
         }
+        if bytes_elsewhere.saturating_add(accounted) > MAX_STORED_SESSION_BYTES {
+            return Err(WorkspaceFull::StoreBytes(MAX_STORED_SESSION_BYTES));
+        }
         Ok(())
     }
 
     /// Write `bytes` to the workspace key `path` at `now`, replacing whatever that key
     /// held, or refuse the write because the workspace has no room for it.
     ///
-    /// Both ceilings are checked against what the workspace would hold AFTER this
-    /// write, with the replaced file's own bytes discounted, so rewriting a file never
-    /// fails on the size the previous version took.
+    /// Every ceiling is checked against what would be held AFTER this write, with the
+    /// replaced file's own bytes discounted, so rewriting a file never fails on the size
+    /// the previous version took. `bytes_elsewhere` is read the same way as in
+    /// [`Self::room_for`].
     pub fn write_file(
         &mut self,
         path: &str,
         bytes: Vec<u8>,
         now: SystemTime,
+        bytes_elsewhere: usize,
     ) -> Result<(), WorkspaceFull> {
         let replaced = self.files.get(path).map_or(0, |file| file.bytes.len());
         if !self.files.contains_key(path) && self.files.len() >= MAX_SESSION_FILES {
@@ -1618,6 +1703,17 @@ impl CodeInterpreterSessionRecord {
             .saturating_add(bytes.len());
         if after > MAX_SESSION_FILE_BYTES {
             return Err(WorkspaceFull::Bytes(MAX_SESSION_FILE_BYTES));
+        }
+        let accounted_after = self
+            .accounted_bytes()
+            .saturating_sub(if self.files.contains_key(path) {
+                accounted_file_bytes(path, replaced)
+            } else {
+                0
+            })
+            .saturating_add(accounted_file_bytes(path, bytes.len()));
+        if bytes_elsewhere.saturating_add(accounted_after) > MAX_STORED_SESSION_BYTES {
+            return Err(WorkspaceFull::StoreBytes(MAX_STORED_SESSION_BYTES));
         }
         self.files.insert(
             path.to_string(),
@@ -1662,17 +1758,23 @@ impl CodeInterpreterSessionRecord {
     /// Called only for a script that ran to completion: one that ended on an exception
     /// defined nothing a later run can rely on. The oldest script gives way once
     /// either ceiling is passed, so the context a caller just built is the part that
-    /// survives.
-    pub fn keep_context_script(&mut self, script: String) {
-        if script.len() > MAX_CONTEXT_BYTES {
-            // One script larger than the whole context cannot be kept at all; the run
-            // itself already happened.
+    /// survives. `bytes_elsewhere` is what every OTHER session holds, so the context
+    /// this session keeps holds the whole-store ceiling too: a script the store has no
+    /// room for is not kept at all, exactly as one larger than the whole context is not.
+    pub fn keep_context_script(&mut self, script: String, bytes_elsewhere: usize) {
+        // The context this session may hold: its own ceiling, and no more than the room
+        // the rest of the store leaves under the whole-store one.
+        let own_room = MAX_STORED_SESSION_BYTES
+            .saturating_sub(bytes_elsewhere)
+            .saturating_sub(self.accounted_file_total())
+            .min(MAX_CONTEXT_BYTES);
+        if script.len() > own_room {
+            // A script the context has no room for cannot be kept at all; the run itself
+            // already happened.
             return;
         }
         self.context_scripts.push(script);
-        while self.context_scripts.len() > MAX_CONTEXT_SCRIPTS
-            || self.context_bytes() > MAX_CONTEXT_BYTES
-        {
+        while self.context_scripts.len() > MAX_CONTEXT_SCRIPTS || self.context_bytes() > own_room {
             if self.context_scripts.is_empty() {
                 break;
             }
@@ -1684,6 +1786,30 @@ impl CodeInterpreterSessionRecord {
     pub fn context_bytes(&self) -> usize {
         self.context_scripts.iter().map(String::len).sum()
     }
+
+    /// What this session is charged in the whole-store accounting
+    /// ([`MAX_STORED_SESSION_BYTES`]): every workspace file's content, its key and the
+    /// fixed per-entry overhead, plus every script of its execution context.
+    pub fn accounted_bytes(&self) -> usize {
+        self.accounted_file_total()
+            .saturating_add(self.context_bytes())
+    }
+
+    /// The workspace half of [`Self::accounted_bytes`].
+    fn accounted_file_total(&self) -> usize {
+        self.files
+            .iter()
+            .map(|(key, file)| accounted_file_bytes(key, file.bytes.len()))
+            .fold(0usize, usize::saturating_add)
+    }
+}
+
+/// What one workspace file of `size` bytes stored under `key` is charged in the
+/// whole-store accounting: its content, its key, and
+/// [`SESSION_FILE_ENTRY_OVERHEAD_BYTES`].
+fn accounted_file_bytes(key: &str, size: usize) -> usize {
+    size.saturating_add(key.len())
+        .saturating_add(SESSION_FILE_ENTRY_OVERHEAD_BYTES)
 }
 
 /// A resource this service's `ResourceNotFoundException` can name, with the label AWS
@@ -1697,6 +1823,8 @@ impl CodeInterpreterSessionRecord {
 pub enum NotFoundResource {
     /// An AgentCore Memory container, addressed by `memoryId`.
     Memory,
+    /// A code interpreter sandbox, addressed by `codeInterpreterIdentifier`.
+    CodeInterpreter,
     /// A session: one of an actor's sessions in a memory container, or one of a code
     /// interpreter's sessions, both addressed by `sessionId`.
     Session,
@@ -1712,6 +1840,7 @@ impl NotFoundResource {
     pub fn label(self) -> &'static str {
         match self {
             Self::Memory => "Memory",
+            Self::CodeInterpreter => "Code Interpreter",
             Self::Session => "Session",
             Self::Event => "Event",
             Self::Evaluator => "Evaluator",
@@ -1734,11 +1863,13 @@ pub fn resource_not_found_message(resource: NotFoundResource, identifier: &str) 
 /// `MemoryId`'s pattern admits either the bare id or the
 /// `arn:<partition>:bedrock-agentcore:<region>:<account>:memory/<id>` form, so both
 /// spellings address one container; the bare id is the canonical key.
+///
+/// The rule itself is the SHARED one
+/// ([`::service_common::agentcore_resources::memory_id`]) and this delegates to it: the
+/// control plane registers a container under that key and this plane resolves one by it,
+/// so the two cannot read a `memoryId` two different ways.
 pub fn normalize_memory_id(memory_id: &str) -> String {
-    match memory_id.split_once(":memory/") {
-        Some((prefix, id)) if prefix.starts_with("arn:") => id.to_string(),
-        _ => memory_id.to_string(),
-    }
+    ::service_common::agentcore_resources::memory_id(memory_id).to_string()
 }
 
 /// Mint an `eventId`.
@@ -1937,4 +2068,62 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState>)
+}
+
+/// The SHARED AgentCore resource inventory in the shared engine: call it with a handler's
+/// `&*self.engine`.
+///
+/// A Memory container and a code interpreter are created by the CONTROL plane, a different
+/// service, and this plane's own API creates neither: a write it serves names its parent in
+/// the request path and nothing else. So the only way it can tell a parent this account
+/// holds from one that was never created is the record that plane wrote, in ONE inventory
+/// under one shared type
+/// ([`::service_common::agentcore_resources::AgentCoreResourceInventory`]). The engine keys
+/// state by TYPE, so a copy of its own inside
+/// [`ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState`] would be invisible to the
+/// plane that writes it.
+///
+/// LOCK ORDER: a handler takes this inventory FIRST, reads the one answer it needs and
+/// releases it before taking [`service_state`] — the order every reader of the inventory
+/// keeps, so two services cannot invert it.
+///
+/// Answer `None` with a modelled server error, never with a fresh engine.
+pub fn resource_inventory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<
+    ::engine::ServiceState<::service_common::agentcore_resources::AgentCoreResourceInventory>,
+> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::agentcore_resources::AgentCoreResourceInventory,
+            >,
+        )
+}
+
+/// Whether the account holds the memory container `memory_id` names, in either spelling
+/// `MemoryId` admits — the ONE pre-condition every call that WRITES inside a container
+/// checks before it writes, so no two of them disagree about whether a container exists.
+///
+/// `None` when the shared engine does not carry the inventory at all, which a handler
+/// answers with a modelled server error rather than by writing.
+pub fn holds_memory<Eng: Send + Sync + 'static>(engine: &Eng, memory_id: &str) -> Option<bool> {
+    let inventory = resource_inventory(engine)?;
+    let held = inventory.lock().holds_memory(memory_id);
+    Some(held)
+}
+
+/// Whether the account can reach the code interpreter `code_interpreter_identifier` names:
+/// one the control plane created and has not deleted, or the tool the service provides to
+/// every account. The companion of [`holds_memory`] for the tools plane, read the same way.
+pub fn holds_code_interpreter<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    code_interpreter_identifier: &str,
+) -> Option<bool> {
+    let inventory = resource_inventory(engine)?;
+    let held = inventory
+        .lock()
+        .holds_code_interpreter(code_interpreter_identifier);
+    Some(held)
 }

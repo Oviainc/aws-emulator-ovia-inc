@@ -264,6 +264,11 @@ pub mod ad_directories;
 /// of a reinforcement-fine-tuning category, and the AgenticRFT job runtime data plane
 /// reads to resolve the job ARN its callers carry.
 pub mod agentic_rft_jobs;
+/// The inventory of which AgentCore Memory containers and code interpreters the account
+/// holds, written by the Bedrock AgentCore CONTROL plane — which creates and deletes them —
+/// and read by the AgentCore DATA plane, which creates neither and so cannot tell a
+/// resource of this account from one that was never created.
+pub mod agentcore_resources;
 pub mod arn;
 /// Serving an operation AUDITED: the ONE wrapper that records every call a service serves
 /// as a management event, so no operation has to record its own and none is forgotten.

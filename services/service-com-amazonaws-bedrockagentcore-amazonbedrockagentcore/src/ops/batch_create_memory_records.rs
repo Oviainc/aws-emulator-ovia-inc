@@ -178,6 +178,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let memory_id = crate::state::normalize_memory_id(&input.memory_id);
         let now = ::std::time::SystemTime::now();
+
+        // The same pre-condition `CreateEvent` keeps, for the same reason: a Memory
+        // container is created through the CONTROL plane, so records cannot be written
+        // into one that does not exist. The inventory is read and released before this
+        // service's own store is taken.
+        let held = crate::state::holds_memory(&*self.engine, &input.memory_id).ok_or_else(|| {
+            BatchCreateMemoryRecordsErrorModeled::ServiceException(ServiceException {
+                message: "the shared engine does not carry the AgentCore resource inventory"
+                    .to_string(),
+            })
+        })?;
+        if !held {
+            return Err(
+                BatchCreateMemoryRecordsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message(
+                            crate::state::NotFoundResource::Memory,
+                            &input.memory_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let mut store = state.lock();
         // A record expiry is a time-to-live, so records the clock has already run out on
         // leave before this batch reads or writes anything.

@@ -25,7 +25,7 @@ use std::time::Duration;
 use aws_smithy_types::date_time::{DateTime, Format};
 use service_com_amazonaws_bedrockagentcore_amazonbedrockagentcore as agentcore;
 
-use super::harness::label;
+use super::harness::{create_code_interpreter, label};
 
 /// The system code interpreter AWS ships; `codeInterpreterIdentifier` is modelled as a
 /// plain string, so any identifier a caller names addresses its own session set.
@@ -36,8 +36,14 @@ const CUSTOM_INTERPRETER: &str = "demo_interpreter-1a2b3c4d5e";
 
 /// The emulator, with request authentication off so a test signs nothing, plus the
 /// shared engine so a case can age a stored session's clock without sleeping.
+///
+/// The customer-created interpreter this suite starts sessions on is created first,
+/// through the shared inventory the CONTROL plane's `CreateCodeInterpreter` writes: a
+/// session cannot be started on an interpreter that was never created. The interpreter
+/// the service provides needs no such call — nothing creates it and nothing deletes it.
 fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    create_code_interpreter(&engine, CUSTOM_INTERPRETER);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(agentcore::EmulatedService::new(Arc::clone(&engine)));

@@ -15,6 +15,9 @@
 // are where concurrently landing suites add their line, so a declaration placed there
 // collides with every one of them. The head of the list is the one region nothing
 // else appends to.
+// Declared in this same head region, for the reason the note above records.
+#[path = "all/bedrock_agentcore_data_plane_parent_resources.rs"]
+mod bedrock_agentcore_data_plane_parent_resources;
 #[path = "all/cloudformation_fifo_resource_generated_names.rs"]
 mod cloudformation_fifo_resource_generated_names;
 // Declared here, in this same head region, for the reason the entry above records: what a

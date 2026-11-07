@@ -191,6 +191,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let memory_id = crate::state::normalize_memory_id(&input.memory_id);
+
+        // The same pre-condition `CreateEvent` keeps, for the same reason: a Memory
+        // container is created through the CONTROL plane, so content cannot be ingested
+        // into one that does not exist. The inventory is read and released before this
+        // service's own store is taken.
+        let held = crate::state::holds_memory(&*self.engine, &input.memory_id).ok_or_else(|| {
+            IngestDataErrorModeled::ServiceException(ServiceException {
+                message: "the shared engine does not carry the AgentCore resource inventory"
+                    .to_string(),
+            })
+        })?;
+        if !held {
+            return Err(IngestDataErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        crate::state::NotFoundResource::Memory,
+                        &input.memory_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
         let mut store = state.lock();
 
         // `IngestData` is `@idempotent`, and the model documents that a `clientToken`

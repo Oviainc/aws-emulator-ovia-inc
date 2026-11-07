@@ -295,7 +295,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .memory_names
             .insert(record.name.clone(), memory_id.clone());
         store.remember_memory_client_token(Self::NAME, input.client_token, &memory_id);
-        store.memories.insert(memory_id, record);
+        store.memories.insert(memory_id.clone(), record);
+        // The container now exists, so the AgentCore DATA plane — which writes the
+        // events and records INSIDE it and creates no container of its own — can
+        // resolve the id this call minted. Taken AFTER this service's own store, the
+        // one lock order every reader of the inventory keeps.
+        drop(store);
+        if let Some(inventory) = crate::state::resource_inventory(&*self.engine) {
+            inventory.lock().register_memory(&memory_id);
+        }
 
         Ok(output)
     }

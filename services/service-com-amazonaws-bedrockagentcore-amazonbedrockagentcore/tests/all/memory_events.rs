@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
-use super::harness::label;
+use super::harness::{create_memory, label};
 
 /// A memory id matching `MemoryId`'s pattern
 /// `^(arn:...:memory/)?[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}$`.
@@ -20,14 +20,28 @@ const MEMORY: &str = "demo-memory-0123456789";
 const MEMORY_ARN: &str = "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/demo-memory-0123456789";
 
 /// The emulator, with request authentication off so a test signs nothing.
+///
+/// The memory container this suite writes into is created first, through the shared
+/// inventory the CONTROL plane's `CreateMemory` writes: a write into a container that was
+/// never created is refused, so every suite has to create the container it uses.
 fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// The same emulator and the shared engine beside it, for the one case that creates
+/// memory containers of its own: a container is created by registering it in that
+/// inventory, which is reached through the engine.
+fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    create_memory(&engine, MEMORY);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
-        service_com_amazonaws_bedrockagentcore_amazonbedrockagentcore::EmulatedService::new(engine),
+        service_com_amazonaws_bedrockagentcore_amazonbedrockagentcore::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
     );
-    router
+    (router, engine)
 }
 
 /// Send one request and return its status and parsed JSON body (`Value::Null` for an
@@ -1249,13 +1263,14 @@ async fn the_store_evicts_its_least_recently_written_records() {
     use service_com_amazonaws_bedrockagentcore_amazonbedrockagentcore::state::{
         MAX_EVENTS_PER_SESSION, MAX_MEMORIES,
     };
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
 
     // One event in each of MAX_MEMORIES + 1 distinct memory containers, oldest first.
     // Each id matches `MemoryId`'s pattern `[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}`.
     let mut written: Vec<(String, String)> = Vec::new();
     for index in 0..=MAX_MEMORIES {
         let memory = format!("mem-{index:03}-0123456789");
+        create_memory(&engine, &memory);
         let (status, created) = create_event(
             &router,
             &memory,
@@ -1293,6 +1308,7 @@ async fn the_store_evicts_its_least_recently_written_records() {
 
     // And inside one session: the oldest event leaves once the session passes its bound.
     let memory = "ring-memory-0123456789";
+    create_memory(&engine, memory);
     let mut ids: Vec<String> = Vec::new();
     for index in 0..MAX_EVENTS_PER_SESSION + 3 {
         let (status, created) = create_event(

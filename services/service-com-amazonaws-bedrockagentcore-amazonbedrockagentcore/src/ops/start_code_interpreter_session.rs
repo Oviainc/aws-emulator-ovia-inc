@@ -207,6 +207,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // A code interpreter is created through the CONTROL plane (apart from the one the
+        // service provides to every account), so this call resolves the interpreter BEFORE
+        // it allocates any session state: a session cannot run code in a sandbox that does
+        // not exist, and minting a `sessionId` against one would hand the caller an id
+        // every later call then behaves inconsistently on. The message names the resource
+        // that did not resolve and the identifier exactly as the request spelled it.
+        //
+        // The inventory is read and released before this service's own store is taken,
+        // which is the lock order every reader of it keeps.
+        let held = crate::state::holds_code_interpreter(
+            &*self.engine,
+            &input.code_interpreter_identifier,
+        )
+        .ok_or_else(|| {
+            StartCodeInterpreterSessionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the shared engine does not carry the AgentCore resource inventory"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        if !held {
+            return Err(
+                StartCodeInterpreterSessionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message(
+                            crate::state::NotFoundResource::CodeInterpreter,
+                            &input.code_interpreter_identifier,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let mut store = state.lock();
 
         // `clientToken` is an `@idempotencyToken` on an `@idempotent` operation, and
@@ -248,8 +285,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             session_id: session.session_id.clone(),
             created_at: ::aws_smithy_types::DateTime::from(session.created_at),
         };
-        // Registers the code interpreter and holds every bound the store declares, so
-        // no caller can grow it without limit.
+        // Indexes the session under the code interpreter this call resolved above, and
+        // holds every bound the store declares, so no caller can grow it without limit.
         store.insert_code_interpreter_session(session, input.client_token);
 
         Ok(output)

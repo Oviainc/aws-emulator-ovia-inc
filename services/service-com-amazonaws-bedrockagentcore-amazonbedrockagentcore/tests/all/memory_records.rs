@@ -46,8 +46,13 @@ const SECONDS_PER_DAY: f64 = 86_400.0;
 const CALLER_MANAGED_STRATEGY: &str = "CUSTOM";
 
 /// The emulator, with request authentication off so a test signs nothing.
+///
+/// The memory container this suite writes records into is created first, through the
+/// shared inventory the CONTROL plane's `CreateMemory` writes: a write into a container
+/// that was never created is refused.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    super::harness::create_memory(&engine, MEMORY);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(agentcore::EmulatedService::new(engine));

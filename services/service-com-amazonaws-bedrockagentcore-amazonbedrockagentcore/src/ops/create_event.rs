@@ -196,6 +196,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let memory_id = crate::state::normalize_memory_id(&input.memory_id);
+
+        // A Memory container is created through the CONTROL plane, so this write resolves
+        // the container BEFORE it persists anything: an event cannot be stored in a
+        // container that does not exist, and answering 201 for one would tell the caller
+        // its data is durable somewhere nothing holds. The message names the resource that
+        // did not resolve and the identifier exactly as the request spelled it.
+        //
+        // The inventory is read and released before this service's own store is taken,
+        // which is the lock order every reader of it keeps.
+        let held = crate::state::holds_memory(&*self.engine, &input.memory_id).ok_or_else(|| {
+            CreateEventErrorModeled::ServiceException(ServiceException {
+                message: "the shared engine does not carry the AgentCore resource inventory"
+                    .to_string(),
+            })
+        })?;
+        if !held {
+            return Err(CreateEventErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        crate::state::NotFoundResource::Memory,
+                        &input.memory_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
         let mut store = state.lock();
 
         // `CreateEvent` is `@idempotent`, and the model documents that a `clientToken`

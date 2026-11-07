@@ -1150,6 +1150,112 @@ async fn a_write_the_workspace_has_no_room_for_stores_nothing() {
     );
 }
 
+/// The tools plane is bounded ACROSS the whole store, not only per session: once every
+/// session together holds `MAX_STORED_SESSION_BYTES`, a further workspace write is
+/// refused and stores nothing, and it is accepted again as soon as the store has room.
+///
+/// The per-session ceilings alone would admit their product — one full workspace per
+/// session, on every code interpreter — so the rule under test is the whole-store one.
+/// The other sessions are seeded directly into the store (the CONTROL plane does not
+/// create them, and driving 64 MiB through the wire would only slow the case down);
+/// everything the rule is asserted on goes through real HTTP.
+#[tokio::test]
+async fn the_whole_store_bounds_every_session_workspace_together() {
+    use agentcore::state::{
+        CodeInterpreterSessionRecord, SessionFile, MAX_SESSION_FILE_BYTES,
+        MAX_STORED_SESSION_BYTES,
+    };
+
+    let (router, engine) = emulator();
+    let session = start_session(&router, json!({})).await;
+
+    /// Seed one session holding a full workspace on its own code interpreter, and answer
+    /// that interpreter's identifier so the case can drop it again.
+    fn seed_full_session(engine: &engine::InMemoryEngine, index: usize) -> String {
+        let identifier = format!("filler_interpreter-{index:010}");
+        let state = agentcore::state::service_state(engine).expect("the service state");
+        let mut store = state.lock();
+        let seq = store.next_seq();
+        let mut seeded = CodeInterpreterSessionRecord::started(
+            seq,
+            identifier.clone(),
+            None,
+            900,
+            None,
+            None,
+            std::time::SystemTime::now(),
+        );
+        seeded.files.insert(
+            "filler.bin".to_string(),
+            SessionFile {
+                bytes: vec![0u8; MAX_SESSION_FILE_BYTES],
+                written_at: std::time::SystemTime::now(),
+            },
+        );
+        store.insert_code_interpreter_session(seeded, None);
+        identifier
+    }
+
+    // Fill the store to its ceiling with full workspaces of other sessions.
+    let fillers: Vec<String> = (0..MAX_STORED_SESSION_BYTES / MAX_SESSION_FILE_BYTES)
+        .map(|index| seed_full_session(&engine, index))
+        .collect();
+
+    // A one-byte write into the live session now has nowhere to go, and the refusal says
+    // it is the store that is full rather than this session's own workspace.
+    let refused = invoke(
+        &router,
+        Some(&session),
+        "writeFiles",
+        json!({"content": [{"path": "small.txt", "text": "x"}]}),
+    )
+    .await;
+    let refused = result_event("the-store-is-full", &refused);
+    assert!(
+        is_error(&refused),
+        "case the-store-is-full: a write past the whole-store ceiling is an error, got {refused}"
+    );
+    assert!(
+        text_of(&refused).contains(&MAX_STORED_SESSION_BYTES.to_string()),
+        "case the-store-is-full: the refusal must name the whole-store ceiling, got {:?}",
+        text_of(&refused)
+    );
+    assert_eq!(
+        workspace_files(&engine, &session),
+        0,
+        "case the-store-is-full: a refused write must store nothing, got {} file(s)",
+        workspace_files(&engine, &session)
+    );
+
+    // Drop one of the full sessions: the store has room again, and the very same write is
+    // accepted — so the ceiling is weighed against what is HELD, not a blanket refusal.
+    {
+        let state = agentcore::state::service_state(&*engine).expect("the service state");
+        let mut store = state.lock();
+        store
+            .code_interpreters
+            .remove(fillers.first().expect("one filler interpreter"));
+    }
+    let accepted = invoke(
+        &router,
+        Some(&session),
+        "writeFiles",
+        json!({"content": [{"path": "small.txt", "text": "x"}]}),
+    )
+    .await;
+    let accepted = result_event("the-store-has-room-again", &accepted);
+    assert!(
+        !is_error(&accepted),
+        "case the-store-has-room-again: expected the write to be accepted, got {accepted}"
+    );
+    assert_eq!(
+        workspace_files(&engine, &session),
+        1,
+        "case the-store-has-room-again: expected the file stored, got {} file(s)",
+        workspace_files(&engine, &session)
+    );
+}
+
 /// `executeCode` runs the script when the runtime named is one the embedded engine
 /// serves, and reports that nothing ran for any other.
 #[tokio::test]

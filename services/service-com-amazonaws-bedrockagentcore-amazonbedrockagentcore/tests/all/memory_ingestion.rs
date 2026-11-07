@@ -22,7 +22,7 @@ use std::sync::Arc;
 use service_com_amazonaws_bedrockagentcore_amazonbedrockagentcore as agentcore;
 use agentcore::ops::types::{Content, IngestPayloadType, MetadataValue};
 
-use super::harness::label;
+use super::harness::{create_memory, label};
 
 /// A memory id matching `MemoryId`'s pattern
 /// `^(arn:...:memory/)?[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}$`.
@@ -33,8 +33,13 @@ const MEMORY_ARN: &str =
 
 /// The emulator, with request authentication off so a test signs nothing, plus the
 /// shared engine so a case can read back what a request persisted.
+///
+/// The memory container this suite ingests into is created first, through the shared
+/// inventory the CONTROL plane's `CreateMemory` writes: ingesting into a container that
+/// was never created is refused.
 fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    create_memory(&engine, MEMORY);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(agentcore::EmulatedService::new(Arc::clone(&engine)));

@@ -275,6 +275,29 @@ impl<Eng: Send + Sync + 'static> InvokeCodeInterpreter<Eng> {
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| internal("the shared engine does not carry this service's state"))?;
 
+        // A code interpreter is created through the CONTROL plane (apart from the one the
+        // service provides to every account), so this call resolves the interpreter before
+        // it reaches any session of it: a tool cannot run in a sandbox that does not
+        // exist, and a call that names no session would otherwise START one on it. The
+        // inventory is read and released before this service's own store is taken.
+        let held = crate::state::holds_code_interpreter(
+            &*self.engine,
+            &input.code_interpreter_identifier,
+        )
+        .ok_or_else(|| internal("the shared engine does not carry the AgentCore resource inventory"))?;
+        if !held {
+            return Err(
+                InvokeCodeInterpreterErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message(
+                            crate::state::NotFoundResource::CodeInterpreter,
+                            &input.code_interpreter_identifier,
+                        )),
+                    },
+                ),
+            );
+        }
+
         let now = SystemTime::now();
         // The session this tool runs in, resolved (or started) under the guard and
         // then addressed by id, so nothing below holds the guard while a script runs.
@@ -342,11 +365,12 @@ impl<Eng: Send + Sync + 'static> InvokeCodeInterpreter<Eng> {
                 )
                 .await
             }
-            "writeFiles" => self.with_session_mut(
+            "writeFiles" => self.write_files_in_session(
                 &state,
                 &input.code_interpreter_identifier,
                 &session_id,
-                |session| write_files(session, &arguments, SystemTime::now()),
+                &arguments,
+                SystemTime::now(),
             )?,
             "readFiles" => self.with_session(
                 &state,
@@ -434,6 +458,28 @@ impl<Eng: Send + Sync + 'static> InvokeCodeInterpreter<Eng> {
         Ok(tool(session))
     }
 
+    /// [`Self::with_session_mut`] for the ONE tool that GROWS the store: the bytes every
+    /// other session holds are read under the same guard and handed to the write, so a
+    /// workspace write holds the whole-store ceiling as well as this session's own.
+    fn write_files_in_session(
+        &self,
+        state: &::engine::ServiceState<
+            crate::state::ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState,
+        >,
+        code_interpreter_identifier: &str,
+        session_id: &str,
+        arguments: &ToolArguments,
+        now: SystemTime,
+    ) -> Result<Result<ToolOutcome, InvokeCodeInterpreterErrorModeled>, InvokeCodeInterpreterErrorModeled>
+    {
+        let mut store = state.lock();
+        let elsewhere = store.session_bytes_elsewhere(code_interpreter_identifier, session_id);
+        let session = store
+            .code_interpreter_session_mut(code_interpreter_identifier, session_id)
+            .ok_or_else(|| session_gone(code_interpreter_identifier, session_id))?;
+        Ok(write_files(session, arguments, now, elsewhere))
+    }
+
     /// `executeCode`: run the submitted script in the engine this emulator embeds for
     /// the language it names, on top of the session's execution context.
     async fn execute_code(
@@ -515,10 +561,12 @@ impl<Eng: Send + Sync + 'static> InvokeCodeInterpreter<Eng> {
             // session sees. One that ended on an exception defined nothing a later run
             // can rely on, so it is not kept.
             let mut store = state.lock();
+            let elsewhere =
+                store.session_bytes_elsewhere(code_interpreter_identifier, session_id);
             if let Some(session) =
                 store.code_interpreter_session_mut(code_interpreter_identifier, session_id)
             {
-                session.keep_context_script(script);
+                session.keep_context_script(script, elsewhere);
             }
         }
 
@@ -659,6 +707,7 @@ fn write_files(
     session: &mut crate::state::CodeInterpreterSessionRecord,
     arguments: &ToolArguments,
     now: SystemTime,
+    bytes_elsewhere: usize,
 ) -> Result<ToolOutcome, InvokeCodeInterpreterErrorModeled> {
     let blocks = arguments.content.as_deref().unwrap_or_default();
     if blocks.is_empty() {
@@ -697,7 +746,7 @@ fn write_files(
         .iter()
         .map(|(key, bytes)| (key.clone(), bytes.len()))
         .collect();
-    if let Err(full) = session.room_for(&sizes) {
+    if let Err(full) = session.room_for(&sizes, bytes_elsewhere) {
         return Ok(ToolOutcome::Failed(match full {
             crate::state::WorkspaceFull::Files(limit) => format!(
                 "The session workspace holds at most {limit} files, so none of the {} files this \
@@ -709,6 +758,12 @@ fn write_files(
                  call names was written.",
                 pending.len()
             ),
+            crate::state::WorkspaceFull::StoreBytes(limit) => format!(
+                "The code interpreter sessions of this emulator together hold at most {limit} \
+                 bytes, so none of the {} files this call names was written. Stop a session you \
+                 no longer need, or remove files from it.",
+                pending.len()
+            ),
         }));
     }
 
@@ -718,13 +773,17 @@ fn write_files(
         // The batch already has room, so this cannot report the workspace full; the
         // store checks each write anyway, and its answer is reported rather than
         // dropped.
-        if let Err(full) = session.write_file(&key, bytes, now) {
+        if let Err(full) = session.write_file(&key, bytes, now, bytes_elsewhere) {
             return Ok(ToolOutcome::Failed(match full {
                 crate::state::WorkspaceFull::Files(limit) => format!(
                     "The session workspace holds at most {limit} files, so {key} was not written."
                 ),
                 crate::state::WorkspaceFull::Bytes(limit) => format!(
                     "The session workspace holds at most {limit} bytes, so {key} was not written."
+                ),
+                crate::state::WorkspaceFull::StoreBytes(limit) => format!(
+                    "The code interpreter sessions of this emulator together hold at most {limit} \
+                     bytes, so {key} was not written."
                 ),
             }));
         }

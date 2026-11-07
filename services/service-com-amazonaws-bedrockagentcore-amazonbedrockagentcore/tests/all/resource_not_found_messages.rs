@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use service_com_amazonaws_bedrockagentcore_amazonbedrockagentcore as agentcore;
 
-use super::harness::label;
+use super::harness::{create_memory, label};
 
 /// The error code every refusal under test carries.
 const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
@@ -75,8 +75,13 @@ const TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
 const SPAN: &str = "00f067aa0ba902b7";
 
 /// The emulator, with request authentication off so a test signs nothing.
+///
+/// The one memory container whose path DOES resolve is created first, through the shared
+/// inventory the CONTROL plane's `CreateMemory` writes; the ghost ids below are created
+/// nowhere, which is what makes them ghosts.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    create_memory(&engine, MEMORY);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(agentcore::EmulatedService::new(engine));

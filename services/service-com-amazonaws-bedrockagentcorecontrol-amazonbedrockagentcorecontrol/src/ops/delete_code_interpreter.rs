@@ -199,6 +199,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.updated_at = now;
         }
 
-        Ok(record.delete_output(now))
+        let output = record.delete_output(now);
+        // An interpreter being torn down runs no more code, so the AgentCore DATA
+        // plane stops resolving it from this instant: a session started on it after
+        // this call would belong to a sandbox nothing holds. Taken AFTER this
+        // service's own store, the one lock order every reader of the inventory keeps.
+        drop(store);
+        if let Some(inventory) = crate::state::resource_inventory(&*self.engine) {
+            inventory
+                .lock()
+                .forget_code_interpreter(&input.code_interpreter_id);
+        }
+
+        Ok(output)
     }
 }

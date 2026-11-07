@@ -378,6 +378,28 @@ fn exactly_one_service_sharing_the_agentcore_signing_name_claims_each_request() 
 async fn every_agentcore_signed_request_is_dispatched_instead_of_refused_as_ambiguous() {
     let router = router_with_both_services();
 
+    // The data plane writes only INSIDE a Memory container the CONTROL plane created, so
+    // the container the two data-plane rows below address is created first — through the
+    // control plane's own route, over the engine both services share. Its `memoryId` is
+    // the one that plane MINTED: an id a request invents belongs to no container.
+    let (status, code, memory) = call(
+        &router,
+        "POST",
+        "/memories/create",
+        json!({"name": "shared_signing_name", "eventExpiryDuration": 30}),
+    )
+    .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (202, ""),
+        "the fixture memory container must be created, got HTTP {status} {code:?} with \
+         {memory:?}"
+    );
+    let memory_id = memory["memory"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateMemory reported no memory id: {memory:?}"))
+        .to_string();
+
     // (case, method, uri, body, expected status, expected error code)
     //
     // Each row names the answer of the ONE service that owns the route, which is what
@@ -385,11 +407,11 @@ async fn every_agentcore_signed_request_is_dispatched_instead_of_refused_as_ambi
     // `UnknownService` (404, none). An operation that is still scaffolded answers the
     // scaffold's `501 NotImplemented` — also an answer from the service that owns the
     // route, where the router's refusals are not.
-    let rows: [(&str, &str, &str, Value, u16, &str); 8] = [
+    let rows: [(&str, &str, String, Value, u16, &str); 8] = [
         (
             "CreateGateway, the operation this issue was filed on",
             "POST",
-            "/gateways/",
+            "/gateways/".to_string(),
             json!({
                 "name": "lambda-mcp-gateway",
                 "roleArn": "arn:aws:iam::123456789012:role/GatewayRole",
@@ -402,7 +424,7 @@ async fn every_agentcore_signed_request_is_dispatched_instead_of_refused_as_ambi
         (
             "ListGateways, implemented",
             "GET",
-            "/gateways/",
+            "/gateways/".to_string(),
             Value::Null,
             200,
             "",
@@ -410,7 +432,7 @@ async fn every_agentcore_signed_request_is_dispatched_instead_of_refused_as_ambi
         (
             "GetGatewayTarget on a gateway that does not exist",
             "GET",
-            "/gateways/my-gateway-abcdefghij/targets/abcdefghij/",
+            "/gateways/my-gateway-abcdefghij/targets/abcdefghij/".to_string(),
             Value::Null,
             404,
             "ResourceNotFoundException",
@@ -418,7 +440,7 @@ async fn every_agentcore_signed_request_is_dispatched_instead_of_refused_as_ambi
         (
             "CreateAgentRuntime on the control plane, implemented",
             "PUT",
-            "/runtimes/",
+            "/runtimes/".to_string(),
             json!({
                 "agentRuntimeName": "shared_signing_name",
                 "agentRuntimeArtifact": {
@@ -435,7 +457,7 @@ async fn every_agentcore_signed_request_is_dispatched_instead_of_refused_as_ambi
         (
             "ListAgentRuntimes on the control plane, implemented",
             "POST",
-            "/runtimes/",
+            "/runtimes/".to_string(),
             Value::Null,
             200,
             "",
@@ -443,7 +465,7 @@ async fn every_agentcore_signed_request_is_dispatched_instead_of_refused_as_ambi
         (
             "CreateEvent on the data plane, implemented",
             "POST",
-            "/memories/demo-memory-0123456789/events",
+            format!("/memories/{memory_id}/events"),
             json!({
                 "actorId": "actor-1",
                 "sessionId": "session-1",
@@ -456,7 +478,7 @@ async fn every_agentcore_signed_request_is_dispatched_instead_of_refused_as_ambi
         (
             "ListSessions on the data plane, implemented",
             "POST",
-            "/memories/demo-memory-0123456789/actor/actor-1/sessions",
+            format!("/memories/{memory_id}/actor/actor-1/sessions"),
             json!({}),
             200,
             "",
@@ -464,7 +486,7 @@ async fn every_agentcore_signed_request_is_dispatched_instead_of_refused_as_ambi
         (
             "InvokeAgentRuntime on the data plane, still scaffolded",
             "POST",
-            "/runtimes/probe-0123456789/invocations",
+            "/runtimes/probe-0123456789/invocations".to_string(),
             json!({}),
             501,
             "NotImplemented",
@@ -472,7 +494,7 @@ async fn every_agentcore_signed_request_is_dispatched_instead_of_refused_as_ambi
     ];
 
     for (case, method, uri, body, expected_status, expected_code) in rows {
-        let (status, code, parsed) = call(&router, method, uri, body).await;
+        let (status, code, parsed) = call(&router, method, &uri, body).await;
         assert_eq!(
             (status, code.as_str()),
             (expected_status, expected_code),

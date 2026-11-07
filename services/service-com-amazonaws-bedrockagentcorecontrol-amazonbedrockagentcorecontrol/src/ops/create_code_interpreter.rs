@@ -282,7 +282,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.client_token,
             &code_interpreter_id,
         );
-        store.code_interpreters.insert(code_interpreter_id, record);
+        store
+            .code_interpreters
+            .insert(code_interpreter_id.clone(), record);
+        // The interpreter now exists, so the AgentCore DATA plane — which starts the
+        // sessions it runs code in and creates no interpreter of its own — can resolve
+        // the id this call minted. Taken AFTER this service's own store, the one lock
+        // order every reader of the inventory keeps.
+        drop(store);
+        if let Some(inventory) = crate::state::resource_inventory(&*self.engine) {
+            inventory
+                .lock()
+                .register_code_interpreter(&code_interpreter_id);
+        }
 
         Ok(output)
     }
