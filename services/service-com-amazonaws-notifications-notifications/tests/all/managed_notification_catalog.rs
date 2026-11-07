@@ -108,8 +108,8 @@ const PUBLISHED: &[(&str, &str, &str, &str)] = &[
     (
         "AWS-MP-Buyer",
         "MPBuyerAgreements",
-        "Agreements",
-        "Notifications about your agreements and subscriptions, including new agreements.",
+        "Agreements and subscriptions",
+        "Notifications about your agreements and subscriptions, including new agreements, amendments, cancellations, expirations, renewals, free trial reminders, payment requests, and billing adjustments.",
     ),
 ];
 

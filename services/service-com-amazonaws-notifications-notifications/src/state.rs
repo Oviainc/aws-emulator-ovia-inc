@@ -733,14 +733,12 @@ const MANAGED_NOTIFICATION_CATALOG: &[PublishedManagedNotification] = &[
     PublishedManagedNotification {
         category: "AWS-MP-Buyer",
         sub_category: "MPBuyerAgreements",
-        name: "Agreements",
-        // The published text of this one entry is known only as far as this
-        // sentence goes: the recording available here states it up to "new
-        // agreements" and no further. It stops at the last published word
-        // rather than continuing with prose nobody published, so the entry is
-        // part of the catalog a buyer account enumerates without carrying
-        // invented display text.
-        description: "Notifications about your agreements and subscriptions, including new agreements.",
+        name: "Agreements and subscriptions",
+        // The whole published sentence, as the service publishes it: the
+        // enumeration of the agreement and subscription events it covers runs
+        // to its end rather than stopping at its first item, so a caller that
+        // renders the catalog shows the complete prose.
+        description: "Notifications about your agreements and subscriptions, including new agreements, amendments, cancellations, expirations, renewals, free trial reminders, payment requests, and billing adjustments.",
     },
 ];
 

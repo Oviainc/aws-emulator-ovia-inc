@@ -27,6 +27,8 @@ mod event_rule_updates;
 mod event_rules;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/managed_catalog_published_text.rs"]
+mod managed_catalog_published_text;
 #[path = "all/managed_notification_catalog.rs"]
 mod managed_notification_catalog;
 #[path = "all/managed_notification_configurations.rs"]
