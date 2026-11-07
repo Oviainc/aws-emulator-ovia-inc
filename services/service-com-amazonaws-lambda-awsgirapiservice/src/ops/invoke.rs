@@ -965,13 +965,14 @@ fn unrunnable(why: crate::state::Unrunnable) -> InvokeError {
             })
             .into()
         }
-        // "The request throughput limit was exceeded": more handlers are already running
-        // than this emulator runs at once.
+        // "The request throughput limit was exceeded": the capacity that was full is the
+        // host's pool of run slots, which stands in for the account's concurrent executions,
+        // so the throttle names that limit the way the operation documents it.
         crate::state::Unrunnable::Overloaded(message) => {
             InvokeErrorModeled::TooManyRequestsException(TooManyRequestsException {
                 r#type: None,
                 message: Some(message),
-                reason: None,
+                reason: Some(crate::state::ACCOUNT_CONCURRENCY_REASON.to_string()),
                 retry_after_seconds: None,
             })
             .into()

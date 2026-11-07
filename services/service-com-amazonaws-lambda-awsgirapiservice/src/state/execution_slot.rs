@@ -62,6 +62,16 @@ pub const INITIALIZATION_TYPE_PROVISIONED_CONCURRENCY: &str = "provisioned-concu
 pub const RESERVED_FUNCTION_CONCURRENCY_REASON: &str =
     "ReservedFunctionConcurrentInvocationLimitExceeded";
 
+/// The `Reason` it names when the capacity that was full is the ACCOUNT's concurrent
+/// executions rather than one function's reservation, the other of the two the operation
+/// documents and one of the same `ThrottleReason` values.
+///
+/// This is the pool a function that reserves nothing draws on, which in this emulator is the
+/// engine memory the substrate runs handlers in
+/// (`super::execution::MAX_CONCURRENT_RUN_MEMORY_MB`): an invocation refused because none of
+/// it came free is refused on the account's capacity, so that is the reason it carries.
+pub const ACCOUNT_CONCURRENCY_REASON: &str = "ConcurrentInvocationLimitExceeded";
+
 /// The message Lambda words a throttled invocation with: the fixed sentence of the throttle,
 /// which names nothing about the request.
 pub const THROTTLED_INVOCATION_MESSAGE: &str = "Rate Exceeded.";
@@ -169,12 +179,14 @@ pub fn admit_invocation(
     };
     // "The number of simultaneous executions to reserve for the function": the invocation is
     // admitted only while the function is processing fewer than that, and a function that
-    // reserves nothing is bounded by the account's capacity instead — which no run of this
-    // emulator reaches (`super::CONCURRENT_EXECUTIONS_LIMIT`), so the account-level
-    // `ConcurrentInvocationLimitExceeded` reason is not one this admission produces. How many
-    // handlers EXECUTE at once is a separate, host-sized bound
-    // (`super::execution::max_concurrent_runs`): it makes an admitted caller wait for an
-    // execution environment rather than refusing it, so it is no limit of the API.
+    // reserves nothing is bounded by the account's capacity instead — which in this emulator
+    // is the engine memory the execution substrate runs handlers in
+    // (`super::execution::MAX_CONCURRENT_RUN_MEMORY_MB`), below the account ceiling
+    // (`super::CONCURRENT_EXECUTIONS_LIMIT`). An invocation this admission let in WAITS for
+    // its share of that memory rather than being refused for it, so that bound is no limit of
+    // the API; the throttle a substrate that frees none in the whole wait answers carries the
+    // account-level reason ([`ACCOUNT_CONCURRENCY_REASON`]) — which is therefore the
+    // substrate's to produce and not this admission's.
     if let Some(reserved) = record.reserved_concurrent_executions {
         if record.concurrent_executions >= reserved {
             return Err(Throttled {

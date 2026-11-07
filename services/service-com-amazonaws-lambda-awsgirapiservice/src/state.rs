@@ -2482,7 +2482,9 @@ pub mod alias_routing;
 /// the admission that hands it out and the throttle for one that cannot be admitted; see the
 /// module's own header.
 pub mod execution_slot;
-pub use execution_slot::{admit_invocation, Admitted, ExecutionSlot, Throttled};
+pub use execution_slot::{
+    admit_invocation, Admitted, ExecutionSlot, Throttled, ACCOUNT_CONCURRENCY_REASON,
+};
 
 /// The FUNCTION RECORD: one Lambda function as this emulator holds it, and everything a
 /// read of that function reports out of what is stored.

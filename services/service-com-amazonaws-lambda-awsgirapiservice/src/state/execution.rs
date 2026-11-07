@@ -29,21 +29,23 @@
 //! * the RUN's own budget, which the engine spends and the guest cannot reach
 //!   ([`Budget`]): the function's own `Timeout`, clamped to the range the model
 //!   allows for it, plus the step, memory, log and response bounds;
-//! * how long the CALLER waits, which is this module's ([`HOST_WAIT_CEILING`]) and is
-//!   never the guest's to set: a run still going when the caller's wait is spent is
-//!   ABANDONED — its slot goes back to the pool at once, it counts against
-//!   [`MAX_ABANDONED_RUNS`] for as long as its thread lasts, and past that cap an
+//! * how long the caller waits for THE RUN once it has that memory, which is this module's
+//!   ([`HOST_WAIT_CEILING`]) and is never the guest's to set: a run still going when that
+//!   wait is spent is ABANDONED — its share goes back to the envelope at once, it counts
+//!   against [`MAX_ABANDONED_RUNS`] for as long as its thread lasts, and past that cap an
 //!   invocation is refused with the modelled throttle rather than adding another thread.
 //!
-//! At most [`max_concurrent_runs`] handlers run at once, so the memory and CPU the
-//! engines can hold is bounded however many invocations arrive. That pool is a RESOURCE
-//! bound of this process and not a concurrency limit of the API: an invocation the
-//! function's reservation and the account's capacity admit is one Lambda SERVES, so a
-//! caller that finds every slot busy WAITS for one — for as long as [`PERMIT_WAIT`], which
-//! is the longest a run ahead of it can hold a slot — and only a pool still full after that
-//! is answered with the modelled throttle. Every run happens on a thread of its own with no
-//! state guard of this service held, so one caller's handler cannot stall another caller's
-//! request.
+//! The engines of the runs in flight hold at most [`MAX_CONCURRENT_RUN_MEMORY_MB`] of memory
+//! between them, so what the handlers of this process take of the host is bounded however
+//! many invocations arrive. That envelope is a RESOURCE bound of this process and not a
+//! concurrency limit of the API: an invocation the function's reservation and the account's
+//! capacity admit is one Lambda SERVES ([`super::execution_slot`]), so a caller that finds
+//! the memory held QUEUES for its own share of it — the `MemorySize` its configuration asks
+//! for ([`run_memory_claim_mb`]) — for as long as [`PERMIT_WAIT`], the longest a run ahead of
+//! it can hold a share, and only an envelope still full after that is answered with the
+//! modelled throttle. Every run happens on a thread of its own with no state guard of this
+//! service held, so one caller's handler cannot stall another caller's request, and the
+//! smallest share a run can hold is what bounds those threads to [`MAX_CONCURRENT_RUNS`].
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -118,53 +120,58 @@ mod host_posix;
 pub mod environment_key;
 pub use environment_key::{durable_data_key_fault, environment_key_fault, EnvironmentKeyFault};
 
-/// The FEWEST handlers this emulator runs at once, however few threads of execution the
-/// host offers.
+/// The engine memory the runs of this process may hold TOGETHER, stated in the MB a
+/// function's `MemorySize` is stated in.
 ///
-/// A pool smaller than this would serialise callers behind one another on a small host,
-/// and an invocation that arrives while others are in flight is one Lambda serves rather
-/// than queues behind the run ahead of it.
-pub const MIN_CONCURRENT_RUNS: usize = 4;
+/// This is the AGGREGATE bound on what the handlers of this process can take of the host: one
+/// run holds at most the memory its own configuration asks for, clamped to this module's
+/// per-run ceiling ([`run_heap_bytes`], at most [`MAX_RUN_MEMORY_BYTES`]), and the runs in
+/// flight hold at most this between them — so what the engines hold does not grow with the
+/// number of callers, however many invocations arrive. It bounds the resource a run really
+/// costs rather than a COUNT of runs that ignores it: four runs of the largest per-run heap
+/// is the same envelope as sixteen of the smallest `MemorySize` the model allows, and both
+/// are what this process can hold at once.
+pub const MAX_CONCURRENT_RUN_MEMORY_MB: u32 = 4 * PER_RUN_MEMORY_CEILING_MB;
 
-/// The MOST handlers this emulator runs at once, however many threads of execution the host
-/// offers.
-///
-/// Each run holds an engine, a [`RUN_STACK_BYTES`] stack and up to [`MAX_RUN_MEMORY_BYTES`]
-/// of heap, so the pool is capped: what this process can hold at once stays bounded on a
-/// machine with very many cores.
-pub const MAX_CONCURRENT_RUNS_CEILING: usize = 16;
+/// The per-run ceiling [`MAX_RUN_MEMORY_BYTES`] states, in those same MB.
+const PER_RUN_MEMORY_CEILING_MB: u32 = (MAX_RUN_MEMORY_BYTES / BYTES_PER_MB) as u32;
 
-/// How many handlers run at once: one per thread of execution the HOST offers, between
-/// [`MIN_CONCURRENT_RUNS`] and [`MAX_CONCURRENT_RUNS_CEILING`].
+/// How long an invocation waits for its share of that envelope before it is throttled.
 ///
-/// The pool is sized to the machine because it bounds this process's RESOURCES rather than
-/// the API's concurrency: the invocations a function's reservation and the account's
-/// capacity admit are the ones Lambda runs, so the emulator runs as many handlers at once
-/// as the host can really run at once, and a caller beyond that waits for a slot
-/// ([`PERMIT_WAIT`]) instead of being refused for load of this process's own making.
-#[must_use]
-pub fn max_concurrent_runs() -> usize {
-    ::std::thread::available_parallelism()
-        .map_or(MIN_CONCURRENT_RUNS, ::std::num::NonZeroUsize::get)
-        .clamp(MIN_CONCURRENT_RUNS, MAX_CONCURRENT_RUNS_CEILING)
-}
-
-/// How long an invocation waits for one of those slots before it is throttled.
-///
-/// The longest a run AHEAD of it can hold a slot: a caller's wait for a run is bounded by
+/// The longest a run AHEAD of it can hold a share: a caller's wait for a run is bounded by
 /// [`HOST_WAIT_CEILING`], and a run still going when that wait is spent is abandoned
-/// [`ABANDON_GRACE`] later and hands its slot straight back. So within this span a slot is
-/// certain to come free, and waiting it out is what keeps this emulator's own pool from
+/// [`ABANDON_GRACE`] later and hands its share straight back. So within this span memory is
+/// certain to come free, and waiting it out is what keeps this emulator's own envelope from
 /// answering the modelled throttle where neither the function's reservation nor the
 /// account's capacity was reached.
 pub const PERMIT_WAIT: Duration = HOST_WAIT_CEILING.saturating_add(ABANDON_GRACE);
 
-/// The longest a CALLER waits for a run, whatever the function's own timeout says.
+/// How many handlers run at once, at most, which FOLLOWS from that envelope: every function
+/// has at least the smallest `MemorySize` the model allows ([`MIN_MEMORY_SIZE_MB`]), so no
+/// more runs than this fit in the envelope however small the functions are — which is also
+/// what bounds the run threads and the stacks they hold ([`RUN_STACK_BYTES`]).
+pub const MAX_CONCURRENT_RUNS: u32 = MAX_CONCURRENT_RUN_MEMORY_MB / (MIN_MEMORY_SIZE_MB as u32);
+
+/// How much of that envelope one invocation of a function configured for `memory_size` MB
+/// holds while it runs: the memory its engine is really given ([`run_heap_bytes`]), in MB, and
+/// never more than the whole envelope.
+///
+/// So a function asking for the smallest memory the model allows leaves room for
+/// [`MAX_CONCURRENT_RUNS`] runs beside it, and one asking for the per-run ceiling leaves room
+/// for three: the concurrency the substrate serves is what the memory in flight allows.
+#[must_use]
+pub fn run_memory_claim_mb(memory_size: i32) -> u32 {
+    let bytes = u64::try_from(run_heap_bytes(memory_size)).unwrap_or(u64::MAX);
+    let megabytes = u32::try_from(bytes / BYTES_PER_MB).unwrap_or(u32::MAX);
+    megabytes.clamp(1, MAX_CONCURRENT_RUN_MEMORY_MB)
+}
+
+/// The longest a CALLER waits for a RUN of its own, whatever the function's own timeout says.
 ///
 /// This is the HOST's ceiling, not the function's: a `Timeout` of up to 900 seconds would
 /// otherwise hold a request open for a quarter of an hour. The run's own deadline is the
 /// function's clamped `Timeout` ([`run_budget`]); this is only how long the answer is
-/// waited for.
+/// waited for, from the moment this invocation holds the memory to run in.
 pub const HOST_WAIT_CEILING: Duration = Duration::from_secs(30);
 
 /// How long after its budget is spent a run is still waited for before it is abandoned.
@@ -400,8 +407,8 @@ impl Invoked {
 
 /// Run `invocation`'s handler and report what it came to.
 ///
-/// The run happens on a thread of its own, holding one of this module's run slots and no
-/// state guard of this service, and the caller's wait for it is bounded by
+/// The run happens on a thread of its own, holding its own share of this module's run memory
+/// and no state guard of this service, and the caller's wait for it is bounded by
 /// [`HOST_WAIT_CEILING`] however long the function's own timeout is.
 pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnable> {
     let Some(engine) = engine_for(invocation.runtime.as_deref()) else {
@@ -417,7 +424,9 @@ pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnabl
     };
     // Each engine imports the sources of its own language: the entries a package holds for
     // the other one are not modules this run could load. One budget is spent across every
-    // mount this invocation reads ([`package::ReadBudget`]).
+    // mount this invocation reads ([`package::ReadBudget`]), which is what bounds this read.
+    // It happens BEFORE any capacity is claimed, so a package this emulator cannot run at all
+    // is answered as that at once rather than after a wait for memory it will never use.
     let mut read_budget = package::ReadBudget::default();
     let read = match engine {
         Engine::Python => package::python_modules(invocation.zip_bytes.as_deref()),
@@ -457,25 +466,42 @@ pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnabl
     }
 
     if abandoned_runs() >= MAX_ABANDONED_RUNS {
-        return Err(Unrunnable::Overloaded(format!(
-            "{MAX_ABANDONED_RUNS} invocations of this emulator are still running past their \
-             budget. Retry the request."
-        )));
+        // The capacity that is full is this host's, which stands in for the account's
+        // concurrent executions, so what the caller is told is the modelled throttle for
+        // that pool and the detail of which host ceiling it was stays in the log.
+        ::tracing::warn!(
+            abandoned = abandoned_runs(),
+            ceiling = MAX_ABANDONED_RUNS,
+            "as many runs of this emulator are outstanding past their budget as it keeps \
+             threads for, so this invocation was throttled rather than started"
+        );
+        return Err(Unrunnable::Overloaded(
+            super::execution_slot::THROTTLED_INVOCATION_MESSAGE.to_string(),
+        ));
     }
-    // One of the run slots, waited for as long as [`PERMIT_WAIT`] — the longest a run
-    // ahead of this one can hold a slot — so a caller that arrives while the pool is busy
-    // is served once a handler ahead of it ends, and only a pool still full after that is
-    // answered the modelled throttle. Held until this invocation is answered, including
-    // when its run is abandoned — which is what puts the slot back at once.
-    let permit = ::tokio::time::timeout(PERMIT_WAIT, Arc::clone(run_slots()).acquire_owned())
-        .await
-        .map_err(|_| {
-            Unrunnable::Overloaded(
-                "Too many invocations are running in this emulator. Retry the request."
-                    .to_string(),
-            )
-        })?
-        .map_err(|error| Unrunnable::Internal(format!("the run slots are gone: {error}")))?;
+    // This run's share of the engine memory the process allows its runs together
+    // ([`MAX_CONCURRENT_RUN_MEMORY_MB`]), waited for as long as [`PERMIT_WAIT`] — the longest
+    // a run ahead of this one can hold a share — so a caller that arrives while the memory is
+    // held is served once a handler ahead of it ends, and only an envelope still full after
+    // that is answered the modelled throttle. Held until this invocation is answered,
+    // including when its run is abandoned — which is what puts the share back at once.
+    let claim = run_memory_claim_mb(invocation.memory_size);
+    let permit = ::tokio::time::timeout(
+        PERMIT_WAIT,
+        Arc::clone(run_memory()).acquire_many_owned(claim),
+    )
+    .await
+    .map_err(|_| {
+        ::tracing::warn!(
+            claimed_mb = claim,
+            envelope_mb = MAX_CONCURRENT_RUN_MEMORY_MB,
+            waited_seconds = PERMIT_WAIT.as_secs(),
+            "the engine memory this emulator runs handlers in did not come free inside the \
+             caller's own wait, so this invocation was throttled rather than started"
+        );
+        Unrunnable::Overloaded(super::execution_slot::THROTTLED_INVOCATION_MESSAGE.to_string())
+    })?
+    .map_err(|error| Unrunnable::Internal(format!("the run memory is gone: {error}")))?;
 
     let budget = run_budget(invocation.timeout);
     let heap_bytes = run_heap_bytes(invocation.memory_size);
@@ -1064,13 +1090,21 @@ const RUN_FINISHED: u8 = 1;
 /// A run the caller gave up on.
 const RUN_ABANDONED: u8 = 2;
 
-/// The run slots, shared by every invocation this process serves: as many of them as the
-/// host can run handlers on at once ([`max_concurrent_runs`]), handed out in the order they
-/// were asked for, because the semaphore is fair — so a waiting caller is served rather
-/// than passed over by the callers arriving behind it.
-fn run_slots() -> &'static Arc<::tokio::sync::Semaphore> {
-    static SLOTS: OnceLock<Arc<::tokio::sync::Semaphore>> = OnceLock::new();
-    SLOTS.get_or_init(|| Arc::new(::tokio::sync::Semaphore::new(max_concurrent_runs())))
+/// The engine memory the runs of this process share, in the MB of
+/// [`MAX_CONCURRENT_RUN_MEMORY_MB`]: one permit is one MB, so an invocation holds exactly the
+/// memory its own configuration asks for ([`run_memory_claim_mb`]) and the runs in flight
+/// hold at most the envelope between them.
+///
+/// The shares are handed out in the order they were asked for, because the semaphore is fair
+/// — so a waiting caller is served rather than passed over by the callers arriving behind it,
+/// including one waiting for a larger share than they are.
+fn run_memory() -> &'static Arc<::tokio::sync::Semaphore> {
+    static MEMORY: OnceLock<Arc<::tokio::sync::Semaphore>> = OnceLock::new();
+    MEMORY.get_or_init(|| {
+        Arc::new(::tokio::sync::Semaphore::new(
+            MAX_CONCURRENT_RUN_MEMORY_MB as usize,
+        ))
+    })
 }
 
 /// How many abandoned runs are outstanding.

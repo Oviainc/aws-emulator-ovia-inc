@@ -310,6 +310,18 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
             &prepared.resource,
         );
         let invoked = match crate::state::run_invocation(prepared.invocation).await {
+            // No run slot of the substrate came free inside this request's whole wait: the
+            // capacity that was full is the one a function with no reservation draws on, so
+            // the request is answered as the throttle it is rather than as a gateway failure
+            // of a run that was never attempted.
+            Err(crate::state::Unrunnable::Overloaded(message)) => {
+                ::tracing::warn!(
+                    request_id = %request_id,
+                    "a function URL request found no capacity to run the function, so nothing \
+                     ran"
+                );
+                return plane_error(THROTTLED_STATUS, &message);
+            }
             Ok(invoked) => invoked,
             Err(why) => {
                 ::tracing::warn!(

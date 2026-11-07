@@ -122,7 +122,7 @@ pub const MAX_QUEUED_ASYNC_INVOCATIONS: usize = 100;
 /// tasks — and the payloads they hold — bounded by the emulator rather than by the request
 /// rate. It is above [`MAX_QUEUED_ASYNC_INVOCATIONS`], so a function's whole queue can be in
 /// flight, and well above the handlers that can RUN at once
-/// ([`super::execution::max_concurrent_runs`]), so a burst waits on the run slots rather than
+/// ([`super::execution::MAX_CONCURRENT_RUNS`]), so a burst waits on the run memory rather than
 /// being dropped here.
 pub const MAX_IN_FLIGHT_DELIVERIES: usize = 256;
 
@@ -165,7 +165,7 @@ impl Drop for DeliveryPermit {
 /// one wait for the event's delivery delay and then at most
 /// [`super::async_delivery::MAX_ASYNC_DELIVERY_ATTEMPTS`] runs of the handler through
 /// [`super::execution::run_invocation`] — which holds a run slot of its own, waits at most
-/// [`super::execution::PERMIT_WAIT`] for one and is cut off by the function's `Timeout`
+/// [`super::execution::PERMIT_WAIT`] for one of them and is cut off by the function's `Timeout`
 /// inside [`super::execution::HOST_WAIT_CEILING`] — with only an errored handler taking
 /// another ([`super::async_delivery::next_attempt_in`]).
 ///

@@ -707,12 +707,14 @@ fn unrunnable(why: crate::state::Unrunnable) -> InvokeWithResponseStreamError {
             })
             .into()
         }
+        // The capacity that was full is the host's pool of run slots, which stands in for the
+        // account's concurrent executions, so the throttle names that limit.
         crate::state::Unrunnable::Overloaded(message) => {
             InvokeWithResponseStreamErrorModeled::TooManyRequestsException(
                 TooManyRequestsException {
                     r#type: None,
                     message: Some(message),
-                    reason: None,
+                    reason: Some(crate::state::ACCOUNT_CONCURRENCY_REASON.to_string()),
                     retry_after_seconds: None,
                 },
             )
