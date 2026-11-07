@@ -20,6 +20,11 @@
 //! ([`super::resource_policy_allows`]) — exactly the reading the `sqs` half makes of a
 //! queue's `Policy`. A function that has granted this service nothing is not invoked, and one
 //! whose policy grants it is, so a client repairing the grant sees the next publish arrive.
+//!
+//! An invocation that was not made leaves the MESSAGE undelivered, so what the subscription's
+//! own `RedrivePolicy` holds is that message — the notification every enveloped subscriber of
+//! the topic receives — rather than the `Records` event this delivery would have wrapped it in
+//! ([`FunctionDelivery::dead_letter_copy`]).
 
 use crate::state::{self, PublishedMessage};
 
@@ -55,7 +60,7 @@ const POLICY_ABSENT_CODE: &str = "ResourceNotFoundException";
 #[derive(Debug, Clone)]
 pub(super) struct FunctionDelivery {
     /// The subscription that owes the delivery: the log names it when it cannot be made, and
-    /// its own dead-letter queue is where the event is parked then.
+    /// its own dead-letter queue is where the message is held then.
     subscription_arn: String,
     /// The function the subscription's endpoint ARN names.
     target: FunctionLocation,
@@ -64,9 +69,12 @@ pub(super) struct FunctionDelivery {
     topic_arn: String,
     /// The event the function is invoked with.
     payload: ::std::sync::Arc<str>,
-    /// Where this event is parked when the invocation cannot be made: the dead-letter queue
-    /// the subscription's own `RedrivePolicy` names, or `None` when it asks for no redrive.
-    dead_letter: Option<QueueLocation>,
+    /// Where an undeliverable message is held and WHAT is held there: the dead-letter queue the
+    /// subscription's own `RedrivePolicy` names, paired with the notification of the published
+    /// message, or `None` when the subscription asks for no redrive. The two are one fact — does
+    /// this subscription ask for a redrive? — so they are one member, and the notification is
+    /// rendered only when there is somewhere to hold it.
+    dead_letter: Option<(QueueLocation, ::std::sync::Arc<str>)>,
     /// The ordering members of the published message, carried only so a dead-letter copy
     /// reaches a FIFO queue, which takes no message without a group.
     message_group_id: Option<String>,
@@ -90,6 +98,19 @@ impl FunctionDelivery {
     ) -> Option<Self> {
         let endpoint = subscription.endpoint.as_deref()?;
         let target = FunctionLocation::of_function_arn(endpoint)?;
+        // "RedrivePolicy – When specified, sends undeliverable messages to the specified
+        // Amazon SQS dead-letter queue" — the same attribute of the same subscription the
+        // `sqs` half reads, because a redrive is about the subscription rather than about the
+        // endpoint kind.
+        let dead_letter = state::dead_letter_target_arn(&subscription.attributes)
+            .as_deref()
+            .and_then(QueueLocation::of_queue_arn)
+            .map(|target| {
+                let held: ::std::sync::Arc<str> = ::std::sync::Arc::from(
+                    super::notification_envelope(published, protocol_body, &subscription.arn),
+                );
+                (target, held)
+            });
         Some(Self {
             subscription_arn: subscription.arn.clone(),
             target,
@@ -99,13 +120,7 @@ impl FunctionDelivery {
                 protocol_body,
                 &subscription.arn,
             )),
-            // "RedrivePolicy – When specified, sends undeliverable messages to the specified
-            // Amazon SQS dead-letter queue" — the same attribute of the same subscription
-            // the `sqs` half reads, because a redrive is about the subscription rather than
-            // about the endpoint kind.
-            dead_letter: state::dead_letter_target_arn(&subscription.attributes)
-                .as_deref()
-                .and_then(QueueLocation::of_queue_arn),
+            dead_letter,
             message_group_id: published.message_group_id.clone(),
             message_deduplication_id: published.message_deduplication_id.clone(),
             logged,
@@ -141,18 +156,25 @@ impl FunctionDelivery {
         self.payload.len()
     }
 
-    /// The copy of this event that is held in the subscription's dead-letter queue when the
-    /// function could not be invoked, or `None` when the subscription asks for no redrive.
+    /// The copy of the undeliverable MESSAGE that is held in the subscription's dead-letter
+    /// queue when the function could not be invoked, or `None` when the subscription asks for
+    /// no redrive.
     ///
-    /// The copy is the event the FUNCTION itself would have received, because that is the
-    /// message that could not be delivered — the same choice the `sqs` half makes.
+    /// What a redrive holds is "undeliverable messages"
+    /// (`SetSubscriptionAttributesInput$AttributeName`), and the message is the NOTIFICATION of
+    /// the publish — the same document every enveloped subscriber of the topic receives
+    /// ([`super::notification_envelope`]). The `Records` array around it is not part of the
+    /// message: it is the shape the INVOCATION of a function carries its event in
+    /// ([`records_envelope`]), built by this delivery and belonging to it, so a message that
+    /// never reached an invocation is held as the message rather than as the event that was
+    /// never handed over.
     pub(super) fn dead_letter_copy(&self) -> Option<QueueDelivery> {
-        let dead_letter = self.dead_letter.clone()?;
+        let (dead_letter, body) = self.dead_letter.clone()?;
         Some(QueueDelivery {
             subscription_arn: self.subscription_arn.clone(),
             target: dead_letter,
             topic_arn: self.topic_arn.clone(),
-            body: ::std::sync::Arc::clone(&self.payload),
+            body,
             attributes: Vec::new(),
             message_group_id: self.message_group_id.clone(),
             message_deduplication_id: self.message_deduplication_id.clone(),

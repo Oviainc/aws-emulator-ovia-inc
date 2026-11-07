@@ -1006,10 +1006,12 @@ impl QueueTarget {
 /// Amazon SQS dead-letter queue. Messages that can't be delivered due to client errors (for
 /// example, when the subscribed endpoint is unreachable) […] are held in the dead-letter
 /// queue for further analysis or reprocessing"
-/// (`SetSubscriptionAttributesInput$AttributeName`). The copy is the body the subscription
-/// itself would have received, in that subscription's own delivery format, because that is
-/// the message that could not be delivered — whichever endpoint kind the subscription
-/// addresses.
+/// (`SetSubscriptionAttributesInput$AttributeName`). What is held there is the undeliverable
+/// MESSAGE in the form the subscription's own attributes render it — the notification envelope,
+/// or the raw body a subscription asking for raw delivery receives — and not the event
+/// envelope one endpoint kind's API wraps that message in to hand it over
+/// ([`function_delivery::FunctionDelivery::dead_letter_copy`]): a message that never reached
+/// the endpoint is held as the message, whichever endpoint kind the subscription addresses.
 ///
 /// Whatever came of the attempt, a topic carrying a feedback role for that subscription's
 /// protocol has one delivery-status record written for it

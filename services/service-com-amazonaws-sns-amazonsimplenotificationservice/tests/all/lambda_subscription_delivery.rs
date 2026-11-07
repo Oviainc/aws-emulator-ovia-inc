@@ -60,13 +60,13 @@ pub(crate) const ZIP_FILE: &str = "UEsDBAoAAAAAAAAAAAA=";
 /// How long a wait for an invocation lasts before giving up. An invocation is made as soon as
 /// the publish that owes it is answered, so this is many deliveries' worth of slack and not a
 /// span the behaviour depends on.
-const DELIVERY_BUDGET: Duration = Duration::from_secs(10);
+pub(crate) const DELIVERY_BUDGET: Duration = Duration::from_secs(10);
 
 /// How long a wait lasts before concluding that NOTHING was invoked.
 const QUIET_BUDGET: Duration = Duration::from_millis(1_500);
 
 /// How often a wait looks.
-const LOOK_INTERVAL: Duration = Duration::from_millis(25);
+pub(crate) const LOOK_INTERVAL: Duration = Duration::from_millis(25);
 
 /// SNS, Lambda and Amazon SQS over ONE shared engine: a subscription's endpoint is a function,
 /// and the invocation is asserted on the function.

@@ -19,8 +19,10 @@
 //!   dead-letter queue. Messages that can't be delivered due to client errors (for example,
 //!   when the subscribed endpoint is unreachable) […] are held in the dead-letter queue for
 //!   further analysis or reprocessing" (`SubscribeInput$Attributes`) — so a delivery the
-//!   function's own resource policy withholds is held in that queue, as the event the function
-//!   itself would have been handed, and the function is not invoked at all.
+//!   function's own resource policy withholds is held in that queue as the undeliverable
+//!   MESSAGE, the notification every enveloped subscriber of the topic receives, and the
+//!   function is not invoked at all. The `Records` array is not part of that message: it is the
+//!   envelope an INVOCATION carries its event in, and in this row no invocation was made.
 //!
 //! The rows differ along what the rules generalise over: whether the endpoint can take the
 //! delivery yet, whether it will take it at all, whether the subscription asks for a redrive,
@@ -259,8 +261,9 @@ async fn a_delivery_the_function_cannot_take_yet_is_retried_until_it_can() {
 
 /// RULE: a delivery the subscribed function WILL NOT take — its own resource policy grants
 /// this service nothing — is held in the dead-letter queue the subscription's `RedrivePolicy`
-/// names, as the event the function itself would have been handed; the function is not invoked
-/// at all, and once the grant is added the next publish reaches it with nothing parked.
+/// names, as the undeliverable MESSAGE rather than as the event envelope an invocation would
+/// have carried; the function is not invoked at all, and once the grant is added the next
+/// publish reaches it with nothing parked.
 #[tokio::test]
 async fn a_delivery_the_function_will_not_take_is_held_in_the_dead_letter_queue() {
     let case = "a function whose policy grants nothing, under a RedrivePolicy";
@@ -285,23 +288,40 @@ async fn a_delivery_the_function_will_not_take_is_held_in_the_dead_letter_queue(
         "case {case:?}: the notification that could not be delivered must be held in the \
          dead-letter queue, got {held:?}"
     );
-    let event: Value = serde_json::from_str(&held[0]).unwrap_or_else(|error| {
+    let notification: Value = serde_json::from_str(&held[0]).unwrap_or_else(|error| {
         panic!(
-            "case {case:?}: the parked copy must be the event the function would have been \
-             handed ({error}): {}",
+            "case {case:?}: the parked copy must be the notification that could not be \
+             delivered ({error}): {}",
             held[0]
         )
     });
-    assert_eq!(
-        event["Records"][0]["Sns"]["Message"].as_str(),
-        Some("withheld"),
-        "case {case:?}: the parked copy carries the message as published, got {event}"
+    assert!(
+        notification.get("Records").is_none(),
+        "case {case:?}: the parked copy is the undeliverable message, not the event envelope an \
+         invocation carries, got {notification}"
     );
     assert_eq!(
-        event["Records"][0]["EventSubscriptionArn"].as_str(),
-        Some(subscription.as_str()),
+        notification["Type"].as_str(),
+        Some("Notification"),
+        "case {case:?}: the parked copy is the notification of the publish, got {notification}"
+    );
+    assert_eq!(
+        notification["Message"].as_str(),
+        Some("withheld"),
+        "case {case:?}: the parked copy carries the message as published, got {notification}"
+    );
+    assert_eq!(
+        notification["TopicArn"].as_str(),
+        Some(topic.as_str()),
+        "case {case:?}: the parked copy names the topic published to, got {notification}"
+    );
+    assert!(
+        notification["UnsubscribeURL"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&format!("SubscriptionArn={subscription}")),
         "case {case:?}: the parked copy names the subscription that could not receive it, got \
-         {event}"
+         {notification}"
     );
     let events = quiet(&emulator, function).await;
     assert!(
