@@ -167,8 +167,8 @@ async fn a_name_that_resolves_to_nothing_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "BadRequestException",
-            "case {sql}: expected BadRequestException, got {body}"
+            "DatabaseErrorException",
+            "case {sql}: expected DatabaseErrorException, got {body}"
         );
         assert_eq!(
             body["records"],
@@ -188,7 +188,10 @@ async fn a_name_that_resolves_to_nothing_is_refused() {
 /// operation combines, a chain of operators (which the parse builds iteratively,
 /// so no parser limit sees it), nested parentheses (which it builds recursively),
 /// and a chain just inside the bound, which is answered by the engine rather than
-/// refused up front.
+/// refused up front — and WHICH refusal each one is: a statement larger than one
+/// call runs is refused up front as a validation fault, while one the ENGINE refuses
+/// carries the modelled `DatabaseErrorException`, the class an error the database
+/// raised is reported under.
 #[tokio::test]
 async fn a_statement_deeper_than_one_call_may_build_is_refused() {
     let api = DataApi::new();
@@ -198,22 +201,29 @@ async fn a_statement_deeper_than_one_call_may_build_is_refused() {
             // `sql`, so it is the DEPTH bound that answers and not the length one.
             "a chain of 4000 combined queries",
             format!("SELECT 1{}", " UNION SELECT 1".repeat(4_000)),
+            // Refused before the engine saw it: larger than one call runs, which is a
+            // fault of the CALL.
+            "ValidationException",
         ),
         (
             "a chain of 5000 operators",
             format!("SELECT 1{}", " AND 1".repeat(5_000)),
+            "ValidationException",
         ),
         (
             "5000 nested parentheses",
             format!("SELECT {}1{}", "(".repeat(5_000), ")".repeat(5_000)),
+            // The engine's own recursion limit refused it.
+            "DatabaseErrorException",
         ),
         (
             "a chain of 900 operators, inside the bound",
             format!("SELECT 1{}", " AND 1".repeat(900)),
+            "DatabaseErrorException",
         ),
     ];
 
-    for (case, sql) in cases {
+    for (case, sql, expected) in cases {
         let (status, body) = api.execute(json!({"sql": sql})).await;
         assert_eq!(
             status, 400,
@@ -221,8 +231,8 @@ async fn a_statement_deeper_than_one_call_may_build_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "BadRequestException",
-            "case {case}: expected BadRequestException, got {body}"
+            expected,
+            "case {case}: expected {expected}, got {body}"
         );
     }
 

@@ -918,22 +918,27 @@ async fn one_call_runs_one_bounded_statement() {
     api.run(json!({"sql": "CREATE TABLE counted (id int4)"}))
         .await;
 
-    for (case, sql) in [
+    for (case, sql, expected) in [
         (
             "two statements",
             "INSERT INTO counted (id) VALUES (1); INSERT INTO counted (id) VALUES (2)".to_string(),
+            // More than one call runs: a fault of the CALL, refused before the engine
+            // saw it.
+            "ValidationException",
         ),
         (
             "a statement nested past the bound",
             format!("SELECT {}1{}", "abs(".repeat(64), ")".repeat(64)),
+            // The ENGINE's own depth limit refused it, so it is the database's error.
+            "DatabaseErrorException",
         ),
     ] {
         let (status, body) = api.execute(json!({"sql": sql})).await;
         assert_eq!(status, 400, "case {case}: got {status} {body}");
         assert_eq!(
             error_code(&body),
-            "BadRequestException",
-            "case {case}: got {body}"
+            expected,
+            "case {case}: expected {expected}, got {body}"
         );
     }
 
@@ -1072,7 +1077,7 @@ async fn a_statement_is_bounded_by_the_levels_it_chains() {
         assert_eq!(status, 400, "case {case} past the bound: got {status} {body}");
         assert_eq!(
             error_code(&body),
-            "BadRequestException",
+            "ValidationException",
             "case {case} past the bound: got {body}"
         );
 

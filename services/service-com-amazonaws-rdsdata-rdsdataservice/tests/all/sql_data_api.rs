@@ -80,7 +80,7 @@ impl DataApi {
             .to_string()
     }
 
-    async fn commit(&self, transaction_id: &str) -> (u16, Value) {
+    pub(crate) async fn commit(&self, transaction_id: &str) -> (u16, Value) {
         self.post(
             "/CommitTransaction",
             with_target(json!({"transactionId": transaction_id})),
@@ -187,8 +187,8 @@ async fn a_data_api_client_script_runs_end_to_end() {
     );
     assert_eq!(
         error_code(&outside),
-        "BadRequestException",
-        "the engine's refusal is reported as BadRequestException, got {outside}"
+        "DatabaseErrorException",
+        "the engine's refusal is reported as DatabaseErrorException, got {outside}"
     );
 
     let (status, committed) = api.commit(&transaction).await;
@@ -706,8 +706,8 @@ async fn a_sequence_assigns_the_key_and_generated_fields_stays_empty() {
     );
     assert_eq!(
         error_code(&refused),
-        "BadRequestException",
-        "the engine's constraint failure is a bad request, got {refused}"
+        "DatabaseErrorException",
+        "the engine's constraint failure is the database's error, got {refused}"
     );
 }
 
@@ -826,8 +826,10 @@ async fn the_json_record_format_returns_the_result_set_as_json() {
 
 /// RULE: a `transactionId` no open transaction answers to is HTTP 404
 /// `TransactionNotFoundException`, on every operation that takes one; a statement
-/// the engine refuses is HTTP 400 `BadRequestException`; and an operation nobody
-/// has implemented still answers HTTP 501 rather than a hollow 200.
+/// the ENGINE refuses is HTTP 400 `DatabaseErrorException` while a fault of the
+/// CALL — a parameter that cannot be bound, a member that names nothing — is HTTP
+/// 400 `ValidationException`; and an operation nobody has implemented still answers
+/// HTTP 501 rather than a hollow 200.
 #[tokio::test]
 async fn the_modelled_failures_are_what_a_client_sees() {
     let api = DataApi::new();
@@ -861,18 +863,21 @@ async fn the_modelled_failures_are_what_a_client_sees() {
         );
     }
 
-    let bad_requests = vec![
+    let refusals = vec![
         (
             "a statement the engine cannot parse",
             json!({"sql": "SELEKT nothing"}),
+            "DatabaseErrorException",
         ),
         (
             "a table that does not exist",
             json!({"sql": "SELECT id FROM absent"}),
+            "DatabaseErrorException",
         ),
         (
             "a named parameter with no value supplied",
             json!({"sql": "SELECT id FROM things WHERE id = :id"}),
+            "ValidationException",
         ),
         (
             "an array parameter, which the model says is not supported",
@@ -880,6 +885,7 @@ async fn the_modelled_failures_are_what_a_client_sees() {
                 "sql": "INSERT INTO things (id) VALUES (:id)",
                 "parameters": [parameter("id", json!({"arrayValue": {"longValues": [1, 2]}}))],
             }),
+            "ValidationException",
         ),
         (
             "isNull set to false, which names no value",
@@ -887,19 +893,21 @@ async fn the_modelled_failures_are_what_a_client_sees() {
                 "sql": "INSERT INTO things (id) VALUES (:id)",
                 "parameters": [parameter("id", json!({"isNull": false}))],
             }),
+            "ValidationException",
         ),
         (
             "more than one statement in one call",
             json!({"sql": "INSERT INTO things (id) VALUES (1); INSERT INTO things (id) VALUES (2)"}),
+            "ValidationException",
         ),
     ];
-    for (case, members) in bad_requests {
+    for (case, members, expected) in refusals {
         let (status, body) = api.execute(members).await;
         assert_eq!(status, 400, "case {case}: got {body}");
         assert_eq!(
             error_code(&body),
-            "BadRequestException",
-            "case {case}: got {body}"
+            expected,
+            "case {case}: expected {expected}, got {body}"
         );
     }
 
@@ -950,7 +958,7 @@ async fn the_modelled_failures_are_what_a_client_sees() {
         assert_eq!(status, 400, "case {case}: got {answered}");
         assert_eq!(
             error_code(&answered),
-            "BadRequestException",
+            "ValidationException",
             "case {case}: got {answered}"
         );
     }
@@ -1026,7 +1034,7 @@ async fn the_engine_cannot_reach_outside_the_emulators_own_state() {
         assert_eq!(status, 400, "case {case}: expected a refusal, got {body}");
         assert_eq!(
             error_code(&body),
-            "BadRequestException",
+            "DatabaseErrorException",
             "case {case}: got {body}"
         );
     }
@@ -1098,7 +1106,7 @@ async fn the_functions_caller_sql_may_reach_are_allow_listed() {
         );
         assert_eq!(
             error_code(&body),
-            "BadRequestException",
+            "DatabaseErrorException",
             "case {case}: got {body}"
         );
     }
@@ -1179,7 +1187,7 @@ async fn one_request_cannot_consume_the_emulator() {
     assert_eq!(status, 400, "case deep expression: got {too_deep}");
     assert_eq!(
         error_code(&too_deep),
-        "BadRequestException",
+        "DatabaseErrorException",
         "case deep expression: got {too_deep}"
     );
 
@@ -1190,7 +1198,7 @@ async fn one_request_cannot_consume_the_emulator() {
     assert_eq!(status, 400, "case oversized value: got {too_big}");
     assert_eq!(
         error_code(&too_big),
-        "BadRequestException",
+        "DatabaseErrorException",
         "case oversized value: got {too_big}"
     );
 
@@ -1256,11 +1264,12 @@ async fn one_request_cannot_consume_the_emulator() {
         "case a batch past the request's output budget: got {status} {batched}"
     );
     // `BatchExecuteStatement` does not model `UnsupportedResultException` — it
-    // returns no result set — so the refusal is the bad request its own contract
-    // declares, and the message says which bound was reached.
+    // returns no result set — so a result-shaped refusal of a statement the engine
+    // RAN is reported under the database's own error class, and the message says
+    // which bound was reached.
     assert_eq!(
         error_code(&batched),
-        "BadRequestException",
+        "DatabaseErrorException",
         "case a batch past the request's output budget: got {batched}"
     );
 
@@ -1299,7 +1308,7 @@ async fn one_request_cannot_consume_the_emulator() {
     assert_eq!(status, 400, "case too many parameter sets: got {too_many}");
     assert_eq!(
         error_code(&too_many),
-        "BadRequestException",
+        "ValidationException",
         "case too many parameter sets: got {too_many}"
     );
 
@@ -1511,7 +1520,7 @@ async fn every_schema_a_statement_writes_into_is_bounded() {
         );
         assert_eq!(
             error_code(&refused),
-            "BadRequestException",
+            "DatabaseErrorException",
             "case {case}: a cap reached is the engine refusing the statement, not a deadline, got {refused}"
         );
         assert!(
@@ -1613,9 +1622,9 @@ async fn a_pattern_comparison_is_bounded_and_leaves_the_data_plane_usable() {
             // of the request, rather than occupying the data plane.
             assert_eq!(
                 error_code(&body),
-                "BadRequestException",
-                "case {case}: a pattern the engine refuses is the caller's request being \
-                 refused, got {body}"
+                "DatabaseErrorException",
+                "case {case}: a pattern the engine refuses is reported as the database's \
+                 own error, got {body}"
             );
         }
         assert!(
@@ -1764,7 +1773,7 @@ async fn a_type_hint_decides_what_a_string_parameter_may_be() {
         );
         assert_eq!(
             error_code(&body),
-            "BadRequestException",
+            "ValidationException",
             "case {hint} refusing {refused:?}: got {body}"
         );
         assert!(

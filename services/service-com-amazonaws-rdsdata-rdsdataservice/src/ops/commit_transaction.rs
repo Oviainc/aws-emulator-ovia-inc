@@ -174,7 +174,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CommitTransactionError::from(
                 CommitTransactionErrorModeled::InternalServerErrorException(
@@ -182,6 +181,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
+        // The same precondition chain every call of this service is admitted by: a
+        // commit is a call on the cluster too, so it is refused for a cluster that does
+        // not serve the Data API and for credentials that do not log in to it. This
+        // operation carries no statement and selects no database.
+        crate::state::preconditions::admit(
+            &*self.engine,
+            ctx,
+            &crate::state::preconditions::Call {
+                operation: Self::NAME,
+                resource_arn: &input.resource_arn,
+                secret_arn: &input.secret_arn,
+                sql: None,
+                database: None,
+            },
+        )
+        .await
+        .map_err(refused)?;
         // Installing the transaction's database is engine-owned state under the
         // service lock, so it runs on the blocking pool under one wall clock.
         crate::state::in_data_plane(move || commit(&store, &input))
@@ -190,35 +206,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// Report a call the precondition chain refused as the error this operation models for
+/// that class.
+fn refused(refusal: crate::state::preconditions::Refusal) -> CommitTransactionError {
+    let message = Some(refusal.message());
+    match refusal {
+        crate::state::preconditions::Refusal::Validation(message) => {
+            return crate::scaffolded::Scaffolded::validation(message)
+        }
+        crate::state::preconditions::Refusal::AccessDenied(_) => {
+            CommitTransactionErrorModeled::AccessDeniedException(AccessDeniedException { message })
+        }
+        crate::state::preconditions::Refusal::HttpEndpointNotEnabled(_) => {
+            CommitTransactionErrorModeled::HttpEndpointNotEnabledException(
+                HttpEndpointNotEnabledException { message },
+            )
+        }
+        crate::state::preconditions::Refusal::SecretsError(_) => {
+            CommitTransactionErrorModeled::SecretsErrorException(SecretsErrorException { message })
+        }
+        crate::state::preconditions::Refusal::InvalidSecret(_) => {
+            CommitTransactionErrorModeled::InvalidSecretException(InvalidSecretException { message })
+        }
+        crate::state::preconditions::Refusal::DatabaseError(_) => {
+            CommitTransactionErrorModeled::DatabaseErrorException(DatabaseErrorException { message })
+        }
+    }
+    .into()
+}
+
 /// Apply the transaction's writes, inside the data plane.
 fn commit(
     store: &crate::state::Store,
     input: &CommitTransactionInput,
 ) -> Result<CommitTransactionOutput, crate::state::SqlError> {
-    crate::state::require_arn("resourceArn", &input.resource_arn)?;
-    crate::state::require_arn("secretArn", &input.secret_arn)?;
     let mut state = store.lock();
     let cluster = state.cluster_mut(&input.resource_arn)?;
     cluster.expire_timed_out_transactions();
     // The name the transaction's writes belong to, read before the transaction is
-    // taken out of the store: the destination slot is claimed through the CAPPED
-    // accessor first, so a commit that cannot be served (the cluster is at
-    // `MAX_DATABASES_PER_CLUSTER` and this name is new, because the committed
-    // database was swept while the transaction was open) is refused with the
-    // transaction still intact rather than losing its writes.
-    let database = crate::state::database_key(
-        cluster
-            .transactions
-            .get(&input.transaction_id)
-            .ok_or(crate::state::SqlError::TransactionNotFound)?
-            .database
-            .as_ref(),
-    );
+    // ended: the destination slot is claimed through the CAPPED accessor first, so a
+    // commit that cannot be served (the cluster is at `MAX_DATABASES_PER_CLUSTER` and
+    // this name is new, because the committed database was swept while the transaction
+    // was open) is refused with the transaction still intact rather than losing its
+    // writes.
+    let transaction = cluster.open_transaction_mut(&input.transaction_id)?;
+    let aborted = transaction.is_aborted();
+    let database = crate::state::database_key(transaction.database.as_ref());
     cluster.database_mut(&database)?;
-    let transaction = cluster
-        .transactions
-        .remove(&input.transaction_id)
-        .ok_or(crate::state::SqlError::TransactionNotFound)?;
+    // Ending the transaction hands back the database it was writing into and leaves its
+    // id with the cluster, now terminal — so a SECOND commit of the same id is answered
+    // for a transaction a previous call ended rather than as an id this service never
+    // issued.
+    let pending = cluster.end_transaction(&input.transaction_id)?;
+    if aborted {
+        // A statement of this transaction already failed, and "if the transaction block
+        // is aborted, COMMIT performs a ROLLBACK and reports ROLLBACK" (PostgreSQL's own
+        // `COMMIT`): the writes are discarded, and what the caller is told is the
+        // rollback that really happened rather than a commit that did not. The sequence
+        // values the transaction took out are still not handed out again, for the reason
+        // `RollbackTransaction` gives.
+        let marks = pending.sequence_marks();
+        drop(pending);
+        if let Some(committed) = cluster.databases.get_mut(&database) {
+            committed.advance_sequences(&marks);
+        }
+        return Ok(CommitTransactionOutput {
+            transaction_status: Some(crate::state::ROLLBACK_COMPLETE_STATUS.to_string()),
+        });
+    }
     // Applying the transaction's writes: the database it wrote into becomes the
     // cluster's committed database for that name, which is what makes those writes
     // visible to a later non-transactional statement.
@@ -233,9 +288,9 @@ fn commit(
     // `two_writers_on_one_database_are_last_writer_wins` in
     // `tests/all/sql_data_api.rs` pins it, so the semantics are asserted and not
     // merely commented.
-    cluster.databases.insert(database, transaction.pending);
+    cluster.databases.insert(database, pending);
     Ok(CommitTransactionOutput {
-        transaction_status: Some("Transaction Committed".to_string()),
+        transaction_status: Some(crate::state::TRANSACTION_COMMITTED_STATUS.to_string()),
     })
 }
 
@@ -269,7 +324,9 @@ fn request_failed(error: crate::state::SqlError) -> CommitTransactionError {
                 ServiceUnavailableError::default(),
             )
         }
-        _ => CommitTransactionErrorModeled::BadRequestException(BadRequestException { message }),
+        _ => CommitTransactionErrorModeled::DatabaseErrorException(DatabaseErrorException {
+            message,
+        }),
     }
     .into()
 }

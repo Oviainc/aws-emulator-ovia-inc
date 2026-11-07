@@ -112,6 +112,14 @@ use crate::ops::types::{ArrayValue, ColumnMetadata, Field, ResultSetOptions, Sql
 /// from.
 pub mod postgres;
 
+/// Whether IAM lets a request perform the action it asks for — the identity leg of
+/// the precondition chain.
+pub mod authorization;
+
+/// The ONE precondition chain every call is admitted by: the call's own shape, the
+/// identity, the cluster, the secret, the login and the database.
+pub mod preconditions;
+
 use postgres::{PgType, Plan, TypeClass};
 
 /// A handle on this service's store, as a handler gets it from [`service_state`].
@@ -162,6 +170,16 @@ const MAX_SQL_BYTES: i32 = 65_536;
 const MAX_EXPRESSION_DEPTH: i32 = 200;
 pub(crate) const MAX_COMPOUND_SELECT: i32 = 20;
 const MAX_BOUND_PARAMETERS: i32 = 1_000;
+
+/// How many values one call's `parameters` list (and each entry of its
+/// `parameterSets`) may carry.
+///
+/// The model constrains neither list's length, and the length is the caller's to choose,
+/// so it is capped here — at the engine's OWN variable limit
+/// ([`MAX_BOUND_PARAMETERS`]), because a statement cannot bind more placeholders than
+/// that whatever the request carries. The cap is applied BEFORE the list is scanned, so a
+/// long list cannot buy work.
+pub const MAX_PARAMETERS_PER_STATEMENT: usize = MAX_BOUND_PARAMETERS as usize;
 
 /// `SQLITE_LIMIT_LIKE_PATTERN_LENGTH`: the longest `LIKE`/`GLOB` pattern one
 /// comparison may carry.
@@ -215,6 +233,13 @@ const TEMP_STORE_MEMORY: i64 = 2;
 /// neither `parameterSets`'s length nor its total size, so the count is capped
 /// here; the whole batch also shares one [`STATEMENT_TIME_BUDGET`].
 pub const MAX_PARAMETER_SETS: usize = 1_000;
+
+/// The savepoint one `BatchExecuteStatement` runs inside, so the engine itself is what
+/// undoes a refused batch: opened before its first statement, released when every
+/// statement has run, and rolled back to when one of them fails.
+const BATCH_SAVEPOINT_BEGIN: &str = "SAVEPOINT rds_data_batch";
+const BATCH_SAVEPOINT_RELEASE: &str = "RELEASE rds_data_batch";
+const BATCH_SAVEPOINT_ROLLBACK: &str = "ROLLBACK TO rds_data_batch; RELEASE rds_data_batch";
 
 /// How many clusters, databases per cluster and open transactions per cluster this
 /// emulator stores at once. Each is a store a caller can grow by naming a fresh
@@ -403,6 +428,39 @@ pub const TRANSACTION_IDLE_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 /// hours."
 pub const TRANSACTION_MAX_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How long a TERMINAL transaction's id is remembered.
+///
+/// A transaction that ended is kept so that a later call quoting its id is answered for a
+/// transaction that ended; what the caller is told is the same either way, so forgetting
+/// one changes nothing a caller can observe — which is why the window is the lifetime a
+/// live transaction has at most ([`TRANSACTION_MAX_LIFETIME`]) rather than for ever, and
+/// a cluster keeps at most [`MAX_TERMINAL_TRANSACTIONS`] of them.
+pub const TERMINAL_TRANSACTION_MEMORY: Duration = TRANSACTION_MAX_LIFETIME;
+
+/// How many ended transactions one cluster remembers at once. A terminal record holds no
+/// database — only its id and when it ended — but a caller opening and committing
+/// transactions in a loop would still grow the store without limit, so the OLDEST ended
+/// record is dropped first and the ones a live workflow just ended stay.
+pub const MAX_TERMINAL_TRANSACTIONS: usize = 64;
+
+/// What the service tells a caller whose `transactionId` names no transaction that is
+/// RUNNING: one it never issued, one the clock rolled back, and one a previous call ended
+/// — a commit, a rollback, or a statement of its own that failed.
+///
+/// Entirely fixed text: it carries no value from the request and none from state, so a
+/// refusal says nothing about which ids this service has issued.
+pub const TRANSACTION_NOT_RUNNING_MESSAGE: &str =
+    "INVALID_ARGUMENT: Transaction error: one previous call resulted in a termination of \
+     your transaction";
+
+/// The `transactionStatus` a commit that installed a transaction's writes reports.
+pub const TRANSACTION_COMMITTED_STATUS: &str = "Transaction Committed";
+
+/// The `transactionStatus` a rollback reports — and what a COMMIT of a transaction one of
+/// its own statements had already failed in reports, because that commit performs a
+/// rollback (see `CommitTransaction`).
+pub const ROLLBACK_COMPLETE_STATUS: &str = "Rollback complete";
+
 /// Run one request's unit of engine work.
 ///
 /// The work is synchronous and CPU-bound (it drives the SQL engine and holds the
@@ -533,9 +591,86 @@ impl Cluster {
     /// the clock did, and a later call quoting that `transactionId` is answered
     /// with `TransactionNotFoundException` the way the real service answers a
     /// timed-out one.
+    ///
+    /// A transaction that ENDED is forgotten the same way once
+    /// [`TERMINAL_TRANSACTION_MEMORY`] has passed, and the oldest ended record goes
+    /// first past [`MAX_TERMINAL_TRANSACTIONS`]: a forgotten terminal id and a remembered
+    /// one are answered alike, so this changes nothing a caller can observe.
     pub fn expire_timed_out_transactions(&mut self) {
         self.transactions
             .retain(|_, transaction| !transaction.timed_out());
+        while self.terminal_transaction_count() > MAX_TERMINAL_TRANSACTIONS {
+            let Some(oldest) = self
+                .transactions
+                .values()
+                .filter_map(|transaction| {
+                    transaction
+                        .terminated_at
+                        .map(|at| (at, transaction.id.clone()))
+                })
+                .min()
+                .map(|(_, id)| id)
+            else {
+                break;
+            };
+            self.transactions.remove(&oldest);
+        }
+    }
+
+    /// How many transactions of this cluster are still open — the ones that hold a copy
+    /// of a database, which is what [`MAX_OPEN_TRANSACTIONS`] bounds.
+    pub fn open_transaction_count(&self) -> usize {
+        self.transactions
+            .values()
+            .filter(|transaction| !transaction.is_terminal())
+            .count()
+    }
+
+    /// How many ended transactions this cluster still remembers.
+    fn terminal_transaction_count(&self) -> usize {
+        self.transactions
+            .values()
+            .filter(|transaction| transaction.is_terminal())
+            .count()
+    }
+
+    /// The OPEN transaction `transaction_id` names.
+    ///
+    /// `Err(SqlError::TransactionNotFound)` for an id this cluster has no open
+    /// transaction for — one it never issued, one the clock has rolled back, and one that
+    /// has ENDED (committed, rolled back, or terminated by a statement of its own that
+    /// failed). Using the id of a transaction that is no longer running it is the same
+    /// refusal however it stopped running, which is what the real service answers.
+    pub fn open_transaction_mut(
+        &mut self,
+        transaction_id: &str,
+    ) -> Result<&mut Transaction, SqlError> {
+        let transaction = self
+            .transactions
+            .get_mut(transaction_id)
+            .ok_or(SqlError::TransactionNotFound)?;
+        if transaction.is_terminal() {
+            return Err(SqlError::TransactionNotFound);
+        }
+        Ok(transaction)
+    }
+
+    /// End the transaction `transaction_id` names and hand back the database it was
+    /// writing into. The id stays with the cluster, now terminal.
+    pub fn end_transaction(&mut self, transaction_id: &str) -> Result<Database, SqlError> {
+        self.transactions
+            .get_mut(transaction_id)
+            .ok_or(SqlError::TransactionNotFound)?
+            .end()
+    }
+
+    /// Record that a statement of the transaction `transaction_id` names FAILED, so the
+    /// database ignores every further command of it until a commit or a rollback ends it.
+    /// A no-op for an id this cluster holds no transaction for.
+    pub fn abort_transaction(&mut self, transaction_id: &str) {
+        if let Some(transaction) = self.transactions.get_mut(transaction_id) {
+            transaction.abort();
+        }
     }
 }
 
@@ -792,7 +927,88 @@ impl Database {
         drop(watchdog);
         self.conn
             .progress_handler(PROGRESS_HANDLER_OPS, None::<fn() -> bool>);
-        outcome
+        // An error the DATABASE raised reaches the caller in the words of the database
+        // this API answers for, with its SQLSTATE — never in the words of whichever
+        // engine ran the statement.
+        outcome.map_err(|error| self.in_postgresql_words(error))
+    }
+
+    /// The same failure, worded as Aurora PostgreSQL words that condition
+    /// ([`postgres::postgresql_diagnostic`]). A condition that front end does not word,
+    /// and every failure that is not the engine refusing a statement, is unchanged.
+    fn in_postgresql_words(&self, error: SqlError) -> SqlError {
+        let SqlError::Engine(message) = &error else {
+            return error;
+        };
+        match postgres::postgresql_diagnostic(message, &|table| self.primary_key_of(table)) {
+            Some(worded) => SqlError::Engine(worded),
+            None => error,
+        }
+    }
+
+    /// The columns the PRIMARY KEY of `table` covers, in key order, read from the engine's
+    /// own schema. Empty for a table it holds no such declaration for.
+    fn primary_key_of(&self, table: &str) -> Vec<String> {
+        let Ok(mut statement) = self.conn.prepare(
+            "SELECT info.name FROM sqlite_master AS m JOIN pragma_table_info(m.name) AS info \
+             WHERE m.type = 'table' AND m.name = ?1 COLLATE NOCASE AND info.pk > 0 \
+             ORDER BY info.pk",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(columns) = statement.query_map([table], |row| row.get::<_, String>(0)) else {
+            return Vec::new();
+        };
+        columns.filter_map(Result::ok).collect()
+    }
+
+    /// Run `sql` once per parameter set, as ONE unit of work: either every statement
+    /// of the batch is applied, or none of them is.
+    ///
+    /// `BatchExecuteStatement` is "a batch SQL statement over an array of data", and a
+    /// batch one of whose statements fails leaves nothing behind: the whole batch is
+    /// refused, so a caller retrying it cannot land a row twice. The statements run
+    /// inside a savepoint the engine itself undoes, which is what makes that atomic
+    /// rather than a sequence of writes this module tries to take back by hand.
+    ///
+    /// `budget` is the REQUEST's, shared by every statement of the batch, so N parameter
+    /// sets buy neither N deadlines nor N times the output.
+    pub fn run_batch_within(
+        &mut self,
+        budget: &mut RequestBudget,
+        sql: &str,
+        parameter_sets: &[Vec<SqlParameter>],
+    ) -> Result<Vec<StatementOutcome>, SqlError> {
+        self.conn
+            .execute_batch(BATCH_SAVEPOINT_BEGIN)
+            .map_err(SqlError::from_engine)?;
+        let mut outcomes = Vec::with_capacity(parameter_sets.len());
+        let mut refused = None;
+        for parameters in parameter_sets {
+            match self.run_within(budget, sql, parameters) {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(error) => {
+                    refused = Some(error);
+                    break;
+                }
+            }
+        }
+        let Some(error) = refused else {
+            self.conn
+                .execute_batch(BATCH_SAVEPOINT_RELEASE)
+                .map_err(SqlError::from_engine)?;
+            return Ok(outcomes);
+        };
+        // Undoing the batch is what makes the refusal atomic, so a failure to undo it is
+        // reported rather than passed over: the caller is told the batch was refused, and
+        // this says so if the engine could not take the earlier statements back.
+        if let Err(undone) = self.conn.execute_batch(BATCH_SAVEPOINT_ROLLBACK) {
+            tracing::error!(
+                error = %undone,
+                "the rds-data data plane could not undo a refused batch"
+            );
+        }
+        Err(error)
     }
 
     fn run_bounded(
@@ -806,7 +1022,6 @@ impl Database {
         let plan = postgres::plan(sql)?;
         let mut statement = self.conn.prepare(&plan.sql).map_err(SqlError::from_engine)?;
         let mut columns = self.describe(&statement, &plan);
-        require_returnable(&columns)?;
         bind_named_parameters(&mut statement, parameters)?;
 
         let mut rows = Vec::new();
@@ -866,6 +1081,13 @@ impl Database {
                 column.type_name.clone(),
             );
         }
+        // The RESULT is shaped once the statement has been APPLIED, so a statement whose
+        // result cannot be returned still did what it said: AWS runs and commits an
+        // `INSERT … RETURNING` whose returned value the API cannot represent, and only
+        // then refuses the result. Refusing it before the statement ran would make
+        // "the result is unsupported" indistinguishable from "the statement was rejected"
+        // — the row would be missing against this emulator and present against AWS.
+        require_returnable(&columns)?;
         Ok(StatementOutcome {
             columns,
             rows,
@@ -903,16 +1125,24 @@ impl Database {
                     None => (None, None),
                 };
                 let (pg, named_type) = match declared_type.as_deref() {
-                    Some(declared_type) => (
+                    Some(declared_type) => {
                         // A column the engine reports as an integer may be one
                         // this database declared with a sequence, which is the
                         // type the catalog holds for it.
-                        match self.declared_sequence(table_name.as_deref(), &label) {
+                        let mut pg = match self.declared_sequence(table_name.as_deref(), &label) {
                             Some(sequence) => postgres::pg_type(&sequence),
                             None => postgres::pg_type(declared_type),
-                        },
-                        true,
-                    ),
+                        };
+                        // A refusal the STATEMENT's own text determines stands even where
+                        // the table names the column's type: it is about the VALUE this
+                        // statement puts in that column, not about the declaration.
+                        if pg.refusal.is_none() {
+                            pg.refusal = plan
+                                .result_type(index, count)
+                                .and_then(|planned| planned.refusal.clone());
+                        }
+                        (pg, true)
+                    }
                     None => match plan.result_type(index, count) {
                         Some(pg) => (pg.clone(), true),
                         None => (postgres::type_of_storage_class(None), false),
@@ -1076,6 +1306,22 @@ impl Drop for Watchdog {
 }
 
 /// A transaction a caller opened with `BeginTransaction`.
+///
+/// A transaction has three states, which are three different answers to a later call:
+///
+/// * OPEN — its statements run against its own copy of the database;
+/// * ABORTED — a statement of its own FAILED, so "a transaction is terminated when a
+///   statement in it fails" (`BeginTransaction`'s own documentation) and the database
+///   ignores every further command "until end of transaction block". The transaction is
+///   still THERE: only a commit or a rollback ends it, and either one discards what it
+///   wrote;
+/// * ENDED — a commit installed its writes, or a rollback discarded them. Its id stays
+///   with the cluster rather than vanishing from it, so a later call quoting that id is
+///   answered for a transaction that ended rather than served against a copy of the
+///   database nobody can commit any more.
+///
+/// Its copy of the database goes when it ends, so what is remembered is the id and when it
+/// ended.
 #[derive(Debug)]
 pub struct Transaction {
     /// The opaque id returned to the caller and used to find this transaction.
@@ -1088,9 +1334,16 @@ pub struct Transaction {
     /// When a call last used this transaction's id, which is what the idle timeout
     /// is measured from.
     pub last_used_at: SystemTime,
-    /// The transaction's own copy of the database, taken when it was opened:
-    /// written by its statements, installed on commit, dropped on rollback.
-    pub pending: Database,
+    /// The transaction's own copy of the database, taken when it was opened: written by
+    /// its statements, installed on commit, dropped on rollback — and `None` once the
+    /// transaction has ENDED, because an ended transaction has no database to write into.
+    /// An ABORTED transaction still holds it: the copy is what a rollback discards.
+    pending: Option<Database>,
+    /// Set when a statement of this transaction failed, which is what the database
+    /// ignores every further command of it for. A commit or a rollback still ends it.
+    aborted: bool,
+    /// When the transaction ended, and `None` while it is open or aborted.
+    terminated_at: Option<SystemTime>,
 }
 
 impl Transaction {
@@ -1098,7 +1351,8 @@ impl Transaction {
     /// snapshot. The id is opaque and unique (a version-4 UUID's 32 hex digits,
     /// well inside the modelled 192-character limit). A cluster holds at most
     /// [`MAX_OPEN_TRANSACTIONS`] open transactions — each is a whole copy of a
-    /// database — past which opening another is refused.
+    /// database — past which opening another is refused. A transaction that ENDED holds
+    /// no database, so it is not one of them.
     pub fn open(
         cluster: &mut Cluster,
         resource_arn: &str,
@@ -1106,7 +1360,7 @@ impl Transaction {
         database: Option<&String>,
         schema: Option<&String>,
     ) -> Result<String, SqlError> {
-        if cluster.transactions.len() >= MAX_OPEN_TRANSACTIONS {
+        if cluster.open_transaction_count() >= MAX_OPEN_TRANSACTIONS {
             return Err(SqlError::Capacity(format!(
                 "this emulator holds at most {MAX_OPEN_TRANSACTIONS} open transactions per cluster"
             )));
@@ -1124,7 +1378,9 @@ impl Transaction {
                 schema: schema.cloned(),
                 created_at: now,
                 last_used_at: now,
-                pending,
+                pending: Some(pending),
+                aborted: false,
+                terminated_at: None,
             },
         );
         Ok(id)
@@ -1135,15 +1391,70 @@ impl Transaction {
         self.last_used_at = SystemTime::now();
     }
 
-    /// Whether the clock has already timed this transaction out.
+    /// Whether this transaction has ENDED — a commit installed its writes, or a rollback
+    /// discarded them.
+    pub fn is_terminal(&self) -> bool {
+        self.terminated_at.is_some()
+    }
+
+    /// Whether a statement of this transaction FAILED, so the database ignores every
+    /// further command of it until the transaction block ends.
+    pub fn is_aborted(&self) -> bool {
+        self.aborted
+    }
+
+    /// The database this transaction's statements write into.
+    ///
+    /// `Err` once a statement of this transaction has failed: the database "ignores
+    /// commands until end of transaction block", which is an error the DATABASE raises
+    /// for every further statement rather than the transaction being gone.
+    pub fn open_database(&mut self) -> Result<&mut Database, SqlError> {
+        if self.aborted {
+            return Err(SqlError::Engine(postgres::transaction_aborted()));
+        }
+        self.pending.as_mut().ok_or(SqlError::TransactionNotFound)
+    }
+
+    /// End this transaction and hand back the database it was writing into, so the caller
+    /// can install it (a commit) or read the sequence marks out of it and drop it (a
+    /// rollback). The id stays in the cluster, now ended.
+    ///
+    /// `Err` for one that has already ended, which is what refuses a second commit or
+    /// rollback of the same id.
+    pub fn end(&mut self) -> Result<Database, SqlError> {
+        let pending = self.pending.take().ok_or(SqlError::TransactionNotFound)?;
+        self.terminated_at = Some(SystemTime::now());
+        Ok(pending)
+    }
+
+    /// Record that a statement of this transaction FAILED, which is what terminates it:
+    /// "a transaction is terminated when a statement in it fails"
+    /// (`BeginTransaction`'s own documentation). Nothing it wrote can reach the committed
+    /// database any more — a commit of it discards its writes exactly as a rollback does —
+    /// and the copy it was writing into is kept until one of them ends it, because that is
+    /// what they discard.
+    pub fn abort(&mut self) {
+        self.aborted = true;
+    }
+
+    /// Whether the clock has already timed this transaction out — an OPEN or ABORTED one
+    /// idle or old enough to be rolled back, or an ENDED one past the window a terminal id
+    /// is kept for.
     fn timed_out(&self) -> bool {
-        self.last_used_at
-            .elapsed()
-            .is_ok_and(|idle| idle >= TRANSACTION_IDLE_TIMEOUT)
-            || self
-                .created_at
+        match self.terminated_at {
+            Some(terminated_at) => terminated_at
                 .elapsed()
-                .is_ok_and(|age| age >= TRANSACTION_MAX_LIFETIME)
+                .is_ok_and(|since| since >= TERMINAL_TRANSACTION_MEMORY),
+            None => {
+                self.last_used_at
+                    .elapsed()
+                    .is_ok_and(|idle| idle >= TRANSACTION_IDLE_TIMEOUT)
+                    || self
+                        .created_at
+                        .elapsed()
+                        .is_ok_and(|age| age >= TRANSACTION_MAX_LIFETIME)
+            }
+        }
     }
 }
 
@@ -1311,16 +1622,14 @@ impl ColumnInfo {
 }
 
 /// Refuse a result set carrying a column of a type the `Field` union has no
-/// member for.
+/// member for, or a value the result has no form for.
 ///
 /// The statement itself is valid and the engine ran it: it is the RESULT that
 /// cannot be returned, which is what the modelled `UnsupportedResultException`
-/// ("It contained an unsupported data type") says.
+/// ("It contained an unsupported data type") says — which is why this runs AFTER the
+/// statement has been applied.
 fn require_returnable(columns: &[ColumnInfo]) -> Result<(), SqlError> {
-    match columns
-        .iter()
-        .find_map(|column| column.pg.refusal.as_ref())
-    {
+    match columns.iter().find_map(|column| column.pg.refusal.as_ref()) {
         Some(refusal) => Err(SqlError::UnsupportedResult(refusal.clone())),
         None => Ok(()),
     }
@@ -1412,10 +1721,12 @@ pub enum SqlError {
     /// constraint violation, an action the authorizer does not allow, or a limit
     /// the connection carries.
     Engine(String),
-    /// A named placeholder in the statement has no value in `parameters`.
-    MissingParameter(String),
-    /// A parameter the request supplied is not one this data plane can bind.
-    UnsupportedParameter(String),
+    /// The request's `parameters` cannot be bound to the statement's placeholders: a
+    /// placeholder with no parameter, a parameter named twice, a name that is not a
+    /// parameter name, or a value the service refuses as a parameter. A fault of the
+    /// CALL rather than of the statement, so it is reported as a validation fault and
+    /// carries the sentence AWS words that fault with ([`parameter_faults`]).
+    Parameter(String),
     /// The result the statement produced cannot be returned in the form the
     /// request asked for.
     UnsupportedResult(String),
@@ -1465,18 +1776,29 @@ impl SqlError {
         Self::Unavailable(error.to_string())
     }
 
+    /// Whether a transaction a statement failed in is ENDED by that failure, or stays
+    /// there to be ended by a commit or a rollback.
+    ///
+    /// "A transaction is terminated when a statement in it fails"
+    /// (`BeginTransaction`'s own documentation): a statement the engine refused, or one
+    /// its deadline stopped, reached the database and failed there, so the transaction it
+    /// was part of can no longer be committed. A fault of the CALL — a parameter that
+    /// cannot be bound, a member the model does not constrain — never reached the
+    /// database, and a RESULT the API cannot represent is not the statement failing:
+    /// neither touches the transaction.
+    pub fn terminates_a_transaction(&self) -> bool {
+        matches!(self, Self::Engine(_) | Self::Timeout)
+    }
+
     /// What to tell the caller.
     pub fn message(&self) -> String {
         match self {
             Self::Engine(message)
-            | Self::UnsupportedParameter(message)
+            | Self::Parameter(message)
             | Self::UnsupportedResult(message)
             | Self::InvalidRequest(message)
             | Self::Capacity(message) => message.clone(),
-            Self::MissingParameter(name) => {
-                format!("no value supplied for the named parameter :{name}")
-            }
-            Self::TransactionNotFound => "The transaction ID wasn't found".to_string(),
+            Self::TransactionNotFound => TRANSACTION_NOT_RUNNING_MESSAGE.to_string(),
             Self::Timeout => format!(
                 "the statement did not finish within {} seconds",
                 STATEMENT_TIME_BUDGET.as_secs()
@@ -1488,23 +1810,6 @@ impl SqlError {
             Self::Unavailable(_) => "An internal error occurred".to_string(),
         }
     }
-}
-
-/// Refuse a member the model types as `Arn` that is not one.
-///
-/// The model types both `resourceArn` and `secretArn` as `Arn`, and an ARN is
-/// `arn:<partition>:<service>:<region>:<account-id>:<resource>`. A value of another
-/// shape names neither a cluster nor a secret, so the call is refused rather than
-/// served — the emulator has no RDS control plane and no Secrets Manager binding to
-/// resolve either value against, so this shape check is all it can honestly check.
-pub fn require_arn(member: &str, value: &str) -> Result<(), SqlError> {
-    if value.starts_with("arn:") && value.split(':').count() >= 6 {
-        return Ok(());
-    }
-    Err(SqlError::InvalidRequest(format!(
-        "{member} must be an Amazon Resource Name of the form \
-         arn:<partition>:<service>:<region>:<account-id>:<resource>"
-    )))
 }
 
 /// What caller SQL may do inside this emulator's data plane — the authorizer every
@@ -1593,6 +1898,80 @@ fn confine_to_data_plane(context: AuthContext<'_>) -> Authorization {
     }
 }
 
+/// The sentences AWS refuses each distinct parameter-binding fault with. Every one is
+/// fixed text but for the NAME, which comes from the request's own `parameters` or from
+/// the placeholder in its statement.
+///
+/// A binding fault is a fault of the CALL, not of the statement, which is why these are
+/// answered as validation faults and never as a SQL error: the caller has to change its
+/// request, not its data.
+pub mod parameter_faults {
+    /// A placeholder in the statement that no parameter supplies a value for. The name is
+    /// the placeholder's, WITHOUT the prefix that introduces it in the statement.
+    pub fn cannot_find(name: &str) -> String {
+        format!("Cannot find parameter: {name}")
+    }
+
+    /// Two parameters of the same name: which value the placeholder takes is not the
+    /// service's to choose.
+    pub fn duplicate(name: &str) -> String {
+        format!("Duplicate parameter {name}")
+    }
+
+    /// A parameter whose NAME carries the ':' that introduces a placeholder in the
+    /// statement. The name belongs to the parameter; the prefix belongs to the statement.
+    pub fn invalid_name(name: &str) -> String {
+        format!("Named parameter syntax is invalid, input: {name}")
+    }
+
+    /// An `arrayValue` parameter. The `Field` union declares an `arrayValue` arm — it is
+    /// how an array comes BACK — but `parameters`'s own documentation says "Array
+    /// parameters are not supported".
+    pub const ARRAYS_UNSUPPORTED: &str = "Array parameters are not supported.";
+}
+
+/// Refuse a request whose `parameters` cannot be bound, before the statement runs.
+///
+/// Three faults are decided from the request alone — a name repeated, a name carrying the
+/// placeholder prefix, and an `arrayValue` — so they are decided here, ahead of the
+/// engine: the statement must not run and then be refused. The fourth, a placeholder with
+/// no parameter, needs the statement the engine prepared and is reported from
+/// [`bind_named_parameters`].
+///
+/// BOUNDED, and in ONE pass: the list's length is the caller's to choose, so it is capped
+/// at [`MAX_PARAMETERS_PER_STATEMENT`] before anything is scanned, and the repeated name is
+/// found through a set rather than by comparing each name with the ones before it — so the
+/// work is linear in the list and the list is bounded.
+///
+/// Shared by both operations that carry parameters, so one set of parameters is judged one
+/// way whichever of them is called.
+pub fn require_bindable_parameters(parameters: &[SqlParameter]) -> Result<(), SqlError> {
+    if parameters.len() > MAX_PARAMETERS_PER_STATEMENT {
+        // A property of the REQUEST: it carries more values than one statement can bind.
+        return Err(SqlError::InvalidRequest(format!(
+            "parameters carries {} values; a statement binds at most \
+             {MAX_PARAMETERS_PER_STATEMENT}",
+            parameters.len()
+        )));
+    }
+    let mut named: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for parameter in parameters {
+        let name = parameter.name.as_deref().unwrap_or_default();
+        if name.starts_with(':') {
+            return Err(SqlError::Parameter(parameter_faults::invalid_name(name)));
+        }
+        if !named.insert(name) {
+            return Err(SqlError::Parameter(parameter_faults::duplicate(name)));
+        }
+        if matches!(parameter.value.as_ref(), Some(Field::arrayValue(_))) {
+            return Err(SqlError::Parameter(
+                parameter_faults::ARRAYS_UNSUPPORTED.to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Bind every placeholder of a prepared statement from `parameters`.
 ///
 /// A named placeholder (`:name`, `@name`, `$name` — the forms SQLite accepts) takes
@@ -1618,11 +1997,11 @@ fn bind_named_parameters(
                             .as_deref()
                             .is_some_and(|candidate| candidate == name)
                     })
-                    .ok_or_else(|| SqlError::MissingParameter(name.to_string()))?
+                    .ok_or_else(|| SqlError::Parameter(parameter_faults::cannot_find(name)))?
             }
-            None => parameters
-                .get(position)
-                .ok_or_else(|| SqlError::MissingParameter((position + 1).to_string()))?,
+            None => parameters.get(position).ok_or_else(|| {
+                SqlError::Parameter(parameter_faults::cannot_find(&(position + 1).to_string()))
+            })?,
         };
         statement
             .raw_bind_parameter(position + 1, sql_value_for(parameter)?)
@@ -1649,7 +2028,7 @@ fn sql_value_for(parameter: &SqlParameter) -> Result<SqlValue, SqlError> {
     Ok(match parameter.value.as_ref() {
         None | Some(Field::isNull(true)) => SqlValue::Null,
         Some(Field::isNull(false)) => {
-            return Err(SqlError::UnsupportedParameter(format!(
+            return Err(SqlError::Parameter(format!(
                 "parameter {} sets isNull to false, which names no value; send the value \
                  in its own member, or isNull true for a NULL",
                 parameter.name.as_deref().unwrap_or("")
@@ -1663,9 +2042,11 @@ fn sql_value_for(parameter: &SqlParameter) -> Result<SqlValue, SqlError> {
             None => SqlValue::Text(value.clone()),
         },
         Some(Field::blobValue(value)) => SqlValue::Blob(value.clone()),
+        // Refused by [`require_bindable_parameters`] before the statement is prepared;
+        // this arm is what makes the union exhaustive.
         Some(Field::arrayValue(_)) => {
-            return Err(SqlError::UnsupportedParameter(
-                "array parameters are not supported".to_string(),
+            return Err(SqlError::Parameter(
+                parameter_faults::ARRAYS_UNSUPPORTED.to_string(),
             ))
         }
     })
@@ -1703,7 +2084,7 @@ fn hinted_text(name: &str, hint: &str, value: &str) -> Result<SqlValue, SqlError
         // seventh value is a request this service cannot act on rather than a
         // hint it may drop.
         _ => {
-            return Err(SqlError::InvalidRequest(format!(
+            return Err(SqlError::Parameter(format!(
                 "parameter {name} carries typeHint {hint}, which is not one of DATE, \
                  DECIMAL, JSON, TIME, TIMESTAMP or UUID"
             )))
@@ -1712,7 +2093,7 @@ fn hinted_text(name: &str, hint: &str, value: &str) -> Result<SqlValue, SqlError
     if accepted {
         Ok(SqlValue::Text(value.to_string()))
     } else {
-        Err(SqlError::InvalidRequest(format!(
+        Err(SqlError::Parameter(format!(
             "parameter {name} carries typeHint {hint}, whose accepted format is {form}"
         )))
     }
@@ -2108,16 +2489,14 @@ fn json_for(value: &SqlValue, column: &ColumnInfo) -> Result<serde_json::Value, 
                 serde_json::Value::from(*number)
             }
         }
-        // JSON has no form for a non-finite number, so one the engine produced
-        // (an overflow, a division that is not a number) is refused rather than
-        // reported as NULL, which would tell the caller the value is missing.
+        // JSON has no form for a non-finite number, and neither has the `Field` union:
+        // such a value is the result this call cannot return, stated the way the
+        // modelled refusal states it, rather than reported as NULL, which would tell the
+        // caller the value is missing.
         SqlValue::Real(number) => serde_json::Number::from_f64(*number)
             .map(serde_json::Value::Number)
             .ok_or_else(|| {
-                SqlError::UnsupportedResult(format!(
-                    "column {} holds {number}, which has no JSON form",
-                    column.label
-                ))
+                SqlError::UnsupportedResult(postgres::NON_FINITE_FLOAT.to_string())
             })?,
         // An array column's value is the list of its elements, not the text the
         // engine holds that list as.

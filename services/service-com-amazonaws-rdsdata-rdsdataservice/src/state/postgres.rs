@@ -162,10 +162,219 @@ mod jdbc {
     pub const OTHER: i32 = 1111;
 }
 
+/// What the Data API tells a caller whose `sql` carries more than one statement: a call
+/// runs one statement, and this is the sentence that says so.
+pub(super) const MULTISTATEMENT_REFUSAL: &str = "Multistatements aren't supported.";
+
 /// What the modelled `UnsupportedResultException` says about a result whose type
 /// it cannot carry. The model's own wording for the condition: "It contained a
 /// multidimensional array."
 pub(super) const MULTIDIMENSIONAL_ARRAY: &str = "The result contains a multidimensional array.";
+
+/// What the Data API says about a floating value that is not a number at all: JSON has no
+/// form for `NaN` or `Infinity`, so a result set carrying one cannot be rendered as the
+/// single JSON string `formatRecordsAs=JSON` asks for, and the modelled
+/// `UnsupportedResultException` says so in AWS's own words.
+pub(super) const NON_FINITE_FLOAT: &str = "NaN and Infinity values are not supported";
+
+/// How the Data API renders an error the DATABASE raised: the engine's own message,
+/// introduced the way PostgreSQL introduces an error, and closed with the SQLSTATE of the
+/// condition — which is what a client classifies the failure by.
+fn postgresql_error(message: &str, sqlstate: &str) -> String {
+    format!("ERROR: {message}; SQLState: {sqlstate}")
+}
+
+/// How PostgreSQL states that a statement reached a transaction a previous statement of
+/// it already failed in: "current transaction is aborted, commands ignored until end of
+/// transaction block", under the SQLSTATE of that condition (class 25, in-failed-SQL-
+/// transaction).
+///
+/// An error the DATABASE raises for the statement, which is why it is reported as the
+/// database's error and not as the transaction being gone: the transaction is still there,
+/// and a commit or a rollback still ends it.
+pub(super) fn transaction_aborted() -> String {
+    postgresql_error(
+        "current transaction is aborted, commands ignored until end of transaction block",
+        SQLSTATE_IN_FAILED_TRANSACTION,
+    )
+}
+
+/// How PostgreSQL states a statement it cannot parse: "syntax error at or near" the token
+/// it stopped on, the POSITION of that token in the statement, and the SQLSTATE of a
+/// syntax error.
+///
+/// The token and the place come from the PARSER's own answer — which names the token it
+/// found and the line and column it found it at — so nothing here reads the caller's SQL
+/// to decide what is wrong with it; the statement is read only to count the characters
+/// before that line and column, which is the POSITION PostgreSQL reports.
+///
+/// A parser answer that names no such token keeps the parser's own text: there is nothing
+/// to state PostgreSQL's sentence from.
+pub(super) fn syntax_error(sql: &str, parser_message: &str) -> String {
+    let Some((token, place)) = parser_message
+        .split_once(PARSER_FOUND)
+        .and_then(|(_, rest)| rest.split_once(PARSER_AT_LINE))
+    else {
+        return parser_message.to_string();
+    };
+    let Some((line, column)) = place.split_once(PARSER_COLUMN) else {
+        return parser_message.to_string();
+    };
+    let (Ok(line), Ok(column)) = (
+        line.trim().trim_end_matches(',').parse::<usize>(),
+        column.trim().parse::<usize>(),
+    ) else {
+        return parser_message.to_string();
+    };
+    postgresql_error(
+        &format!(
+            "syntax error at or near \"{}\"; Position: {}",
+            token.trim(),
+            character_position(sql, line, column)
+        ),
+        SQLSTATE_SYNTAX_ERROR,
+    )
+}
+
+/// How the parser's own answer introduces the token it stopped on and the place it found
+/// it at.
+const PARSER_FOUND: &str = " found: ";
+const PARSER_AT_LINE: &str = " at Line: ";
+const PARSER_COLUMN: &str = " Column: ";
+
+/// The 1-based CHARACTER position of (`line`, `column`) in `sql`, which is what
+/// PostgreSQL's `Position` reports — where the parser answers a line and a column.
+fn character_position(sql: &str, line: usize, column: usize) -> usize {
+    let before: usize = sql
+        .split('\n')
+        .take(line.saturating_sub(1))
+        // The newline that ends each line counts as one character.
+        .map(|earlier| earlier.chars().count() + 1)
+        .sum();
+    before + column.max(1)
+}
+
+/// The SQLSTATEs of the conditions this front end words, from PostgreSQL's "Error Codes"
+/// appendix: a unique violation, a not-null violation, a statement in a transaction that
+/// has already failed, a statement that cannot be parsed, and the two catalog lookups
+/// that find nothing.
+const SQLSTATE_UNIQUE_VIOLATION: &str = "23505";
+const SQLSTATE_NOT_NULL_VIOLATION: &str = "23502";
+const SQLSTATE_IN_FAILED_TRANSACTION: &str = "25P02";
+const SQLSTATE_SYNTAX_ERROR: &str = "42601";
+const SQLSTATE_UNDEFINED_TABLE: &str = "42P01";
+const SQLSTATE_UNDEFINED_COLUMN: &str = "42703";
+
+/// How the SQL engine behind this front end introduces each condition in its own
+/// diagnostics, which is what is read to recognise the condition. Nothing is matched on
+/// the statement's text: this reads the ENGINE's answer, not the caller's SQL.
+const ENGINE_UNIQUE_VIOLATION: &str = "UNIQUE constraint failed: ";
+const ENGINE_NOT_NULL_VIOLATION: &str = "NOT NULL constraint failed: ";
+const ENGINE_UNDEFINED_TABLE: &str = "no such table: ";
+const ENGINE_UNDEFINED_COLUMN: &str = "no such column: ";
+/// The engine's other spelling of an undefined column, which names the table too: "table
+/// <table> has no column named <column>".
+const ENGINE_UNDEFINED_COLUMN_OF: &str = "table ";
+const ENGINE_UNDEFINED_COLUMN_OF_MIDDLE: &str = " has no column named ";
+
+/// The NAME the engine's diagnostic is about, read out of the text that follows its
+/// prefix: the engine adds a hint and the statement it was parsing to some of its
+/// messages, where PostgreSQL's own sentence carries the name alone.
+fn named_in(rest: &str) -> String {
+    let head = rest.split(" - ").next().unwrap_or(rest).trim();
+    let head = head.split_whitespace().next().unwrap_or(head);
+    head.trim_matches('"').to_string()
+}
+
+/// One column a constraint covers, as the engine names it: `table.column`.
+fn split_qualified(qualified: &str) -> Option<(&str, &str)> {
+    qualified.trim().rsplit_once('.')
+}
+
+/// The diagnostic the DATABASE THIS API ADVERTISES words an engine error with, or `None`
+/// for a condition this front end does not word — whose own text the caller sees.
+///
+/// The Data API answers for Aurora PostgreSQL, so an error the database raised reaches the
+/// caller in PostgreSQL's words and with PostgreSQL's SQLSTATE, whatever engine actually
+/// ran the statement: that text and that code are what a client branches on, so an
+/// engine-specific sentence in their place is a sentence no client can classify.
+///
+/// `primary_key_of` answers the columns a table's PRIMARY KEY covers, which is what
+/// decides the NAME of the violated constraint: PostgreSQL names a table's primary-key
+/// constraint `<table>_pkey` and a unique constraint over other columns
+/// `<table>_<column…>_key`.
+pub(super) fn postgresql_diagnostic(
+    engine_message: &str,
+    primary_key_of: &dyn Fn(&str) -> Vec<String>,
+) -> Option<String> {
+    if let Some(columns) = engine_message.strip_prefix(ENGINE_UNIQUE_VIOLATION) {
+        let qualified: Vec<(&str, &str)> = columns.split(',').filter_map(split_qualified).collect();
+        let (table, _) = *qualified.first()?;
+        let violated: Vec<String> = qualified
+            .iter()
+            .map(|(_, column)| (*column).to_string())
+            .collect();
+        let constraint = if covers_the_same_columns(&primary_key_of(table), &violated) {
+            format!("{table}_pkey")
+        } else {
+            format!("{table}_{}_key", violated.join("_"))
+        };
+        return Some(postgresql_error(
+            &format!("duplicate key value violates unique constraint \"{constraint}\""),
+            SQLSTATE_UNIQUE_VIOLATION,
+        ));
+    }
+    if let Some(column) = engine_message.strip_prefix(ENGINE_NOT_NULL_VIOLATION) {
+        let (table, column) = split_qualified(column)?;
+        return Some(postgresql_error(
+            &format!(
+                "null value in column \"{column}\" of relation \"{table}\" violates not-null \
+                 constraint"
+            ),
+            SQLSTATE_NOT_NULL_VIOLATION,
+        ));
+    }
+    if let Some(table) = engine_message.strip_prefix(ENGINE_UNDEFINED_TABLE) {
+        return Some(postgresql_error(
+            &format!("relation \"{}\" does not exist", named_in(table)),
+            SQLSTATE_UNDEFINED_TABLE,
+        ));
+    }
+    if let Some(column) = engine_message.strip_prefix(ENGINE_UNDEFINED_COLUMN) {
+        return Some(postgresql_error(
+            &format!("column \"{}\" does not exist", named_in(column)),
+            SQLSTATE_UNDEFINED_COLUMN,
+        ));
+    }
+    if let Some((table, column)) = engine_message
+        .strip_prefix(ENGINE_UNDEFINED_COLUMN_OF)
+        .and_then(|rest| rest.split_once(ENGINE_UNDEFINED_COLUMN_OF_MIDDLE))
+    {
+        return Some(postgresql_error(
+            &format!(
+                "column \"{}\" of relation \"{}\" does not exist",
+                named_in(column),
+                named_in(table)
+            ),
+            SQLSTATE_UNDEFINED_COLUMN,
+        ));
+    }
+    None
+}
+
+/// Whether two lists of column names cover the same columns, compared the way the engine
+/// and the catalog spell them (without regard to case) and without regard to order.
+fn covers_the_same_columns(one: &[String], other: &[String]) -> bool {
+    if one.is_empty() || one.len() != other.len() {
+        return false;
+    }
+    let fold = |names: &[String]| {
+        let mut folded: Vec<String> = names.iter().map(|name| name.to_lowercase()).collect();
+        folded.sort_unstable();
+        folded
+    };
+    fold(one) == fold(other)
+}
 
 /// What a value of a type is, as far as the `Field` union is concerned: the
 /// member a value comes back in, and whether a number is exact.
@@ -367,7 +576,7 @@ pub fn plan(sql: &str) -> Result<Plan, SqlError> {
     let dialect = PostgreSqlDialect {};
     let tokens = Tokenizer::new(&dialect, sql)
         .tokenize()
-        .map_err(|error| SqlError::Engine(error.to_string()))?;
+        .map_err(|error| SqlError::Engine(syntax_error(sql, &error.to_string())))?;
     let (set_operations, levels) = chained_levels(&tokens);
     if set_operations > MAX_SET_OPERATIONS {
         return Err(SqlError::InvalidRequest(format!(
@@ -385,12 +594,14 @@ pub fn plan(sql: &str) -> Result<Plan, SqlError> {
         .with_recursion_limit(MAX_PARSE_DEPTH)
         .try_with_sql(sql)
         .and_then(|mut parser| parser.parse_statements())
-        .map_err(|error| SqlError::Engine(error.to_string()))?;
+        .map_err(|error| SqlError::Engine(syntax_error(sql, &error.to_string())))?;
     if statements.len() != 1 {
-        return Err(SqlError::InvalidRequest(format!(
-            "this call runs one SQL statement; {} were sent",
-            statements.len()
-        )));
+        // "Multistatements aren't supported." — a call runs ONE statement (`sql` is "The
+        // SQL statement"), and this is the sentence the service refuses a string carrying
+        // several with, whatever it carries.
+        return Err(SqlError::InvalidRequest(
+            MULTISTATEMENT_REFUSAL.to_string(),
+        ));
     }
     let mut statement = statements.remove(0);
     // The types the statement's own text gives its result columns are read from

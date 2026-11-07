@@ -48,12 +48,38 @@ uuid = { version = "1", features = ["v4"] }
 # documented format names, so no date arithmetic or format parsing is written
 # here. Same version the rest of the tree pins.
 time = { version = "0.3.55", default-features = false, features = ["parsing", "macros", "std"] }
+# `iam_authorization` / `iam_role`: the tree's ONE evaluation of IAM policy documents
+# against (action, resource), and the readings of a principal ARN, used by the
+# authorization leg of the request precondition chain (`src/state/authorization.rs`).
+service-common = { path = "../common" }
+# The CLUSTER a request addresses is Amazon RDS's resource, so whether it exists, whether
+# its Data API HTTP endpoint is turned on and which user it was created with are ASKED of
+# that service: the AWS SDK driven over the emulator's own in-process transport, through
+# the operation callback, so this crate names no other service's crate and an emulator
+# assembled without Amazon RDS is told apart from one that holds no such cluster.
+aws-sdk-rds = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The identity a request speaks for and the policies in force on it: the IAM store maps
+# an access key id to the user that holds it and holds that user's documents, and the STS
+# store resolves a session credential. No API answers "whose key is this", which is why
+# these stores are read rather than called.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The SECRET a request names is Secrets Manager's resource, and its value is sealed under
+# the key the secret names — only its owner can open it. So it is RETRIEVED the way any
+# emulated service reaches another: the AWS SDK driven over the in-process callback.
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# The owners of the cluster, the secret and the caller's identity, mounted beside this
+# service in the precondition suite so the facts the Data API resolves are real resources
+# of this emulator, created through those services' own operations.
+service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
+service-com-amazonaws-kms-trentservice = { workspace = true }
+service-com-amazonaws-rds-amazonrdsv19 = { workspace = true }
 # Hexadecimal, for writing a byte string as text in this crate's suites: the
 # bytes a binary column holds are written in hex and the base64 the response
 # carries them as is decoded back to them.

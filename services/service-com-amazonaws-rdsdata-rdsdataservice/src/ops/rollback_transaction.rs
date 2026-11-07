@@ -174,7 +174,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             RollbackTransactionError::from(
                 RollbackTransactionErrorModeled::InternalServerErrorException(
@@ -182,6 +181,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
+        // The same precondition chain every call of this service is admitted by, and for
+        // the same reason: a rollback is a call on the cluster, so the cluster, the
+        // secret and the identity are resolved before the transaction is looked up — a
+        // caller naming a cluster it may not reach is told that, not told about its
+        // transaction.
+        crate::state::preconditions::admit(
+            &*self.engine,
+            ctx,
+            &crate::state::preconditions::Call {
+                operation: Self::NAME,
+                resource_arn: &input.resource_arn,
+                secret_arn: &input.secret_arn,
+                sql: None,
+                database: None,
+            },
+        )
+        .await
+        .map_err(refused)?;
         // Dropping the transaction's database is engine-owned state under the
         // service lock, so it runs on the blocking pool under one wall clock.
         crate::state::in_data_plane(move || rollback(&store, &input))
@@ -190,30 +207,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// Report a call the precondition chain refused as the error this operation models for
+/// that class.
+fn refused(refusal: crate::state::preconditions::Refusal) -> RollbackTransactionError {
+    let message = Some(refusal.message());
+    match refusal {
+        crate::state::preconditions::Refusal::Validation(message) => {
+            return crate::scaffolded::Scaffolded::validation(message)
+        }
+        crate::state::preconditions::Refusal::AccessDenied(_) => {
+            RollbackTransactionErrorModeled::AccessDeniedException(AccessDeniedException {
+                message,
+            })
+        }
+        crate::state::preconditions::Refusal::HttpEndpointNotEnabled(_) => {
+            RollbackTransactionErrorModeled::HttpEndpointNotEnabledException(
+                HttpEndpointNotEnabledException { message },
+            )
+        }
+        crate::state::preconditions::Refusal::SecretsError(_) => {
+            RollbackTransactionErrorModeled::SecretsErrorException(SecretsErrorException {
+                message,
+            })
+        }
+        crate::state::preconditions::Refusal::InvalidSecret(_) => {
+            RollbackTransactionErrorModeled::InvalidSecretException(InvalidSecretException {
+                message,
+            })
+        }
+        crate::state::preconditions::Refusal::DatabaseError(_) => {
+            RollbackTransactionErrorModeled::DatabaseErrorException(DatabaseErrorException {
+                message,
+            })
+        }
+    }
+    .into()
+}
+
 /// Discard the transaction's writes, inside the data plane.
 fn rollback(
     store: &crate::state::Store,
     input: &RollbackTransactionInput,
 ) -> Result<RollbackTransactionOutput, crate::state::SqlError> {
-    crate::state::require_arn("resourceArn", &input.resource_arn)?;
-    crate::state::require_arn("secretArn", &input.secret_arn)?;
     let mut state = store.lock();
     let cluster = state.cluster_mut(&input.resource_arn)?;
     cluster.expire_timed_out_transactions();
-    let transaction = cluster
-        .transactions
-        .remove(&input.transaction_id)
-        .ok_or(crate::state::SqlError::TransactionNotFound)?;
+    // The name the transaction was opened for, read before it is ended.
+    let database = crate::state::database_key(
+        cluster
+            .open_transaction_mut(&input.transaction_id)?
+            .database
+            .as_ref(),
+    );
+    // Ending the transaction hands back the database it was writing into and leaves its
+    // id with the cluster, now terminal — so a SECOND rollback of the same id, or a
+    // statement carrying it, is answered for a transaction a previous call ended.
+    let pending = cluster.end_transaction(&input.transaction_id)?;
     // A sequence is not part of the transaction that took values out of it, so
     // the values its statements were handed are not handed out again: the marks
     // its own copy of the database holds are carried into the committed one
     // before that copy is dropped. Only into a database this cluster still has —
     // reporting a rollback creates nothing.
-    let marks = transaction.pending.sequence_marks();
-    let database = crate::state::database_key(transaction.database.as_ref());
+    let marks = pending.sequence_marks();
     // Discarding the transaction drops the database copy it was writing into, so
     // none of its writes ever reach the committed database.
-    drop(transaction);
+    drop(pending);
     if let Some(committed) = cluster.databases.get_mut(&database) {
         committed.advance_sequences(&marks);
     }
@@ -221,7 +279,7 @@ fn rollback(
     // the service reports for a rollback that finished, not a sentence about the
     // transaction.
     Ok(RollbackTransactionOutput {
-        transaction_status: Some("Rollback complete".to_string()),
+        transaction_status: Some(crate::state::ROLLBACK_COMPLETE_STATUS.to_string()),
     })
 }
 
@@ -255,7 +313,9 @@ fn request_failed(error: crate::state::SqlError) -> RollbackTransactionError {
                 ServiceUnavailableError::default(),
             )
         }
-        _ => RollbackTransactionErrorModeled::BadRequestException(BadRequestException { message }),
+        _ => RollbackTransactionErrorModeled::DatabaseErrorException(DatabaseErrorException {
+            message,
+        }),
     }
     .into()
 }

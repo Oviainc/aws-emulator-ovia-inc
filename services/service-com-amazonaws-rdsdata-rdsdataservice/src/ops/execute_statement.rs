@@ -241,12 +241,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ExecuteStatementError::from(ExecuteStatementErrorModeled::InternalServerErrorException(
                 InternalServerErrorException::default(),
             ))
         })?;
+        // The identity, the cluster, the secret, the login and the database the call
+        // names, all resolved BEFORE the statement runs: a call the chain refuses must
+        // not reach the engine, so nothing it would have written is written.
+        crate::state::preconditions::admit(
+            &*self.engine,
+            ctx,
+            &crate::state::preconditions::Call {
+                operation: Self::NAME,
+                resource_arn: &input.resource_arn,
+                secret_arn: &input.secret_arn,
+                sql: Some(&input.sql),
+                // A statement inside a transaction runs against the database that
+                // transaction was opened for, so the member is not a database this call
+                // selects.
+                database: match input.transaction_id {
+                    Some(_) => None,
+                    None => input.database.as_deref(),
+                },
+            },
+        )
+        .await
+        .map_err(refused)?;
         // The engine work is synchronous and CPU-bound, and it holds the state
         // lock, so it runs on the blocking pool under one wall clock rather than on
         // an async worker.
@@ -256,17 +277,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// Report a call the precondition chain refused as the error this operation models for
+/// that class.
+fn refused(refusal: crate::state::preconditions::Refusal) -> ExecuteStatementError {
+    let message = Some(refusal.message());
+    match refusal {
+        crate::state::preconditions::Refusal::Validation(message) => {
+            return crate::scaffolded::Scaffolded::validation(message)
+        }
+        crate::state::preconditions::Refusal::AccessDenied(_) => {
+            ExecuteStatementErrorModeled::AccessDeniedException(AccessDeniedException { message })
+        }
+        crate::state::preconditions::Refusal::HttpEndpointNotEnabled(_) => {
+            ExecuteStatementErrorModeled::HttpEndpointNotEnabledException(
+                HttpEndpointNotEnabledException { message },
+            )
+        }
+        crate::state::preconditions::Refusal::SecretsError(_) => {
+            ExecuteStatementErrorModeled::SecretsErrorException(SecretsErrorException { message })
+        }
+        crate::state::preconditions::Refusal::InvalidSecret(_) => {
+            ExecuteStatementErrorModeled::InvalidSecretException(InvalidSecretException { message })
+        }
+        crate::state::preconditions::Refusal::DatabaseError(_) => {
+            ExecuteStatementErrorModeled::DatabaseErrorException(DatabaseErrorException { message })
+        }
+    }
+    .into()
+}
+
 /// Run the statement and build the response, inside the data plane.
 fn execute(
     store: &crate::state::Store,
     input: &ExecuteStatementInput,
 ) -> Result<ExecuteStatementOutput, crate::state::SqlError> {
-    crate::state::require_arn("resourceArn", &input.resource_arn)?;
-    crate::state::require_arn("secretArn", &input.secret_arn)?;
+    let parameters = input.parameters.clone().unwrap_or_default();
+    // The faults of the request's own `parameters` are decided before the statement is
+    // prepared AND before the state lock is taken, so a request-shaped fault costs no
+    // other caller anything: the statement never runs, and nothing waits on this one.
+    crate::state::require_bindable_parameters(&parameters)?;
     let mut state = store.lock();
     let cluster = state.cluster_mut(&input.resource_arn)?;
     cluster.expire_timed_out_transactions();
-    let parameters = input.parameters.clone().unwrap_or_default();
 
     // ONE budget for this request: the deadline its statement runs under and the
     // response bytes it may produce, shared by reading the values out of the
@@ -279,14 +331,25 @@ fn execute(
     // and auto-commits — what the model's doc says an untransacted call does.
     let outcome = match input.transaction_id.as_deref() {
         Some(transaction_id) => {
-            let transaction = cluster
-                .transactions
-                .get_mut(transaction_id)
-                .ok_or(crate::state::SqlError::TransactionNotFound)?;
+            let transaction = cluster.open_transaction_mut(transaction_id)?;
             transaction.touch();
-            transaction
-                .pending
-                .run_within(&mut budget, &input.sql, &parameters)?
+            let ran = transaction
+                .open_database()?
+                .run_within(&mut budget, &input.sql, &parameters);
+            // "A transaction is terminated when a statement in it fails"
+            // (`BeginTransaction`'s own documentation), so a statement the ENGINE
+            // refused aborts the transaction it was part of: the database ignores every
+            // further command of it, and whatever it had written can no longer be
+            // committed — a commit of it discards those writes exactly as a rollback
+            // does.
+            if ran
+                .as_ref()
+                .err()
+                .is_some_and(crate::state::SqlError::terminates_a_transaction)
+            {
+                cluster.abort_transaction(transaction_id);
+            }
+            ran?
         }
         None => cluster
             .database_mut(&crate::state::database_key(input.database.as_ref()))?
@@ -337,6 +400,13 @@ fn format_as_json(format: Option<&str>) -> bool {
 }
 
 /// Report a statement that did not run as the error this operation models for it.
+///
+/// WHICH class a failure is depends on WHOSE fault it is, which is the one rule this
+/// mapping follows: an error the DATABASE raised while running the statement is
+/// `DatabaseErrorException` ("There was an error in processing the SQL statement"), a
+/// fault of the CALL — the request's own parameters or members — is a validation fault,
+/// and a result the API cannot represent is `UnsupportedResultException`. The deprecated
+/// `BadRequestException` ("This exception is deprecated") is answered for none of them.
 fn statement_failed(error: crate::state::SqlError) -> ExecuteStatementError {
     let message = Some(error.message());
     match error {
@@ -372,11 +442,20 @@ fn statement_failed(error: crate::state::SqlError) -> ExecuteStatementError {
                 ServiceUnavailableError::default(),
             )
         }
-        crate::state::SqlError::Engine(_)
-        | crate::state::SqlError::MissingParameter(_)
-        | crate::state::SqlError::UnsupportedParameter(_)
-        | crate::state::SqlError::InvalidRequest(_) => {
-            ExecuteStatementErrorModeled::BadRequestException(BadRequestException { message })
+        // The database raised it: the statement reached the engine and the engine
+        // refused it, which is the class a client branches on to tell "the database
+        // rejected my data" from "my call is wrong".
+        crate::state::SqlError::Engine(_) => {
+            ExecuteStatementErrorModeled::DatabaseErrorException(DatabaseErrorException { message })
+        }
+        // The CALL is wrong: a parameter that cannot be bound, or a member the model's
+        // own constraints do not reach — more than one statement in one `sql`, more
+        // parameter sets or more statement than one call runs. Nothing ran, and the
+        // caller has to change its request rather than its data, which is what the
+        // validation class says (the deprecated `BadRequestException` says neither).
+        crate::state::SqlError::Parameter(message)
+        | crate::state::SqlError::InvalidRequest(message) => {
+            return crate::scaffolded::Scaffolded::validation(message)
         }
     }
     .into()

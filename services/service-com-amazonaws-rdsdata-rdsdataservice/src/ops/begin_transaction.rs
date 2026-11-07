@@ -180,12 +180,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             BeginTransactionError::from(BeginTransactionErrorModeled::InternalServerErrorException(
                 InternalServerErrorException::default(),
             ))
         })?;
+        // The same precondition chain every call of this service is admitted by: a
+        // transaction is opened on a cluster that serves the Data API, with credentials
+        // that log in to it, or it is not opened at all — a returned transaction id for a
+        // cluster AWS would have refused is a handle on nothing.
+        crate::state::preconditions::admit(
+            &*self.engine,
+            ctx,
+            &crate::state::preconditions::Call {
+                operation: Self::NAME,
+                resource_arn: &input.resource_arn,
+                secret_arn: &input.secret_arn,
+                sql: None,
+                database: input.database.as_deref(),
+            },
+        )
+        .await
+        .map_err(refused)?;
         // Taking the transaction's snapshot is engine work, so it runs on the
         // blocking pool under one wall clock rather than on an async worker.
         crate::state::in_data_plane(move || begin(&store, &input))
@@ -194,13 +210,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// Report a call the precondition chain refused as the error this operation models for
+/// that class.
+fn refused(refusal: crate::state::preconditions::Refusal) -> BeginTransactionError {
+    let message = Some(refusal.message());
+    match refusal {
+        crate::state::preconditions::Refusal::Validation(message) => {
+            return crate::scaffolded::Scaffolded::validation(message)
+        }
+        crate::state::preconditions::Refusal::AccessDenied(_) => {
+            BeginTransactionErrorModeled::AccessDeniedException(AccessDeniedException { message })
+        }
+        crate::state::preconditions::Refusal::HttpEndpointNotEnabled(_) => {
+            BeginTransactionErrorModeled::HttpEndpointNotEnabledException(
+                HttpEndpointNotEnabledException { message },
+            )
+        }
+        crate::state::preconditions::Refusal::SecretsError(_) => {
+            BeginTransactionErrorModeled::SecretsErrorException(SecretsErrorException { message })
+        }
+        crate::state::preconditions::Refusal::InvalidSecret(_) => {
+            BeginTransactionErrorModeled::InvalidSecretException(InvalidSecretException { message })
+        }
+        crate::state::preconditions::Refusal::DatabaseError(_) => {
+            BeginTransactionErrorModeled::DatabaseErrorException(DatabaseErrorException { message })
+        }
+    }
+    .into()
+}
+
 /// Open the transaction, inside the data plane.
 fn begin(
     store: &crate::state::Store,
     input: &BeginTransactionInput,
 ) -> Result<BeginTransactionOutput, crate::state::SqlError> {
-    crate::state::require_arn("resourceArn", &input.resource_arn)?;
-    crate::state::require_arn("secretArn", &input.secret_arn)?;
     let mut state = store.lock();
     let cluster = state.cluster_mut(&input.resource_arn)?;
     cluster.expire_timed_out_transactions();
@@ -242,7 +285,11 @@ fn request_failed(error: crate::state::SqlError) -> BeginTransactionError {
                 ServiceUnavailableError::default(),
             )
         }
-        _ => BeginTransactionErrorModeled::BadRequestException(BadRequestException { message }),
+        // An error the DATABASE raised while this transaction was being opened; a fault
+        // of the CALL cannot reach here, because the chain above decided those.
+        _ => BeginTransactionErrorModeled::DatabaseErrorException(DatabaseErrorException {
+            message,
+        }),
     }
     .into()
 }

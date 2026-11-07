@@ -206,7 +206,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             BatchExecuteStatementError::from(
                 BatchExecuteStatementErrorModeled::InternalServerErrorException(
@@ -214,6 +213,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
+        // The same precondition chain every call of this service is admitted by: the
+        // identity, the cluster, the secret, the login and the database, all resolved
+        // before the batch reaches the engine.
+        crate::state::preconditions::admit(
+            &*self.engine,
+            ctx,
+            &crate::state::preconditions::Call {
+                operation: Self::NAME,
+                resource_arn: &input.resource_arn,
+                secret_arn: &input.secret_arn,
+                sql: Some(&input.sql),
+                database: match input.transaction_id {
+                    Some(_) => None,
+                    None => input.database.as_deref(),
+                },
+            },
+        )
+        .await
+        .map_err(refused)?;
         // The engine work is synchronous and CPU-bound, and it holds the state
         // lock, so it runs on the blocking pool under one wall clock rather than on
         // an async worker.
@@ -223,14 +241,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// Report a call the precondition chain refused as the error this operation models for
+/// that class.
+fn refused(refusal: crate::state::preconditions::Refusal) -> BatchExecuteStatementError {
+    let message = Some(refusal.message());
+    match refusal {
+        crate::state::preconditions::Refusal::Validation(message) => {
+            return crate::scaffolded::Scaffolded::validation(message)
+        }
+        crate::state::preconditions::Refusal::AccessDenied(_) => {
+            BatchExecuteStatementErrorModeled::AccessDeniedException(AccessDeniedException {
+                message,
+            })
+        }
+        crate::state::preconditions::Refusal::HttpEndpointNotEnabled(_) => {
+            BatchExecuteStatementErrorModeled::HttpEndpointNotEnabledException(
+                HttpEndpointNotEnabledException { message },
+            )
+        }
+        crate::state::preconditions::Refusal::SecretsError(_) => {
+            BatchExecuteStatementErrorModeled::SecretsErrorException(SecretsErrorException {
+                message,
+            })
+        }
+        crate::state::preconditions::Refusal::InvalidSecret(_) => {
+            BatchExecuteStatementErrorModeled::InvalidSecretException(InvalidSecretException {
+                message,
+            })
+        }
+        crate::state::preconditions::Refusal::DatabaseError(_) => {
+            BatchExecuteStatementErrorModeled::DatabaseErrorException(DatabaseErrorException {
+                message,
+            })
+        }
+    }
+    .into()
+}
+
 /// Run the statement once per parameter set and build the response, inside the
 /// data plane.
 fn execute_batch(
     store: &crate::state::Store,
     input: &BatchExecuteStatementInput,
 ) -> Result<BatchExecuteStatementOutput, crate::state::SqlError> {
-    crate::state::require_arn("resourceArn", &input.resource_arn)?;
-    crate::state::require_arn("secretArn", &input.secret_arn)?;
     let parameter_sets = input.parameter_sets.clone().unwrap_or_default();
     if parameter_sets.len() > crate::state::MAX_PARAMETER_SETS {
         // A property of the REQUEST, not of this emulator's room: the caller sent
@@ -241,39 +294,57 @@ fn execute_batch(
             crate::state::MAX_PARAMETER_SETS
         )));
     }
+    // Every set's own bindings are decided before the batch reaches the engine, so a
+    // batch carrying one unbindable set runs none of its statements.
+    for parameters in &parameter_sets {
+        crate::state::require_bindable_parameters(parameters)?;
+    }
     let mut state = store.lock();
     let cluster = state.cluster_mut(&input.resource_arn)?;
     cluster.expire_timed_out_transactions();
 
-    // A `transactionId` runs the batch inside that transaction, against its own
-    // copy of the database; without one the batch runs against the committed
-    // database and auto-commits.
-    let database = match input.transaction_id.as_deref() {
-        Some(transaction_id) => {
-            let transaction = cluster
-                .transactions
-                .get_mut(transaction_id)
-                .ok_or(crate::state::SqlError::TransactionNotFound)?;
-            transaction.touch();
-            &mut transaction.pending
-        }
-        None => cluster.database_mut(&crate::state::database_key(input.database.as_ref()))?,
-    };
-
     // Exactly one `UpdateResult` per parameter set, in the order the sets arrived:
     // the statement is run once per set against the same database, so N sets of an
-    // INSERT leave N rows behind. ONE budget covers the whole batch — one deadline
+    // INSERT leave N rows behind — and a set that FAILS refuses the whole batch,
+    // leaving none of them behind. ONE budget covers the whole batch — one deadline
     // and one output cap, shared by every statement — so a long `parameterSets`
     // can buy neither more engine time nor more result memory than a single
     // statement gets.
     let mut budget = crate::state::RequestBudget::new();
-    let mut update_results = Vec::with_capacity(parameter_sets.len());
-    for parameters in &parameter_sets {
-        let outcome = database.run_within(&mut budget, &input.sql, parameters)?;
-        update_results.push(UpdateResult {
+
+    // A `transactionId` runs the batch inside that transaction, against its own
+    // copy of the database; without one the batch runs against the committed
+    // database and auto-commits.
+    let outcomes = match input.transaction_id.as_deref() {
+        Some(transaction_id) => {
+            let transaction = cluster.open_transaction_mut(transaction_id)?;
+            transaction.touch();
+            let ran = transaction.open_database()?.run_batch_within(
+                &mut budget,
+                &input.sql,
+                &parameter_sets,
+            );
+            // A statement of the batch that the engine refused aborts the transaction it
+            // ran in, exactly as a single statement does.
+            if ran
+                .as_ref()
+                .err()
+                .is_some_and(crate::state::SqlError::terminates_a_transaction)
+            {
+                cluster.abort_transaction(transaction_id);
+            }
+            ran?
+        }
+        None => cluster
+            .database_mut(&crate::state::database_key(input.database.as_ref()))?
+            .run_batch_within(&mut budget, &input.sql, &parameter_sets)?,
+    };
+    let update_results = outcomes
+        .iter()
+        .map(|outcome| UpdateResult {
             generated_fields: Some(outcome.generated_fields()),
-        });
-    }
+        })
+        .collect::<Vec<_>>();
     // An access record for the data plane: who was addressed and how much the
     // engine ran. The statement text and the secret are NOT recorded — both carry
     // caller secrets.
@@ -290,8 +361,10 @@ fn execute_batch(
 }
 
 /// Report a statement that did not run as the error this operation models for it.
-/// This operation returns no result set, so a result-shaped failure can only come
-/// from the statement itself and is reported as a bad request.
+///
+/// The same rule the single-statement path follows: an error the DATABASE raised is
+/// `DatabaseErrorException`, a fault of the CALL is a validation fault, and the
+/// deprecated `BadRequestException` is answered for neither.
 fn statement_failed(error: crate::state::SqlError) -> BatchExecuteStatementError {
     let message = Some(error.message());
     match error {
@@ -324,13 +397,20 @@ fn statement_failed(error: crate::state::SqlError) -> BatchExecuteStatementError
                 ServiceUnavailableError::default(),
             )
         }
+        // This operation returns no result set, so a result-shaped failure can only
+        // come from a statement the engine ran: it is the database's error either way.
         crate::state::SqlError::Engine(_)
-        | crate::state::SqlError::MissingParameter(_)
-        | crate::state::SqlError::UnsupportedParameter(_)
         | crate::state::SqlError::UnsupportedResult(_)
-        | crate::state::SqlError::InvalidRequest(_)
         | crate::state::SqlError::ResultTooLarge => {
-            BatchExecuteStatementErrorModeled::BadRequestException(BadRequestException { message })
+            BatchExecuteStatementErrorModeled::DatabaseErrorException(DatabaseErrorException {
+                message,
+            })
+        }
+        // The CALL is wrong: a parameter that cannot be bound, or a member the model's
+        // own constraints do not reach. Nothing ran.
+        crate::state::SqlError::Parameter(message)
+        | crate::state::SqlError::InvalidRequest(message) => {
+            return crate::scaffolded::Scaffolded::validation(message)
         }
     }
     .into()
