@@ -194,7 +194,7 @@ fn refused(
     identifier: &str,
 ) -> DeleteCloudWatchAlarmTemplateError {
     match refusal {
-        crate::state::PublishedWriteRefusal::NotFound => not_found(identifier),
+        crate::state::PublishedWriteRefusal::NotFound => not_found(),
         crate::state::PublishedWriteRefusal::Published => {
             DeleteCloudWatchAlarmTemplateErrorModeled::BadRequestException(BadRequestException {
                 message: Some(crate::state::published_resource_message(
@@ -209,13 +209,13 @@ fn refused(
 
 /// No cloudwatch alarm template in this region has that id or name, by either
 /// form `Identifier` documents ("Can be either be its id or current name"). The
-/// operation's own modelled 404, with a message built from the request.
-fn not_found(identifier: &str) -> DeleteCloudWatchAlarmTemplateError {
+/// operation's own modelled 404, carrying no `message` member — a resource of
+/// the cloudwatch alarm-template hierarchy that an identifier does not resolve
+/// to is reported with the status and the error code alone (see
+/// [`crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE`]).
+fn not_found() -> DeleteCloudWatchAlarmTemplateError {
     DeleteCloudWatchAlarmTemplateErrorModeled::NotFoundException(NotFoundException {
-        message: Some(crate::state::not_found_message(
-            "cloudwatch alarm template",
-            identifier,
-        )),
+        message: crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE,
     })
     .into()
 }

@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(identifier) => Some(
                 state
                     .alarm_template_group(&region, identifier)
-                    .ok_or_else(|| not_found("cloudwatch alarm template group", identifier))?
+                    .ok_or_else(group_not_found)?
                     .id
                     .clone(),
             ),
@@ -254,10 +254,24 @@ fn bad_request(message: String) -> ListCloudWatchAlarmTemplatesError {
     .into()
 }
 
-/// The request filtered by a resource that does not exist where this request can
-/// see it, so the filter names no set of templates. The operation's own modelled
-/// 404, whose message this family composes from the request: the resource type,
-/// the identifier, then `not found`.
+/// The request filtered by a cloudwatch alarm template GROUP that does not exist
+/// where this request can see it, so the filter names no set of templates. The
+/// operation's own modelled 404, carrying no `message` member — the group is a
+/// resource of the cloudwatch alarm-template hierarchy, which reports a resource
+/// an identifier does not resolve to with the status and the error code alone
+/// (see
+/// [`crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE`]).
+fn group_not_found() -> ListCloudWatchAlarmTemplatesError {
+    ListCloudWatchAlarmTemplatesErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE,
+    })
+    .into()
+}
+
+/// The request filtered by a resource of ANOTHER family that does not exist
+/// where this request can see it — the signal map the `SignalMapIdentifier`
+/// filter names. That family's 404 states its message, built from the request:
+/// the resource type, the identifier, then `not found`.
 fn not_found(resource_type: &str, identifier: &str) -> ListCloudWatchAlarmTemplatesError {
     ListCloudWatchAlarmTemplatesErrorModeled::NotFoundException(NotFoundException {
         message: Some(crate::state::not_found_message(resource_type, identifier)),

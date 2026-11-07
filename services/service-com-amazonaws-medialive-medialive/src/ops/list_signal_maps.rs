@@ -179,9 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(identifier) => Some(
                 state
                     .alarm_template_group(&region, identifier)
-                    .ok_or_else(|| {
-                        alarm_group_not_found("CloudWatch alarm template group", identifier)
-                    })?
+                    .ok_or_else(alarm_group_not_found)?
                     .id
                     .clone(),
             ),
@@ -242,12 +240,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The request filtered by a CloudWatch alarm template group that does not exist
+/// The request filtered by a cloudwatch alarm template group that does not exist
 /// in the region it was signed for, so the filter names no set of signal maps.
-/// That family's 404 states its message, built from the request.
-fn alarm_group_not_found(resource_type: &str, identifier: &str) -> ListSignalMapsError {
+/// The same 404, carrying no `message` member — the group is a resource of the
+/// cloudwatch alarm-template hierarchy, which reports a resource an identifier
+/// does not resolve to with the status and the error code alone (see
+/// [`crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE`]).
+fn alarm_group_not_found() -> ListSignalMapsError {
     ListSignalMapsErrorModeled::NotFoundException(NotFoundException {
-        message: Some(crate::state::not_found_message(resource_type, identifier)),
+        message: crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE,
     })
     .into()
 }

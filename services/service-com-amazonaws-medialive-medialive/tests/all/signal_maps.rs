@@ -680,23 +680,24 @@ async fn repeated_creates_and_unresolvable_group_identifiers_are_refused() {
     }
 
     // (case, the member carrying an identifier that resolves to no group, the
-    //  identifier, whether the refusal's message names it — the alarm family
-    //  composes a message from the request, while a rule-template group's 404
-    //  carries no message member at all, which is that hierarchy's own rule,
-    //  pinned by `crate::event_bridge_rule_template_not_found`)
+    //  identifier, whether the refusal's message names it — a template-group 404
+    //  of EITHER monitor hierarchy carries no message member at all, which is
+    //  those hierarchies' own rule, pinned by
+    //  `crate::event_bridge_rule_template_not_found` and
+    //  `crate::not_found_refusal_wording`)
     let unresolvable: [(&str, &str, &str, bool); 3] = [
         (
             "alarm group by name",
             "cloudWatchAlarmTemplateGroupIdentifiers",
             "group-1",
-            true,
+            false,
         ),
         (
             // Even the id of a group of ANOTHER type resolves to no alarm group.
             "alarm group by a stored eventbridge group's id",
             "cloudWatchAlarmTemplateGroupIdentifiers",
             &group_id,
-            true,
+            false,
         ),
         (
             "eventbridge group that was never created",
@@ -731,7 +732,7 @@ async fn repeated_creates_and_unresolvable_group_identifiers_are_refused() {
             assert_eq!(
                 refused.get("message"),
                 Some(&json!(null)),
-                "case {case:?}: expected a rule-template group's refusal to report the \
+                "case {case:?}: expected a template group's refusal to report the \
                  message member with no value, got {:?}",
                 refused.get("message")
             );

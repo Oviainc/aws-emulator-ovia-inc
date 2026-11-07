@@ -79,7 +79,7 @@ fn batch_operations() -> Vec<Batch> {
             members: &[
                 ("channelIds", "Channel"),
                 ("inputIds", "Input"),
-                ("inputSecurityGroupIds", "Input security group"),
+                ("inputSecurityGroupIds", "InputSecurityGroup"),
                 ("multiplexIds", "Multiplex"),
             ],
             cap: MAX_BATCH_DELETE_IDS,

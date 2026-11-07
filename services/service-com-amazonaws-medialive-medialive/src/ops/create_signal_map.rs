@@ -272,14 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             let group = state
                 .alarm_template_group(&region, identifier)
-                .ok_or_else(|| {
-                    CreateSignalMapErrorModeled::NotFoundException(NotFoundException {
-                        message: Some(crate::state::not_found_message(
-                            "CloudWatch alarm template group",
-                            identifier,
-                        )),
-                    })
-                })?;
+                .ok_or_else(alarm_group_not_found)?;
             cloud_watch_alarm_template_group_ids.push(group.id.clone());
         }
 
@@ -349,11 +342,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// reports a resource an identifier does not resolve to with the status and the
 /// code alone (see
 /// [`crate::state::EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE`]), whichever
-/// operation resolved it. The entry point's own 404 above, and the alarm
-/// group's, keep their families' messages.
+/// operation resolved it. The entry point's own 404 above keeps its family's
+/// message.
 fn rule_group_not_found() -> CreateSignalMapError {
     CreateSignalMapErrorModeled::NotFoundException(NotFoundException {
         message: crate::state::EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE,
+    })
+    .into()
+}
+
+/// A `CloudWatchAlarmTemplateGroupIdentifiers` entry that resolves to no stored
+/// alarm template group, so there is no group to associate the signal map with.
+///
+/// The modelled 404 carries no `message` member either: the group is a resource
+/// of the cloudwatch alarm-template hierarchy, which reports a resource an
+/// identifier does not resolve to with the status and the error code alone (see
+/// [`crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE`]).
+fn alarm_group_not_found() -> CreateSignalMapError {
+    CreateSignalMapErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE,
     })
     .into()
 }

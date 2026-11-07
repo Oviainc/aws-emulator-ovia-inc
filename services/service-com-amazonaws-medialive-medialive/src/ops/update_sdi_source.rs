@@ -180,7 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         input.sdi_source_id
                     ))
                 } else {
-                    crate::state::not_found_message("SdiSource", &input.sdi_source_id)
+                    // The label is this resource's own English phrase, worded
+                    // exactly as `DescribeSdiSource`'s refusal words it.
+                    crate::state::not_found_message("SDI source", &input.sdi_source_id)
                 };
                 return Err(UpdateSdiSourceErrorModeled::NotFoundException(NotFoundException {
                     message: Some(message),

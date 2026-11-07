@@ -286,16 +286,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Turn a store refusal into this operation's own modelled error: a group the
 /// region does not hold is its 404, a name the region already uses its 409, and a
 /// full store its 429.
+///
+/// The 404 carries no `message` member: the group is a resource of the
+/// cloudwatch alarm-template hierarchy, which reports a resource an identifier
+/// does not resolve to with the status and the error code alone (see
+/// [`crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE`]).
 fn refused(
     refusal: crate::state::AlarmTemplateRefusal,
 ) -> CreateCloudWatchAlarmTemplateError {
     match refusal {
-        crate::state::AlarmTemplateRefusal::GroupNotFound { identifier } => {
+        crate::state::AlarmTemplateRefusal::GroupNotFound { .. } => {
             CreateCloudWatchAlarmTemplateErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message(
-                    "cloudwatch alarm template group",
-                    &identifier,
-                )),
+                message:
+                    crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE,
             })
             .into()
         }

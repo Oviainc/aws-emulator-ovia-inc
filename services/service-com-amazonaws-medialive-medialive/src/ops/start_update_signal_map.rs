@@ -277,12 +277,14 @@ fn refused(
                 message: Some(crate::state::not_found_message("Resource", &arn)),
             })
         }
-        Refusal::AlarmGroupNotFound { identifier } => {
+        // The cloudwatch alarm-template hierarchy reports a resource an
+        // identifier does not resolve to with the status and the error code
+        // alone, whichever operation resolved it (see
+        // [`crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE`]).
+        Refusal::AlarmGroupNotFound { .. } => {
             StartUpdateSignalMapErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message(
-                    "CloudWatch alarm template group",
-                    &identifier,
-                )),
+                message:
+                    crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE,
             })
         }
         // The rule-template hierarchy reports a resource an identifier does not

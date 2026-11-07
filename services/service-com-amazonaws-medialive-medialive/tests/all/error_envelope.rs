@@ -158,8 +158,12 @@ fn assert_envelope(
 /// status (409, 404, 400, 429), the retry classification each one implies (a
 /// throttle may be retried, the other client failures may not), the operation that
 /// refused (a create, two reads, a delete, a list) and the resource family it
-/// belongs to (the template-group API and the classic channel API). The issue's
+/// belongs to (the monitor API and the classic channel API). The issue's
 /// recorded case is the first row.
+///
+/// The 404 rows are families whose refusal STATES a message; that the envelope is
+/// complete on a 404 that states none — the cloudwatch alarm-template hierarchy's
+/// — is pinned by `crate::not_found_refusal_wording`.
 #[tokio::test]
 async fn every_failure_carries_the_response_envelope() {
     let opened = unix_seconds(SystemTime::now()) - 1.0;
@@ -223,9 +227,9 @@ async fn every_failure_carries_the_response_envelope() {
             false,
             answer(
                 &router,
-                "read of a template group no name answers to",
+                "read of a signal map no identifier answers to",
                 "GET",
-                &format!("{GROUPS}/absent-group"),
+                "/prod/signal-maps/absent-map",
                 None,
             )
             .await,

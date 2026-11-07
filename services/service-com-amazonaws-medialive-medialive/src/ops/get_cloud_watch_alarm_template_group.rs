@@ -156,7 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
         let group = state
             .alarm_template_group(&region, &input.identifier)
-            .ok_or_else(|| not_found(&input.identifier))?;
+            .ok_or_else(not_found)?;
         Ok(crate::state::alarm_template_group_output!(
             GetCloudWatchAlarmTemplateGroupOutput,
             group
@@ -167,15 +167,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// No group in this region answers to the requested identifier, by either of the
 /// two forms `Identifier` documents (its id or its current name).
 ///
-/// Worded by the service's one not-found helper, as every other operation of this
-/// crate words it: `crate::state::not_found_message` exists "so no two operations
-/// word it two ways", and this reader was the last one wording it its own way.
-fn not_found(identifier: &str) -> GetCloudWatchAlarmTemplateGroupError {
+/// The modelled 404 carries no `message` member: a resource of the cloudwatch
+/// alarm-template hierarchy that an identifier does not resolve to is reported
+/// with the status and the error code alone (see
+/// [`crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE`]).
+fn not_found() -> GetCloudWatchAlarmTemplateGroupError {
     GetCloudWatchAlarmTemplateGroupErrorModeled::NotFoundException(NotFoundException {
-        message: Some(crate::state::not_found_message(
-            "cloudwatch alarm template group",
-            identifier,
-        )),
+        message: crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE,
     })
     .into()
 }

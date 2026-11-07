@@ -716,8 +716,11 @@ async fn a_listing_reports_only_the_templates_of_its_own_region() {
 /// none of the options its member documents, are refused with
 /// `BadRequestException` (400); an identifier that resolves to no resource of
 /// the filtered type where the request can see it is refused with
-/// `NotFoundException` (404), whose message names the resource type, the
-/// identifier, then `not found`.
+/// `NotFoundException` (404) — carrying no `message` member when the
+/// unresolvable resource belongs to the cloudwatch alarm-template hierarchy
+/// (the `GroupIdentifier` filter), and this family's own message, the resource's
+/// label then the identifier then `not found`, when it belongs to another family
+/// (the `SignalMapIdentifier` filter).
 ///
 /// The rows differ along the page size asked for, the scope spelling, which
 /// filter carries the unresolvable identifier and WHY it is unresolvable — never
@@ -758,47 +761,48 @@ async fn a_bad_page_size_scope_or_unresolvable_filter_is_refused() {
         );
     }
 
-    // (case, query member, identifier, the resource type the message names)
-    let unresolvable: [(&str, &str, String, &str); 6] = [
+    // (case, query member, identifier, the message the refusal carries — absent
+    //  for a resource of the alarm-template hierarchy)
+    let unresolvable: [(&str, &str, String, Option<&str>); 6] = [
         (
             "group never created",
             "groupIdentifier",
             "no-such-group".to_string(),
-            "cloudwatch alarm template group",
+            None,
         ),
         (
             "group filter naming a signal map's id",
             "groupIdentifier",
             map.clone(),
-            "cloudwatch alarm template group",
+            None,
         ),
         (
             "group by a name nothing holds",
             "groupIdentifier",
             "map-one".to_string(),
-            "cloudwatch alarm template group",
+            None,
         ),
         (
             "signal map never created",
             "signalMapIdentifier",
             "no-such-map".to_string(),
-            "Signal map",
+            Some("Signal map"),
         ),
         (
             "signal map filter naming a group's id",
             "signalMapIdentifier",
             group.clone(),
-            "Signal map",
+            Some("Signal map"),
         ),
         (
             "signal map by a name nothing holds",
             "signalMapIdentifier",
             "group-one".to_string(),
-            "Signal map",
+            Some("Signal map"),
         ),
     ];
 
-    for (case, member, identifier, resource_type) in unresolvable {
+    for (case, member, identifier, label) in unresolvable {
         let (status, body) = list(&router, &format!("?{member}={identifier}")).await;
         assert_eq!(
             status, 404,
@@ -810,11 +814,13 @@ async fn a_bad_page_size_scope_or_unresolvable_filter_is_refused() {
             "NotFoundException",
             "case {case:?}: expected NotFoundException, got {body}"
         );
+        let expected = match label {
+            Some(label) => json!(format!("{label} {identifier} not found")),
+            None => Value::Null,
+        };
         assert_eq!(
-            body["message"],
-            json!(format!("{resource_type} {identifier} not found")),
-            "case {case:?}: expected the message to name the resource type then the \
-             identifier, got {:?}",
+            body["message"], expected,
+            "case {case:?}: expected the message {expected:?}, got {:?}",
             body["message"]
         );
     }

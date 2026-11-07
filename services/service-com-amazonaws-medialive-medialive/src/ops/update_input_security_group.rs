@@ -201,7 +201,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateInputSecurityGroupErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::state::not_found_message(
-                        "Input security group",
+                        // The label is this resource's own: the shape name
+                        // `InputSecurityGroup`, as the service's recorded
+                        // refusal names it, worded exactly as
+                        // `DescribeInputSecurityGroup`'s refusal words it.
+                        "InputSecurityGroup",
                         &input.input_security_group_id,
                     )),
                 },

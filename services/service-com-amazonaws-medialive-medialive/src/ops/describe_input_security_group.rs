@@ -165,7 +165,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DescribeInputSecurityGroupErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::not_found_message(
-                        "Input security group",
+                        // The label is the API's own spelling of this resource —
+                        // the shape name `InputSecurityGroup`, which is how the
+                        // service's recorded refusal names it, not an English
+                        // rendering of it. Each family's label is that family's
+                        // own: MediaLive words some of its not-found sentences
+                        // with the shape name and others as prose, so a label is
+                        // never derived from the shape name.
+                        "InputSecurityGroup",
                         &input.input_security_group_id,
                     )),
                 })

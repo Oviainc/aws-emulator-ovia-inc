@@ -196,9 +196,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// A `MultiplexId` naming no stored multiplex, and a `ProgramName` the named
 /// multiplex does not hold, are what this operation's modelled
-/// `NotFoundException` is for, and the refusal names which of the two is missing
-/// with the same wording every reader of this service uses — so a second delete
-/// of the same program is refused exactly as a describe of it is. A multiplex a
+/// `NotFoundException` is for, and the refusal names which of the two is
+/// missing: this DELETE resolves the enclosing multiplex first, so an absent
+/// multiplex is reported as the multiplex's own not-found, which is what its
+/// recorded refusal carries — unlike `DescribeMultiplexProgram`, which resolves
+/// the pair as one program lookup and names the program. A multiplex a
 /// delete has already been accepted for is a conflict with the state: its record
 /// is still readable, but nothing it holds is a caller's to change.
 fn refused(

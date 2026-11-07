@@ -43,6 +43,33 @@ pub const MAX_ALARM_TEMPLATE_GROUPS: usize = 100;
 /// the group it created can still be returned.
 pub const MAX_ALARM_TEMPLATE_GROUP_TOKENS: usize = MAX_ALARM_TEMPLATE_GROUPS;
 
+/// The `message` a not-found refusal carries when what the identifier failed to
+/// resolve to is a resource of the CLOUDWATCH ALARM-TEMPLATE hierarchy — a
+/// template group or one of the templates inside it: NONE, the member is left
+/// unset.
+///
+/// `NotFoundException`'s single member `Message` (jsonName `message`) is
+/// OPTIONAL and its documentation is a placeholder
+/// (`smithy_query(query="shape",shape="NotFoundException")`), so the model
+/// states no message rule and the member may legitimately be absent. The
+/// recorded behaviour of this hierarchy is that it IS absent: the 404 answered
+/// for a group identifier that resolves to nothing carries the status and the
+/// error code and no `message` member at all, and so does the 404 answered for
+/// a template identifier. So this is a `None` and not an empty string — an
+/// empty string is a present member whose value is empty, which is a different
+/// error document.
+///
+/// This is the same absence the sibling monitor hierarchy already answers with
+/// ([`super::EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE`]), while the
+/// resource families OUTSIDE the two template hierarchies keep composing their
+/// own per-resource sentence with [`super::not_found_message`].
+///
+/// ONE constant, so every place that reports such a resource missing — its own
+/// get/update/delete at both levels, the group resolution of the template
+/// create, of the template update and of the two listings, and the signal-map
+/// writes that resolve a group — cannot answer it two ways.
+pub const CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE: Option<String> = None;
+
 /// Why [`ComAmazonawsMedialiveMedialiveState::insert_alarm_template_group`]
 /// stored nothing. Each variant is one modelled refusal of
 /// `CreateCloudWatchAlarmTemplateGroup`.

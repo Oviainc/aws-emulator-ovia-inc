@@ -350,6 +350,9 @@ mod node_settings_update;
 #[path = "all/not_found_message.rs"]
 mod not_found_message;
 
+#[path = "all/not_found_refusal_wording.rs"]
+mod not_found_refusal_wording;
+
 #[path = "all/offering_catalog.rs"]
 mod offering_catalog;
 

@@ -4,9 +4,11 @@
 //! of the requested type is answered with, end to end over the restJson1 wire.
 //!
 //! The rule: whichever operation answers it, the refusal's `message` is the one
-//! message this service composes from the request — the resource type, the
-//! identifier the request named, then `not found` — the phrasing the recorded
-//! refusals of the classic channel/input API carry ("Channel <id> not found").
+//! message this service composes from the request — the resource's own label,
+//! the identifier the request named, then `not found`. The LABEL is that
+//! resource family's own and is never derived from its shape name: MediaLive
+//! words some families' label as the shape name (`InputSecurityGroup`) and
+//! others as an English phrase (`SDI source`).
 //! The resource's own get/update/delete word it exactly as the batch operations
 //! and the reference checks of the same resource do, so a client cannot tell from
 //! the wording which entry point it asked through.
@@ -74,14 +76,18 @@ const NETWORK: Family = Family {
 const SDI_SOURCE: Family = Family {
     name: "SdiSource",
     collection: SDI_SOURCES,
-    resource_type: "SdiSource",
+    // MediaLive words this resource's not-found sentence as the English phrase
+    // `SDI source`, not as the shape name.
+    resource_type: "SDI source",
     id_wrapper: Some("sdiSource"),
 };
 
 const INPUT_SECURITY_GROUP: Family = Family {
     name: "input security group",
     collection: INPUT_SECURITY_GROUPS,
-    resource_type: "Input security group",
+    // And this one as the shape name `InputSecurityGroup`: the two conventions
+    // are per-resource, so neither can be derived from the other.
+    resource_type: "InputSecurityGroup",
     id_wrapper: None,
 };
 

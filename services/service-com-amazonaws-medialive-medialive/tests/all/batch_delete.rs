@@ -386,7 +386,7 @@ async fn every_resource_a_delete_cannot_touch_is_reported_as_its_own_failure() {
             "none",
             "NotFoundException",
             None,
-            "Input security group {id} not found",
+            "InputSecurityGroup {id} not found",
         ),
         (
             "security group in use",

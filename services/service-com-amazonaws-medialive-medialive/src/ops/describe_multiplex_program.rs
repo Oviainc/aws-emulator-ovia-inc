@@ -170,21 +170,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(program) =
             state.multiplex_program_description(&input.multiplex_id, &input.program_name)
         else {
-            // Which resource is missing is what the refusal names: a multiplex
-            // id no multiplex has, or a program the named multiplex does not
-            // hold — which is named by that multiplex and its own name, since a
-            // program has no identifier of its own.
-            let message = if state.multiplexes.contains_key(&input.multiplex_id) {
-                crate::state::multiplex_program_not_found_message(
-                    &input.multiplex_id,
-                    &input.program_name,
-                )
-            } else {
-                crate::state::not_found_message("Multiplex", &input.multiplex_id)
-            };
+            // This READ resolves the two labels as ONE program lookup, so the
+            // refusal names the program — the multiplex it would live in and
+            // its own name, the pair its URI names it by — whether it is the
+            // program or the enclosing multiplex that the store does not hold.
+            // A failed parent lookup is not re-raised as the parent's own
+            // not-found here: the caller asked about the program. The program's
+            // WRITE paths resolve that multiplex first and report it instead,
+            // which is what their own recorded refusals carry.
             return Err(DescribeMultiplexProgramErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(message),
+                    message: Some(crate::state::multiplex_program_not_found_message(
+                        &input.multiplex_id,
+                        &input.program_name,
+                    )),
                 },
             )
             .into());

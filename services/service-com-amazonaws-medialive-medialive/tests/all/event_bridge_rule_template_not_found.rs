@@ -49,7 +49,6 @@ const GROUPS: &str = "/prod/eventbridge-rule-template-groups";
 /// The collections of the two OTHER monitor families the control rows read
 /// (`smithy_query(query="digest")`).
 const ALARM_GROUPS: &str = "/prod/cloudwatch-alarm-template-groups";
-const ALARM_TEMPLATES: &str = "/prod/cloudwatch-alarm-templates";
 const SIGNAL_MAPS: &str = "/prod/signal-maps";
 
 /// The envelope members a MediaLive failure carries beside `message`, which this
@@ -420,23 +419,22 @@ async fn a_deleted_rule_template_or_group_is_404_with_no_message() {
     }
 }
 
-/// Rule, from the other side: the absent `message` belongs to the rule-template
-/// hierarchy, so every OTHER MediaLive resource family still composes its own
-/// message from the request — the resource type, the identifier the request
-/// named, then `not found`.
+/// Rule, from the other side: the absent `message` belongs to the two monitor
+/// TEMPLATE hierarchies, so every resource family OUTSIDE them still composes
+/// its own message from the request — the resource's label, the identifier the
+/// request named, then `not found`.
 ///
-/// The rows span the families whose recorded 404s DO carry a message (the
-/// classic channel and input API) and the monitor families this change leaves
-/// alone (the cloudwatch alarm template and its group, the signal map), reached
-/// both by their own `Identifier` and through a filter of a listing — including
-/// the `SignalMapIdentifier` filter of `ListEventBridgeRuleTemplates`, an
-/// operation of the hierarchy that is resolving a resource of another family.
+/// The rows span the families whose recorded 404s DO carry a message: the
+/// classic channel and input API, and the signal map, reached both by its own
+/// `Identifier` and through the `SignalMapIdentifier` filter of
+/// `ListEventBridgeRuleTemplates` — an operation of a hierarchy that is
+/// resolving a resource of another family, which is where the two rules meet.
 #[tokio::test]
 async fn another_family_s_not_found_still_states_its_message() {
     let router = medialive();
 
     // (case, method, uri, the message the family composes)
-    let rows: [(&str, &str, String, String); 7] = [
+    let rows: [(&str, &str, String, String); 4] = [
         (
             "DescribeChannel",
             "GET",
@@ -454,24 +452,6 @@ async fn another_family_s_not_found_still_states_its_message() {
             "GET",
             format!("{SIGNAL_MAPS}/no-such-map"),
             "Signal map no-such-map not found".to_string(),
-        ),
-        (
-            "GetCloudWatchAlarmTemplateGroup",
-            "GET",
-            format!("{ALARM_GROUPS}/no-such-group"),
-            "cloudwatch alarm template group no-such-group not found".to_string(),
-        ),
-        (
-            "GetCloudWatchAlarmTemplate",
-            "GET",
-            format!("{ALARM_TEMPLATES}/no-such-template"),
-            "cloudwatch alarm template no-such-template not found".to_string(),
-        ),
-        (
-            "ListSignalMaps filtered by an alarm group",
-            "GET",
-            format!("{SIGNAL_MAPS}?cloudWatchAlarmTemplateGroupIdentifier=no-such-group"),
-            "CloudWatch alarm template group no-such-group not found".to_string(),
         ),
         (
             "ListEventBridgeRuleTemplates filtered by a signal map",

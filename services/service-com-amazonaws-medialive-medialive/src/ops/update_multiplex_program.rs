@@ -193,7 +193,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// A `MultiplexId` naming no stored multiplex, and a `ProgramName` the named
 /// multiplex does not hold, are what this operation's modelled
 /// `NotFoundException` is for, and the refusal names which of the two is
-/// missing with the same wording every reader of this service uses. A multiplex
+/// missing with the same wording every other operation of this service uses for
+/// it: this WRITE resolves the enclosing multiplex first, so an absent
+/// multiplex is reported as the multiplex's own not-found, which is what its
+/// recorded refusal carries — unlike `DescribeMultiplexProgram`, which resolves
+/// the pair as one program lookup and names the program. A multiplex
 /// that is going away, and a `ProgramNumber` another program of the same
 /// multiplex already holds, are conflicts with the state. Settings outside what
 /// the model publishes for them are a bad request, worded by the shared refusal

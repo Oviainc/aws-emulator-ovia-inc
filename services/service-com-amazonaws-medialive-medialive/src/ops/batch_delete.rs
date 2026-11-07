@@ -310,6 +310,11 @@ fn delete_input(
     .ok_or_else(unavailable)
 }
 
+/// How a refusal about an input security group NAMES the resource: the shape
+/// name `InputSecurityGroup`, the API's own spelling of it, so this batch's
+/// per-resource refusal reads exactly as `DescribeInputSecurityGroup`'s does.
+const INPUT_SECURITY_GROUP: &str = "InputSecurityGroup";
+
 /// One input security group's delete. The group's `Inputs` and `Channels` are
 /// "the list of inputs / channels currently using this Input Security Group", so
 /// a group a resource still uses is refused; a group nothing uses moves to the
@@ -325,7 +330,7 @@ fn delete_input_security_group(
     id: &str,
 ) -> Result<Outcome, BatchDeleteError> {
     let Some(group) = state.input_security_groups.get(id) else {
-        return Ok(not_found("Input security group", id));
+        return Ok(not_found(INPUT_SECURITY_GROUP, id));
     };
     let arn = group.arn.clone();
     let inputs = state.inputs_using_security_group(id);
@@ -348,7 +353,7 @@ fn delete_input_security_group(
     // state. A repeated delete asks for the state the group is already in, so
     // it changes nothing and is reported the same way.
     let Some(group) = state.input_security_groups.get_mut(id) else {
-        return Ok(not_found("Input security group", id));
+        return Ok(not_found(INPUT_SECURITY_GROUP, id));
     };
     crate::state::delete_input_security_group(group);
 

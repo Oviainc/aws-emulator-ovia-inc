@@ -201,7 +201,7 @@ fn refused(
     identifier: &str,
 ) -> UpdateCloudWatchAlarmTemplateGroupError {
     match refusal {
-        crate::state::PublishedWriteRefusal::NotFound => not_found(identifier),
+        crate::state::PublishedWriteRefusal::NotFound => not_found(),
         crate::state::PublishedWriteRefusal::Published => {
             UpdateCloudWatchAlarmTemplateGroupErrorModeled::BadRequestException(
                 BadRequestException {
@@ -219,12 +219,14 @@ fn refused(
 /// No group in this region answers to the requested identifier, by either of the
 /// two forms `Identifier` documents (its id or its current name), so there is
 /// nothing to update.
-fn not_found(identifier: &str) -> UpdateCloudWatchAlarmTemplateGroupError {
+///
+/// The modelled 404 carries no `message` member: a resource of the cloudwatch
+/// alarm-template hierarchy that an identifier does not resolve to is reported
+/// with the status and the error code alone (see
+/// [`crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE`]).
+fn not_found() -> UpdateCloudWatchAlarmTemplateGroupError {
     UpdateCloudWatchAlarmTemplateGroupErrorModeled::NotFoundException(NotFoundException {
-        message: Some(crate::state::not_found_message(
-            "cloudwatch alarm template group",
-            identifier,
-        )),
+        message: crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE,
     })
     .into()
 }

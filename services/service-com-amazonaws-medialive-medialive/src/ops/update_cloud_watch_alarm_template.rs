@@ -279,25 +279,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// no template in the region has and a group identifier no group in it has are
 /// both its 404 (neither leaves a template to change, or a group to move it
 /// into), and a name another template in the region already holds is its 409.
+///
+/// Both 404s carry no `message` member: the template and its group are both
+/// resources of the cloudwatch alarm-template hierarchy, which reports a
+/// resource an identifier does not resolve to with the status and the error code
+/// alone (see
+/// [`crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE`]).
 fn refused(
     refusal: crate::state::AlarmTemplateUpdateRefusal,
 ) -> UpdateCloudWatchAlarmTemplateError {
     match refusal {
-        crate::state::AlarmTemplateUpdateRefusal::NotFound { identifier } => {
+        crate::state::AlarmTemplateUpdateRefusal::NotFound { .. }
+        | crate::state::AlarmTemplateUpdateRefusal::GroupNotFound { .. } => {
             UpdateCloudWatchAlarmTemplateErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message(
-                    "cloudwatch alarm template",
-                    &identifier,
-                )),
-            })
-            .into()
-        }
-        crate::state::AlarmTemplateUpdateRefusal::GroupNotFound { identifier } => {
-            UpdateCloudWatchAlarmTemplateErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message(
-                    "cloudwatch alarm template group",
-                    &identifier,
-                )),
+                message:
+                    crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE,
             })
             .into()
         }

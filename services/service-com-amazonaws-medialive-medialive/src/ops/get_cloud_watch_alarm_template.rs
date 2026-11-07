@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
         let template = state
             .alarm_template(&region, &input.identifier)
-            .ok_or_else(|| not_found(&input.identifier))?;
+            .ok_or_else(not_found)?;
 
         Ok(crate::state::alarm_template_output!(
             GetCloudWatchAlarmTemplateOutput,
@@ -167,13 +167,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// No template in this region has that id or name. The operation's own modelled
-/// 404, with a message built from the request.
-fn not_found(identifier: &str) -> GetCloudWatchAlarmTemplateError {
+/// 404, carrying no `message` member — a resource of the cloudwatch
+/// alarm-template hierarchy that an identifier does not resolve to is reported
+/// with the status and the error code alone (see
+/// [`crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE`]).
+fn not_found() -> GetCloudWatchAlarmTemplateError {
     GetCloudWatchAlarmTemplateErrorModeled::NotFoundException(NotFoundException {
-        message: Some(crate::state::not_found_message(
-            "cloudwatch alarm template",
-            identifier,
-        )),
+        message: crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE,
     })
     .into()
 }

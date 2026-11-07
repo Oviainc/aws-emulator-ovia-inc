@@ -168,7 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.sdi_sources.contains_key(&input.sdi_source_id) {
             return Err(DeleteSdiSourceErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::not_found_message(
-                    "SdiSource",
+                    // The label is this resource's own English phrase, worded
+                    // exactly as `DescribeSdiSource`'s refusal words it.
+                    "SDI source",
                     &input.sdi_source_id,
                 )),
             })

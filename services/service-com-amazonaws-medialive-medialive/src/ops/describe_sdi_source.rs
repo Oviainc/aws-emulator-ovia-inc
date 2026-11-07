@@ -155,7 +155,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DescribeSdiSourceErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::not_found_message(
-                        "SdiSource",
+                        // The label is this resource's own: MediaLive words this
+                        // resource's not-found sentence as the English phrase
+                        // `SDI source`, which is how its recorded refusal names
+                        // it, and not as the shape name `SdiSource`. Each
+                        // family's label is that family's own and is never
+                        // derived from the shape name.
+                        "SDI source",
                         &input.sdi_source_id,
                     )),
                 })

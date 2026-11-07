@@ -765,7 +765,7 @@ async fn a_refused_update_leaves_the_signal_map_as_it_was() {
             body: json!({ "cloudWatchAlarmTemplateGroupIdentifiers": ["no-such-group"] }),
             status: 404,
             code: "NotFoundException",
-            message: Some("no-such-group".to_string()),
+            message: None,
         },
         Refusal {
             case: "a rule template group identifier naming no group",

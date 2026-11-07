@@ -823,11 +823,14 @@ async fn a_retried_create_is_idempotent_only_for_the_multiplex_it_was_addressed_
 }
 
 /// Rule: a `MultiplexId` that names no stored multiplex cannot carry a program —
-/// `DescribeMultiplexProgram` answers `NotFoundException` for it and for a
-/// `ProgramName` the named multiplex does not hold, and
-/// `CreateMultiplexProgram`, which models no `NotFoundException`
+/// `DescribeMultiplexProgram` answers `NotFoundException` naming the PROGRAM the
+/// request addressed (the multiplex and the program name its URI names it by,
+/// even when it is the enclosing multiplex that is missing), and so does a
+/// `ProgramName` the named multiplex does not hold, while
+/// `CreateMultiplexProgram`, which addresses the multiplex's program collection
+/// and models no `NotFoundException`
 /// (`smithy_query(query="operation", operation="CreateMultiplexProgram")`),
-/// refuses it as a client error and stores nothing.
+/// refuses the absent multiplex as a client error naming it and stores nothing.
 #[tokio::test]
 async fn naming_a_multiplex_or_program_that_does_not_exist_is_refused() {
     let router = medialive();
@@ -868,15 +871,15 @@ async fn naming_a_multiplex_or_program_that_does_not_exist_is_refused() {
             "a multiplex id never minted",
             "9999999",
             "kept",
-            "Multiplex",
-            "9999999",
+            "Multiplex program",
+            "kept",
         ),
         (
             "a multiplex id that is not a number at all",
             "no-such-multiplex",
             "kept",
-            "Multiplex",
-            "no-such-multiplex",
+            "Multiplex program",
+            "kept",
         ),
         (
             "a program name no program has",

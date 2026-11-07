@@ -555,22 +555,25 @@ async fn a_bad_page_size_or_an_unresolvable_group_filter_is_refused() {
         );
     }
 
-    // (case, query member, identifier, the message the refusal carries — the
-    //  alarm family composes one from the request; a rule-template group's 404
-    //  leaves the member unset, which is that hierarchy's own rule, pinned by
-    //  `crate::event_bridge_rule_template_not_found`)
+    // (case, query member, identifier, the message the refusal carries — a
+    //  template-group 404 of EITHER monitor hierarchy leaves the member unset,
+    //  which is those hierarchies' own rule (pinned by
+    //  `crate::event_bridge_rule_template_not_found` and
+    //  `crate::not_found_refusal_wording`), so every row here is unset
+    //  and the `Option` is what keeps the assertion honest for a family that
+    //  does state its message)
     let unresolvable: [(&str, &str, String, Option<&str>); 5] = [
         (
             "alarm group never created",
             "cloudWatchAlarmTemplateGroupIdentifier",
             "no-such-group".to_string(),
-            Some("CloudWatch alarm template group"),
+            None,
         ),
         (
             "alarm filter naming a rule group's id",
             "cloudWatchAlarmTemplateGroupIdentifier",
             rule.clone(),
-            Some("CloudWatch alarm template group"),
+            None,
         ),
         (
             "rule group never created",
@@ -588,7 +591,7 @@ async fn a_bad_page_size_or_an_unresolvable_group_filter_is_refused() {
             "alarm group by a name no group holds",
             "cloudWatchAlarmTemplateGroupIdentifier",
             "rule-one".to_string(),
-            Some("CloudWatch alarm template group"),
+            None,
         ),
     ];
 
@@ -615,7 +618,7 @@ async fn a_bad_page_size_or_an_unresolvable_group_filter_is_refused() {
             None => assert_eq!(
                 body.get("message"),
                 Some(&json!(null)),
-                "case {case:?}: expected a rule-template group's refusal to report the \
+                "case {case:?}: expected a template group's refusal to report the \
                  message member with no value, got {:?}",
                 body.get("message")
             ),

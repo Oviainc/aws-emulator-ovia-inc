@@ -190,12 +190,14 @@ fn refused(
     identifier: &str,
 ) -> DeleteCloudWatchAlarmTemplateGroupError {
     match refusal {
+        // The modelled 404 carries no `message` member: a resource of the
+        // cloudwatch alarm-template hierarchy that an identifier does not
+        // resolve to is reported with the status and the error code alone (see
+        // [`crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE`]).
         crate::state::TemplateGroupDeleteRefusal::NotFound => {
             DeleteCloudWatchAlarmTemplateGroupErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message(
-                    "cloudwatch alarm template group",
-                    identifier,
-                )),
+                message:
+                    crate::state::alarm_template_groups::CLOUD_WATCH_ALARM_TEMPLATE_NOT_FOUND_MESSAGE,
             })
             .into()
         }
