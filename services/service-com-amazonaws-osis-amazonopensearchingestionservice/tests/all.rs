@@ -23,6 +23,8 @@ mod pipeline_lifecycle;
 mod pipeline_refusal_wording;
 #[path = "all/pipeline_update.rs"]
 mod pipeline_update;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
 #[path = "all/resource_tags.rs"]

@@ -6,6 +6,10 @@
 //! read back out of the stored record, so a later `GetPipeline` / `ListPipelines` cannot
 //! disagree with what this call returned.
 //!
+//! A create whose `Tags` name a key in the namespace AWS keeps for its own tags
+//! ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) is refused 400 `ValidationException` before
+//! the record is built, so no pipeline is minted.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -201,6 +205,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 },
             )
+            .into());
+        }
+
+        // A tag key in the namespace AWS keeps for its own tags is not a key a caller may
+        // assign, on a create no more than on a later tag write: the request is refused
+        // before the pipeline record is built, so a create carrying one mints nothing.
+        if let Some(reserved) = input
+            .tags
+            .as_deref()
+            .and_then(|tags| {
+                crate::state::first_reserved_tag_key(tags.iter().map(|tag| tag.key.as_str()))
+            })
+        {
+            return Err(CreatePipelineErrorModeled::ValidationException(ValidationException {
+                // The wording is the service's, with the offending key as its only
+                // variable part, so the refusal reads the same wherever a tag path meets
+                // a reserved key.
+                message: Some(crate::state::reserved_tag_key_message(reserved)),
+            })
             .into());
         }
 

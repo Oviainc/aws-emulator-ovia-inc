@@ -7,6 +7,11 @@
 //! twice — and answers no members, so every later read of that pipeline is what reports
 //! the set.
 //!
+//! A key in the namespace AWS keeps for its own tags
+//! ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) is not a caller's to assign: a request
+//! naming one is refused 400 `ValidationException` before anything is merged, so no part
+//! of the call is applied.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -155,6 +160,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(limit_exceeded());
         }
 
+        // A tag key in the namespace AWS keeps for its own tags is not a key a caller may
+        // assign, and that is a fact of the REQUEST alone: it is judged before the ARN is
+        // resolved and before anything is merged, so a refused call applies no part of
+        // itself and its refusal says nothing about what the account stores.
+        if let Some(reserved) =
+            crate::state::first_reserved_tag_key(input.tags.iter().map(|tag| tag.key.as_str()))
+        {
+            return Err(reserved_tag_key(reserved));
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let mut store = state.lock();
         store.settle(now);
@@ -199,6 +214,19 @@ fn not_found() -> TagResourceError {
 fn limit_exceeded() -> TagResourceError {
     TagResourceErrorModeled::LimitExceededException(LimitExceededException {
         message: Some("You attempted to create more than the allowed number of tags".to_string()),
+    })
+    .into()
+}
+
+/// The request names a tag key in the namespace AWS reserves for its own system tags —
+/// HTTP 400 `ValidationException`, this operation's modelled error for "missing or invalid
+/// input fields".
+///
+/// The wording is the service's, with the offending key as its only variable part
+/// ([`crate::state::reserved_tag_key_message`]).
+fn reserved_tag_key(key: &str) -> TagResourceError {
+    TagResourceErrorModeled::ValidationException(ValidationException {
+        message: Some(crate::state::reserved_tag_key_message(key)),
     })
     .into()
 }

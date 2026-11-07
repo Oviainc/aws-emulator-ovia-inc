@@ -83,6 +83,44 @@ pub const MAX_PIPELINES: usize = 1_000;
 /// process's memory without bound.
 pub const MAX_TAGS_PER_PIPELINE: usize = 50;
 
+/// The tag-key namespace AWS keeps for the tags it sets itself.
+///
+/// `TagKey` is modelled as a plain `@length(1, 128)` string with the `.*` pattern, so the
+/// model states no charset rule: a key in this namespace is a SYSTEM tag, which no caller
+/// may assign or remove ([`is_reserved_tag_key`]).
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` names a tag in the reserved namespace ([`RESERVED_TAG_KEY_PREFIX`]).
+///
+/// A tag key is case-sensitive DATA, but the namespace test is not: the prefix is compared
+/// without regard to case, so a differently-cased spelling of it cannot smuggle a system
+/// tag past the guard. Only the START of the key is in the namespace — a key that merely
+/// contains the prefix, or ends with it, is the caller's own.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The first key of `keys` that [`is_reserved_tag_key`], in the order the request gave
+/// them, or `None` when every key is the caller's own to write.
+///
+/// The FIRST one is what a refusal names, so a request carrying several reserved keys is
+/// refused for the same key however the rest of the list is ordered.
+pub fn first_reserved_tag_key<'a, I>(keys: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    keys.into_iter().find(|key| is_reserved_tag_key(key))
+}
+
+/// The message a request naming the reserved tag key `key` is refused with.
+///
+/// The text around the key is FIXED; the one variable part is the offending key, copied
+/// out of the request verbatim, so a caller can tell which entry of its list was refused.
+pub fn reserved_tag_key_message(key: &str) -> String {
+    format!("Invalid System Tag: {key} is missing Vendor Id.")
+}
+
 /// The resource-based policy document of a resource nothing is attached to: the empty
 /// JSON object.
 ///

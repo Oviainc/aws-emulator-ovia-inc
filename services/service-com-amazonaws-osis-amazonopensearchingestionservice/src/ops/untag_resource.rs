@@ -6,6 +6,11 @@
 //! leaving every other key alone. Removing a key the pipeline does not carry is not an
 //! error, so an untag is idempotent.
 //!
+//! A key in the namespace AWS keeps for its own tags
+//! ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) is not a caller's to remove either: a
+//! request naming one is refused 400 `ValidationException` before anything is removed, so
+//! no part of the call is applied.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -143,6 +148,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let now = ::std::time::SystemTime::now();
 
+        // A tag key in the namespace AWS keeps for its own tags is no more a caller's to
+        // REMOVE than to assign, and that is a fact of the REQUEST alone: it is judged
+        // before the ARN is resolved and before anything is removed, so a refused call
+        // applies no part of itself.
+        if let Some(reserved) =
+            crate::state::first_reserved_tag_key(input.tag_keys.iter().map(String::as_str))
+        {
+            return Err(reserved_tag_key(reserved));
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let mut store = state.lock();
         store.settle(now);
@@ -170,6 +185,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn not_found() -> UntagResourceError {
     UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some("The pipeline could not be found".to_string()),
+    })
+    .into()
+}
+
+/// The request names a tag key in the namespace AWS reserves for its own system tags —
+/// HTTP 400 `ValidationException`, this operation's modelled error for "missing or invalid
+/// input fields".
+///
+/// The wording is the service's, with the offending key as its only variable part
+/// ([`crate::state::reserved_tag_key_message`]) — the same refusal a tag WRITE of that key
+/// takes, so one bad key is refused the same way whichever tag path names it.
+fn reserved_tag_key(key: &str) -> UntagResourceError {
+    UntagResourceErrorModeled::ValidationException(ValidationException {
+        message: Some(crate::state::reserved_tag_key_message(key)),
     })
     .into()
 }
