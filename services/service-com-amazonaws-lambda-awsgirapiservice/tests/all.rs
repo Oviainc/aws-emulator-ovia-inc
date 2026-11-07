@@ -201,6 +201,8 @@ mod function_versions_by_capacity_provider;
 mod functions_by_code_signing_config;
 #[path = "all/handler_aws_sdk.rs"]
 mod handler_aws_sdk;
+#[path = "all/handler_email_sdk.rs"]
+mod handler_email_sdk;
 #[path = "all/handler_rest_api_sdk.rs"]
 mod handler_rest_api_sdk;
 #[path = "all/invocation_concurrency.rs"]

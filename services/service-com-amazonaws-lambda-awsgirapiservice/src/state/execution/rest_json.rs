@@ -111,6 +111,15 @@ impl Model {
         let shape = self.shape(name)?;
         (shape.get("type").and_then(Value::as_str) == Some("operation")).then_some(shape)
     }
+
+    /// How many operations this model binds — the one fact that holds of an embedded model
+    /// whatever service it is: that it parsed, and carries a surface to bind against.
+    pub fn operation_count(&self) -> usize {
+        self.shapes
+            .values()
+            .filter(|shape| shape.get("type").and_then(Value::as_str) == Some("operation"))
+            .count()
+    }
 }
 
 /// The trait of a member that says where its value belongs on the wire.

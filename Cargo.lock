@@ -13059,6 +13059,7 @@ dependencies = [
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-kinesis-kinesis-20131202",
  "service-com-amazonaws-kms-trentservice",
+ "service-com-amazonaws-sesv2-simpleemailservice-v2",
  "service-com-amazonaws-sqs-amazonsqs",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",

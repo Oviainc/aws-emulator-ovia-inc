@@ -202,6 +202,10 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # A handler's SDK call to a REST-bound service is asserted against the service that answers
 # it, so Amazon API Gateway is mounted beside lambda on ONE engine for those tests.
 service-com-amazonaws-apigateway-backplanecontrolservice = { workspace = true }
+# The same for Amazon SES API v2, the other REST-bound service a handler's SDK reaches: the
+# identity, configuration set and message a handler's calls produce are read back through
+# that service's own API, mounted beside lambda on ONE engine.
+service-com-amazonaws-sesv2-simpleemailservice-v2 = { workspace = true }
 # The same table is the sink a handler's OWN outbound call writes to in the stream-driven
 # pipeline test, mounted on that same engine so the item is read back where a client reads
 # it.

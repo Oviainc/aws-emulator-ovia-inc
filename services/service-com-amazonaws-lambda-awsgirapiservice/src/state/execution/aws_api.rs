@@ -231,6 +231,18 @@ pub const APIS: &[Api] = &[
             json_version: "1.1",
         },
     },
+    // `services/service-com-amazonaws-sesv2-simpleemailservice-v2/smithy-model/
+    // com-amazonaws-sesv2-simpleemailservice-v2.json`: restJson1, sigv4Name `ses`,
+    // endpointPrefix `email`, sdkId `SESv2`. Its requests are bound per operation out of
+    // that same model ([`SESV2`]), so all 116 operations it binds are reachable — sending a
+    // message, and managing an identity, a configuration set, a contact list or a
+    // suppression list, are what a function that exists to send mail does.
+    Api {
+        sdk_token: "sesv2",
+        signing_name: "ses",
+        endpoint_prefix: "email",
+        protocol: Protocol::RestJson(&SESV2),
+    },
 ];
 
 /// Amazon API Gateway's own model, which a call to it is bound by.
@@ -247,6 +259,18 @@ static APIGATEWAY: super::rest_json::RestApi = super::rest_json::RestApi {
          com-amazonaws-apigateway-backplanecontrolservice.json"
     ),
     namespace: "com.amazonaws.apigateway",
+    parsed: ::std::sync::OnceLock::new(),
+};
+
+/// Amazon SES API v2's own model, which a call to it is bound by, embedded exactly as the
+/// API Gateway model above is and for the same reason: the wire facts of its operations are
+/// that model's, so this seam states none of them.
+static SESV2: super::rest_json::RestApi = super::rest_json::RestApi {
+    model: include_str!(
+        "../../../../service-com-amazonaws-sesv2-simpleemailservice-v2/smithy-model/\
+         com-amazonaws-sesv2-simpleemailservice-v2.json"
+    ),
+    namespace: "com.amazonaws.sesv2",
     parsed: ::std::sync::OnceLock::new(),
 };
 
@@ -590,15 +614,11 @@ mod tests {
                 // carries is what every one of its requests is bound by, so the one fact to
                 // hold is that the model parsed and binds operations at all.
                 super::Protocol::RestJson(rest) => {
-                    let bound = super::super::rest_json::bind(
-                        rest,
-                        "GetRestApis",
-                        &::serde_json::json!({}),
-                    );
+                    let bound = rest.model().operation_count();
                     assert!(
-                        bound.is_ok(),
+                        bound > 0,
                         "case {:?}: expected the embedded model to bind its operations, got \
-                         {bound:?}",
+                         {bound}",
                         api.sdk_token
                     );
                 }
