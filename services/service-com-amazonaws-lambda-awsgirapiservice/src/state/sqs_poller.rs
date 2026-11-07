@@ -15,10 +15,16 @@
 //!   consumer of a queue goes through, so a delivery the poller makes counts exactly as a
 //!   client's `ReceiveMessage` does: the message's `ApproximateReceiveCount` rises, it is
 //!   hidden while a consumer holds it and it becomes visible again when that hold lapses.
-//!   The hold covers the whole of the attempt the batch is handed to — the queue's own
-//!   `VisibilityTimeout` or the function's `Timeout`, whichever is longer, since one attempt
-//!   cannot outlast the function's — so no message is handed to a second consumer while the
-//!   first attempt at it may still be running (see [`invisible_for_seconds`]). A poll also
+//!   The hold covers the whole span this poller holds the batch — the window it gathers it
+//!   over plus the attempt it hands it to, which is the queue's own `VisibilityTimeout` or
+//!   the function's `Timeout`, whichever is longer, since one attempt cannot outlast the
+//!   function's — so no message is handed to a second consumer while the first attempt at it
+//!   may still be running (see [`invisible_for_seconds`]). A mapping carrying a
+//!   `MaximumBatchingWindowInSeconds` — "the maximum amount of time, in seconds, that Lambda
+//!   spends gathering records before invoking the function" — holds a batch it has not
+//!   filled for up to that long, taking up what arrives meanwhile, so its function is
+//!   invoked with the records that accumulated over the window rather than with each as it
+//!   arrives ([`gathered`]). A poll also
 //!   applies what the queue's own `RedrivePolicy` owes first, so a
 //!   message that has had every delivery that policy allows is moved to the dead-letter
 //!   queue the policy names instead of being handed over again. The reads of that poll are
@@ -110,6 +116,13 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// instead, which is a smaller batch and never a message that is not polled.
 const MAX_MESSAGES_PER_BATCH: usize = 1_000;
 
+/// The longest batching window a mapping gathers a batch over.
+///
+/// Source: `MaximumBatchingWindowInSeconds`' own `@range(min: 0, max: 300)`. The boundary
+/// validator already refuses a request past it; this is that same bound applied where the
+/// POLLER relies on it, since the value is read back out of stored state.
+const MAX_BATCHING_WINDOW_SECONDS: i32 = 300;
+
 /// The `eventSource` each record of the event a queue mapping hands its function carries.
 const SQS_EVENT_SOURCE: &str = "aws:sqs";
 
@@ -161,6 +174,12 @@ struct PollTarget {
     /// `BatchSize`: "the maximum number of records in each batch that Lambda pulls from
     /// your stream or queue".
     batch_size: usize,
+    /// `MaximumBatchingWindowInSeconds`: "the maximum amount of time, in seconds, that
+    /// Lambda spends gathering records before invoking the function" — so a mapping that
+    /// configures one holds a batch it has not filled for up to that long, taking up what
+    /// arrives meanwhile, instead of invoking its function with the first messages it finds.
+    /// Zero (which is the default for a queue source) hands over what one poll found.
+    batching_window: Duration,
     /// The `Pattern` of each of the mapping's `FilterCriteria` filters, as stored.
     filters: Vec<String>,
     /// Whether the mapping's `FunctionResponseTypes` asks for the function's report of which
@@ -172,6 +191,7 @@ struct PollTarget {
 
 /// One message this pass polled: the message itself, and the record the event handed to the
 /// function carries it as.
+#[derive(Debug)]
 struct PolledMessage {
     /// The id the queue holds the message under, which is what a delete names it by.
     message_id: String,
@@ -189,6 +209,10 @@ struct PolledMessage {
 pub struct PollSession {
     /// The clients this pass invokes a function through, built on first use.
     clients: Clients,
+    /// For each mapping that is GATHERING a batch, what it has gathered so far — a mapping
+    /// with a `MaximumBatchingWindowInSeconds` of its own, whose batch is neither full nor
+    /// out of time yet.
+    gathering: BTreeMap<String, Gathering>,
     /// For each mapping, the minute (epoch seconds divided by sixty) its last 0-valued poll
     /// count was published in.
     idle_minute: BTreeMap<String, i64>,
@@ -196,11 +220,27 @@ pub struct PollSession {
     failures: BTreeMap<String, u32>,
 }
 
+/// The batch a mapping with a batching window is still gathering.
+///
+/// Its messages are already OUT of the queue — the poll that took them hid them from every
+/// other consumer for the whole span this hold covers (see [`invisible_for_seconds`]) — so
+/// they are held here until the batch is full or the window has run, and then handed to the
+/// function as one event.
+#[derive(Debug)]
+struct Gathering {
+    /// When the first message of this batch was gathered, which is what the window is
+    /// measured from.
+    opened_at: SystemTime,
+    /// The messages gathered so far, in the order the queue handed them over.
+    messages: Vec<PolledMessage>,
+}
+
 impl ::std::fmt::Debug for PollSession {
     /// The bookkeeping, without the clients: an SDK client has no rendering of its own.
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
         formatter
             .debug_struct("PollSession")
+            .field("gathering", &self.gathering)
             .field("idle_minute", &self.idle_minute)
             .field("failures", &self.failures)
             .finish_non_exhaustive()
@@ -289,6 +329,12 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
         polling_targets(&store)
     };
     let at_secs = epoch_secs(now);
+    // A mapping that no longer polls — disabled, deleted, or its function no longer
+    // invocable — is gathering nothing: anything it held stays on its queue and becomes
+    // visible again when the hold on it lapses.
+    let polling: ::std::collections::BTreeSet<String> =
+        targets.iter().map(|target| target.uuid.clone()).collect();
+    session.gathering.retain(|uuid, _| polling.contains(uuid));
     for target in targets {
         // Lambda reads the queue ACTING AS the function's execution role, so the reads this
         // pass would make are subject to the policies in force on that role AT THIS INSTANT
@@ -299,18 +345,32 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
         // a role and withhold nothing).
         if let Some(detail) = withheld_queue_read(iam.as_ref(), &target) {
             note_unpollable(session, &target, &detail);
+            // A mapping that may take nothing out of its queue is not gathering either: the
+            // batch it was holding is let go, so the records in it are the queue's to hand
+            // over again once their hold lapses — rather than being handed over later, under
+            // receipt handles that lapsed with it, by a pass whose window has long run.
+            session.gathering.remove(&target.uuid);
             continue;
         }
-        let polled = take_batch(&queues, &target, now);
-        if polled.is_empty() {
-            // Nothing was waiting, so no processing attempt was made and there is no result
-            // of one to report. The poll itself is still a measurement: a mapping that
-            // polled an empty queue says so, at most once a minute.
-            if target.meters_event_counts && claim_idle_minute(session, &target.uuid, at_secs) {
-                metrics.publish_idle_poll(&target.uuid, at_secs);
+        let polled = take_batch(&queues, &target, now, gathering_room(session, &target));
+        // What this mapping has to hand over NOW: what one poll found, or — for a mapping
+        // with a batching window — what it has gathered over that window.
+        let polled = match gathered(session, &target, polled, now) {
+            Gathered::Due(polled) => polled,
+            // Still gathering: the messages are held, so nothing is invoked, deleted or
+            // metered for them yet. The pass that hands them over reports all of it.
+            Gathered::Gathering => continue,
+            Gathered::Nothing => {
+                // Nothing was waiting, so no processing attempt was made and there is no
+                // result of one to report. The poll itself is still a measurement: a mapping
+                // that polled an empty queue says so, at most once a minute.
+                if target.meters_event_counts && claim_idle_minute(session, &target.uuid, at_secs)
+                {
+                    metrics.publish_idle_poll(&target.uuid, at_secs);
+                }
+                continue;
             }
-            continue;
-        }
+        };
         let (invoking, filtered_out) = partition_by_filters(&target, &polled);
         // A message the filter rejected is removed from the queue: nothing else would, and
         // the mapping would otherwise be handed it again at every poll.
@@ -437,40 +497,145 @@ fn note_unpollable(session: &mut PollSession, target: &PollTarget, detail: &str)
 ///
 /// A delivery hides a message for the queue's own `VisibilityTimeout`, which is the span a
 /// message is handed to ONE consumer for. A poller holding a batch for a function is that
-/// one consumer for as long as the attempt it handed the batch to lasts, and it keeps the
-/// batch's visibility extended for that whole span rather than letting it lapse part way
-/// through: a message that came back mid-attempt would be handed to a second consumer while
-/// the first was still working on it, which is a delivery nothing asked for. One attempt
-/// cannot outlast the function's own `Timeout` — "the amount of time that Lambda allows a
-/// function to run before stopping it" — so holding the batch for the longer of the two
-/// spans covers the attempt whatever it comes to, and leaves the queue's own timeout in
-/// charge whenever it is already the longer one. That is also what the comparison a mapping
-/// is ACCEPTED against assumes (`crate::state::queue_visibility_refusal`); the hold is what
-/// keeps it true after a client lowers the queue's timeout or raises the function's, neither
-/// of which the other service knows about.
+/// one consumer for as long as it holds it: the window it gathers the batch over plus the
+/// attempt it then hands it to, and it keeps the batch's visibility extended for that whole
+/// span rather than letting it lapse part way through — a message that came back mid-attempt
+/// would be handed to a second consumer while the first was still working on it, which is a
+/// delivery nothing asked for. One attempt cannot outlast the function's own `Timeout` —
+/// "the amount of time that Lambda allows a function to run before stopping it" — so
+/// holding the batch for the gathering window plus the longer of the two spans covers the
+/// whole hold whatever it comes to, and leaves the queue's own timeout in charge whenever it
+/// is already the longer one. That is also what the comparison a mapping is ACCEPTED against
+/// assumes (`crate::state::queue_visibility_refusal`); the hold is what keeps it true after
+/// a client lowers the queue's timeout or raises the function's, neither of which the other
+/// service knows about.
 ///
 /// Bounded by the range the attribute itself takes, since the result is how long one
 /// delivery hides a message for.
 fn invisible_for_seconds(
     queue_visibility_timeout_seconds: i64,
     function_timeout_seconds: i64,
+    gathering_window_seconds: i64,
 ) -> i64 {
     let (floor, ceiling) = sqs::state::integer_bounds(sqs::state::VISIBILITY_TIMEOUT);
     queue_visibility_timeout_seconds
         .max(function_timeout_seconds)
+        .saturating_add(gathering_window_seconds)
         .clamp(floor, ceiling)
 }
 
-/// Take the next batch out of `target`'s queue at `now`, as the records the function would
-/// be handed them as.
+/// How many more messages `target` may take out of its queue on this pass: its `BatchSize`,
+/// less whatever it has already gathered towards the batch it is holding.
+fn gathering_room(session: &PollSession, target: &PollTarget) -> usize {
+    let held = session
+        .gathering
+        .get(&target.uuid)
+        .map_or(0, |gathering| gathering.messages.len());
+    target.batch_size.saturating_sub(held)
+}
+
+/// What a mapping has to hand its function at `now`.
+enum Gathered {
+    /// This batch: hand it over.
+    Due(Vec<PolledMessage>),
+    /// The mapping is still gathering — it holds messages, and neither its `BatchSize` nor
+    /// its batching window is up yet.
+    Gathering,
+    /// Nothing is held and the queue had nothing to hand over.
+    Nothing,
+}
+
+/// Whether the batch a mapping has gathered is DUE — its function is handed it now — or
+/// whether the mapping goes on gathering.
 ///
-/// Empty when the mapping names a queue this engine no longer holds, or when the queue had
-/// nothing it could hand over.
+/// The two reasons a batch is due, and nothing else: it holds "the maximum number of records
+/// in each batch that Lambda pulls from your stream or queue" (`BatchSize`), or it has been
+/// gathering for the whole of "the maximum amount of time, in seconds, that Lambda spends
+/// gathering records before invoking the function" (`MaximumBatchingWindowInSeconds`) — both
+/// MAXIMA, so a batch that fills goes without waiting the rest of the window out, and a
+/// window that has run hands over whatever was gathered however small it is. A batch holding
+/// nothing is never due: there is nothing to hand over.
+///
+/// `pub` because it is the whole of the decision this poller takes about a gathered batch,
+/// stated in one place.
+#[must_use]
+pub fn batch_is_due(
+    gathered: usize,
+    batch_size: usize,
+    waited: Duration,
+    window: Duration,
+) -> bool {
+    gathered > 0 && (gathered >= batch_size || waited >= window)
+}
+
+/// Fold what this pass polled into what `target` is gathering, and decide whether the batch
+/// is due.
+///
+/// A mapping with no batching window gathers nothing: what one poll found is the batch, as
+/// `MaximumBatchingWindowInSeconds` being zero says. A mapping WITH one holds its batch until
+/// [`batch_is_due`] says it may go, measured from the first message of that batch — so the
+/// function is invoked with the records that accumulated over the window rather than with
+/// each as it arrives.
+fn gathered(
+    session: &mut PollSession,
+    target: &PollTarget,
+    polled: Vec<PolledMessage>,
+    now: SystemTime,
+) -> Gathered {
+    if target.batching_window.is_zero() {
+        return if polled.is_empty() {
+            Gathered::Nothing
+        } else {
+            Gathered::Due(polled)
+        };
+    }
+    let gathering = session
+        .gathering
+        .entry(target.uuid.clone())
+        .or_insert_with(|| Gathering {
+            opened_at: now,
+            messages: Vec::new(),
+        });
+    if gathering.messages.is_empty() {
+        // The window is measured from the first message gathered, not from the pass that
+        // found the queue empty.
+        gathering.opened_at = now;
+    }
+    gathering.messages.extend(polled);
+    if gathering.messages.is_empty() {
+        session.gathering.remove(&target.uuid);
+        return Gathered::Nothing;
+    }
+    let waited = now
+        .duration_since(gathering.opened_at)
+        .unwrap_or_default();
+    if !batch_is_due(
+        gathering.messages.len(),
+        target.batch_size,
+        waited,
+        target.batching_window,
+    ) {
+        return Gathered::Gathering;
+    }
+    let batch = ::std::mem::take(&mut gathering.messages);
+    session.gathering.remove(&target.uuid);
+    Gathered::Due(batch)
+}
+
+/// Take the next batch out of `target`'s queue at `now`, as the records the function would
+/// be handed them as — at most `room` messages, which is what is left of its `BatchSize`.
+///
+/// Empty when the mapping names a queue this engine no longer holds, when the queue had
+/// nothing it could hand over, and when the batch being gathered is already full.
 fn take_batch(
     queues: &::engine::ServiceState<sqs::state::ComAmazonawsSqsAmazonsqsState>,
     target: &PollTarget,
     now: SystemTime,
+    room: usize,
 ) -> Vec<PolledMessage> {
+    if room == 0 {
+        return Vec::new();
+    }
     let mut store = queues.lock();
     // Retention lapses, visibility timeouts and message movement tasks are owed by the
     // clock, so what the delivery below sees is what the queue may hand out.
@@ -493,14 +658,18 @@ fn take_batch(
     let Some(queue) = store.queue_by_arn_mut(&target.queue_arn) else {
         return Vec::new();
     };
-    // The batch is hidden for as long as the attempt it is about to be handed to may last;
-    // see `invisible_for_seconds`.
+    // The batch is hidden for as long as this poller holds it: the window it is gathered
+    // over and the attempt it is then handed to; see `invisible_for_seconds`.
     let handed = queue.hand_over(
         now,
-        target.batch_size,
+        room,
         sqs::state::after(
             now,
-            invisible_for_seconds(visibility_timeout, target.function_timeout_seconds),
+            invisible_for_seconds(
+                visibility_timeout,
+                target.function_timeout_seconds,
+                i64::try_from(target.batching_window.as_secs()).unwrap_or(i64::MAX),
+            ),
         ),
     );
     handed
@@ -870,6 +1039,17 @@ fn polling_targets(store: &ComAmazonawsLambdaAwsgirapiserviceState) -> Vec<PollT
                 batch_size: usize::try_from(mapping.batch_size)
                     .unwrap_or(1)
                     .clamp(1, MAX_MESSAGES_PER_BATCH),
+                // "The maximum amount of time, in seconds, that Lambda spends gathering
+                // records before invoking the function": a mapping that states none gathers
+                // for no time at all, which is the default for a queue source.
+                batching_window: Duration::from_secs(
+                    mapping
+                        .maximum_batching_window_in_seconds
+                        .unwrap_or(0)
+                        .clamp(0, MAX_BATCHING_WINDOW_SECONDS)
+                        .unsigned_abs()
+                        .into(),
+                ),
                 filters: mapping
                     .filter_criteria
                     .as_ref()
@@ -1379,22 +1559,27 @@ mod tests {
         // The rows differ along which of the two spans is the longer one, and are taken at
         // each published bound of both members: `VisibilityTimeout` is "an integer from 0 to
         // 43,200 (12 hours)" and a function's `Timeout` runs from one second to AWS's
-        // published Lambda quota of 900.
+        // published Lambda quota of 900. The last column is the window the batch is
+        // GATHERED over before any of that, which the hold has to cover too
+        // (`MaximumBatchingWindowInSeconds`, `@range(min: 0, max: 300)`).
         let rows = [
-            ("the queue hides nothing", 0, 5, 5),
-            ("a one second queue, an eight second function", 1, 8, 8),
-            ("a queue above the function", 30, 3, 30),
-            ("the two spans equal", 10, 10, 10),
-            ("the shortest function a queue can outlast", 1, 1, 1),
-            ("the longest function", 30, 900, 900),
-            ("the queue at its ceiling", 43_200, 900, 43_200),
+            ("the queue hides nothing", 0, 5, 0, 5),
+            ("a one second queue, an eight second function", 1, 8, 0, 8),
+            ("a queue above the function", 30, 3, 0, 30),
+            ("the two spans equal", 10, 10, 0, 10),
+            ("the shortest function a queue can outlast", 1, 1, 0, 1),
+            ("the longest function", 30, 900, 0, 900),
+            ("the queue at its ceiling", 43_200, 900, 0, 43_200),
+            ("a batch gathered over ten seconds", 30, 5, 10, 40),
+            ("the longest window", 30, 5, 300, 330),
+            ("a window on top of the ceiling", 43_200, 900, 300, 43_200),
         ];
-        for (case, visibility_timeout, function_timeout, expected) in rows {
-            let held = invisible_for_seconds(visibility_timeout, function_timeout);
+        for (case, visibility_timeout, function_timeout, window, expected) in rows {
+            let held = invisible_for_seconds(visibility_timeout, function_timeout, window);
             assert_eq!(
                 held, expected,
-                "case {case:?}: a batch handed to a function whose timeout is \
-                 {function_timeout}s, out of a queue hiding a delivery for \
+                "case {case:?}: a batch gathered over {window}s and handed to a function \
+                 whose timeout is {function_timeout}s, out of a queue hiding a delivery for \
                  {visibility_timeout}s, must stay in flight for {expected}s, got {held}s"
             );
         }

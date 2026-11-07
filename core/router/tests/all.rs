@@ -37,6 +37,8 @@ mod directory_data_access_cycle;
 #[path = "all/kinesisvideo_discovered_data_plane.rs"]
 mod kinesisvideo_discovered_data_plane;
 // Declared here, in this same head region, for the reason the entry above records.
+#[path = "all/lambda_sqs_event_source_batching_window.rs"]
+mod lambda_sqs_event_source_batching_window;
 #[path = "all/codebuild_service_role_trust.rs"]
 mod codebuild_service_role_trust;
 // Declared here, in this same head region, for the reason the entry above records.

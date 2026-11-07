@@ -33,6 +33,8 @@ mod pipe_execution_role;
 mod pipe_filter_body_format;
 #[path = "all/pipe_filter_clause_form.rs"]
 mod pipe_filter_clause_form;
+#[path = "all/pipe_lambda_target.rs"]
+mod pipe_lambda_target;
 #[path = "all/pipe_lifecycle.rs"]
 mod pipe_lifecycle;
 #[path = "all/pipe_lifecycle_conflicts.rs"]

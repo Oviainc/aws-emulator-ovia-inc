@@ -99,6 +99,8 @@ mod dynamodb_stream_event_source_delivery;
 mod event_invoke_config;
 #[path = "all/event_source_mapping_batch_item_failures.rs"]
 mod event_source_mapping_batch_item_failures;
+#[path = "all/event_source_mapping_batching_window.rs"]
+mod event_source_mapping_batching_window;
 #[path = "all/event_source_mapping_delete_in_use.rs"]
 mod event_source_mapping_delete_in_use;
 #[path = "all/event_source_mapping_deletion.rs"]

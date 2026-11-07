@@ -68,6 +68,11 @@ tokio = { workspace = true, features = ["time"] }
 # it: on the target queue, with the source queue drained and the enrichment run.
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
+# A pipe whose target is a Lambda function is asserted against the function's own run, so
+# Lambda is mounted beside pipes in that suite and the handler's deployment package — a
+# .zip archive the suite writes in memory — is uploaded the way a caller uploads one.
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # A DynamoDB-stream-sourced pipe reads the very records DynamoDB's own writes publish, so
 # the table service and the streams service are mounted beside pipes in that suite: the
 # changes are applied with `PutItem`/`DeleteItem` and the pipe reads them off the stream.

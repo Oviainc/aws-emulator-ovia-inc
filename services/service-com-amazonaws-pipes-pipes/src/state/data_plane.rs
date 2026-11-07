@@ -35,12 +35,16 @@
 //!   is what the target stage delivers. So an enrichment that collapses a batch into one
 //!   aggregate produces fewer target deliveries than there were source records, one that
 //!   returns several events produces more, and one that returns nothing produces none.
-//! * TARGET. Each event of the array handed to the target stage is delivered on its own:
-//!   an Amazon SQS queue's `SendMessage` takes ONE payload per call, and
-//!   `PipeTargetSqsQueueParameters` carries only `MessageGroupId` and
+//! * TARGET. How many calls the array handed to the target stage comes to is the TARGET's
+//!   own, never the pipe's: an Amazon SQS queue's `SendMessage` takes ONE payload per
+//!   call, and `PipeTargetSqsQueueParameters` carries only `MessageGroupId` and
 //!   `MessageDeduplicationId` — no batch member — so a batch of N events becomes N
-//!   messages of one event each, never one message holding an array. A parameter's value
-//!   is used as configured unless it is a JSON path into the event (`$.…`), which is
+//!   messages of one event each, never one message holding an array; a Lambda function's
+//!   `Invoke` takes one payload which can be the array itself, so the same batch becomes
+//!   ONE invocation carrying every event, which is what makes the source's `BatchSize` the
+//!   count of invocations a backlog comes to. A function target is invoked synchronously or
+//!   asynchronously as its `InvocationType` says ([`deliver_batch`]). A queue parameter's
+//!   value is used as configured unless it is a JSON path into the event (`$.…`), which is
 //!   resolved against each event delivered, so the value can be the record's own.
 //!
 //! Either of those last two stages may be handed something OTHER than the event: an
@@ -120,6 +124,7 @@ use std::time::{Duration, Instant};
 use ::serde_json::{json, Value};
 
 use super::{pipe_state, ComAmazonawsPipesPipesState, PipeRecord};
+use crate::ops::types::PipeTargetParameters;
 
 /// How long the poller waits before looking at an idle source again. Short enough that
 /// a record sent to the source is moved promptly, long enough not to spin.
@@ -283,6 +288,11 @@ const MESSAGE_GROUP_ID: &str = "MessageGroupId";
 
 /// The `MessageDeduplicationId` target parameter, likewise.
 const MESSAGE_DEDUPLICATION_ID: &str = "MessageDeduplicationId";
+
+/// The `InvocationType` of a Lambda function target that is invoked ASYNCHRONOUSLY.
+/// Source: `PipeTargetInvocationType` in `smithy-model/com-amazonaws-pipes-pipes.json`,
+/// whose other value `REQUEST_RESPONSE` is the one the member documents as the default.
+const FIRE_AND_FORGET_INVOCATION: &str = "FIRE_AND_FORGET";
 
 /// What an `InputTemplate` OPENS a placeholder with, before the JSON path of the value
 /// the placeholder stands for.
@@ -855,9 +865,9 @@ async fn move_one_batch(
         }
     };
 
-    // The target stage makes one call per event, each the same call on the same resource,
-    // so the role is asked about it once for the batch — and only when there is an event
-    // to deliver, because a batch the enrichment emptied makes no target call at all.
+    // The target stage makes the same call on the same resource for every event of the
+    // batch, so the role is asked about it once for the batch — and only when there is an
+    // event to deliver, because a batch the enrichment emptied makes no target call at all.
     if !events.is_empty() {
         if let Some(detail) = record.refusal(run.target.delivery_action(), &run.target_arn) {
             return Batch::Failed {
@@ -869,49 +879,65 @@ async fn move_one_batch(
         }
     }
 
-    // One target call per event, never one call holding the array. What the target
-    // RECEIVES is the event rendered through the TARGET's input template, when the pipe
-    // carries one; the target parameters are read from the event itself either way. Both
-    // of those read the event through its PATHS, so both see the message body in the
-    // format its producer sent it in — while the event a target with no template is
-    // handed is the envelope itself, body as sent.
-    for event in &events {
-        let read = path_view(event);
-        let payload = match run.target_template.as_deref() {
-            None => Cow::Borrowed(event),
-            Some(template) => match render_template(template, read.as_ref()) {
-                Ok(payload) => Cow::Owned(payload),
-                Err(detail) => {
-                    return Batch::Failed {
-                        stage: Stage::Target,
-                        events: taken,
-                        detail,
-                        checked_out,
-                    }
-                }
-            },
-        };
-        if let Err(detail) = deliver_event(
-            callback,
-            clients,
-            &run.target,
-            payload.as_ref(),
-            read.as_ref(),
-        )
-        .await
-        {
+    // What the target RECEIVES per event: the event rendered through the TARGET's input
+    // template, when the pipe carries one; the target parameters are read from the event
+    // itself either way. Both of those read the event through its PATHS, so both see the
+    // message body in the format its producer sent it in — while the event a target with
+    // no template is handed is the envelope itself, body as sent.
+    let payloads = match target_payloads(run, &events) {
+        Ok(payloads) => payloads,
+        Err(detail) => {
             return Batch::Failed {
                 stage: Stage::Target,
                 events: taken,
                 detail,
                 checked_out,
-            };
+            }
         }
+    };
+
+    // How the target TAKES them is the target's own: one call per event for a target whose
+    // API carries one payload per call, one call holding every event for a target whose API
+    // takes the batch ([`deliver_batch`]).
+    if let Err(detail) = deliver_batch(callback, clients, &run.target, &payloads).await {
+        return Batch::Failed {
+            stage: Stage::Target,
+            events: taken,
+            detail,
+            checked_out,
+        };
     }
 
     // Delivered: the batch may be finished with its source.
     finish_batch(callback, clients, cursors, record, run, &polled).await;
     Batch::Moved { events: taken }
+}
+
+/// What ONE event contributes to the target stage: the payload the target receives for it,
+/// beside that event as a path reads it ([`path_view`]), which the target parameters are
+/// resolved against.
+type Delivery<'a> = (Cow<'a, Value>, Cow<'a, Value>);
+
+/// What each event of `events` contributes to the target stage: the payload the target
+/// receives beside the event the target parameters are resolved against.
+///
+/// A render that fails is a FAILED delivery for the whole batch — no event of it is
+/// handed over — so the records stay on the source rather than part of a batch being
+/// delivered.
+fn target_payloads<'a>(
+    run: &RunningPipe,
+    events: &'a [Value],
+) -> Result<Vec<Delivery<'a>>, String> {
+    let mut payloads = Vec::with_capacity(events.len());
+    for event in events {
+        let read = path_view(event);
+        let payload = match run.target_template.as_deref() {
+            None => Cow::Borrowed(event),
+            Some(template) => Cow::Owned(render_template(template, read.as_ref())?),
+        };
+        payloads.push((payload, read));
+    }
+    Ok(payloads)
 }
 
 /// Finish a batch with its SOURCE, now that every event derived from it has been
@@ -1890,17 +1916,23 @@ fn enrichment_events(returned: &[u8], arn: &str) -> Result<Vec<Value>, String> {
     })
 }
 
-/// Deliver ONE event to the target.
+/// Deliver the batch to the target.
 ///
-/// `payload` is what the target RECEIVES — the event, or the event rendered through the
-/// target's input template — while `event` is the event the target parameters are read
-/// from, as a path reads it ([`path_view`]).
-async fn deliver_event(
+/// Each entry of `payloads` is what the target RECEIVES for one event — the event, or the
+/// event rendered through the target's input template — beside the event its target
+/// parameters are read from, as a path reads it ([`path_view`]).
+///
+/// How many calls that comes to is the TARGET's own: `SendMessage` takes one message body
+/// per call and `PipeTargetSqsQueueParameters` carries no batch member, so a queue target
+/// receives one call per event and never one message holding the array; `Invoke` takes one
+/// payload, which is the batch itself, so a function target receives ONE call carrying
+/// every event — which is what makes the source's `BatchSize` the count of invocations a
+/// backlog comes to.
+async fn deliver_batch(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
     target: &Target,
-    payload: &Value,
-    event: &Value,
+    payloads: &[Delivery<'_>],
 ) -> Result<(), String> {
     match target {
         Target::Queue {
@@ -1909,33 +1941,81 @@ async fn deliver_event(
             message_group_id,
             message_deduplication_id,
         } => {
-            // Each parameter is read for THIS event, so one that is a path into the event
-            // contributes the record's own value rather than one constant for every
-            // record — which is what lets a FIFO target keep a group or a deduplication
-            // token per record.
-            let group = resolved_parameter(MESSAGE_GROUP_ID, message_group_id.as_deref(), event)?;
-            let deduplication = resolved_parameter(
-                MESSAGE_DEDUPLICATION_ID,
-                message_deduplication_id.as_deref(),
-                event,
-            )?;
-            let mut request = clients
-                .sqs(callback, region)
-                .send_message()
-                .queue_url(url)
-                .message_body(target_body(payload));
-            if let Some(group) = group {
-                request = request.message_group_id(group);
+            for (payload, event) in payloads {
+                // Each parameter is read for THIS event, so one that is a path into the
+                // event contributes the record's own value rather than one constant for
+                // every record — which is what lets a FIFO target keep a group or a
+                // deduplication token per record.
+                let group = resolved_parameter(
+                    MESSAGE_GROUP_ID,
+                    message_group_id.as_deref(),
+                    event.as_ref(),
+                )?;
+                let deduplication = resolved_parameter(
+                    MESSAGE_DEDUPLICATION_ID,
+                    message_deduplication_id.as_deref(),
+                    event.as_ref(),
+                )?;
+                let mut request = clients
+                    .sqs(callback, region)
+                    .send_message()
+                    .queue_url(url)
+                    .message_body(target_body(payload.as_ref()));
+                if let Some(group) = group {
+                    request = request.message_group_id(group);
+                }
+                if let Some(deduplication) = deduplication {
+                    request = request.message_deduplication_id(deduplication);
+                }
+                request.send().await.map_err(|error| {
+                    format!(
+                        "the target queue {url} did not take the event ({})",
+                        ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+                    )
+                })?;
             }
-            if let Some(deduplication) = deduplication {
-                request = request.message_deduplication_id(deduplication);
+            Ok(())
+        }
+        Target::Function {
+            arn,
+            region,
+            synchronous,
+        } => {
+            // The events as ONE array, serialized from the payloads themselves rather than
+            // from a second copy of them.
+            let events: Vec<&Value> = payloads.iter().map(|(payload, _)| payload.as_ref()).collect();
+            let batch = ::serde_json::to_string(&events)
+                .map_err(|error| format!("the batch for the target {arn} is not JSON ({error})"))?;
+            // How big a payload ONE invocation carries is the INVOKED service's own quota,
+            // enforced where it is published: a batch past it is refused by the `Invoke`
+            // below, which fails the target stage and leaves the records on the source,
+            // exactly as any other refusal of that call does.
+            let answer = clients
+                .lambda(callback, region)
+                .invoke()
+                .function_name(arn)
+                .invocation_type(if *synchronous {
+                    ::aws_sdk_lambda::types::InvocationType::RequestResponse
+                } else {
+                    ::aws_sdk_lambda::types::InvocationType::Event
+                })
+                .payload(::aws_sdk_lambda::primitives::Blob::new(batch.into_bytes()))
+                .send()
+                .await
+                .map_err(|error| {
+                    format!(
+                        "the target {arn} could not be invoked ({})",
+                        ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+                    )
+                })?;
+            // "If present, indicates that an error occurred during function execution"
+            // (`InvocationResponse$FunctionError`): the batch was not taken, so nothing of
+            // it is deleted from the source and the pipe hands it over again. An
+            // asynchronous invocation reports none — Lambda has only accepted the event at
+            // that point — so what such a target did with the batch is its own business.
+            if let Some(failure) = answer.function_error.as_deref() {
+                return Err(format!("the target {arn} answered a {failure} error"));
             }
-            request.send().await.map_err(|error| {
-                format!(
-                    "the target queue {url} did not take the event ({})",
-                    ::aws_smithy_types::error::display::DisplayErrorContext(&error)
-                )
-            })?;
             Ok(())
         }
     }
@@ -2287,14 +2367,25 @@ enum Target {
         message_group_id: Option<String>,
         message_deduplication_id: Option<String>,
     },
+    /// A Lambda function: ONE `Invoke` carrying the whole batch.
+    Function {
+        arn: String,
+        region: String,
+        /// Whether that invocation is synchronous. `InvocationType` is "whether to invoke
+        /// the function synchronously or asynchronously", `REQUEST_RESPONSE` (the default)
+        /// corresponding to the `RequestResponse` of Lambda's own `Invoke` and
+        /// `FIRE_AND_FORGET` to its `Event`.
+        synchronous: bool,
+    },
 }
 
 impl Target {
     /// The IAM action the target stage's call is authorized under: the API call this kind
-    /// of target takes one event by.
+    /// of target takes its events by.
     fn delivery_action(&self) -> &'static str {
         match self {
             Self::Queue { .. } => SEND_MESSAGE_ACTION,
+            Self::Function { .. } => INVOKE_FUNCTION_ACTION,
         }
     }
 }
@@ -2415,10 +2506,7 @@ fn resolve_run(pipe: &PipeRecord) -> Result<RunningPipe, String> {
     let target_template = target_parameters
         .and_then(|parameters| parameters.input_template.clone())
         .filter(|template| !template.is_empty());
-    let target = resolve_target(
-        &pipe.target,
-        target_parameters.and_then(|parameters| parameters.sqs_queue_parameters.as_ref()),
-    )?;
+    let target = resolve_target(&pipe.target, target_parameters)?;
 
     Ok(RunningPipe {
         source,
@@ -2459,31 +2547,43 @@ fn resolve_enrichment(arn: &str) -> Result<Enrichment, String> {
 /// The target the `Target` ARN names, or why this data plane does not deliver to it.
 fn resolve_target(
     arn: &str,
-    queue_parameters: Option<&crate::ops::types::PipeTargetSqsQueueParameters>,
+    parameters: Option<&PipeTargetParameters>,
 ) -> Result<Target, String> {
     let parsed = ::service_common::arn::parse(arn)
         .ok_or_else(|| format!("its Target {arn} is not a resource ARN"))?;
-    if parsed.vendor != SQS_NAMESPACE {
-        return Err(format!(
-            "its Target names a {} resource, and only an Amazon SQS queue target is delivered \
-             to by this emulator",
-            parsed.vendor
-        ));
+    match (parsed.vendor, parsed.resource_type()) {
+        (SQS_NAMESPACE, _) => {
+            let name = parsed.resource;
+            if name.contains('/') || name.contains(':') {
+                return Err(format!("its Target {arn} names no queue"));
+            }
+            let queue_parameters = parameters.and_then(|p| p.sqs_queue_parameters.as_ref());
+            Ok(Target::Queue {
+                url: queue_url(parsed.region, parsed.account, name),
+                region: parsed.region.to_string(),
+                message_group_id: queue_parameters
+                    .and_then(|parameters| parameters.message_group_id.clone())
+                    .filter(|group| !group.is_empty()),
+                message_deduplication_id: queue_parameters
+                    .and_then(|parameters| parameters.message_deduplication_id.clone())
+                    .filter(|token| !token.is_empty()),
+            })
+        }
+        (LAMBDA_NAMESPACE, FUNCTION_RESOURCE) => Ok(Target::Function {
+            arn: arn.to_string(),
+            region: parsed.region.to_string(),
+            // `REQUEST_RESPONSE` is the default the member documents, so a pipe that
+            // configures no invocation type is invoked synchronously.
+            synchronous: parameters
+                .and_then(|p| p.lambda_function_parameters.as_ref())
+                .and_then(|parameters| parameters.invocation_type.as_deref())
+                .is_none_or(|configured| configured != FIRE_AND_FORGET_INVOCATION),
+        }),
+        (vendor, _) => Err(format!(
+            "its Target names a {vendor} resource, and only an Amazon SQS queue or a Lambda \
+             function target is delivered to by this emulator"
+        )),
     }
-    let name = parsed.resource;
-    if name.contains('/') || name.contains(':') {
-        return Err(format!("its Target {arn} names no queue"));
-    }
-    Ok(Target::Queue {
-        url: queue_url(parsed.region, parsed.account, name),
-        region: parsed.region.to_string(),
-        message_group_id: queue_parameters
-            .and_then(|parameters| parameters.message_group_id.clone())
-            .filter(|group| !group.is_empty()),
-        message_deduplication_id: queue_parameters
-            .and_then(|parameters| parameters.message_deduplication_id.clone())
-            .filter(|token| !token.is_empty()),
-    })
 }
 
 /// The url Amazon SQS addresses the queue named `name` by:

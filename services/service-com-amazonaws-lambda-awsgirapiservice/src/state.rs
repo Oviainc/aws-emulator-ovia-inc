@@ -235,7 +235,7 @@ pub mod event_source_poller;
 pub mod metrics;
 pub use metrics::{invoked_resource, publish_invocation};
 pub mod sqs_poller;
-pub use sqs_poller::{drive_sqs_pollers, poll_due, PollSession, POLL_INTERVAL};
+pub use sqs_poller::{batch_is_due, drive_sqs_pollers, poll_due, PollSession, POLL_INTERVAL};
 
 /// Which records of a batch the function it was handed to reported it did not process — the
 /// ONE reading of a partial batch response, which both pollers above decide what to consume
