@@ -47,6 +47,18 @@ const REQUEST_ID_HEADER: &str = "x-amzn-requestid";
 /// the CLOCK, so nothing here sleeps on the emulator's behalf.
 const SLACK: Duration = Duration::from_millis(150);
 
+/// The `Timeout` every function this suite creates carries, in seconds.
+///
+/// It bounds the WALL CLOCK one run may spend (`state::execution::run_budget`), and the
+/// handlers here return at once, so what it has to cover is not their work but the host's
+/// own scheduling: this target runs its suites in parallel over
+/// `state::execution::MAX_CONCURRENT_RUNS` run slots, so a run can sit mid-flight while
+/// other suites' runs hold the CPU, and a value with no headroom would end such a run on
+/// its deadline and answer a failure document instead of the handler's value — a failure
+/// of the host's load rather than of the rule under test. Kept under
+/// `state::execution::HOST_WAIT_CEILING`, so the caller still waits out the whole budget.
+const FUNCTION_TIMEOUT_SECONDS: i32 = 25;
+
 /// What a dispatched request answered.
 struct Answer {
     status: u16,
@@ -170,7 +182,7 @@ async fn create_function(router: &MultiServiceRouter, name: &str, source: &str, 
             "Runtime": runtime,
             "Handler": handler_of(runtime),
             "Publish": true,
-            "Timeout": 5,
+            "Timeout": FUNCTION_TIMEOUT_SECONDS,
             "Code": {
                 "ZipFile": base64::engine::general_purpose::STANDARD.encode(module(runtime, source)),
             },
@@ -238,6 +250,53 @@ async fn invoke(
         headers,
     )
     .await
+}
+
+/// The `errorType` an answer carries for a run whose RUNTIME ended instead of answering,
+/// and the message this emulator reports for the one such ending the HOST decides: a run
+/// stopped on a memory bound (`state::execution`'s report for `Stop::Memory`).
+const RUNTIME_EXIT_ERROR: &str = "Runtime.ExitError";
+const RUNTIME_KILLED: &str = "signal: killed";
+
+/// How many times a row re-drives its invocation while the host keeps stopping the run.
+const HOST_STOP_ATTEMPTS: usize = 4;
+
+/// `Invoke` on `reference`, re-driven while the answer reports a run the HOST stopped
+/// instead of a run of the handler.
+///
+/// The handlers this suite runs allocate nothing and return at once, so no row of it can ask
+/// for an answer like that: the memory bound a run is stopped on is read from the WHOLE
+/// process (`state/execution/python.rs`), and this target runs its suites in parallel over
+/// `state::execution::MAX_CONCURRENT_RUNS` run slots, so a trivial run can be stopped for
+/// memory another suite holds. Such an answer is not an answer to the request the row made,
+/// so the request is made again — a bounded number of times, and the last answer is returned
+/// whatever it is, so a run that really failed still fails the row.
+async fn invoke_run(
+    router: &MultiServiceRouter,
+    reference: &str,
+    headers: &[(&str, &str)],
+) -> Answer {
+    let mut answered = invoke(router, reference, headers).await;
+    for _ in 1..HOST_STOP_ATTEMPTS {
+        if !stopped_by_the_host(&answered) {
+            break;
+        }
+        answered = invoke(router, reference, headers).await;
+    }
+    answered
+}
+
+/// Whether `answered` reports a run the host stopped on a bound of its own.
+fn stopped_by_the_host(answered: &Answer) -> bool {
+    if answered.header("x-amz-function-error").is_none() {
+        return false;
+    }
+    let document = answered.json();
+    document.get("errorType").and_then(Value::as_str) == Some(RUNTIME_EXIT_ERROR)
+        && document
+            .get("errorMessage")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains(RUNTIME_KILLED))
 }
 
 /// One row: the case, the runtime, the handler it runs, the qualifier the invocation names
@@ -326,7 +385,7 @@ async fn an_invocations_answer_names_the_invocation_it_ran() {
         } else {
             Vec::new()
         };
-        let answered = invoke(&router, &reference, &headers).await;
+        let answered = invoke_run(&router, &reference, &headers).await;
         assert_eq!(
             answered.status,
             200,
@@ -341,6 +400,18 @@ async fn an_invocations_answer_names_the_invocation_it_ran() {
             "case {}: expected the answer to name its request in {REQUEST_ID_HEADER}, got \
              {stated:?}",
             row.case
+        );
+        // Reported before the ids are compared: a run that FAILED answers its failure
+        // document instead of the handler's value, which names the invocation nowhere, so
+        // the cause belongs in the message rather than showing up as an absent id.
+        let failure = answered.header("x-amz-function-error");
+        assert_eq!(
+            failure,
+            None,
+            "case {}: the handler returns a value, so the run must not fail, got \
+             {failure:?} with {:?}",
+            row.case,
+            answered.text()
         );
         let reported = answered
             .json()

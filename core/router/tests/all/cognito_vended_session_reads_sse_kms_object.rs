@@ -37,6 +37,17 @@
 //! literal, because the rule here is that the two agree; whether S3 normalises a bare key
 //! id to its full ARN is a question of the WRITE path, which this rule does not decide.
 //!
+//! The refusal suite below is about the other half of such a read: WHOSE read it is.
+//! A read that serves an SSE-KMS object's bytes performs `kms:Decrypt` on the object's key as
+//! the principal the request's credential speaks for, and a vended session speaks for the
+//! role the POOL RESOLVED for the exchange that minted it — the pool's `unauthenticated`
+//! role for a vend presenting no login, its `authenticated` role for one that does
+//! (`SetIdentityPoolRoles`' own `Roles` map, and "Logins should not be specified when trying
+//! to get credentials for an unauthenticated identity",
+//! `GetCredentialsForIdentityInput$Logins`) — so a key policy naming one of those roles opens
+//! the object for the sessions of THAT role and leaves every other session to the policy's
+//! other statements.
+//!
 //! Assembling the whole router costs stack (see `boot_serve.rs`), so it is built — and the
 //! requests driven — on a sized thread.
 
@@ -157,6 +168,23 @@ fn dispatch(
 /// which is NOT the vended session.
 const SETUP_KEY_ID: &str = "AKIDTEST";
 
+/// The identity-provider name a login carrying a token THIS service minted is handed over
+/// under — the Amazon Cognito Identity principal: "If the token is for
+/// cognito-identity.amazonaws.com, it will be passed through to Security Token Service with
+/// the appropriate role for the token" (`GetCredentialsForIdentity`'s own documentation).
+const COGNITO_IDENTITY_PROVIDER: &str = "cognito-identity.amazonaws.com";
+
+/// Which exchange a vend is, which is what the pool resolves its role from: "Logins should
+/// not be specified when trying to get credentials for an unauthenticated identity"
+/// (`GetCredentialsForIdentityInput$Logins`), so a vend presenting a login is the
+/// AUTHENTICATED exchange and one presenting none is the guest exchange — and the pool's
+/// `authenticated` and `unauthenticated` roles are the roles each resolves to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flow {
+    Guest,
+    Authenticated,
+}
+
 /// A setup call's signing, for the service whose signing name is `signing_name`.
 fn as_setup(signing_name: &str) -> Signing<'_> {
     Signing::As {
@@ -268,7 +296,7 @@ fn pool_trust_policy(pool_id: &str) -> String {
 const POOL_ROLE_POLICY: &str = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
      \"Action\":[\"kms:Decrypt\",\"s3:GetObject\"],\"Resource\":\"*\"}]}";
 
-/// The identity policy the SECOND suite's guest role carries: the S3 read alone, and no
+/// The identity policy the roles of the SECOND suite's pool carry: the S3 read alone, and no
 /// `kms:Decrypt`.
 ///
 /// S3 authorizes the signed read itself against the session principal's own documents, so a
@@ -402,6 +430,19 @@ fn vend_guest_session(
     runtime: &tokio::runtime::Runtime,
     pool_id: &str,
 ) -> String {
+    vend_session(router, runtime, pool_id, Flow::Guest)
+}
+
+/// The access key id of a session vended to a fresh identity of `pool_id` for the exchange
+/// `flow` is: `GetId`, the `GetOpenIdToken` an authenticated exchange presents as its login,
+/// and `GetCredentialsForIdentity` — each sent with NO credential scope, the way a client
+/// holding no Amazon Web Services credential sends them.
+fn vend_session(
+    router: &MultiServiceRouter,
+    runtime: &tokio::runtime::Runtime,
+    pool_id: &str,
+    flow: Flow,
+) -> String {
     let identity = rpc(
         router,
         runtime,
@@ -421,18 +462,32 @@ fn vend_guest_session(
         .expect("GetId reports an IdentityId")
         .to_string();
 
+    // The login an AUTHENTICATED exchange presents: a token this service itself minted FOR
+    // THIS identity, handed over under this service's own provider name. The guest exchange
+    // presents none at all, which is what makes it the unauthenticated one.
+    let mut request = json!({ "IdentityId": &identity_id });
+    if flow == Flow::Authenticated {
+        let mut logins = serde_json::Map::new();
+        logins.insert(
+            COGNITO_IDENTITY_PROVIDER.to_string(),
+            Value::String(open_id_token(router, runtime, &identity_id)),
+        );
+        request["Logins"] = Value::Object(logins);
+    }
     let vended = rpc(
         router,
         runtime,
         Signing::Anonymous,
         "AWSCognitoIdentityService.GetCredentialsForIdentity",
-        &json!({ "IdentityId": identity_id }),
+        &request,
     );
     assert_eq!(
         vended.status,
         200,
-        "an unsigned GetCredentialsForIdentity must be served, got {}",
-        vended.status
+        "case {flow:?}: an unsigned GetCredentialsForIdentity must be served, got {} with \
+         {:?}",
+        vended.status,
+        vended.text()
     );
     let credentials = vended.json();
     let access_key_id = credentials["Credentials"]["AccessKeyId"]
@@ -457,6 +512,34 @@ fn vend_guest_session(
         );
     }
     access_key_id
+}
+
+/// An unsigned `cognito-identity:GetOpenIdToken`, answering the OpenID Connect token this
+/// service issued for `identity_id` — the value an authenticated exchange presents as its
+/// login under this service's own provider name.
+fn open_id_token(
+    router: &MultiServiceRouter,
+    runtime: &tokio::runtime::Runtime,
+    identity_id: &str,
+) -> String {
+    let issued = rpc(
+        router,
+        runtime,
+        Signing::Anonymous,
+        "AWSCognitoIdentityService.GetOpenIdToken",
+        &json!({ "IdentityId": identity_id }),
+    );
+    assert_eq!(
+        issued.status,
+        200,
+        "setup: an unsigned GetOpenIdToken must be served, got {} with {:?}",
+        issued.status,
+        issued.text()
+    );
+    issued.json()["Token"]
+        .as_str()
+        .expect("GetOpenIdToken reports a Token")
+        .to_string()
 }
 
 /// The access key id of a guest session of a fresh pool whose unauthenticated role carries
@@ -845,6 +928,14 @@ fn key_policy(roles: &[&str]) -> String {
 /// The S3 crate's `sse_kms_decrypt_authorization` suite tables the same rule over the
 /// authorities, callers, conditions and operations it generalises over; this is the one leg
 /// only the assembled router can drive.
+///
+/// It closes by tabling the dimension that leg is one row of, and that only an identity pool
+/// has: WHICH of the pool's roles a vended session speaks for. The pool resolves its
+/// `unauthenticated` role for an exchange presenting no login and its `authenticated` role
+/// for one that does, so the key policy serves such a read exactly when it reaches the role
+/// the pool resolved for that session's own exchange — every subset of the two roles against
+/// a session of each exchange ([`RESOLVED_ROLE_ROWS`]), on the one router, pool, key and
+/// object this suite already stands up.
 #[test]
 fn a_vended_session_the_key_policy_does_not_reach_cannot_read_the_object() {
     std::thread::Builder::new()
@@ -863,9 +954,10 @@ fn a_vended_session_the_key_policy_does_not_reach_cannot_read_the_object() {
             let payload = b"the bytes the key policy protects";
             create_bucket(&router, &runtime, bucket);
 
-            // The pool and its two roles. The guest session below is a session of the
-            // unauthenticated one, which carries the S3 read and no `kms:Decrypt` of its own
-            // ([`POOL_ROLE_READ_POLICY`]), so what decides its read is the KEY policy.
+            // The pool and its two roles. Each session below is a session of one of them,
+            // and BOTH carry the S3 read and no `kms:Decrypt` of their own
+            // ([`POOL_ROLE_READ_POLICY`]), so what decides either session's read is the KEY
+            // policy.
             let pool_name = "vended-session-denied-pool";
             let pool_id = create_identity_pool(&router, &runtime, pool_name);
             let guest_role = create_pool_role(
@@ -880,7 +972,7 @@ fn a_vended_session_the_key_policy_does_not_reach_cannot_read_the_object() {
                 &runtime,
                 &format!("{pool_name}-auth"),
                 &pool_id,
-                None,
+                Some(POOL_ROLE_READ_POLICY),
             );
             set_pool_roles(
                 &router,
@@ -976,8 +1068,171 @@ fn a_vended_session_the_key_policy_does_not_reach_cannot_read_the_object() {
                 "the served read must answer the stored bytes, got {:?}",
                 served.text()
             );
+
+            // And the same statement over the whole class the two legs above are rows of:
+            // which of the pool's roles a session speaks for is what the key policy decides
+            // the read by, so a session of the pool's OTHER exchange is admitted by the
+            // grant of ITS role and by no other. The same router, pool, key and object
+            // serve every row; what each row varies is the key policy and which session
+            // reads ([`RESOLVED_ROLE_ROWS`]).
+            let authenticated_key_id =
+                vend_session(&router, &runtime, &pool_id, Flow::Authenticated);
+            for row in RESOLVED_ROLE_ROWS {
+                let granted: Vec<&str> = row
+                    .grants_the_role_of
+                    .iter()
+                    .map(|flow| match flow {
+                        Flow::Guest => guest_role.as_str(),
+                        Flow::Authenticated => authenticated.as_str(),
+                    })
+                    .collect();
+                let policy = rpc(
+                    &router,
+                    &runtime,
+                    as_setup("kms"),
+                    "TrentService.PutKeyPolicy",
+                    &json!({
+                        "KeyId": &key_id,
+                        "Policy": key_policy(&granted),
+                        "BypassPolicyLockoutSafetyCheck": true,
+                    }),
+                );
+                assert_eq!(
+                    policy.status,
+                    200,
+                    "case {:?}: setup PutKeyPolicy must succeed, got {} with {:?}",
+                    row.case,
+                    policy.status,
+                    policy.text()
+                );
+
+                let access_key_id = match row.flow {
+                    Flow::Guest => guest_key_id.as_str(),
+                    Flow::Authenticated => authenticated_key_id.as_str(),
+                };
+                let read = vended_get_object(&router, &runtime, access_key_id, bucket, key);
+                if row.served {
+                    assert_eq!(
+                        read.status,
+                        200,
+                        "case {:?}: the read must be served, got {} with {:?}",
+                        row.case,
+                        read.status,
+                        read.text()
+                    );
+                    assert_eq!(
+                        read.body.as_ref(),
+                        payload.as_slice(),
+                        "case {:?}: the served read must answer the stored bytes, got {:?}",
+                        row.case,
+                        read.text()
+                    );
+                } else {
+                    assert_eq!(
+                        read.status,
+                        403,
+                        "case {:?}: the read must be refused with HTTP 403, got {} with {:?}",
+                        row.case,
+                        read.status,
+                        read.text()
+                    );
+                    assert_eq!(
+                        element(&read.text(), "Code").as_deref(),
+                        Some("AccessDenied"),
+                        "case {:?}: the refusal must carry S3's AccessDenied code, got {:?}",
+                        row.case,
+                        read.text()
+                    );
+                    assert!(
+                        !read
+                            .body
+                            .as_ref()
+                            .windows(payload.len())
+                            .any(|at| at == payload),
+                        "case {:?}: a refused read must carry none of the object's bytes, got \
+                         {:?}",
+                        row.case,
+                        read.text()
+                    );
+                }
+            }
         })
         .expect("spawn the vended-session refusal thread")
         .join()
         .expect("a vended session the key policy does not reach must be refused the plaintext");
 }
+
+/// One row of the table
+/// [`a_vended_session_the_key_policy_does_not_reach_cannot_read_the_object`] closes with:
+/// which exchange the reading session came of, which of the pool's two roles the key policy
+/// grants `kms:Decrypt` to, and whether the read is then served.
+struct ResolvedRoleRow {
+    case: &'static str,
+    /// The exchange the reading session was vended by, which is what the pool resolves its
+    /// role from.
+    flow: Flow,
+    /// The roles the key policy names, each given as the flow whose role it is.
+    grants_the_role_of: &'static [Flow],
+    /// Whether the read must then be served the object's bytes.
+    served: bool,
+}
+
+/// The table: both exchanges a pool vends for, against every subset of its two roles the key
+/// policy can name. A read is served exactly when the policy reaches the role the POOL
+/// resolved for that session's own exchange — neither more (the other role's grant opens
+/// nothing for it) nor less (a grant of its own role opens it whichever other roles are
+/// named beside it).
+const RESOLVED_ROLE_ROWS: &[ResolvedRoleRow] = &[
+    ResolvedRoleRow {
+        case: "neither role granted, the guest session reads",
+        flow: Flow::Guest,
+        grants_the_role_of: &[],
+        served: false,
+    },
+    ResolvedRoleRow {
+        case: "neither role granted, the authenticated session reads",
+        flow: Flow::Authenticated,
+        grants_the_role_of: &[],
+        served: false,
+    },
+    ResolvedRoleRow {
+        case: "the authenticated role alone granted, the guest session reads",
+        flow: Flow::Guest,
+        grants_the_role_of: &[Flow::Authenticated],
+        served: false,
+    },
+    ResolvedRoleRow {
+        case: "the authenticated role alone granted, the authenticated session reads",
+        flow: Flow::Authenticated,
+        grants_the_role_of: &[Flow::Authenticated],
+        served: true,
+    },
+    ResolvedRoleRow {
+        case: "the guest role alone granted, the guest session reads",
+        flow: Flow::Guest,
+        grants_the_role_of: &[Flow::Guest],
+        served: true,
+    },
+    ResolvedRoleRow {
+        case: "the guest role alone granted, the authenticated session reads",
+        flow: Flow::Authenticated,
+        grants_the_role_of: &[Flow::Guest],
+        served: false,
+    },
+    ResolvedRoleRow {
+        case: "both roles granted, the guest session reads",
+        flow: Flow::Guest,
+        grants_the_role_of: &[Flow::Guest, Flow::Authenticated],
+        served: true,
+    },
+    ResolvedRoleRow {
+        case: "both roles granted, the authenticated session reads",
+        flow: Flow::Authenticated,
+        grants_the_role_of: &[Flow::Guest, Flow::Authenticated],
+        served: true,
+    },
+];
+
+// The table above is driven by
+// [`a_vended_session_the_key_policy_does_not_reach_cannot_read_the_object`], on the router,
+// pool, key and object that suite already stands up.
