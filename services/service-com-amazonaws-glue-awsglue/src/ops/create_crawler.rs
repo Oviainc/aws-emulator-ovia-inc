@@ -10,7 +10,7 @@
 //! resolved FIRST — before any member of the request is judged — and a role this emulator's
 //! own IAM answers that Glue cannot assume (this account holds no such role, or its trust
 //! policy does not admit the Glue service principal) is refused with `InvalidInputException`
-//! with nothing persisted (see [`crate::state::crawler_role_is_unassumable`]).
+//! with nothing persisted (see [`crate::state::glue_role_is_unassumable`]).
 //!
 //! An S3 target that names an `EventQueueArn` (or the `DlqEventQueueArn` beside it) is
 //! crawled FROM that queue, and the crawl runs as the crawler's `Role`, so the create is
@@ -205,11 +205,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // run under, and it is settled before the resource is described.
         //
         // The question is put to the emulator's OWN IAM over its OWN in-process callback
-        // (see [`crate::state::crawler_role_is_unassumable`]), and only what IAM ANSWERED
+        // (see [`crate::state::glue_role_is_unassumable`]), and only what IAM ANSWERED
         // is refused, so an emulator with no IAM to ask refuses nothing. Awaited before
         // the store is locked.
         let region = crate::state::request_region(ctx.parts());
-        if crate::state::crawler_role_is_unassumable(ctx, &region, &input.role).await {
+        if crate::state::glue_role_is_unassumable(ctx, &region, &input.role).await {
             return Err(CreateCrawlerErrorModeled::InvalidInputException(
                 InvalidInputException {
                     message: Some(crate::state::messages::ROLE_NOT_ASSUMABLE.to_string()),

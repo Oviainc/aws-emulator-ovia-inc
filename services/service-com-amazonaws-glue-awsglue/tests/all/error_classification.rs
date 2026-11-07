@@ -49,7 +49,7 @@ const JOB_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/sim2real-glue-job-rol
 /// Its request id is the one per-run field, so it is asserted by SHAPE rather than by value;
 /// everything else is fixed text. A refusal that wraps another service's refusal carries two
 /// clauses, so this strips the outermost one and can be applied again to what it returns.
-fn without_diagnostic(
+pub(crate) fn without_diagnostic(
     case: &str,
     message: &str,
     service: &str,

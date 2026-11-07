@@ -191,7 +191,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This operation models a server fault, so an unreachable store is reported as
             // that rather than as a client error the caller could act on — the same way
@@ -222,6 +221,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+        // A role this update would REPLACE the stored one with is held to the same
+        // resolution the create holds its own to: the transform's task runs are performed
+        // BY this service acting as it, so a role the account's own IAM answers that Glue
+        // cannot assume backs no task run, and the update is refused with the same sentence
+        // the create answers (see [`crate::state::glue_role_is_unassumable`]). An update
+        // naming no role replaces none, so nothing is resolved for it. Awaited before the
+        // store is locked.
+        if let Some(role) = input.role.as_deref() {
+            let region = crate::state::request_region(ctx.parts());
+            if crate::state::glue_role_is_unassumable(ctx, &region, role).await {
+                return Err(UpdateMLTransformErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(crate::state::messages::ml_transform_role_not_assumable(
+                            &crate::state::glue_role_reference(role).arn,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
         }
 
         let mut store = state.lock();

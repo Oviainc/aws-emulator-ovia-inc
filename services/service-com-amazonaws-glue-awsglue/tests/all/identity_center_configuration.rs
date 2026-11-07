@@ -19,16 +19,58 @@
 //! instance the create names, how many scopes it sets (none, one, several), whether it
 //! enables background sessions, how many creates race for the singleton, and how an
 //! `InstanceArn` can fail to name an instance.
+//!
+//! Whether the instance a create names is one the ACCOUNT holds is a separate rule, pinned
+//! by [`crate::identity_center_instance`]; the creates here name instances the account holds,
+//! so what they exercise is the singleton.
+
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::messages::IDENTITY_CENTER_CONFIGURATION_NOT_FOUND;
+use service_com_amazonaws_ssoadmin_swbexternalservice::state::{
+    instance_arn, ComAmazonawsSsoadminSwbexternalserviceState as IdentityCenterState, Instance,
+    SEED_IDENTITY_STORE_ID, SEED_INSTANCE_NAME, SEED_INSTANCE_TYPE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{call, emulator, error_code, error_message, ok, ACCOUNT_ID};
+use crate::wire::{call, emulator, emulator_on, error_code, error_message, ok, ACCOUNT_ID, REGION};
+
+/// The Identity Center instance id every create below names, as Identity Center mints one.
+const INSTANCE_ID: &str = "ssoins-1234567890abcdef";
 
 /// An Identity Center instance ARN, as Identity Center spells one:
 /// `arn:aws:sso:::instance/<instance id>`.
 const INSTANCE_ARN: &str = "arn:aws:sso:::instance/ssoins-1234567890abcdef";
+
+/// An emulator whose account HOLDS the Identity Center instances `instance_ids` names.
+///
+/// A configuration is registered against an instance of the account
+/// ([`crate::identity_center_instance`] pins that rule), so a suite about the SINGLETON
+/// stands the instances it names up first — seeded into the Identity Center store the way
+/// that service's own create writes them.
+fn emulator_holding(instance_ids: &[&str]) -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    {
+        let state = engine.state::<IdentityCenterState>();
+        let mut store = state.lock();
+        for instance_id in instance_ids {
+            let instance = Instance::active(
+                instance_id,
+                SEED_IDENTITY_STORE_ID,
+                SEED_INSTANCE_TYPE,
+                Some(SEED_INSTANCE_NAME.to_string()),
+                ::aws_smithy_types::DateTime::from_secs(1_700_000_000),
+                REGION,
+            );
+            store.instances.insert(instance.instance_arn.clone(), instance);
+        }
+        // The account's instances are the ones seeded here, so no ambient instance is handed
+        // out beside them.
+        store.ambient_instance_enabled = true;
+    }
+    emulator_on(engine)
+}
 
 /// The `ApplicationArn` prefix a create mints under: an Identity Center application is a
 /// resource of the account's own Identity Center, named inside the instance it belongs to.
@@ -103,8 +145,9 @@ async fn the_configuration_is_absent_until_created_and_absent_again_after_delete
     ];
 
     for (index, (case, extra)) in cases.iter().enumerate() {
-        let router = emulator();
-        let instance_arn = format!("{INSTANCE_ARN}{index}");
+        let instance_id = format!("{INSTANCE_ID}{index}");
+        let router = emulator_holding(&[&instance_id]);
+        let instance_arn = instance_arn(&instance_id);
         assert_absent(&router, case).await;
 
         // The delete of an absent singleton is the same miss as the read's.
@@ -232,7 +275,11 @@ async fn only_the_first_create_registers_the_configuration() {
     ];
 
     for (case, losers) in cases {
-        let router = emulator();
+        let router = emulator_holding(&[
+            INSTANCE_ID,
+            "ssoins-aaaaaaaaaaaaaaaa",
+            "ssoins-bbbbbbbbbbbbbbbb",
+        ]);
         let winner = ok(
             &router,
             "CreateGlueIdentityCenterConfiguration",

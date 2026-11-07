@@ -53,7 +53,7 @@ pub fn crawl_event_queues(targets: &CrawlerTargets) -> Vec<String> {
     queues
 }
 
-/// The IAM store a crawler's `Role` is resolved against.
+/// The IAM store a caller-supplied `Role` is resolved against.
 ///
 /// It is the IAM service's OWN state struct, reached through the SAME shared engine this
 /// service's store lives in, so Glue reads the very records `CreateRole`,
@@ -70,25 +70,30 @@ pub fn iam_state<Eng: Send + Sync + 'static>(
     ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::service_state(engine)
 }
 
-/// The service principal a crawler's `Role` has to trust for this service to run the crawl
-/// as it. A crawl is performed BY Glue acting as that role, so the role's trust policy is
-/// what lets Glue assume it at all.
-pub const CRAWLER_SERVICE_PRINCIPAL: &str = "glue.amazonaws.com";
+/// The service principal a caller-supplied execution `Role` has to trust for this service to
+/// act as it. The work — a crawl, a statistics run, a transform's task runs, a session's
+/// statements — is performed BY Glue acting as that role, so the role's trust policy is what
+/// lets Glue assume it at all.
+pub const GLUE_SERVICE_PRINCIPAL: &str = "glue.amazonaws.com";
 
-/// The ONE reading of the form a crawler's `Role` may take: its role NAME and its role ARN.
+/// The ONE reading of the form an execution `Role` may take: its role NAME and its role ARN.
 ///
 /// `Role` is "the IAM role or Amazon Resource Name (ARN) of an IAM role used by the new
-/// crawler to access customer resources" (`CreateCrawler$Role`), so a value that reads as an
-/// ARN carries the name inside it ([`::service_common::iam_role::role_name`], the tree's one
-/// reading of an IAM ARN) and any other value IS the name. Stated once here so the two
+/// crawler to access customer resources" (`CreateCrawler$Role`), and the same member of the
+/// other writes that take one names a role the same way (`CreateMLTransform$Role` is "the
+/// name or Amazon Resource Name (ARN) of the IAM role",
+/// `CreateColumnStatisticsTaskSettings$Role` "the role used for running the column
+/// statistics", while `CreateSession$Role` is modelled as an ARN outright). So a value that
+/// reads as an ARN carries the name inside it ([`::service_common::iam_role::role_name`], the
+/// tree's one reading of an IAM ARN) and any other value IS the name. Stated once here so the
 /// questions this crate asks about that member — the trust document
-/// ([`crawler_role_is_unassumable`]) and the identity policies in force on the role
+/// ([`glue_role_is_unassumable`]) and the identity policies in force on the role
 /// ([`role_policy_documents`]) — cannot read the member's form two different ways.
-pub fn crawler_role_reference(role: &str) -> CrawlerRole<'_> {
+pub fn glue_role_reference(role: &str) -> GlueRole<'_> {
     match ::service_common::iam_role::role_name(role) {
         // A value that reads as this account's role ARN: the name is the one IAM holds it
         // under, and the ARN is the value as sent.
-        Some(name) => CrawlerRole {
+        Some(name) => GlueRole {
             name,
             arn: role.to_string(),
         },
@@ -96,11 +101,11 @@ pub fn crawler_role_reference(role: &str) -> CrawlerRole<'_> {
         // ARN is the one this emulator mints for a role of that name — or it is an ARN of
         // another account, which names no role this emulator's IAM can be asked about and
         // so resolves to no local name either.
-        None if ::service_common::arn::parse(role).is_some() => CrawlerRole {
+        None if ::service_common::arn::parse(role).is_some() => GlueRole {
             name: role,
             arn: role.to_string(),
         },
-        None => CrawlerRole {
+        None => GlueRole {
             name: role,
             // An IAM ARN is partition-global, so it carries no Region.
             arn: ::engine::emulator_arn(IAM_ARN_NAMESPACE, "", &format!("{ROLE_ARN_SEGMENT}/{role}")),
@@ -108,10 +113,10 @@ pub fn crawler_role_reference(role: &str) -> CrawlerRole<'_> {
     }
 }
 
-/// What a crawler's `Role` resolves to: the name IAM would hold the role under, and the ARN
-/// that addresses it. See [`crawler_role_reference`].
+/// What an execution `Role` resolves to: the name IAM would hold the role under, and the ARN
+/// that addresses it. See [`glue_role_reference`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CrawlerRole<'a> {
+pub struct GlueRole<'a> {
     /// The role name, for a lookup in the IAM store's own records.
     pub name: &'a str,
     /// The role ARN, for a reading that addresses the role by ARN.
@@ -126,10 +131,13 @@ pub(super) const ROLE_ARN_SEGMENT: &str = "role";
 
 /// Whether this emulator's own IAM ANSWERED that `role` is a role Glue cannot assume: this
 /// account holds no such role, or the trust policy the role carries does not admit
-/// [`CRAWLER_SERVICE_PRINCIPAL`].
+/// [`GLUE_SERVICE_PRINCIPAL`].
 ///
-/// A crawler RUNS AS its `Role`, so a role Glue cannot assume backs no crawl at all, and
-/// the service settles that before it stores anything. The whole question — which role of
+/// A resource that RUNS AS its `Role` — a crawler, the column statistics task settings of a
+/// table, a machine learning transform, an interactive session — is backed by nothing at all
+/// when Glue cannot assume that role, and each of those writes settles this before it stores
+/// anything (the refusal each of them words its own way lives in [`super::messages`]). The
+/// whole question — which role of
 /// this account the value names, what IAM answers about it, and whether the trust document
 /// it carries admits a service principal — is the ONE reading every emulated service that
 /// resolves a caller-supplied execution role shares
@@ -142,7 +150,7 @@ pub(super) const ROLE_ARN_SEGMENT: &str = "role";
 /// for every case where nothing is KNOWN about the role, including an emulator with no IAM
 /// mounted to ask: a refusal has to be grounded in what IAM answered, never assumed. Awaited
 /// with NO store guard held.
-pub async fn crawler_role_is_unassumable(
+pub async fn glue_role_is_unassumable(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     role: &str,
@@ -150,8 +158,8 @@ pub async fn crawler_role_is_unassumable(
     ::service_common::iam_role::role_is_unassumable(
         ctx,
         region,
-        &crawler_role_reference(role).arn,
-        CRAWLER_SERVICE_PRINCIPAL,
+        &glue_role_reference(role).arn,
+        GLUE_SERVICE_PRINCIPAL,
     )
     .await
 }
@@ -188,7 +196,7 @@ pub const MAX_CHECKED_EVENT_QUEUES: usize = 32;
 ///
 /// `Role` is "the IAM role or Amazon Resource Name (ARN) of an IAM role"
 /// (`CreateCrawler$Role`), whose form is read HERE by the crate's one reading of that
-/// member ([`crawler_role_reference`]), so this lookup and the trust-document reading
+/// member ([`glue_role_reference`]), so this lookup and the trust-document reading
 /// beside it resolve the same value to the same role.
 ///
 /// `None` when nothing can be SHOWN about the role's permissions: this account holds no
@@ -199,7 +207,7 @@ pub const MAX_CHECKED_EVENT_QUEUES: usize = 32;
 pub fn role_policy_documents(role: &str, iam: &IamState) -> Option<Vec<String>> {
     use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
 
-    let name = crawler_role_reference(role).name;
+    let name = glue_role_reference(role).name;
     let stored = iam.roles.get(&iam_store::name_key(name))?;
     let role_key = iam_store::name_key(&stored.role_name);
     let inline = iam.role_inline_policies.get(&role_key);

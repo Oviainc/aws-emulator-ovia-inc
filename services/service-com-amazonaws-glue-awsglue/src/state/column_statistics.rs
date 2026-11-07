@@ -436,3 +436,4 @@ pub fn new_column_statistics_task_run_id() -> String {
 /// How many 64-bit words a column statistics task run id carries: two, i.e. 128 bits
 /// rendered as 32 lowercase hexadecimal characters.
 pub(super) const COLUMN_STATISTICS_TASK_RUN_ID_WORDS: usize = 2;
+

@@ -45,15 +45,67 @@ pub fn schedule_not_a_cron_expression(expression: &str) -> String {
 /// `AlreadyExistsException`, and no disclosure of the requested name.
 pub const CRAWLER_ALREADY_EXISTS: &str = "Crawler already exists.";
 
-/// `CreateCrawler` (and the `UpdateCrawler` that replaces a crawler's role) for a
-/// `Role` this service cannot assume ([`super::crawler_role_is_unassumable`]).
+/// `CreateCrawler` (and the `UpdateCrawler` that replaces a crawler's role), and
+/// `CreateColumnStatisticsTaskSettings`, for a `Role` this service cannot assume
+/// ([`super::glue_role_is_unassumable`]).
 ///
 /// RECORDED constant, and the whole message: it is the service's fixed template for
 /// this check, naming neither the role the request sent, the principal that has to be
 /// admitted, nor the operation — so a client recognises the refusal by its wording
-/// whichever crawler write reported it. No trailing period, as recorded.
+/// whichever of those writes reported it. No trailing period, as recorded.
 pub const ROLE_NOT_ASSUMABLE: &str =
     "Service is unable to assume provided role. Please verify role's TrustPolicy";
+
+/// `CreateMLTransform` (and the `UpdateMLTransform` that replaces a transform's role) for
+/// a `Role` this service cannot assume ([`super::glue_role_is_unassumable`]).
+///
+/// RECORDED template: the fixed text plus ONE variable part, the ARN that addresses the
+/// role the request named ([`super::glue_role_reference`]) — which is the value as sent
+/// where `Role` named an ARN, and the ARN of a role of this account where it named a bare
+/// name, since the sentence states an `arn:`. The machine learning transform surface words
+/// this refusal its own way, which is why it is not the crawler's constant above.
+pub fn ml_transform_role_not_assumable(role_arn: &str) -> String {
+    format!("Unable to assume role for arn: {role_arn}")
+}
+
+/// `CreateSession` for a `Role` this service cannot assume
+/// ([`super::glue_role_is_unassumable`]).
+///
+/// RECORDED template: the session surface states the requirement as a sentence naming the
+/// role the request sent (`CreateSession$Role` is modelled as a role ARN outright), and the
+/// component that raised it appends its own diagnostic clause ([`with_diagnostic`]) after
+/// the line break the sentence ends with. A session is provisioned by the job executor
+/// acting as that role, which is the component the clause names.
+pub fn session_role_not_assumable(role_arn: &str) -> String {
+    with_diagnostic(
+        &format!(
+            "Role {role_arn} should be given assume role permissions for Glue Service.\n"
+        ),
+        DIAGNOSTIC_SERVICE_JOB_EXECUTOR,
+        DIAGNOSTIC_STATUS_VALIDATION,
+        DIAGNOSTIC_CODE_INVALID_INPUT,
+    )
+}
+
+/// A ruleset write (`CreateDataQualityRuleset`, and the `UpdateDataQualityRuleset` that
+/// replaces the stored DQDL) whose `Ruleset` declares no rule at all
+/// ([`super::dqdl_rule_count`] answers 0): text no terminated `Rules = [ … ]` list can be
+/// read out of, or a list holding no entry.
+///
+/// RECORDED constant, and the whole message: it names neither the ruleset nor the text it
+/// was read from, so a client recognises the refusal by its wording. No trailing period, as
+/// recorded.
+pub const DATA_QUALITY_RULES_NOT_PARSED: &str = "DataQuality rules cannot be parsed";
+
+/// `CreateGlueIdentityCenterConfiguration` whose `InstanceArn` names no Identity Center
+/// instance of this account ([`super::identity_center_instance_is_absent`]).
+///
+/// RECORDED constant, and the whole message: it names the member in the service's own
+/// camel-case spelling and withholds the value the request sent, so the refusal discloses
+/// nothing of the request back to it.
+pub const IDENTITY_CENTER_INSTANCE_NOT_IN_ACCOUNT: &str =
+    "Provided identityCenterInstanceArn is invalid. Please check IdentityCenter instance \
+     Arn in your account.";
 
 /// Any operation refusing a request member whose value is outside the form that member
 /// admits — the `Versions` of `DeleteSchemaVersions` that spells no version number or
@@ -479,6 +531,12 @@ const DIAGNOSTIC_SERVICE_GLUE: &str = "glue";
 /// this service surfaces wrapped in its own
 /// ([`table_optimizer_entity_not_found`]).
 const DIAGNOSTIC_SERVICE_DATA_CATALOG: &str = "AmazonDataCatalog";
+
+/// The component a diagnostic clause names for a refusal the JOB EXECUTOR raised: the
+/// component that provisions a job run or an interactive session, and so the one that
+/// resolves the role such a run would be performed as ([`session_role_not_assumable`]).
+/// As recorded.
+const DIAGNOSTIC_SERVICE_JOB_EXECUTOR: &str = "AWSGlueJobExecutor";
 
 /// The `Error Code` a clause states for a reference that resolved to nothing.
 const DIAGNOSTIC_CODE_ENTITY_NOT_FOUND: &str = "EntityNotFoundException";

@@ -19,7 +19,10 @@
 //! `InstanceArn` has to be the ARN of an Identity Center INSTANCE
 //! ([`crate::state::identity_center_instance_id`]), because the application this create
 //! mints is a resource of that instance and carries its id; a value naming no instance is
-//! refused with `InvalidInputException`.
+//! refused with `InvalidInputException`. It also has to name an instance THIS ACCOUNT holds
+//! ([`crate::state::identity_center_instance_is_absent`], which asks the account's own
+//! Identity Center): an application cannot be registered with an instance that does not
+//! exist, so such a create is refused with the same error and registers nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -186,6 +189,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             crate::state::messages::malformed_identity_center_instance_arn(
                                 &input.instance_arn,
                             ),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+        // And it has to be an instance THIS ACCOUNT holds: the application is registered
+        // WITH that instance, so an instance the account does not hold is one Glue could
+        // register nothing with. The question is put to the account's own Identity Center
+        // (see [`crate::state::identity_center_instance_is_absent`]), and only what that
+        // service ANSWERED is refused — so an emulator with no Identity Center to ask
+        // refuses nothing. Decided before any state of this service is read or written, so a
+        // refused create registers nothing.
+        if crate::state::identity_center_instance_is_absent(&*self.engine, &input.instance_arn) {
+            return Err(
+                CreateGlueIdentityCenterConfigurationErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(
+                            crate::state::messages::IDENTITY_CENTER_INSTANCE_NOT_IN_ACCOUNT
+                                .to_string(),
                         ),
                         from_federation_source: None,
                     },

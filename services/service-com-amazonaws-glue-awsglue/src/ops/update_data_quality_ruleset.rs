@@ -14,6 +14,11 @@
 //! for exactly that reason — see
 //! [`crate::ops::types::UpdateDataQualityRulesetOutput`].
 //!
+//! A `Ruleset` it would replace the stored DQDL with has to declare at least one rule
+//! ([`crate::state::dqdl_rule_count`]), exactly as the create's does; text declaring none is
+//! refused with the operation's modelled `InvalidInputException` and the stored ruleset is
+//! left untouched.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -183,6 +188,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // A `Ruleset` this update would REPLACE the stored DQDL with is held to the same
+        // requirement the create holds its own to: the rules of a ruleset are the entries of
+        // the `Rules = [ … ]` list its text declares ([`crate::state::dqdl_rule_count`]), so
+        // text declaring none is refused with the same sentence and the stored ruleset is
+        // left exactly as it was. An update naming no `Ruleset` replaces none.
+        if input
+            .ruleset
+            .as_deref()
+            .is_some_and(|ruleset| crate::state::dqdl_rule_count(ruleset) == 0)
+        {
+            return Err(
+                UpdateDataQualityRulesetErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(
+                            crate::state::messages::DATA_QUALITY_RULES_NOT_PARSED.to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
         let mut store = state.lock();
 
         // `Name` is `@required` with `length 1..255`, and the `Description` and `Ruleset`

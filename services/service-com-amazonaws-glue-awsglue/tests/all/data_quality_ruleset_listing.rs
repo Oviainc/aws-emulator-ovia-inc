@@ -215,9 +215,9 @@ async fn a_listed_ruleset_reports_the_number_of_rules_its_dqdl_declares() {
             "Rules = [\n    ColumnExists \"a\"\n    # , ColumnExists \"b\"\n]",
             1,
         ),
-        ("an empty rule list", "Rules = []", 0),
+        ("an empty rule list is refused rather than stored", "Rules = []", 0),
         (
-            "no rule list at all",
+            "no rule list at all is refused rather than stored",
             "Analyzers = [ Completeness \"a\" ]",
             0,
         ),
@@ -235,6 +235,31 @@ async fn a_listed_ruleset_reports_the_number_of_rules_its_dqdl_declares() {
 
     for (index, (case, ruleset, expected)) in rows.iter().enumerate() {
         let name = format!("counted-{index:02}");
+        // DQDL declaring NO rule is not a ruleset the store can hold: the write refuses it
+        // (see [`crate::data_quality_ruleset_parsing`]), so there is nothing to list.
+        if *expected == 0 {
+            let (status, body) = call(
+                &router,
+                "CreateDataQualityRuleset",
+                &json!({ "Name": name, "Ruleset": ruleset }),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected the create to be refused, got {status} with {body}"
+            );
+            let page = ok(
+                &router,
+                "ListDataQualityRulesets",
+                &json!({ "Filter": { "Name": name } }),
+            )
+            .await;
+            assert!(
+                listed(&page).is_empty(),
+                "case {case:?}: a refused create must leave nothing to list, got {page}"
+            );
+            continue;
+        }
         given_ruleset(
             &router,
             &json!({ "Name": name, "Ruleset": ruleset }),
@@ -293,12 +318,15 @@ async fn a_listed_ruleset_reports_the_number_of_rules_its_dqdl_declares() {
 /// (`smithy_query operation=CreateDataQualityRuleset`).
 const MAX_RULESET_LENGTH: usize = 65_536;
 
-/// DQDL the store holds but no rule list can be read out of — malformed, truncated or
-/// nested past what a rule is written with — is reported as the rules it declares, which is
-/// none: the listing still answers, so text a caller chose can neither fail nor hang it.
-/// A ruleset past the modelled length bound never reaches the store at all.
+/// DQDL no rule list can be read out of — malformed, truncated or nested past what a rule is
+/// written with — declares no rules, so a write carrying it is REFUSED and nothing is listed
+/// for it (the refusal's own wording is pinned by
+/// [`crate::data_quality_ruleset_parsing`]). Text that does declare rules is stored and
+/// listed with that many, so the listing answers for every ruleset the store can hold and
+/// text a caller chose can neither fail nor hang it. A ruleset past the modelled length
+/// bound never reaches the store at all.
 #[tokio::test]
-async fn dqdl_no_rule_list_can_be_read_out_of_declares_no_rules() {
+async fn dqdl_no_rule_list_can_be_read_out_of_is_refused_rather_than_listed() {
     let router = emulator();
 
     // A rule list nested far past anything a rule's own operands need.
@@ -367,6 +395,31 @@ async fn dqdl_no_rule_list_can_be_read_out_of_declares_no_rules() {
 
     for (index, (case, ruleset, expected)) in rows.iter().enumerate() {
         let name = format!("malformed-{index:02}");
+        // Text declaring no rule is refused by the write, so nothing is listed for it; text
+        // declaring rules is stored and listed with that many.
+        if *expected == 0 {
+            let (status, body) = call(
+                &router,
+                "CreateDataQualityRuleset",
+                &json!({ "Name": name, "Ruleset": ruleset }),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected the create to be refused, got {status} with {body}"
+            );
+            let page = ok(
+                &router,
+                "ListDataQualityRulesets",
+                &json!({ "Filter": { "Name": name } }),
+            )
+            .await;
+            assert!(
+                listed(&page).is_empty(),
+                "case {case:?}: a refused create must leave nothing to list, got {page}"
+            );
+            continue;
+        }
         given_ruleset(&router, &json!({ "Name": name, "Ruleset": ruleset })).await;
 
         let page = ok(

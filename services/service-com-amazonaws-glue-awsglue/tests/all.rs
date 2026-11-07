@@ -133,6 +133,8 @@ mod data_quality_ruleset_evaluation_runs;
 mod data_quality_ruleset_identity;
 #[path = "all/data_quality_ruleset_listing.rs"]
 mod data_quality_ruleset_listing;
+#[path = "all/data_quality_ruleset_parsing.rs"]
+mod data_quality_ruleset_parsing;
 #[path = "all/data_quality_ruleset_updates.rs"]
 mod data_quality_ruleset_updates;
 #[path = "all/data_quality_rulesets.rs"]
@@ -157,6 +159,8 @@ mod etl_jobs_and_connections;
 mod event_batching_conditions;
 #[path = "all/event_trigger_batch_firing.rs"]
 mod event_trigger_batch_firing;
+#[path = "all/execution_role_admission.rs"]
+mod execution_role_admission;
 #[path = "all/federated_catalogs.rs"]
 mod federated_catalogs;
 #[path = "all/form_type_deletion.rs"]
@@ -173,6 +177,8 @@ mod get_table_entity_not_found;
 mod iceberg_tables;
 #[path = "all/identity_center_configuration.rs"]
 mod identity_center_configuration;
+#[path = "all/identity_center_instance.rs"]
+mod identity_center_instance;
 #[path = "all/glossaries.rs"]
 mod glossaries;
 #[path = "all/glossary_deletion.rs"]

@@ -18,12 +18,15 @@ use serde_json::{json, Value};
 use crate::wire::{call, emulator, error_code, error_message, ok};
 
 /// The longest `Ruleset` the model accepts: "len 1..65536" on `DataQualityRulesetString`
-/// (`smithy_query operation=UpdateDataQualityRuleset`). The shortest it accepts is one
-/// byte, which is [`MIN_RULESET_LENGTH`].
+/// (`smithy_query operation=UpdateDataQualityRuleset`). The shortest text a stored ruleset
+/// can carry is [`SHORTEST_STORED_RULESET`].
 const MAX_RULESET_LENGTH: usize = 65_536;
 
-/// The shortest `Ruleset` the model accepts, from the same `length 1..65536`.
-const MIN_RULESET_LENGTH: usize = 1;
+/// The shortest `Ruleset` a write can carry: the model's `length 1..65536` admits one byte,
+/// but the service also requires the text to declare a rule (see
+/// [`crate::data_quality_ruleset_parsing`]), and the shortest DQDL that declares one is a
+/// rule list holding a single entry — so this is the shortest text a stored ruleset can have.
+const SHORTEST_STORED_RULESET: &str = "Rules=[x]";
 
 /// The longest `Description` the model accepts: "len 0..2048" on `DescriptionString`
 /// (`smithy_query operation=UpdateDataQualityRuleset`). Its lower bound is zero, so the
@@ -91,7 +94,7 @@ async fn an_update_writes_the_members_it_names_and_preserves_the_rest() {
     let router = emulator();
 
     let longest_ruleset = ruleset_of_length(MAX_RULESET_LENGTH);
-    let shortest_ruleset = ruleset_of_length(MIN_RULESET_LENGTH);
+    let shortest_ruleset = SHORTEST_STORED_RULESET.to_string();
     let longest_description = "d".repeat(MAX_DESCRIPTION_LENGTH);
 
     // (case, the create, the patch, the Description expected afterwards, the Ruleset
@@ -183,7 +186,7 @@ async fn an_update_writes_the_members_it_names_and_preserves_the_rest() {
             json!(longest_ruleset),
         ),
         (
-            "a Ruleset at the model's lower bound",
+            "the shortest Ruleset a stored ruleset can carry",
             json!({
                 "Name": "shortest-ruleset",
                 "Ruleset": "Rules = [ ColumnExists \"f\" ]",

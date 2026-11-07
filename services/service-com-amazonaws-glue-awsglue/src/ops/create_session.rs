@@ -17,6 +17,11 @@
 //! [`crate::state::SESSION_SETTLES_AFTER`] out, and whichever later call reads it
 //! materialises the status the clock had already reached.
 //!
+//! That environment is provisioned BY this service acting as the request's `Role`, so a
+//! role the account's own IAM answers that Glue cannot assume
+//! ([`crate::state::glue_role_is_unassumable`]) is refused with the operation's modelled
+//! `InvalidInputException` before anything is written, and no session is provisioned.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -214,6 +219,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A session is provisioned BY this service acting as the request's `Role`, so the
+        // role is resolved BEFORE the request's other members and before anything is
+        // written: a role this service cannot assume backs no session at all, so the create
+        // is refused for the role whatever else the request gets wrong, and nothing is
+        // stored.
+        //
+        // The question is put to the emulator's OWN IAM over its OWN in-process callback
+        // (see [`crate::state::glue_role_is_unassumable`]), and only what IAM ANSWERED is
+        // refused, so an emulator with no IAM to ask refuses nothing. Awaited before the
+        // store is locked.
+        //
+        // The Region is the one the create is served in, which is also where the session is
+        // provisioned and how it is addressed thereafter.
+        let region = crate::state::request_region(ctx.parts());
+        if crate::state::glue_role_is_unassumable(ctx, &region, &input.role).await {
+            return Err(CreateSessionErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::session_role_not_assumable(
+                        &crate::state::glue_role_reference(&input.role).arn,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
         // "The Glue version determines the versions of Apache Spark and Python that Glue
         // supports. The GlueVersion must be greater than 2.0": a version that is not names
         // no runtime this session could run on, so the create is refused before anything is
@@ -232,9 +263,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A session is provisioned in the Region its create is served in and is addressed
-        // by `Id` alone thereafter, so the Region and the id together are its whole address.
-        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 

@@ -3017,6 +3017,24 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         self.instances.get(instance_arn)
     }
 
+    /// Whether this ACCOUNT holds the instance `instance_arn` names — the question another
+    /// emulated service asks before it registers a resource OF that instance (Glue registers
+    /// its Identity Center application with one).
+    ///
+    /// The account holds the instances this store holds, and — while nothing has decided the
+    /// account's enablement ([`Self::ambient_instance_enabled`]) — the AMBIENT instance the
+    /// next request would be given ([`Self::enable_ambient_instance`]), whose id is
+    /// [`SEED_INSTANCE_ID`]. Stated HERE, beside the rule that hands that instance out, so a
+    /// service asking the question cannot re-derive it and drift from it.
+    ///
+    /// A READ: it reports what the account holds at this instant and enables nothing, so
+    /// asking it leaves the next request's answer exactly as it was.
+    pub fn holds_instance(&self, instance_arn: &str) -> bool {
+        self.instance(instance_arn).is_some()
+            || (!self.ambient_instance_enabled
+                && instance_arn == self::instance_arn(SEED_INSTANCE_ID))
+    }
+
     /// The instance `instance_arn` names, for a handler that updates it.
     pub fn instance_mut(&mut self, instance_arn: &str) -> Option<&mut Instance> {
         self.instances.get_mut(instance_arn)

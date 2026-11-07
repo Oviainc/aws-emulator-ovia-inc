@@ -32,6 +32,10 @@ service-common = { path = "../common" }
 # The account's own IAM records, read through the same shared engine, so a crawler's
 # `Role` is resolved against the roles `CreateRole`/`PutRolePolicy` wrote.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The account's own IAM Identity Center instances, read through the same shared engine, so
+# the `InstanceArn` of a Glue Identity Center configuration is resolved against the
+# instances `CreateInstance`/`ListInstances` answer for.
+service-com-amazonaws-ssoadmin-swbexternalservice = { workspace = true }
 # The KMS client the catalog resolves `EncryptionAtRest$SseAwsKmsKeyId` through, and
 # encrypts and decrypts a catalog object's data key with, over the in-process callback
 # into this same emulator (no network client feature is enabled: the transport is the

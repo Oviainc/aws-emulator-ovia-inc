@@ -215,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Role` keeps the stored one, which the create already resolved.
         if let Some(role) = input.role.as_deref() {
             let region = crate::state::request_region(ctx.parts());
-            if crate::state::crawler_role_is_unassumable(ctx, &region, role).await {
+            if crate::state::glue_role_is_unassumable(ctx, &region, role).await {
                 return Err(invalid_input(
                     crate::state::messages::ROLE_NOT_ASSUMABLE.to_string(),
                 ));

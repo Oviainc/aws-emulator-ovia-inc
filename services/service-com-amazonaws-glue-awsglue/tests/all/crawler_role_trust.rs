@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_glue_awsglue::state::CRAWLER_SERVICE_PRINCIPAL;
+use service_com_amazonaws_glue_awsglue::state::GLUE_SERVICE_PRINCIPAL;
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::Role;
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state::{
     name_key, role_arn, ComAmazonawsIamAwsidentitymanagementv20100508State as IamState,
@@ -41,7 +41,10 @@ const ROLE_NOT_ASSUMABLE: &str =
 /// An emulator with Glue AND IAM mounted on one shared engine, plus that engine: the role
 /// resolution asks IAM over the emulator's own in-process callback, so IAM has to be
 /// mounted for it to answer at all.
-fn emulator_with_iam() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+///
+/// Shared with [`crate::execution_role_admission`], which holds the other writes that run as
+/// a caller-supplied role to the same resolution, so both suites stand the same emulator up.
+pub(crate) fn emulator_with_iam() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -59,7 +62,7 @@ fn emulator_with_iam() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 /// Seed `role_name` into the shared engine's IAM store carrying `trust` as its
 /// `AssumeRolePolicyDocument` — the record `CreateRole` writes — and answer the ARN IAM
 /// holds it under.
-fn seed_role(
+pub(crate) fn seed_role(
     engine: &Arc<engine::InMemoryEngine>,
     role_name: &str,
     trust: Option<String>,
@@ -88,7 +91,7 @@ fn seed_role(
 }
 
 /// A trust document with one statement: `effect` for `principal` performing `action`.
-fn trust(effect: &str, principal: &str, action: &str) -> String {
+pub(crate) fn trust(effect: &str, principal: &str, action: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -101,8 +104,8 @@ fn trust(effect: &str, principal: &str, action: &str) -> String {
 }
 
 /// The trust document a role Glue can assume carries.
-fn glue_trust() -> String {
-    trust("Allow", CRAWLER_SERVICE_PRINCIPAL, "sts:AssumeRole")
+pub(crate) fn glue_trust() -> String {
+    trust("Allow", GLUE_SERVICE_PRINCIPAL, "sts:AssumeRole")
 }
 
 /// A `CreateCrawler` body naming one S3 crawl target and `role`.
@@ -158,7 +161,7 @@ async fn a_crawler_is_created_only_for_a_role_iam_shows_glue_can_assume() {
         },
         Row {
             case: "a service wildcard in the action",
-            held: Some(Some(trust("Allow", CRAWLER_SERVICE_PRINCIPAL, "sts:*"))),
+            held: Some(Some(trust("Allow", GLUE_SERVICE_PRINCIPAL, "sts:*"))),
             admitted: true,
         },
         Row {
@@ -179,7 +182,7 @@ async fn a_crawler_is_created_only_for_a_role_iam_shows_glue_can_assume() {
                         },
                         {
                             "Effect": "Allow",
-                            "Principal": { "Service": CRAWLER_SERVICE_PRINCIPAL },
+                            "Principal": { "Service": GLUE_SERVICE_PRINCIPAL },
                             "Action": "sts:AssumeRole",
                         },
                     ],
@@ -201,7 +204,7 @@ async fn a_crawler_is_created_only_for_a_role_iam_shows_glue_can_assume() {
             case: "a trust document naming another action",
             held: Some(Some(trust(
                 "Allow",
-                CRAWLER_SERVICE_PRINCIPAL,
+                GLUE_SERVICE_PRINCIPAL,
                 "s3:GetObject",
             ))),
             admitted: false,
@@ -210,7 +213,7 @@ async fn a_crawler_is_created_only_for_a_role_iam_shows_glue_can_assume() {
             case: "a trust document explicitly denying the Glue principal",
             held: Some(Some(trust(
                 "Deny",
-                CRAWLER_SERVICE_PRINCIPAL,
+                GLUE_SERVICE_PRINCIPAL,
                 "sts:AssumeRole",
             ))),
             admitted: false,

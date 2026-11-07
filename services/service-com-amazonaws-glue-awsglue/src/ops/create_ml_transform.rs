@@ -15,6 +15,11 @@
 //! the client's choice at CREATE time only — every later operation addresses a transform
 //! by the id this create minted.
 //!
+//! A transform's task runs are performed BY this service acting as its `Role`, so a role
+//! the account's own IAM answers that Glue cannot assume
+//! ([`crate::state::glue_role_is_unassumable`]) is refused with the operation's modelled
+//! `InvalidInputException` before the store is read, and no transform is registered.
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -219,7 +224,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This operation models a server fault, so an unreachable store is reported as
             // that rather than as a client error the caller could act on.
@@ -232,6 +236,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A transform's task runs are performed BY this service acting as its `Role`, so
+        // the role is resolved BEFORE the request's other members: a role this service
+        // cannot assume backs no task run at all, so the create is refused for the role
+        // whatever else the request gets wrong, and no transform is registered.
+        //
+        // The question is put to the emulator's OWN IAM over its OWN in-process callback
+        // (see [`crate::state::glue_role_is_unassumable`]), and only what IAM ANSWERED is
+        // refused, so an emulator with no IAM to ask refuses nothing. Awaited before the
+        // store is locked.
+        let region = crate::state::request_region(ctx.parts());
+        if crate::state::glue_role_is_unassumable(ctx, &region, &input.role).await {
+            return Err(CreateMLTransformErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::ml_transform_role_not_assumable(
+                        &crate::state::glue_role_reference(&input.role).arn,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

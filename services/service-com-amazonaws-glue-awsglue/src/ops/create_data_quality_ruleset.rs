@@ -13,6 +13,12 @@
 //! why the response shape is hand-declared — see
 //! [`crate::ops::types::CreateDataQualityRulesetOutput`].
 //!
+//! The `Ruleset` has to declare at least one rule: a ruleset "is a set of rules in DQDL",
+//! and the rules of one are the entries of the `Rules = [ … ]` list its text declares
+//! ([`crate::state::dqdl_rule_count`]), so text no terminated list can be read out of, and a
+//! list holding no entry, is refused with the operation's modelled `InvalidInputException`
+//! and stored not at all.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -202,6 +208,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // "A ruleset is a set of rules in DQDL" — so the `Ruleset` the request carries has
+        // to declare at least one rule: its rules are the entries of the one
+        // `Rules = [ … ]` list the text declares ([`crate::state::dqdl_rule_count`]), and
+        // text no terminated list can be read out of, or a list holding no entry, declares
+        // none. Such a ruleset is refused before anything is stored, rather than held as a
+        // ruleset no evaluation could ever run.
+        if crate::state::dqdl_rule_count(&input.ruleset) == 0 {
+            return Err(
+                CreateDataQualityRulesetErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(
+                            crate::state::messages::DATA_QUALITY_RULES_NOT_PARSED.to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
         let mut store = state.lock();
 
         // "A unique name for the data quality ruleset": the name is the whole address of a

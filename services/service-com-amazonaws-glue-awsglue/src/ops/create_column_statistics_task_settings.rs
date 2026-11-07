@@ -11,8 +11,12 @@
 //! table the addressed catalog does not hold is the operation's modelled
 //! `EntityNotFoundException`, and a second create for a table that already carries
 //! settings is its `AlreadyExistsException` rather than an overwrite — the update path is
-//! `UpdateColumnStatisticsTaskSettings`'s. While a column statistics task run of that
-//! table is in flight the create is refused with the operation's modelled
+//! `UpdateColumnStatisticsTaskSettings`'s. A statistics run of that table is performed BY
+//! this service acting as the settings' `Role`, so a role the account's own IAM answers
+//! that Glue cannot assume ([`crate::state::glue_role_is_unassumable`]) is refused with the
+//! operation's modelled `InvalidInputException` before anything is read or written. While a
+//! column statistics task run of that table is in flight the create is refused with the
+//! operation's modelled
 //! `ColumnStatisticsTaskRunningException` and persists nothing: the settings a run uses
 //! are not rewritten under a run that is already generating that table's statistics. A
 //! `Schedule` is stored only when it is the cron expression the service documents;
@@ -186,15 +190,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let region = crate::state::request_region(ctx.parts());
         // Whether the caller may address this catalog at all is decided FIRST, before the
         // request's own contents and before the entity lookup: a `CatalogId` of another
         // account is reachable only through that catalog's own resource policy (see
         // `crate::state::foreign_catalog_refusal`).
-        if let Some(message) = crate::state::foreign_catalog_refusal(
-            &catalog_id,
-            &crate::state::request_region(ctx.parts()),
-            Self::NAME,
-        ) {
+        if let Some(message) =
+            crate::state::foreign_catalog_refusal(&catalog_id, &region, Self::NAME)
+        {
             return Err(
                 CreateColumnStatisticsTaskSettingsErrorModeled::AccessDeniedException(
                     AccessDeniedException {
@@ -203,6 +206,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        }
+
+        // The statistics run this configures is performed BY this service acting as the
+        // settings' `Role`, so the role is resolved BEFORE the request's other members and
+        // before the table is looked up: a role this service cannot assume backs no
+        // statistics run at all, so the create is refused for the role whatever else the
+        // request gets wrong, and nothing is persisted.
+        //
+        // The question is put to the emulator's OWN IAM over its OWN in-process callback
+        // (see [`crate::state::glue_role_is_unassumable`]), and only what IAM ANSWERED is
+        // refused, so an emulator with no IAM to ask refuses nothing. Awaited before the
+        // store is locked.
+        if crate::state::glue_role_is_unassumable(ctx, &region, &input.role).await {
+            return Err(invalid_input(
+                crate::state::messages::ROLE_NOT_ASSUMABLE.to_string(),
+            ));
         }
 
         // A `Schedule` is "a schedule for running the column statistics, specified in CRON
