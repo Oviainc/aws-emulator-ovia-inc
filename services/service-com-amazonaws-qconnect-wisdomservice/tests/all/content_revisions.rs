@@ -64,10 +64,11 @@ const MESSAGE_CONTENT_NOT_FOUND: &str = "Content does not exist.";
 /// The sentence an `uploadId` naming no upload of this knowledge base is refused with.
 const MESSAGE_INVALID_UPLOAD_ID: &str = "Invalid uploadId";
 
-/// The sentence a write naming a revision the content no longer carries is refused with,
-/// written out here rather than imported from the implementation so the assertion pins the
-/// wire text.
-const MESSAGE_PRECONDITION_FAILED: &str = "Request precondition failed";
+/// The message text a write naming a revision the content no longer carries is refused
+/// with: NONE — the status and the error code are the whole refusal, so the optional member
+/// is absent and a client reading it sees the empty string. Written out here rather than
+/// imported from the implementation so the assertion pins the wire text.
+const MESSAGE_PRECONDITION_FAILED: &str = "";
 
 /// One wire answer, reduced to what a client branches on.
 #[derive(Debug)]

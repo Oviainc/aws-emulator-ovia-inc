@@ -31,6 +31,8 @@ mod assistant_lifecycle;
 mod authorization_precedence;
 #[path = "all/built_in_ai_agent_revisions.rs"]
 mod built_in_ai_agent_revisions;
+#[path = "all/content_precondition_message.rs"]
+mod content_precondition_message;
 #[path = "all/content_revisions.rs"]
 mod content_revisions;
 #[path = "all/content_search.rs"]

@@ -3,10 +3,11 @@
 //! @op UpdateContent
 //! Implemented: writes the stored content the route names and answers out of that one
 //! record. `revisionId` is the optimistic lock the member documents — a request naming a
-//! revision the content no longer carries is refused `PreconditionFailedException` (412)
-//! and writes nothing — and every write that lands mints a new revision, so of two writers
-//! naming one revision exactly one wins and the other is told to re-read. A `uploadId`
-//! replaces the asset with the bytes that upload received.
+//! revision the content no longer carries is refused `PreconditionFailedException` (412),
+//! status and code alone with no message text, and writes nothing — and every write that
+//! lands mints a new revision, so of two writers naming one revision exactly one wins and
+//! the other is told to re-read. A `uploadId` replaces the asset with the bytes that
+//! upload received.
 //!
 //! ## Shape of an operation
 //!
@@ -149,19 +150,6 @@ fn validation(message: String) -> UpdateContentError {
     .into()
 }
 
-/// The sentence a write naming a revision the content no longer carries is refused with.
-///
-/// It is the fixed text the recorded wire answer of this endpoint carries for that class,
-/// and it carries NO value: neither the revision the request named nor the one the record
-/// holds, so a refused writer learns only that the precondition it stated did not hold —
-/// which, with the rule the member documents ("this argument acts as an optimistic lock to
-/// ensure content was not modified since it was last read"), is the whole of what it can
-/// act on. The legacy Amazon Connect Wisdom view of this same endpoint words it from its
-/// own copy of this text
-/// (`services/service-com-amazonaws-wisdom-wisdomservice/src/ops/update_content.rs`), so a
-/// client cannot get a different sentence depending on which model it addressed.
-const MESSAGE_STALE_REVISION: &str = "Request precondition failed";
-
 /// The `UpdateContent` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -245,10 +233,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .is_some_and(|named| named != current_revision)
         {
+            // The refusal is the status and the error code: this endpoint sends no message
+            // text for the class, so the OPTIONAL member is left unset rather than filled
+            // with a sentence of this emulator's own. A refused writer learns that the
+            // precondition it stated does not hold — which, with the rule the member
+            // documents ("this argument acts as an optimistic lock to ensure content was
+            // not modified since it was last read"), is the whole of what it can act on:
+            // re-read the content and retry against the revision that read reports.
             return Err(UpdateContentErrorModeled::PreconditionFailedException(
-                PreconditionFailedException {
-                    message: Some(MESSAGE_STALE_REVISION.to_string()),
-                },
+                PreconditionFailedException { message: None },
             )
             .into());
         }
