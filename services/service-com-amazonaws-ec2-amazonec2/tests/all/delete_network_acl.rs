@@ -626,10 +626,11 @@ async fn a_refused_delete_leaves_every_network_acl_where_it_was() {
                 format!("Invalid id: \"{value}\"")
             }
             RefusedId::Literal(value) => format!("The networkAcl ID '{value}' does not exist"),
-            RefusedId::DefaultOfVpc => format!(
-                "The network acl '{network_acl_id}' is the default network acl and cannot be \
-                 deleted"
-            ),
+            // AWS's own sentence for this refusal: lower-case start, with the ACL id the
+            // request named appended bare.
+            RefusedId::DefaultOfVpc => {
+                format!("cannot delete default network ACL {network_acl_id}")
+            }
             RefusedId::Associated => format!(
                 "The networkAcl '{network_acl_id}' has dependencies and cannot be deleted."
             ),

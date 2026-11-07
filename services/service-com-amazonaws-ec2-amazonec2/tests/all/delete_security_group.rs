@@ -94,11 +94,43 @@ async fn create_security_group(
     member(case, &body, "groupId")
 }
 
-/// Launch `count` instances holding the security group `group_id`, as their instance ids.
+/// A `/24` inside the VPC block `vpc_cidr`, which is the subnet a launch of that VPC is
+/// placed in.
+fn subnet_cidr_in(vpc_cidr: &str) -> String {
+    let mut octets = vpc_cidr.split('.');
+    let first = octets.next().unwrap_or("10");
+    let second = octets.next().unwrap_or("0");
+    format!("{first}.{second}.1.0/24")
+}
+
+/// A subnet of `vpc_id` holding `cidr_block`, as its id.
+///
+/// A launch has to be placed in a subnet OF THE VPC its security groups belong to — a group
+/// belongs to one VPC, and `RunInstances` refuses a group of another — so a suite that
+/// launches with a group of a VPC it created gives the launch that VPC's subnet.
+async fn create_subnet(
+    case: &str,
+    router: &MultiServiceRouter,
+    vpc_id: &str,
+    cidr_block: &str,
+) -> String {
+    let body = ok(
+        case,
+        router,
+        "CreateSubnet",
+        &[param("VpcId", vpc_id), param("CidrBlock", cidr_block)],
+    )
+    .await;
+    member(case, &body, "subnetId")
+}
+
+/// Launch `count` instances holding the security group `group_id`, in `subnet_id`, as their
+/// instance ids.
 async fn run_instances(
     case: &str,
     router: &MultiServiceRouter,
     group_id: &str,
+    subnet_id: &str,
     count: u32,
 ) -> Vec<String> {
     let body = ok(
@@ -109,6 +141,7 @@ async fn run_instances(
             param("ImageId", AMI),
             param("MinCount", &count.to_string()),
             param("MaxCount", &count.to_string()),
+            param("SubnetId", subnet_id),
             param("SecurityGroupId.1", group_id),
         ],
     )
@@ -336,8 +369,14 @@ async fn delete_security_group_refuses_while_an_unterminated_instance_holds_the_
             create_security_group(case, &router, &vpc_id, "another-group").await
         };
 
-        let instances =
-            run_instances(case, &router, &launched_group, row.holder.instances).await;
+        let instances = run_instances(
+            case,
+            &router,
+            &launched_group,
+            &create_subnet(case, &router, &vpc_id, &subnet_cidr_in(row.vpc_cidr)).await,
+            row.holder.instances,
+        )
+        .await;
         if row.holder.settle_launch {
             past_the_transition().await;
         }
@@ -510,7 +549,9 @@ async fn delete_security_group_dry_run_reports_the_outcome_and_deletes_nothing()
             Target::Held => {
                 let held =
                     create_security_group(case, &router, &vpc_id, "dry-run-held").await;
-                run_instances(case, &router, &held, 1).await;
+                let subnet_id =
+                    create_subnet(case, &router, &vpc_id, &subnet_cidr_in(row.vpc_cidr)).await;
+                run_instances(case, &router, &held, &subnet_id, 1).await;
                 past_the_transition().await;
                 held
             }

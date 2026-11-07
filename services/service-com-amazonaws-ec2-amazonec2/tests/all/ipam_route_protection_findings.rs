@@ -105,8 +105,18 @@ struct Fixture {
 }
 
 /// Create one IPAM over the wire and answer its id and the id of its default public scope.
+///
+/// The IPAM is given [`POOL_LOCALE`] as an operating Region beside its home one: "operating
+/// Regions are Amazon Web Services Regions where the IPAM is allowed to manage IP address
+/// CIDRs" (`Ipam$OperatingRegions`), and a pool's `Locale` has to be one of them, so the
+/// located pool below is created in a Region this IPAM operates in.
 async fn create_ipam(router: &MultiServiceRouter) -> (String, String) {
-    let (status, body) = invoke(router, "CreateIpam", &[]).await;
+    let (status, body) = invoke(
+        router,
+        "CreateIpam",
+        &[p("OperatingRegion.1.RegionName", POOL_LOCALE)],
+    )
+    .await;
     assert_eq!(
         status, 200,
         "creating an IPAM: expected HTTP 200, got {status} with body {body}"

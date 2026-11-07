@@ -641,6 +641,11 @@ impl ComAmazonawsEc2Amazonec2State {
             }
             false
         });
+        // A CIDR `ProvisionIpamPoolCidr` answered as `pending-provision` is `provisioned`
+        // once its due instant has passed, and one `DeprovisionIpamPoolCidr` answered as
+        // `pending-deprovision` has left its pool at its own instant — both owed whether or
+        // not anybody called, the same contract as the pool's moves above.
+        self.materialize_due_ipam_pool_cidr_moves(now);
         // An IPAM scope `CreateIpamScope` answered as `create-in-progress` reaches
         // `create-complete` once its due instant has passed, whether or not anybody called —
         // the same contract as the pool above. The two default scopes of an IPAM are not
@@ -970,6 +975,12 @@ impl ComAmazonawsEc2Amazonec2State {
                 // The transition is applied once; nothing is owed on this table any more.
                 false
             });
+        // A transit gateway a `DeleteTransitGateway` left `deleting` was GONE at the instant
+        // that call recorded for it, with the route tables that came up with it — whether or
+        // not anybody called again. The gateway family's one clock-owed REMOVAL, for the reason
+        // [`Self::begin_transit_gateway_deletion`] gives: a deleted gateway is one
+        // `DescribeTransitGateways` stops carrying.
+        self.materialize_due_transit_gateway_deletions(now);
         // A route server, its endpoints and its peers come up the same way: each is
         // answered in the non-terminal `pending` state its create hands back, so the clock
         // owes it `available` one TRANSITION_DELAY later whether or not anybody calls
@@ -1138,6 +1149,12 @@ impl ComAmazonawsEc2Amazonec2State {
             // The transition is applied once; nothing is owed on this IPAM any more.
             false
         });
+        // An IPAM `DeleteIpam` answered as `delete-in-progress` was GONE at the instant that
+        // call recorded for it, with everything it contained — whether or not anybody called
+        // again. The one clock-owed REMOVAL of the IPAM family, for the reason
+        // [`Self::begin_ipam_deletion`] gives: a deleted IPAM is one `DescribeIpams` reports
+        // as not existing.
+        self.materialize_due_ipam_deletions(now);
         // The resources whose own record carries the move the clock owes it
         // ([`PendingStateMove`]): a transit gateway attachment an acceptance or a rejection
         // left transient, one subnet association of a multicast domain, a route table

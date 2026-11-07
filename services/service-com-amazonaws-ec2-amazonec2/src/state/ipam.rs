@@ -448,36 +448,46 @@ impl ComAmazonawsEc2Amazonec2State {
 
     /// The CIDRs provisioned to the pool `pool_id` names, as the store spells each range.
     ///
-    /// A BYOIP address range IPAM manages names the pool managing it
-    /// (`ByoipCidr$IpamPoolId`), which `MoveByoipCidrToIpam` is what writes, so those ranges
-    /// are the CIDRs provisioned to a pool that "you cannot delete an IPAM pool if there are
-    /// … provisioned to it" (`DeleteIpamPool`) speaks of. They are the only ones the store
-    /// holds today; whoever implements `ProvisionIpamPoolCidr` should answer its records from
-    /// here too, so the one reader of "what is provisioned to this pool" keeps covering all
-    /// of them.
+    /// A range `ProvisionIpamPoolCidr` provisioned to the pool is one of them
+    /// ([`Self::ipam_pool_cidr_records`]), and so is a BYOIP address range IPAM manages,
+    /// which names the pool managing it (`ByoipCidr$IpamPoolId`) and which
+    /// `MoveByoipCidrToIpam` is what writes. Together they are the CIDRs provisioned to a pool
+    /// that "you cannot delete an IPAM pool if there are … provisioned to it"
+    /// (`DeleteIpamPool`) speaks of, which is why this is the ONE reader of that question: a
+    /// pool cannot be judged empty by one path and occupied by another.
+    ///
+    /// A range whose deprovisioning has already been asked for is not one
+    /// ([`ipam_pool_cidr_holds_space`]).
     pub fn ipam_pool_provisioned_cidrs(&self, pool_id: &str) -> Vec<String> {
-        self.byoip_cidrs
-            .iter()
-            .filter(|(_, record)| record.byoip_cidr.ipam_pool_id.as_deref() == Some(pool_id))
-            .map(|(cidr, _)| cidr.clone())
-            .collect()
+        let mut provisioned: Vec<String> = self
+            .ipam_pool_cidr_records(pool_id)
+            .into_iter()
+            .filter(|record| ipam_pool_cidr_holds_space(record.view.state.as_deref()))
+            .filter_map(|record| record.view.cidr.clone())
+            .collect();
+        provisioned.extend(
+            self.byoip_cidrs
+                .iter()
+                .filter(|(_, record)| record.byoip_cidr.ipam_pool_id.as_deref() == Some(pool_id))
+                .map(|(cidr, _)| cidr.clone()),
+        );
+        provisioned.sort();
+        provisioned.dedup();
+        provisioned
     }
 
     /// Deprovision every CIDR provisioned to the pool `pool_id` names, and answer how many
     /// ranges that was.
     ///
-    /// The inverse of the move that provisioned them: a range stops being managed by this
-    /// pool (`ByoipCidr$IpamPoolId`) and is in no public IPv4 pool either
-    /// (`ByoipCidr$PoolId`), so it is once again a range the account holds outside IPAM. Its
-    /// own state is untouched — a range that was being advertised goes on being advertised —
-    /// exactly as `MoveByoipCidrToIpam` leaves it across the move in.
+    /// What `DeleteIpamPool`'s `Cascade` — "including provisioned CIDRs" — and `DeleteIpam`'s
+    /// do to a pool's ranges: every range the pool holds, through the ONE reader of that
+    /// question above and the ONE writer that takes one back
+    /// ([`Self::deprovision_ipam_pool_cidr`]), so a cascade and an explicit
+    /// `DeprovisionIpamPoolCidr` leave a range in exactly the same state.
     pub fn deprovision_ipam_pool_cidrs(&mut self, pool_id: &str) -> usize {
         let provisioned = self.ipam_pool_provisioned_cidrs(pool_id);
         for cidr in &provisioned {
-            if let Some(record) = self.byoip_cidrs.get_mut(cidr) {
-                record.byoip_cidr.ipam_pool_id = None;
-                record.byoip_cidr.pool_id = None;
-            }
+            self.deprovision_ipam_pool_cidr(pool_id, cidr);
         }
         provisioned.len()
     }

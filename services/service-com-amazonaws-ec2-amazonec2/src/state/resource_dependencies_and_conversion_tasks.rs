@@ -155,6 +155,32 @@ impl ComAmazonawsEc2Amazonec2State {
         })
     }
 
+    /// The NAT gateways that still hold a place in `subnet_id`.
+    ///
+    /// "You must delete any NAT gateway in the subnet before you can delete the subnet" — a NAT
+    /// gateway is created IN a subnet (`CreateNatGatewayRequest$SubnetId`) and holds an address
+    /// of it for as long as it is there. One whose deletion has already been ASKED FOR holds
+    /// nothing the caller still has to take away — the same reading
+    /// [`Self::held_by_instance_connect_endpoints`] makes of an endpoint a delete has started
+    /// on, and the one that lets a caller tear a network down in one pass — so the states that
+    /// hold the subnet are the ones before that: every state but `deleting` and `deleted`.
+    pub fn nat_gateways_in_subnet(&self, subnet_id: &str) -> Vec<String> {
+        let mut found: Vec<String> = self
+            .nat_gateways
+            .iter()
+            .filter(|(_, nat_gateway)| {
+                nat_gateway.subnet_id.as_deref() == Some(subnet_id)
+                    && !matches!(
+                        nat_gateway.state.as_deref(),
+                        Some(NAT_GATEWAY_STATE_DELETING | NAT_GATEWAY_STATE_DELETED)
+                    )
+            })
+            .map(|(nat_gateway_id, _)| nat_gateway_id.clone())
+            .collect();
+        found.sort();
+        found
+    }
+
     /// What still depends on the subnet `subnet_id`, as the ids of the depending resources.
     ///
     /// "You must terminate all running instances in the subnet before you can delete the
@@ -165,6 +191,7 @@ impl ComAmazonawsEc2Amazonec2State {
         let mut found = self.instances_in_subnet(subnet_id);
         found.extend(self.network_interfaces_in_subnet(subnet_id));
         found.extend(self.instance_connect_endpoints_in_subnet(subnet_id));
+        found.extend(self.nat_gateways_in_subnet(subnet_id));
         found.sort();
         found
     }

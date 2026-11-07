@@ -2327,6 +2327,113 @@ impl ComAmazonawsEc2Amazonec2State {
         Some(view)
     }
 
+    /// The attachments the transit gateway `transit_gateway_id` still holds, by the attachment
+    /// id each is held under — what has to be taken away before the gateway itself can be
+    /// deleted.
+    ///
+    /// An attachment whose owner REJECTED it is attached to nothing, so it is not one of them;
+    /// every other stored attachment names this gateway for as long as it is stored, so it
+    /// holds the gateway exactly as a stored network interface holds its subnet.
+    pub fn transit_gateway_attachments_of<'a>(&'a self, transit_gateway_id: &str) -> Vec<&'a str> {
+        self.transit_gateway_attachments
+            .iter()
+            .filter(|(_, record)| {
+                record.view.transit_gateway_id() == Some(transit_gateway_id)
+                    && record.view.state() != Some(record.view.states().rejected)
+            })
+            .map(|(attachment_id, _)| attachment_id.as_str())
+            .collect()
+    }
+
+    /// Start deleting the transit gateway `transit_gateway_id` names, and answer it as the
+    /// store then holds it — `None` when the account holds no such gateway.
+    ///
+    /// "Deletes the specified transit gateway" is work AWS reports as under way: the
+    /// `TransitGatewayState` catalog carries `deleting` and `deleted`, so the gateway is left
+    /// in the TRANSIENT state with the clock owing it the REMOVAL one [`TRANSITION_DELAY`]
+    /// later ([`Self::transit_gateway_delete_at`], applied by
+    /// [`Self::materialize_due_transitions`]) — the same arrangement, on the same clock, as the
+    /// `pending` a create left it in, and the one
+    /// [`Self::begin_ipam_deletion`] gives a deleted IPAM. So a caller that reads straight back
+    /// still sees the delete under way and a later one finds the gateway gone, which is what
+    /// `DescribeTransitGateways` no longer carrying it means.
+    ///
+    /// Any move the clock still owed the gateway is superseded: one on its way out is not going
+    /// to land in the state a create or a modification was moving it to.
+    pub fn begin_transit_gateway_deletion(
+        &mut self,
+        transit_gateway_id: &str,
+    ) -> Option<TransitGateway> {
+        let transit_gateway = self.transit_gateways.get_mut(transit_gateway_id)?;
+        transit_gateway.state = Some(TRANSIT_GATEWAY_STATE_DELETING.to_string());
+        let view = transit_gateway.clone();
+        self.transit_gateway_available_at.remove(transit_gateway_id);
+        self.transit_gateway_delete_at.insert(
+            transit_gateway_id.to_string(),
+            Instant::now() + TRANSITION_DELAY,
+        );
+        Some(view)
+    }
+
+    /// Apply the removal the clock owes a deleted transit gateway, as of `now`.
+    ///
+    /// A gateway a `DeleteTransitGateway` left `deleting` was GONE at the instant that call
+    /// recorded for it, with the route tables that came up with it, whether or not anybody
+    /// called again — so the removal is applied from [`Self::materialize_due_transitions`], its
+    /// one caller, before anything reads the store.
+    pub(super) fn materialize_due_transit_gateway_deletions(&mut self, now: Instant) {
+        let due: Vec<String> = self
+            .transit_gateway_delete_at
+            .iter()
+            .filter(|(_, due_at)| now >= **due_at)
+            .map(|(transit_gateway_id, _)| transit_gateway_id.clone())
+            .collect();
+        for transit_gateway_id in due {
+            self.transit_gateway_delete_at.remove(&transit_gateway_id);
+            self.remove_transit_gateway(&transit_gateway_id);
+        }
+    }
+
+    /// Remove the transit gateway `transit_gateway_id` names with the route tables that came
+    /// up with it, and answer it as the store held it — `None` when the account holds no such
+    /// gateway.
+    ///
+    /// "When you delete a transit gateway, we delete its default route table": a route table
+    /// of the gateway cannot outlive it, so it goes here rather than being left reporting a
+    /// `TransitGatewayId` nothing resolves — and with each table go the associations and
+    /// propagations that named it. The caller-chosen bytes every removed record held go back
+    /// to the store's budget on exactly the terms the create charged them
+    /// ([`transit_gateway_payload_bytes`], [`transit_gateway_route_table_payload_bytes`]), and
+    /// so does the `available` move the clock still owed either.
+    pub fn remove_transit_gateway(&mut self, transit_gateway_id: &str) -> Option<TransitGateway> {
+        let transit_gateway = self.transit_gateways.remove(transit_gateway_id)?;
+        self.release_stored_bytes(transit_gateway_payload_bytes(&transit_gateway));
+        self.transit_gateway_available_at.remove(transit_gateway_id);
+        self.transit_gateway_delete_at.remove(transit_gateway_id);
+        let route_table_ids: Vec<String> = self
+            .transit_gateway_route_tables
+            .iter()
+            .filter(|(_, route_table)| {
+                route_table.transit_gateway_id.as_deref() == Some(transit_gateway_id)
+            })
+            .map(|(route_table_id, _)| route_table_id.clone())
+            .collect();
+        for route_table_id in route_table_ids {
+            if let Some(route_table) = self.transit_gateway_route_tables.remove(&route_table_id) {
+                self.release_stored_bytes(transit_gateway_route_table_payload_bytes(&route_table));
+            }
+            self.transit_gateway_route_table_available_at
+                .remove(&route_table_id);
+            self.transit_gateway_associations
+                .retain(|(held, _), _| *held != route_table_id);
+            self.transit_gateway_propagations
+                .retain(|(held, _), _| *held != route_table_id);
+            self.transit_gateway_prefix_list_references
+                .retain(|(held, _), _| *held != route_table_id);
+        }
+        Some(transit_gateway)
+    }
+
     /// The attachments of `transit_gateway_id` whose KIND has to be deleted before the
     /// gateway's Amazon-side ASN can be modified, by the attachment id each is held under.
     ///

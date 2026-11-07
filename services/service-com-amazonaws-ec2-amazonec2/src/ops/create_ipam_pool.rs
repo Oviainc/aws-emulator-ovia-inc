@@ -323,8 +323,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|locale| !state::region_name_is_well_formed(locale))
         {
             return Err(state::invalid_parameter_value(format!(
-                "Invalid value '{locale}' for Locale. It must be an Amazon Web Services \
-                 Region or the network border group of a supported Local Zone"
+                "The locale {locale} is not valid."
             )));
         }
 
@@ -408,6 +407,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "PublicIpSource may be specified only for a pool in the '{public}' scope",
                 public = state::IPAM_SCOPE_TYPE_PUBLIC,
             )));
+        }
+
+        // "The locale for the pool should be one of the following: An Amazon Web Services
+        // Region where you want this IPAM pool to be available for allocations" (`Locale`),
+        // and the Regions an IPAM may manage space in are its own: "operating Regions are
+        // Amazon Web Services Regions where the IPAM is allowed to manage IP address CIDRs"
+        // (`Ipam$OperatingRegions`). So a pool whose locale is outside the operating Regions
+        // of the IPAM its scope belongs to could never allocate in that Region, which EC2
+        // refuses with the code for an action the resources it names forbid rather than
+        // creating a pool that cannot be used.
+        if let Some(locale) = input.locale.as_deref() {
+            let ipam = store
+                .ipams
+                .iter()
+                .find(|(_, ipam)| ipam.ipam_arn == scope.ipam_arn)
+                .map(|(ipam_id, ipam)| (ipam_id.clone(), ipam.clone()));
+            if let Some((ipam_id, ipam)) = ipam {
+                let operates_there = ipam
+                    .operating_regions
+                    .iter()
+                    .flatten()
+                    .any(|operating| operating.region_name.as_deref() == Some(locale));
+                if !operates_there {
+                    return Err(state::dependency_violation(format!(
+                        "The specified action is not valid. Ipam {ipam_id} does not contain \
+                         the operating Region {locale}."
+                    )));
+                }
+            }
         }
 
         // Idempotency: one token names the one pool it minted, so a replay reports that pool

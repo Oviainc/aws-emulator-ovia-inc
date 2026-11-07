@@ -234,17 +234,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "You cannot delete an IPAM pool if there are allocations in it or CIDRs
             // provisioned to it. To deprovision pool CIDRs, see DeprovisionIpamPoolCidr"
             // (`DeleteIpamPool`), and a pool within this one is a resource within it that
-            // `Cascade` is the one way to delete along with it.
+            // `Cascade` is the one way to delete along with it. EC2 words both refusals the
+            // same way: the action, the resource it is not valid for, and what is still in it.
             if !store.ipam_pool_provisioned_cidrs(pool_id).is_empty() {
                 return Err(state::dependency_violation(format!(
-                    "The IPAM pool '{pool_id}' has CIDRs provisioned to it. Deprovision the \
-                     CIDRs before deleting the pool."
+                    "The specified action is not valid for {pool_id}. There are one or more \
+                     pool cidrs provisioned in the pool."
                 )));
             }
             if !within.is_empty() {
                 return Err(state::dependency_violation(format!(
-                    "The IPAM pool '{pool_id}' has pools within it. Delete the pools within \
-                     it before deleting the pool."
+                    "The specified action is not valid for {pool_id}. There are one or more \
+                     pools in the pool."
                 )));
             }
         }

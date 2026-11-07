@@ -668,6 +668,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .get(&image_id)
                 .and_then(|image| image.imds_support.as_deref()),
         })?;
+        // "The IDs of the security groups. You can create a security group using
+        // CreateSecurityGroup" (`RunInstancesRequest$SecurityGroupIds`) and "[Default VPC] The
+        // names of the security groups" (`$SecurityGroups`): which groups this launch applies
+        // is read against the subnet it is placed in, and whether that is admissible is asked
+        // BELOW, after the DryRun arm — the recorded answer to a dry run of a launch naming a
+        // group of another VPC is `DryRunOperation`, so the flag is answered before these two
+        // resources are read against each other.
         let security_groups: Vec<(Option<String>, Option<String>)> = input
             .security_group_ids
             .iter()
@@ -792,6 +799,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.dry_run == Some(true) {
             return Err(Scaffolded::dry_run_operation());
         }
+
+        // The groups this launch applies, read against the subnet it is placed in: a group the
+        // account holds none of is a reference to nothing, and a group of ANOTHER VPC could
+        // never be applied to an interface in this subnet. Asked here, after the DryRun arm,
+        // for the reason given where `security_groups` is built.
+        refuse_incompatible_security_groups(
+            &store,
+            store
+                .launch_subnet(input.subnet_id.as_deref(), &availability_zone)
+                .map(|subnet| {
+                    (
+                        subnet.subnet_id.clone().unwrap_or_default(),
+                        subnet.vpc_id.clone().unwrap_or_default(),
+                    )
+                }),
+            &security_groups,
+        )?;
 
         if let Some(reservation_id) = replayed {
             return store.whole_reservation_view(&reservation_id).ok_or_else(|| {
@@ -949,4 +973,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .whole_reservation_view(&reservation_id)
             .ok_or_else(|| Scaffolded::internal_error("the launched reservation was not stored"))
     }
+}
+
+/// Refuse a launch whose security groups cannot be applied in the subnet it is placed in.
+///
+/// `launch_subnet` is the (`SubnetId`, `VpcId`) of the subnet the launch lands in
+/// ([`crate::state::ComAmazonawsEc2Amazonec2State::launch_subnet`]), or `None` when the account
+/// holds no subnet for it — there is then no network to read the groups against, so nothing is
+/// refused here. `named` is the launch's groups as ids and names, in the order the request
+/// gave them, so the group the refusal names is the one the caller sent.
+///
+/// Two rules, both about one reference:
+///
+/// * a group the account holds none of is a reference to nothing, so the launch is refused with
+///   the group's own `InvalidGroup.NotFound` rather than answered with an instance reporting a
+///   group no describe can report. A NAME is resolved in the VPC the launch is placed in —
+///   "[Default VPC] The names of the security groups" (`RunInstancesRequest$SecurityGroups`),
+///   and a name is unique within one VPC — which is the same reading
+///   [`crate::state::ComAmazonawsEc2Amazonec2State::group_identifier_of`] completes a named
+///   group with;
+/// * a security group belongs to ONE VPC, while the instance's primary network interface sits
+///   in the subnet's VPC, so a group of another VPC could never be applied to this instance:
+///   EC2 refuses the launch `InvalidParameter`, naming the group and the subnet that do not
+///   meet.
+fn refuse_incompatible_security_groups(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    launch_subnet: Option<(String, String)>,
+    named: &[(Option<String>, Option<String>)],
+) -> Result<(), RunInstancesError> {
+    let Some((subnet_id, vpc_id)) = launch_subnet else {
+        return Ok(());
+    };
+    for (group_id, group_name) in named {
+        let held = match (group_id.as_deref(), group_name.as_deref()) {
+            (Some(group_id), _) => store
+                .security_groups
+                .get(group_id)
+                .map(|group| (group_id.to_string(), group.vpc_id.clone()))
+                .ok_or_else(|| crate::state::invalid_group_not_found(group_id))?,
+            (None, Some(group_name)) => store
+                .security_groups
+                .values()
+                .find(|group| {
+                    group.group_name.as_deref() == Some(group_name)
+                        && group.vpc_id.as_deref() == Some(vpc_id.as_str())
+                })
+                .map(|group| {
+                    (
+                        group.group_id.clone().unwrap_or_default(),
+                        group.vpc_id.clone(),
+                    )
+                })
+                .ok_or_else(|| {
+                    // The name was resolved IN the launch subnet's VPC, so the sentence names
+                    // the network the lookup was scoped to — the wording the rule path of this
+                    // crate answers a reference it scoped the same way with
+                    // (`crate::state::prepared_user_id_group_pair`).
+                    crate::scaffolded::Scaffolded::service_error(
+                        crate::state::INVALID_GROUP_NOT_FOUND,
+                        400,
+                        format!(
+                            "The security group '{group_name}' does not exist in VPC '{vpc_id}'"
+                        ),
+                    )
+                })?,
+            (None, None) => continue,
+        };
+        let (resolved_group_id, group_vpc_id) = held;
+        if group_vpc_id.as_deref() != Some(vpc_id.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::service_error(
+                crate::state::INVALID_PARAMETER,
+                400,
+                format!(
+                    "Security group {resolved_group_id} and subnet {subnet_id} belong to \
+                     different networks."
+                ),
+            ));
+        }
+    }
+    Ok(())
 }

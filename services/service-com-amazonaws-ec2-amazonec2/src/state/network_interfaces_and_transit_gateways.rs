@@ -1165,6 +1165,12 @@ pub const TRANSIT_GATEWAY_STATE_AVAILABLE: &str = "available";
 /// [`TRANSIT_GATEWAY_STATE_AVAILABLE`] again.
 pub const TRANSIT_GATEWAY_STATE_MODIFYING: &str = "modifying";
 
+/// A transit gateway whose deletion has been asked for: the `TransitGatewayState` enum's
+/// `deleting` member (`smithy_query(query="shape",shape="TransitGatewayState")`), which is what
+/// `DeleteTransitGateway` answers with until the clock's own
+/// [`ComAmazonawsEc2Amazonec2State::transit_gateway_delete_at`] instant removes the gateway.
+pub const TRANSIT_GATEWAY_STATE_DELETING: &str = "deleting";
+
 /// VPC Encryption Control being turned ON for a transit gateway: the
 /// `EncryptionStateValue` enum's `enabling` member, the transient state a modification that
 /// asked for encryption support answers with.

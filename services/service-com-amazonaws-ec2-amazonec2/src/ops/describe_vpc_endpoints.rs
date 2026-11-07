@@ -265,10 +265,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .find(|endpoint_id| !store.vpc_endpoints.contains_key(**endpoint_id))
         {
-            return Err(state::id_not_found(
+            // The sentence is this resource's own — "The Vpc Endpoint Id '…' does not exist",
+            // the wording AWS answers a describe naming an endpoint that does not exist with
+            // — built from the id the REQUEST named. That spelling of the resource noun is
+            // why this one does not go through [`crate::state::id_not_found`].
+            return Err(crate::scaffolded::Scaffolded::service_error(
                 state::INVALID_VPC_ENDPOINT_ID_NOT_FOUND,
-                "VPC endpoint ID",
-                unknown,
+                400,
+                format!("The Vpc Endpoint Id '{unknown}' does not exist"),
             ));
         }
 

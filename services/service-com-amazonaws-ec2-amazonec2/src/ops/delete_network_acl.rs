@@ -171,10 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You can't delete the default network ACL" (this operation's own doc): the ACL a
         // VPC comes with exists for as long as the VPC does, so only `DeleteVpc` removes it.
+        // The sentence is AWS's own for this refusal, which starts lower-case and ends with
+        // the id the request named.
         if network_acl.is_default == Some(true) {
             return Err(state::invalid_parameter_value(format!(
-                "The network acl '{network_acl_id}' is the default network acl and cannot \
-                 be deleted"
+                "cannot delete default network ACL {network_acl_id}"
             )));
         }
 

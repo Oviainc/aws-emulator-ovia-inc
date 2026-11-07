@@ -1774,6 +1774,7 @@ use crate::ops::types::{
     InstanceIpv6Prefix, InstanceNetworkInterface, InstanceNetworkInterfaceAttachment,
     InstancePrivateIpAddress,
     Ipam, IpamInternetRegistryAssociation, IpamOperatingRegion, IpamPolicy, IpamPool,
+    IpamPoolCidr,
     IpamPrefixListResolver, IpamPrefixListResolverRule, IpamPrefixListResolverTarget,
     IpamResourceDiscovery, IpamResourceDiscoveryAssociation, IpamResourceTag,
     IpamRoutingPolicyRegistration, IpamRoutingPolicyRegistrationDelta, IpamScope,
@@ -2236,6 +2237,8 @@ mod image_block_public_access_and_metadata_defaults;
 mod image_usage_report_store;
 mod capacity_billing_and_recycle_bins;
 mod ipam;
+mod ipam_deletion;
+mod ipam_pool_cidrs;
 mod vpc_endpoints_and_transit_gateway_attachments;
 mod prefix_lists_and_dedicated_hosts;
 mod network_interfaces_and_transit_gateways;
@@ -2273,6 +2276,8 @@ pub use network_interfaces_and_transit_gateways::INVALID_ROUTE_TABLE_ID_NOT_FOUN
 pub use prefix_lists_and_dedicated_hosts::*;
 pub use vpc_endpoints_and_transit_gateway_attachments::*;
 pub use ipam::*;
+pub use ipam_deletion::*;
+pub use ipam_pool_cidrs::*;
 pub use capacity_billing_and_recycle_bins::*;
 pub use image_usage_report_store::*;
 pub use image_block_public_access_and_metadata_defaults::*;

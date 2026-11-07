@@ -320,6 +320,13 @@ mod allocate_hosts;
 // note above gives — the sorted neighbourhood is the contended region of this file.
 #[path = "all/deleted_resources_and_dependencies.rs"]
 mod deleted_resources_and_dependencies;
+// The pre-conditions a mutating call is held to — a referenced resource has to exist and be
+// compatible with the others named, and a resource something still occupies cannot be deleted
+// — and what a delete leaves readable. Declared beside the suite above rather than in sorted
+// position, for the reason the note above gives: the sorted neighbourhood and the tail are
+// where every new ec2 suite inserts its lines.
+#[path = "all/dependency_and_not_found_refusals.rs"]
+mod dependency_and_not_found_refusals;
 // What `CreateVpcEndpoint` stores for each endpoint type, and what it refuses. Declared here
 // rather than in sorted position, for the reason the note above gives: the sorted
 // neighbourhood is where every new ec2 suite inserts its lines.

@@ -640,10 +640,47 @@ pub fn nth_address_in_cidr_block(block: &str, index: u32) -> Option<String> {
     if address > last {
         return None;
     }
+    address_text(is_ipv6, address)
+}
+
+/// The address `value` as its family spells it: the ONE formatting of a numeric address in
+/// this crate, so a block cut out of a range and an address counted into one read the same.
+fn address_text(is_ipv6: bool, value: u128) -> Option<String> {
     if is_ipv6 {
-        return Some(Ipv6Addr::from(address).to_string());
+        return Some(Ipv6Addr::from(value).to_string());
     }
-    Some(::std::net::Ipv4Addr::from(u32::try_from(address).ok()?).to_string())
+    Some(::std::net::Ipv4Addr::from(u32::try_from(value).ok()?).to_string())
+}
+
+/// The `index`th block of `netmask_length` bits inside `range`, or `None` when `range` is not
+/// a CIDR block, the size is not one `range` can be cut into, or the range does not reach that
+/// far.
+///
+/// Counted from the range's own base address, which is block 0, through the ONE reading of a
+/// block's numeric bounds in this crate ([`cidr_block_bounds`]) and the one formatting of an
+/// address of either family ([`nth_address_in_cidr_block`]) — so a block chosen out of a range
+/// is spelled exactly as every other block of this crate is.
+///
+/// What IPAM hands a pool that asks for a SIZE rather than a range
+/// (`crate::ops::provision_ipam_pool_cidr`): the caller walks the index to find a free one.
+pub fn nth_cidr_block_in(range: &str, netmask_length: u32, index: u128) -> Option<String> {
+    let (is_ipv6, first, last) = cidr_block_bounds(range)?;
+    let width: u32 = if is_ipv6 { 128 } else { 32 };
+    // A netmask of 0 names the whole address space rather than a block inside this range, and
+    // one past the family's width names no block at all.
+    if netmask_length == 0 || netmask_length > width {
+        return None;
+    }
+    let size = 1u128.checked_shl(width - netmask_length)?;
+    let base = index.checked_mul(size)?.checked_add(first)?;
+    let block_last = base.checked_add(size - 1)?;
+    if block_last > last {
+        return None;
+    }
+    Some(format!(
+        "{}/{netmask_length}",
+        address_text(is_ipv6, base)?
+    ))
 }
 
 /// Is every address of `inner` an address of `outer`?
@@ -2244,10 +2281,27 @@ pub fn prepared_ip_permission<E>(
     for entry in permission.prefix_list_ids.iter().flatten() {
         validate_security_group_rule_description(entry.description.as_ref())?;
         let prefix_list_id = entry.prefix_list_id.as_deref().unwrap_or_default();
+        // A rule granting a prefix list grants exactly the ranges THAT LIST holds, so a value
+        // naming no prefix list the caller can see grants nothing and can never grant
+        // anything. A value carrying this resource's own prefix NAMES a prefix list whatever
+        // follows it — a prefix list id is not one of this API's `<prefix>-<hex>` resource ids,
+        // AWS's own published lists carrying names rather than hexadecimal — so "no list of
+        // that id" is the only question there is to ask about it, and the answer is the prefix
+        // list's OWN not-found class: the one answer every path that resolves a rule's
+        // `PrefixListId` gives
+        // (`crate::ops::authorize_security_group_egress::referenced_prefix_lists`, which asks
+        // it of the Region's published catalog as well). A value carrying no prefix at all
+        // names no resource of any kind, which is a malformed member rather than a missing
+        // list.
         if !prefix_list_id_is_well_formed(prefix_list_id) {
-            return Err(invalid_parameter_value(format!(
-                "Invalid prefix list id '{prefix_list_id}' for ipPermissions.{position}"
-            )));
+            let names_a_prefix_list =
+                prefix_list_id.starts_with(&format!("{PREFIX_LIST_ID_PREFIX}-"));
+            if !names_a_prefix_list {
+                return Err(invalid_parameter_value(format!(
+                    "Invalid prefix list id '{prefix_list_id}' for ipPermissions.{position}"
+                )));
+            }
+            return Err(invalid_prefix_list_id_not_found(prefix_list_id));
         }
         prefix_list_ids.push(PrefixListId {
             prefix_list_id: Some(prefix_list_id.to_string()),
@@ -2357,8 +2411,52 @@ pub fn prepared_user_id_group_pair<E>(
                 return Err(invalid_group_id_malformed(group_id));
             }
             let owned_here = user_id == ::engine::emulator_account_id();
-            if owned_here && !store.security_groups.contains_key(group_id) {
-                return Err(invalid_group_not_found(group_id));
+            if owned_here {
+                // "A security group and the referenced security group must be in the same VPC,
+                // or in peered VPCs" (the EC2 User Guide's security group rules): a rule of a
+                // group of one VPC cannot reference a group of another, because the reference
+                // is not VISIBLE from inside that network. So the lookup is scoped to the
+                // rule's own VPC, and a group outside it is reported as not existing IN that
+                // VPC — which is exactly what it is.
+                //
+                // The two members that make a reference to ANOTHER network legitimate are the
+                // ones that identify it: "the ID of the VPC for the referenced security group"
+                // (`UserIdGroupPair$VpcId`) — which has to be the VPC that group is really in
+                // — and "the ID of the VPC peering connection, if applicable"
+                // (`$VpcPeeringConnectionId`), which has to be a connection this account holds
+                // BETWEEN the two VPCs ([`ComAmazonawsEc2Amazonec2State::vpc_peering_connection_between`],
+                // the one reader of that question). A value naming neither is not permission.
+                let held = store
+                    .security_groups
+                    .get(group_id)
+                    .ok_or_else(|| invalid_group_not_found(group_id))?;
+                let group_vpc_id = held.vpc_id.clone().unwrap_or_default();
+                let names_the_groups_vpc = pair
+                    .vpc_id
+                    .as_deref()
+                    .is_some_and(|named| !named.is_empty() && named == group_vpc_id);
+                let joined_by_a_peering = pair
+                    .vpc_peering_connection_id
+                    .as_deref()
+                    .filter(|peering| !peering.is_empty())
+                    .is_some_and(|peering| {
+                        store.vpc_peering_connection_between(vpc_id, &group_vpc_id)
+                            == Some(peering)
+                    });
+                let visible = vpc_id.is_empty()
+                    || group_vpc_id == vpc_id
+                    || names_the_groups_vpc
+                    || joined_by_a_peering;
+                if !visible {
+                    // The group exists, in another network the request did not identify, so
+                    // from the rule's VPC there is no such group — in EC2's own wording for
+                    // this class, which names the network the lookup was scoped to.
+                    return Err(Scaffolded::service_error(
+                        INVALID_GROUP_NOT_FOUND,
+                        400,
+                        format!("The security group '{group_id}' does not exist in VPC '{vpc_id}'"),
+                    ));
+                }
             }
             group_id.to_string()
         }

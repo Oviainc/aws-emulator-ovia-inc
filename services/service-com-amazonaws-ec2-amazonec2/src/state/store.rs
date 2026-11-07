@@ -2150,6 +2150,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// `available` [`TRANSITION_DELAY`] later whether or not anybody calls again. The
     /// gateway's default route table moves with it.
     pub transit_gateway_available_at: BTreeMap<String, Instant>,
+    /// When a `deleting` transit gateway's own REMOVAL falls due, by `TransitGatewayId` — the
+    /// counterpart of [`Self::transit_gateway_available_at`] for the other end of a gateway's
+    /// life, on the same monotonic clock and the same [`TRANSITION_DELAY`], and applied by the
+    /// same [`Self::materialize_due_transitions`].
+    ///
+    /// A removal rather than a further state, because a deleted gateway is one
+    /// `DescribeTransitGateways` stops carrying — see
+    /// [`Self::begin_transit_gateway_deletion`].
+    pub transit_gateway_delete_at: BTreeMap<String, Instant>,
     /// Every transit gateway route table the account holds, by
     /// `TransitGatewayRouteTableId` — starting with the default one each
     /// `CreateTransitGateway` makes (see the module docs). Ordered by id, the stable order
@@ -2574,6 +2583,23 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// unique, case-sensitive identifier that you provide to ensure the idempotency of the
     /// request" (`CreateIpamPoolRequest$ClientToken`).
     pub ipam_pool_client_tokens: HashMap<String, String>,
+    /// Every CIDR provisioned to one of the account's IPAM pools, by `IpamPoolCidrId` — see
+    /// [`IpamPoolCidrRecord`]. Ordered by that id, the stable order `GetIpamPoolCidrs`
+    /// reports and pages over.
+    ///
+    /// `ProvisionIpamPoolCidr` is the operation that adds one and `DeprovisionIpamPoolCidr`
+    /// the one that takes it back, and this is the store "you cannot delete an IPAM pool if
+    /// there are … CIDRs provisioned to it" (`DeleteIpamPool`) is asked of, through
+    /// [`Self::ipam_pool_provisioned_cidrs`].
+    pub ipam_pool_cidrs: BTreeMap<String, IpamPoolCidrRecord>,
+    /// When a `delete-in-progress` IPAM's own REMOVAL falls due, by `IpamId` — the fact the
+    /// modelled [`Ipam`] shape carries no member for, stored beside the IPAM under the same
+    /// id, on the same monotonic clock and the same [`TRANSITION_DELAY`] as
+    /// [`Self::ipam_create_complete_at`]. [`Self::materialize_due_transitions`] applies it.
+    ///
+    /// A removal rather than a further state, because a deleted IPAM is one `DescribeIpams`
+    /// answers [`INVALID_IPAM_ID_NOT_FOUND`] for — see [`Self::begin_ipam_deletion`].
+    pub ipam_delete_at: BTreeMap<String, Instant>,
     /// Every IPAM prefix list resolver the account holds, by `IpamPrefixListResolverId`, as
     /// the modelled [`IpamPrefixListResolver`] shape itself — the container a prefix list
     /// resolver TARGET belongs to, which is what `CreateIpamPrefixListResolverTarget`
@@ -3161,6 +3187,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             address_transfers: BTreeMap::new(),
             transit_gateways: BTreeMap::new(),
             transit_gateway_available_at: BTreeMap::new(),
+            // A fresh account has deleted no transit gateway, so the clock owes none of them
+            // its removal.
+            transit_gateway_delete_at: BTreeMap::new(),
             transit_gateway_route_tables: BTreeMap::new(),
             transit_gateway_route_table_available_at: BTreeMap::new(),
             transit_gateway_propagations: BTreeMap::new(),
@@ -3232,6 +3261,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             ipam_pool_create_complete_at: BTreeMap::new(),
             ipam_pool_delete_complete_at: BTreeMap::new(),
             ipam_pool_client_tokens: HashMap::new(),
+            // Nothing has provisioned a CIDR to a pool or deleted an IPAM yet.
+            ipam_pool_cidrs: BTreeMap::new(),
+            ipam_delete_at: BTreeMap::new(),
             // Nothing has created a prefix list resolver or a target against one yet.
             ipam_prefix_list_resolvers: BTreeMap::new(),
             ipam_prefix_list_resolver_rules: BTreeMap::new(),
