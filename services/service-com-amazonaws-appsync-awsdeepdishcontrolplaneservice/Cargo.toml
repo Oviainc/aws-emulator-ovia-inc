@@ -23,6 +23,9 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Parses the OIDC `issuer`, which AppSync requires to be a valid URL.
 url = "2"
+# Parses a caller-supplied GraphQL type definition (SDL), which `CreateType` and
+# `UpdateType` carry.
+apollo-parser = "0.8"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

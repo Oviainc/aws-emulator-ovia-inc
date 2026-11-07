@@ -10,6 +10,11 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// The GraphQL types created under a GraphQL API, and how one type definition is
+/// parsed, kept and reported.
+mod schema_types;
+pub use schema_types::*;
+
 use crate::ops::types::{
     AdditionalAuthenticationProvider, Api, ApiAssociation, ApiCache, ApiKey, AppSyncRuntime,
     AuthMode, ChannelNamespace, DataSource, DomainNameConfig, DynamodbDataSourceConfig,
@@ -88,6 +93,12 @@ pub struct GraphqlApiRecord {
     /// Bounded: `CreateFunction` refuses a create once the API holds the AppSync
     /// per-API quota of functions, so this map cannot grow without limit.
     pub functions: BTreeMap<String, FunctionRecord>,
+    /// The GraphQL types created under this API, keyed by the type name their
+    /// definition declares — the name is what every type operation addresses one by,
+    /// so it identifies the type within its API and no second key is needed.
+    /// Bounded: `CreateType` refuses a create once the API holds the AppSync per-API
+    /// quota of types, so this map cannot grow without limit.
+    pub types: BTreeMap<String, TypeRecord>,
 }
 
 impl GraphqlApiRecord {

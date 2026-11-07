@@ -8067,6 +8067,7 @@ dependencies = [
 name = "service-com-amazonaws-appsync-awsdeepdishcontrolplaneservice"
 version = "0.1.0"
 dependencies = [
+ "apollo-parser",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",

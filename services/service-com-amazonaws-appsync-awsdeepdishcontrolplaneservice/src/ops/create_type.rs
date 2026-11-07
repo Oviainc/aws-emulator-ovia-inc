@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateType`'s real behaviour. Implement it here — this is
+//! Implemented: parses the GraphQL SDL definition the request carries and persists the
+//! ONE type it declares under its API in [`crate::state`], refusing a definition GraphQL
+//! cannot read or that declares no single type. The `format` the request names chooses
+//! how the answer reports that definition (`crate::state::TypeRecord::to_type`). This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +146,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateType"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateTypeErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(CreateTypeErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // The definition is "in GraphQL Schema Definition Language (SDL) format", so
+        // the type the call creates is the one that definition declares: a definition
+        // GraphQL cannot read, or one that declares no single type, names no type to
+        // create and is refused before anything is written.
+        let parsed = crate::state::parse_type_definition(&input.definition).map_err(|refusal| {
+            CreateTypeErrorModeled::BadRequestException(BadRequestException {
+                message: Some(refusal.message()),
+                ..Default::default()
+            })
+        })?;
+
+        // The type is reported in the region the caller addressed, so its ARN is built
+        // from that region rather than from a fixed one.
+        let region = crate::state::request_region(ctx);
+        let mut guard = state.lock();
+        let seq = guard.next_seq();
+
+        // A type lives under a GraphQL API, so it cannot be created under an API this
+        // account does not hold.
+        let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
+            return Err(CreateTypeErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        // The declared name identifies the type within its API — it is what every type
+        // operation addresses one by — so a create cannot take a name the API already
+        // holds: it would replace a type the caller did not name for replacement
+        // (`UpdateType` is what changes one).
+        if api.types.contains_key(&parsed.name) {
+            return Err(CreateTypeErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::type_exists_message(&parsed.name)),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // The store is bounded, so a repeated create cannot grow it without limit.
+        if api.types.len() >= TYPES_PER_API {
+            return Err(CreateTypeErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!("an API may hold at most {TYPES_PER_API} types")),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        let name = parsed.name.clone();
+        let record = crate::state::TypeRecord {
+            seq,
+            arn: ::engine::emulator_arn(
+                crate::state::ARN_SERVICE,
+                &region,
+                &crate::state::type_resource(&input.api_id, &name),
+            ),
+            // The SDL the caller wrote is kept as it arrived, so an SDL report answers
+            // the definition that was created rather than a re-spelling of it.
+            definition: input.definition,
+            parsed,
+        };
+        api.types.insert(name.clone(), record);
+
+        // Answer from the STORED record, with the definition in the format the request
+        // asked for, so this body is the one `GetType` answers with later.
+        Ok(CreateTypeOutput {
+            r#type: api
+                .types
+                .get(&name)
+                .map(|record| record.to_type(&input.format, &api.types)),
+        })
     }
 }
+
+/// The AppSync service quota for types on ONE GraphQL API, which also bounds the
+/// per-API collection this operation writes to: a create past it is refused, so
+/// repeating the call cannot grow the store without limit.
+const TYPES_PER_API: usize = 2_500;

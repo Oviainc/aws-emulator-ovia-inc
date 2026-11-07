@@ -296,13 +296,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             environment_variables: std::collections::BTreeMap::new(),
             created_at: std::time::SystemTime::now(),
             api_keys: std::collections::BTreeMap::new(),
-            // A fresh API holds no cache, no data source and no function:
-            // `CreateApiCache`, `CreateDataSource` and `CreateFunction` are what
-            // create them. Nothing has torn a cache of it down either.
+            // A fresh API holds no cache, no data source, no function and no type:
+            // `CreateApiCache`, `CreateDataSource`, `CreateFunction` and `CreateType`
+            // are what create them. Nothing has torn a cache of it down either.
             api_cache: None,
             api_cache_deleted: false,
             data_sources: std::collections::BTreeMap::new(),
             functions: std::collections::BTreeMap::new(),
+            types: std::collections::BTreeMap::new(),
         };
 
         guard.graphql_apis.insert(api_id.clone(), record);
