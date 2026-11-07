@@ -853,6 +853,8 @@ mod cloudformation_provisions_sns_topics;
 mod cloudformation_provisions_sns_subscriptions;
 #[path = "all/cloudformation_sns_topic_policy_admits_s3_notifications.rs"]
 mod cloudformation_sns_topic_policy_admits_s3_notifications;
+#[path = "all/sns_lambda_subscription_permission.rs"]
+mod sns_lambda_subscription_permission;
 #[path = "all/sns_lambda_subscription_stack_invokes_its_function.rs"]
 mod sns_lambda_subscription_stack_invokes_its_function;
 #[path = "all/sns_lambda_subscription_permission_boundary.rs"]

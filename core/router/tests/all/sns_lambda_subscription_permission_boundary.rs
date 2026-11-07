@@ -21,7 +21,10 @@
 //!
 //! The two halves differ along exactly what the rule generalises over — whether the stack
 //! declares the `AWS::Lambda::Permission` — and the second half is deployed as an UPDATE of
-//! the same stack, so the grant is the only thing that changed between them.
+//! the same stack, so the grant is the only thing that changed between them. The same boundary
+//! over two INDEPENDENTLY deployed stacks is
+//! [`crate::sns_lambda_subscription_permission`], which drives this suite's harness rather
+//! than a copy of it.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,6 +61,9 @@ pub(crate) const LOOK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// CloudFormation, SNS, Lambda, Amazon SQS and IAM over ONE engine, as
 /// `core/router/src/lib.rs` mounts them.
+///
+/// `pub(crate)` with the helpers below: a sibling suite that reads the same boundary over two
+/// independently deployed stacks drives THIS harness rather than a second copy of it.
 pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -315,7 +321,7 @@ pub(crate) async fn drain(router: &MultiServiceRouter, url: &str) -> Vec<String>
 }
 
 /// Wait for `marker` to appear on the queue at `url`, and report every body seen.
-async fn wait_for(router: &MultiServiceRouter, url: &str, marker: &str) -> Vec<String> {
+pub(crate) async fn wait_for(router: &MultiServiceRouter, url: &str, marker: &str) -> Vec<String> {
     let deadline = Instant::now() + DELIVERY_BUDGET;
     let mut seen: Vec<String> = Vec::new();
     loop {
@@ -328,7 +334,7 @@ async fn wait_for(router: &MultiServiceRouter, url: &str, marker: &str) -> Vec<S
 }
 
 /// Wait out [`QUIET_BUDGET`] and report every body the queue at `url` held in it.
-async fn stayed_quiet(router: &MultiServiceRouter, url: &str) -> Vec<String> {
+pub(crate) async fn stayed_quiet(router: &MultiServiceRouter, url: &str) -> Vec<String> {
     let deadline = Instant::now() + QUIET_BUDGET;
     let mut seen: Vec<String> = Vec::new();
     while Instant::now() < deadline {
