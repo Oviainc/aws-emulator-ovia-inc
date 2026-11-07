@@ -58,7 +58,10 @@ const ACCOUNT: &str = "000000000000";
 /// over the in-process callback — Secrets Manager, which holds the secret, and KMS, which
 /// identifies the key it is encrypted under — all over ONE shared engine, exactly as the
 /// assembled router mounts them.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` so the sibling suites that drive the same path mount it the same way rather
+/// than standing up a second copy.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Verifying signatures is the emulator's concern, not this service's; these tests
@@ -79,8 +82,9 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// A Secrets Manager client over this emulator's own in-process callback — the same seam
-/// the RDS handlers create the secret over.
-fn secrets_manager(router: &MultiServiceRouter) -> aws_sdk_secretsmanager::Client {
+/// the RDS handlers create the secret over. `pub(crate)` for the same reason as
+/// [`emulator`].
+pub(crate) fn secrets_manager(router: &MultiServiceRouter) -> aws_sdk_secretsmanager::Client {
     let callback = smithy_server_runtime::EmbeddedEmulator::from_router(router.clone());
     let config = aws_sdk_secretsmanager::Config::builder()
         .behavior_version(aws_sdk_secretsmanager::config::BehaviorVersion::latest())

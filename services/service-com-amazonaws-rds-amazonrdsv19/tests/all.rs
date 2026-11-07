@@ -157,8 +157,12 @@ mod integration_deletion;
 mod lifecycle_poll_loops;
 #[path = "all/maintenance_action_resource_guard.rs"]
 mod maintenance_action_resource_guard;
+#[path = "all/managed_master_secret_key_bound.rs"]
+mod managed_master_secret_key_bound;
 #[path = "all/managed_master_user_password.rs"]
 mod managed_master_user_password;
+#[path = "all/managed_master_user_secret.rs"]
+mod managed_master_user_secret;
 #[path = "all/management_event_recording.rs"]
 mod management_event_recording;
 #[path = "all/modification_and_final_snapshot_refusal_sentences.rs"]

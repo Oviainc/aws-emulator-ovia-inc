@@ -9,6 +9,11 @@
 //! with `CreateDBInstance` (which resolves a member instance's cluster against the same
 //! store).
 //!
+//! A create that asks for `ManageMasterUserPassword` also has a secret created in Amazon
+//! Web Services Secrets Manager to hold the password RDS generates, and reports it as
+//! `DBCluster$MasterUserSecret`; the generation and the create of that secret live in
+//! [`crate::state::mint_master_user_secret`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -443,6 +448,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ("Domain", input.domain.as_deref()),
             ("DomainIAMRoleName", input.domain_iam_role_name.as_deref()),
             ("KmsKeyId", input.kms_key_id.as_deref()),
+            // This one is stored too — on the cluster's managed master user secret — so it
+            // is bounded here with the other stored free-form members.
+            (
+                "MasterUserSecretKmsKeyId",
+                input.master_user_secret_kms_key_id.as_deref(),
+            ),
             ("MonitoringRoleArn", input.monitoring_role_arn.as_deref()),
             ("OptionGroupName", input.option_group_name.as_deref()),
             ("PerformanceInsightsKMSKeyId", input.performance_insights_kms_key_id.as_deref()),
