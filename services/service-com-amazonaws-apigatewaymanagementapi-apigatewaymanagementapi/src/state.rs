@@ -47,7 +47,20 @@
 use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
 
+use ::tokio::sync::mpsc::{error::TrySendError, Sender};
+
 pub use crate::ops::types::Identity;
+
+/// How many pushed payloads one LIVE connection's channel holds before a delivery to it is
+/// refused.
+///
+/// An EMULATOR resource bound, not an AWS limit: a payload queued for a connection is bytes
+/// the emulator holds on behalf of a client that is not reading them, so the depth is capped
+/// and a delivery past it is refused rather than growing the process. Deep enough that a
+/// caller sending a handful of payloads in a row never sees a refusal, and shallow enough
+/// that the bytes one stalled connection can pin stay small (its product with the modelled
+/// per-payload maximum, [`crate::ops::post_to_connection::MAX_DATA_BYTES`]).
+pub const CONNECTION_PUSH_DEPTH: usize = 64;
 
 /// One registered WebSocket connection: everything the three modeled operations
 /// read or write about it.
@@ -87,6 +100,26 @@ pub struct Connection {
     /// Total bytes delivered to this connection, including evicted payloads. Saturating,
     /// for the same reason.
     pub delivered_bytes: u64,
+    /// The LIVE socket this connection is carried on, when it is carried on one: the
+    /// channel the api's own WebSocket data plane serves the connection over
+    /// ([`open_connection`]). `None` for a connection registered without one, which is the
+    /// emulator-internal registration seam ([`register_connection`]).
+    ///
+    /// What makes a `PostToConnection` a DELIVERY rather than a record: a payload handed to
+    /// this channel is written to the client's socket by the task serving it. Holding the
+    /// only sender here is also what closes that socket when the connection is deleted —
+    /// dropping the record drops the sender, and the serving task sees its channel end.
+    pub live: Option<Sender<Vec<u8>>>,
+}
+
+/// Why a payload could not be handed to a connection's live socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryRefused {
+    /// The connection's channel is full: the client has stopped reading and
+    /// [`CONNECTION_PUSH_DEPTH`] payloads are already waiting.
+    Backlogged,
+    /// The task serving the connection is gone, so the connection no longer exists.
+    Closed,
 }
 
 /// How many delivered payloads one connection retains for inspection.
@@ -106,6 +139,24 @@ pub const MAX_RETAINED_MESSAGES: usize = 16;
 pub const MAX_RETAINED_BYTES: usize = 1024 * 1024;
 
 impl Connection {
+    /// Hand `payload` to the task serving this connection's LIVE socket, or say why it could
+    /// not be: the channel is full (the client is not reading), closed (the connection has
+    /// ended), or absent (this connection is carried on no socket, so a delivery is recorded
+    /// and nothing is written).
+    ///
+    /// Never blocks and never waits, so a caller of `PostToConnection` is not held up by a
+    /// client that stopped reading.
+    pub fn deliver(&self, payload: Vec<u8>) -> Result<(), DeliveryRefused> {
+        let Some(live) = self.live.as_ref() else {
+            return Ok(());
+        };
+        match live.try_send(payload) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(DeliveryRefused::Backlogged),
+            Err(TrySendError::Closed(_)) => Err(DeliveryRefused::Closed),
+        }
+    }
+
     /// Record one delivered payload: count it, add its bytes, keep it in the bounded
     /// observation window, and evict the oldest retained payloads until both
     /// [`MAX_RETAINED_MESSAGES`] and [`MAX_RETAINED_BYTES`] hold again.
@@ -218,6 +269,11 @@ pub fn registry_unavailable<E>(operation: &str) -> crate::scaffolded::Scaffolded
 /// was registered, and `false` without touching anything when the id is already
 /// registered (so `ConnectedAt` cannot be reset) or when `engine` does not carry this
 /// service's state.
+///
+/// Registers a connection carried on NO socket: what a `PostToConnection` to it does is
+/// recorded and nothing is written. A connection the api's own WebSocket data plane is
+/// carrying one for is opened through [`open_connection`] instead, which is handed the
+/// channel that makes a post a real delivery.
 pub fn register_connection<Eng: Send + Sync + 'static>(
     engine: &Eng,
     connection_id: impl Into<String>,
@@ -227,6 +283,27 @@ pub fn register_connection<Eng: Send + Sync + 'static>(
     let Some(state) = service_state(engine) else {
         return false;
     };
+    open_connection(&state, connection_id, identity, connected_at, None)
+}
+
+/// Register a WebSocket connection on the state handle itself, with the LIVE socket it is
+/// carried on when it is carried on one.
+///
+/// This is the seam the WEBSOCKET data plane of the api that owns the connection calls when
+/// its handshake completes: it holds the api's records and this registry under the one
+/// shared engine, so it hands the channel over rather than registering an id nothing can
+/// deliver to. `live` is `None` for the emulator-internal registration
+/// ([`register_connection`]).
+///
+/// Returns `true` when the connection was registered, and `false` without touching anything
+/// when the id is already registered, so `ConnectedAt` cannot be reset.
+pub fn open_connection(
+    state: &::engine::ServiceState<ComAmazonawsApigatewaymanagementapiApigatewaymanagementapiState>,
+    connection_id: impl Into<String>,
+    identity: Identity,
+    connected_at: SystemTime,
+    live: Option<Sender<Vec<u8>>>,
+) -> bool {
     let connection_id = connection_id.into();
     let mut guard = state.lock();
     if guard.connections.contains_key(&connection_id) {
@@ -245,9 +322,34 @@ pub fn register_connection<Eng: Send + Sync + 'static>(
             messages: Vec::new(),
             delivered_count: 0,
             delivered_bytes: 0,
+            live,
         },
     );
     true
+}
+
+/// Forget a connection that has ENDED, answering whether it was registered.
+///
+/// The other half of [`open_connection`], called by the data plane that was carrying the
+/// connection when the socket closes: from here on the id identifies a connection that no
+/// longer exists, which is `GoneException` for each of the three modelled operations. The id
+/// stays ISSUED, so it is never refused as one this service never minted.
+pub fn close_connection(
+    state: &::engine::ServiceState<ComAmazonawsApigatewaymanagementapiApigatewaymanagementapiState>,
+    connection_id: &str,
+) -> bool {
+    state.lock().connections.remove(connection_id).is_some()
+}
+
+/// This service's registry on the shared engine, as the handle the two seams above take.
+///
+/// `pub` because the data plane that carries a connection reaches the registry once, when
+/// its socket opens, and then holds the handle for the life of that socket.
+pub fn registry<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<ComAmazonawsApigatewaymanagementapiApigatewaymanagementapiState>>
+{
+    service_state(engine)
 }
 
 /// The registry's record for `connection_id`, cloned, or `None` when no such

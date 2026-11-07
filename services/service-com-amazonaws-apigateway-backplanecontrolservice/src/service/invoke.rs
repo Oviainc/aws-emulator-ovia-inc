@@ -4236,7 +4236,7 @@ const VELOCITY_DIRECTIVES: &[&str] = &[
 /// request, so it must not be able to fail. The byte it keys on is ASCII, so the position
 /// after one is always a character boundary; the remainder is still taken with `str::get`,
 /// which answers `None` rather than panicking for any position that is not.
-fn carries_velocity_directive(template: &str) -> bool {
+pub(crate) fn carries_velocity_directive(template: &str) -> bool {
     for (index, byte) in template.as_bytes().iter().enumerate() {
         if *byte != b'#' {
             continue;

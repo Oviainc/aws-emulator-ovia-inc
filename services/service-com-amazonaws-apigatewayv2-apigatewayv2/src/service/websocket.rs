@@ -3,32 +3,39 @@
 //! The `execute-api` WEBSOCKET data plane: how an RFC 6455 OPENING HANDSHAKE addressed to
 //! a stage of a WebSocket api is recognised, and what it is answered with.
 //!
-//! A WebSocket api is reached at the URI its `ApiEndpoint` reports —
-//! `wss://{api-id}.execute-api.{region}.amazonaws.com`, with "the stage name … appended to
-//! this URI to form a complete path to a deployed API stage" (`Api$ApiEndpoint`) — so the
-//! first request a client makes against a deployed WebSocket stage is not a modelled
-//! operation at all: it is the opening handshake of RFC 6455 (a `GET` carrying
-//! `Connection: Upgrade`, `Upgrade: websocket` and a `Sec-WebSocket-Key`). No service
-//! claimed that request, so the emulator's front door could resolve no target service for
-//! it and answered `404` `UnknownService` — an "this API does not exist" shape for an
-//! endpoint this very service told the caller to use, and one no WebSocket client can act
-//! on: it cannot tell a missing data plane from a stage that was never deployed.
+//! A WebSocket api is reached over a SOCKET, and the socket it is served on is this api's
+//! own: [`transport`] opens one per WebSocket api through the core
+//! (`engine.listeners()`), completes the handshake on it, and carries the frames that
+//! follow, and the address it landed on is what that api announces as its `ApiEndpoint`
+//! ("the stage name … appended to this URI to form a complete path to a deployed API
+//! stage", `Api$ApiEndpoint`). A client that dials the announced address therefore reaches
+//! the api's data plane in full — `101 Switching Protocols`, then frames dispatched to the
+//! route the api's `RouteSelectionExpression` selects ([`dispatch`]).
 //!
-//! This module is therefore the second half of [`crate::service::EmulatedService`]: the
-//! claim ([`claims_parts`], read by `Service::can_handle`) and the serving ([`serve`],
-//! reached from `Service::override_routing_error` — a handshake names no modelled
-//! operation, and it carries no credential whose verification could change the answer).
-//! It is a pure READ of this service's own records: a handshake changes nothing here, and
-//! every status it answers is computed from the api's and the stage's stored state.
+//! THIS module serves the other address the same handshake can arrive at: the emulator's
+//! own SERVICE endpoint, where a client that rewrote the announced URI onto the endpoint it
+//! is already talking to ends up. No service claimed such a request before, so the front
+//! door could resolve no target service for it and answered `404` `UnknownService` — an
+//! "this API does not exist" shape for an endpoint this very service told the caller to
+//! use, and one no WebSocket client can act on: it cannot tell a missing data plane from a
+//! stage that was never deployed. So this module is the second half of
+//! [`crate::service::EmulatedService`]: the claim ([`claims_parts`], read by
+//! `Service::can_handle`) and the serving ([`serve`], reached from
+//! `Service::override_routing_error` — a handshake names no modelled operation, and it
+//! carries no credential whose verification could change the answer). It is a pure READ of
+//! this service's own records: a handshake changes nothing here, and every status it answers
+//! is computed from the api's and the stage's stored state.
 //!
 //! # What it resolves, in order
 //!
 //! 1. the request is an RFC 6455 opening handshake ([`Handshake::is_opening`]) and does not
 //!    address the `@connections` space, which belongs to ApiGatewayManagementApi;
 //! 2. it addresses an api THIS service holds whose `ProtocolType` is `WEBSOCKET`
-//!    ([`resolve`]) — by the api id in an `execute-api` host, or, for a handshake whose
-//!    host names no api (the emulator's own endpoint, or a custom domain fronting the
-//!    api), by the stage segment of its path;
+//!    ([`resolve`]) — by the api id in an `execute-api` host, by the api id a rewritten
+//!    endpoint carries in the path (`/_aws/execute-api/{api-id}/{stage}`, the marker the
+//!    HTTP data plane reads too), or, for a handshake whose host names no api (the
+//!    emulator's own endpoint, or a custom domain fronting the api), by the stage segment of
+//!    its path;
 //! 3. that api holds a stage the path names, and that stage has a deployment released to
 //!    it; a step that resolves nothing is `403` `{"message":"Forbidden"}`, which is what
 //!    API Gateway answers for an api id it does not serve and for a stage that has no
@@ -47,26 +54,30 @@
 //!
 //! # What it does not do, and what it answers instead
 //!
-//! A DEPLOYED WebSocket stage whose authorization step let the handshake through is
+//! 5. the CONNECTION REQUEST itself is served by the `$connect` route's integration, and the
+//!    handshake completes only on a successful reply ([`dispatch::connection_request`]), so
+//!    a reply the api's own configuration cannot produce is `500`
+//!    `{"message":"Internal server error"}` here exactly as it is on the api's own socket.
+//!
+//! A handshake that every step above let through would be answered `101 Switching
+//! Protocols` — and is, on the api's own socket ([`transport`]). On THIS endpoint it is
 //! answered `501` `NotImplemented` with the sentence [`NO_WEBSOCKET_TRANSPORT_MESSAGE`],
-//! and NOT with `101 Switching Protocols`.
+//! which names the address the api IS reached at.
 //!
 //! The emulator's front door serves one BUFFERED request per call — `emulator_server`'s
 //! production listener hands each request to the router and writes the one response it
 //! answers with, and the only seams a service is given (`Service::override_operation`,
 //! `Service::override_routing_error`) take an already-buffered request and return a
 //! buffered response. Nothing in that path can hand the connection's byte stream to a
-//! service, so there is no socket on which to carry WebSocket frames after a handshake,
-//! and nothing that could run `$connect`, the route-selection-expression route or
-//! `$disconnect` over one. A `101` would therefore promise a session nothing can carry:
-//! the client would see the upgrade succeed and then read EOF on its first frame, and a
-//! connection id minted for it would be addressable at `@connections` while no socket
-//! existed. That is a fabricated success, so it is refused instead — the same answer, for
-//! the same reason, that the Transcribe Streaming WebSocket transport gives
+//! service, so a `101` answered HERE would promise a session nothing can carry: the client
+//! would see the upgrade succeed and then read EOF on its first frame, and a connection id
+//! minted for it would be addressable while no socket existed. That is a fabricated
+//! success, so it is refused instead — the same answer, for the same reason, that the
+//! Transcribe Streaming WebSocket transport gives
 //! (`service-com-amazonaws-transcribestreaming-transcribe/src/ops/types/event_stream.rs`,
 //! which refuses the upgrade with its operation's own modelled error). `501` is this
 //! emulator's "not implemented" channel (`crate::scaffolded`), and it is not a retryable
-//! 5xx: a client learns the capability is absent rather than retrying for ever.
+//! 5xx: a client learns to dial the announced socket rather than retrying for ever.
 //!
 //! Nor is an authorizer's own ALLOW/DENY decision computed: a `REQUEST` authorizer's
 //! decision is the answer of the Lambda function its `AuthorizerUri` names, and no
@@ -75,6 +86,9 @@
 //! 4 above applies is the part of the authorization that is the SERVICE's own and is
 //! computed from stored records — the identity-source precondition the authorizer is only
 //! invoked past, and a route whose authorizer the api does not hold.
+
+pub mod dispatch;
+pub mod transport;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use smithy_server_runtime::http;
@@ -122,10 +136,16 @@ const NOT_IMPLEMENTED_CODE: &str = "NotImplemented";
 /// docs for why no `101` is answered.
 pub const NO_WEBSOCKET_TRANSPORT_MESSAGE: &str =
     "NO_WEBSOCKET_TRANSPORT: this emulator's front door serves one buffered request per \
-     call and cannot switch a connection to the WebSocket protocol, so the RFC 6455 \
-     opening handshake against this deployed WEBSOCKET stage is refused instead of \
-     answered 101 Switching Protocols; no connection id is minted and no $connect, route \
-     or $disconnect integration runs";
+     call and cannot switch a connection to the WebSocket protocol, so an RFC 6455 opening \
+     handshake made HERE is refused; the api's own socket, which completes the handshake \
+     and carries its frames, is the one its ApiEndpoint announces";
+
+/// [`NO_WEBSOCKET_TRANSPORT_MESSAGE`] naming the address this api IS reached at, so a
+/// developer who made the handshake against the service endpoint reads where to make it
+/// instead.
+fn wrong_endpoint_message(api_endpoint: &str) -> String {
+    format!("{NO_WEBSOCKET_TRANSPORT_MESSAGE}: {api_endpoint}")
+}
 
 /// The status the capability refusal carries: [`crate::scaffolded`]'s 501, which an SDK
 /// retry classifier does not treat as retryable.
@@ -249,6 +269,23 @@ fn resolve<'s>(
     if handshake.addresses_connections() {
         return None;
     }
+    // LOCAL-ENDPOINT style first, because its marker is unambiguous on any host: a client
+    // that resolves `{api-id}.execute-api.{region}.amazonaws.com` nowhere rewrites the
+    // endpoint it was given into the emulator's own, carrying the api id in the path ahead
+    // of the stage (`/_aws/execute-api/{api-id}/{stage}`). It is the SAME marker the HTTP
+    // data plane reads, through that plane's one reading of it
+    // ([`super::invoke::local_endpoint_path`]).
+    if let Some((api_id, stage_path)) = super::invoke::local_endpoint_path(handshake.path) {
+        let api = store.apis.get(api_id).filter(|api| is_websocket(api))?;
+        // The path already names the api, so a path that names no stage of it is still
+        // this api's to answer: an endpoint that serves nothing (`403`).
+        let stage_name = first_segment(stage_path).unwrap_or_default();
+        return Some(Resolved {
+            api,
+            stage_name: stage_name.to_string(),
+            stage: api.stages.get(stage_name),
+        });
+    }
     let stage_name = first_segment(handshake.path);
     match api_id_of_host(handshake.host) {
         Some(api_id) => {
@@ -355,21 +392,46 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
         return forbidden();
     };
     // A deployed stage: the handshake is authorized by the route that serves the
-    // connection request, and only then met by the capability this emulator does not
-    // have. See the module docs for why this is not a `101`.
-    if let Some(refusal) =
-        connect_authorization_refusal(resolved.api, stage, &deployment.configuration, req)
-    {
-        return refusal;
+    // connection request, and only then met by the answer this endpoint can give it. See
+    // the module docs for why that answer is not a `101` on THIS endpoint.
+    if let Some((status, message)) = connect_authorization_refusal(
+        resolved.api,
+        stage,
+        &deployment.configuration,
+        |name: &str| req.headers().get(name).map(str::to_string),
+        req.uri(),
+    ) {
+        return json_response(status, message, None);
+    }
+    // And then by the CONNECTION REQUEST itself, which the `$connect` route's integration
+    // serves: the handshake completes only on a successful reply, so a reply the api's own
+    // configuration cannot produce is the `500` a gateway answers for it
+    // ([`dispatch::connection_request`]) — observable here, because it is decided before any
+    // socket exists.
+    let admits = match dispatch::connection_request(&deployment.configuration) {
+        Ok(None) => true,
+        Ok(Some(reply)) => dispatch::is_success_status(reply.status_code.as_deref()),
+        Err(_unserved) => false,
+    };
+    if !admits {
+        tracing::info!(
+            api_id = %resolved.api.api_id,
+            stage = %stage.stage_name,
+            "refusing a WebSocket opening handshake: the connection request's integration \
+             did not reply successfully"
+        );
+        return json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None);
     }
     tracing::info!(
         api_id = %resolved.api.api_id,
         stage = %stage.stage_name,
-        "refusing a WebSocket opening handshake: this emulator has no WebSocket transport"
+        announced = %resolved.api.api_endpoint,
+        "refusing a WebSocket opening handshake on the service endpoint: this api's socket \
+         is the one its ApiEndpoint announces"
     );
     json_response(
         NOT_IMPLEMENTED_STATUS,
-        NO_WEBSOCKET_TRANSPORT_MESSAGE,
+        &wrong_endpoint_message(&resolved.api.api_endpoint),
         Some(NOT_IMPLEMENTED_CODE),
     )
 }
@@ -410,12 +472,16 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
 /// [`query_parameters`], never once per identity source; and the identity sources then
 /// looked up in it are capped at [`crate::state::MAX_IDENTITY_SOURCES_PER_AUTHORIZER`] by
 /// the create that stored them.
-fn connect_authorization_refusal(
+pub(crate) fn connect_authorization_refusal<H>(
     api: &Api,
     stage: &Stage,
     deployed: &crate::state::DeployedConfiguration,
-    req: &RtRequest,
-) -> Option<RtResponse> {
+    header: H,
+    uri: &str,
+) -> Option<(u16, &'static str)>
+where
+    H: Fn(&str) -> Option<String>,
+{
     let route = deployed
         .routes
         .values()
@@ -444,16 +510,16 @@ fn connect_authorization_refusal(
             "the connection request's route is authorized by an authorizer this api does \
              not hold"
         );
-        return Some(json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None));
+        return Some((UNPLACEABLE_STATUS, INTERNAL_MESSAGE));
     };
-    let query_parameters = query_parameters(req.uri());
+    let query_parameters = query_parameters(uri);
     let absent: Vec<&str> = authorizer
         .identity_source
         .iter()
         .filter(|identity_source| {
             !presents_identity_source(
                 identity_source,
-                |name: &str| req.headers().get(name).map(str::to_string),
+                &header,
                 &query_parameters,
                 &stage.stage_variables,
             )
@@ -471,11 +537,7 @@ fn connect_authorization_refusal(
         "refusing a WebSocket opening handshake: an identity source of the connection \
          request's authorizer is absent, so the authorizer is not invoked"
     );
-    Some(json_response(
-        UNAUTHORIZED_STATUS,
-        UNAUTHORIZED_MESSAGE,
-        None,
-    ))
+    Some((UNAUTHORIZED_STATUS, UNAUTHORIZED_MESSAGE))
 }
 
 /// Whether a comma-separated HTTP field value carries `token`, compared

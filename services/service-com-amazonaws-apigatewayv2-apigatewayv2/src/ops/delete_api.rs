@@ -173,6 +173,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // them.
         store.authorizer_cache.clear_api(&input.api_id);
         store.route_throttles.clear_api(&input.api_id);
+        // The api's SOCKET goes too: dropping the core's listener handle closes the port and
+        // severs every connection that was open on it, which is what makes a deleted api stop
+        // answering on the address it announced.
+        store.websocket_transport.forget_api(&input.api_id);
 
         Ok(DeleteApiOutput)
     }

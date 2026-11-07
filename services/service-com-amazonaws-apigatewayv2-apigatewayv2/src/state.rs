@@ -28,6 +28,7 @@ mod network;
 pub mod paging;
 pub mod route_throttle;
 pub mod selection_expression;
+pub mod websocket_transport;
 pub mod wire_status;
 
 /// The statuses a mutating operation of this service answers where that is not its
@@ -1014,6 +1015,11 @@ pub struct ComAmazonawsApigatewayv2Apigatewayv2State {
     /// (`ThrottlingRateLimit` / `ThrottlingBurstLimit`). Data-plane state, like
     /// [`Self::authorizer_cache`], so it lives beside the apis rather than inside one.
     pub route_throttles: route_throttle::RouteThrottles,
+    /// The SOCKET each WebSocket api is reached at and the connections open on it: the
+    /// transport its data plane runs over ([`websocket_transport::WebSocketTransport`]).
+    /// Data-plane state, like [`Self::authorizer_cache`], and held beside the apis under the
+    /// same lock so an api's records and the socket it announces cannot drift apart.
+    pub websocket_transport: websocket_transport::WebSocketTransport,
 }
 
 impl ComAmazonawsApigatewayv2Apigatewayv2State {

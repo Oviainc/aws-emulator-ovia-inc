@@ -20,7 +20,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the test requests are signed for. Deliberately NOT the emulator's
 /// `us-east-1` default, so an `ApiEndpoint` built from a hardcoded region fails.
-const REGION: &str = "eu-west-1";
+pub(crate) const REGION: &str = "eu-west-1";
 
 /// How many characters the id of a resource the ACCOUNT holds carries (and of the pages
 /// and mappings nested in one). `Id` is an unconstrained string in the model, so the
@@ -376,16 +376,15 @@ async fn create_api_persists_the_record_get_api_reports_back() {
         let api_id = as_str(&created, "apiId");
         assert_minted_id(case.label, "ApiId", &api_id);
 
-        // The host is the api's own, in the request's region; the scheme follows the
-        // api's protocol type (see `api_endpoint_scheme.rs` for the table over that).
-        assert_eq!(
-            as_str(&created, "apiEndpoint"),
-            format!(
-                "{}://{api_id}.execute-api.{REGION}.amazonaws.com",
-                crate::api_endpoint_scheme::expected_scheme(&as_str(&created, "protocolType"))
-            ),
-            "case {:?}: ApiEndpoint must be the api's own execute-api host in the request's region, got {created}",
-            case.label
+        // The endpoint is the address the api is reached at, with the scheme its protocol
+        // type names (see `api_endpoint_scheme.rs` for the table over that).
+        crate::api_endpoint_scheme::assert_announced_endpoint(
+            case.label,
+            "CreateApi",
+            &as_str(&created, "protocolType"),
+            &api_id,
+            REGION,
+            &as_str(&created, "apiEndpoint"),
         );
         assert_eq!(
             as_str(&created, "routeSelectionExpression"),

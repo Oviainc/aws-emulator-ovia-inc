@@ -120,14 +120,22 @@ async fn deploy_api(
     let (status, created) = call(emulator, "POST", "/v2/apis", Some(api)).await;
     assert_eq!(status, 201, "case {case:?}: CreateApi must answer 201, got {created}");
     let api_id = as_str(&created, "apiId");
-    let endpoint = as_str(&created, "apiEndpoint");
-    let endpoint_host = endpoint
-        .split_once("://")
-        .map_or(endpoint.as_str(), |(_scheme, host)| host)
-        .to_string();
-    assert!(
-        endpoint_host.starts_with(&format!("{api_id}.")),
-        "case {case:?}: the api must report its own endpoint host, got {endpoint:?}"
+    let announced = as_str(&created, "apiEndpoint");
+    crate::api_endpoint_scheme::assert_announced_endpoint(
+        case,
+        "CreateApi",
+        &protocol_type,
+        &api_id,
+        crate::api_lifecycle::REGION,
+        &announced,
+    );
+    // The host this suite addresses the handshake at is the api's own `execute-api` host —
+    // the one AWS publishes and this emulator's FRONT DOOR claims, which is what these cases
+    // are about. A WEBSOCKET api's own socket is announced instead (`announced` above) and is
+    // driven over a real connection in `websocket_transport_data_plane`.
+    let endpoint_host = format!(
+        "{api_id}.execute-api.{}.amazonaws.com",
+        crate::api_lifecycle::REGION
     );
 
     let (status, integration) = call(
@@ -351,13 +359,18 @@ async fn handshake(
     .await
 }
 
-/// The route key a row's route carries: a WebSocket api routes the handshake's own
-/// `$connect`, an HTTP api routes a method and a path.
+/// The route key a row's route carries: a WebSocket api's catch-all `$default` route, an
+/// HTTP api's method and path.
+///
+/// `$default` rather than `$connect`, because these cases are about how a handshake RESOLVES
+/// an api and a stage: a `$connect` route's integration serves the CONNECTION REQUEST, whose
+/// own answer is `websocket_connect_authorization`'s and
+/// `websocket_transport_data_plane`'s subject.
 fn route_key(protocol_type: &str) -> &'static str {
     if protocol_type == "HTTP" {
         "ANY /{proxy+}"
     } else {
-        "$connect"
+        "$default"
     }
 }
 
@@ -475,9 +488,10 @@ async fn a_deployed_websocket_stage_answers_the_handshake_from_its_own_records()
         );
         let reason = message(&answer);
         assert!(
-            reason.contains("WebSocket") && reason.contains("101"),
-            "case {:?}: the refusal must say the WebSocket transport is absent rather \
-             than read as a misconfigured stage, got {reason:?}",
+            reason.contains("WebSocket") && reason.contains("ApiEndpoint"),
+            "case {:?}: the refusal must say this endpoint carries no WebSocket transport \
+             and name the one the api announces, rather than read as a misconfigured \
+             stage, got {reason:?}",
             row.case
         );
     }

@@ -238,6 +238,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         let is_http = input.protocol_type == crate::state::HTTP_PROTOCOL_TYPE;
+        // A WEBSOCKET api is reached over a socket rather than by one request and one
+        // response, so it is given one of its own below and announces that socket's address.
+        let is_websocket = input.protocol_type == crate::state::WEBSOCKET_PROTOCOL_TYPE;
 
         // Each string member of the api this request describes falls in the length
         // window the shape it targets documents, and none of those shapes carries an
@@ -358,12 +361,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // served here", not a client error.
             return Err(crate::scaffolded::Scaffolded::not_implemented("CreateApi"));
         };
-        let mut store = state.lock();
+        // Minting the api's id is all the store is held for here, in a block of its own, so
+        // the guard is out of scope before the socket below is opened: opening one is the
+        // core's work and is awaited, and no state guard may be held across an await.
+        let api_id = {
+            let mut store = state.lock();
 
-        // Bound the growth a caller drives: AWS's published quota is 600 APIs per
-        // account per Region, and `TooManyRequestsException` is the modelled error for
-        // "a limit has been exceeded" (it carries the limit's name in `LimitType`).
+            // Bound the growth a caller drives: AWS's published quota is 600 APIs per
+            // account per Region, and `TooManyRequestsException` is the modelled error for
+            // "a limit has been exceeded" (it carries the limit's name in `LimitType`).
+            if store.apis.len() >= crate::state::MAX_APIS {
+                return Err(CreateApiErrorModeled::TooManyRequestsException(
+                    TooManyRequestsException {
+                        limit_type: Some("API".to_string()),
+                        message: Some(format!(
+                            "The maximum number of APIs ({}) for this account has been reached.",
+                            crate::state::MAX_APIS
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            store.mint_api_id()
+        };
+
+        // A WEBSOCKET api's data plane is a SOCKET rather than one request and one response,
+        // and the core owns it ([`crate::service::websocket::transport`]): it is opened for
+        // the id just minted, and the address it landed on is what this api announces as its
+        // `ApiEndpoint`, so the URI a caller hands a WebSocket client library is one that
+        // client can reach. A socket that could not be opened leaves the api UNCREATED rather
+        // than announcing an address nothing serves.
+        let announced_socket = if is_websocket {
+            match crate::service::websocket::transport::open_for_api(&*self.engine, &api_id).await
+            {
+                Ok(authority) => Some(authority),
+                Err(reason) => {
+                    state.lock().websocket_transport.forget_api(&api_id);
+                    return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                        crate::scaffolded::NotImplemented {
+                            message: format!(
+                                "this emulator could not open the socket a WEBSOCKET api's \
+                                 data plane is served on, so no api was created: {reason}"
+                            ),
+                        },
+                    ));
+                }
+            }
+        } else {
+            ::std::option::Option::None
+        };
+
+        let mut store = state.lock();
+        // The quota is weighed AGAIN under this lock, because the one above was released
+        // while the socket was opened: two creates in flight at once must not both pass a
+        // check made before either inserted, or the account would come to hold more apis
+        // than the limit the modelled refusal names. The socket this request opened is
+        // forgotten with the refusal, so nothing stays listening for an api that was not
+        // created.
         if store.apis.len() >= crate::state::MAX_APIS {
+            store.websocket_transport.forget_api(&api_id);
             return Err(CreateApiErrorModeled::TooManyRequestsException(
                 TooManyRequestsException {
                     limit_type: Some("API".to_string()),
@@ -375,18 +432,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-
-        let api_id = store.mint_api_id();
-
         let region = crate::state::request_region(ctx.parts());
+        let api_endpoint = match announced_socket.as_deref() {
+            Some(authority) => crate::state::websocket_transport::announced_endpoint(authority),
+            None => {
+                crate::state::execute_api_endpoint(&api_id, &region, &input.protocol_type)
+            }
+        };
         let record = crate::state::Api {
             // The endpoint's scheme follows the api's protocol type, so the value a
             // caller hands to a client library names the protocol that api speaks.
-            api_endpoint: crate::state::execute_api_endpoint(
-                &api_id,
-                &region,
-                &input.protocol_type,
-            ),
+            api_endpoint,
             api_id: api_id.clone(),
             name: input.name,
             protocol_type: input.protocol_type,
@@ -426,7 +482,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `api_id` comes from the store's own id bijection, so it names no existing
         // api and this inserts. Taking the entry back gives the STORED record, so what
         // the caller is told is what a later GetApi will report.
-        let stored = store.apis.entry(api_id).or_insert(record);
+        let stored = store.apis.entry(api_id.clone()).or_insert(record);
 
         // Quick create: "Quick create produces an API with an integration, a default
         // catch-all route, and a default stage which is configured to automatically

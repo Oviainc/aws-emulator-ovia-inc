@@ -225,6 +225,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // deleted.
             return Err(PostToConnectionErrorModeled::GoneException(GoneException {}).into());
         };
+        // DELIVER it first, where the connection is carried on a live socket: a post is
+        // "sends the provided data to the specified connection", so what the client reads is
+        // the point and the record below is the account of it. Two refusals come out of the
+        // attempt, and both are modelled:
+        //
+        // * the task serving the socket is gone, so the connection no longer exists:
+        //   `GoneException` ("The connection with the provided id no longer exists"), and the
+        //   record goes with it so every later call agrees;
+        // * the client is not reading and the connection's queue is full:
+        //   `LimitExceededException` ("the WebSocket client side buffer is full", the
+        //   member's own documentation), and nothing is recorded as delivered.
+        //
+        // A connection carried on NO socket (the emulator-internal registration seam) is
+        // recorded and nothing is written, which is what that seam exists for.
+        match connection.deliver(input.data.clone()) {
+            Ok(()) => {}
+            Err(crate::state::DeliveryRefused::Closed) => {
+                guard.connections.remove(&input.connection_id);
+                return Err(PostToConnectionErrorModeled::GoneException(GoneException {}).into());
+            }
+            Err(crate::state::DeliveryRefused::Backlogged) => {
+                tracing::info!(
+                    connection_id = %input.connection_id,
+                    "refusing a PostToConnection: the connection's client side buffer is full"
+                );
+                return Err(PostToConnectionErrorModeled::LimitExceededException(
+                    LimitExceededException {},
+                )
+                .into());
+            }
+        }
         // Counts the delivery and keeps it in the connection's BOUNDED observation
         // window; see `crate::state::Connection::push_delivered` for why the retained
         // payloads are capped rather than accumulated.

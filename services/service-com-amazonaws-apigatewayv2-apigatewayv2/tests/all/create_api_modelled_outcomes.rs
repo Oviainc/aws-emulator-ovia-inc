@@ -312,9 +312,16 @@ async fn create_api_answers_only_a_status_its_model_declares() {
                 // the record's own instant.
                 let api_id = as_str(&body, "apiId");
                 assert_minted_id(case, "ApiId", &api_id);
-                assert!(
-                    as_str(&body, "apiEndpoint").contains(&api_id),
-                    "case {case:?}: ApiEndpoint must be this api's own host, got {body}"
+                // The endpoint is the address this api is reached at: its own
+                // `execute-api` host for an HTTP api, and for a WEBSOCKET api the socket
+                // the core opened for it (`api_endpoint_scheme` holds the whole rule).
+                crate::api_endpoint_scheme::assert_announced_endpoint(
+                    case,
+                    "CreateApi",
+                    &as_str(&body, "protocolType"),
+                    &api_id,
+                    crate::api_lifecycle::REGION,
+                    &as_str(&body, "apiEndpoint"),
                 );
                 assert!(
                     !as_str(&body, "name").is_empty(),

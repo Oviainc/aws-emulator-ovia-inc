@@ -51,9 +51,13 @@
 //! Two modules own that half, one per `ProtocolType`, over the readings they share
 //! ([`data_plane`]):
 //!
-//! - [`websocket`] — the RFC 6455 opening handshake a WEBSOCKET api's stage is reached
-//!   with: which handshakes this service claims ([`websocket::claims_parts`]) and what each
-//!   is answered with ([`websocket::serve`], reached from [`Service::override_routing_error`]);
+//! - [`websocket`] — a WEBSOCKET api, whose data plane is a SOCKET: the core opens one per
+//!   api ([`websocket::transport`], reached from the operation that mints the api), that
+//!   socket completes the RFC 6455 handshake and carries the frames each route serves
+//!   ([`websocket::dispatch`]), and the address it landed on is what the api announces as its
+//!   `ApiEndpoint`. The same handshake arriving at this emulator's own SERVICE endpoint is
+//!   claimed ([`websocket::claims_parts`]) and answered from the api's records there too
+//!   ([`websocket::serve`], reached from [`Service::override_routing_error`]);
 //! - [`invoke`] — an ordinary HTTP request to a route of a deployed HTTP api stage: the
 //!   claim ([`invoke::claims_parts`]), and the serving ([`invoke::serve`]) as an OPERATION
 //!   of this service's own ([`Service::override_operation`]), which is how the router hands
@@ -121,7 +125,10 @@ mod data_plane;
 mod invoke;
 mod jwt;
 mod portal;
-mod websocket;
+// `pub` for the data plane's own half: `websocket::transport::open_for_api` is called by the
+// operation that mints a WebSocket api, which is what opens that api's socket and gives its
+// `ApiEndpoint` the address to announce.
+pub mod websocket;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::Schema;

@@ -100,6 +100,30 @@ const MAX_RENDERED_BYTES: usize = 8 * crate::ops::put_integration::MAX_TEMPLATE_
 const MAX_RENDER_WORK: usize = 4 * 1024 * 1024;
 
 
+/// `template` rendered against `inputs`, refusing outright a template that carries a
+/// DIRECTIVE — the half of the language that is statements rather than values (see the
+/// module docs).
+///
+/// The ONE entry point for a caller that renders a mapping template and reports both
+/// refusals the same way. The REST data plane in this crate checks the two halves
+/// separately, because it words them differently per integration type; another plane that
+/// renders the same language — the WEBSOCKET data plane of API Gateway v2, whose `MOCK`
+/// integration's request and response templates are the same `TemplateMap` values — wants
+/// the whole rule in one call, and gets it here rather than keeping a second renderer.
+pub fn rendered_without_directives(
+    template: &str,
+    inputs: &TemplateInputs,
+) -> Result<String, Unrendered> {
+    if super::invoke::carries_velocity_directive(template) {
+        return Err(Unrendered {
+            reason: "it carries a Velocity directive, which is a statement this emulator \
+                     does not execute"
+                .to_string(),
+        });
+    }
+    rendered(template, inputs)
+}
+
 /// `template` rendered against `inputs`, or the first reason this emulator does not render
 /// it.
 ///

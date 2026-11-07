@@ -496,11 +496,21 @@ async fn a_stack_creates_the_api_gateway_v2_resources_it_declares() {
                 "case {case:?}: expected the ApiEndpoint output to be the endpoint API \
                  Gateway reports, got {outputs:?}"
             );
+            // The endpoint names the API GATEWAY address the api is reached at: an HTTP
+            // api's own `execute-api` host, and for a WEBSOCKET api the socket that api's
+            // data plane is served on, which carries the core's assigned port rather than
+            // the api id (the apigatewayv2 crate's `api_endpoint_scheme` suite owns that
+            // whole rule).
             assert!(
-                endpoint.starts_with(&format!("{}://{api_id}.", expected_scheme(protocol_type))),
-                "case {case:?}: expected a {protocol_type} endpoint naming the api, got \
-                 {endpoint:?}"
+                endpoint.starts_with(&format!("{}://", expected_scheme(protocol_type))),
+                "case {case:?}: expected a {protocol_type} endpoint, got {endpoint:?}"
             );
+            if protocol_type == "HTTP" {
+                assert!(
+                    endpoint.starts_with(&format!("https://{api_id}.")),
+                    "case {case:?}: expected an HTTP endpoint naming the api, got {endpoint:?}"
+                );
+            }
 
             // Each mapping the template declared, read back by the id the stack published
             // — the id a client calls `GetApiMapping` with.

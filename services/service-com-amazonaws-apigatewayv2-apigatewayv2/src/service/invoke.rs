@@ -138,7 +138,10 @@
 
 mod dispatch;
 mod lambda;
-mod proxy_event;
+// `pub(crate)` for the ONE id minting the WebSocket data plane shares with this one
+// (`proxy_event::mint_request_id`): the gateway mints a `requestId` per call on either
+// protocol, so both planes mint it the same way rather than each writing its own.
+pub(crate) mod proxy_event;
 mod proxy_response;
 mod request_authorizer;
 
@@ -454,7 +457,12 @@ fn servable(api: Option<&Api>) -> Option<&Api> {
 /// by the api id (`/_aws/execute-api/{api-id}/…`), and the endpoint HOST itself
 /// (`/_aws/{api-id}.execute-api.{region}.amazonaws.com/…`) — because what a rewriter has
 /// to carry across is the host, and those are the two ways to write it.
-fn local_endpoint_path(path: &str) -> Option<(&str, &str)> {
+///
+/// `pub(super)` because BOTH data planes are addressed this way: a client that rewrote a
+/// WebSocket api's endpoint into the emulator's carries the api id in the path exactly like
+/// this, so [`super::websocket`] reads the marker through this one function rather than
+/// writing a second reading of it.
+pub(super) fn local_endpoint_path(path: &str) -> Option<(&str, &str)> {
     let (marker, rest) = split_first_segment(path)?;
     if marker != LOCAL_ENDPOINT_PREFIX {
         return None;

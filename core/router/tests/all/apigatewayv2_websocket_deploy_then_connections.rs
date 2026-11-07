@@ -230,7 +230,11 @@ fn a_websocket_api_deploys_and_its_connections_endpoint_serves_the_registry() {
         .name("apigatewayv2-websocket-deploy".to_string())
         .stack_size(BOOT_STACK_SIZE)
         .spawn(|| {
+            // `enable_io`: a WEBSOCKET api's data plane is a SOCKET the core opens when the
+            // api is created, so the runtime this check creates one on has to be able to
+            // bind one.
             let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
                 .build()
                 .expect("build a current-thread runtime");
             runtime.block_on(async {
@@ -254,14 +258,25 @@ fn a_websocket_api_deploys_and_its_connections_endpoint_serves_the_registry() {
                     let api_id = as_str(row.case, "CreateApi", &created, "apiId");
                     // Every row is a WEBSOCKET api, so its `ApiEndpoint` is the URI a
                     // WebSocket client library opens: the RFC 6455 scheme `wss` on the
-                    // api's own execute-api host. The `@connections` management
-                    // endpoint below is a separate, HTTPS control surface.
-                    assert_eq!(
-                        created.get("apiEndpoint").and_then(Value::as_str),
-                        Some(
-                            format!("wss://{api_id}.execute-api.{REGION}.amazonaws.com").as_str()
-                        ),
-                        "case {:?}: the api must report its own execute-api endpoint, got {created}",
+                    // address that api's own data-plane socket is served at, which is the
+                    // one a client on this machine can complete a handshake against (the
+                    // apigatewayv2 crate's `api_endpoint_scheme` and
+                    // `websocket_transport_data_plane` suites own that rule). The
+                    // `@connections` management endpoint below is a separate, HTTPS control
+                    // surface.
+                    let announced = created
+                        .get("apiEndpoint")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    assert!(
+                        announced.starts_with("wss://"),
+                        "case {:?}: the api must report a wss:// endpoint, got {created}",
+                        row.case
+                    );
+                    assert!(
+                        !announced.contains("amazonaws.com"),
+                        "case {:?}: the announced endpoint must be the socket the api is \
+                         reached at, not a host nothing here serves, got {created}",
                         row.case
                     );
 
@@ -561,7 +576,10 @@ fn the_two_execute_api_services_route_apart_under_one_signing_name() {
         .name("execute-api-routing".to_string())
         .stack_size(BOOT_STACK_SIZE)
         .spawn(|| {
+            // `enable_io` for the same reason as the check above: creating a WEBSOCKET api
+            // opens that api's own socket.
             let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
                 .build()
                 .expect("build a current-thread runtime");
             runtime.block_on(async {

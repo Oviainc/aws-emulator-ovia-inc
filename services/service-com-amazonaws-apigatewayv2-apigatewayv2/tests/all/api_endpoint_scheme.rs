@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP tests for the scheme of an api's default `ApiEndpoint`.
+//! End-to-end HTTP tests for an api's default `ApiEndpoint`.
 //!
 //! The rule: an api's `ApiEndpoint` is the URI a caller hands to a client library to
 //! reach that api, so its scheme names the protocol the api speaks — `wss` for a
-//! WebSocket API (the RFC 6455 handshake scheme), `https` for an HTTP API — on the
-//! `{api-id}.execute-api.{region}.amazonaws.com` host
-//! (`CreateApiResponse$ApiEndpoint`), whichever operation reports the api.
+//! WebSocket API (the RFC 6455 handshake scheme), `https` for an HTTP API
+//! (`CreateApiResponse$ApiEndpoint`) — and its AUTHORITY is the address that api is
+//! REACHED at: an HTTP api's own `{api-id}.execute-api.{region}.amazonaws.com` host, which
+//! this emulator's front door claims and serves, and for a WEBSOCKET api the `host:port` of
+//! the socket the core opened for that api's data plane, which is the one address a
+//! WebSocket client on this machine can complete a handshake against. Whichever operation
+//! reports the api reports the same value.
 //!
 //! The table spans the whole `ProtocolType` enum (`HTTP | WEBSOCKET`, from
 //! `smithy_query(query="shape", shape="ProtocolType")`) crossed with the regions a
 //! request can be signed for, and every row is read back through CreateApi, GetApi
-//! AND GetApis, so the scheme is asserted on each reporter rather than only on the
+//! AND GetApis, so the value is asserted on each reporter rather than only on the
 //! one the recorded case used.
 
 use serde_json::{json, Value};
@@ -38,6 +42,66 @@ struct EndpointCase {
     protocol_type: &'static str,
     region: &'static str,
     extra: Value,
+}
+
+/// Assert `announced` is the endpoint an api of `protocol_type` is reached at; see the
+/// module docs for the rule.
+///
+/// `reporter` names the operation that reported it, so a row that disagrees says WHICH
+/// reader disagreed.
+pub(crate) fn assert_announced_endpoint(
+    case: &str,
+    reporter: &str,
+    protocol_type: &str,
+    api_id: &str,
+    region: &str,
+    announced: &str,
+) {
+    let scheme = expected_scheme(protocol_type);
+    let Some(authority) = announced.strip_prefix(&format!("{scheme}://")) else {
+        panic!(
+            "case {case:?}: {reporter} must report a {scheme}:// endpoint, got {announced:?}"
+        );
+    };
+    if protocol_type == "HTTP" {
+        assert_eq!(
+            authority,
+            format!("{api_id}.execute-api.{region}.amazonaws.com"),
+            "case {case:?}: {reporter} must report the api's own execute-api host, got \
+             {announced:?}"
+        );
+        return;
+    }
+    // A WEBSOCKET api announces the socket the core opened for it: a `host:port` on the
+    // interface the emulator is reached on — loopback unless the operator bound another —
+    // with the port the core assigned, which is the one address a WebSocket client on this
+    // machine can complete a handshake against.
+    let (host, port) = authority
+        .rsplit_once(':')
+        .unwrap_or_else(|| panic!("case {case:?}: {reporter} must report a host:port the \
+                                  client dials, got {announced:?}"));
+    let address: std::net::IpAddr = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .unwrap_or_else(|_| {
+            panic!(
+                "case {case:?}: {reporter} must report the address the socket is bound to, \
+                 got {announced:?}"
+            )
+        });
+    assert!(
+        address.is_loopback(),
+        "case {case:?}: {reporter} must report the interface the core binds, got {announced:?}"
+    );
+    let port: u16 = port
+        .parse()
+        .unwrap_or_else(|_| panic!("case {case:?}: {reporter} must report a port, got {announced:?}"));
+    assert!(
+        port > 0,
+        "case {case:?}: {reporter} must report the port the socket landed on, got \
+         {announced:?}"
+    );
 }
 
 fn endpoint_cases() -> Vec<EndpointCase> {
@@ -115,17 +179,14 @@ async fn api_endpoint_scheme_follows_the_protocol_type_on_every_reporter() {
         );
 
         let api_id = as_str(&created, "apiId");
-        let expected = format!(
-            "{}://{api_id}.execute-api.{}.amazonaws.com",
-            expected_scheme(case.protocol_type),
-            case.region
-        );
-
-        assert_eq!(
-            as_str(&created, "apiEndpoint"),
-            expected,
-            "case {:?}: CreateApi reported the wrong ApiEndpoint, got {created}",
-            case.label
+        let announced = as_str(&created, "apiEndpoint");
+        assert_announced_endpoint(
+            case.label,
+            "CreateApi",
+            case.protocol_type,
+            &api_id,
+            case.region,
+            &announced,
         );
 
         let (status, fetched) =
@@ -138,7 +199,7 @@ async fn api_endpoint_scheme_follows_the_protocol_type_on_every_reporter() {
         );
         assert_eq!(
             as_str(&fetched, "apiEndpoint"),
-            expected,
+            announced,
             "case {:?}: GetApi reported the wrong ApiEndpoint, got {fetched}",
             case.label
         );
@@ -159,16 +220,16 @@ async fn api_endpoint_scheme_follows_the_protocol_type_on_every_reporter() {
             .collect();
         assert_eq!(
             endpoints,
-            vec![expected.clone()],
+            vec![announced.clone()],
             "case {:?}: GetApis listed the wrong ApiEndpoint, got {listed}",
             case.label
         );
     }
 }
 
-/// Two apis that differ ONLY in `ProtocolType` differ in their endpoint scheme and in
-/// nothing else about the endpoint: the host is each api's own, so the scheme is not a
-/// property of the store or of the region but of the api.
+/// Two apis that differ ONLY in `ProtocolType` differ in their endpoint: each is reported
+/// at the address that api is reached at, so the endpoint is not a property of the store or
+/// of the region but of the api.
 #[tokio::test]
 async fn the_scheme_is_the_only_difference_between_the_two_protocol_types() {
     let emulator = emulator();
@@ -199,13 +260,13 @@ async fn the_scheme_is_the_only_difference_between_the_two_protocol_types() {
         );
         let api_id = as_str(&created, "apiId");
         let endpoint = as_str(&created, "apiEndpoint");
-        assert_eq!(
-            endpoint,
-            format!(
-                "{}://{api_id}.execute-api.{region}.amazonaws.com",
-                expected_scheme(protocol_type)
-            ),
-            "case {protocol_type:?}: wrong ApiEndpoint, got {created}"
+        assert_announced_endpoint(
+            protocol_type,
+            "CreateApi",
+            protocol_type,
+            &api_id,
+            region,
+            &endpoint,
         );
         endpoints.push(endpoint);
     }

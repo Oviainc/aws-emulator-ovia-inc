@@ -171,18 +171,20 @@ async fn the_sequence_that_makes_an_api_servable_completes_and_reads_back() {
         let case = row.case;
         let emulator = emulator();
 
-        // The api. Its `ApiEndpoint` is the address a client calls, so it has to name
-        // this api: "{api-id}.execute-api.{region}.amazonaws.com" (the region and scheme
-        // themselves are `api_endpoint_scheme`'s rule).
+        // The api. Its `ApiEndpoint` is the address a client calls, so it has to be the
+        // address this api is reached at (`api_endpoint_scheme` holds that whole rule: an
+        // HTTP api's own `execute-api` host, a WEBSOCKET api's own socket).
         let (status, api) = call(&emulator, "POST", "/v2/apis", Some(row.api.clone())).await;
         modelled_success(case, "CreateApi", 201, status, &api);
         let api_id = as_str(&api, "apiId");
         assert_minted_id(case, "ApiId", &api_id);
-        let endpoint = as_str(&api, "apiEndpoint");
-        assert!(
-            endpoint.contains(&format!("{api_id}.execute-api."))
-                && endpoint.ends_with(".amazonaws.com"),
-            "case {case:?}: ApiEndpoint must name this api, got {endpoint:?}"
+        crate::api_endpoint_scheme::assert_announced_endpoint(
+            case,
+            "CreateApi",
+            &as_str(&api, "protocolType"),
+            &api_id,
+            crate::api_lifecycle::REGION,
+            &as_str(&api, "apiEndpoint"),
         );
 
         // The integration the route will front.

@@ -19,7 +19,7 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -40,12 +40,39 @@ aws-sdk-lambda = { version = "1", default-features = false }
 # Base64, for the one encoding an HTTP api's proxy event states a payload in when it is not
 # text (`isBase64Encoded`), in both directions.
 base64 = "0.22"
+# The RFC 6455 WebSocket protocol, server side: a WEBSOCKET api's data plane completes the
+# opening handshake and frames every message with this maintained implementation over the
+# core-owned socket (`src/service/websocket/transport.rs`) rather than with anything
+# hand-written. `handshake` only — this crate serves the SERVER half and opens no connection
+# of its own, and the core owns TLS.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# The `Stream`/`Sink` halves of that socket, so a frame arriving and a frame pushed to the
+# connection are awaited together.
+futures-util = { version = "0.3", default-features = false }
+# Matches an `IntegrationResponseKey` written as a regular expression (`/2\d\d/`), which is
+# how a WebSocket integration's responses are selected by the status a call produced.
+regex = "1"
+# The ONE renderer of an API Gateway mapping template ("a map of Velocity templates",
+# `Integration$RequestTemplates`): a WEBSOCKET api's MOCK integration carries the same
+# `TemplateMap` values the REST data plane renders, so this crate drives that renderer
+# rather than keeping a second copy of the language's rules
+# (`service::mapping_template::rendered_without_directives`).
+service-com-amazonaws-apigateway-backplanecontrolservice = { workspace = true }
+# The WebSocket CONNECTION REGISTRY the `@connections` management API serves: a connection
+# this api's socket carries is registered there with the channel that makes a
+# `PostToConnection` a real delivery, which is the seam that crate's state documents for the
+# data plane of the api that owns the connection.
+service-com-amazonaws-apigatewaymanagementapi-apigatewaymanagementapi = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# The client half of the test harness's WebSocket conversation: a case dials the api's
+# announced socket over TCP (`tokio/net`) and waits a bounded time for a frame
+# (`tokio/time`).
+tokio = { workspace = true, features = ["net", "time"] }
 # The EC2 service, mounted beside this one in the test harness: that a VPC link can only
 # be created in subnets of one VPC the account really has is driven end to end with the
 # owner of subnets on the same engine. DEV-ONLY: this crate depends on no other service's

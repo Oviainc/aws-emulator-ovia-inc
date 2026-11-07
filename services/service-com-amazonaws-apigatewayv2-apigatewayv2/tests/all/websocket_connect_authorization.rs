@@ -25,10 +25,12 @@
 //! function."
 //! (`smithy_query(query="doc",shape="CreateAuthorizerRequest",member="IdentitySource")`).
 //!
-//! What a handshake whose identity sources ARE satisfied gets is the `501` the sibling
-//! suite `websocket_handshake_data_plane` owns: the authorizer's own ALLOW/DENY is the
-//! answer of the Lambda its `AuthorizerUri` names, which no deployment package runs here,
-//! and this emulator's front door carries no socket to switch to in any case. So a `501`
+//! What a handshake whose identity sources ARE satisfied gets is the answer the CONNECTION
+//! REQUEST's own integration gives: the authorizer's own ALLOW/DENY is the answer of the
+//! Lambda its `AuthorizerUri` names, which no deployment package runs here, and the `MOCK`
+//! integration these rows' `$connect` route fronts reaches no backend, so it gives the
+//! connection request no decision and the gateway answers `500`
+//! (`websocket_transport_data_plane` owns that rule, over the api's own socket). So a `500`
 //! in these rows means "the authorization step let this handshake through", and is
 //! asserted for exactly that.
 //!
@@ -51,9 +53,13 @@ const UNAUTHORIZED: u16 = 401;
 const UNAUTHORIZED_MESSAGE: &str = "Unauthorized";
 
 /// The status a handshake the authorization step LET THROUGH is answered with, and the
-/// error code it carries: this emulator has no WebSocket transport (see the module docs).
-const NOT_IMPLEMENTED: u16 = 501;
-const NOT_IMPLEMENTED_CODE: &str = "NotImplemented";
+/// sentence it carries: past the authorization the connection request is served by the
+/// `$connect` route's own INTEGRATION, and a `MOCK` integration — the one these rows' route
+/// fronts — reaches no backend, so it gives the connection request no decision and the
+/// gateway answers `500`. What these rows assert is that the answer is NOT the `401` the
+/// authorization step itself refuses with.
+const LET_THROUGH: u16 = 500;
+const LET_THROUGH_MESSAGE: &str = "Internal server error";
 
 /// The status a successful upgrade would carry. Asserted ABSENT everywhere: a refusal
 /// before the integration is what AWS answers the handshake itself with.
@@ -117,11 +123,13 @@ async fn deploy(
     .await;
     assert_eq!(status, 201, "case {case:?}: CreateApi must answer 201, got {created}");
     let api_id = as_str(&created, "apiId");
-    let endpoint = as_str(&created, "apiEndpoint");
-    let endpoint_host = endpoint
-        .split_once("://")
-        .map_or(endpoint.as_str(), |(_scheme, host)| host)
-        .to_string();
+    // These cases drive the handshake at the api's own `execute-api` host, which this
+    // emulator's FRONT DOOR claims; the api's own socket is announced in its `ApiEndpoint`
+    // and is driven over a real connection in `websocket_transport_data_plane`.
+    let endpoint_host = format!(
+        "{api_id}.execute-api.{}.amazonaws.com",
+        crate::api_lifecycle::REGION
+    );
 
     let (status, authorizer_body) = call(
         emulator,
@@ -303,7 +311,7 @@ const ROWS: &[Row] = &[
         stage_variables: &[],
         query: "token=t0ken",
         headers: &[],
-        expected: NOT_IMPLEMENTED,
+        expected: LET_THROUGH,
     },
     Row {
         case: "the same authorizer, a handshake carrying no query string at all",
@@ -337,7 +345,7 @@ const ROWS: &[Row] = &[
         stage_variables: &[],
         query: "",
         headers: &[("auth", "t0ken")],
-        expected: NOT_IMPLEMENTED,
+        expected: LET_THROUGH,
     },
     Row {
         case: "a header identity source the handshake does not carry",
@@ -364,7 +372,7 @@ const ROWS: &[Row] = &[
         stage_variables: &[],
         query: "token=t0ken&other=x",
         headers: &[("auth", "t0ken")],
-        expected: NOT_IMPLEMENTED,
+        expected: LET_THROUGH,
     },
     Row {
         case: "two identity sources, only one presented: ALL of them must be",
@@ -384,7 +392,7 @@ const ROWS: &[Row] = &[
         stage_variables: &[],
         query: "",
         headers: &[],
-        expected: NOT_IMPLEMENTED,
+        expected: LET_THROUGH,
     },
     Row {
         case: "a stage variable the stage holds",
@@ -392,7 +400,7 @@ const ROWS: &[Row] = &[
         stage_variables: &[("tenant", "acme")],
         query: "",
         headers: &[],
-        expected: NOT_IMPLEMENTED,
+        expected: LET_THROUGH,
     },
     Row {
         case: "a stage variable the stage does not hold",
@@ -408,7 +416,7 @@ const ROWS: &[Row] = &[
         stage_variables: &[],
         query: "token=t0ken",
         headers: &[("auth", "t0ken")],
-        expected: NOT_IMPLEMENTED,
+        expected: LET_THROUGH,
     },
     Row {
         case: "the $-prefixed spelling of a header the handshake does not carry",
@@ -425,7 +433,7 @@ const ROWS: &[Row] = &[
         stage_variables: &[],
         query: "my%20token=t0ken",
         headers: &[],
-        expected: NOT_IMPLEMENTED,
+        expected: LET_THROUGH,
     },
     Row {
         case: "a context parameter, which the service computes for every call and no \
@@ -434,7 +442,7 @@ const ROWS: &[Row] = &[
         stage_variables: &[],
         query: "",
         headers: &[],
-        expected: NOT_IMPLEMENTED,
+        expected: LET_THROUGH,
     },
     Row {
         case: "an expression naming a request part this data plane cannot read, which is \
@@ -480,19 +488,18 @@ async fn an_absent_identity_source_refuses_the_connection_request_before_its_rou
                 answer.summary()
             );
             assert_ne!(
-                answer.error_type.as_deref(),
-                Some(NOT_IMPLEMENTED_CODE),
-                "case {:?}: the authorizer was never invoked, so this is not a capability \
-                 refusal, got {}",
+                answer.status, LET_THROUGH,
+                "case {:?}: the authorizer was never invoked, so the connection request's \
+                 own integration was never reached, got {}",
                 row.case,
                 answer.summary()
             );
         } else {
             assert_eq!(
-                answer.error_type.as_deref(),
-                Some(NOT_IMPLEMENTED_CODE),
-                "case {:?}: a handshake the authorization step let through meets the \
-                 absent transport, got {}",
+                message(&answer),
+                LET_THROUGH_MESSAGE,
+                "case {:?}: a handshake the authorization step let through is answered by \
+                 the connection request's integration, got {}",
                 row.case,
                 answer.summary()
             );
@@ -530,8 +537,8 @@ async fn a_route_whose_authorization_is_not_an_authorizers_is_not_refused_by_thi
         let answer = handshake(&emulator, &deployed, "", &[]).await;
         assert_not_upgraded(case, &answer);
         assert_eq!(
-            answer.status, NOT_IMPLEMENTED,
-            "case {case:?}: expected {NOT_IMPLEMENTED} for an AuthorizationType of \
+            answer.status, LET_THROUGH,
+            "case {case:?}: expected {LET_THROUGH} for an AuthorizationType of \
              {authorization_type}, got {}",
             answer.summary()
         );

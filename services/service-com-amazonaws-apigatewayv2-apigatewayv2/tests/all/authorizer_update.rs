@@ -827,11 +827,12 @@ async fn the_connect_authorization_step_reads_the_patched_identity_sources() {
     // fronts, from the authorizer's CURRENT record: "verifying all of the
     // identity-related request parameters are present in the request, not null, and
     // non-empty … Otherwise, it returns a 401 Unauthorized response without calling the
-    // Lambda function" (`CreateAuthorizerRequest$IdentitySource`). A handshake the step
-    // lets through meets the transport this emulator does not have, which is the 501 the
-    // `websocket_handshake_data_plane` suite owns — so here a 501 means "let through".
+    // Lambda function" (`CreateAuthorizerRequest$IdentitySource`). A handshake the step lets
+    // through is then answered by the CONNECTION REQUEST's own integration, and the `MOCK`
+    // integration this route fronts reaches no backend, so the gateway answers 500
+    // (`websocket_transport_data_plane` owns that rule) — so here a 500 means "let through".
     const UNAUTHORIZED: u16 = 401;
-    const LET_THROUGH: u16 = 501;
+    const LET_THROUGH: u16 = 500;
     let case = "the data plane reads the patched record";
     let emulator = emulator();
 
