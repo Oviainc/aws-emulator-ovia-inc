@@ -22,8 +22,9 @@
 //! performed under, the action and resource patterns a statement names (exact, prefix
 //! wildcard, whole wildcard, another instance), the effect and the order the statements are
 //! written in, the condition keys a push publishes (the instance's tags under both spellings
-//! AWS gives them, and the OS user the key is pushed for), a policy put and then deleted, and
-//! the two principals the decision cannot refuse.
+//! AWS gives them, and the OS user the key is pushed for), the instance's tags being CHANGED
+//! under an unchanged policy, a policy put and then deleted, and the two principals the
+//! decision cannot refuse.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -81,6 +82,15 @@ const ABSENT_INSTANCE_ID: &str = "i-0fedcba9876543210";
 /// decided against.
 const TAG_KEY: &str = "Environment";
 const TAG_VALUE: &str = "staging";
+
+/// The tag key the retag table fences a push on — a key no other table here names, so the two
+/// cannot decide each other's rows.
+const TEAM_TAG_KEY: &str = "Team";
+
+/// The tag value the retag table's clause names, and the two values it does not compare equal
+/// to: the push is allowed exactly while the instance carries the first.
+const WANTED_TEAM: &str = "platform";
+const OTHER_TEAMS: [&str; 2] = ["network", "storage"];
 
 /// One emulator: a shared engine carrying EC2 Instance Connect, the IAM service the users and
 /// their policies are made with, and the STS service a credential is resolved through — the
@@ -289,6 +299,86 @@ impl Emulator {
                 .with_tags([(TAG_KEY, TAG_VALUE)]),
         );
         guard.serial_console_access_enabled = true;
+    }
+
+    /// Launch one instance EC2 really holds and answer its id: the published Amazon Linux 2
+    /// AMI resolved the documented way (`DescribeImages` over the Amazon-owned catalog), one
+    /// `RunInstances` of it carrying `tags` as the launch's instance tag specification, and
+    /// the wait for the `running` state EC2 owes a launched instance — so a push at that id is
+    /// decided about an instance, and about tags, EC2 itself reports.
+    ///
+    /// Only on an emulator with EC2 mounted ([`Emulator::with_ec2`]).
+    async fn launch_running_instance(&self, case: &str, tags: &[(&str, &str)]) -> String {
+        let images = self
+            .ec2(
+                case,
+                "DescribeImages",
+                &[
+                    ("Owner.1", "amazon"),
+                    ("Filter.1.Name", "name"),
+                    ("Filter.1.Value.1", AL2_NAME_PATTERN),
+                    ("Filter.2.Name", "state"),
+                    ("Filter.2.Value.1", "available"),
+                ],
+            )
+            .await;
+        let image_id = xml_element(&images, "imageId").unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: the published catalog must report an available Amazon Linux 2 \
+                 AMI for {AL2_NAME_PATTERN}, got {images}"
+            )
+        });
+        let mut params = vec![
+            ("ImageId".to_string(), image_id),
+            ("InstanceType".to_string(), "m5.large".to_string()),
+            ("MinCount".to_string(), "1".to_string()),
+            ("MaxCount".to_string(), "1".to_string()),
+        ];
+        if !tags.is_empty() {
+            params.push((
+                "TagSpecification.1.ResourceType".to_string(),
+                "instance".to_string(),
+            ));
+            for (position, (key, value)) in tags.iter().enumerate() {
+                let nth = position + 1;
+                params.push((
+                    format!("TagSpecification.1.Tag.{nth}.Key"),
+                    (*key).to_string(),
+                ));
+                params.push((
+                    format!("TagSpecification.1.Tag.{nth}.Value"),
+                    (*value).to_string(),
+                ));
+            }
+        }
+        let named: Vec<(&str, &str)> = params
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let run = self.ec2(case, "RunInstances", &named).await;
+        let instance_id = xml_element(&run, "instanceId")
+            .unwrap_or_else(|| panic!("case {case:?}: RunInstances must mint an instance: {run}"));
+
+        // EC2 reports a launched instance `pending` and owes it `running` one transition span
+        // later; a push is refused for the state until then, which is not what these rules are
+        // about.
+        tokio::time::sleep(ec2::state::TRANSITION_DELAY + Duration::from_millis(400)).await;
+        instance_id
+    }
+
+    /// Set one tag of an instance EC2 holds, through EC2's own `CreateTags` — the call a client
+    /// tags, and retags, a resource with.
+    async fn tag_instance(&self, case: &str, instance_id: &str, key: &str, value: &str) {
+        self.ec2(
+            case,
+            "CreateTags",
+            &[
+                ("ResourceId.1", instance_id),
+                ("Tag.1.Key", key),
+                ("Tag.1.Value", value),
+            ],
+        )
+        .await;
     }
 }
 
@@ -888,55 +978,11 @@ async fn a_resource_tag_clause_is_decided_from_the_tags_ec2_reports() {
     let emulator = Emulator::with_ec2();
     let send = "ec2-instance-connect:SendSSHPublicKey";
 
-    // Resolve the published Amazon Linux 2 AMI the documented way and launch one instance of
-    // it, so the push is decided about the instance EC2 holds.
-    let images = emulator
-        .ec2(
-            launched,
-            "DescribeImages",
-            &[
-                ("Owner.1", "amazon"),
-                ("Filter.1.Name", "name"),
-                ("Filter.1.Value.1", AL2_NAME_PATTERN),
-                ("Filter.2.Name", "state"),
-                ("Filter.2.Value.1", "available"),
-            ],
-        )
-        .await;
-    let image_id = xml_element(&images, "imageId").unwrap_or_else(|| {
-        panic!(
-            "case {launched:?}: the published catalog must report an available Amazon Linux 2 \
-             AMI for {AL2_NAME_PATTERN}, got {images}"
-        )
-    });
-    let run = emulator
-        .ec2(
-            launched,
-            "RunInstances",
-            &[
-                ("ImageId", &image_id),
-                ("InstanceType", "m5.large"),
-                ("MinCount", "1"),
-                ("MaxCount", "1"),
-            ],
-        )
-        .await;
-    let instance_id = xml_element(&run, "instanceId")
-        .unwrap_or_else(|| panic!("case {launched:?}: RunInstances must mint an instance: {run}"));
-
-    // EC2 reports a launched instance `pending` and owes it `running` one transition span
-    // later; a push is refused for the state until then, which is not what this rule is about.
-    tokio::time::sleep(ec2::state::TRANSITION_DELAY + Duration::from_millis(400)).await;
+    // Launch one instance EC2 holds, then tag it through EC2's own `CreateTags`, so the push
+    // is decided about the instance — and the tags — EC2 reports.
+    let instance_id = emulator.launch_running_instance(launched, &[]).await;
     emulator
-        .ec2(
-            launched,
-            "CreateTags",
-            &[
-                ("ResourceId.1", &instance_id),
-                ("Tag.1.Key", TAG_KEY),
-                ("Tag.1.Value", TAG_VALUE),
-            ],
-        )
+        .tag_instance(launched, &instance_id, TAG_KEY, TAG_VALUE)
         .await;
 
     // Each row: the value the clause compares the instance's tag against, and what the push
@@ -987,6 +1033,124 @@ async fn a_resource_tag_clause_is_decided_from_the_tags_ec2_reports() {
                 stored.as_deref(),
                 Some(pushed.as_str()),
                 "case {case:?}: the allowed push must store the key it pushed"
+            );
+        }
+    }
+}
+
+/// RULE: a resource-tag clause is decided against the target instance's tags AS THEY STAND AT
+/// THE INSTANT OF THE CALL, so an unchanged policy and an identical, unchanged request flip
+/// from refused to allowed and back as the instance's tags are changed through EC2's own
+/// tagging — a clause the current tags satisfy grants, and one they do not withholds the
+/// grant, which leaves no statement allowing the action.
+///
+/// The beats span both directions of the transition (a tag set that does not satisfy the
+/// clause, one that does, a third value, and back), and the rows span both spellings AWS
+/// publishes a resource tag under, which name the same tag set. On the FIRST row the
+/// non-matching value is the one the instance was LAUNCHED with (a tag specification of the
+/// launch), so that beat is decided about a tag no call wrote; each later row starts from
+/// whatever the row before it left on the instance, which the last beat makes a value the
+/// clause does not name.
+#[tokio::test]
+async fn retagging_the_instance_flips_the_same_calls_decision() {
+    let launched = "an instance launched tagged for another team";
+    let emulator = Emulator::with_ec2();
+    let send = "ec2-instance-connect:SendSSHPublicKey";
+    let instance_id = emulator
+        .launch_running_instance(launched, &[(TEAM_TAG_KEY, OTHER_TEAMS[0])])
+        .await;
+
+    // Each beat: the value the instance is retagged to before the call (`None` leaves the tag
+    // the launch set), and what the identical call must then come to.
+    let beats: [(&str, Option<&str>, Expected); 5] = [
+        ("carrying a tag the clause does not name", None, Expected::NoAllow),
+        (
+            "retagged to the team the clause names",
+            Some(WANTED_TEAM),
+            Expected::Allowed,
+        ),
+        (
+            "retagged to a third team",
+            Some(OTHER_TEAMS[1]),
+            Expected::NoAllow,
+        ),
+        (
+            "retagged back to the team the clause names",
+            Some(WANTED_TEAM),
+            Expected::Allowed,
+        ),
+        (
+            "retagged for another team once more",
+            Some(OTHER_TEAMS[0]),
+            Expected::NoAllow,
+        ),
+    ];
+
+    for (index, prefix) in ["aws:ResourceTag/", "ec2:ResourceTag/"]
+        .into_iter()
+        .enumerate()
+    {
+        let user_name = format!("retagged-{index}");
+        let fenced_on = format!("{prefix}{TEAM_TAG_KEY}");
+        let document = policy(&statement(
+            "Allow",
+            send,
+            "*",
+            Some(&string_equals(&fenced_on, WANTED_TEAM)),
+        ));
+        let setup = format!("the {fenced_on} clause");
+        let key_id = emulator
+            .iam_user_key(&setup, &user_name, Some(&document))
+            .await;
+
+        // The key the store holds for (instance, OS user) when this row starts: only an
+        // ALLOWED push may change it, so a refused beat must leave it exactly as it was. The
+        // reads below are all taken AT `decided_at`, one instant captured before the first
+        // push: this row is about WHICH key the store holds, not about the 60-second lifetime
+        // a pushed key has (which `instance_connect_key_push` covers), so no beat can read a
+        // key as absent for having aged while the beats ran.
+        let state = emulator.state();
+        let decided_at = Instant::now();
+        let mut held = state
+            .lock()
+            .active_ssh_key(&instance_id, OS_USER, decided_at)
+            .map(|key| key.public_key.clone());
+
+        for (beat, retag_to, expected) in beats {
+            let case = format!("{fenced_on}, {beat}");
+            if let Some(value) = retag_to {
+                emulator
+                    .tag_instance(&case, &instance_id, TEAM_TAG_KEY, value)
+                    .await;
+            }
+            let pushed = ssh_key(&case);
+            let (status, body) = emulator
+                .push_ssh(&key_id, &instance_id, OS_USER, &pushed)
+                .await;
+            assert_decision(
+                &case,
+                &user_name,
+                send,
+                &instance_id,
+                expected,
+                status,
+                &body,
+            );
+            if expected == Expected::Allowed {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the push the current tags allow must succeed, got {status} \
+                     {body}"
+                );
+                held = Some(pushed.clone());
+            }
+            let stored = state
+                .lock()
+                .active_ssh_key(&instance_id, OS_USER, decided_at)
+                .map(|key| key.public_key.clone());
+            assert_eq!(
+                stored, held,
+                "case {case:?}: expected the store to hold {held:?}, got {stored:?}"
             );
         }
     }
