@@ -44,6 +44,23 @@
 //! ([`smithy_server_runtime::OperationContext::callback`]), so nothing here opens a socket
 //! or leaves the host and this crate names no other service crate.
 //!
+//! Every write to a destination is made UNDER A ROLE where the filter's configuration names
+//! one, and is authorized against that role before it is attempted
+//! ([`withheld_by_delivery_role`]). `PutSubscriptionFilter$roleArn` is "the ARN of an IAM role
+//! that grants CloudWatch Logs permissions to deliver ingested log events to the destination
+//! stream" and a logical destination carries the same thing for the target it names
+//! (`Destination$roleArn`, "a role for impersonation, used when delivering log events to the
+//! target"), so the envelope reaches the destination only where the permissions in force on
+//! that role allow the destination service's own write action ([`DELIVERY_ACTIONS`]) on the
+//! destination resource — the question IAM itself answers
+//! ([`service_common::iam_role::role_withholds_action`]). A role that allows it nothing
+//! delivers nothing, and the withheld envelope is accounted for exactly as one the
+//! destination would not take ([`DELIVERY_ERRORS_METRIC`]), since no record reached the
+//! destination either way. A configuration that names NO role — which is every Lambda
+//! destination, "you don't need to provide the ARN when you are working with a logical
+//! destination for cross-account delivery" — is governed by what authorizes that destination
+//! instead, so nothing is withheld here for it.
+//!
 //! A filter's destination is also written to when the filter is CONFIGURED rather than when
 //! anything is ingested: `PutSubscriptionFilter` validates a STREAM destination it was
 //! handed by putting one health-check record on it ([`health_check`]), which is the one
@@ -173,6 +190,18 @@ const KINESIS_DESTINATION_TYPE: &str = "Kinesis";
 const FIREHOSE_DESTINATION_TYPE: &str = "Firehose";
 const LAMBDA_DESTINATION_TYPE: &str = "Lambda";
 
+/// The action the destination's own service authorizes the write of one envelope under,
+/// per ARN vendor: putting one record on a data stream or a delivery stream, and invoking a
+/// function. These are the actions the delivery role has to carry, as `PutDestination$roleArn`
+/// states the rule for a stream ("grants CloudWatch Logs permissions to call the Amazon
+/// Kinesis PutRecord operation on the destination stream") and as the calls below make them
+/// ([`deliver_to_kinesis`], [`deliver_to_firehose`], [`deliver_to_lambda`]).
+const DELIVERY_ACTIONS: [(&str, &str); 3] = [
+    (KINESIS_STREAM.0, "kinesis:PutRecord"),
+    (FIREHOSE_DELIVERY_STREAM.0, "firehose:PutRecord"),
+    (LAMBDA_FUNCTION.0, "lambda:InvokeFunction"),
+];
+
 /// The unit both delivery metrics' datapoints carry, from the `AWS/Logs` metric table: these
 /// are counts of events and of failures rather than measurements in a unit, so the unit is
 /// the `StandardUnit` value for no unit.
@@ -194,6 +223,12 @@ pub struct Delivery {
     pub destination_arn: String,
     /// The kind of destination that ARN names ([`DESTINATION_TYPE_DIMENSION`]).
     pub destination_type: String,
+    /// The IAM role the write to that destination is made under, where the filter's
+    /// configuration names one: the filter's own `roleArn`, or — for a logical destination —
+    /// the `roleArn` that destination was created with, which is the role it states for
+    /// "delivering log events to the target". `None` where no role governs the write, which
+    /// is what leaves it unauthorized by this module ([`withheld_by_delivery_role`]).
+    pub role_arn: Option<String>,
     /// How many ingested events this envelope carries, which is what a delivery that
     /// succeeds counts as [`FORWARDED_LOG_EVENTS_METRIC`].
     pub forwarded_log_events: usize,
@@ -324,10 +359,11 @@ pub fn health_check(
     store: &ComAmazonawsCloudwatchlogsLogs20140328State,
     log_group_name: &str,
     filter_name: &str,
-    destination_arn: &str,
+    configured_destination_arn: &str,
+    role_arn: Option<&str>,
 ) -> Option<Delivery> {
-    let destination_arn = physical_destination(store, destination_arn)?;
-    let destination_type = destination_type(&destination_arn)?;
+    let physical_destination_arn = physical_destination(store, configured_destination_arn)?;
+    let destination_type = destination_type(&physical_destination_arn)?;
     let named = CONTROL_MESSAGE_DESTINATIONS
         .iter()
         .find(|(kind, _)| *kind == destination_type)
@@ -339,8 +375,11 @@ pub fn health_check(
     Some(Delivery {
         log_group_name: log_group_name.to_string(),
         filter_name: filter_name.to_string(),
-        destination_arn,
+        destination_arn: physical_destination_arn,
         destination_type: destination_type.to_string(),
+        // The check is written to the destination the same way an ingested batch's envelope
+        // is, so it is made under the same role and authorized the same way.
+        role_arn: delivery_role(store, configured_destination_arn, role_arn),
         // The check carries the service's own sentence, not a log event the filter
         // forwarded, so it forwards nothing.
         forwarded_log_events: 0,
@@ -448,6 +487,7 @@ pub fn deliveries(
                 filter_name: filter.filter_name.clone(),
                 destination_arn: destination_arn.clone(),
                 destination_type: destination_type.to_string(),
+                role_arn: delivery_role(store, &filter.destination_arn, filter.role_arn.as_deref()),
                 forwarded_log_events: chunk.len(),
                 partition_key,
                 payload: gzip(&body),
@@ -499,6 +539,31 @@ fn physical_destination(
         return is_deliverable(&target).then_some(target);
     }
     is_deliverable(destination_arn).then(|| destination_arn.to_string())
+}
+
+/// The IAM role the write to `destination_arn` is made under, as the stored configuration
+/// names it: the `roleArn` of the LOGICAL destination for a `destinationArn` that names one —
+/// that is the role that destination states for "delivering log events to the target" and the
+/// filter carries none for it — and otherwise the role the filter itself was configured with.
+///
+/// `None` where nothing names a role, so nothing here is authorized against one: a filter put
+/// without a `roleArn` (a Lambda destination), a logical destination this account does not
+/// hold, or one stored with an empty role.
+fn delivery_role(
+    store: &ComAmazonawsCloudwatchlogsLogs20140328State,
+    destination_arn: &str,
+    filter_role_arn: Option<&str>,
+) -> Option<String> {
+    let configured = if ::service_common::arn::parse(destination_arn)
+        .is_some_and(|parsed| parsed.vendor == LOGS_DESTINATION.0)
+    {
+        store
+            .destination_by_arn(destination_arn)
+            .map(|destination| destination.role_arn.clone())
+    } else {
+        filter_role_arn.map(::std::string::ToString::to_string)
+    };
+    configured.filter(|role_arn| !role_arn.trim().is_empty())
 }
 
 /// Whether an ARN names a physical resource this module delivers an envelope to.
@@ -634,6 +699,13 @@ async fn hand_over(
         .and_then(::service_common::arn::region_label)
         .unwrap_or(fallback_region)
         .to_string();
+    // The write is made UNDER the configured delivery role, so what that role is allowed to
+    // do on the destination decides whether it is made at all: a role the destination's
+    // service would refuse the call to writes nothing, and the envelope is accounted for as
+    // one the destination did not take.
+    if let Some(withheld) = withheld_by_delivery_role(ctx, &region, delivery, &vendor).await {
+        return Some(withheld);
+    }
     if vendor == KINESIS_STREAM.0 {
         deliver_to_kinesis(ctx, &region, delivery).await
     } else if vendor == FIREHOSE_DELIVERY_STREAM.0 {
@@ -643,6 +715,46 @@ async fn hand_over(
     } else {
         Some("the destination names no kind a subscription filter delivers to".to_string())
     }
+}
+
+/// Why the DELIVERY ROLE withholds this envelope, and `None` where it does not withhold it —
+/// which is also the answer where no role governs the write at all.
+///
+/// CloudWatch Logs writes to a subscription destination under the role the configuration
+/// names, so the write is the role's to make: it happens only where the permissions in force
+/// on that role allow the destination service's own write action for the vendor the envelope
+/// is going to ([`DELIVERY_ACTIONS`]) on the destination resource. That decision is IAM's,
+/// asked of IAM ([`service_common::iam_role::role_withholds_action`]), and a role IAM
+/// withholds the action from delivers nothing — never a record the destination's service
+/// would have refused.
+///
+/// `None`, so the delivery proceeds, where nothing says otherwise: a configuration naming no
+/// role, a vendor with no write action of this kind, and every case IAM gave no answer about.
+async fn withheld_by_delivery_role(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    delivery: &Delivery,
+    vendor: &str,
+) -> Option<String> {
+    let role_arn = delivery.role_arn.as_deref()?;
+    let action = DELIVERY_ACTIONS
+        .iter()
+        .find(|(named, _)| *named == vendor)
+        .map(|(_, action)| *action)?;
+    ::service_common::iam_role::role_withholds_action(
+        ctx,
+        region,
+        role_arn,
+        action,
+        &delivery.destination_arn,
+    )
+    .await
+    .then(|| {
+        format!(
+            "the delivery role is not allowed to {action} on the destination, so no record \
+             was written to it"
+        )
+    })
 }
 
 /// Mark each named filter's destination as one that refused its last delivery, so

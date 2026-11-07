@@ -670,6 +670,11 @@ mod logs_emf_declared_projections;
 // reason those entries record: the appended tail at the end of this file and the head of the
 #[path = "all/logs_export_task_destination_bucket.rs"]
 mod logs_export_task_destination_bucket;
+// Declared HERE, beside the sibling `logs_*` suites in the same quiet `n`/`o` gap, for the
+// reason those entries record: the appended tail at the end of this file and the head of the
+// list are both regions every concurrently landing router suite puts its line in.
+#[path = "all/logs_subscription_delivery_role.rs"]
+mod logs_subscription_delivery_role;
 #[path = "all/partnercentral_channel_target_routing.rs"]
 mod partnercentral_channel_target_routing;
 #[path = "all/personalize_signing_name_routing.rs"]

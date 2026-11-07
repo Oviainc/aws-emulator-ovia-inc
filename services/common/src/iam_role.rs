@@ -12,7 +12,8 @@
 //! name does IAM hold it — so the reading is stated here for them to share.
 //!
 //! The trust-policy half of the question, once the role is found, is
-//! [`crate::iam_trust_policy`].
+//! [`crate::iam_trust_policy`]; what the role's own permissions let the service do UNDER it
+//! is [`role_withholds_action`].
 //!
 //! Today Firehose reads it here; the copies that predate this module — `iam_role_name` in
 //! `service-com-amazonaws-scheduler-awschronosservice/src/state.rs`, `is_iam_role_arn` in
@@ -308,6 +309,72 @@ pub async fn role_pass_is_unauthorized(
         RoleAnswer::Absent => true,
         RoleAnswer::Unknown => false,
     }
+}
+
+/// Whether IAM ANSWERED that the permissions in force on the role `role_arn` names do NOT
+/// allow `action` on `resource`.
+///
+/// This is the question a service asks before it ACTS UNDER a caller-supplied role: the call
+/// it then makes is authorized against that role's permissions rather than against the
+/// caller's own, so a role whose policies grant that call nothing cannot make it, and the
+/// service must not make it either. It is put to IAM itself — the simulation of a principal's
+/// policies ("determine the policies' effective permissions"), reached over the in-process
+/// hop ([`crate::iam_client`]) — so the documents in force (the attached ones, the inline ones
+/// and the ceiling a permissions boundary sets) are collected and decided by the service that
+/// HOLDS them, and this crate keeps one evaluation of an IAM document rather than two.
+///
+/// `false` — withhold nothing — for everything that is NOT such an answer, for the reason
+/// [`role_is_unassumable`] gives: a value that names no role of this account, an answer this
+/// emulator could not read, and any failure of the hop at all, including an emulator with no
+/// IAM mounted. A role this account's IAM holds nothing under falls there too, the way
+/// [`held_role_is_unassumable`] reads it: a role record exists in this emulator's IAM only
+/// where a client created it HERE, while a delivery or execution role is routinely
+/// provisioned out of band, so its absence is evidence about this store and not about the
+/// role's permissions. An attachment whose document this account does not hold is a grant
+/// nothing can read, so it is one of those non-answers as well — the same deliberate
+/// non-refusal the store-reading readers take of it.
+///
+/// This is the form for a service that does NOT hold the IAM store: it has no access to those
+/// records, so it asks their holder. A service that reads them directly instead — Amazon
+/// EventBridge Pipes' `state::execution_role`, AWS Step Functions' `state::task_authorization`
+/// and the Lambda core's `state::network` — answers the SAME question, and the two routes
+/// agree because both end in this crate's one evaluation of an IAM document
+/// ([`crate::iam_authorization`]), which the simulation itself is built on. Nothing new should
+/// grow a third route: a service with the records at hand reads them, and every other asks
+/// here.
+pub async fn role_withholds_action(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+    action: &str,
+    resource: &str,
+) -> bool {
+    if role_name(role_arn).is_none() {
+        return false;
+    }
+    let answer = crate::iam_client::iam_client(ctx, region)
+        .simulate_principal_policy()
+        .policy_source_arn(role_arn)
+        .action_names(action)
+        .resource_arns(resource)
+        .send()
+        .await;
+    let Ok(answer) = answer else {
+        return false;
+    };
+    // One result per action asked about, each carrying the decision over the resources asked
+    // about; the pair here is one action and one resource, so the FIRST result is the answer,
+    // and an answer that reports no result at all is one nothing can be read from.
+    answer
+        .evaluation_results()
+        .first()
+        .map(::aws_sdk_iam::types::EvaluationResult::eval_decision)
+        .is_some_and(|decision| {
+            !matches!(
+                decision,
+                ::aws_sdk_iam::types::PolicyEvaluationDecisionType::Allowed
+            )
+        })
 }
 
 /// What IAM answers about a role of this account, as the two readings above share ONE hop.

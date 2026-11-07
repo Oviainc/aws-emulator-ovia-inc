@@ -12,7 +12,9 @@
 //! ingested batch on, with no replay of the batches it missed. The put WRITES to the
 //! destination as it validates it: one health-check record
 //! ([`crate::state::subscription_delivery::health_check`]), which is what tells a client at
-//! wiring time that the destination it named is reachable.
+//! wiring time that the destination it named is reachable. That record is written UNDER the
+//! `roleArn` the filter is configured with, like every later delivery, so a role whose
+//! permissions do not let CloudWatch Logs write to the destination puts nothing on it.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -410,6 +412,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutSubscriptionFi
         let log_group_name = input.log_group_name.clone();
         let filter_name = input.filter_name.clone();
         let destination_arn = input.destination_arn.clone();
+        let role_arn = input.role_arn.clone();
         group.subscription_filters.insert(
             input.filter_name.clone(),
             crate::state::SubscriptionFilterRecord {
@@ -442,6 +445,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutSubscriptionFi
             &log_group_name,
             &filter_name,
             &destination_arn,
+            role_arn.as_deref(),
         ))
     }
 }

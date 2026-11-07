@@ -211,6 +211,8 @@ mod scratch_queries;
 mod state_roundtrip;
 #[path = "all/storage_tier_policy.rs"]
 mod storage_tier_policy;
+#[path = "all/subscription_delivery_authorization.rs"]
+mod subscription_delivery_authorization;
 #[path = "all/subscription_delivery_telemetry.rs"]
 mod subscription_delivery_telemetry;
 #[path = "all/subscription_destination_health_check.rs"]
