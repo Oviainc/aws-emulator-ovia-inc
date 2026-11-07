@@ -2,8 +2,13 @@
 
 //! @op TagResource
 //! Implemented: merges `Tags` onto the stored chatbot resource named by `ResourceARN`,
-//! keyed by `TagKey`, so a repeated key replaces its value. A merge that would carry more
-//! than the modelled 200 tags is a 400 `TooManyTagsException`.
+//! keyed by `TagKey`, so a repeated key replaces its value. A merge that would leave the
+//! resource carrying more than the 200 tags the modelled `TagList` bounds is refused as a
+//! request-constraint violation — 400 `InvalidRequestException` stating NO message, the
+//! answer AWS Chatbot was recorded giving for a resource already at the cap — and persists
+//! nothing: the modelled `TooManyTagsException` words the request LIST being too long, which
+//! the list's own `@length` bound already refuses before a handler runs, not the stored total
+//! the merge would reach.
 //!
 //! `ResourceARN` is any chatbot ARN, so the resource type in the ARN decides where the tags
 //! live — see [`crate::state::ChatbotResourceKind`]. An ARN the store holds nothing under is
@@ -77,6 +82,10 @@
 //!   valid credentials for the target resource. NOT listed on this operation by the model;
 //!   widened in below, because AWS Chatbot was recorded answering it for a custom-action ARN
 //!   outside the form this account's actions are minted under.
+//! * `InvalidRequestException` (HTTP 400) — Your request input doesn't meet the constraints
+//!   required by AWS Chatbot. NOT listed on this operation by the model either; widened in
+//!   below, because it is what AWS Chatbot was recorded answering for a merge that would take
+//!   a resource past the per-resource tag cap.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -97,13 +106,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chatbot-wheatleyorchest
 // model's `errors` list for TagResource does not, and it is what a custom-action ARN outside
 // the form this account's actions are minted under is refused with — see
 // `crate::state::is_mintable_custom_action_arn`.
+// `InvalidRequestException` is widened in the same way, and for the same reason: this SERVICE
+// models it (`@error("client")` `@httpError(400)`, and the custom-action operations list it)
+// while the model's `errors` list for TagResource does not, and it is the class AWS Chatbot
+// refuses a merge that would take a resource past the per-resource tag cap with.
 #[smithy_macros::operation_error(
     "com.amazonaws.chatbot#TagResource",
-    extra_errors = ["UnauthorizedException"]
+    extra_errors = ["UnauthorizedException", "InvalidRequestException"]
 )]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
     InternalServiceError(InternalServiceError),
+    InvalidRequestException(InvalidRequestException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
     TooManyTagsException(TooManyTagsException),
@@ -212,14 +226,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for tag in input.tags {
             merged.insert(tag.tag_key, tag.tag_value);
         }
+        // The stored total the merge would reach is a REQUEST constraint, not a property of
+        // the list the request carried: the modelled `TagList` bound refuses a request list
+        // longer than the cap before any handler runs, so what is left for the handler is the
+        // total this resource would be left carrying. AWS Chatbot refuses that with its
+        // generic client-input error class, and words nothing for it — so no message is
+        // synthesised here and the member goes out as the explicit null this service's error
+        // document carries for a class that words none (`crate::service::wire`).
         if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(TagResourceErrorModeled::TooManyTagsException(TooManyTagsException {
-                message: Some(format!(
-                    "a resource carries at most {} tags, and this request would leave {}",
-                    crate::state::MAX_TAGS_PER_RESOURCE,
-                    merged.len()
-                )),
-            })
+            return Err(TagResourceErrorModeled::InvalidRequestException(
+                InvalidRequestException { message: None },
+            )
             .into());
         }
         *stored_tags = merged;

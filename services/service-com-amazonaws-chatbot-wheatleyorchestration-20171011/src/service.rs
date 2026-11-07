@@ -14,7 +14,8 @@
 //! entry; you edit the behavioral seams below.
 //!
 //! Five opt-in seams are yours to change; every one defaults to the framework's
-//! own behaviour, so an unedited service still routes and answers correctly:
+//! own behaviour, so an unedited service still routes and answers correctly
+//! (`override_protocol` is a sixth, which this service takes — see [`wire`]):
 //!
 //! - `can_handle` — which requests this service claims. The default matches the
 //!   request's resolved route key against this service's signing name. Edit it
@@ -45,6 +46,11 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// How this service's error document carries a modelled exception's `Message` member: the
+/// sixth seam, `override_protocol`, which this service takes for that one thing the generic
+/// renderer cannot express.
+pub mod wire;
+
 /// The error code AWS Chatbot answers a request whose input does not satisfy a modeled
 /// constraint with.
 ///
@@ -73,6 +79,10 @@ const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// This service's wire protocol: the model's own `restJson1`, with the error document
+    /// of [`wire`]. Built once here because [`Service::override_protocol`] hands back a
+    /// borrow of it.
+    protocol: wire::MessageAlwaysPresentRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -82,6 +92,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: wire::MessageAlwaysPresentRestJson::new(),
         }
     }
 }
@@ -171,5 +182,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own restJson1 codec, with the ONE difference the generic renderer
+        // cannot express: a modelled exception's `Message` member is present in the error
+        // document even where the error class states no message, as JSON `null` rather than
+        // dropped (see `wire`). Borrowed from the field built in `new`, never constructed
+        // per request.
+        Some(&self.protocol)
     }
 }

@@ -27,6 +27,8 @@ mod custom_action_delete;
 mod custom_action_fail_closed;
 #[path = "all/custom_action_update.rs"]
 mod custom_action_update;
+#[path = "all/error_message_member.rs"]
+mod error_message_member;
 #[path = "all/error_response_contract.rs"]
 mod error_response_contract;
 #[path = "all/input_constraint_refusals.rs"]
@@ -41,6 +43,8 @@ mod slack_workspace_authorization;
 mod state_roundtrip;
 #[path = "all/success_response_wire_shape.rs"]
 mod success_response_wire_shape;
+#[path = "all/tag_resource_cap.rs"]
+mod tag_resource_cap;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;
 #[path = "all/wire.rs"]

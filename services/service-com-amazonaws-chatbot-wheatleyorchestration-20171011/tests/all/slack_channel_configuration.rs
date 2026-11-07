@@ -1008,10 +1008,20 @@ async fn a_tag_merge_past_the_tag_limit_is_refused_and_changes_nothing() {
                     status, 400,
                     "case {label:?}: expected 400, got {status} with {body}"
                 );
+                // The stored total the merge would reach is a request-constraint
+                // violation, so it carries this service's generic client-input class and
+                // states no message — not the modelled `TooManyTagsException`, which words
+                // the request LIST being too long. `tests/all/tag_resource_cap.rs` asserts
+                // that rule across every kind of resource that carries tags.
                 assert_eq!(
                     error_code(&body),
-                    "TooManyTagsException",
-                    "case {label:?}: expected a TooManyTagsException, got {body}"
+                    "InvalidRequestException",
+                    "case {label:?}: expected an InvalidRequestException, got {body}"
+                );
+                assert_eq!(
+                    body.get("message"),
+                    Some(&Value::Null),
+                    "case {label:?}: this refusal states no message, got {body}"
                 );
             }
         }

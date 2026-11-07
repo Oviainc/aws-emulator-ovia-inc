@@ -8,9 +8,10 @@
 //! store, so every later call addressed to that ARN answers exactly as it does for an
 //! action that was never created — `GetCustomAction` with the modelled 404
 //! `ResourceNotFoundException` naming the action and the account, and the delete itself with
-//! the modelled 404 its own error class carries, which is the error code and status ALONE:
-//! this is an error class AWS Chatbot words nothing for, so its answer has no message member
-//! at all. The record's tags go with it, and the name is free for a new create again. The
+//! the modelled 404 its own error class carries, which states NO message: this is an error
+//! class AWS Chatbot words nothing for, so the document's `Message` member is reported as an
+//! explicit null rather than as a sentence borrowed from another operation's error class.
+//! The record's tags go with it, and the name is free for a new create again. The
 //! delete answers an empty result document, is addressed by ARN alone (a custom action being
 //! account-scoped), leaves every other action alone, and an ARN no create can mint for this
 //! account is refused with the modelled 403 `UnauthorizedException` having removed nothing
@@ -63,8 +64,11 @@ fn not_found_message(action_name: &str) -> String {
 }
 
 /// Assert `answer` is the modelled 404 a delete addressed to one of this account's
-/// custom-action ARNs that holds no action carries: the error code and the status, and no
-/// message member of either spelling — AWS Chatbot words this error class nothing.
+/// custom-action ARNs that holds no action carries: the error code, the status, and a
+/// `Message` member stating NOTHING — reported as an explicit JSON null, the form this
+/// service's error document carries a member no error class words (`src/service/wire.rs`),
+/// and never under the other spelling, which `ResourceNotFoundException` does not declare
+/// (`smithy_query` shape=ResourceNotFoundException: member `Message`).
 fn assert_not_found_without_a_message(label: &str, arn: &str, answer: &crate::wire::Answer) {
     assert_eq!(
         answer.status, 404,
@@ -79,14 +83,15 @@ fn assert_not_found_without_a_message(label: &str, arn: &str, answer: &crate::wi
     );
     assert_eq!(
         answer.body.get("Message"),
-        None,
-        "case {label:?} ({arn}): this error class carries no message, got {}",
+        Some(&Value::Null),
+        "case {label:?} ({arn}): this error class states no message, so the member is a \
+         null, got {}",
         answer.body
     );
     assert_eq!(
         answer.body.get("message"),
         None,
-        "case {label:?} ({arn}): this error class carries no message, got {}",
+        "case {label:?} ({arn}): this error class declares no lowercase member, got {}",
         answer.body
     );
 }
@@ -296,9 +301,9 @@ async fn a_repeated_delete_is_not_found_and_the_name_is_free_with_none_of_its_ta
         );
 
         // The action is gone, so a repeat of the same delete has nothing to remove and
-        // reports the action absent with the modelled 404 — the error code and status alone,
-        // the answer AWS Chatbot gives this error class, which is also the answer for a name
-        // nothing was ever created under.
+        // reports the action absent with the modelled 404 stating no message, the answer AWS
+        // Chatbot gives this error class, which is also the answer for a name nothing was
+        // ever created under.
         for attempt in 2..=3 {
             let again = emulator
                 .call(DELETE_PATH, &json!({"CustomActionArn": arn}))
@@ -365,7 +370,7 @@ async fn deleting_one_of_this_account_s_names_that_holds_no_action_is_not_found_
     let stored = get_ok(&emulator, &present).await;
 
     // The store cannot tell a delete of an action removed a moment ago from a delete of a
-    // name nothing was ever created under, so both are the same modelled 404 carrying no
+    // name nothing was ever created under, so both are the same modelled 404 stating no
     // message. The rows differ in the action name's length (`CustomActionName`, len 1..64 —
     // both published bounds included) and charset, so the answer cannot follow from one
     // spelling of the name.

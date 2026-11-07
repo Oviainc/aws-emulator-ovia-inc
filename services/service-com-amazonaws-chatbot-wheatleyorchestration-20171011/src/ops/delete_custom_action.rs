@@ -12,11 +12,13 @@
 //! of this account is minted under ([`crate::state::is_mintable_custom_action_arn`]) that
 //! holds no action is refused with the modelled 404 `ResourceNotFoundException` — the answer
 //! a chat configuration's delete is recorded giving for an ARN holding no resource. That
-//! refusal carries NO `Message` member: this error class is one AWS Chatbot words nothing
-//! for, as the recorded delete of an action this account holds none of shows, so the error
-//! reports its code and status alone rather than borrowing the sentence another operation's
-//! error class carries. An ARN of any other form is refused with the modelled 403
-//! `UnauthorizedException` before the store is consulted, as the read refuses it.
+//! refusal states NO message: this error class is one AWS Chatbot words nothing for, as the
+//! recorded delete of an action this account holds none of shows, so the error reports its
+//! code and status rather than borrowing the sentence another operation's error class
+//! carries, and its `Message` member goes out as the explicit null this service's error
+//! document carries for a class that words none (`crate::service::wire`). An ARN of any
+//! other form is refused with the modelled 403 `UnauthorizedException` before the store is
+//! consulted, as the read refuses it.
 //!
 //! ## Shape of an operation
 //!
@@ -175,8 +177,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A custom action is account-scoped, so its ARN names it on its own and the signing
         // region is not part of the lookup. The record owns its tags, so removing it removes
         // them with it. An ARN of the minted form holding no action is the modelled 404, and
-        // AWS Chatbot words nothing for this operation's not-found: it answers the error code
-        // and status with no message member, so none is synthesised here.
+        // AWS Chatbot words nothing for this operation's not-found: it states no message, so
+        // none is synthesised here and the member goes out as a null.
         let removed = state.lock().custom_actions.remove(&input.custom_action_arn);
         if removed.is_none() {
             return Err(
