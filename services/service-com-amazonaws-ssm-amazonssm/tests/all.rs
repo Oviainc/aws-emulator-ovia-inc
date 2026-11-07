@@ -59,6 +59,8 @@ mod parameter_store;
 mod parameters_batch;
 #[path = "all/parameters_by_path.rs"]
 mod parameters_by_path;
+#[path = "all/public_parameter_catalog.rs"]
+mod public_parameter_catalog;
 #[path = "all/published_documents.rs"]
 mod published_documents;
 #[path = "all/resource_data_syncs.rs"]

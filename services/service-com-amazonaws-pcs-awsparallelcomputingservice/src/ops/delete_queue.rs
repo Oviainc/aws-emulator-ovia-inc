@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteQueue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteQueue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Moves the queue to `DELETING` in [`crate::state`]; the clock then owes its removal,
+//! after which `GetQueue` answers 404 and `ListQueues` no longer lists it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteQueue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A queue that is not settled \u2014 still being provisioned, or already on its way out \u2014 has
+//! another operation of its own in flight, so deleting it is refused with
+//! `ConflictException` (HTTP 409) rather than started twice. Deleting the queue is what
+//! releases the compute node groups it assigns jobs to, which is why it comes first in the
+//! delete order a client has to follow.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +167,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteQueue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteQueueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteQueue"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteQueueErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the PCS emulator holds no state on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+        state.settle();
+
+        let Some(cluster) = state.cluster_mut(&input.cluster_identifier) else {
+            return Err(DeleteQueueErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::CLUSTER, &input.cluster_identifier),
+            )
+            .into());
+        };
+        let Some(queue_id) = cluster
+            .queue(&input.queue_identifier)
+            .map(|queue| queue.id.clone())
+        else {
+            return Err(DeleteQueueErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::QUEUE, &input.queue_identifier),
+            )
+            .into());
+        };
+        let Some(queue) = cluster.queues.get_mut(&queue_id) else {
+            return Err(DeleteQueueErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the queue disappeared while it was being read".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Only a settled queue can be deleted: one still provisioning, or already on its
+        // way out, has an operation of its own in flight.
+        if queue.status != crate::state::STATUS_ACTIVE {
+            return Err(DeleteQueueErrorModeled::ConflictException(
+                crate::state::not_active(crate::state::QUEUE, &queue.id),
+            )
+            .into());
+        }
+
+        // PCS reports the queue as DELETING until it is gone; the clock owes the removal.
+        queue.status = crate::state::STATUS_DELETING.to_string();
+        queue.modified_at = crate::state::now_date_time();
+        queue.pending = Some(crate::state::Pending::in_a_span(
+            crate::state::PendingChange::Remove,
+        ));
+        Ok(DeleteQueueOutput {})
     }
 }

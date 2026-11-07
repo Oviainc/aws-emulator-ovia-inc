@@ -1669,8 +1669,12 @@ pub(super) fn deprecated_amazon_linux_2_image(days_ago: u64) -> ImageSpec {
 /// pattern has to make, and the oldest Amazon Linux 2 build carries the
 /// `DeprecationTime` its end of standard support fell on, so a deprecated image is part
 /// of the catalog rather than only of a test.
+///
+/// The AWS PCS sample AMIs ([`pcs_sample_image_specs`]) close the catalog: they are
+/// published the same way and under the Parameter Store names AWS publishes their ids
+/// under.
 pub fn published_image_specs() -> Vec<ImageSpec> {
-    vec![
+    let mut specs = vec![
         ImageSpec {
             description: "Amazon Linux 2023 AMI 2023.6.20241121.0 x86_64 HVM kernel-6.1"
                 .to_string(),
@@ -1842,7 +1846,89 @@ pub fn published_image_specs() -> Vec<ImageSpec> {
                 "2024-11-13T07:36:19.000Z",
             )
         },
-    ]
+    ];
+    specs.extend(pcs_sample_image_specs());
+    specs
+}
+
+/// The build date every AWS PCS sample AMI of the catalog was published on, carried by its
+/// name as well as by its `CreationDate` so the two cannot disagree — the same way every
+/// Amazon Linux row above carries the build date of the version it names.
+const PCS_SAMPLE_AMI_BUILD_DATE: &str = "2025-01-15";
+
+/// The `CreationDate` of those images: the build date above, at the time of day the
+/// catalog's other rows carry one at.
+const PCS_SAMPLE_AMI_CREATION_DATE: &str = "2025-01-15T09:21:44.000Z";
+
+/// One published AWS PCS sample AMI: `(Slurm version, operating system, architecture)`.
+///
+/// AWS PCS publishes a sample AMI per Slurm version, operating system and architecture, and
+/// publishes each one's id in Parameter Store under
+/// [`pcs_sample_ami_parameter_name`] — which is how a client picks the image for a compute
+/// node group without naming a Region-specific id. Two Slurm versions are published,
+/// because choosing between them is the choice a client reading the hierarchy has to make,
+/// and both architectures of the newer one, because a node group's instance types decide
+/// which it needs.
+const PCS_SAMPLE_AMI_ROWS: &[(&str, &str, &str)] = &[
+    ("24.11", "amzn2", "x86_64"),
+    ("24.11", "amzn2", "arm64"),
+    ("24.11", "al2023", "x86_64"),
+    ("24.11", "al2023", "arm64"),
+    ("24.05", "amzn2", "x86_64"),
+];
+
+/// The public Systems Manager parameter name AWS PCS publishes a sample AMI's id under:
+/// `/aws/service/pcs/<Slurm version>/<operating system>/<architecture>/latest/ami-id`.
+pub fn pcs_sample_ami_parameter_name(slurm: &str, os: &str, architecture: &str) -> String {
+    format!("/aws/service/pcs/{slurm}/{os}/{architecture}/latest/ami-id")
+}
+
+/// The AWS PCS sample AMIs of the published catalog, one per [`PCS_SAMPLE_AMI_ROWS`] entry.
+///
+/// Public images like every other row of [`published_image_specs`], each carrying the
+/// Parameter Store name its id is published under, so the one place this emulator records
+/// which AMI a public parameter names
+/// ([`ComAmazonawsEc2Amazonec2State::public_ssm_parameter_image_ids`]) holds the PCS
+/// hierarchy too and a client resolving it reaches an image this account can really launch.
+pub fn pcs_sample_image_specs() -> Vec<ImageSpec> {
+    PCS_SAMPLE_AMI_ROWS
+        .iter()
+        .map(|(slurm, os, architecture)| {
+            // The boot mode each variant is published with, as the Amazon Linux rows above
+            // carry it: 64-bit Arm boots UEFI, Amazon Linux 2023 on x86 prefers it, and
+            // Amazon Linux 2 on x86 boots the legacy BIOS.
+            let boot_mode = match (*os, *architecture) {
+                (_, "arm64") => BOOT_MODE_UEFI,
+                ("al2023", _) => BOOT_MODE_UEFI_PREFERRED,
+                _ => BOOT_MODE_LEGACY_BIOS,
+            };
+            ImageSpec {
+                description: format!(
+                    "AWS PCS sample AMI for Slurm {slurm} on {os} {architecture}"
+                ),
+                boot_mode: Some(boot_mode.to_string()),
+                // Amazon Linux 2023 requires IMDSv2, as its own rows above do; Amazon
+                // Linux 2 declares no such requirement.
+                imds_support: (*os == "al2023").then(|| IMDS_SUPPORT_V2.to_string()),
+                // An HPC compute-node image is no Free Tier image, unlike the Amazon Linux
+                // and Windows base rows above.
+                free_tier_eligible: false,
+                public_ssm_parameter_name: Some(pcs_sample_ami_parameter_name(
+                    slurm,
+                    os,
+                    architecture,
+                )),
+                ..published_amazon_image(
+                    &format!(
+                        "aws-pcs-sample_ami-{os}-{architecture}-slurm-{slurm}-{}",
+                        PCS_SAMPLE_AMI_BUILD_DATE.replace('-', ".")
+                    ),
+                    architecture,
+                    PCS_SAMPLE_AMI_CREATION_DATE,
+                )
+            }
+        })
+        .collect()
 }
 
 /// The public Systems Manager parameter names AWS publishes as a SECOND name for an image

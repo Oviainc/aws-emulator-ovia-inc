@@ -10,6 +10,11 @@
 //! and labels THAT version carries. Nothing here mutates the store — a read must not
 //! change what a later caller sees.
 //!
+//! A name in the hierarchy AWS publishes its own parameters in is resolved against THAT
+//! catalog ([`crate::state::public_parameters`]) rather than against the store, as every
+//! read of a name is: the catalog publishes one version of such a name, so its history is
+//! that one version.
+//!
 //! ## Paging
 //!
 //! A page carries at most `MaxResults` entries, up to the modelled maximum
@@ -283,10 +288,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The store guard is released before the keys are asked, so no state of this
         // service is held while KMS's decision is made.
+        let published =
+            crate::state::public_parameters::published(&*self.engine, &region, query.name);
         let (mut parameters, next_token, to_open) = {
             let store = state.lock();
-            let Some(record) = store.parameter(&region, query.name) else {
-                return Err(not_found().into());
+            // A name in the hierarchy AWS publishes its own parameters in is resolved
+            // against THAT catalog ([`crate::state::public_parameters`]), which this
+            // account's store holds nothing of; a name neither holds is the miss below.
+            let record = match store
+                .parameter(&region, query.name)
+                .or(published.as_ref())
+            {
+                Some(record) => record,
+                None => return Err(not_found().into()),
             };
             // A token this service issued names a version that was waiting when the
             // previous page was served, so one naming a version past the newest this

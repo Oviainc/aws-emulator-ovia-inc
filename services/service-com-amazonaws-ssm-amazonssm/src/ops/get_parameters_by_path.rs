@@ -11,6 +11,15 @@
 //! reported at its newest version, or at the version a `Label` filter names. Nothing
 //! here mutates the store — a read must not change what a later caller sees.
 //!
+//! ## AWS's own hierarchy
+//!
+//! A path inside the hierarchy AWS publishes its own parameters in reads THAT catalog
+//! ([`crate::state::public_parameters`]) instead: no parameter of this account can live
+//! there, and AWS publishes none in the account's own hierarchy, so each path is answered
+//! from the one source that can hold anything under it. Both sources are read in the same
+//! ascending name order, so filtering, paging and the resume cursor are the same for
+//! either.
+//!
 //! ## Filters
 //!
 //! `ParameterFilters` accepts the three keys this operation publishes — `Type`, `KeyId`
@@ -294,10 +303,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         // The token is the name of the parameter the next page starts at, so a token
-        // that is not a parameter name at all was not issued here.
+        // that is not a parameter name at all was not issued here. A name AWS publishes is
+        // such a name too, even though [`name_rejection`] — which states what a CALLER may
+        // create — refuses the hierarchy AWS reserves for itself: a page of the published
+        // catalog resumes at the published name it stopped at.
         let resume_from = match input.next_token.as_deref() {
             None | Some("") => None,
-            Some(token) if name_rejection(token).is_none() => Some(canonical_name(token)),
+            Some(token)
+                if name_rejection(token).is_none()
+                    || crate::state::public_parameters::is_published_name(token) =>
+            {
+                Some(canonical_name(token))
+            }
             Some(_) => {
                 return Err(GetParametersByPathErrorModeled::InvalidNextToken(
                     InvalidNextToken {
@@ -314,6 +331,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is what makes the resume cursor total.
         let recursive = input.recursive.unwrap_or(false);
         let region = request_region(ctx.parts());
+        // AWS's own published parameters are read by naming the hierarchy AWS owns: no
+        // parameter of this account can live in it (`PutParameter` refuses such a name)
+        // and AWS publishes nothing in the account's own hierarchy, so a read of AWS's
+        // hierarchy reports the published catalog and every other path reports what this
+        // account wrote. Projected BEFORE the store guard is taken, so no state of this
+        // service is held while the catalog's own store is read.
+        let published = if crate::state::public_parameters::is_published_hierarchy(path) {
+            crate::state::public_parameters::published_records(&*self.engine, &region)
+        } else {
+            Vec::new()
+        };
         // The store guard is released before the keys are asked, so no state of this
         // service is held while KMS's decision is made.
         let (mut parameters, next_token, to_open) = {
@@ -321,7 +349,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut parameters = Vec::new();
             let mut to_open = Vec::new();
             let mut next_token = None;
-            for (name, record) in store.parameters_of_region(&region) {
+            // One ascending order over both sources, so a page boundary and the name it
+            // resumes at mean the same thing whichever source the parameter came from.
+            let mut candidates: Vec<(&str, &crate::state::ParameterRecord)> = store
+                .parameters_of_region(&region)
+                .chain(
+                    published
+                        .iter()
+                        .map(|record| (canonical_name(&record.name), record)),
+                )
+                .collect();
+            candidates.sort_by_key(|(name, _)| *name);
+            for (name, record) in candidates {
                 if resume_from.is_some_and(|from| name < from) {
                     continue;
                 }

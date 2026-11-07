@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteComputeNodeGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteComputeNodeGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Moves the compute node group to `DELETING` in [`crate::state`]; the clock then owes it
+//! `DELETED` and, a span later, its removal, after which `GetComputeNodeGroup` answers 404
+//! and `ListComputeNodeGroups` no longer lists it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteComputeNodeGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "You must delete all queues associated with the compute node group first", so a group a
+//! queue of its cluster still assigns jobs to is refused with `ConflictException` (HTTP
+//! 409) — the delete ordering a client has to follow — and so is a group that is not
+//! settled, because a group still being provisioned or already on its way out has another
+//! operation of its own in flight.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +168,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteComputeNodeGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteComputeNodeGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteComputeNodeGroup"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteComputeNodeGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the PCS emulator holds no state on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+        state.settle();
+
+        let Some(cluster) = state.cluster_mut(&input.cluster_identifier) else {
+            return Err(DeleteComputeNodeGroupErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::CLUSTER, &input.cluster_identifier),
+            )
+            .into());
+        };
+        let Some(group_id) = cluster
+            .compute_node_group(&input.compute_node_group_identifier)
+            .map(|group| group.id.clone())
+        else {
+            return Err(DeleteComputeNodeGroupErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(
+                    crate::state::COMPUTE_NODE_GROUP,
+                    &input.compute_node_group_identifier,
+                ),
+            )
+            .into());
+        };
+
+        // "You must delete all queues associated with the compute node group first": a
+        // group a queue still assigns jobs to is in an unstable state to delete, whichever
+        // status that queue is in.
+        if !cluster.queues_assigning_to(&group_id).is_empty() {
+            return Err(DeleteComputeNodeGroupErrorModeled::ConflictException(
+                crate::state::compute_node_group_still_referenced(&group_id),
+            )
+            .into());
+        }
+
+        let Some(group) = cluster.compute_node_groups.get_mut(&group_id) else {
+            return Err(DeleteComputeNodeGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the compute node group disappeared while it was being read"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        // Only a settled group can be deleted: one still provisioning, or already on its
+        // way out, has an operation of its own in flight.
+        if group.status != crate::state::STATUS_ACTIVE {
+            return Err(DeleteComputeNodeGroupErrorModeled::ConflictException(
+                crate::state::not_active(crate::state::COMPUTE_NODE_GROUP, &group.id),
+            )
+            .into());
+        }
+
+        // PCS reports the group as DELETING until the delete comes due, then DELETED for
+        // one span before the record is forgotten (see [`crate::state::STATUS_DELETED`]).
+        group.status = crate::state::STATUS_DELETING.to_string();
+        group.modified_at = crate::state::now_date_time();
+        group.pending = Some(crate::state::Pending::in_a_span(
+            crate::state::PendingChange::MarkDeleted,
+        ));
+        Ok(DeleteComputeNodeGroupOutput {})
     }
 }

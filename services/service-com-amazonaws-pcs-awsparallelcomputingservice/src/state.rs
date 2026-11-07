@@ -54,12 +54,13 @@ use crate::ops::types::{
     Accounting, AccountingRequest, Cluster, ClusterSlurmConfiguration,
     ClusterSlurmConfigurationRequest, ClusterSummary, ComputeNodeGroup,
     ComputeNodeGroupConfiguration, ComputeNodeGroupSlurmConfiguration,
-    ComputeNodeGroupSlurmConfigurationRequest, ConflictException, CustomLaunchTemplate, Endpoint,
-    ErrorInfo, InstanceConfig, Networking, NetworkingRequest, NodeLifecycleActions,
-    NodeLifecycleActionsRequest, Queue, QueueSlurmConfiguration, QueueSlurmConfigurationRequest,
-    QueueSummary, ResourceNotFoundException, ScalingConfiguration, ScalingConfigurationRequest,
-    Scheduler, SchedulerRequest, ServiceQuotaExceededException, SlurmRest, SlurmRestRequest,
-    SpotOptions, UpdateClusterSlurmConfigurationRequest, ValidationException,
+    ComputeNodeGroupSlurmConfigurationRequest, ComputeNodeGroupSummary, ConflictException,
+    CustomLaunchTemplate, Endpoint, ErrorInfo, InstanceConfig, Networking, NetworkingRequest,
+    NodeLifecycleActions, NodeLifecycleActionsRequest, Queue, QueueSlurmConfiguration,
+    QueueSlurmConfigurationRequest, QueueSummary, ResourceNotFoundException, ScalingConfiguration,
+    ScalingConfigurationRequest, Scheduler, SchedulerRequest, ServiceQuotaExceededException,
+    SlurmRest, SlurmRestRequest, SpotOptions, UpdateClusterSlurmConfigurationRequest,
+    ValidationException,
     ValidationExceptionField,
 };
 
@@ -73,6 +74,17 @@ pub const STATUS_ACTIVE: &str = "ACTIVE";
 
 /// The status a cluster carries between `DeleteCluster` and its removal.
 pub const STATUS_DELETING: &str = "DELETING";
+
+/// The status a compute node group carries once its delete has come due, before the
+/// record is forgotten.
+///
+/// `ComputeNodeGroupStatus` is the ONLY one of the service's three status enums that
+/// declares a `DELETED` member (`COMPUTE_NODE_GROUP_STATUS_VALUES` in
+/// `crate::ops::types`, against `CLUSTER_STATUS_VALUES` and `QUEUE_STATUS_VALUES`), so a
+/// deleted compute node group is a thing the API can report and a deleted cluster or queue
+/// is not: the group is reported `DELETED` for one span and then forgotten, while a queue
+/// and a cluster go straight from `DELETING` to gone.
+pub const STATUS_DELETED: &str = "DELETED";
 
 /// The status a cluster carries while an `UpdateCluster` is being applied (a
 /// `ClusterStatus` member), until the clock owes it [`STATUS_ACTIVE`] again.
@@ -187,6 +199,9 @@ pub const MAX_REMEMBERED_CLIENT_TOKENS: usize = 1024;
 pub enum PendingChange {
     /// `CREATING` -> [`STATUS_ACTIVE`].
     Activate,
+    /// `DELETING` -> [`STATUS_DELETED`], and then owed [`PendingChange::Remove`] (see
+    /// [`STATUS_DELETED`] for why only a compute node group takes this step).
+    MarkDeleted,
     /// `DELETING` -> gone from state.
     Remove,
 }
@@ -382,6 +397,57 @@ impl ClusterRecord {
             .or_else(|| self.queues.values().find(|queue| queue.name == identifier))
     }
 
+    /// The ids of this cluster's queues that STILL assign jobs to the compute node group
+    /// `group_id`, in creation order.
+    ///
+    /// A queue's `computeNodeGroupConfigurations` name a group the way the request wrote
+    /// it — by its generated id or by its name, the two forms
+    /// `ComputeNodeGroupIdentifier` allows — so each configuration is resolved through
+    /// [`Self::compute_node_group`] before it is compared, rather than matched as text.
+    /// That makes this the ONE answer to "is this group still in use", which the delete
+    /// of a group and the delete of a queue cannot disagree about.
+    ///
+    /// A queue that is itself already being deleted is NOT counted: the dependency that
+    /// blocks a delete is an `ACTIVE` dependent ("A cluster to delete is in an unstable
+    /// state. For example, because it still has `ACTIVE` node groups or queues", the
+    /// model's own `ConflictException` example), so a caller deleting a hierarchy in order
+    /// is not made to wait out each child's removal before starting the next.
+    pub fn queues_assigning_to(&self, group_id: &str) -> Vec<String> {
+        let mut referencing: Vec<(u64, String)> = self
+            .queues
+            .values()
+            .filter(|queue| !queue.is_being_deleted())
+            .filter(|queue| {
+                queue
+                    .compute_node_group_configurations
+                    .iter()
+                    .filter_map(|configuration| configuration.compute_node_group_id.as_deref())
+                    .any(|named| {
+                        self.compute_node_group(named)
+                            .is_some_and(|group| group.id == group_id)
+                    })
+            })
+            .map(|queue| (queue.seq, queue.id.clone()))
+            .collect();
+        referencing.sort_by_key(|(seq, _)| *seq);
+        referencing.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// How many of this cluster's children still block its own delete: every queue and
+    /// compute node group that is not already being deleted (see
+    /// [`Self::queues_assigning_to`] for why a child on its way out does not).
+    pub fn blocking_children(&self) -> usize {
+        self.queues
+            .values()
+            .filter(|queue| !queue.is_being_deleted())
+            .count()
+            + self
+                .compute_node_groups
+                .values()
+                .filter(|group| !group.is_being_deleted())
+                .count()
+    }
+
     /// Apply every transition the clock owes this cluster and its children at `now`.
     /// `true` means the cluster itself is now owed removal.
     fn settle(&mut self, now: Instant) -> bool {
@@ -476,6 +542,25 @@ impl ComputeNodeGroupRecord {
     fn settle(&mut self, now: Instant) -> bool {
         apply_pending(&mut self.pending, &mut self.status, &mut self.modified_at, now)
     }
+
+    /// Whether this group is already on its way out, so it blocks no delete of the
+    /// cluster that holds it.
+    pub fn is_being_deleted(&self) -> bool {
+        self.status == STATUS_DELETING || self.status == STATUS_DELETED
+    }
+
+    /// The modelled `ComputeNodeGroupSummary` `ListComputeNodeGroups` returns.
+    pub fn to_summary(&self) -> ComputeNodeGroupSummary {
+        ComputeNodeGroupSummary {
+            name: self.name.clone(),
+            id: self.id.clone(),
+            arn: self.arn.clone(),
+            cluster_id: self.cluster_id.clone(),
+            created_at: self.created_at,
+            modified_at: self.modified_at,
+            status: self.status.clone(),
+        }
+    }
 }
 
 impl QueueRecord {
@@ -511,6 +596,12 @@ impl QueueRecord {
     /// Apply the transition the clock owes this queue at `now`; `true` means removal.
     fn settle(&mut self, now: Instant) -> bool {
         apply_pending(&mut self.pending, &mut self.status, &mut self.modified_at, now)
+    }
+
+    /// Whether this queue is already on its way out, so it blocks neither the delete of
+    /// a compute node group it assigns jobs to nor the delete of its cluster.
+    pub fn is_being_deleted(&self) -> bool {
+        self.status == STATUS_DELETING
     }
 }
 
@@ -765,6 +856,12 @@ fn apply_pending(
                 *pending = None;
                 false
             }
+            PendingChange::MarkDeleted => {
+                *status = STATUS_DELETED.to_string();
+                *modified_at = now_date_time();
+                *pending = Some(Pending::in_a_span(PendingChange::Remove));
+                false
+            }
             PendingChange::Remove => true,
         },
         _ => false,
@@ -928,6 +1025,57 @@ pub fn not_found(kind: ResourceKind, identifier: &str) -> ResourceNotFoundExcept
 pub fn cluster_not_active(cluster_id: &str) -> ConflictException {
     ConflictException {
         message: "A cluster isn't in ACTIVE status.".to_string(),
+        resource_id: cluster_id.to_string(),
+        resource_type: CLUSTER.resource_type.to_string(),
+    }
+}
+
+/// The modelled `ConflictException` (HTTP 409) for an operation on a resource of `kind`
+/// that is not in [`STATUS_ACTIVE`] — the child-resource counterpart of
+/// [`cluster_not_active`], worded the same way the service words that one and naming the
+/// resource by `resourceId` rather than in the sentence.
+pub fn not_active(kind: ResourceKind, resource_id: &str) -> ConflictException {
+    if kind == CLUSTER {
+        return cluster_not_active(resource_id);
+    }
+    ConflictException {
+        message: format!("A {} isn't in {STATUS_ACTIVE} status.", kind.noun),
+        resource_id: resource_id.to_string(),
+        resource_type: kind.resource_type.to_string(),
+    }
+}
+
+/// The modelled `ConflictException` (HTTP 409) for deleting a compute node group a queue
+/// of its cluster still assigns jobs to.
+///
+/// "You must delete all queues associated with the compute node group first"
+/// (`DeleteComputeNodeGroup`'s own documentation), which is the unstable state the model
+/// names among `ConflictException`'s examples. The sentence is the service's own FIXED
+/// text for that conflict and echoes no caller-supplied value: the group is named by
+/// `resourceId`, the way every other refusal of this service names its resource.
+pub fn compute_node_group_still_referenced(group_id: &str) -> ConflictException {
+    ConflictException {
+        message: "AWS PCS can't delete the compute node group you specified because the \
+                  cluster has associated queues."
+            .to_string(),
+        resource_id: group_id.to_string(),
+        resource_type: COMPUTE_NODE_GROUP.resource_type.to_string(),
+    }
+}
+
+/// The modelled `ConflictException` (HTTP 409) for deleting a cluster that still holds a
+/// queue or a compute node group.
+///
+/// "You must delete all queues and compute node groups associated with the cluster before
+/// you can delete the cluster" (`DeleteCluster`'s own documentation) — the "unstable
+/// state" the model names among `ConflictException`'s examples. The service's own FIXED
+/// sentence for it, echoing no caller-supplied value: the cluster is named by
+/// `resourceId`, as in [`compute_node_group_still_referenced`].
+pub fn cluster_still_has_children(cluster_id: &str) -> ConflictException {
+    ConflictException {
+        message: "AWS PCS can't delete the cluster you specified because it has associated \
+                  queues or compute node groups."
+            .to_string(),
         resource_id: cluster_id.to_string(),
         resource_type: CLUSTER.resource_type.to_string(),
     }
@@ -1136,6 +1284,14 @@ pub const PAGE_KIND_CLUSTERS: &str = "clusters";
 /// resume another cluster's.
 pub fn page_kind_queues(cluster_id: &str) -> String {
     format!("queues:{cluster_id}")
+}
+
+/// The listing kind
+/// [`ListComputeNodeGroups`](crate::ops::list_compute_node_groups)' page tokens carry, for
+/// one cluster — scoped the same way [`page_kind_queues`] is, so no token resumes another
+/// cluster's groups or another listing of the same cluster.
+pub fn page_kind_compute_node_groups(cluster_id: &str) -> String {
+    format!("computenodegroups:{cluster_id}")
 }
 
 /// The creation sequence a `nextToken` for the listing `kind` resumes after, or `None`

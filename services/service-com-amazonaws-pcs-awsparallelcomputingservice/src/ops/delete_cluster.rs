@@ -180,18 +180,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You must delete all queues and compute node groups associated with the cluster
         // first": a cluster that still holds either is in an unstable state to delete.
-        let children = cluster.queues.len() + cluster.compute_node_groups.len();
-        if children > 0 {
-            return Err(DeleteClusterErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "cluster {} still has {} queue(s) and {} compute node group(s); delete them first",
-                    cluster.id,
-                    cluster.queues.len(),
-                    cluster.compute_node_groups.len()
-                ),
-                resource_id: cluster.id.clone(),
-                resource_type: "cluster".to_string(),
-            })
+        if cluster.blocking_children() > 0 {
+            return Err(DeleteClusterErrorModeled::ConflictException(
+                crate::state::cluster_still_has_children(&cluster.id),
+            )
             .into());
         }
 

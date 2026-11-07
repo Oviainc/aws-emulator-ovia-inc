@@ -347,8 +347,8 @@ async fn a_name_this_endpoint_resolves_nothing_for_is_reported_not_refused() {
             "arn:aws:s3:::a-bucket-of-mine".to_string(),
         ),
         (
-            "the AWS-published namespace no caller can create a parameter in",
-            "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64".to_string(),
+            "a name in the AWS-published hierarchy that AWS publishes nothing under",
+            "/aws/service/ami-amazon-linux-latest/no-such-published-alias".to_string(),
         ),
         (
             "a name carrying an empty hierarchy level",

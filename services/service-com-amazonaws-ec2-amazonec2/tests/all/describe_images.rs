@@ -272,6 +272,16 @@ static DEPRECATED_CATALOG_NAMES: std::sync::LazyLock<Vec<String>> =
             .collect()
     });
 
+/// The catalog images that ARE eligible for the Free Tier, read off the specs rather than
+/// written out, so the row that filters on it cannot drift as the catalog grows.
+fn free_tier_catalog_names() -> Vec<String> {
+    published_image_specs()
+        .into_iter()
+        .filter(|spec| spec.free_tier_eligible)
+        .map(|spec| spec.name)
+        .collect()
+}
+
 /// `names` followed by the catalog's deprecated image names, for a table row whose filter
 /// selects those too.
 fn with_deprecated_catalog(names: &[&'static str]) -> Vec<&'static str> {
@@ -609,6 +619,7 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
     let seeded = seed(&engine);
     let account = engine::emulator_account_id().to_string();
     let catalog = catalog_names();
+    let free_tier_catalog = free_tier_catalog_names();
     let windows_snapshot = seeded.windows_snapshot_id.clone();
     let golden_location = format!("{account}/app-golden-2026-01-x86_64");
     let watermark_key = format!("{account}:approvedAmi");
@@ -624,6 +635,10 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
             vec![
                 "al2023-ami-2023.6.20241121.0-kernel-6.1-arm64",
                 "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-arm64",
+                // The published catalog's 64-bit Arm AWS PCS sample AMIs
+                // (`ec2::state::pcs_sample_image_specs`).
+                "aws-pcs-sample_ami-amzn2-arm64-slurm-24.11-2025.01.15",
+                "aws-pcs-sample_ami-al2023-arm64-slurm-24.11-2025.01.15",
                 "amzn2-ami-hvm-2.0.20241113.1-arm64-gp2",
                 "app-golden-2026-01-arm64",
             ],
@@ -636,6 +651,8 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
             vec![
                 "al2023-ami-2023.6.20241121.0-kernel-6.1-arm64",
                 "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-arm64",
+                "aws-pcs-sample_ami-amzn2-arm64-slurm-24.11-2025.01.15",
+                "aws-pcs-sample_ami-al2023-arm64-slurm-24.11-2025.01.15",
                 "amzn2-ami-hvm-2.0.20241113.1-arm64-gp2",
                 "app-golden-2026-01-arm64",
                 "legacy-i386-image",
@@ -685,6 +702,10 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
             vec![
                 "al2023-ami-2023.6.20241121.0-kernel-6.1-arm64",
                 "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-arm64",
+                // 64-bit Arm boots UEFI, so the catalog's Arm AWS PCS sample AMIs
+                // (`ec2::state::pcs_sample_image_specs`) are here too.
+                "aws-pcs-sample_ami-amzn2-arm64-slurm-24.11-2025.01.15",
+                "aws-pcs-sample_ami-al2023-arm64-slurm-24.11-2025.01.15",
                 "amzn2-ami-hvm-2.0.20241113.1-arm64-gp2",
             ],
         ),
@@ -695,6 +716,9 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
                 "amzn2-ami-hvm-2.0.20241113.1-x86_64-gp2",
                 "amzn2-ami-kernel-5.10-hvm-2.0.20241113.1-x86_64-gp2",
                 "amzn2-ami-minimal-hvm-2.0.20241113.1-x86_64-ebs",
+                // The x86 Amazon Linux 2 AWS PCS sample AMIs boot the same way.
+                "aws-pcs-sample_ami-amzn2-x86_64-slurm-24.11-2025.01.15",
+                "aws-pcs-sample_ami-amzn2-x86_64-slurm-24.05-2025.01.15",
             ]),
         ),
         // "You can use a wildcard (*), for example, 2021-09-29T*, which matches an entire
@@ -728,7 +752,7 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
         (
             "free-tier-eligible",
             vec!["true".into()],
-            borrowed(&catalog),
+            borrowed(&free_tier_catalog),
         ),
         ("hypervisor", vec!["ovm".into()], vec!["legacy-i386-image"]),
         // No account declares Allowed AMIs criteria, so no image fails them.

@@ -28,6 +28,10 @@
 //! the service trims each name, and a trimmed name that still carries spaces between
 //! characters fails the request with a `ValidationException`.
 //!
+//! A name in the hierarchy AWS publishes its own parameters in is resolved against THAT
+//! catalog ([`crate::state::public_parameters`]), which no account's store holds anything
+//! of, so only a name neither the store nor the catalog holds is reported as unresolvable.
+//!
 //! The parameters are reported in alphabetical order of their names ("The results for
 //! GetParameters requests are listed in alphabetical order in query responses",
 //! `GetParametersRequest$Names`), whatever order they were asked in, and the unresolvable
@@ -241,6 +245,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let account = ::engine::emulator_account_id();
 
+        // AWS's own published parameters ([`crate::state::public_parameters`]) are resolved
+        // beside the account's: a name in the hierarchy AWS owns is in no account's store,
+        // so it is resolved against the catalog and only a name NEITHER holds is reported
+        // as one this read could not resolve. Projected BEFORE the store guard is taken, so
+        // no state of this service is held while the catalog's own store is read.
+        let published =
+            crate::state::public_parameters::published_among(&*self.engine, &region, &asked);
+
         // The store guard is released before the keys are asked, so no state of this
         // service is held while KMS's decision is made.
         let (mut parameters, invalid_parameters, to_open) = {
@@ -266,7 +278,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     invalid.push(name.to_string());
                     continue;
                 }
-                let Some(record) = store.parameter(&region, query.name) else {
+                let Some(record) = store
+                    .parameter(&region, query.name)
+                    .or_else(|| published.get(query.name))
+                else {
                     invalid.push(name.to_string());
                     continue;
                 };

@@ -46,10 +46,12 @@ const MISSING: &[Row] = &[
         name: "team/service/absent",
     },
     // "PutParameter refuses a name prefixed with aws or ssm", so no caller can have
-    // created one of these and every read of one is a miss.
+    // created one of these — and AWS publishes nothing under this one, so every read of it
+    // is a miss (a name AWS DOES publish resolves against its catalog instead; see
+    // `all/public_parameter_catalog.rs`).
     Row {
         case: "the AWS-managed namespace no caller can write",
-        name: "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64",
+        name: "/aws/service/ami-amazon-linux-latest/no-such-published-alias",
     },
     Row {
         case: "a name whose every character is part of the path",

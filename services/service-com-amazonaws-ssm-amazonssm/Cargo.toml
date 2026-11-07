@@ -31,6 +31,10 @@ service-common = { path = "../common" }
 # have it decrypted for its caller is that key's own policy decision, read through KMS's
 # own state accessors rather than from a second copy of them here.
 service-com-amazonaws-kms-trentservice = { workspace = true }
+# The image catalog Amazon EC2 publishes: the AWS-published parameters of the `/aws`
+# hierarchy resolve to the ids of the images that service holds, which is the one place
+# this emulator records which AMI a public parameter names.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # `CreateDocument`'s content is "in JSON or YAML format", and the document's schema
 # version, description and parameters are read out of it. yaml-rust2 is a pure-Rust
 # YAML 1.2 implementation, and YAML 1.2 is a superset of JSON, so one parser reads

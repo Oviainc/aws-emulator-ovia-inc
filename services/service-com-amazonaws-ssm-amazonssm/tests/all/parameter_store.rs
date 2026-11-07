@@ -595,8 +595,8 @@ async fn reading_what_was_never_stored_is_parameter_not_found() {
         ("sibling of a stored name", "/Dev/Stored2"),
         ("parent of a stored name", "/Dev"),
         (
-            "AWS-owned public parameter",
-            "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64",
+            "a name in the AWS-owned hierarchy that AWS publishes nothing under",
+            "/aws/service/ami-amazon-linux-latest/no-such-published-alias",
         ),
         (
             "ARN of another account",

@@ -28,13 +28,19 @@
 //! `ParameterNotFound` — the error code alone, with NO message: the shape's `message` is an
 //! optional member and Parameter Store words none for this refusal, so nothing here invents
 //! a sentence for it. The same holds for every read and delete of this slice that reports a
-//! name it holds no parameter for. This includes the AWS-managed `/aws/...` namespace (the public
-//! AMI-alias parameters, say). No caller can create one — `PutParameter` refuses a name
-//! prefixed with `aws` or `ssm` — and this emulator seeds none: their values are AWS's
-//! own published catalog data (an AMI id for a Region and a release), which nothing here
-//! computes and no other operation of this emulator would recognise. Answering with an
-//! invented id would be fabricating a value nothing produced, so such a read reports the
-//! modelled error instead.
+//! name it holds no parameter for.
+//!
+//! ## AWS's own parameters
+//!
+//! The AWS-managed `/aws` hierarchy is NOT the account's: no caller can write there —
+//! `PutParameter` refuses a name prefixed with `aws` or `ssm` — and AWS publishes its own
+//! parameters in it, in every account and Region alike. A name in that hierarchy is
+//! therefore resolved against the published catalog
+//! ([`crate::state::public_parameters`]) rather than against the store, and only a name
+//! neither holds is `ParameterNotFound`. What the catalog publishes is read out of the
+//! state that OWNS it — the public parameter names Amazon EC2's image catalog publishes an
+//! AMI under, and the id of that image — so the value a read reports is the id of an image
+//! this account can really launch rather than an invented one.
 //!
 //! ## Shape of an operation
 //!
@@ -253,10 +259,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The store guard is released before the key is asked, so no state of this
         // service is held while KMS's decision is made.
+        let published = crate::state::public_parameters::published(
+            &*self.engine,
+            &region,
+            query.name,
+        );
         let (mut parameter, to_open) = {
             let store = state.lock();
-            let Some(record) = store.parameter(&region, query.name) else {
-                return Err(not_found().into());
+            let record = match store.parameter(&region, query.name) {
+                Some(record) => record,
+                // A name in the hierarchy AWS publishes its own parameters in is resolved
+                // against THAT catalog, which this account's store holds nothing of; a
+                // name neither holds is the miss below.
+                None => match published.as_ref() {
+                    Some(record) => record,
+                    None => return Err(not_found().into()),
+                },
             };
             let Some(version) = record.select(query.selector) else {
                 // The parameter exists, so what the request named is a version or a label

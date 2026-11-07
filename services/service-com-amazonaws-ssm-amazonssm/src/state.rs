@@ -131,6 +131,10 @@ pub mod document_format;
 /// decision the KMS key the value is sealed under makes rather than this service.
 pub mod secure_string;
 
+/// The parameters AWS itself publishes in the `/aws` hierarchy of every Region, which a
+/// read resolves beside the parameters this account wrote.
+pub mod public_parameters;
+
 /// A command a caller sent to the managed nodes of one Region, and the invocation each of
 /// those nodes holds of it.
 pub mod commands;
@@ -210,6 +214,9 @@ pub const TYPE_SECURE_STRING: &str = "SecureString";
 /// See [`TYPE_SECURE_STRING`]. A value of this type is a list: "Items in a StringList
 /// must be separated by a comma (,)" (`PutParameter`'s `Type` doc).
 pub const TYPE_STRING_LIST: &str = "StringList";
+
+/// See [`TYPE_SECURE_STRING`]: the plain, unencrypted scalar value.
+pub const TYPE_STRING: &str = "String";
 
 /// The separator between the items of a [`TYPE_STRING_LIST`] value (same doc: "You
 /// can't use other punctuation or special character to escape items in the list").
@@ -923,12 +930,26 @@ impl ParameterRecord {
 /// The ARN of the parameter `name` names in `region` — the one spelling of it, for a
 /// caller that holds no record to ask ([`ParameterRecord::arn`] is the same ARN).
 ///
-/// A hierarchical name keeps its whole path after the `parameter/` prefix.
+/// A hierarchical name keeps its whole path after the `parameter/` prefix. A name in AWS's
+/// own published hierarchy carries no account at all (see below).
 pub fn parameter_arn(region: &str, name: &str) -> String {
-    ::engine::emulator_arn(
+    let owned_by_this_account = ::engine::emulator_arn(
         ARN_SERVICE,
         region,
         &format!("{ARN_RESOURCE_PREFIX}{}", canonical_name(name)),
+    );
+    if !public_parameters::is_published_name(name) {
+        return owned_by_this_account;
+    }
+    // A parameter in AWS's own hierarchy ([`public_parameters`]) belongs to no account —
+    // AWS publishes it in every account and Region alike and no account can write it — so
+    // its ARN names none: the account field is EMPTY where an account's own parameter
+    // carries this endpoint's account. Derived from the canonical ARN above rather than
+    // spelled out, so both forms name the same partition, service, Region and resource.
+    owned_by_this_account.replacen(
+        &format!(":{}:", ::engine::emulator_account_id()),
+        "::",
+        1,
     )
 }
 
