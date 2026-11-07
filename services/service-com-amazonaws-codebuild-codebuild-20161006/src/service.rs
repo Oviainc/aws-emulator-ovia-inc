@@ -40,13 +40,14 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use aws_smithy_schema::{Schema, ShapeType};
-use aws_smithy_schema_server::{Violation, ViolationKind};
+use aws_smithy_schema::Schema;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
-use std::collections::BTreeSet;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
+
+/// How this service words a request the framework refused before any handler ran.
+mod refusal;
 
 /// The `com-amazonaws-codebuild-codebuild-20161006` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -103,35 +104,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // ("The input value that was provided is not valid"), the client-input error
         // every operation in its model declares; the framework's default code is a
         // synthetic `ValidationException` no CodeBuild client branches on. Both the
-        // code and the message are replaced together. The message keeps the
-        // framework's own wording, which names the member and the constraint it
-        // failed, so the clause a caller has to act on is single-homed there — with
-        // the offending value re-rendered in its member's own wire form by
-        // [`rendered_in_member_type`]. The exception is the one member CodeBuild
-        // refuses with a sentence of its own, below.
+        // code and the message are replaced together, and the sentence is chosen per
+        // broken RULE by [`refusal::message`]: the constraint classes CodeBuild words
+        // itself get its own sentence, and every other violation keeps the shared
+        // envelope naming the member and the constraint it failed.
         match refusal {
-            Refusal::Invalid(violations) => {
-                // One member is CodeBuild's own to refuse rather than the shared
-                // constraint walk's: a sort order outside its enum is answered by the
-                // sentence the service states for it ([`INVALID_SORT_ORDER_MESSAGE`]),
-                // so no caller is told its list request failed generic request
-                // validation. That sentence is the whole answer whenever such a
-                // violation is among the ones found — the service refuses the sort order
-                // it was handed rather than reporting a constraint envelope beside it —
-                // and every other violation keeps the framework's wording.
-                let message = if violations.iter().any(is_sort_order_violation) {
-                    INVALID_SORT_ORDER_MESSAGE.to_string()
-                } else {
-                    let stated: Vec<Violation> =
-                        violations.iter().map(rendered_in_member_type).collect();
-                    aws_smithy_schema_server::envelope(&stated)
-                        .unwrap_or_else(|| "Invalid input".to_string())
-                };
-                Some(Refused {
-                    code: "InvalidInputException".to_string(),
-                    message,
-                })
-            }
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "InvalidInputException".to_string(),
+                message: refusal::message(violations),
+            }),
             // Authentication is the framework's answer to give, not this service's.
             _ => None,
         }
@@ -235,116 +216,4 @@ const INPUT_SCHEMAS: &[&Schema] = &[
     crate::ops::types::UPDATE_WEBHOOK_INPUT_SCHEMA,
 ];
 
-/// The validation paths, across every input in [`INPUT_SCHEMAS`], of the members
-/// the model types as `float` or `double`.
-///
-/// Built once from the schemas themselves, so nothing here names a member: a path
-/// is in this set exactly when the MODEL says that member is floating point.
-/// Codegen emits a member schema without its target's own members
-/// (`Schema::new_member` takes a shape type and a name), so the walk sees each
-/// input's top-level members — which is where this service's floating-point
-/// members are (`DescribeCodeCoverages$minLineCoveragePercentage` and
-/// `$maxLineCoveragePercentage`, both targeting `Percentage`).
-fn floating_point_member_paths() -> &'static BTreeSet<String> {
-    static PATHS: LazyLock<BTreeSet<String>> = LazyLock::new(|| {
-        let mut paths = BTreeSet::new();
-        for input in INPUT_SCHEMAS {
-            for member in input.members() {
-                let Some(name) = member.member_name() else {
-                    continue;
-                };
-                if matches!(member.shape_type(), ShapeType::Float | ShapeType::Double) {
-                    // The casing of a validation path segment belongs to the path,
-                    // not to the model, so it is spelled by the framework module
-                    // that owns that spelling.
-                    paths.insert(aws_smithy_schema_server::constraints::path::member(name));
-                }
-            }
-        }
-        paths
-    });
-    &PATHS
-}
 
-/// `violation` with the offending value rendered in the wire form of the member's
-/// own modelled type.
-///
-/// AWS states a constraint violation as `Value '<value>' at '<member path>' failed
-/// to satisfy constraint: …`, and the value it echoes is written the way that
-/// member's type is written on the wire: a floating-point member always carries a
-/// fractional part (`150` sent for a `double` is stated as `'150.0'`), an integral
-/// member never does. The framework renders every numeric leaf with Rust's
-/// `to_string`, which prints an integral `f64` as `150`, so this restores the point
-/// for exactly the members [`floating_point_member_paths`] reports as floating
-/// point. Every other violation — and any value that is not a number — is left
-/// exactly as the framework worded it.
-fn rendered_in_member_type(violation: &Violation) -> Violation {
-    let stated = violation.clone();
-    let Some(shown) = violation.value.as_deref() else {
-        return stated;
-    };
-    if !floating_point_member_paths().contains(&member_path_of(&violation.path)) {
-        return stated;
-    }
-    let Ok(value) = shown.parse::<f64>() else {
-        return stated;
-    };
-    Violation {
-        // `{value:?}` is the shortest text that round-trips an `f64` AND always
-        // carries a point or an exponent; `to_string` would print `150` again.
-        value: Some(format!("{value:?}")),
-        ..stated
-    }
-}
-
-/// `path` with the position or key of each collection step dropped, so a member
-/// inside a list or a map answers to the one path its member schema has.
-///
-/// A violation path spells a collection step as `<position-or-key>.member`
-/// (`ids.1.member`); the model knows that member only as `ids.member`.
-fn member_path_of(path: &str) -> String {
-    let mut segments: Vec<&str> = Vec::new();
-    for segment in path.split('.') {
-        // The caller-chosen key of a map entry could itself be the literal
-        // `member`; that only ever costs this one path a match, since the key is
-        // dropped either way.
-        if segment == COLLECTION_STEP {
-            segments.pop();
-        }
-        segments.push(segment);
-    }
-    segments.join(".")
-}
-
-/// The segment a validation path puts between a collection and its element, as
-/// `aws_smithy_schema_server::constraints::path` spells it.
-const COLLECTION_STEP: &str = "member";
-
-/// What CodeBuild states as the reason a list request asked for a sort order it does
-/// not define, carried by the modelled `InvalidInputException`.
-///
-/// The sentence is FIXED: it quotes neither the rejected value, the member path nor the
-/// permitted set, so it is the same on every request and every operation that takes a
-/// sort order. Recorded behaviour — the model states no message for the error.
-const INVALID_SORT_ORDER_MESSAGE: &str = "Invalid sort order specified";
-
-/// `true` when `violation` is a value outside the model's `SortOrderType` value set.
-///
-/// A violation carries the value set from the schema of the member that failed, so the
-/// comparison is against the MODEL rather than against a member name: every operation
-/// whose input models a sort order is covered, including the ones whose handlers are
-/// still scaffolded, and no other enum of this service declares the same values.
-fn is_sort_order_violation(violation: &Violation) -> bool {
-    let declared = crate::ops::types::SORT_ORDER_TYPE_VALUES;
-    match &violation.kind {
-        // Set equality, so the order codegen happens to list an enum's values in is
-        // not part of the test.
-        ViolationKind::EnumValue(allowed) => {
-            allowed.len() == declared.len()
-                && allowed
-                    .iter()
-                    .all(|value| declared.contains(&value.as_str()))
-        }
-        _ => false,
-    }
-}

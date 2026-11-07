@@ -139,8 +139,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         // A read: it reports what CreateProject stored, in the order the request
-        // named the projects, and splits the names it does not hold into
-        // `projectsNotFound`. The names are resolved as a SET
+        // named the projects, and splits the identifiers it does not hold into
+        // `projectsNotFound`. `names` is documented as "The names or ARNs of the build        // projects", so each identifier is resolved through
+        // `crate::state::ComAmazonawsCodebuildCodebuild20161006State::project_by_identifier`,
+        // which takes either form — and an identifier that resolves to nothing is
+        // reported back exactly as the request sent it, so a caller that asked by ARN
+        // can match the answer to what it asked. The identifiers are resolved as a SET
         // ([`crate::state::distinct_identifiers`]), so a request naming one project
         // twice is answered with one entry for it. The webhook's `secret` is the one
         // member a read withholds
@@ -149,12 +153,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let guard = state.lock();
         let mut projects = Vec::new();
         let mut not_found = Vec::new();
-        for name in crate::state::distinct_identifiers(&input.names) {
-            match guard.projects.get(name) {
-                Some(stored) => projects.push(crate::state::project_without_webhook_secret(
-                    stored.project.clone(),
-                )),
-                None => not_found.push(name.to_string()),
+        for identifier in crate::state::distinct_identifiers(&input.names) {
+            match guard.project_by_identifier(identifier) {
+                // One project is reported once however many identifiers named it: the
+                // list names the SET of projects the call is about, and the name and the
+                // ARN are two spellings of the same one
+                // ([`crate::state::distinct_identifiers`], which drops a repeat of the
+                // same spelling).
+                Some(stored) => {
+                    if !projects
+                        .iter()
+                        .any(|reported: &Project| reported.arn == stored.project.arn)
+                    {
+                        projects.push(crate::state::project_without_webhook_secret(
+                            stored.project.clone(),
+                        ));
+                    }
+                }
+                None => not_found.push(identifier.to_string()),
             }
         }
 

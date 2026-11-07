@@ -293,6 +293,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A build RUNS AS the role it is started with, so an override has to name a role
+        // CodeBuild can assume: `serviceRoleOverride` is "The name of a service role for
+        // this build that overrides the one specified in the build project", and a build
+        // started under a role this account does not hold, or one whose trust policy does
+        // not admit this service, could never run. Asked of IAM itself (the shared reading
+        // in `service_common::iam_role`, the same question `CreateProject` asks of the
+        // role a project is stored with) before any state of this service is touched, so a
+        // refused request starts no build. A request that overrides nothing is not asked:
+        // the project's own role was settled when the project was stored.
+        if let Some(role_arn) = input.service_role_override.as_deref() {
+            if service_common::iam_role::role_is_unassumable(
+                ctx,
+                &region,
+                role_arn,
+                crate::state::SERVICE_PRINCIPAL,
+            )
+            .await
+            {
+                return Err(StartBuildErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(crate::state::UNASSUMABLE_SERVICE_ROLE_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
         // READ PASS: take the shared lock only long enough to copy the project and
         // settle the idempotency question, then release it so none of the
         // caller-driven resolution below runs inside the critical section every other

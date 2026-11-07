@@ -232,6 +232,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A source that HAS input source code must say where that code is; the rule
+        // holds wherever a project's source is set, so `UpdateProject` applies the same
+        // check to the configuration one of its requests would leave behind. Needs no
+        // state, so it is checked beside the buildspec rule above.
+        if let Some(message) = crate::state::source_location_violation(&input.source) {
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&arn),
+            );
+            return Err(CreateProjectErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // A batch build configuration states the wait the batch it configures is held
         // to, so a `timeoutInMins` outside the window AWS documents is refused wherever
         // one is accepted — here, `UpdateProject` and `StartBuildBatch`'s override —
@@ -251,6 +270,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateProjectErrorModeled::InvalidInputException(
                 InvalidInputException {
                     message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // A project RUNS AS the service role it is created with, so the role has to be
+        // one CodeBuild can assume: `serviceRole` is "The ARN of the IAM role that
+        // enables CodeBuild to interact with dependent Amazon Web Services services on
+        // behalf of the Amazon Web Services account", and a project stored with a role
+        // this account does not hold, or one whose trust policy does not admit this
+        // service, could never run a build. The question is asked of IAM itself (the
+        // shared reading in `service_common::iam_role`), while no state of this service
+        // is held, and before anything is persisted.
+        if service_common::iam_role::role_is_unassumable(
+            ctx,
+            &region,
+            &input.service_role,
+            crate::state::SERVICE_PRINCIPAL,
+        )
+        .await
+        {
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&arn),
+            );
+            return Err(CreateProjectErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::UNASSUMABLE_SERVICE_ROLE_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -356,6 +405,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 project: project.clone(),
                 created_millis: now,
                 last_modified_millis: now,
+                // Nothing has been cached for a project that has never built, so there
+                // is no reset instant to report until `InvalidateProjectCache` makes one.
+                cache_invalidated_millis: None,
             },
         );
         // The lock is dropped before the audit record is written, so a log consumer

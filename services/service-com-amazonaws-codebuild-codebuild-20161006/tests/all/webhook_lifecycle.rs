@@ -110,7 +110,7 @@ async fn create_project(router: &MultiServiceRouter, name: &str, source_type: &s
         "CreateProject",
         json!({
             "name": name,
-            "source": {"type": source_type, "buildspec": "version: 0.2"},
+            "source": source_of(source_type),
             "artifacts": {"type": "NO_ARTIFACTS"},
             "environment": {
                 "type": "LINUX_CONTAINER",
@@ -127,6 +127,11 @@ async fn create_project(router: &MultiServiceRouter, name: &str, source_type: &s
     );
     import_source_credentials(router, source_type).await;
 }
+
+// A project source of `source_type` that satisfies the location rule, taken from the
+// shared harness so this suite does not restate it (see
+// `project_build_lifecycle::source_of`).
+use super::project_build_lifecycle::source_of;
 
 /// Hold an access token for `server_type` — one of the model's `ServerType` values, so
 /// nothing is imported for a source type that has no repository provider.

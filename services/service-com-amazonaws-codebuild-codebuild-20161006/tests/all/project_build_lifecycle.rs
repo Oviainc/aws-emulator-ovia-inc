@@ -172,6 +172,27 @@ pub(crate) fn expected_arn(resource: &str) -> String {
     )
 }
 
+/// A project source of `source_type` that states everything CodeBuild requires of one:
+/// its buildspec inline, and — for every type that HAS input source code of its own —
+/// the `location` that code lives at (`ProjectSource$location`: "If you specify
+/// CODEPIPELINE for the Type property, don't specify this property. For all of the other
+/// types, you must specify Location"; `NO_SOURCE` has no source code to locate).
+///
+/// Shared by every suite that creates a project per source type, so the rule is encoded
+/// once: a suite whose subject is something else is then never decided by this one.
+pub(crate) fn source_of(source_type: &str) -> Value {
+    let mut source = json!({"type": source_type, "buildspec": "version: 0.2"});
+    let needs_location =
+        source_type != state::NO_SOURCE_TYPE && source_type != state::CODEPIPELINE_SOURCE_TYPE;
+    if let (Value::Object(members), true) = (&mut source, needs_location) {
+        members.insert(
+            "location".to_string(),
+            json!("https://example.test/repo/source"),
+        );
+    }
+    source
+}
+
 /// The whole slice, in the order a client drives it: every read reports what the
 /// preceding write persisted.
 #[tokio::test]
@@ -1040,6 +1061,7 @@ async fn list_projects_orders_by_each_sort_by_criterion() {
                     },
                     created_millis: created,
                     last_modified_millis: last_modified,
+                    cache_invalidated_millis: None,
                 },
             );
         }
@@ -1293,6 +1315,7 @@ async fn each_per_request_store_is_bounded_at_its_growth_site() {
                     },
                     created_millis: 0,
                     last_modified_millis: 0,
+                    cache_invalidated_millis: None,
                 },
             );
         }

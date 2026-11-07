@@ -26,6 +26,11 @@ tracing = { workspace = true }
 # RFC 9562 version-8 id.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `iam_role`: the workspace's ONE reading of a caller-supplied IAM role ARN — which role
+# of this account it names, and whether that role's trust policy admits a service
+# principal — which `CreateProject` and `StartBuild` ask before storing a project or
+# starting a build that would RUN AS the role the request hands over.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

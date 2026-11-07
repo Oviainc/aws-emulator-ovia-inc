@@ -935,6 +935,18 @@ pub struct StoredProject {
     pub created_millis: i64,
     /// Epoch millis the project was last changed at.
     pub last_modified_millis: i64,
+    /// Epoch millis the project's build cache was last reset at — `None` until
+    /// `InvalidateProjectCache` resets it. It is the instant a cache the project
+    /// carries ([`effective_cache`]) is valid FROM, so anything cached before it was
+    /// discarded by that call; it is not part of the modelled [`Project`], because
+    /// CodeBuild reports no member for it.
+    ///
+    /// Nothing READS it yet, and no response can: the one thing that would consult it is
+    /// a build restoring the project's cache, and this emulator runs no build (see
+    /// [`BUILD_NOT_EXECUTED_MESSAGE`]). It is kept because it is the state the reset
+    /// produces — a test reads it through the store the handler writes — rather than
+    /// because a reader exists for it today.
+    pub cache_invalidated_millis: Option<i64>,
 }
 
 /// A persisted build: the modelled [`Build`] plus the instant at which the clock
@@ -1686,6 +1698,24 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
             self.resource_policies.remove(arn);
         }
         true
+    }
+
+    /// The project `identifier` names, if this account holds it — where the identifier
+    /// is either the NAME the project is keyed by or the ARN that project carries.
+    ///
+    /// `BatchGetProjectsInput$names` is documented as "The names or ARNs of the build
+    /// projects", so an operation that takes a project identifier resolves both forms
+    /// through here. An ARN is resolved the way [`Self::report_group_by_arn`] resolves
+    /// one: its resource segment names the key, and the candidate is kept only if its
+    /// STORED ARN is exactly the one asked for, so an ARN for another partition, region,
+    /// account or resource type can never resolve to a local project. A value that is no
+    /// ARN of this service is taken as the name itself.
+    pub fn project_by_identifier(&self, identifier: &str) -> Option<&StoredProject> {
+        let Some(name) = project_name_from_arn(identifier) else {
+            return self.projects.get(identifier);
+        };
+        let stored = self.projects.get(name)?;
+        (stored.project.arn.as_deref() == Some(identifier)).then_some(stored)
     }
 
     /// The report group `arn` names, if this account holds it.
@@ -3950,3 +3980,101 @@ pub fn build_batch_config_violation(
 /// states no message for the error.
 pub const PROJECT_NOT_BATCH_ENABLED_MESSAGE: &str =
     "BatchConfig must be configured on the project to use the BuildBatch feature";
+
+/// The `ProjectSource$type` value whose source code is supplied by the pipeline action a
+/// build runs under rather than by the project, one of `SourceType`'s modelled values.
+/// The model documents it as the one type that states no `location`: "If you specify
+/// CODEPIPELINE for the Type property, don't specify this property."
+pub const CODEPIPELINE_SOURCE_TYPE: &str = "CODEPIPELINE";
+
+/// What CodeBuild states as the reason a source states no location it could be built
+/// from, carried by the modelled `InvalidInputException`.
+///
+/// Fixed text, under [`SANDBOX_NOT_FOUND_MESSAGE`]'s rule: it names the member of the
+/// project configuration that is incomplete and the member missing from it, and quotes
+/// nothing of the request — so the sentence is the same for every source type the rule
+/// covers. It is the sentence CodeBuild states for the same rule on the OTHER member that
+/// needs a location, the project's artifacts (`Invalid artifacts: location is required`),
+/// with the member at fault swapped for this one. Recorded behaviour — the model states no
+/// message for the error.
+pub const SOURCE_LOCATION_REQUIRED_MESSAGE: &str = "Invalid source: location is required";
+
+/// Why `source` states no location it could be built from, as the message the modelled
+/// `InvalidInputException` carries — or `None` when it states one, or needs none.
+///
+/// `ProjectSource$location` is "Information about the location of the source code to be
+/// built", and the model states the rule outright: "If you specify `CODEPIPELINE` for the
+/// `Type` property, don't specify this property. For all of the other types, you must
+/// specify `Location`." [`NO_SOURCE_TYPE`] is the other type that needs none — it "does
+/// not have input source code" at all, so there is no location for it to name — and the
+/// two are the whole set of types that carry their source from somewhere other than a
+/// location of their own. So the refusal holds wherever a project's source is SET
+/// (`CreateProject` and `UpdateProject` alike), rather than persisting a project whose
+/// source could never be resolved.
+///
+/// A location of nothing but whitespace counts as absent, for the reason
+/// [`inline_buildspec_violation`] reads an all-whitespace buildspec as absent: such a
+/// value names no object, repository or clone URL either.
+///
+/// Only a PRIMARY source is checked, under [`inline_buildspec_violation`]'s rule.
+pub fn source_location_violation(source: &crate::ops::types::ProjectSource) -> Option<String> {
+    if source.r#type == CODEPIPELINE_SOURCE_TYPE || source.r#type == NO_SOURCE_TYPE {
+        return None;
+    }
+    let states_location = source
+        .location
+        .as_ref()
+        .is_some_and(|location| !location.trim().is_empty());
+    (!states_location).then(|| SOURCE_LOCATION_REQUIRED_MESSAGE.to_string())
+}
+
+/// What CodeBuild states as the reason a build id names nothing it could address,
+/// carried by the modelled `InvalidInputException`.
+///
+/// Fixed text, under [`SANDBOX_NOT_FOUND_MESSAGE`]'s rule: the rejected value is the
+/// caller's own and is not quoted back, so the sentence is the same for every malformed
+/// id. Recorded behaviour — the model states no message for the error.
+pub const INVALID_BUILD_ID_MESSAGE: &str = "Invalid build ID provided";
+
+/// Whether `value` ADDRESSES a build at all: it has the `<projectName>:<uuid>` shape
+/// every build this service mints is keyed by ([`project_name_from_resource_id`]), or it
+/// is a build ARN of this service, whose resource segment is such an id
+/// ([`build_id_from_arn`]).
+///
+/// A value of neither form addresses no build that could ever exist, which CodeBuild
+/// refuses as bad input ([`INVALID_BUILD_ID_MESSAGE`]) rather than reporting as a build
+/// it does not hold — a value that DOES address one, for a build nobody started, is the
+/// case that belongs in the not-found half of a batch read. The ARN form is admitted
+/// here rather than refused because nothing records CodeBuild refusing it, and a reader
+/// keyed by id reports it absent either way.
+pub fn addresses_a_build(value: &str) -> bool {
+    project_name_from_resource_id(value).is_some() || build_id_from_arn(value).is_some()
+}
+
+/// The service principal CodeBuild assumes a project's service role as, from the ARN
+/// namespace of this service: a role a project runs under has to admit it, and
+/// `CreateProject$serviceRole` is "The ARN of the IAM role that enables CodeBuild to
+/// interact with dependent Amazon Web Services services on behalf of the Amazon Web
+/// Services account".
+pub const SERVICE_PRINCIPAL: &str = "codebuild.amazonaws.com";
+
+/// What CodeBuild states as the reason the role a request hands it is one it cannot run a
+/// build under, carried by the modelled `InvalidInputException`.
+///
+/// Fixed text, under [`SANDBOX_NOT_FOUND_MESSAGE`]'s rule: CodeBuild names the pass it
+/// could not make — `sts:AssumeRole` on the service role — and then the conditions the
+/// caller has to check, rather than quoting the role the request named, so the sentence is
+/// the same whether this account holds no such role or the role's trust policy does not
+/// admit this service ([`SERVICE_PRINCIPAL`]). Those are exactly the two conditions
+/// `service_common::iam_role` asks IAM about, which is why they are the two the sentence
+/// states. Recorded behaviour — the model states no message for the error.
+///
+/// The prefix up to and including the first condition is the recorded text verbatim; the
+/// second condition is stated in the service's own terms, because the recording available
+/// here is clipped after the first. It is the one part of this sentence that may still
+/// differ from AWS's, and it is to be replaced the moment a full recording of this refusal
+/// is at hand.
+pub const UNASSUMABLE_SERVICE_ROLE_MESSAGE: &str =
+    "CodeBuild is not authorized to perform: sts:AssumeRole on service role. Please verify \
+     that: 1) The provided service role exists, 2) The service role's trust policy allows \
+     codebuild.amazonaws.com to assume it.";

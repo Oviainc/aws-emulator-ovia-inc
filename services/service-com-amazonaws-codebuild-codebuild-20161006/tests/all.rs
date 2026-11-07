@@ -29,6 +29,8 @@ mod delete_fleet;
 mod delete_report_group;
 #[path = "all/fleet_lifecycle.rs"]
 mod fleet_lifecycle;
+#[path = "all/input_constraint_wording.rs"]
+mod input_constraint_wording;
 #[path = "all/list_build_batches.rs"]
 mod list_build_batches;
 #[path = "all/list_build_batches_for_project.rs"]
@@ -53,6 +55,8 @@ mod project_build_batch_lifecycle;
 mod project_build_lifecycle;
 #[path = "all/project_effective_configuration.rs"]
 mod project_effective_configuration;
+#[path = "all/project_source_and_identity.rs"]
+mod project_source_and_identity;
 #[path = "all/project_visibility.rs"]
 mod project_visibility;
 #[path = "all/read_response_shape.rs"]

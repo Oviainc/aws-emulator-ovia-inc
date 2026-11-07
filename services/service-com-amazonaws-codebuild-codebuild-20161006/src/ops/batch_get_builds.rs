@@ -136,6 +136,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
+        // Every id has to ADDRESS a build — the `<projectName>:<uuid>` form every build
+        // of this service is keyed by, or the ARN whose resource segment is such an id.
+        // A value of neither form addresses no build that could ever exist, so CodeBuild
+        // refuses the request rather than reporting it as a build it does not hold: the
+        // not-found half is for ids nobody started a build under. Checked for every id
+        // before any is resolved, so one malformed value refuses the whole request.
+        if input
+            .ids
+            .iter()
+            .any(|id| !crate::state::addresses_a_build(id))
+        {
+            return Err(BatchGetBuildsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::INVALID_BUILD_ID_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         let now = crate::state::now_millis();
         let mut guard = state.lock();
         let mut builds = Vec::new();

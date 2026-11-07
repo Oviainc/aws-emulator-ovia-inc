@@ -155,5 +155,32 @@ Cause 8: privilegedMode=None; 'an untagged project reports tags None'; KeyError 
 Cause 9: ResourceNotFoundException 'Project cannot be found: ...project/sim2real-cb-proj-cea66fa4ff0e' after the stack completed; "the deployed stack holds projects [], projectsNotFound=['sim2real-cbnv-e2e-...']"; KeyError 'OutputValue'.
 Cause 10: 'expected ResourceNotFoundException, got NotImplemented' / 'expected InvalidInputException, got NotImplemented' / ClientError (NotImplemented) 'operation <Op> is scaffolded but not implemented in this emulator'.
 
+## Resolution
+
+Causes 2, 4, 6, 7 and 10's `InvalidateProjectCache` are fixed, cause 5 is implemented
+(the refusal happens; only the tail of AWS's enumerated sentence could not be recovered
+from the material available), and causes 3 and 8 were already correct — all covered by
+`services/service-com-amazonaws-codebuild-codebuild-20161006/tests/all/input_constraint_wording.rs`,
+`.../tests/all/project_source_and_identity.rs` and
+`core/router/tests/all/codebuild_service_role_trust.rs`.
+
+TWO causes of this report remain OPEN and are tracked here rather than in the fixed body
+above:
+
+* Cause 1 (build execution, 16 checks) and the sandbox-stdout check of cause 10 need a
+  runtime that can run the caller's buildspec commands. A CodeBuild build runs a POSIX
+  shell inside a container; the in-process engines available to this emulator are a
+  JavaScript and a Python interpreter, and the only maintained pure-Rust shell
+  (brush-core) executes non-builtin commands by spawning host processes and reads and
+  writes host paths, so it cannot be contained. StartBuild therefore still ends a build
+  in its modelled FAULT at PROVISIONING with the context message
+  `state::BUILD_NOT_EXECUTED_MESSAGE`, unchanged.
+* Cause 9 (CloudFormation-declared CodeBuild resources, 4 checks) needs a resource
+  provider for `AWS::CodeBuild::Project` / `::Fleet` in the CloudFormation crate (the
+  shape `create_codebuild_report_group` already has for `AWS::CodeBuild::ReportGroup`)
+  plus the stack-Outputs `OutputValue` resolution this report notes is a
+  CloudFormation-wide defect with its own open issues. StartBuild still answers its
+  modelled `ResourceNotFoundException` for a project CodeBuild does not hold.
+
 ## Steps to Reproduce
 Boot the emulator from this checkout and replay the codebuild behavioral suite (run_behavioral_suite), or individually: (1) CreateProject with a NO_SOURCE inline buildspec that echoes and exits 0, StartBuild, then BatchGetBuilds until buildComplete — observe buildStatus FAULT at PROVISIONING; (2) BatchDeleteBuilds(ids=[]) with client-side parameter validation disabled and compare the message; (3) ListBuildsForProject(projectName=<never-created>) and StopBuild(id=<project>:<random-uuid>) and compare messages; (4) BatchGetBuilds(ids=['this-id-has-no-colon-separator']); (5) CreateProject with serviceRole pointing at a non-existent IAM role, and StartBuild with serviceRoleOverride on an unassumable role; (6) CreateProject with source {'type':'S3'} and no location; (7) BatchGetProjects(names=[<project ARN>]) and inspect projectsNotFound; (8) read environment.privilegedMode and tags off BatchGetProjects, and call ListBuildsForProject on a build-less project; (9) deploy a CFN stack with an AWS::CodeBuild::Project and then StartBuild on it / read DescribeStacks Outputs; (10) call DeleteWebhook, GetReportGroupTrend, InvalidateProjectCache, ListBuildBatchesForProject, ListSandboxesForProject, ListCommandExecutionsForSandbox, StartCommandExecution, StartBuildBatch, BatchGetFleets and PutResourcePolicy against absent/malformed inputs.

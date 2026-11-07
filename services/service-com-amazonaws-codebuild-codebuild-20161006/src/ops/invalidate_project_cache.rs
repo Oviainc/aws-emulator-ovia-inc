@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InvalidateProjectCache
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InvalidateProjectCache`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InvalidateProjectCache::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resets the build cache of a stored project: this is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -134,18 +127,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InvalidateProjectCache` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InvalidateProjectCacheErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("InvalidateProjectCache"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "InvalidateProjectCache (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let now = crate::state::now_millis();
+        let mut guard = state.lock();
+        // A cache belongs to a project, so the project is this call's one precondition:
+        // a name this account holds no project under addresses no cache to reset, which
+        // is the modelled missing resource rather than a bad request. The sentence is
+        // the fixed one the project-MANAGEMENT operations state
+        // (`crate::state::PROJECT_NOT_FOUND_MESSAGE`): a reset is an act ON the project,
+        // not a listing of one project's records.
+        let Some(stored) = guard.projects.get_mut(&input.project_name) else {
+            drop(guard);
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::NotFound,
+                Some(&crate::state::project_arn(
+                    &crate::state::request_region(ctx.parts()),
+                    &input.project_name,
+                )),
+            );
+            return Err(InvalidateProjectCacheErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::PROJECT_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "Resets the cache for a project." What a reset leaves behind is the instant
+        // from which the project's cache counts as empty: anything cached before it was
+        // discarded, so a later build of this project starts from nothing whatever its
+        // `cache` configuration says. The project's own settings — `cache` included —
+        // are untouched, and so is `lastModified`: the project was not changed, its
+        // cache was emptied. CodeBuild reports no member for either fact, which is why
+        // `InvalidateProjectCacheOutput` has none; the record is kept beside the project
+        // (`crate::state::StoredProject::cache_invalidated_millis`).
+        stored.cache_invalidated_millis = Some(now);
+        let project_arn = stored.project.arn.clone();
+        drop(guard);
+
+        crate::state::audit(
+            Self::NAME,
+            ctx.parts(),
+            crate::state::AuditOutcome::ProjectUpdated,
+            project_arn.as_deref(),
+        );
+
+        Ok(InvalidateProjectCacheOutput {})
     }
 }

@@ -29,6 +29,9 @@ mod directory_data_access_cycle;
 #[path = "all/kinesisvideo_discovered_data_plane.rs"]
 mod kinesisvideo_discovered_data_plane;
 // Declared here, in this same head region, for the reason the entry above records.
+#[path = "all/codebuild_service_role_trust.rs"]
+mod codebuild_service_role_trust;
+// Declared here, in this same head region, for the reason the entry above records.
 #[path = "all/cloudformation_ec2_cdk_vpc_estate.rs"]
 mod cloudformation_ec2_cdk_vpc_estate;
 #[path = "all/greengrass_deployment_iot_job.rs"]

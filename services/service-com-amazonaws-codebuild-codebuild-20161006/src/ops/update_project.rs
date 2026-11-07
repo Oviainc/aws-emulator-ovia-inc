@@ -243,6 +243,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut project = stored.project;
         let created_millis = stored.created_millis;
         let stored_modified_millis = stored.last_modified_millis;
+        // An update replaces the project's settings, not the state of its build cache:
+        // the instant `InvalidateProjectCache` last reset that cache stays as it was.
+        let cache_invalidated_millis = stored.cache_invalidated_millis;
         apply_update(&mut project, input);
 
         // The RESULTING configuration, not the request alone, is what has to be a valid
@@ -253,6 +256,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .source
             .as_ref()
             .and_then(crate::state::inline_buildspec_violation)
+        {
+            drop(guard);
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&arn),
+            );
+            return Err(UpdateProjectErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The same discipline for the resulting source LOCATION: a source that has
+        // input source code must say where it is
+        // (`crate::state::source_location_violation`), so an update that would leave the
+        // project unable to resolve its source is refused and the project stays as it
+        // was.
+        if let Some(message) = project
+            .source
+            .as_ref()
+            .and_then(crate::state::source_location_violation)
         {
             drop(guard);
             crate::state::audit(
@@ -315,6 +343,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 project: project.clone(),
                 created_millis,
                 last_modified_millis,
+                cache_invalidated_millis,
             },
         );
         drop(guard);

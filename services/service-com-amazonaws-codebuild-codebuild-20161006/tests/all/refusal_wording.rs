@@ -22,7 +22,9 @@ use service_com_amazonaws_codebuild_codebuild_20161006::ops::types::{
 use service_com_amazonaws_codebuild_codebuild_20161006::state;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::project_build_lifecycle::{call, create_project_body, emulator, error_type, REGION};
+use super::project_build_lifecycle::{
+    call, create_project_body, emulator, error_type, source_of, REGION,
+};
 
 /// The `message` an error body carries.
 fn message(body: &Value) -> String {
@@ -250,12 +252,7 @@ async fn the_webhook_build_type_refusal_is_worded_as_codebuild_words_it() {
         // A repository-event webhook (the request names no build type, so it is the
         // default one) against this source type.
         let name = format!("hook-default-{}", source_type.to_lowercase());
-        create_project_with_source(
-            &router,
-            &name,
-            json!({"type": source_type, "buildspec": "version: 0.2"}),
-        )
-        .await;
+        create_project_with_source(&router, &name, source_of(source_type)).await;
         let case = format!("default build type on {source_type}");
         if takes_repository_events {
             let (status, body) = call(&router, "CreateWebhook", json!({"projectName": name})).await;
@@ -283,12 +280,7 @@ async fn the_webhook_build_type_refusal_is_worded_as_codebuild_words_it() {
         // it answers with the same sentence for every source type but the one it is
         // available for.
         let name = format!("hook-runner-{}", source_type.to_lowercase());
-        create_project_with_source(
-            &router,
-            &name,
-            json!({"type": source_type, "buildspec": "version: 0.2"}),
-        )
-        .await;
+        create_project_with_source(&router, &name, source_of(source_type)).await;
         let case = format!("{} on {source_type}", state::RUNNER_WEBHOOK_BUILD_TYPE);
         let request = json!({
             "projectName": name,
@@ -493,12 +485,7 @@ async fn an_absent_webhook_is_refused_in_codebuilds_own_words() {
 
         for (form, connect_first) in [("never connected", false), ("disconnected", true)] {
             let project = format!("hook-gone-{}-{form}", source_type.to_lowercase()).replace(' ', "-");
-            create_project_with_source(
-                &router,
-                &project,
-                json!({"type": source_type, "buildspec": "version: 0.2"}),
-            )
-            .await;
+            create_project_with_source(&router, &project, source_of(source_type)).await;
 
             if connect_first {
                 let mut request = json!({"projectName": project});
