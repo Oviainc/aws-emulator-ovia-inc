@@ -1267,18 +1267,25 @@ async fn describe_log_groups_filters_and_pages() {
         );
     }
 
-    // A pattern search returns only arn, creationTime and logGroupName.
+    // A pattern search returns the reduced projection: identity and classification only.
     let page = logs
         .ok("DescribeLogGroups", &json!({"logGroupNamePattern": "other"}))
         .await;
     let group = &page["logGroups"][0];
-    for present in ["arn", "creationTime", "logGroupName"] {
+    for present in [
+        "arn",
+        "creationTime",
+        "logGroupArn",
+        "logGroupClass",
+        "logGroupName",
+        "metricFilterCount",
+    ] {
         assert!(
             group.get(present).is_some_and(|value| !value.is_null()),
             "case pattern search: expected {present}, got {group}"
         );
     }
-    for absent in ["logGroupArn", "storedBytes", "metricFilterCount", "logGroupClass"] {
+    for absent in ["storedBytes", "retentionInDays", "kmsKeyId"] {
         assert!(
             group.get(absent).is_none_or(Value::is_null),
             "case pattern search: expected no {absent}, got {group}"

@@ -91,6 +91,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 
+use super::callback_client::callback_client;
 use super::emf::{ExtractedDatapoint, DEFAULT_STORAGE_RESOLUTION, LOGS_NAMESPACE};
 use super::filter_pattern::FilterPattern;
 use super::{ComAmazonawsCloudwatchlogsLogs20140328State, StoredEvent};
@@ -783,30 +784,6 @@ fn mark_destinations_unhealthy<Eng: Send + Sync + 'static>(
     }
 }
 
-/// Build one destination service's client over the in-process callback, against that
-/// service's endpoint in `region`.
-///
-/// The transport is in-process, so the client disables what only a network client needs:
-/// retries, timeouts, stalled-stream protection and identity caching each want a sleep
-/// implementation the callback transport is not given, and there is nothing behind it to
-/// retry.
-macro_rules! callback_client {
-    ($sdk:ident, $ctx:expr, $endpoint:literal, $region:expr) => {{
-        let config = ::$sdk::Config::builder()
-            .behavior_version(::$sdk::config::BehaviorVersion::latest())
-            .http_client($ctx.callback().http_client())
-            .credentials_provider($ctx.callback().aws_credentials_provider())
-            .region(::$sdk::config::Region::new($region.to_string()))
-            .endpoint_url(format!("https://{}.{}.amazonaws.com", $endpoint, $region))
-            .retry_config(::$sdk::config::retry::RetryConfig::disabled())
-            .timeout_config(::$sdk::config::timeout::TimeoutConfig::disabled())
-            .identity_cache(::$sdk::config::IdentityCache::no_cache())
-            .stalled_stream_protection(::$sdk::config::StalledStreamProtectionConfig::disabled())
-            .build();
-        ::$sdk::Client::from_conf(config)
-    }};
-}
-
 /// How a failed delivery is worded in the warning: the SDK's own rendering of the answer
 /// the destination service gave.
 fn why(error: &impl std::error::Error) -> String {
@@ -822,7 +799,7 @@ async fn deliver_to_kinesis(
 ) -> Option<String> {
     let stream_name =
         ::service_common::arn::resource_id_of_type(&delivery.destination_arn, KINESIS_STREAM.1)?;
-    let client = callback_client!(aws_sdk_kinesis, ctx, "kinesis", region);
+    let client = callback_client!(aws_sdk_kinesis, ctx.callback(), "kinesis", region);
     client
         .put_record()
         .stream_name(stream_name)
@@ -846,7 +823,7 @@ async fn deliver_to_firehose(
         &delivery.destination_arn,
         FIREHOSE_DELIVERY_STREAM.1,
     )?;
-    let client = callback_client!(aws_sdk_firehose, ctx, "firehose", region);
+    let client = callback_client!(aws_sdk_firehose, ctx.callback(), "firehose", region);
     let record = ::aws_sdk_firehose::types::Record::builder()
         .data(::aws_sdk_firehose::primitives::Blob::new(
             delivery.payload.clone(),
@@ -881,7 +858,7 @@ async fn deliver_to_lambda(
         "awslogs": {"data": ::aws_smithy_types::base64::encode(&delivery.payload)},
     })
     .to_string();
-    let client = callback_client!(aws_sdk_lambda, ctx, "lambda", region);
+    let client = callback_client!(aws_sdk_lambda, ctx.callback(), "lambda", region);
     client
         .invoke()
         .function_name(function)

@@ -2,7 +2,10 @@
 
 //! @op CreateLogGroup
 //! Implemented: inserts a log group into the shared store, or refuses a name that
-//! already exists. This is the ONLY file to touch for this operation.
+//! already exists, a name the guidelines reserve, an account at its log-group quota, or a
+//! `kmsKeyId` whose KEY POLICY does not let CloudWatch Logs encrypt this group's data
+//! ([`crate::state::kms_key_grant`]) — a refused create stores nothing. This is the ONLY
+//! file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`CreateLogGroup::handle`] with real behaviour and
@@ -226,21 +229,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
-        let mut store = state.lock();
 
-        // "You can create up to 1,000,000 log groups per Region per account."
-        if store.log_groups.len() >= crate::state::MAX_LOG_GROUPS {
-            return Err(CreateLogGroupErrorModeled::LimitExceededException(
-                LimitExceededException {
-                    message: Some(format!(
-                        "the maximum of {} log groups per Region per account has been reached",
-                        crate::state::MAX_LOG_GROUPS
-                    )),
-                },
-            )
-            .into());
+        // The quota and the name collision are judged first — and under their own guard, which
+        // is released before the key below is — so a create that was never going to be accepted
+        // asks KMS nothing.
+        {
+            let store = state.lock();
+
+            // "You can create up to 1,000,000 log groups per Region per account."
+            if store.log_groups.len() >= crate::state::MAX_LOG_GROUPS {
+                return Err(CreateLogGroupErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "the maximum of {} log groups per Region per account has been reached",
+                            crate::state::MAX_LOG_GROUPS
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            if store.log_groups.contains_key(&input.log_group_name) {
+                return Err(CreateLogGroupErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some("The specified log group already exists".to_string()),
+                    },
+                )
+                .into());
+            }
         }
 
+        // "If you associate an KMS key with the log group, ingested data is encrypted using
+        // the KMS key": whether this key MAY encrypt this group's data is decided by the
+        // KEY's own policy, which lives in KMS, so it is read where KMS holds it and with no
+        // lock held ([`crate::state::kms_key_grant`]). A key whose policy does not cover the
+        // group being created could never encrypt it, so the group is not created at all.
+        if let Some(kms_key_id) = input.kms_key_id.as_deref() {
+            let group_arn = crate::state::log_group_arn(&region, &input.log_group_name, false);
+            if let Some(message) =
+                crate::state::kms_key_grant::refusal_for(ctx, &region, kms_key_id, &group_arn).await
+            {
+                return Err(CreateLogGroupError::access_denied(message));
+            }
+        }
+
+        let mut store = state.lock();
+
+        // The collision is judged again under the guard the group is inserted beneath: the key
+        // resolution above released it, and a create that landed in that span owns the name.
         if store.log_groups.contains_key(&input.log_group_name) {
             return Err(CreateLogGroupErrorModeled::ResourceAlreadyExistsException(
                 ResourceAlreadyExistsException {

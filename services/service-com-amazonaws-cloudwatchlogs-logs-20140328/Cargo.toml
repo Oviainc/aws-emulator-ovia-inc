@@ -56,8 +56,13 @@ aws-sdk-kinesis = { version = "1", default-features = false }
 aws-sdk-firehose = { version = "=1.126.0", default-features = false }
 aws-sdk-lambda = { version = "1", default-features = false }
 # `CreateExportTask` resolves the S3 bucket its `destination` names against the object
-# store, over the same in-process callback, with the `HeadBucket` this client generates.
+# store, over the same in-process callback, with the `HeadBucket` this client generates, and
+# the task's worker writes the exported log data there with `PutObject`.
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# A log group's `kmsKeyId` may only be associated when the KEY's own policy lets CloudWatch
+# Logs use it for that group, which is read from KMS with the `GetKeyPolicy` this client
+# generates, over the same in-process callback.
+aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -75,6 +80,14 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 # the fan-out suite mounts that service beside this one on the same engine and reads the
 # delivered records back off the stream.
 service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
+# The KEY POLICY a log group's `kmsKeyId` is judged against is one KMS itself holds, so the
+# suite about that gate mounts KMS beside this service on the same engine and creates the
+# key through it.
+service-com-amazonaws-kms-trentservice = { workspace = true }
+# An export task's objects are written to a REAL bucket of the object store, so the suite
+# about them mounts Amazon S3 beside this service on the same engine and reads the objects
+# back through it.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

@@ -16,7 +16,11 @@
 //! The one caller-supplied value that reaches the client's AUTHORITY is the signing Region,
 //! and it is narrowed before it gets there ([`service_common::arn::region_label`]), so no
 //! request can re-point this client at a host of its own choosing: it reaches the emulator's
-//! own Amazon S3 and nothing else, whatever bucket a caller names.
+//! own Amazon S3 and nothing else, whatever bucket a caller names. The client itself is the
+//! shared callback client every call to another service of this emulator is made through
+//! ([`crate::state::callback_client`]).
+
+use super::callback_client::callback_client;
 
 /// Whether Amazon S3 reports that it holds no bucket under `bucket`.
 ///
@@ -37,29 +41,10 @@ pub async fn bucket_is_absent(
     // falls back to the default rather than putting caller text in the authority.
     let region =
         ::service_common::arn::region_label(region).unwrap_or(crate::state::DEFAULT_REGION);
-    let config = ::aws_sdk_s3::Config::builder()
-        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
-        .http_client(ctx.callback().http_client())
-        .credentials_provider(ctx.callback().aws_credentials_provider())
-        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
-        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
-        // The emulator serves one endpoint for every service, so the bucket travels in the
-        // path rather than in a per-bucket host the router could not resolve.
-        .force_path_style(true)
-        // The transport is in-process: there is nothing to retry, time out or watch for a
-        // stalled stream, and each of those would need a sleep implementation this client
-        // is not given. The same goes for caching the identity: the credentials the
-        // callback hands over are used directly, and they only sign this in-process call.
-        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
-        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
-        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
-        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
-        .build();
-    let answer = ::aws_sdk_s3::Client::from_conf(config)
-        .head_bucket()
-        .bucket(bucket)
-        .send()
-        .await;
+    // The emulator serves one endpoint for every service, so the bucket travels in the path
+    // rather than in a per-bucket host the router could not resolve.
+    let client = callback_client!(aws_sdk_s3, ctx.callback(), "s3", region, force_path_style(true));
+    let answer = client.head_bucket().bucket(bucket).send().await;
     match answer {
         // S3 holds the bucket.
         Ok(_) => false,

@@ -144,19 +144,22 @@ async fn a_window_selects_on_the_stored_timestamp_and_never_on_the_ingestion_tim
         .iter()
         .map(|(label, age)| (ingested_at - age, format!("an event {label}")))
         .collect();
-    let wire: Vec<(i64, &str)> = written
-        .iter()
-        .map(|(timestamp, message)| (*timestamp, message.as_str()))
-        .collect();
-    logs.ok(
-        "PutLogEvents",
-        &json!({
-            "logGroupName": GROUP,
-            "logStreamName": STREAM,
-            "logEvents": batch(&wire),
-        }),
-    )
-    .await;
+    // ONE event per request: the span these ages cover is wider than the 24 hours
+    // `PutLogEvents` admits between one batch's oldest and newest in-window event, and a
+    // batch that breaks that is refused whole. Writing them separately keeps every timestamp
+    // and ingestion instant this suite is about and is what a client stamping events this
+    // far apart does.
+    for (timestamp, message) in &written {
+        logs.ok(
+            "PutLogEvents",
+            &json!({
+                "logGroupName": GROUP,
+                "logStreamName": STREAM,
+                "logEvents": batch(&[(*timestamp, message.as_str())]),
+            }),
+        )
+        .await;
+    }
 
     let stored = stored_events(&logs, "the stored events", GROUP).await;
     let reported: Vec<(i64, String)> = stored

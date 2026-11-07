@@ -2,7 +2,10 @@
 
 //! @op AssociateKmsKey
 //! Implemented: records the KMS key on the target the request names — one log group, or
-//! the account's stored query-insights results — in the shared store, where
+//! the account's query results — once the KEY's own key policy is read from KMS and lets
+//! CloudWatch Logs encrypt that resource's data with it
+//! ([`crate::state::kms_key_grant`]); an association the key policy does not cover is
+//! refused and nothing is recorded. The association lives in the shared store, where
 //! `DescribeLogGroups` projects a log group's as `LogGroup$kmsKeyId`. This is the ONLY
 //! file to touch for this operation.
 //!
@@ -200,8 +203,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; this operation needs none of it.
-        let _ = ctx;
+        // `ctx` carries the Region the credential scope names, which is where the key policy
+        // the association is judged against is read.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             AssociateKmsKeyError::from(AssociateKmsKeyErrorModeled::ServiceUnavailableException(
@@ -210,7 +214,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
-        let mut store = state.lock();
 
         let invalid = |message: String| {
             AssociateKmsKeyError::from(AssociateKmsKeyErrorModeled::InvalidParameterException(
@@ -236,6 +239,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.resource_identifier.as_deref(),
         )
         .map_err(invalid)?;
+
+        // The ARN of the resource whose data this key would encrypt, which is what the key's
+        // own policy is written against: the log group's, or the account's query-result ARN.
+        let encrypted_resource_arn = match &target {
+            crate::state::KmsKeyTarget::LogGroup(name) => {
+                // A target this account does not hold is the more specific client error, and
+                // it is judged under its own guard so none is held across the call below.
+                if !state.lock().log_groups.contains_key(name) {
+                    return Err(AssociateKmsKeyErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::resource_not_found_message("log group")),
+                        },
+                    )
+                    .into());
+                }
+                crate::state::log_group_arn(&region, name, false)
+            }
+            crate::state::KmsKeyTarget::QueryResults => {
+                crate::state::query_results_arn(&region)
+            }
+        };
+
+        // "After a KMS key is associated with a log group, all newly ingested data for the
+        // log group is encrypted using the KMS key": whether this key MAY encrypt that data
+        // is decided by the KEY's own policy, which lives in KMS, so it is read where KMS
+        // holds it and with no lock held ([`crate::state::kms_key_grant`]). An association
+        // the key policy does not cover would leave the resource's data unencryptable, so it
+        // is refused and nothing is recorded.
+        if let Some(message) = crate::state::kms_key_grant::refusal_for(
+            ctx,
+            &region,
+            &input.kms_key_id,
+            &encrypted_resource_arn,
+        )
+        .await
+        {
+            return Err(AssociateKmsKeyError::access_denied(message));
+        }
+
+        let mut store = state.lock();
 
         match target {
             // "Specify the logGroupName parameter to cause log events ingested into that

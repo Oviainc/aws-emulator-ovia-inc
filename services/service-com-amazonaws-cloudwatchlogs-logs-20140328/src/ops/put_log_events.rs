@@ -21,7 +21,12 @@
 //! [`MAX_EVENT_FUTURE_MS`] in the future, older than [`MAX_EVENT_AGE_MS`], or preceding
 //! the log group's retention period is not stored — so it is not readable, does not move
 //! the stream's event-time summary and does not count towards the log group's
-//! `storedBytes` — and the batch's remaining events are processed as usual.
+//! `storedBytes` — and the batch's remaining events are processed as usual. The BATCH
+//! constraints are the other half and are not reported that way: a batch out of
+//! chronological order, one carrying an event over the per-event size limit, one whose
+//! counted size exceeds [`MAX_BATCH_BYTES`], and one whose in-window events span more than
+//! [`MAX_BATCH_SPAN_MS`] are each refused WHOLE with `InvalidParameterException`, storing
+//! none of their events.
 //!
 //! EMULATOR POLICY, stated here because it is visible to a client: a log stream holds at
 //! most [`crate::state::MAX_STREAM_EVENTS`] events and [`crate::state::MAX_STREAM_BYTES`]
@@ -205,6 +210,19 @@ const MAX_EVENT_AGE_MS: i64 = 14 * MILLIS_PER_DAY;
 /// are rejected while processing remaining valid events."
 const MAX_EVENT_FUTURE_MS: i64 = 2 * 60 * 60 * 1_000;
 
+/// The widest span a single batch's in-window events may cover, from this operation's
+/// documented batch constraints: "For valid events (within 14 days in the past to 2 hours
+/// in future), the time span in a single batch cannot exceed 24 hours. Otherwise, the
+/// operation fails."
+const MAX_BATCH_SPAN_MS: i64 = MILLIS_PER_DAY;
+
+/// The sentence CloudWatch Logs refuses a batch over [`MAX_BATCH_SPAN_MS`] with: a constant
+/// statement about the request as a whole, naming no event of it — the same shape as the
+/// chronological-order refusal, which is the other constraint on the batch rather than on
+/// one of its events.
+const BATCH_SPAN_MESSAGE: &str =
+    "The batch of log events in a single PutLogEvents request cannot span more than 24 hours.";
+
 /// What the ingestion window says about one event of a batch.
 ///
 /// The window is clock-relative, so it is decided once per batch against the single
@@ -254,6 +272,27 @@ fn admit(timestamp: i64, now: i64, retention_in_days: Option<i32>) -> Admission 
 /// An index of the input batch as `RejectedLogEventsInfo` reports it.
 fn log_event_index(index: usize) -> i32 {
     i32::try_from(index).unwrap_or(i32::MAX)
+}
+
+/// The span between the oldest and the newest event of `events` that the ingestion window
+/// ADMITS the request to carry, or `None` when the window refuses every event of the batch.
+///
+/// Admitted here means inside the window's clock-relative bounds — neither
+/// [`Admission::TooOld`] nor [`Admission::TooNew`] — which is the set the batch-span
+/// constraint is stated over ("for valid events (within 14 days in the past to 2 hours in
+/// future), the time span in a single batch cannot exceed 24 hours"). An event the
+/// retention period alone refuses is one of them: it is inside those bounds.
+fn span_of_valid_events(events: &[InputLogEvent], admissions: &[Admission]) -> Option<i64> {
+    let mut oldest: Option<i64> = None;
+    let mut newest: Option<i64> = None;
+    for (event, admission) in events.iter().zip(admissions) {
+        if matches!(admission, Admission::TooOld | Admission::TooNew) {
+            continue;
+        }
+        oldest = Some(oldest.map_or(event.timestamp, |held: i64| held.min(event.timestamp)));
+        newest = Some(newest.map_or(event.timestamp, |held: i64| held.max(event.timestamp)));
+    }
+    Some(newest?.saturating_sub(oldest?))
 }
 
 /// The `PutLogEvents` operation.
@@ -402,22 +441,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
         // of all event messages in UTF-8, plus 26 bytes for each log event", and "Each
         // log event can be no larger than 1 MB". (The maximum of 10,000 events per batch
         // is the modelled `len 1..10000`, already refused at the boundary.)
+        //
+        // The two bounds are applied to the two sizes the documentation states them over: the
+        // per-event one to the event's MESSAGE ("each log event can be no larger than 1 MB"),
+        // and the batch one to the COUNTED size, the sum of the messages plus the per-event
+        // overhead that accounting rule charges ([`crate::state::EVENT_OVERHEAD_BYTES`]). Each
+        // refusal reports the size the service counts for what it refused — for one event its
+        // message plus that overhead — so the number a caller reads is the one AWS charges it
+        // for. A message between the limit less the overhead and the limit itself therefore
+        // passes the per-event bound and is refused by the batch bound, which is the only one
+        // its counted size breaks.
         let mut batch_bytes: i64 = 0;
-        for (index, event) in input.log_events.iter().enumerate() {
-            let event_bytes = i64::try_from(event.message.len()).unwrap_or(i64::MAX);
-            if event_bytes > MAX_EVENT_BYTES {
+        for event in input.log_events.iter() {
+            let message_bytes = i64::try_from(event.message.len()).unwrap_or(i64::MAX);
+            let event_bytes = message_bytes.saturating_add(crate::state::EVENT_OVERHEAD_BYTES);
+            if message_bytes > MAX_EVENT_BYTES {
                 return Err(invalid(format!(
-                    "logEvents.{index}.message is {event_bytes} bytes; a log event can be no larger than {MAX_EVENT_BYTES} bytes"
+                    "Log event too large: {event_bytes} bytes exceeds limit of {MAX_EVENT_BYTES}"
                 )));
             }
-            batch_bytes =
-                batch_bytes.saturating_add(event_bytes + crate::state::EVENT_OVERHEAD_BYTES);
+            batch_bytes = batch_bytes.saturating_add(event_bytes);
         }
         if batch_bytes > MAX_BATCH_BYTES {
             return Err(invalid(format!(
-                "logEvents is {batch_bytes} bytes; the maximum batch size is {MAX_BATCH_BYTES} bytes, \
-                 counted as the sum of all event messages in UTF-8 plus {} bytes for each log event",
-                crate::state::EVENT_OVERHEAD_BYTES
+                "Upload too large: {batch_bytes} bytes exceeds limit of {MAX_BATCH_BYTES}"
             )));
         }
         // "The log events in the batch must be in chronological order by their
@@ -445,6 +492,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
             .iter()
             .map(|event| admit(event.timestamp, ingestion_time, retention_in_days))
             .collect();
+        // "For valid events (within 14 days in the past to 2 hours in future), the time
+        // span in a single batch cannot exceed 24 hours. Otherwise, the operation fails."
+        // A batch that breaks this is REFUSED WHOLE — it is a constraint on the request,
+        // not a per-event admission — so it is judged here, before anything is stored, and
+        // answered with the same shape of sentence the chronological-order constraint is:
+        // a constant statement about the request, naming no event of it. The span is
+        // measured over the events INSIDE the ingestion window, which is what the
+        // parenthetical in that sentence names, so the events the window already refuses
+        // cannot stretch it.
+        let in_window_span = span_of_valid_events(&input.log_events, &admissions);
+        if in_window_span.is_some_and(|span| span > MAX_BATCH_SPAN_MS) {
+            return Err(invalid(BATCH_SPAN_MESSAGE.to_string()));
+        }
         // The boundary indexes the model documents: "the index of the last log event that
         // is too old" (exclusive), the same for the expired run, and "the index of the
         // first log event that is too new" (inclusive). Each is read off the admissions

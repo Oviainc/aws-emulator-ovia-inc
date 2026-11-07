@@ -2,8 +2,10 @@
 
 //! @op CreateExportTask
 //! Implemented: starts an export of one stored log group's events to an S3 bucket,
-//! minting the task `DescribeExportTasks` then reports. This is the ONLY file to touch
-//! for this operation.
+//! minting the task `DescribeExportTasks` then reports and handing the export itself to
+//! the task's worker, which writes the window's events to the destination bucket before
+//! the task reaches `COMPLETED` ([`crate::state::export_worker`]). This is the ONLY file
+//! to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`CreateExportTask::handle`] with real behaviour and
@@ -295,6 +297,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.log_stream_name_prefix = input.log_stream_name_prefix.clone();
         store.export_tasks.insert(task_id.clone(), record);
         store.enforce_export_task_ceiling();
+        // The guard is released before the export is handed over: its worker takes it itself
+        // to read the events it exports.
+        drop(store);
+
+        // "This is an asynchronous call": the export itself — selecting the window's events
+        // and writing them to the destination bucket — runs off this response path and
+        // finishes before the task reports `COMPLETED`
+        // ([`crate::state::export_worker`]). The worker is handed this request's own
+        // in-process callback, so the objects are written where this call was made.
+        crate::state::export_worker::start(
+            ::std::sync::Arc::clone(&self.engine),
+            ctx.callback().clone(),
+            crate::state::request_region(ctx.parts()),
+            task_id.clone(),
+        );
 
         Ok(CreateExportTaskOutput {
             // "This operation initiates an export task and responds with the ID of the

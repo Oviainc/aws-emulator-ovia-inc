@@ -18,8 +18,8 @@
 //! * `LogGroupIdentifier`'s `@pattern` `^[\w#+=/:,.@-]*$` admits no `*`, so a log group's
 //!   `arn` form (which ends in `:*`) is not one of the identifiers these operations take,
 //!   while its `logGroupArn` form is;
-//! * `DescribeLogGroups` under a `logGroupNamePattern` reports "only arn, creationTime,
-//!   and logGroupName", so it reports no `dataProtectionStatus` for a group that holds a
+//! * `DescribeLogGroups` under a `logGroupNamePattern` reports the reduced log-group
+//!   projection, which carries no `dataProtectionStatus` for a group that holds a
 //!   policy — the same group reports `ACTIVATED` without the pattern.
 //!
 //! The tables span the classes those rules generalise over (which group of a set holds a
@@ -264,9 +264,9 @@ async fn the_wildcard_arn_form_is_outside_the_member_pattern() {
     );
 }
 
-/// `DescribeLogGroups` under a `logGroupNamePattern` reports "only arn, creationTime, and
-/// logGroupName", so it reports no `dataProtectionStatus` — for a group holding a policy
-/// and for one that does not.
+/// `DescribeLogGroups` under a `logGroupNamePattern` reports the reduced log-group
+/// projection, which carries no `dataProtectionStatus` — for a group holding a policy and
+/// for one that does not.
 #[tokio::test]
 async fn a_pattern_search_reports_no_data_protection_status() {
     let logs = Logs::new();
@@ -308,7 +308,7 @@ async fn a_pattern_search_reports_no_data_protection_status() {
         assert_eq!(
             found.get("dataProtectionStatus"),
             None,
-            "case {group}: a pattern search reports only arn, creationTime and logGroupName, got {found}"
+            "case {group}: a pattern search reports no dataProtectionStatus, got {found}"
         );
         let without_pattern = data_protection_status(&logs, group).await;
         let expected = if holds_policy { Some("ACTIVATED") } else { None };

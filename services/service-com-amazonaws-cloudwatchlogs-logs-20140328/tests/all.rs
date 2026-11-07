@@ -25,6 +25,8 @@ mod anomaly_suppression;
 mod cmk_group_delivery_byte_fidelity;
 #[path = "all/cmk_group_fan_out_isolation.rs"]
 mod cmk_group_fan_out_isolation;
+#[path = "all/cmk_key_policy_scope.rs"]
+mod cmk_key_policy_scope;
 #[path = "all/configuration_templates.rs"]
 mod configuration_templates;
 #[path = "all/data_protection_policies.rs"]
@@ -83,6 +85,8 @@ mod export_task_account_slot;
 mod export_task_active_window;
 #[path = "all/export_task_cancellation.rs"]
 mod export_task_cancellation;
+#[path = "all/export_task_objects.rs"]
+mod export_task_objects;
 #[path = "all/export_task_status_messages.rs"]
 mod export_task_status_messages;
 #[path = "all/export_tasks.rs"]
@@ -133,6 +137,8 @@ mod log_group_auth_and_encryption;
 mod log_group_fields;
 #[path = "all/log_group_name_pattern_lists.rs"]
 mod log_group_name_pattern_lists;
+#[path = "all/log_group_pattern_projection.rs"]
+mod log_group_pattern_projection;
 #[path = "all/log_group_tags.rs"]
 mod log_group_tags;
 #[path = "all/log_stream_removal.rs"]
@@ -163,6 +169,8 @@ mod metric_filters;
 mod metric_transformation_exclusion_wording;
 #[path = "all/missing_destination_refusal.rs"]
 mod missing_destination_refusal;
+#[path = "all/put_log_events_batch_constraints.rs"]
+mod put_log_events_batch_constraints;
 #[path = "all/query_and_stream_refusal_text.rs"]
 mod query_and_stream_refusal_text;
 #[path = "all/query_cancellation.rs"]

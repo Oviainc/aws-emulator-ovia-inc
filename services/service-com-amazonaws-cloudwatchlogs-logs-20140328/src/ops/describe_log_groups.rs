@@ -2,8 +2,10 @@
 
 //! @op DescribeLogGroups
 //! Implemented: enumerates the log groups in the shared store, honouring the prefix,
-//! pattern, class and identifier filters and the page bounds. This is the ONLY file to
-//! touch for this operation.
+//! pattern, class and identifier filters and the page bounds. A lookup by
+//! `logGroupNamePattern` answers the REDUCED projection of each group the service serves
+//! for a pattern search — its identity and classification members only. This is the ONLY
+//! file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DescribeLogGroups::handle`] with real behaviour and
@@ -374,8 +376,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .encode()
         });
 
-        // "If you specify logGroupNamePattern in your request, then only arn,
-        // creationTime, and logGroupName are included in the response."
+        // A pattern lookup answers a REDUCED projection of each log group: the identity and
+        // classification members — `arn`, `creationTime`, `logGroupArn`, `logGroupClass`,
+        // `logGroupName` and `metricFilterCount` — and none of the members that describe what
+        // the group HOLDS or how it is configured (its retention, its stored bytes, its
+        // encryption, its data protection and its per-group switches), which only the prefix
+        // lookup of the same group carries.
         let pattern_search = input.log_group_name_pattern.is_some();
 
         Ok(DescribeLogGroupsOutput {
@@ -386,8 +392,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         creation_time: Some(group.creation_time_ms),
                         arn: Some(group.arn.clone()),
                         retention_in_days: group.retention_in_days.filter(|_| !pattern_search),
-                        metric_filter_count: (!pattern_search)
-                            .then(|| group.metric_filter_count()),
+                        metric_filter_count: Some(group.metric_filter_count()),
                         stored_bytes: (!pattern_search).then_some(group.stored_bytes),
                         kms_key_id: group.kms_key_id.clone().filter(|_| !pattern_search),
                         data_protection_status: group
@@ -395,9 +400,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .filter(|_| !pattern_search)
                             .map(str::to_string),
                         inherited_properties: None,
-                        log_group_class: (!pattern_search)
-                            .then(|| group.log_group_class.clone()),
-                        log_group_arn: (!pattern_search).then(|| group.log_group_arn.clone()),
+                        log_group_class: Some(group.log_group_class.clone()),
+                        log_group_arn: Some(group.log_group_arn.clone()),
                         deletion_protection_enabled: (!pattern_search)
                             .then_some(group.deletion_protection_enabled),
                         bearer_token_authentication_enabled: (!pattern_search)
