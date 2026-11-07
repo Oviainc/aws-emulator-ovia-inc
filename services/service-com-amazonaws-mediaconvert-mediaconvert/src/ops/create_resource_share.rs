@@ -191,13 +191,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this service does.
         let job_id = crate::state::job_id_from_reference(&input.job_id);
 
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        state.settle(now);
+        // The guard is taken and RELEASED around the write, so the publication below holds
+        // no lock across the in-process call it makes.
+        let outcome = {
+            let mut state = state.lock();
+            state.settle(now);
 
-        // The store owns the attempt, the job's share status and the clock-owed
-        // completion together, so the three cannot disagree.
-        match state.create_resource_share(job_id, &input.support_case_id, now) {
+            // The store owns the attempt, the job's share status and the clock-owed
+            // completion together, so the three cannot disagree.
+            state.create_resource_share(job_id, &input.support_case_id, now)
+        };
+
+        // A status change this call's own settle materialised is a job state change,
+        // published by the call that materialised it
+        // (`state::publish_job_state_changes`). A share attempt is not a job status, so
+        // recording one publishes nothing of its own.
+        crate::state::publish_job_state_changes(ctx, &*self.engine, &region).await;
+
+        match outcome {
             // A repeat against the same support case asks for the state the job is
             // already in, so it answers the same empty 202 and leaves the recorded
             // attempt exactly as it was. A request naming ANOTHER support case records a

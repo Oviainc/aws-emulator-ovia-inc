@@ -31,7 +31,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_mediaconvert_mediaconvert::state::system_resource_modify_message;
+use service_com_amazonaws_mediaconvert_mediaconvert::state::{
+    system_resource_modify_message, SYSTEM_JOB_TEMPLATE_UPDATE_MESSAGE,
+};
 use service_com_amazonaws_mediaconvert_mediaconvert::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -469,6 +471,19 @@ impl BuiltIn {
             Self::Queue => "/2017-08-29/queues",
             Self::Preset => "/2017-08-29/presets",
             Self::JobTemplate => "/2017-08-29/jobTemplates",
+        }
+    }
+
+    /// The sentence this kind's UPDATE door refuses a built-in record with.
+    ///
+    /// MediaConvert words this refusal per DOOR: the job-template update door states the
+    /// class of resource it will not update and carries no slot at all, while the queue
+    /// and preset update doors answer the crate-wide sentence that names the request
+    /// member the record was addressed by.
+    fn update_refusal(self) -> String {
+        match self {
+            Self::JobTemplate => SYSTEM_JOB_TEMPLATE_UPDATE_MESSAGE.to_string(),
+            Self::Queue | Self::Preset => system_resource_modify_message("name"),
         }
     }
 }
@@ -1332,9 +1347,10 @@ async fn a_built_in_resource_is_not_the_callers_to_tag_or_untag() {
             );
 
             // The sibling door that modifies the same record answers the same way, which
-            // is the rule this case is one half of. Each refusal names the request member
-            // that identified the resource — `arn` for a tagging door, `name` for the
-            // `Update*` one — so the sentence differs only in that member.
+            // is the rule this case is one half of. Each refusal is the sentence that
+            // door words: the tagging doors name the request member the resource was
+            // addressed by (`arn`), the queue and preset update doors name theirs
+            // (`name`), and the job-template update door has its own fixed sentence.
             let name = built_in_arn
                 .rsplit('/')
                 .next()
@@ -1353,7 +1369,7 @@ async fn a_built_in_resource_is_not_the_callers_to_tag_or_untag() {
                  with body {}",
                 updated.status, updated.body
             );
-            let by_name = system_resource_modify_message("name");
+            let by_name = kind.update_refusal();
             assert_eq!(
                 updated.string("/message"),
                 by_name,

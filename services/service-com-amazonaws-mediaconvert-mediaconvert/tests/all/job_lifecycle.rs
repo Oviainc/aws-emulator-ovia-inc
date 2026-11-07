@@ -99,12 +99,64 @@ impl Emulator {
         S: smithy_server_runtime::Service,
         F: FnOnce(Arc<engine::InMemoryEngine>) -> S,
     {
-        let mut emulator = Self::new();
-        let extra = build(Arc::clone(&emulator.engine));
+        Self::new().mount(build)
+    }
+
+    /// Mount one more service beside this one on the same router, built over the SAME
+    /// engine, and answer the emulator — so a suite that needs SEVERAL other services (a
+    /// bus and the queue one of its rules targets, say) chains the calls.
+    pub(crate) fn mount<S, F>(mut self, build: F) -> Self
+    where
+        S: smithy_server_runtime::Service,
+        F: FnOnce(Arc<engine::InMemoryEngine>) -> S,
+    {
+        let extra = build(Arc::clone(&self.engine));
         // The router has not been cloned or served yet, so the service set is still
         // uniquely held and one more may join it.
-        emulator.router.register_service(extra);
-        emulator
+        self.router.register_service(extra);
+        self
+    }
+
+    /// One `awsJson` RPC call against a service mounted BESIDE this one, the way a client
+    /// makes it: `POST /` with `X-Amz-Target: <target_prefix>.<operation>` and a
+    /// credential scoped to `signing_name`, which is what the router picks the service
+    /// from.
+    pub(crate) async fn rpc(
+        &self,
+        signing_name: &str,
+        target_prefix: &str,
+        json_version: &str,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        let credential = format!(
+            "AKIDTESTTESTTESTTEST/20260101/{REGION}/{signing_name}/aws4_request, \
+             SignedHeaders=host;x-amz-date, Signature=deadbeef"
+        );
+        let request = ::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", format!("{signing_name}.{REGION}.amazonaws.com"))
+            .header(
+                "content-type",
+                format!("application/x-amz-json-{json_version}"),
+            )
+            .header("x-amz-target", format!("{target_prefix}.{operation}"))
+            .header(
+                "authorization",
+                format!("AWS4-HMAC-SHA256 Credential={credential}"),
+            )
+            .body(::bytes::Bytes::from(body.to_string()))
+            .expect("build the request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let raw = response.body().clone();
+        let decoded = if raw.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&raw).unwrap_or(Value::Null)
+        };
+        (status, decoded)
     }
 
     /// An emulator whose jobs are due to leave `SUBMITTED` after `span`.

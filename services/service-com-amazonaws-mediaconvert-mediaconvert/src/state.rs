@@ -99,7 +99,7 @@
 //! modelled `BadRequestException`. There is no `unwrap`, `expect`, `panic!` or slice
 //! index anywhere in this module or in the handlers that use it.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
@@ -110,6 +110,12 @@ use crate::ops::types::{
     OutputGroup, OutputGroupSettings, Policy, Preset, PresetSettings, Queue, QueueTransition,
     ReservationPlan, ReservationPlanSettings, Timing, VideoCodecSettings, VideoDescription,
 };
+mod job_events;
+mod system_catalog;
+mod paging;
+pub use job_events::*;
+pub use paging::*;
+use system_catalog::*;
 
 /// The built-in queue a job with no `Queue` member is sent to.
 ///
@@ -677,12 +683,38 @@ pub fn system_resource_delete_message(member: &str) -> String {
 }
 
 /// As [`system_resource_delete_message`], for a request that would MODIFY a built-in
-/// resource rather than delete it — `UpdateJobTemplate` on a `SYSTEM` template, which
-/// `JobTemplate$Type` says a user "can't modify or delete". Same recorded shape, naming
-/// the request member and the action the request asked for.
+/// resource rather than delete it — `UpdateQueue` on a system queue, `UpdatePreset` on a
+/// built-in preset — which `Type` says a user "can't modify or delete". Same recorded
+/// shape, naming the request member and the action the request asked for.
+///
+/// The one door this sentence does NOT word is `UpdateJobTemplate`, which AWS refuses in
+/// its own fixed wording ([`SYSTEM_JOB_TEMPLATE_UPDATE_MESSAGE`]).
 pub fn system_resource_modify_message(member: &str) -> String {
     system_resource_message(member, "modify")
 }
+
+/// How MediaConvert refuses an UPDATE of a built-in JOB TEMPLATE.
+///
+/// `JobTemplate$Type`: "System or built-in job templates can't be modified or deleted by
+/// the user", and the refusal AWS is recorded answering `UpdateJobTemplate` for one is
+/// this sentence — ENTIRELY fixed text, naming the class of resource the service will not
+/// update rather than the template or the request member that named it. So it carries no
+/// slot at all, and nothing about the request can change a byte of it.
+pub const SYSTEM_JOB_TEMPLATE_UPDATE_MESSAGE: &str =
+    "You are not allowed to update system job templates.";
+
+/// How MediaConvert refuses the deletion of a queue that still holds work.
+///
+/// The queue is "currently in use", which is a conflict with the current state of the
+/// resource (the modelled `ConflictException`, 409), and the sentence AWS answers is
+/// ENTIRELY fixed text: it states the conflict and the remediation — cancel the jobs that
+/// are `SUBMITTED` or `PROGRESSING` in that queue, then resubmit — and names neither the
+/// queue nor how many jobs it holds. So it carries no slot at all: nothing about the
+/// request or the store's own counters appears in it.
+pub const QUEUE_IN_USE_MESSAGE: &str = "The queue is currently in use and cannot be \
+     deleted. To resolve: Stop submitting any other requests to modify this queue, and \
+     cancel any remaining jobs that are in a SUBMITTED or PROGRESSING state in this \
+     queue. Then, resubmit your request.";
 
 /// How this service refuses a `Create*` whose `Name` a BUILT-IN resource already holds.
 ///
@@ -2195,336 +2227,6 @@ impl PagedRecord for PresetRecord {
     }
 }
 
-/// `ContainerType` values a built-in preset's name names
-/// (`smithy_query(query="shape",shape="ContainerType")`): the MP4 file container, the
-/// MPEG-2 transport stream of an HLS output, and the fragmented MP4 of a DASH output.
-const CONTAINER_MP4: &str = "MP4";
-/// See [`CONTAINER_MP4`]. `M3u8Settings`: "These settings relate to the MPEG-2 transport
-/// stream (MPEG2-TS) container for the MPEG2-TS segments in your HLS outputs."
-const CONTAINER_M3U8: &str = "M3U8";
-/// See [`CONTAINER_MP4`]. `MpdSettings`: "These settings relate to the fragmented MP4
-/// container for the segments in your DASH outputs."
-const CONTAINER_MPD: &str = "MPD";
-
-/// See [`CONTAINER_MP4`]. `CmfcSettings`: "These settings relate to the fragmented MP4
-/// container for the segments in your CMAF outputs."
-const CONTAINER_CMFC: &str = "CMFC";
-/// See [`CONTAINER_MP4`]: the container of a Microsoft Smooth Streaming package's segments.
-const CONTAINER_ISMV: &str = "ISMV";
-
-/// `OutputGroupType` values (`smithy_query(query="shape",shape="OutputGroupType")`), the
-/// output packages a group can be, with the labels that enum's own doc gives them: "Type of
-/// output group (File group, Apple HLS, DASH ISO, Microsoft Smooth Streaming, CMAF)".
-const GROUP_TYPE_FILE: &str = "FILE_GROUP_SETTINGS";
-/// See [`GROUP_TYPE_FILE`].
-const GROUP_TYPE_HLS: &str = "HLS_GROUP_SETTINGS";
-/// See [`GROUP_TYPE_FILE`].
-const GROUP_TYPE_DASH_ISO: &str = "DASH_ISO_GROUP_SETTINGS";
-/// See [`GROUP_TYPE_FILE`].
-const GROUP_TYPE_MS_SMOOTH: &str = "MS_SMOOTH_GROUP_SETTINGS";
-/// See [`GROUP_TYPE_FILE`].
-const GROUP_TYPE_CMAF: &str = "CMAF_GROUP_SETTINGS";
-
-/// `VideoCodec` values (`smithy_query(query="shape",shape="VideoCodec")`): MPEG-4 AVC and
-/// HEVC, which a preset name abbreviates `Avc` and `Hevc`.
-const VIDEO_CODEC_AVC: &str = "H_264";
-/// See [`VIDEO_CODEC_AVC`].
-const VIDEO_CODEC_HEVC: &str = "H_265";
-
-/// The `AudioCodec` value every entry of the built-in catalogue names (`Aac`)
-/// (`smithy_query(query="shape",shape="AudioCodec")`).
-const AUDIO_CODEC_AAC: &str = "AAC";
-
-/// `H264FramerateControl`/`H265FramerateControl`'s `SPECIFIED`: the output's frame rate is
-/// the stated `FramerateNumerator`/`FramerateDenominator` ratio rather than the input's.
-const FRAMERATE_SPECIFIED: &str = "SPECIFIED";
-
-/// `H264RateControlMode`/`H265RateControlMode`/`AacRateControlMode`'s `CBR` — "constant
-/// bitrate" — the mode under which `Bitrate` is the rate the stated Mbps names.
-const RATE_CONTROL_CBR: &str = "CBR";
-
-/// `AacCodingMode`'s stereo mode, the channel layout of the AAC track a built-in preset
-/// carries (`smithy_query(query="shape",shape="AacCodingMode")`).
-const AAC_CODING_MODE_STEREO: &str = "CODING_MODE_2_0";
-
-/// `AacSettings$SampleRate`, "the AAC sample rate in samples per second (Hz)", for that
-/// track: 48 kHz, the rate inside the member's published 8000..96000 range that every
-/// container in this catalogue carries.
-const AAC_SAMPLE_RATE: i32 = 48_000;
-
-/// The bitrate and frame rate a published built-in name states for one output.
-///
-/// `H264Settings$Bitrate`/`H265Settings$Bitrate` are "the average bitrate in bits per
-/// second", and the frame rate is the
-/// `FramerateNumerator`/`FramerateDenominator` fraction those shapes carry, so a name's
-/// `<N>Hz`/`<N>fps` token is stored as that fraction rather than as a rounded rate.
-#[derive(Debug, Clone, Copy)]
-struct EncodeRate {
-    /// `Bitrate`, in bits per second.
-    bitrate: i32,
-    /// The numerator of the frame-rate fraction.
-    framerate_numerator: i32,
-    /// The denominator of that fraction.
-    framerate_denominator: i32,
-}
-
-/// `VideoCodecSettings` for a built-in catalogue entry: the codec its name states and — as
-/// `VideoCodecSettings` requires, "for each codec enum that you choose, define the
-/// corresponding settings object" — that codec's own settings object, carrying the bitrate
-/// and frame rate when the name states them and nothing when it does not.
-///
-/// The ONE place in this module that builds a codec settings object, so a built-in preset
-/// and a built-in job template cannot describe the same codec two different ways.
-fn video_codec_settings(video_codec: &str, rate: Option<EncodeRate>) -> VideoCodecSettings {
-    let mut settings = VideoCodecSettings {
-        codec: Some(video_codec.to_string()),
-        ..VideoCodecSettings::default()
-    };
-    if video_codec == VIDEO_CODEC_HEVC {
-        settings.h265_settings = Some(H265Settings {
-            bitrate: rate.map(|rate| rate.bitrate),
-            framerate_control: rate.map(|_| FRAMERATE_SPECIFIED.to_string()),
-            framerate_numerator: rate.map(|rate| rate.framerate_numerator),
-            framerate_denominator: rate.map(|rate| rate.framerate_denominator),
-            rate_control_mode: rate.map(|_| RATE_CONTROL_CBR.to_string()),
-            ..H265Settings::default()
-        });
-    } else {
-        settings.h264_settings = Some(H264Settings {
-            bitrate: rate.map(|rate| rate.bitrate),
-            framerate_control: rate.map(|_| FRAMERATE_SPECIFIED.to_string()),
-            framerate_numerator: rate.map(|rate| rate.framerate_numerator),
-            framerate_denominator: rate.map(|rate| rate.framerate_denominator),
-            rate_control_mode: rate.map(|_| RATE_CONTROL_CBR.to_string()),
-            ..H264Settings::default()
-        });
-    }
-    settings
-}
-
-/// The one stereo AAC audio track a built-in catalogue entry's name states, at `bitrate`
-/// bits per second.
-///
-/// The ONE place in this module that builds an audio description, for the reason
-/// [`video_codec_settings`] is the one place that builds codec settings.
-fn aac_audio_description(bitrate: i32) -> AudioDescription {
-    AudioDescription {
-        codec_settings: Some(AudioCodecSettings {
-            codec: Some(AUDIO_CODEC_AAC.to_string()),
-            aac_settings: Some(AacSettings {
-                bitrate: Some(bitrate),
-                coding_mode: Some(AAC_CODING_MODE_STEREO.to_string()),
-                rate_control_mode: Some(RATE_CONTROL_CBR.to_string()),
-                sample_rate: Some(AAC_SAMPLE_RATE),
-                ..AacSettings::default()
-            }),
-            ..AudioCodecSettings::default()
-        }),
-        ..AudioDescription::default()
-    }
-}
-
-/// One built-in ([`TYPE_SYSTEM`]) output preset: the encoder settings its published name
-/// states, as a row of parameters.
-///
-/// A MediaConvert system preset is named after the output it produces — family, container,
-/// video codec, audio codec, display aspect ratio, frame size, frame rate and video
-/// bitrate — so this row is that name read as data, and [`SystemPreset::settings`] builds
-/// the modelled `PresetSettings` graph from it: no member is set that the name does not
-/// state. The display aspect ratio a name carries is the ratio of [`Self::width`] to
-/// [`Self::height`], so it needs no field of its own.
-#[derive(Debug, Clone, Copy)]
-struct SystemPreset {
-    /// The published `Name`, which is this preset's identity.
-    name: &'static str,
-    /// A [`CONTAINER_MP4`]-style `ContainerType` value.
-    container: &'static str,
-    /// A [`VIDEO_CODEC_AVC`]-style `VideoCodec` value.
-    video_codec: &'static str,
-    /// `VideoDescription$Width`, "the video resolution width, in pixels, for this output".
-    width: i32,
-    /// `VideoDescription$Height`, the matching resolution height.
-    height: i32,
-    /// The `Hz` the name states, as the numerator of the
-    /// `FramerateNumerator`/`FramerateDenominator` fraction the codec settings carry.
-    framerate_numerator: i32,
-    /// The denominator of that fraction.
-    framerate_denominator: i32,
-    /// The `Mbps` the name states, as the codec's `Bitrate`: "the average bitrate in bits
-    /// per second".
-    video_bitrate: i32,
-    /// `AacSettings$Bitrate` for the output's audio track, in bits per second.
-    audio_bitrate: i32,
-}
-
-impl SystemPreset {
-    /// The modelled `PresetSettings` this row states: the container, the video
-    /// description with its codec settings, and the one AAC audio description.
-    fn settings(&self) -> PresetSettings {
-        PresetSettings {
-            container_settings: Some(ContainerSettings {
-                container: Some(self.container.to_string()),
-                ..ContainerSettings::default()
-            }),
-            video_description: Some(VideoDescription {
-                width: Some(self.width),
-                height: Some(self.height),
-                codec_settings: Some(video_codec_settings(
-                    self.video_codec,
-                    Some(EncodeRate {
-                        bitrate: self.video_bitrate,
-                        framerate_numerator: self.framerate_numerator,
-                        framerate_denominator: self.framerate_denominator,
-                    }),
-                )),
-                ..VideoDescription::default()
-            }),
-            audio_descriptions: Some(vec![aac_audio_description(self.audio_bitrate)]),
-            // "For each output that has captions, include one instance of
-            // CaptionDescriptions": a built-in video preset names none.
-            caption_descriptions: None,
-        }
-    }
-}
-
-/// The built-in ([`TYPE_SYSTEM`]) output presets this store is seeded with.
-///
-/// That an account holds presets it did not create is what `Preset$Type` ("A preset can be
-/// of two types: system or custom. System or built-in preset can't be modified or deleted
-/// by the user.") and `PresetListBy`'s `SYSTEM` value say: a caller builds a job from them
-/// without creating anything. The model carries no catalogue of them, so this SET is the
-/// emulator's own, named after the system presets AWS Elemental MediaConvert publishes, and
-/// its size is well inside [`MAX_PRESETS`]; nothing in the emulator keys on a particular
-/// entry, because a built-in preset is recognised by its `Type` and never by its name.
-///
-/// Each entry carries the encoder settings its published name states — the container, the
-/// codecs, the frame size, the frame rate and the bitrate are all in the name — so the
-/// settings here are that name read as data rather than a graph invented for it, exactly as
-/// [`SYSTEM_JOB_TEMPLATES`]' entries are.
-const SYSTEM_PRESETS: [SystemPreset; 11] = [
-    SystemPreset {
-        name: "System-Generic_Hd_Mp4_Avc_Aac_16x9_1920x1080p_24Hz_6Mbps",
-        container: CONTAINER_MP4,
-        video_codec: VIDEO_CODEC_AVC,
-        width: 1920,
-        height: 1080,
-        framerate_numerator: 24,
-        framerate_denominator: 1,
-        video_bitrate: 6_000_000,
-        audio_bitrate: 128_000,
-    },
-    SystemPreset {
-        name: "System-Generic_Hd_Mp4_Avc_Aac_16x9_1280x720p_24Hz_4.5Mbps",
-        container: CONTAINER_MP4,
-        video_codec: VIDEO_CODEC_AVC,
-        width: 1280,
-        height: 720,
-        framerate_numerator: 24,
-        framerate_denominator: 1,
-        video_bitrate: 4_500_000,
-        audio_bitrate: 96_000,
-    },
-    SystemPreset {
-        name: "System-Generic_Sd_Mp4_Avc_Aac_4x3_640x480p_30Hz_1.5Mbps",
-        container: CONTAINER_MP4,
-        video_codec: VIDEO_CODEC_AVC,
-        width: 640,
-        height: 480,
-        framerate_numerator: 30,
-        framerate_denominator: 1,
-        video_bitrate: 1_500_000,
-        audio_bitrate: 96_000,
-    },
-    SystemPreset {
-        name: "System-Generic_Sd_Mp4_Avc_Aac_16x9_640x360p_30Hz_0.6Mbps",
-        container: CONTAINER_MP4,
-        video_codec: VIDEO_CODEC_AVC,
-        width: 640,
-        height: 360,
-        framerate_numerator: 30,
-        framerate_denominator: 1,
-        video_bitrate: 600_000,
-        audio_bitrate: 64_000,
-    },
-    SystemPreset {
-        name: "System-Generic_Uhd_Mp4_Hevc_Aac_16x9_3840x2160p_24Hz_20Mbps",
-        container: CONTAINER_MP4,
-        video_codec: VIDEO_CODEC_HEVC,
-        width: 3840,
-        height: 2160,
-        framerate_numerator: 24,
-        framerate_denominator: 1,
-        video_bitrate: 20_000_000,
-        audio_bitrate: 128_000,
-    },
-    SystemPreset {
-        name: "System-Ott_Hls_Ts_Avc_Aac_16x9_1920x1080p_30Hz_8.5Mbps",
-        container: CONTAINER_M3U8,
-        video_codec: VIDEO_CODEC_AVC,
-        width: 1920,
-        height: 1080,
-        framerate_numerator: 30,
-        framerate_denominator: 1,
-        video_bitrate: 8_500_000,
-        audio_bitrate: 128_000,
-    },
-    SystemPreset {
-        name: "System-Ott_Hls_Ts_Avc_Aac_16x9_1280x720p_30Hz_3.5Mbps",
-        container: CONTAINER_M3U8,
-        video_codec: VIDEO_CODEC_AVC,
-        width: 1280,
-        height: 720,
-        framerate_numerator: 30,
-        framerate_denominator: 1,
-        video_bitrate: 3_500_000,
-        audio_bitrate: 96_000,
-    },
-    SystemPreset {
-        name: "System-Ott_Hls_Ts_Avc_Aac_16x9_960x540p_30Hz_1.5Mbps",
-        container: CONTAINER_M3U8,
-        video_codec: VIDEO_CODEC_AVC,
-        width: 960,
-        height: 540,
-        framerate_numerator: 30,
-        framerate_denominator: 1,
-        video_bitrate: 1_500_000,
-        audio_bitrate: 96_000,
-    },
-    SystemPreset {
-        name: "System-Ott_Hls_Ts_Avc_Aac_16x9_640x360p_30Hz_0.6Mbps",
-        container: CONTAINER_M3U8,
-        video_codec: VIDEO_CODEC_AVC,
-        width: 640,
-        height: 360,
-        framerate_numerator: 30,
-        framerate_denominator: 1,
-        video_bitrate: 600_000,
-        audio_bitrate: 64_000,
-    },
-    SystemPreset {
-        name: "System-Ott_Dash_Mp4_Avc_Aac_16x9_1280x720p_30Hz_3.5Mbps",
-        container: CONTAINER_MPD,
-        video_codec: VIDEO_CODEC_AVC,
-        width: 1280,
-        height: 720,
-        framerate_numerator: 30,
-        framerate_denominator: 1,
-        video_bitrate: 3_500_000,
-        audio_bitrate: 96_000,
-    },
-    SystemPreset {
-        name: "System-Ott_Dash_Mp4_Avc_Aac_16x9_640x360p_30Hz_0.6Mbps",
-        container: CONTAINER_MPD,
-        video_codec: VIDEO_CODEC_AVC,
-        width: 640,
-        height: 360,
-        framerate_numerator: 30,
-        framerate_denominator: 1,
-        video_bitrate: 600_000,
-        audio_bitrate: 64_000,
-    },
-];
-
 /// A reserved queue's pricing plan, built from the settings the caller purchased it with.
 pub fn reservation_plan(
     settings: &ReservationPlanSettings,
@@ -2587,351 +2289,6 @@ pub fn updated_reservation_plan(
         None => reservation_plan(settings, now),
     }
 }
-
-/// The output package a built-in job template's published name states: the
-/// `OutputGroupType` its one output group carries, the label that enum's own documentation
-/// gives that type, and the `ContainerType` each of the group's outputs is written in.
-#[derive(Debug, Clone, Copy)]
-struct OutputPackage {
-    /// A [`GROUP_TYPE_FILE`]-style `OutputGroupType` value.
-    group_type: &'static str,
-    /// `OutputGroup$Name`, "name of the output group": the label `OutputGroupType`'s doc
-    /// gives this type.
-    label: &'static str,
-    /// A [`CONTAINER_MP4`]-style `ContainerType` value for the group's outputs.
-    container: &'static str,
-}
-
-impl OutputPackage {
-    /// The modelled `OutputGroupSettings`: the type, and — as `OutputGroupSettings` pairs
-    /// each type with its own member — that package's settings object.
-    ///
-    /// The object carries no member: the only package settings a built-in template's name
-    /// states are the package itself, and `Destination` ("the S3 output location and the
-    /// output filename base") belongs to the job that is created from the template, not to
-    /// the template.
-    fn settings(&self) -> OutputGroupSettings {
-        let mut settings = OutputGroupSettings {
-            r#type: Some(self.group_type.to_string()),
-            ..OutputGroupSettings::default()
-        };
-        match self.group_type {
-            GROUP_TYPE_HLS => {
-                settings.hls_group_settings = Some(HlsGroupSettings::default());
-            }
-            GROUP_TYPE_DASH_ISO => {
-                settings.dash_iso_group_settings = Some(DashIsoGroupSettings::default());
-            }
-            GROUP_TYPE_MS_SMOOTH => {
-                settings.ms_smooth_group_settings = Some(MsSmoothGroupSettings::default());
-            }
-            GROUP_TYPE_CMAF => {
-                settings.cmaf_group_settings = Some(CmafGroupSettings::default());
-            }
-            _ => {
-                settings.file_group_settings = Some(FileGroupSettings::default());
-            }
-        }
-        settings
-    }
-}
-
-/// A standalone file output ("MediaConvert uses this group of settings to generate a single
-/// standalone file, rather than a streaming package"), in the MP4 container.
-const PACKAGE_FILE: OutputPackage = OutputPackage {
-    group_type: GROUP_TYPE_FILE,
-    label: "File group",
-    container: CONTAINER_MP4,
-};
-/// An Apple HLS package, whose segments are MPEG-2 transport streams.
-const PACKAGE_HLS: OutputPackage = OutputPackage {
-    group_type: GROUP_TYPE_HLS,
-    label: "Apple HLS",
-    container: CONTAINER_M3U8,
-};
-/// A DASH ISO package, whose segments are fragmented MP4.
-const PACKAGE_DASH_ISO: OutputPackage = OutputPackage {
-    group_type: GROUP_TYPE_DASH_ISO,
-    label: "DASH ISO",
-    container: CONTAINER_MPD,
-};
-/// A CMAF package, whose segments are the fragmented MP4 of [`CONTAINER_CMFC`].
-const PACKAGE_CMAF: OutputPackage = OutputPackage {
-    group_type: GROUP_TYPE_CMAF,
-    label: "CMAF",
-    container: CONTAINER_CMFC,
-};
-/// A Microsoft Smooth Streaming package.
-const PACKAGE_MS_SMOOTH: OutputPackage = OutputPackage {
-    group_type: GROUP_TYPE_MS_SMOOTH,
-    label: "Microsoft Smooth Streaming",
-    container: CONTAINER_ISMV,
-};
-
-/// The frame size and encode rate a built-in job template's name states, for a name that
-/// states them.
-///
-/// A name that states none — an adaptive-bitrate package named after its container and
-/// codecs only — leaves the output's resolution and frame rate to the input, which is what
-/// `JobTemplateSettings$FollowSource` describes the service doing with "all outputs that
-/// you don't manually specify".
-#[derive(Debug, Clone, Copy)]
-struct Rendition {
-    /// `VideoDescription$Width`, "the video resolution width, in pixels, for this output",
-    /// which is the stated line count at the stated display aspect ratio.
-    width: i32,
-    /// `VideoDescription$Height`, the line count the name's `<N>p` token states.
-    height: i32,
-    /// The bitrate and frame rate the name's `<N>kbps` and `<N>fps` tokens state.
-    rate: EncodeRate,
-}
-
-/// One built-in ([`TYPE_SYSTEM`]) job template: the encoding configuration its published
-/// name states, as a row of parameters.
-///
-/// A MediaConvert system job template is named after the output it produces — the output
-/// package, the video and audio codecs and, where the name carries them, the display aspect
-/// ratio, frame size, frame rate and video bitrate — so this row is that name read as data,
-/// and [`SystemJobTemplate::settings`] builds the modelled `JobTemplateSettings` graph from
-/// it, exactly as [`SystemPreset`] does for a built-in preset's `PresetSettings`: no member
-/// is set that the name does not state.
-#[derive(Debug, Clone, Copy)]
-struct SystemJobTemplate {
-    /// The published `Name`, which is this template's identity.
-    name: &'static str,
-    /// The output package the name states.
-    package: OutputPackage,
-    /// A [`VIDEO_CODEC_AVC`]-style `VideoCodec` value.
-    video_codec: &'static str,
-    /// The frame size and encode rate the name states, or `None` for a name that states
-    /// neither.
-    rendition: Option<Rendition>,
-}
-
-impl SystemJobTemplate {
-    /// The modelled `JobTemplateSettings` this row states: the one input a job created from
-    /// it inherits, and the one output group of the package the name names.
-    fn settings(&self) -> JobTemplateSettings {
-        let mut audio_selectors = HashMap::new();
-        audio_selectors.insert(
-            AUDIO_SELECTOR_NAME.to_string(),
-            AudioSelector {
-                default_selection: Some(AUDIO_DEFAULT_SELECTION.to_string()),
-                ..AudioSelector::default()
-            },
-        );
-        JobTemplateSettings {
-            // "There can only be one input in a job template" ([`MAX_JOB_TEMPLATE_INPUTS`]):
-            // the input every job created from this template inherits, carrying the audio
-            // selector the output's audio track is taken from. WHERE that input is read
-            // from is not stated here — `InputTemplate` models no `FileInput` at all — so
-            // the job that uses the template states its own source.
-            inputs: Some(vec![InputTemplate {
-                audio_selectors: Some(audio_selectors),
-                ..InputTemplate::default()
-            }]),
-            output_groups: Some(vec![OutputGroup {
-                name: Some(self.package.label.to_string()),
-                output_group_settings: Some(self.package.settings()),
-                outputs: Some(vec![self.output()]),
-                ..OutputGroup::default()
-            }]),
-            ..JobTemplateSettings::default()
-        }
-    }
-
-    /// The one output of this row's group: the container the package is written in, the
-    /// video description the name states, and the one AAC audio track it names.
-    fn output(&self) -> Output {
-        Output {
-            container_settings: Some(ContainerSettings {
-                container: Some(self.package.container.to_string()),
-                ..ContainerSettings::default()
-            }),
-            video_description: Some(VideoDescription {
-                width: self.rendition.map(|rendition| rendition.width),
-                height: self.rendition.map(|rendition| rendition.height),
-                codec_settings: Some(video_codec_settings(
-                    self.video_codec,
-                    self.rendition.map(|rendition| rendition.rate),
-                )),
-                ..VideoDescription::default()
-            }),
-            audio_descriptions: Some(vec![aac_audio_description(
-                BUILT_IN_TEMPLATE_AUDIO_BITRATE,
-            )]),
-            ..Output::default()
-        }
-    }
-}
-
-/// The key a built-in job template's input states its audio selector under.
-///
-/// `Input$AudioSelectors` ("Use Audio selectors to specify a track or set of tracks from the
-/// input that you will use in your outputs") is a map whose keys are LABELS rather than
-/// modelled values, so this one is the emulator's own, the label the service's own console
-/// gives the first selector of an input.
-const AUDIO_SELECTOR_NAME: &str = "Audio Selector 1";
-
-/// `AudioDefaultSelection`'s `DEFAULT` (`smithy_query(query="shape",shape="AudioDefaultSelection")`):
-/// the selector an output with no selector of its own takes its audio from, which is what
-/// makes the single audio track of a built-in template's output resolve against any input.
-const AUDIO_DEFAULT_SELECTION: &str = "DEFAULT";
-
-/// `AacSettings$Bitrate` for the audio track of a built-in job template's output.
-///
-/// A CHOSEN value, not one the published name states: a system job template's name names the
-/// audio codec (`Aac`) and never its bitrate. 128 kbps sits inside the member's published
-/// 6000..1024000 range and is the rate the HD entries of [`SYSTEM_PRESETS`] carry for the
-/// same stereo 48 kHz track, so the two built-in catalogues describe it the same way.
-const BUILT_IN_TEMPLATE_AUDIO_BITRATE: i32 = 128_000;
-
-/// The frame rate of the catalogue's single-file entries, as the
-/// `FramerateNumerator`/`FramerateDenominator` fraction: 30000/1001, the exact value of the
-/// 29.97 fps their names state.
-const FRAMERATE_29_97: (i32, i32) = (30_000, 1_001);
-
-/// The built-in ([`TYPE_SYSTEM`]) job templates this store is seeded with.
-///
-/// That an account holds templates it did not create is what `JobTemplate$Type` ("A job
-/// template can be of two types: system or custom. System or built-in job templates
-/// can't be modified or deleted by the user.") and `JobTemplateListBy`'s `SYSTEM` value
-/// say. The model carries no catalogue of them, so this SET is the emulator's own, named
-/// after the system job templates AWS Elemental MediaConvert publishes, and its size is well
-/// inside both [`MAX_JOB_TEMPLATES`] and one page of `ListJobTemplates`; nothing in the
-/// emulator or its tests keys on a particular entry, because a built-in template is
-/// recognised by its `Type` and never by its name. Its rows span the five published output
-/// packages (`OutputGroupType`) and both video codecs a published name abbreviates.
-///
-/// Each entry carries the encoding configuration its name states, because
-/// `JobTemplate$Settings` IS the template's "pre-made set of encoding instructions": a
-/// client lists this catalogue, picks an entry and creates a job from it, and that job
-/// inherits the entry's output group ([`merge_template_settings`]). The graph of every row
-/// therefore passes the same test a template a caller
-/// stores has to pass
-/// ([`ComAmazonawsMediaconvertMediaconvertState::job_template_settings_problem`]).
-const SYSTEM_JOB_TEMPLATES: [SystemJobTemplate; 12] = [
-    SystemJobTemplate {
-        name: "System-Avc_16x9_1080p_29_97fps_8500kbps",
-        package: PACKAGE_FILE,
-        video_codec: VIDEO_CODEC_AVC,
-        rendition: Some(Rendition {
-            width: 1920,
-            height: 1080,
-            rate: EncodeRate {
-                bitrate: 8_500_000,
-                framerate_numerator: FRAMERATE_29_97.0,
-                framerate_denominator: FRAMERATE_29_97.1,
-            },
-        }),
-    },
-    SystemJobTemplate {
-        name: "System-Avc_16x9_720p_29_97fps_5000kbps",
-        package: PACKAGE_FILE,
-        video_codec: VIDEO_CODEC_AVC,
-        rendition: Some(Rendition {
-            width: 1280,
-            height: 720,
-            rate: EncodeRate {
-                bitrate: 5_000_000,
-                framerate_numerator: FRAMERATE_29_97.0,
-                framerate_denominator: FRAMERATE_29_97.1,
-            },
-        }),
-    },
-    SystemJobTemplate {
-        name: "System-Avc_16x9_540p_29_97fps_3500kbps",
-        package: PACKAGE_FILE,
-        video_codec: VIDEO_CODEC_AVC,
-        rendition: Some(Rendition {
-            width: 960,
-            height: 540,
-            rate: EncodeRate {
-                bitrate: 3_500_000,
-                framerate_numerator: FRAMERATE_29_97.0,
-                framerate_denominator: FRAMERATE_29_97.1,
-            },
-        }),
-    },
-    SystemJobTemplate {
-        name: "System-Avc_16x9_360p_29_97fps_1200kbps",
-        package: PACKAGE_FILE,
-        video_codec: VIDEO_CODEC_AVC,
-        rendition: Some(Rendition {
-            width: 640,
-            height: 360,
-            rate: EncodeRate {
-                bitrate: 1_200_000,
-                framerate_numerator: FRAMERATE_29_97.0,
-                framerate_denominator: FRAMERATE_29_97.1,
-            },
-        }),
-    },
-    SystemJobTemplate {
-        name: "System-Hevc_16x9_2160p_29_97fps_20000kbps",
-        package: PACKAGE_FILE,
-        video_codec: VIDEO_CODEC_HEVC,
-        rendition: Some(Rendition {
-            width: 3840,
-            height: 2160,
-            rate: EncodeRate {
-                bitrate: 20_000_000,
-                framerate_numerator: FRAMERATE_29_97.0,
-                framerate_denominator: FRAMERATE_29_97.1,
-            },
-        }),
-    },
-    SystemJobTemplate {
-        name: "System-Hevc_16x9_1080p_29_97fps_6000kbps",
-        package: PACKAGE_FILE,
-        video_codec: VIDEO_CODEC_HEVC,
-        rendition: Some(Rendition {
-            width: 1920,
-            height: 1080,
-            rate: EncodeRate {
-                bitrate: 6_000_000,
-                framerate_numerator: FRAMERATE_29_97.0,
-                framerate_denominator: FRAMERATE_29_97.1,
-            },
-        }),
-    },
-    SystemJobTemplate {
-        name: "System-Ott_Hls_Ts_Avc_Aac",
-        package: PACKAGE_HLS,
-        video_codec: VIDEO_CODEC_AVC,
-        rendition: None,
-    },
-    SystemJobTemplate {
-        name: "System-Ott_Hls_Ts_Hevc_Aac",
-        package: PACKAGE_HLS,
-        video_codec: VIDEO_CODEC_HEVC,
-        rendition: None,
-    },
-    SystemJobTemplate {
-        name: "System-Ott_Dash_Mp4_Avc_Aac",
-        package: PACKAGE_DASH_ISO,
-        video_codec: VIDEO_CODEC_AVC,
-        rendition: None,
-    },
-    SystemJobTemplate {
-        name: "System-Ott_Dash_Mp4_Hevc_Aac",
-        package: PACKAGE_DASH_ISO,
-        video_codec: VIDEO_CODEC_HEVC,
-        rendition: None,
-    },
-    SystemJobTemplate {
-        name: "System-Ott_Cmaf_Cmfc_Avc_Aac",
-        package: PACKAGE_CMAF,
-        video_codec: VIDEO_CODEC_AVC,
-        rendition: None,
-    },
-    SystemJobTemplate {
-        name: "System-Ott_Smooth_Ismv_Avc_Aac",
-        package: PACKAGE_MS_SMOOTH,
-        video_codec: VIDEO_CODEC_AVC,
-        rendition: None,
-    },
-];
 
 /// One job template: "a pre-made set of encoding instructions that you can use to
 /// quickly create a job".
@@ -3766,319 +3123,6 @@ impl JobsQueryRecord {
     }
 }
 
-/// One page of records and the cursor that resumes after it.
-#[derive(Debug)]
-pub struct Page<'a, R> {
-    pub records: Vec<&'a R>,
-    /// The [`encode_cursor`] token of the last record of the page, and only when a further
-    /// page exists.
-    pub next_token: Option<String>,
-}
-
-/// The page of records EVERY paged reader in this service reports.
-///
-/// ONE place that owns the ordering, the cursor and the page size, whatever kind of record
-/// is being listed, so no paged reader can drift from another: a change to the anchor
-/// comparison, the page-size fallback or the token condition lands in all of them at once.
-/// A listing runs UP the key it is ordered on — alphabetically from the start of the
-/// alphabet, chronologically from the oldest — unless the caller asks for
-/// [`ORDER_DESCENDING`]; `Order`'s doc says only "Default varies by resource", so each
-/// listing passes the `default_order` its own member documents, for the request that
-/// states none.
-///
-/// `records` is whatever set the handler selected (a `Type`, a category, a filter):
-/// choosing the set is the handler's business, ordering and paging it is this function's.
-///
-/// `resume_from` is the ordering key a caller's `nextToken` decoded to; a token that
-/// decodes to nothing is refused by the handler that read it, with its modelled
-/// `BadRequestException`, so there is no failure left to answer here.
-pub fn page_of_records<'a, R: PagedRecord>(
-    records: impl Iterator<Item = &'a R>,
-    sort_key: ListBySortKey,
-    order: Option<&str>,
-    default_order: &str,
-    resume_from: Option<&(u128, String)>,
-    max_results: Option<i32>,
-) -> Page<'a, R> {
-    let ascending = order.unwrap_or(default_order) != ORDER_DESCENDING;
-    let mut matching: Vec<&R> = records.collect();
-    matching.sort_by(|left, right| sort_key.compare(left.ordering_key(), right.ordering_key()));
-    if !ascending {
-        matching.reverse();
-    }
-
-    let start = match resume_from {
-        None => 0,
-        Some((nanos, id)) => {
-            let anchor = (*nanos, id.as_str());
-            // Resume at the first record strictly past the anchor key in this direction.
-            // The anchor itself need not still be in the result set, so a record deleted or
-            // changed between two pages is skipped rather than failing the token.
-            matching
-                .iter()
-                .position(|record| {
-                    let side = sort_key.compare(record.ordering_key(), anchor);
-                    if ascending {
-                        side == ::std::cmp::Ordering::Greater
-                    } else {
-                        side == ::std::cmp::Ordering::Less
-                    }
-                })
-                .unwrap_or(matching.len())
-        }
-    };
-
-    // Every `maxResults` member carries the model's own 1..20 range, so the framework has
-    // already refused anything outside it; the fallback only covers the absent case.
-    let page_size = usize::try_from(max_results.unwrap_or(DEFAULT_PAGE_SIZE))
-        .unwrap_or(DEFAULT_PAGE_SIZE as usize);
-    let page = &matching[start.min(matching.len())..];
-    let page = &page[..page_size.min(page.len())];
-    // A token only when there is a further page to fetch.
-    let next_token = (start + page.len() < matching.len())
-        .then(|| page.last().map(|record| record.cursor()))
-        .flatten();
-    Page {
-        records: page.to_vec(),
-        next_token,
-    }
-}
-
-/// The jobs the filters a paged jobs reader carries keep, out of every job the account
-/// holds.
-///
-/// ONE place that owns the SET a filtering jobs reader reports, as [`records_listed_by`]
-/// owns the set a `listBy` listing reports and [`page_of_records`] the ordering, the cursor
-/// and the page size, so no two jobs readers can drift:
-///
-/// * every filter the request carries NARROWS the set, so a job is kept only when it
-///   satisfies all of them, and a filter the request leaves out narrows nothing;
-/// * `queue` keeps the jobs sent to exactly that queue ([`JobRecord::matches_queue`]),
-///   compared by queue name — a member that also offers the ARN form is reduced to the name
-///   by the reader that read it ([`queue_name_from_reference`]), because only a member whose
-///   own documentation offers that form may be reduced;
-/// * `status` keeps the jobs in exactly that status ([`JobRecord::matches_status`]);
-/// * `input_file` keeps the jobs one of whose inputs CONTAINS it
-///   ([`JobRecord::matches_input_file`]), since such a member is "your input file URL or
-///   your partial input file name".
-///
-/// `ListJobs` and `SearchJobs` both narrow the job set here, each passing the filters its
-/// own members offer; the jobs query takes the very same three tests one at a time
-/// ([`JobRecord::matches_filter`]), because its filter list combines them with OR rather
-/// than AND.
-pub fn jobs_matching<'a>(
-    jobs: impl Iterator<Item = &'a JobRecord> + 'a,
-    queue: Option<&'a str>,
-    status: Option<&'a str>,
-    input_file: Option<&'a str>,
-) -> impl Iterator<Item = &'a JobRecord> + 'a {
-    jobs.filter(move |job| {
-        queue.is_none_or(|name| job.matches_queue(name))
-            && status.is_none_or(|want| job.matches_status(want))
-            && input_file.is_none_or(|file| job.matches_input_file(file))
-    })
-}
-
-/// The page of `jobs` a paged jobs reader reports, through [`page_of_records`].
-///
-/// Every paged reader of the job set goes through this one function — `ListJobs`, `SearchJobs`
-/// and the page a jobs query matches — so they all state the one default this listing
-/// documents. "Your most recently created jobs": ordered by creation time, newest first
-/// unless the caller asked for [`ORDER_ASCENDING`], with the id breaking ties.
-///
-/// `resume_from` is the ordering key a caller's `nextToken` decoded to.
-pub fn page_of_jobs<'a>(
-    jobs: impl Iterator<Item = &'a JobRecord>,
-    order: Option<&str>,
-    resume_from: Option<&(u128, String)>,
-    max_results: Option<i32>,
-) -> Page<'a, JobRecord> {
-    page_of_records(
-        jobs,
-        ListBySortKey::CreationDate,
-        order,
-        ORDER_DESCENDING,
-        resume_from,
-        max_results,
-    )
-}
-
-/// Which key a `listBy`-ordered listing is ordered on, as `listBy` chooses it. Every
-/// `*ListBy` enum in this service names the same two keys — `QueueListBy`, for one: "you
-/// can choose to list them alphabetically by NAME or chronologically by CREATION_DATE" —
-/// so ONE type carries both, and each listing supplies the default its own member
-/// documents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ListBySortKey {
-    /// Alphabetically by `Name`. Names are unique within the account, so this key alone
-    /// is a total order.
-    Name,
-    /// Chronologically by `CreatedAt`, with the name breaking ties.
-    CreationDate,
-}
-
-impl ListBySortKey {
-    /// The key the `listBy` a request carried names, or `default` when it carried none —
-    /// the value that member's own doc states ("If you don't specify, the service will
-    /// list them by ..."). A `listBy` value that names neither key, such as
-    /// [`LIST_BY_SYSTEM`], selects a SET rather than a key, so it orders on `default`
-    /// too.
-    pub fn from_list_by(list_by: Option<&str>, default: Self) -> Self {
-        match list_by {
-            Some(LIST_BY_NAME) => Self::Name,
-            Some(LIST_BY_CREATION_DATE) => Self::CreationDate,
-            _ => default,
-        }
-    }
-
-    /// Where one record's `ordering_key` falls against another's on this key.
-    pub fn compare(self, left: (u128, &str), right: (u128, &str)) -> ::std::cmp::Ordering {
-        match self {
-            Self::Name => left.1.cmp(right.1),
-            Self::CreationDate => left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)),
-        }
-    }
-}
-
-/// A record whose listing selects it with a `listBy` and a `category`.
-///
-/// Implemented by the two kinds of record whose listing takes both members — a job
-/// template and a preset — so [`records_listed_by`] owns the one selection rule they
-/// share. `is_system` comes from [`NamedRecord`], which already states which records are
-/// built in for the create and delete paths, so the set half of a listing reads the same
-/// property those do.
-pub trait ListedRecord: NamedRecord {
-    /// The `Category` the record is stored under, or `None` for one stored under no
-    /// category at all.
-    fn record_category(&self) -> Option<&str>;
-}
-
-impl ListedRecord for JobTemplateRecord {
-    fn record_category(&self) -> Option<&str> {
-        self.category.as_deref()
-    }
-}
-
-impl ListedRecord for PresetRecord {
-    fn record_category(&self) -> Option<&str> {
-        self.category.as_deref()
-    }
-}
-
-/// The records a request's `listBy` and `category` select, out of every record of that
-/// kind the account holds.
-///
-/// ONE place that owns the SET a `listBy` listing reports, as [`page_of_records`] owns its
-/// ordering, cursor and page size, so no two such listings can drift:
-///
-/// * `listBy` chooses WHICH set: its [`LIST_BY_SYSTEM`] value selects the built-in records,
-///   the ones a caller can neither modify nor delete, and every other value — including
-///   none at all, which names only an ordering key — the account's own records.
-/// * `category` keeps only the records stored under exactly that category, so a record
-///   stored under none matches no category a caller can name ("specify a ... category to
-///   limit responses to only [the records] from that category"); a request naming no
-///   category narrows nothing.
-///
-/// A `category` carrying no characters never reaches here: both listings refuse such a
-/// value at the door ([`blank_member_problem`]), because [`optional_free_text`] stores a
-/// category only when it carries characters, so an equality test against one could match
-/// no record and would report a narrowing to the empty set.
-pub fn records_listed_by<'a, R: ListedRecord + 'a>(
-    records: impl Iterator<Item = &'a R> + 'a,
-    list_by: Option<&str>,
-    category: Option<&'a str>,
-) -> impl Iterator<Item = &'a R> + 'a {
-    let wanted_built_in = list_by == Some(LIST_BY_SYSTEM);
-    records.filter(move |record| {
-        record.is_system() == wanted_built_in
-            && category.is_none_or(|want| record.record_category() == Some(want))
-    })
-}
-
-/// The page of `queues` `ListQueues` reports, ordered on the key `list_by` names in the
-/// direction `order` names, through [`page_of_records`].
-///
-/// `QueueListBy`: "you can choose to list them alphabetically by NAME or chronologically
-/// by CREATION_DATE. If you don't specify, the service will list them by creation date" —
-/// so this listing's default key is the creation-date one, whose oldest record is the
-/// account's built-in `Default` queue. Everything else about the page is
-/// [`page_of_records`]'s.
-///
-/// `resume_from` is the ordering key a caller's `nextToken` decoded to.
-pub fn page_of_queues<'a>(
-    queues: impl Iterator<Item = &'a QueueRecord>,
-    list_by: Option<&str>,
-    order: Option<&str>,
-    resume_from: Option<&(u128, String)>,
-    max_results: Option<i32>,
-) -> Page<'a, QueueRecord> {
-    page_of_records(
-        queues,
-        ListBySortKey::from_list_by(list_by, ListBySortKey::CreationDate),
-        order,
-        ORDER_ASCENDING,
-        resume_from,
-        max_results,
-    )
-}
-
-/// The page of `presets` `ListPresets` reports, ordered on the key `list_by` names in the
-/// direction `order` names, through [`page_of_records`].
-///
-/// `PresetListBy`: "you can choose to list them alphabetically by NAME or chronologically
-/// by CREATION_DATE. If you don't specify, the service will list them by name" — so this
-/// listing's default key is the NAME one, which is the only way it differs from the queue
-/// listing.
-///
-/// `presets` is whatever set was selected (a `Type`, a category), which is
-/// [`records_listed_by`]'s business; ordering and paging it is [`page_of_records`]'s.
-///
-/// `resume_from` is the ordering key a caller's `nextToken` decoded to.
-pub fn page_of_presets<'a>(
-    presets: impl Iterator<Item = &'a PresetRecord>,
-    list_by: Option<&str>,
-    order: Option<&str>,
-    resume_from: Option<&(u128, String)>,
-    max_results: Option<i32>,
-) -> Page<'a, PresetRecord> {
-    page_of_records(
-        presets,
-        ListBySortKey::from_list_by(list_by, ListBySortKey::Name),
-        order,
-        ORDER_ASCENDING,
-        resume_from,
-        max_results,
-    )
-}
-
-/// The page of job templates `ListJobTemplates` reports, ordered on the key `list_by`
-/// names in the direction `order` names, through [`page_of_records`].
-///
-/// `JobTemplateListBy`: "you can choose to list them alphabetically by NAME or
-/// chronologically by CREATION_DATE. If you don't specify, the service will list them by
-/// name" — so this listing's default key is the NAME one, as the preset listing's is.
-///
-/// `job_templates` is whatever set was selected (a `Type`, a category), which is
-/// [`records_listed_by`]'s business; ordering and paging it is [`page_of_records`]'s.
-///
-/// `resume_from` is the ordering key a caller's `nextToken` decoded to.
-pub fn page_of_job_templates<'a>(
-    job_templates: impl Iterator<Item = &'a JobTemplateRecord>,
-    list_by: Option<&str>,
-    order: Option<&str>,
-    resume_from: Option<&(u128, String)>,
-    max_results: Option<i32>,
-) -> Page<'a, JobTemplateRecord> {
-    page_of_records(
-        job_templates,
-        ListBySortKey::from_list_by(list_by, ListBySortKey::Name),
-        order,
-        ORDER_ASCENDING,
-        resume_from,
-        max_results,
-    )
-}
-
 /// One Job engine version of the account's catalogue: "periodically grouped MediaConvert
 /// releases", each with "the date that this Job engine version expires".
 ///
@@ -4303,9 +3347,11 @@ pub enum DeleteQueueOutcome {
     /// The queue is built in. `Queue`'s `Type`: "System queues are built in. You can't
     /// modify or delete system queues."
     SystemQueue,
-    /// The queue still holds jobs that have not reached a terminal status, carrying how
-    /// many are `SUBMITTED` and how many `PROGRESSING`.
-    HasActiveJobs { submitted: i32, progressing: i32 },
+    /// The queue still holds jobs that have not reached a terminal status, so the delete
+    /// conflicts with the current state of the resource. It carries no count: the refusal
+    /// AWS words for it states neither the queue nor how many jobs it holds
+    /// ([`QUEUE_IN_USE_MESSAGE`]).
+    HasActiveJobs,
 }
 
 /// What the store did when asked to delete a resource whose `Name` is its identity — a
@@ -4597,6 +3643,14 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     /// `job_settles_after` is: a test pins the span it needs instead of racing the real
     /// clock. Nothing on a request path writes it.
     pub share_completes_after: Duration,
+    /// The job state changes this store has recorded and nothing has published to
+    /// EventBridge yet, oldest first.
+    ///
+    /// Recorded by the one place a job's exit from `SUBMITTED` is written, and drained —
+    /// with this store's lock released — by the publisher
+    /// ([`publish_pending`]). At most [`MAX_PENDING_EVENTS`] entries, the oldest dropped
+    /// first.
+    pending_job_events: VecDeque<JobStateChange>,
 }
 
 impl Default for ComAmazonawsMediaconvertMediaconvertState {
@@ -4669,6 +3723,9 @@ impl Default for ComAmazonawsMediaconvertMediaconvertState {
             job_settles_after: JOB_SETTLES_AFTER,
             jobs_query_completes_after: JOBS_QUERY_COMPLETES_AFTER,
             share_completes_after: SHARE_COMPLETES_AFTER,
+            // Nothing has moved yet, so there is nothing to publish: the first transition
+            // the clock materialises queues the first change.
+            pending_job_events: VecDeque::new(),
         }
     }
 }
@@ -4813,6 +3870,12 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     /// A job that DOES leave `SUBMITTED` here has reached a terminal status, so every
     /// clock-owed instant it carried goes with the transition — see
     /// [`Self::retire_job_clock`], the one statement of that rule.
+    ///
+    /// This is also the one place a job's status MOVES on its own, so it is where the move
+    /// is recorded for publication to EventBridge
+    /// ([`Self::record_job_state_change`]): a job held back by a paused queue has not
+    /// moved and records nothing, and neither does a job a cancel took out of the queue
+    /// before it ever began.
     fn settle_job(&mut self, due: SystemTime, id: &str) {
         let held = self.jobs.get(id).is_some_and(|job| {
             job.status == JOB_STATUS_SUBMITTED && self.queue_is_paused(&job.queue)
@@ -4826,6 +3889,7 @@ impl ComAmazonawsMediaconvertMediaconvertState {
             job.settles_at = None;
             return;
         }
+        let mut moved = false;
         if job.status == JOB_STATUS_SUBMITTED {
             job.status = JOB_STATUS_ERROR.to_string();
             // Why the job failed decides what it reports. An input THIS emulator
@@ -4846,6 +3910,13 @@ impl ComAmazonawsMediaconvertMediaconvertState {
             }
             job.timing.start_time = Some(due);
             job.timing.finish_time = Some(due);
+            moved = true;
+        }
+        // The job has begun and finished processing, so the status it moved into is
+        // published; recorded from the record the write above left, with the instant the
+        // clock made the move due.
+        if moved {
+            self.record_job_state_change(id, due);
         }
         // The job is not waiting in a queue any more, so nothing further is due from it.
         self.retire_job_clock(id);
@@ -5283,10 +4354,7 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         }
         let (submitted, progressing) = self.job_counts(name);
         if submitted > 0 || progressing > 0 {
-            return DeleteQueueOutcome::HasActiveJobs {
-                submitted,
-                progressing,
-            };
+            return DeleteQueueOutcome::HasActiveJobs;
         }
         self.queues.remove(name);
         DeleteQueueOutcome::Deleted

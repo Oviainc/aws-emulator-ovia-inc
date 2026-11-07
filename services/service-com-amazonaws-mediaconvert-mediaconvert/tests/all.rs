@@ -45,6 +45,8 @@ mod create_job_validation;
 mod created_resource_defaults;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/fixed_refusal_sentences.rs"]
+mod fixed_refusal_sentences;
 #[path = "all/foreign_arn_reference.rs"]
 mod foreign_arn_reference;
 #[path = "all/hop_destination_refusal_order.rs"]
@@ -65,6 +67,8 @@ mod job_from_template;
 mod job_lifecycle;
 #[path = "all/job_search.rs"]
 mod job_search;
+#[path = "all/job_state_change_events.rs"]
+mod job_state_change_events;
 #[path = "all/job_template_crud.rs"]
 mod job_template_crud;
 #[path = "all/job_template_queue_reference.rs"]

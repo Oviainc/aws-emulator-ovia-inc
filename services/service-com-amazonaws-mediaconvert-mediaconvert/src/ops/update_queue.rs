@@ -384,9 +384,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state.rearm_queue(&name, now);
         }
         let (submitted, progressing) = state.job_counts(&name);
+        let view = record.view(&region, submitted, progressing);
 
-        Ok(UpdateQueueOutput {
-            queue: Some(record.view(&region, submitted, progressing)),
-        })
+        // The guard is RELEASED here, before the handler returns. Releasing the jobs this
+        // queue was holding publishes nothing of its own: those jobs have not moved yet —
+        // the clock owes them their exit, and the door that materialises it is the one
+        // that publishes it (`state::publish_job_state_changes`).
+        drop(state);
+
+        Ok(UpdateQueueOutput { queue: Some(view) })
     }
 }

@@ -599,10 +599,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let view = job.view(&region);
+        // The guard is RELEASED here, before the handler returns: this submission stores a
+        // job in `SUBMITTED` and "the job's event stream begins at its first move out of
+        // it", so a submit publishes no event of its own. Whatever another job's
+        // transition the settle above materialised stays queued for the next door that
+        // reports job state, which drains the whole queue
+        // (`state::publish_job_state_changes`).
+        drop(state);
 
-        Ok(CreateJobOutput {
-            job: Some(job.view(&region)),
-        })
+        Ok(CreateJobOutput { job: Some(view) })
     }
 }
 

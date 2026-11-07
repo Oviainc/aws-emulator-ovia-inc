@@ -181,44 +181,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        // Reporting only: the one write is materialising the transitions the clock had
-        // already made due at `now` — this query's own completion among them — which were
-        // owed whether or not anybody polled.
-        state.settle(now);
+        // The guard is taken and RELEASED around the read, so the publication below holds
+        // no lock across the in-process call it makes.
+        let (status, jobs, next_token) = {
+            let mut state = state.lock();
+            // Reporting only: the one write is materialising the transitions the clock had
+            // already made due at `now` — this query's own completion among them — which
+            // were owed whether or not anybody polled.
+            state.settle(now);
 
-        let Some(query) = state.jobs_queries.get(&input.id) else {
-            return Err(GetJobsQueryResultsErrorModeled::NotFoundException(
-                NotFoundException {
-                    // The refusal names the request member the lookup read, `Id`.
-                    message: Some(crate::state::not_found_message("id")),
-                },
-            )
-            .into());
-        };
+            let Some(query) = state.jobs_queries.get(&input.id) else {
+                return Err(GetJobsQueryResultsErrorModeled::NotFoundException(
+                    NotFoundException {
+                        // The refusal names the request member the lookup read, `Id`.
+                        message: Some(crate::state::not_found_message("id")),
+                    },
+                )
+                .into());
+            };
 
-        // The matched page is the one the query stored when it was started, so the jobs a
-        // caller polls do not shift under them. A query that has not completed yet
-        // reports no page at all, only its status — and the page is BOTH halves: the jobs
-        // it matched and the cursor for the batch after them, which `reported_page` hands
-        // back together so neither can be reported without the other.
-        let status = Some(query.status.clone());
-        let page = query
-            .reported_page()
-            .map(|(matched, next_token)| (matched.to_vec(), next_token.map(str::to_string)));
-        let (jobs, next_token) = match page {
-            Some((matched, next_token)) => (
-                Some(
-                    matched
-                        .iter()
-                        .filter_map(|id| state.jobs.get(id))
-                        .map(|job| job.view(&region))
-                        .collect(),
+            // The matched page is the one the query stored when it was started, so the jobs
+            // a caller polls do not shift under them. A query that has not completed yet
+            // reports no page at all, only its status — and the page is BOTH halves: the
+            // jobs it matched and the cursor for the batch after them, which
+            // `reported_page` hands back together so neither can be reported without the
+            // other.
+            let status = Some(query.status.clone());
+            let page = query
+                .reported_page()
+                .map(|(matched, next_token)| (matched.to_vec(), next_token.map(str::to_string)));
+            let (jobs, next_token) = match page {
+                Some((matched, next_token)) => (
+                    Some(
+                        matched
+                            .iter()
+                            .filter_map(|id| state.jobs.get(id))
+                            .map(|job| job.view(&region))
+                            .collect::<Vec<_>>(),
+                    ),
+                    next_token,
                 ),
-                next_token,
-            ),
-            None => (None, None),
+                None => (None, None),
+            };
+            (status, jobs, next_token)
         };
+
+        // A status change this read's own settle materialised is a job state change,
+        // published by the call that materialised it
+        // (`state::publish_job_state_changes`).
+        crate::state::publish_job_state_changes(ctx, &*self.engine, &region).await;
 
         Ok(GetJobsQueryResultsOutput {
             jobs,

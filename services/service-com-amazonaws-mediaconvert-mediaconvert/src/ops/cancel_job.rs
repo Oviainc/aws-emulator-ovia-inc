@@ -137,7 +137,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CancelJobErrorModeled::InternalServerErrorException(
@@ -162,13 +162,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        state.settle(now);
+        // The guard is taken and RELEASED around the transition, so the publication below
+        // holds no lock across the in-process call it makes.
+        let outcome = {
+            let mut state = state.lock();
+            state.settle(now);
 
-        // The store owns the transition: it moves the job to CANCELED and drops the
-        // clock-owed exit it no longer needs, so the two cannot disagree.
-        match state.cancel_job(&input.id, now) {
+            // The store owns the transition: it moves the job to CANCELED and drops the
+            // clock-owed exit it no longer needs, so the two cannot disagree.
+            state.cancel_job(&input.id, now)
+        };
+
+        // A status change the settle above materialised is a job state change, so it is
+        // published here (`state::publish_job_state_changes`). The CANCELLATION itself
+        // publishes nothing: a job cancelled while it was still waiting in its queue never
+        // began processing, and MediaConvert publishes no event for it.
+        crate::state::publish_job_state_changes(ctx, &*self.engine, &region).await;
+
+        match outcome {
             // A job that was ALREADY `CANCELED` is in the state the request asks for, so
             // the repeat answers the same empty 202 and leaves the job exactly as it was:
             // cancelling twice is a no-op success, not a conflict.

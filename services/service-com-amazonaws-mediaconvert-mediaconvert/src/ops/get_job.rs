@@ -170,21 +170,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        // Reporting only: the one write is materialising the status change the clock had
-        // already made due at `now`, which was owed whether or not anybody polled.
-        state.settle(now);
+        // The guard is taken and RELEASED around the read, so the publication below holds
+        // no lock across the in-process call it makes.
+        let reported = {
+            let mut state = state.lock();
+            // Reporting only: the one write is materialising the status change the clock had
+            // already made due at `now`, which was owed whether or not anybody polled.
+            state.settle(now);
 
-        let Some(job) = state.jobs.get(&input.id) else {
-            return Err(GetJobErrorModeled::NotFoundException(NotFoundException {
-                // The refusal names the request member the lookup read, `Id`.
-                message: Some(crate::state::not_found_message("id")),
-            })
-            .into());
+            let Some(job) = state.jobs.get(&input.id) else {
+                return Err(GetJobErrorModeled::NotFoundException(NotFoundException {
+                    // The refusal names the request member the lookup read, `Id`.
+                    message: Some(crate::state::not_found_message("id")),
+                })
+                .into());
+            };
+            job.view(&region)
         };
 
+        // A status change this read materialised is a job state change, so it is published
+        // here rather than left for the clock pump to find
+        // (`state::publish_job_state_changes`); a read that materialised nothing publishes
+        // nothing.
+        crate::state::publish_job_state_changes(ctx, &*self.engine, &region).await;
+
         Ok(GetJobOutput {
-            job: Some(job.view(&region)),
+            job: Some(reported),
         })
     }
 }

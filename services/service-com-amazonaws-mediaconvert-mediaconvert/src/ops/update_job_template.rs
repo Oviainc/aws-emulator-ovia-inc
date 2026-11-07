@@ -275,7 +275,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         if template.template_type == crate::state::TYPE_SYSTEM {
             return Err(UpdateJobTemplateErrorModeled::ForbiddenException(ForbiddenException {
-                message: Some(crate::state::system_resource_modify_message("name")),
+                // The sentence MediaConvert publishes for THIS door: all fixed text naming
+                // the class of resource it will not update, with no slot for the template
+                // or the member that named it — see
+                // [`crate::state::SYSTEM_JOB_TEMPLATE_UPDATE_MESSAGE`].
+                message: Some(crate::state::SYSTEM_JOB_TEMPLATE_UPDATE_MESSAGE.to_string()),
             })
             .into());
         }

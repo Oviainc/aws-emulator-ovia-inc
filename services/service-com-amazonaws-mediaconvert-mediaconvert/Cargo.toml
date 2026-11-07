@@ -26,6 +26,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `eventbridge_client`: the ONE in-process EventBridge client an emulated service
+# publishes an event through, so this crate configures no second copy of that hop.
+service-common = { path = "../common" }
+# The AWS SDK for EventBridge, driven over the in-process callback
+# (`OperationContext::callback`): MediaConvert publishes a `MediaConvert Job State
+# Change` event onto the account's default event bus as a job moves through its
+# statuses (`state::job_events`). Only the generated client is needed — the emulator
+# supplies the transport, so the SDK's own HTTPS stack is left out.
+aws-sdk-eventbridge = { version = "1", default-features = false }
 # The AWS SDK for S3, driven over the in-process callback
 # (`OperationContext::callback`): `CreateJob` probes each of a job's
 # `Settings.Inputs[].FileInput` S3 locations with `HeadObject` before the job is
@@ -48,6 +57,12 @@ emulator-core-build-support = { workspace = true }
 hex = { workspace = true }
 # `time` for the one integration case that waits past a job's settle instant.
 tokio = { workspace = true, features = ["time"] }
+# EventBridge and SQS are mounted beside MediaConvert on one engine in the integration
+# tests, because MediaConvert publishes a `MediaConvert Job State Change` event onto the
+# default event bus as a job moves and a rule on that bus delivers it to an SQS queue:
+# without them mounted there is nothing for the publication to reach.
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 
 [lints]
 workspace = true

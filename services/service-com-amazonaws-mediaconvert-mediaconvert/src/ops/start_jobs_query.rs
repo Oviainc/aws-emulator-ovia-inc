@@ -256,26 +256,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
 
         let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        state.settle(now);
+        // The guard is taken and RELEASED around the write, so the publication below holds
+        // no lock across the in-process call it makes.
+        let outcome = {
+            let mut state = state.lock();
+            state.settle(now);
 
-        // The id, the starting status, the matched page and the clock-owed completion are
-        // all owned by `accept_jobs_query`, which also enforces the store's
-        // `MAX_JOBS_QUERIES` ceiling, so caller-driven growth is bounded.
-        let record = crate::state::JobsQueryRecord {
-            // `accept_jobs_query` mints and assigns the id, the status, the due instant
-            // and the page.
-            id: String::new(),
-            terms,
-            order: input.order,
-            max_results: input.max_results,
-            status: String::new(),
-            completes_at: None,
-            matched: Vec::new(),
-            result_next_token: None,
+            // The id, the starting status, the matched page and the clock-owed completion
+            // are all owned by `accept_jobs_query`, which also enforces the store's
+            // `MAX_JOBS_QUERIES` ceiling, so caller-driven growth is bounded.
+            let record = crate::state::JobsQueryRecord {
+                // `accept_jobs_query` mints and assigns the id, the status, the due instant
+                // and the page.
+                id: String::new(),
+                terms,
+                order: input.order,
+                max_results: input.max_results,
+                status: String::new(),
+                completes_at: None,
+                matched: Vec::new(),
+                result_next_token: None,
+            };
+
+            state.accept_jobs_query(record, resume_from.as_ref(), now)
         };
 
-        match state.accept_jobs_query(record, resume_from.as_ref(), now) {
+        // A status change this call's own settle materialised is a job state change,
+        // published by the call that materialised it
+        // (`state::publish_job_state_changes`). A jobs query is not a job, so starting one
+        // publishes nothing of its own.
+        crate::state::publish_job_state_changes(
+            ctx,
+            &*self.engine,
+            &crate::state::request_region(ctx.parts()),
+        )
+        .await;
+
+        match outcome {
             crate::state::AcceptOutcome::Stored(id) => Ok(StartJobsQueryOutput { id: Some(id) }),
             crate::state::AcceptOutcome::AtCapacity => Err(
                 StartJobsQueryErrorModeled::ServiceQuotaExceededException(

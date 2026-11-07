@@ -137,7 +137,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteQueueErrorModeled::InternalServerErrorException(
@@ -160,19 +160,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        // Settle first, so the conflict guard below reads the job statuses the clock had
-        // already made due at `now` rather than stale ones: a queue whose last job has
-        // finished is deletable even if nobody polled that job in between.
-        state.settle(now);
-
         // `{Name}` is the queue name, as `GetQueue`'s is; this operation's input is not
         // documented to accept an ARN.
         let name = input.name;
-        // The store owns the removal and the two refusals that go with it, so the
-        // decision and the state it is read from cannot disagree.
-        match state.delete_queue(&name) {
+        // The guard is taken and RELEASED around the delete, so the publication below
+        // holds no lock across the in-process call it makes.
+        let outcome = {
+            let mut state = state.lock();
+            // Settle first, so the conflict guard below reads the job statuses the clock had
+            // already made due at `now` rather than stale ones: a queue whose last job has
+            // finished is deletable even if nobody polled that job in between.
+            state.settle(now);
+
+            // The store owns the removal and the two refusals that go with it, so the
+            // decision and the state it is read from cannot disagree.
+            state.delete_queue(&name)
+        };
+
+        // A status change the settle above materialised is a job state change, published
+        // by the call that materialised it (`state::publish_job_state_changes`).
+        crate::state::publish_job_state_changes(ctx, &*self.engine, &region).await;
+
+        match outcome {
             // The delete is IDEMPOTENT on the name: a queue that was already gone leaves
             // the store in exactly the state the request asked for, so the repeat is the
             // same empty 202 the first delete answered rather than a failure a teardown
@@ -193,17 +204,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // A queue that still owes work conflicts with the current state of the
             // resource: deleting it would leave jobs whose `Queue` names a queue that is
-            // no longer there.
-            crate::state::DeleteQueueOutcome::HasActiveJobs {
-                submitted,
-                progressing,
-            } => Err(DeleteQueueErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Queue {name} still has {submitted} submitted and {progressing} \
-                     progressing job(s) and can't be deleted."
-                )),
-            })
-            .into()),
+            // no longer there. The refusal is the sentence MediaConvert publishes for a
+            // queue that is in use, which states the remediation and carries no slot for
+            // the queue or its job counts — see
+            // [`crate::state::QUEUE_IN_USE_MESSAGE`].
+            crate::state::DeleteQueueOutcome::HasActiveJobs => {
+                Err(DeleteQueueErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::QUEUE_IN_USE_MESSAGE.to_string()),
+                })
+                .into())
+            }
         }
     }
 }

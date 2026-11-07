@@ -170,25 +170,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        // Reporting only: the one write is materialising the status changes the clock had
-        // already made due at `now`, which were owed whether or not anybody polled.
-        state.settle(now);
-
         // `GetQueue`'s `{Name}` is a queue name; like `ListJobs`' `queue` and unlike
         // `SearchJobs`' `queue`, it is not documented to accept an ARN.
         let name = input.name;
-        let Some(record) = state.queues.get(&name).cloned() else {
-            return Err(GetQueueErrorModeled::NotFoundException(NotFoundException {
-                // The refusal names the request member the lookup read, `Name`.
-                message: Some(crate::state::not_found_message("name")),
-            })
-            .into());
-        };
-        let (submitted, progressing) = state.job_counts(&name);
+        // The guard is taken and RELEASED around the read, so the publication below holds
+        // no lock across the in-process call it makes.
+        let view = {
+            let mut state = state.lock();
+            // Reporting only: the one write is materialising the status changes the clock
+            // had already made due at `now`, which were owed whether or not anybody polled.
+            state.settle(now);
 
-        Ok(GetQueueOutput {
-            queue: Some(record.view(&region, submitted, progressing)),
-        })
+            let Some(record) = state.queues.get(&name).cloned() else {
+                return Err(GetQueueErrorModeled::NotFoundException(NotFoundException {
+                    // The refusal names the request member the lookup read, `Name`.
+                    message: Some(crate::state::not_found_message("name")),
+                })
+                .into());
+            };
+            let (submitted, progressing) = state.job_counts(&name);
+            record.view(&region, submitted, progressing)
+        };
+
+        // A status change this read's own settle materialised is a job state change,
+        // published by the call that materialised it
+        // (`state::publish_job_state_changes`).
+        crate::state::publish_job_state_changes(ctx, &*self.engine, &region).await;
+
+        Ok(GetQueueOutput { queue: Some(view) })
     }
 }

@@ -193,60 +193,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        // Reporting only: the one write is materialising the status changes the clock had
-        // already made due at `now`, which were owed whether or not anybody searched.
-        state.settle(now);
+        // The guard is taken and RELEASED around the search, so the publication below
+        // holds no lock across the in-process call it makes.
+        let (jobs, next_token) = {
+            let mut state = state.lock();
+            // Reporting only: the one write is materialising the status changes the clock
+            // had already made due at `now`, which were owed whether or not anybody
+            // searched.
+            state.settle(now);
 
-        // "Optionally filter results further according to input file, queue, or status":
-        // each filter the request carries NARROWS the set, so a job is reported only when
-        // it satisfies every one of them. Which jobs that leaves is the state module's
-        // ([`crate::state::jobs_matching`]), shared with every other jobs reader that
-        // narrows on these details, so only the FORM each of this operation's own members
-        // offers is read here.
-        //
-        // `queue` is "a queue name, or a queue ARN", so a reference in either form is
-        // reduced to the queue's name before the shared test compares it.
-        let queue = input
-            .queue
-            .as_deref()
-            .map(crate::state::queue_name_from_reference)
-            .map(str::to_string);
-        let status = input.status.clone();
-        // `InputFile`: "Provide your input file URL or your partial input file name" — so
-        // a containment test over this job's inputs, which is the same test the jobs
-        // query's `fileInput` filter key applies.
-        let input_file = input.input_file.clone();
+            // "Optionally filter results further according to input file, queue, or
+            // status": each filter the request carries NARROWS the set, so a job is
+            // reported only when it satisfies every one of them. Which jobs that leaves is
+            // the state module's ([`crate::state::jobs_matching`]), shared with every
+            // other jobs reader that narrows on these details, so only the FORM each of
+            // this operation's own members offers is read here.
+            //
+            // `queue` is "a queue name, or a queue ARN", so a reference in either form is
+            // reduced to the queue's name before the shared test compares it.
+            let queue = input
+                .queue
+                .as_deref()
+                .map(crate::state::queue_name_from_reference)
+                .map(str::to_string);
+            let status = input.status.clone();
+            // `InputFile`: "Provide your input file URL or your partial input file name" —
+            // so a containment test over this job's inputs, which is the same test the
+            // jobs query's `fileInput` filter key applies.
+            let input_file = input.input_file.clone();
 
-        // The ordering, the cursor, the page size and the decode-or-refuse rule for a
-        // `nextToken` are the state module's, shared with every other paged reader of the
-        // job set; only the modelled error the one refusal is answered as is this
-        // operation's.
-        let resume_from = crate::state::resume_from_token(input.next_token.as_deref()).map_err(
-            |message| {
-                SearchJobsErrorModeled::BadRequestException(BadRequestException {
-                    message: Some(message),
-                })
-            },
-        )?;
+            // The ordering, the cursor, the page size and the decode-or-refuse rule for a
+            // `nextToken` are the state module's, shared with every other paged reader of
+            // the job set; only the modelled error the one refusal is answered as is this
+            // operation's.
+            let resume_from = crate::state::resume_from_token(input.next_token.as_deref())
+                .map_err(|message| {
+                    SearchJobsErrorModeled::BadRequestException(BadRequestException {
+                        message: Some(message),
+                    })
+                })?;
 
-        let page = crate::state::page_of_jobs(
-            crate::state::jobs_matching(
-                state.jobs.values(),
-                queue.as_deref(),
-                status.as_deref(),
-                input_file.as_deref(),
-            ),
-            input.order.as_deref(),
-            resume_from.as_ref(),
-            input.max_results,
-        );
+            let page = crate::state::page_of_jobs(
+                crate::state::jobs_matching(
+                    state.jobs.values(),
+                    queue.as_deref(),
+                    status.as_deref(),
+                    input_file.as_deref(),
+                ),
+                input.order.as_deref(),
+                resume_from.as_ref(),
+                input.max_results,
+            );
 
-        let jobs = page.records.iter().map(|job| job.view(&region)).collect();
+            let jobs: Vec<_> = page.records.iter().map(|job| job.view(&region)).collect();
+            (jobs, page.next_token)
+        };
+
+        // A status change this search materialised is a job state change, so it is
+        // published here rather than left for the clock pump to find
+        // (`state::publish_job_state_changes`); a search that materialised nothing
+        // publishes nothing.
+        crate::state::publish_job_state_changes(ctx, &*self.engine, &region).await;
 
         Ok(SearchJobsOutput {
             jobs: Some(jobs),
-            next_token: page.next_token,
+            next_token,
         })
     }
 }

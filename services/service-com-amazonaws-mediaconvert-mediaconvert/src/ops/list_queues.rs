@@ -191,34 +191,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        // Reporting only, as `GetQueue` is: the one write materialises the job status
-        // changes the clock had already made due at `now` — owed whether or not anybody
-        // listed — because each queue's reported job counts are read off those statuses.
-        state.settle(now);
-        let state = &*state;
+        // The guard is taken and RELEASED around the listing, so the publication below
+        // holds no lock across the in-process call it makes.
+        let (queues, next_token, total_concurrent_jobs, unallocated_concurrent_jobs) = {
+            let mut state = state.lock();
+            // Reporting only, as `GetQueue` is: the one write materialises the job status
+            // changes the clock had already made due at `now` — owed whether or not anybody
+            // listed — because each queue's reported job counts are read off those statuses.
+            state.settle(now);
+            let state = &*state;
 
-        let page = crate::state::page_of_queues(
-            state.queues.values(),
-            input.list_by.as_deref(),
-            input.order.as_deref(),
-            resume_from.as_ref(),
-            input.max_results,
-        );
-        let queues = page
-            .records
-            .iter()
-            .map(|record| {
-                let (submitted, progressing) = state.job_counts(&record.name);
-                record.view(&region, submitted, progressing)
-            })
-            .collect();
-        // The pool is the account's in this Region, not this page's, so both counts are
-        // the same on every page of a listing.
-        let (total_concurrent_jobs, unallocated_concurrent_jobs) = state.concurrency_allocation();
+            let page = crate::state::page_of_queues(
+                state.queues.values(),
+                input.list_by.as_deref(),
+                input.order.as_deref(),
+                resume_from.as_ref(),
+                input.max_results,
+            );
+            let queues: Vec<_> = page
+                .records
+                .iter()
+                .map(|record| {
+                    let (submitted, progressing) = state.job_counts(&record.name);
+                    record.view(&region, submitted, progressing)
+                })
+                .collect();
+            // The pool is the account's in this Region, not this page's, so both counts are
+            // the same on every page of a listing.
+            let (total, unallocated) = state.concurrency_allocation();
+            (queues, page.next_token, total, unallocated)
+        };
+
+        // A status change this listing's own settle materialised is a job state change,
+        // published by the call that materialised it
+        // (`state::publish_job_state_changes`).
+        crate::state::publish_job_state_changes(ctx, &*self.engine, &region).await;
 
         Ok(ListQueuesOutput {
-            next_token: page.next_token,
+            next_token,
             queues: Some(queues),
             total_concurrent_jobs: Some(total_concurrent_jobs),
             unallocated_concurrent_jobs: Some(unallocated_concurrent_jobs),
