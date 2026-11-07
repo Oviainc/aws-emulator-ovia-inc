@@ -149,19 +149,33 @@ fn recipe_version_used_by_message(
     format!("Recipe {name} version {version} are used by {holder_kind} {holder}.")
 }
 
-/// The message a refusal of the working version's delete states, and the `ErrorMessage` a
-/// per-item version failure reports for it: the working version of a recipe that still
-/// holds other versions cannot be deleted.
+/// The message `DeleteRecipeVersion` refuses the working draft with: the operation does
+/// not delete that version, stated as DataBrew's own sentence about the identifier this
+/// operation will not take.
 ///
-/// The rule is stated on the version rather than on one operation — "The LATEST_WORKING
-/// version will only be deleted if the recipe has no other versions" (model:
-/// `BatchDeleteRecipeVersion`) — so every operation that deletes a recipe version states
-/// it the same way, and the sentence has no variable part: the version it is about is
-/// already the identifier the request carried.
-pub fn working_version_not_last_message() -> String {
+/// The sentence has NO variable part — it names neither the recipe, nor the versions the
+/// recipe holds, nor the number the draft currently carries; the alias in it is the
+/// literal identifier the refusal is about, not a value echoed from the request. The
+/// single-version delete states that this version is not deletable through it, where the
+/// per-item failure of the batch operation states the ORDERING rule instead
+/// ([`working_version_not_last_item_message`]), so the two operations keep saying
+/// different things about the same version.
+pub fn working_version_delete_refused_message() -> String {
+    format!("Recipe version {LATEST_WORKING} is not allowed to be deleted")
+}
+
+/// The `ErrorMessage` a per-item version failure of the BATCH delete reports for the
+/// working draft of a recipe that still holds other versions: the recipe name the request
+/// addressed and the version identifier that item asked for, then the ordering rule.
+///
+/// "The LATEST_WORKING version will only be deleted if the recipe has no other versions"
+/// (model: `BatchDeleteRecipeVersion`), so the batch operation reports the draft as a
+/// partial failure that states WHAT clears it — delete the other versions and ask again —
+/// and names the pair it is about, since one request's `Errors` can carry several items.
+pub fn working_version_not_last_item_message(name: &str, version: &str) -> String {
     format!(
-        "The {LATEST_WORKING} version will only be deleted if the recipe has no other \
-         versions."
+        "Recipe {name} version {version} can only be deleted if all other versions got \
+         deleted."
     )
 }
 

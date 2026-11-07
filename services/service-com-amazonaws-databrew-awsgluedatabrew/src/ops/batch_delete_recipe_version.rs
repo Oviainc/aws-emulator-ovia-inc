@@ -360,7 +360,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     version_failure(
                         &requested,
                         VERSION_CONFLICT_STATUS,
-                        crate::state::working_version_not_last_message(),
+                        crate::state::working_version_not_last_item_message(
+                            &input.name,
+                            &requested,
+                        ),
                     ),
                 );
             } else if let Some(job) =

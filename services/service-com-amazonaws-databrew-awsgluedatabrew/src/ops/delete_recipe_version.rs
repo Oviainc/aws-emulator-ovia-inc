@@ -240,14 +240,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 ));
             }
-            // "The LATEST_WORKING version will only be deleted if the recipe has no other
-            // versions" (model: `BatchDeleteRecipeVersion`): the rule belongs to the
-            // VERSION rather than to the operation that addresses it, so this request is
-            // refused outright while the recipe holds another version, where the batch
-            // operation reports the same rule as that version's own partial failure.
+            // The two delete operations say DIFFERENT things about this version: the
+            // single-version delete refuses it outright ("not allowed to be deleted"),
+            // where the batch operation reports the ordering rule — "The LATEST_WORKING
+            // version will only be deleted if the recipe has no other versions" (model:
+            // `BatchDeleteRecipeVersion`) — as that version's own partial failure. So the
+            // refusal here is worded for THIS operation, with no part of it read from the
+            // request or from state.
             if holds_other_versions {
                 return Err(refused_as_invalid(
-                    crate::state::working_version_not_last_message(),
+                    crate::state::working_version_delete_refused_message(),
                 ));
             }
             // A job's recipe reference addresses the draft by either of its identifiers.

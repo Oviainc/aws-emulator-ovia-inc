@@ -21,7 +21,9 @@
 //!   LATEST_WORKING version will only be deleted if the recipe has no other versions",
 //!   model: `BatchDeleteRecipeVersion` — the rule belongs to the version, so it holds
 //!   however the version is addressed and whichever operation addresses it), and the
-//!   delete that takes it takes the recipe with it.
+//!   delete that takes it takes the recipe with it. THIS operation words that refusal as
+//!   its own fixed sentence, which `recipe_version_working_refusal_wording.rs` pins
+//!   against the batch operation's per-item ordering sentence.
 //! * A version something still holds is a 409 naming the holder: a project that develops
 //!   the recipe's working version, and a job that runs a version.
 //!
@@ -49,10 +51,10 @@ const LATEST_WORKING: &str = "LATEST_WORKING";
 /// accept (model: `DeleteRecipeVersionRequest$RecipeVersion`).
 const LATEST_PUBLISHED: &str = "LATEST_PUBLISHED";
 
-/// The sentence the refusal of the working version's delete states, which is the rule the
-/// model states on `BatchDeleteRecipeVersion`.
-const WORKING_NOT_LAST_MESSAGE: &str =
-    "The LATEST_WORKING version will only be deleted if the recipe has no other versions.";
+/// The sentence `DeleteRecipeVersion` refuses the working draft with — fixed text with no
+/// variable part, carrying the literal identifier this operation will not delete.
+const WORKING_DELETE_REFUSED_MESSAGE: &str =
+    "Recipe version LATEST_WORKING is not allowed to be deleted";
 
 /// The number the working draft carries after `publishes` publishes: the first minor
 /// revision on top of the highest published major.
@@ -325,8 +327,8 @@ async fn the_working_version_goes_only_when_the_recipe_holds_nothing_else() {
             );
             assert_eq!(
                 refused.error_message(),
-                WORKING_NOT_LAST_MESSAGE,
-                "case {case:?}: expected {WORKING_NOT_LAST_MESSAGE:?}, got {:?}",
+                WORKING_DELETE_REFUSED_MESSAGE,
+                "case {case:?}: expected {WORKING_DELETE_REFUSED_MESSAGE:?}, got {:?}",
                 refused.error_message()
             );
             assert_eq!(

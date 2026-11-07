@@ -45,6 +45,10 @@ mod recipe_version_listing;
 mod recipe_version_resolution;
 #[path = "all/recipe_version_single_delete.rs"]
 mod recipe_version_single_delete;
+#[path = "all/recipe_version_working_refusal_invariance.rs"]
+mod recipe_version_working_refusal_invariance;
+#[path = "all/recipe_version_working_refusal_wording.rs"]
+mod recipe_version_working_refusal_wording;
 #[path = "all/recipe_working_update.rs"]
 mod recipe_working_update;
 #[path = "all/resource_not_found_message.rs"]
