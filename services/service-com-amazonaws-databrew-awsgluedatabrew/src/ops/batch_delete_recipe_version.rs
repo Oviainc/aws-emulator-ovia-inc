@@ -322,7 +322,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     version_failure(
                         requested,
                         VERSION_CONFLICT_STATUS,
-                        crate::state::recipe_version_used_by_job_message(requested, &job),
+                        crate::state::recipe_version_used_by_job_message(
+                            &input.name,
+                            requested,
+                            &job,
+                        ),
                     ),
                 );
                 continue;
@@ -343,7 +347,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     version_failure(
                         &requested,
                         VERSION_CONFLICT_STATUS,
-                        crate::state::recipe_version_used_by_project_message(&requested, project),
+                        crate::state::recipe_version_used_by_project_message(
+                            &input.name,
+                            &requested,
+                            project,
+                        ),
                     ),
                 );
             } else if others_left {
@@ -363,7 +371,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     version_failure(
                         &requested,
                         VERSION_CONFLICT_STATUS,
-                        crate::state::recipe_version_used_by_job_message(&requested, &job),
+                        crate::state::recipe_version_used_by_job_message(
+                            &input.name,
+                            &requested,
+                            &job,
+                        ),
                     ),
                 );
             } else {

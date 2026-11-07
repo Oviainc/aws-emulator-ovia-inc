@@ -234,6 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(project) = &developing_project {
                 return Err(version_in_use(
                     crate::state::recipe_version_used_by_project_message(
+                        &input.name,
                         &input.recipe_version,
                         project,
                     ),
@@ -255,7 +256,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &[crate::state::LATEST_WORKING, working_version.as_str()],
             ) {
                 return Err(version_in_use(
-                    crate::state::recipe_version_used_by_job_message(&input.recipe_version, &job),
+                    crate::state::recipe_version_used_by_job_message(
+                        &input.name,
+                        &input.recipe_version,
+                        &job,
+                    ),
                 ));
             }
             // The working version was the only version this recipe held, and the record is
@@ -276,7 +281,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(job) = store.job_running_recipe_version(&input.name, &addressed_by) {
             return Err(version_in_use(
-                crate::state::recipe_version_used_by_job_message(&input.recipe_version, &job),
+                crate::state::recipe_version_used_by_job_message(
+                    &input.name,
+                    &input.recipe_version,
+                    &job,
+                ),
             ));
         }
 

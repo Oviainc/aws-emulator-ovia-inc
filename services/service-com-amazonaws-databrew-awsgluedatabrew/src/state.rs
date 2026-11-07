@@ -109,25 +109,38 @@ pub fn recipe_version_item_not_found_message(name: &str, version: &str) -> Strin
 }
 
 /// The `ErrorMessage` a per-item version failure reports for a version a PROJECT is
-/// developing: the version identifier the item asked for and the project that holds it,
-/// read from state.
+/// developing: the recipe the request addressed, the version identifier the item asked
+/// for, and the project that holds it, read from state.
 ///
 /// A project develops its recipe's working version, so that version cannot be deleted
-/// while the project exists; the item names the project so a client knows what to delete
-/// first. The phrasing follows the one recorded for this refusal — the versions, then
-/// the project that holds them — with both parts read from the request and from state.
-pub fn recipe_version_used_by_project_message(version: &str, project: &str) -> String {
-    format!("Recipe versions {version} are used by project {project}")
+/// while the project exists; the sentence names the (recipe, version) pair that is held
+/// and then the project holding it, so a client reading a 200 with partial failures can
+/// tell WHICH recipe version survived and what to delete first.
+pub fn recipe_version_used_by_project_message(name: &str, version: &str, project: &str) -> String {
+    recipe_version_used_by_message(name, version, "project", project)
 }
 
 /// The `ErrorMessage` a per-item version failure reports for a version a JOB runs: the
-/// version identifier the item asked for and the job whose recipe reference names it.
+/// recipe the request addressed, the version identifier the item asked for, and the job
+/// whose recipe reference names it.
 ///
 /// A job runs one version of one recipe (model: `Job$RecipeReference`), so a version a
 /// job references cannot be deleted out from under it. The sentence is the one
 /// [`recipe_version_used_by_project_message`] states, for a holder that is a job.
-pub fn recipe_version_used_by_job_message(version: &str, job: &str) -> String {
-    format!("Recipe versions {version} are used by job {job}")
+pub fn recipe_version_used_by_job_message(name: &str, version: &str, job: &str) -> String {
+    recipe_version_used_by_message(name, version, "job", job)
+}
+
+/// The one sentence every "this recipe version is still held" refusal states: the recipe
+/// name and the version identifier the request addressed, the kind of resource holding
+/// that version, and its name — every part read from the request or from state.
+fn recipe_version_used_by_message(
+    name: &str,
+    version: &str,
+    holder_kind: &str,
+    holder: &str,
+) -> String {
+    format!("Recipe {name} version {version} are used by {holder_kind} {holder}.")
 }
 
 /// The message a refusal of the working version's delete states, and the `ErrorMessage` a
