@@ -11,7 +11,9 @@
 //! The cost anomaly MONITOR registry lives here for the same reason: `CreateAnomalyMonitor`
 //! writes it and `GetAnomalyMonitors` reports it, and the anomaly subscription and tagging
 //! operations resolve a monitor ARN against it, so the monitor's identity and content are
-//! derived in exactly one place.
+//! derived in exactly one place. The two registries are related by
+//! [`delete_anomaly_monitor`](ComAmazonawsCostexplorerAwsinsightsindexserviceState::delete_anomaly_monitor),
+//! which is what a monitor's delete does to the subscriptions that alerted on it.
 //!
 //! The cost anomaly SUBSCRIPTION registry is the third, and its record, admission rules
 //! and threshold expansion live in [`anomaly_subscriptions`] — one module per resource, so
@@ -758,6 +760,31 @@ impl ComAmazonawsCostexplorerAwsinsightsindexserviceState {
             .values()
             .filter(|def| def.effective_on(at))
             .count()
+    }
+
+    /// Delete the monitor `monitor_arn` names, and dissociate it from every subscription
+    /// that alerted on it.
+    ///
+    /// `false` when the account holds no monitor under that ARN — nothing is written, so
+    /// the caller refuses the request against a registry exactly as it was.
+    ///
+    /// A subscription alerts on the monitors its `MonitorArnList` names, so deleting a
+    /// monitor drops that ARN from every such list. The subscriptions themselves SURVIVE:
+    /// one whose only monitor is deleted is left alerting on no monitor at all, and only
+    /// `DeleteAnomalySubscription` removes it.
+    ///
+    /// Lives here rather than in the delete handler because it spans two registries, and
+    /// the rule that relates them belongs in one place.
+    pub fn delete_anomaly_monitor(&mut self, monitor_arn: &str) -> bool {
+        if self.anomaly_monitors.remove(monitor_arn).is_none() {
+            return false;
+        }
+        for subscription in self.anomaly_subscriptions.values_mut() {
+            subscription
+                .monitor_arn_list
+                .retain(|arn| arn != monitor_arn);
+        }
+        true
     }
 
     /// The id for the next resource this service mints, advancing the shared sequence.

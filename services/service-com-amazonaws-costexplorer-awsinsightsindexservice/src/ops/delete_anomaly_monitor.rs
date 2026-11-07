@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAnomalyMonitor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAnomalyMonitor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAnomalyMonitor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +126,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAnomalyMonitor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAnomalyMonitorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAnomalyMonitor"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Only reachable when this service was mounted on an engine that holds no
+            // store for it, so there is nothing to delete and the operation genuinely
+            // cannot be served here.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        let mut store = state.lock();
+        // The registry is the only place a monitor exists, so the delete is the removal of
+        // its entry together with its dissociation from every subscription that alerted on
+        // it — one write, so no reader ever sees a subscription alerting on a monitor the
+        // registry has already dropped.
+        let deleted = store.delete_anomaly_monitor(&input.monitor_arn);
+        drop(store);
+
+        if !deleted {
+            // An ARN the account holds no monitor under is the one 404 this operation
+            // models, whether it never named a monitor or named one an earlier delete
+            // already removed.
+            let monitor_arn = input.monitor_arn;
+            return Err(DeleteAnomalyMonitorErrorModeled::UnknownMonitorException(
+                UnknownMonitorException {
+                    message: Some(format!(
+                        "The cost anomaly monitor {monitor_arn} does not exist for the account."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        Ok(DeleteAnomalyMonitorOutput {})
     }
 }
