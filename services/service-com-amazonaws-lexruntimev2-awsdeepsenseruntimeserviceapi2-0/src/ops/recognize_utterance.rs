@@ -257,10 +257,25 @@ fn store_full(error: SessionStoreFull) -> RecognizeUtteranceError {
 
 /// The bot and locale the request addresses hold no model this runtime can
 /// interpret an utterance against, or the control plane that holds them cannot
-/// be reached at all — the same refusal the sibling `RecognizeText` gives, since
-/// both operations are one turn against one built locale.
-fn locale_unavailable(error: LocaleUnavailable) -> RecognizeUtteranceError {
+/// be reached at all — the same refusals the sibling `RecognizeText` gives,
+/// since both operations are one turn against one built locale: an alias id
+/// that is not an alias of that bot resolves to nothing, while a locale that
+/// was never built has no runtime model.
+fn locale_unavailable(
+    error: LocaleUnavailable,
+    bot_id: &str,
+    bot_alias_id: &str,
+) -> RecognizeUtteranceError {
     match error {
+        LocaleUnavailable::UnknownBotAlias => {
+            RecognizeUtteranceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: crate::state::bot_model::bot_alias_not_valid_message(
+                    bot_id,
+                    bot_alias_id,
+                ),
+            })
+            .into()
+        }
         LocaleUnavailable::NotBuilt => {
             RecognizeUtteranceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 message: crate::state::bot_model::BOT_LOCALE_NOT_VALID_MESSAGE.to_string(),
@@ -468,7 +483,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.bot_alias_id,
             &input.locale_id,
         )
-        .map_err(locale_unavailable)?;
+        .map_err(|error| locale_unavailable(error, &input.bot_id, &input.bot_alias_id))?;
 
         let now = SystemTime::now();
         let key = SessionKey::new(
@@ -580,16 +595,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
-        // "The prompt or statement to send to the user": with a text
-        // `responseContentType` the prompt travels as TEXT — the
-        // `x-amz-lex-messages` header carries the messages in full — and this
-        // member carries the speech Amazon Lex V2 synthesized, which a turn that
-        // asked for text has none of. The recorded behavioural check states the
-        // same thing of a real text turn: "asking for text must suppress speech
-        // synthesis", where the response it compares against carries no audio
-        // bytes at all even though the turn's messages are not empty.
-        let audio_stream = Vec::new();
-
         Ok(RecognizeUtteranceOutput {
             // The input was text, so that is the mode this turn ran in.
             input_mode: Some(INPUT_MODE_TEXT.to_string()),
@@ -603,7 +608,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // stream itself, carried under the same gzip-then-base64 encoding as
             // every other payload header.
             input_transcript: Some(encode_text(&transcript).map_err(internal)?),
-            audio_stream,
+            // `audioStream` is "the prompt or statement to send to the user" as
+            // SYNTHESIZED SPEECH: it carries a payload only when
+            // `responseContentType` asked for speech ("if the value begins with
+            // audio/, Amazon Lex V2 returns speech in the response"), which is
+            // refused above because no voice here can produce it. A text
+            // response synthesizes nothing, so the body is empty and the bot's
+            // messages travel only in the `x-amz-lex-messages` header — the same
+            // answer the sibling `PutSession` gives a text session.
+            audio_stream: Vec::new(),
             // A bot member is recognized only for a bot in a network of bots,
             // which this runtime holds no definition of.
             recognized_bot_member: None,

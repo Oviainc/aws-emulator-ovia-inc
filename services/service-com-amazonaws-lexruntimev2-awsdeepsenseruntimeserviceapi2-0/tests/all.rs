@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/bot_locale_dialog.rs"]
 mod bot_locale_dialog;
+#[path = "all/dialog_turn_reporting.rs"]
+mod dialog_turn_reporting;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/recognize_text_nlu.rs"]

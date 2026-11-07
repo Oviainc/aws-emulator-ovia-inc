@@ -15,14 +15,17 @@
 //! conversation:
 //!
 //! 1. Every turn reports `sessionState.intent.slots` — "a map of all of the
-//!    slots for the intent" (`Intent$slots`) — as a map that is THERE, empty
-//!    while nothing is filled, and `sessionState.intent.state`, whatever the
+//!    slots for the intent … if a slot has not been filled, the value is null"
+//!    (`Intent$slots`) — as a map that is THERE, naming every slot the
+//!    recognized intent declares with that `null` for each one the dialog has no
+//!    value for, and `sessionState.intent.state`, whatever the
 //!    turn made of the utterance: a matched intent, an intent still eliciting,
 //!    and the fallback intent alike. Both encodings of a turn report them, and
 //!    so does `GetSession`.
 //! 2. A dialog the bot closes reports the state its own authoring earns:
 //!    `Fulfilled` where the intent has a closing response to convey that it is
-//!    fulfilled, and `ReadyForFulfillment` where its author wrote none. The
+//!    fulfilled and no fulfilment code hook to hand it to, and
+//!    `ReadyForFulfillment` where its author wrote none. The
 //!    authored response is what the turn sends.
 //! 3. `sessionState.originatingRequestId` — "a unique identifier for a specific
 //!    request" — is minted when the session comes into existence, is the same on
@@ -169,16 +172,35 @@ async fn every_turn_reports_the_slots_map_and_the_intent_state() {
             "case {case:?}: expected intent.state {expected_state:?}, got {turn}"
         );
         let filled = slots(case, &turn);
+        // "A map of all of the slots for the intent … if a slot has not been
+        // filled, the value is null" (`Intent$slots`): the map names every slot
+        // the recognized intent declares — `PizzaSize` for the bot's own intent,
+        // none at all for the fallback intent — and a slot the dialog has no
+        // value for is reported as that `null` rather than left out, so a client
+        // can tell a slot that is declared and open from one the intent does not
+        // have.
+        let declares_slot = *expected_intent == ORDER_PIZZA;
         assert_eq!(
             filled.contains_key(PIZZA_SIZE),
-            *fills,
-            "case {case:?}: the slot must{} be filled, got {filled:?}",
-            if *fills { "" } else { " not" }
+            declares_slot,
+            "case {case:?}: the intent's own slot must{} be named, got {filled:?}",
+            if declares_slot { "" } else { " not" }
         );
-        if !*fills {
-            assert!(
-                filled.is_empty(),
-                "case {case:?}: nothing is filled, so the map is empty, got {filled:?}"
+        assert_eq!(
+            filled.len(),
+            usize::from(declares_slot),
+            "case {case:?}: the map names the intent's declared slots and nothing \
+             else, got {filled:?}"
+        );
+        if declares_slot {
+            let value = filled
+                .get(PIZZA_SIZE)
+                .unwrap_or_else(|| panic!("case {case:?}: the slot is named"));
+            assert_eq!(
+                value.is_null(),
+                !*fills,
+                "case {case:?}: a slot the turn filled carries a value and one it did \
+                 not is null, got {value}"
             );
         }
 

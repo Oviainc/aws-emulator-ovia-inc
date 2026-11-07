@@ -16,6 +16,7 @@
 
 pub mod delete_session_types;
 pub mod get_session_types;
+pub mod intent_types;
 pub mod put_session_types;
 pub mod recognize_text_types;
 pub mod recognize_utterance_types;
@@ -25,6 +26,8 @@ pub mod shared_types;
 pub use delete_session_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_session_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use intent_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use put_session_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

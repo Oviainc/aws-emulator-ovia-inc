@@ -29,11 +29,17 @@
 //! 3. While a required slot of the intent has no value the turn ends on
 //!    `ElicitSlot` for that slot, with the prompt authored on it and the intent
 //!    `InProgress`; once every required slot has one the dialog closes, and the
-//!    intent is `Fulfilled` where the bot has a closing response to convey that
-//!    it is and `ReadyForFulfillment` where it authored none.
+//!    intent is `Fulfilled` where the bot completed it itself — it has a closing
+//!    response to convey that it did and no fulfilment code hook to hand the
+//!    intent to
+//!    ([`crate::state::bot_model::ModelIntent::bot_completes_fulfillment`]) —
+//!    and `ReadyForFulfillment` where the fulfilment is the caller's.
 //! 4. Every turn reports both members a client drives a dialog off:
-//!    `Intent.slots` — the map of the intent's slots, empty while nothing is
-//!    filled rather than absent — and `Intent.state`.
+//!    `Intent.state`, and `Intent.slots` — the map of the intent's slots, which
+//!    names EVERY slot the recognized intent declares with a null value for each
+//!    one that has none ("a map of all of the slots for the intent … if a slot
+//!    has not been filled, the value is null", `Intent$slots`) and is the empty
+//!    map for an intent that declares none.
 
 use super::bot_model::{resolve_slot_value, BotLocaleModel, ModelIntent};
 use super::{DIALOG_ACTION_CLOSE, FALLBACK_INTENT, INTERPRETATION_SOURCE, MAX_UTTERANCE_CHARS};
@@ -77,7 +83,8 @@ pub const DIALOG_ACTION_ELICIT_SLOT: &str = "ElicitSlot";
 pub const INTENT_STATE_IN_PROGRESS: &str = "InProgress";
 
 /// `ReadyForFulfillment`: "the bot has elicited all the slot values for the
-/// intent and is ready to fulfill the intent" (`Intent$state`).
+/// intent and is ready to fulfill the intent" (`Intent$state`) — the state of an
+/// intent whose fulfilment the bot does not perform itself.
 pub const INTENT_STATE_READY_FOR_FULFILLMENT: &str = "ReadyForFulfillment";
 
 /// `Fulfilled`: "the bot has completed fulfillment of the intent"
@@ -209,12 +216,13 @@ pub fn interpret(model: &BotLocaleModel, text: &str, state: &SessionState) -> Tu
             None => {
                 messages = authored.closing_messages.clone();
                 // Nothing is left to elicit. The bot has COMPLETED the intent
-                // where it has a closing response to convey that it has, and is
-                // ready for the client to fulfil it where it authored none.
-                let state = if authored.closing_messages.is_empty() {
-                    INTENT_STATE_READY_FOR_FULFILLMENT
-                } else {
+                // where it has a closing response to convey that it has and no
+                // fulfilment code hook to hand the intent to, and is ready for
+                // the client to fulfil it in every other case.
+                let state = if authored.bot_completes_fulfillment() {
                     INTENT_STATE_FULFILLED
+                } else {
+                    INTENT_STATE_READY_FOR_FULFILLMENT
                 };
                 (Some(state.to_string()), close())
             }
@@ -232,12 +240,23 @@ pub fn interpret(model: &BotLocaleModel, text: &str, state: &SessionState) -> Tu
         ),
     };
 
+    // Rule 4: the map names every slot the intent declares, each carrying what
+    // the conversation has filled for it or nothing at all. An intent the locale
+    // does not declare has no slots to name, so the map is the one the session
+    // carries for it.
+    let slots = match authored {
+        Some(authored) => declared_slots(authored, &slots),
+        None => slots,
+    };
+
     let intent = Intent {
         name,
         // "A map of all of the slots for the intent. The name of the slot maps to
-        // the value of the slot" (`Intent$slots`): the map is reported on every
-        // turn — empty while nothing is filled — so a client can index it
-        // without first testing whether the member is there.
+        // the value of the slot. If a slot has not been filled, the value is
+        // null" (`Intent$slots`): the map is reported on every turn, naming every
+        // slot the intent declares, so a client can index it without first
+        // testing whether the member is there and can tell a slot that is
+        // declared and open from one the intent does not have.
         slots: Some(slots),
         state: intent_state,
         confirmation_state: continued.and_then(|intent| intent.confirmation_state.clone()),
@@ -266,8 +285,8 @@ pub fn interpret(model: &BotLocaleModel, text: &str, state: &SessionState) -> Tu
             intent: Some(Intent {
                 name: candidate.name.clone(),
                 // An alternative is an intent the utterance MIGHT have
-                // satisfied: nothing is filled for it, which the same rule
-                // reports as the empty map.
+                // satisfied: no dialog is on it, so nothing is filled or being
+                // elicited for it and the map it reports is empty.
                 slots: Some(HashMap::new()),
                 state: None,
                 confirmation_state: None,
@@ -282,6 +301,39 @@ pub fn interpret(model: &BotLocaleModel, text: &str, state: &SessionState) -> Tu
         messages,
         interpretations,
     }
+}
+
+/// The slot map an intent reports: one entry per slot the intent DECLARES,
+/// carrying the value the conversation has filled for it, and an unfilled slot
+/// ([`unfilled`]) for every slot it has none for.
+///
+/// "A map of all of the slots for the intent. The name of the slot maps to the
+/// value of the slot. If a slot has not been filled, the value is null"
+/// (`Intent$slots`) — so the map is keyed by the intent's own slots whatever the
+/// dialog reached, and an intent that declares none reports an empty map. A name
+/// the intent does not declare is not a slot of it, so a stray entry a caller
+/// put in the session is not reported back.
+fn declared_slots(
+    authored: &ModelIntent,
+    filled: &HashMap<String, Slot>,
+) -> HashMap<String, Slot> {
+    authored
+        .slots
+        .iter()
+        .map(|slot| {
+            // Keyed by the slot's own name, which is what this dialog writes
+            // and what a caller seeding the session names the slot by.
+            let value = filled.get(&slot.name).cloned().unwrap_or_else(unfilled);
+            (slot.name.clone(), value)
+        })
+        .collect()
+}
+
+/// A slot the intent declares and the conversation has no value for: the entry
+/// whose wire form is the documented `null` (`Intent$slots`), which is what a
+/// slot holding nothing at all serializes as.
+fn unfilled() -> Slot {
+    Slot::default()
 }
 
 /// `Close`, the dialog action of a turn that elicits nothing further.

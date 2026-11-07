@@ -200,6 +200,18 @@ async fn recognize_text(emulator: &Emulator, case: &Case) -> crate::harness::Rep
         .await
 }
 
+/// One session state with the member that identifies the CONVERSATION left
+/// aside: `originatingRequestId` is minted per session, so two turns taken
+/// against two emulators report two different ones and everything else is what
+/// the two encodings must agree on.
+fn correlation_aside(state: &Value) -> Value {
+    let mut state = state.clone();
+    if let Some(object) = state.as_object_mut() {
+        object.remove("originatingRequestId");
+    }
+    state
+}
+
 /// Rules 1, 2 and 3: the two encodings of a turn agree, member by member, and
 /// what either one persisted is what `GetSession` then reports.
 #[tokio::test]
@@ -251,11 +263,29 @@ async fn an_utterance_advances_the_session_exactly_as_the_same_text_does() {
         // JSON-bodied sibling reports for the same member.
         let actual_state = utterance.lex_header("x-amz-lex-session-state");
         assert_eq!(
-            actual_state,
-            expected.get("sessionState").cloned(),
+            actual_state.as_ref().map(correlation_aside),
+            expected.get("sessionState").map(correlation_aside),
             "case {:?}: the session state of the turn must agree, got {actual_state:?}",
             case.name
         );
+        // The one member the two cannot share: each turn opened a session of its
+        // own on its own emulator, and `originatingRequestId` identifies one
+        // conversation, so both report one and the two differ.
+        for (encoding, state) in [
+            ("RecognizeUtterance", actual_state.clone()),
+            ("RecognizeText", expected.get("sessionState").cloned()),
+        ] {
+            let minted = state
+                .as_ref()
+                .and_then(|state| state.pointer("/originatingRequestId").cloned())
+                .and_then(|value| value.as_str().map(str::to_string));
+            assert!(
+                minted.as_deref().is_some_and(|id| !id.is_empty()),
+                "case {:?}: {encoding} must report the session's own originatingRequestId, \
+                 got {state:?}",
+                case.name
+            );
+        }
         let actual_interpretations = utterance
             .lex_header("x-amz-lex-interpretations")
             .unwrap_or_else(|| json!([]));
@@ -344,8 +374,11 @@ async fn an_utterance_advances_the_session_exactly_as_the_same_text_does() {
         );
         let after_text = by_text.send("GET", &case.session_path(), None).await;
         assert_eq!(
-            stored.get("sessionState").cloned(),
-            after_text.json().get("sessionState").cloned(),
+            stored.get("sessionState").map(correlation_aside),
+            after_text
+                .json()
+                .get("sessionState")
+                .map(correlation_aside),
             "case {:?}: both encodings leave the same session behind",
             case.name
         );

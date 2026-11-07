@@ -654,6 +654,10 @@ impl Session {
 
     /// Store a dialog state a caller supplied in full, as `PutSession` does:
     /// every member the request carried becomes the session's state.
+    ///
+    /// The `originatingRequestId` is the SESSION's, not one turn's: it is minted
+    /// with the conversation and reported for as long as it lives, so a request
+    /// that carries none leaves the one the session already holds in place.
     pub fn replace_session_state(&mut self, supplied: SessionState, now: SystemTime) {
         let active_contexts = supplied.active_contexts.clone().unwrap_or_default();
         if let Some(originating_request_id) = supplied.originating_request_id.clone() {

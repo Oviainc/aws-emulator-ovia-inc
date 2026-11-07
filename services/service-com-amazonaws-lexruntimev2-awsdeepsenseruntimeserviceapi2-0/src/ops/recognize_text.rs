@@ -124,12 +124,25 @@ fn refused(error: AttributesRefused) -> RecognizeTextError {
 /// interpret an utterance against, or the control plane that holds them cannot
 /// be reached at all.
 ///
-/// A locale that was never built has no runtime model, so the combination is not
-/// one a conversation can be held against: that is the modelled
-/// `ResourceNotFoundException`, and it is answered BEFORE the session store is
-/// touched, so a refused turn starts no session.
-fn locale_unavailable(error: LocaleUnavailable) -> RecognizeTextError {
+/// Two distinct misconfigurations, worded as Amazon Lex V2 words each: an alias
+/// id that is not an alias of that bot resolves to nothing at all, while a
+/// locale that was never built has no runtime model. Both are the modelled
+/// `ResourceNotFoundException`, and both are answered BEFORE the session store
+/// is touched, so a refused turn starts no session.
+fn locale_unavailable(
+    error: LocaleUnavailable,
+    bot_id: &str,
+    bot_alias_id: &str,
+) -> RecognizeTextError {
     match error {
+        LocaleUnavailable::UnknownBotAlias => {
+            RecognizeTextErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: crate::state::bot_model::bot_alias_not_valid_message(
+                    bot_id,
+                    bot_alias_id,
+                ),
+            })
+        }
         LocaleUnavailable::NotBuilt => {
             RecognizeTextErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 message: crate::state::bot_model::BOT_LOCALE_NOT_VALID_MESSAGE.to_string(),
@@ -255,7 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.bot_alias_id,
             &input.locale_id,
         )
-        .map_err(locale_unavailable)?;
+        .map_err(|error| locale_unavailable(error, &input.bot_id, &input.bot_alias_id))?;
 
         let now = SystemTime::now();
         let key = SessionKey::new(

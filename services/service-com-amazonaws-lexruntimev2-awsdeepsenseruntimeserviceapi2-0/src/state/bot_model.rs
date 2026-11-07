@@ -37,6 +37,18 @@ pub const BOT_LOCALE_NOT_VALID_MESSAGE: &str =
     "The provided BotId/BotLocale combination is not valid. Please update the BotId/BotLocale \
      combination and retry your request.";
 
+/// What Amazon Lex V2 answers a runtime call whose `botId`/`botAliasId` pair
+/// resolves to no alias of that bot: a different misconfiguration from a locale
+/// that was never built ([`BOT_LOCALE_NOT_VALID_MESSAGE`]), and the only thing
+/// that tells the two apart is the sentence.
+///
+/// The two ids the request addressed the alias by are the variable parts, taken
+/// from the request's own path labels and reported back verbatim; the text after
+/// them is fixed.
+pub fn bot_alias_not_valid_message(bot_id: &str, bot_alias_id: &str) -> String {
+    format!("{bot_id}/{bot_alias_id} is not a valid BotId/BotAliasId combination.")
+}
+
 /// The `slotConstraint` of a slot Amazon Lex V2 must have a value for before the
 /// intent can be fulfilled. The modelled `SlotConstraint` admits only this and
 /// `Optional` (`lexmodels#SLOT_CONSTRAINT_VALUES`).
@@ -90,11 +102,29 @@ pub struct ModelIntent {
     /// The slots of the intent, in the order `slotPriorities` elicits them.
     pub slots: Vec<ModelSlot>,
     /// The messages the intent's `intentClosingSetting` closing response sends
-    /// once the intent is ready to be fulfilled; empty when none is authored.
+    /// once the intent is ready to be fulfilled; empty when none is authored or
+    /// when the setting is not `active`.
     pub closing_messages: Vec<Message>,
+    /// Is the intent's fulfilment somebody else's work — an ACTIVE, enabled
+    /// `fulfillmentCodeHook`, the Lambda function Amazon Lex V2 "invokes … when
+    /// the intent is ready for fulfillment"? An intent that names no such hook
+    /// is fulfilled by the bot itself.
+    pub fulfillment_by_code_hook: bool,
 }
 
 impl ModelIntent {
+    /// Does the BOT complete this intent itself, rather than leaving its
+    /// fulfilment to its caller?
+    ///
+    /// It does when it has a closing response of its own to play and no
+    /// fulfilment code hook to hand the intent to: nothing else runs, and the
+    /// bot has said its last word. An intent whose fulfilment is a code hook's,
+    /// or that has nothing authored to close on, is fulfilled by whoever called
+    /// the runtime.
+    pub fn bot_completes_fulfillment(&self) -> bool {
+        !self.closing_messages.is_empty() && !self.fulfillment_by_code_hook
+    }
+
     /// The slot of this intent that name declares. A sample utterance names a
     /// slot by its name, which is unique within the intent and compared without
     /// regard to case, as a bot author writes it in prose.
@@ -204,8 +234,13 @@ pub fn resolve_slot_value(slot_type: Option<&ModelSlotType>, said: &str) -> Opti
 /// Why a turn cannot be interpreted against the bot and locale it addresses.
 #[derive(Debug, Clone, Copy)]
 pub enum LocaleUnavailable {
-    /// The addressed bot, alias or locale has no model the runtime can serve:
-    /// it does not exist, or its locale has not been built.
+    /// The `botId`/`botAliasId` pair the request addressed resolves to no alias
+    /// of that bot, so there is no bot version — and therefore no locale — to
+    /// look for at all.
+    UnknownBotAlias,
+    /// The alias resolved, but the locale the request names has no model the
+    /// runtime can serve: that version holds no such locale, or the locale has
+    /// not been built.
     NotBuilt,
     /// The control plane's own store could not be reached, which is this
     /// emulator's fault and not the request's.
@@ -235,7 +270,7 @@ pub fn built_locale<Eng: Send + Sync + 'static>(
         .bot_aliases
         .get(&lexmodels::state::bot_alias_key(bot_id, bot_alias_id))
         .map(|alias| alias.bot_version.clone())
-        .ok_or(LocaleUnavailable::NotBuilt)?;
+        .ok_or(LocaleUnavailable::UnknownBotAlias)?;
 
     // `settled_bot_locale` applies the status transition the clock has already
     // made due, so a build that fell due is observed here exactly as
@@ -272,9 +307,21 @@ pub fn built_locale<Eng: Send + Sync + 'static>(
             closing_messages: intent
                 .intent_closing_setting
                 .as_ref()
+                // "active — Specifies whether an intent's closing response is
+                // used": a setting that is not active plays nothing, and the
+                // member is optional, so an authored setting that omits it is
+                // used.
+                .filter(|setting| setting.active.unwrap_or(true))
                 .and_then(|setting| setting.closing_response.as_ref())
                 .map(|response| response_messages(&response.message_groups))
                 .unwrap_or_default(),
+            // "enabled — Indicates whether a Lambda function should be invoked
+            // to fulfill a specific intent", beside the same `active` flag the
+            // closing setting carries.
+            fulfillment_by_code_hook: intent
+                .fulfillment_code_hook
+                .as_ref()
+                .is_some_and(|hook| hook.enabled && hook.active.unwrap_or(true)),
         })
         .collect();
 

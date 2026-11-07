@@ -26,11 +26,14 @@
 //!    the user said.
 //! 3. While a `Required` slot of the intent has no value the turn answers
 //!    `ElicitSlot` for it, with the prompt authored on the slot and the intent
-//!    `InProgress`; once every required slot has one the intent is
-//!    `ReadyForFulfillment` and the dialog closes. What a turn filled is session
+//!    `InProgress`; once every required slot has one the dialog closes, and this
+//!    bot — which has no closing response of its own — leaves the intent
+//!    `ReadyForFulfillment` for its caller to fulfil (who completes an intent is
+//!    `dialog_turn_reporting`'s own rule 1). What a turn filled is session
 //!    state, so `GetSession` reports it back.
 //! 4. A turn addressed to a bot, alias or locale with no built model is refused
-//!    with the modelled `ResourceNotFoundException`, and starts no session.
+//!    with the modelled `ResourceNotFoundException`, and starts no session; the
+//!    sentence names the condition actually hit.
 
 use std::time::Duration;
 
@@ -40,7 +43,7 @@ use crate::harness::Emulator;
 
 /// An IAM role ARN satisfying the modelled `RoleArn` shape
 /// (len 32..2048, pattern `^arn:aws:iam::[0-9]{12}:role/.*$`).
-const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lex-runtime-suite";
+pub(crate) const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lex-runtime-suite";
 
 /// The prompt authored on the slot every conversation here elicits.
 pub(crate) const SIZE_PROMPT: &str = "What size pizza would you like?";
@@ -56,7 +59,7 @@ const UTTERANCES: [&str; 2] = ["I want to order a pizza", "I want a {PizzaSize} 
 
 /// The locale the conversations are held in, and its own confidence threshold:
 /// inside the modelled `ConfidenceThreshold` range 0..1.
-const LOCALE: &str = "en_US";
+pub(crate) const LOCALE: &str = "en_US";
 /// See [`LOCALE`].
 pub(crate) const THRESHOLD: f64 = 0.4;
 
@@ -341,7 +344,7 @@ pub(crate) async fn say(emulator: &Emulator, bot: &Bot, session_id: &str, text: 
 }
 
 /// A string at a JSON pointer, or `None` when nothing is there.
-fn at(body: &Value, pointer: &str) -> Option<String> {
+pub(crate) fn at(body: &Value, pointer: &str) -> Option<String> {
     body.pointer(pointer)
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -881,21 +884,29 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
         "the locale under test must be one that was never built, got {described:?}"
     );
 
-    // (case, the labels the turn addresses) — one row per way the addressed
-    // combination can have no built model.
-    let rows: Vec<(&str, String)> = vec![
+    // (case, the labels the turn addresses, the message the refusal carries) —
+    // one row per way the addressed combination can have no built model. The two
+    // refusals are worded differently: a `botId`/`botAliasId` pair that resolves
+    // to no alias names both ids, while a locale with no built model carries the
+    // fixed BotId/BotLocale sentence.
+    let rows: Vec<(&str, String, String)> = vec![
         (
             "the bot's own locale, never built",
             format!(
                 "/bots/{}/botAliases/{}/botLocales/{}/sessions/unbuilt",
                 bot.bot_id, bot.bot_alias_id, bot.locale_id
             ),
+            NOT_VALID.to_string(),
         ),
         (
             "a bot id nothing was ever created for",
             format!(
                 "/bots/ZZZZZZZZZZ/botAliases/{}/botLocales/{}/sessions/unbuilt",
                 bot.bot_alias_id, bot.locale_id
+            ),
+            format!(
+                "ZZZZZZZZZZ/{} is not a valid BotId/BotAliasId combination.",
+                bot.bot_alias_id
             ),
         ),
         (
@@ -904,6 +915,10 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
                 "/bots/{}/botAliases/NOSUCHALIAS/botLocales/{}/sessions/unbuilt",
                 bot.bot_id, bot.locale_id
             ),
+            format!(
+                "{}/NOSUCHALIAS is not a valid BotId/BotAliasId combination.",
+                bot.bot_id
+            ),
         ),
         (
             "a locale id the bot has no locale for",
@@ -911,10 +926,11 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
                 "/bots/{}/botAliases/{}/botLocales/de_DE/sessions/unbuilt",
                 bot.bot_id, bot.bot_alias_id
             ),
+            NOT_VALID.to_string(),
         ),
     ];
 
-    for (case, path) in &rows {
+    for (case, path, expected_message) in &rows {
         let refused = emulator
             .send(
                 "POST",
@@ -935,7 +951,7 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
         );
         assert_eq!(
             at(&refused.json(), "/message").as_deref(),
-            Some(NOT_VALID),
+            Some(expected_message.as_str()),
             "case {case:?}: the refusal is worded as the service words it, got {:?}",
             refused.json()
         );

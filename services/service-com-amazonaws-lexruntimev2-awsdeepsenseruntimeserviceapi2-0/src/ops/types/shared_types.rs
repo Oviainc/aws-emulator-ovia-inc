@@ -102,14 +102,10 @@ pub struct SentimentScore {
     pub mixed: f64,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.lexruntimev2#Intent")]
-#[derive(Debug, Clone, Default)]
-pub struct Intent {
-    pub name: String,
-    pub slots: Option<std::collections::HashMap<String, Slot>>,
-    pub state: Option<String>,
-    pub confirmation_state: Option<String>,
-}
+// `Intent` is declared in `super::intent_types`, written out rather than
+// expanded from the model: `Intent$slots` reports a slot the intent declares and
+// nothing has filled as the documented JSON `null`, which the generated map
+// serializer cannot write. See that module for the whole of the difference.
 
 #[smithy_macros::smithy(shape = "com.amazonaws.lexruntimev2#Slot")]
 #[derive(Debug, Clone, Default)]
