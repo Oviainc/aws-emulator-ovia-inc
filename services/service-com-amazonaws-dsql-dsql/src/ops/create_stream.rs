@@ -4,9 +4,19 @@
 //!
 //! Mints and persists a change data capture stream of a cluster: a fresh
 //! lowercase-ULID `streamIdentifier`, the ARN derived from it, the cluster and
-//! the cluster's own region, `CREATING` with the clock owing it `ACTIVE`, and the
-//! target, ordering, format and tags the caller asked for. The target's
-//! `roleArn` has to be a role this account can pass.
+//! the cluster's own region, `CREATING` with the clock owing it its settled
+//! status, and the target, ordering, format and tags the caller asked for. The
+//! target's `roleArn` has to be a role this account can pass.
+//!
+//! ## Which status the clock then owes the stream
+//!
+//! "The stream captures database changes and delivers them to the specified
+//! target destination" — so a target this service cannot deliver to is stream
+//! STATE and not a refusal of the create: `StreamStatus` carries `FAILED` and
+//! `GetStream` reports the `StreamFailureErrorCode` behind it as a
+//! `statusReason`. The target is therefore RESOLVED against the services that own
+//! it ([`target_failure`]) and the answer decides which status the clock owes the
+//! stream, `ACTIVE` or `FAILED`; the create itself is served either way.
 //!
 //! ## Where the pass-role decision is taken
 //!
@@ -253,6 +263,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateStreamErrorModeled::ValidationException(invalid).into());
         }
 
+        // Whether this stream's delivery target can be delivered to is settled
+        // BEFORE this service's own store is reached: resolving the target is a
+        // READ of the services that own it ([`target_failure`]), it touches no
+        // state of theirs or of this one, and the store guard taken below is
+        // never held across an await.
+        let target_failure = target_failure(ctx, &input.target_definition, &region).await;
+
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
         state.settle(now);
@@ -372,16 +389,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             format: input.format.clone(),
             target_definition: input.target_definition.clone(),
             tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
-            // The clock, not a later caller, owes this stream its ACTIVE status.
+            // The clock, not a later caller, owes this stream its settled status:
+            // `ACTIVE` for a target this service can deliver to, and `FAILED`
+            // carrying the code the target's owner answered with for one it
+            // cannot ([`target_failure`]).
             pending: Some(crate::state::PendingTransition {
                 due_at: now + crate::state::SETTLE_AFTER,
-                next_status: crate::state::STREAM_STATUS_ACTIVE,
+                next_status: match target_failure {
+                    Some(_) => crate::state::STREAM_STATUS_FAILED,
+                    None => crate::state::STREAM_STATUS_ACTIVE,
+                },
             }),
+            failure: target_failure,
+            status_updated_at: now,
             stream_identifier: stream_identifier.clone(),
         };
 
         let created = created_stream_output(&input.cluster_identifier, &stream);
+        let settles_into = stream
+            .pending
+            .as_ref()
+            .map_or(created.status.as_str(), |pending| pending.next_status);
         cluster.streams.insert(stream_identifier.clone(), stream);
+        // The record of a call that CHANGED stored state: what was minted, what
+        // the caller was told, and which status the clock now owes it — the one
+        // fact about this stream that is not the caller's own request. Nothing the
+        // caller sent is logged, not the client token that keys the ledger below
+        // and not the target it named.
+        ::tracing::info!(
+            operation = Self::NAME,
+            cluster = %created.cluster_identifier,
+            stream = %created.stream_identifier,
+            status = %created.status,
+            settles_into = %settles_into,
+            target_failure = target_failure.unwrap_or_default(),
+            "created a stream of a cluster"
+        );
         if let Some(token) = input.client_token {
             state
                 .tokens(crate::state::TokenScope::CreateStream)
@@ -461,6 +504,109 @@ fn cross_account_denial(target: &TargetDefinition) -> Option<AccessDeniedExcepti
     (!is_passable_role(target_role_arn(target))).then(|| AccessDeniedException {
         message: CROSS_ACCOUNT_PASS_ROLE_MESSAGE.to_string(),
     })
+}
+
+/// The IAM service principal a stream's delivery runs under: the principal the
+/// role a `targetDefinition` names has to admit for this service to assume it and
+/// write the captured changes to the destination beside it.
+const SERVICE_PRINCIPAL: &str = "dsql.amazonaws.com";
+
+/// The ARN vendor field of the Kinesis data stream a target names
+/// (`KinesisStreamArn`'s pattern fixes it:
+/// `^arn:aws[a-zA-Z-]*:kinesis:[a-z0-9-]*:[0-9]{12}:stream/[a-zA-Z0-9+=,.@_/\-]+$`,
+/// `smithy_query(query="shape", shape="KinesisTargetDefinition")`).
+const KINESIS_ARN_VENDOR: &str = "kinesis";
+
+/// The `StreamFailureErrorCode` the stream's delivery target was found unusable
+/// with, or `None` when nothing answered that it is.
+///
+/// A delivery target this service cannot write to is stream STATE rather than a
+/// refusal of the create: `StreamStatus` carries `FAILED` and `GetStream` reports
+/// the `statusReason` behind it, so the create is served and the stream settles
+/// into the failed status carrying that code
+/// (`smithy_query(query="shape", shape="StreamStatus,StatusReason")`). That is
+/// what a client polling `GetStream` after `CreateStream` learns an unusable
+/// target from.
+///
+/// Every code answered here is one the service that OWNS the target gave about
+/// it, never one derived from the caller's own request: the role is resolved
+/// against this account's IAM records and the destination against the delivery
+/// service's own streams. Both are reached the way any emulated service reaches
+/// another — an AWS SDK client over the emulator's own in-process callback
+/// ([`::service_common::kinesis_client`], [`::service_common::iam_role`]) — so
+/// nothing here opens a socket, resolves a name or reads an ambient credential.
+///
+/// `None` — leave the stream to settle `ACTIVE` — wherever nothing is KNOWN about
+/// the target: an emulator with no IAM or no delivery service mounted to ask, an
+/// answer this could not read, and a role this account's IAM holds nothing under.
+/// A failure has to be grounded in what the owner of the target said about it,
+/// for the reason [`::service_common::iam_role::held_role_is_unassumable`] gives.
+///
+/// Awaited with NO store guard held.
+async fn target_failure(
+    ctx: &OperationContext<'_>,
+    target: &TargetDefinition,
+    request_region: &str,
+) -> Option<&'static str> {
+    // The role comes first: the delivery runs UNDER it, so a role this service
+    // cannot assume reaches no destination whichever destination the union names.
+    if ::service_common::iam_role::held_role_is_unassumable(
+        ctx,
+        request_region,
+        target_role_arn(target),
+        SERVICE_PRINCIPAL,
+    )
+    .await
+    {
+        return Some(crate::state::STREAM_FAILURE_ROLE_ACCESS_DENIED);
+    }
+    match target {
+        TargetDefinition::Kinesis(kinesis) => {
+            kinesis_failure(ctx, &kinesis.stream_arn, request_region).await
+        }
+    }
+}
+
+/// The failure the Kinesis service answered about the data stream `stream_arn`
+/// names, or `None` when it answered the stream.
+///
+/// Asked BY ARN rather than by name, so the partition, Region and account the
+/// caller wrote are part of what the owning service resolves: it answers for the
+/// stream that whole ARN names or for no stream at all. And asked at that ARN's
+/// OWN Region, which is the endpoint holding it — read through
+/// [`::service_common::arn::region_of`], whose Region grammar is what keeps a
+/// caller's text out of the endpoint the client addresses; a value naming no
+/// Region is asked at the Region this request reached.
+///
+/// The two answers this maps are the ones the operation models for a target it
+/// cannot serve (`smithy_query(query="operation",
+/// operation="DescribeStreamSummary")` of the Kinesis model:
+/// `ResourceNotFoundException`, `AccessDeniedException`). Any other answer, and
+/// any failure that is not the owning service answering at all, leaves the target
+/// ungrounded.
+async fn kinesis_failure(
+    ctx: &OperationContext<'_>,
+    stream_arn: &str,
+    request_region: &str,
+) -> Option<&'static str> {
+    let region =
+        ::service_common::arn::region_of(stream_arn, KINESIS_ARN_VENDOR).unwrap_or(request_region);
+    let Err(refused) = ::service_common::kinesis_client::kinesis_client(ctx, region)
+        .describe_stream_summary()
+        .stream_arn(stream_arn)
+        .send()
+        .await
+    else {
+        return None;
+    };
+    let answered = refused.as_service_error()?;
+    if answered.is_resource_not_found_exception() {
+        Some(crate::state::STREAM_FAILURE_KINESIS_STREAM_NOT_FOUND)
+    } else if answered.is_access_denied_exception() {
+        Some(crate::state::STREAM_FAILURE_KINESIS_ACCESS_DENIED)
+    } else {
+        None
+    }
 }
 
 /// `CreateStream` served so the pass-role decision on `targetDefinition` is

@@ -278,7 +278,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(conflict) = cluster_conflict {
                 return Err(DeleteStreamErrorModeled::ConflictException(conflict).into());
             }
-            stream.status = crate::state::STREAM_STATUS_DELETING.to_string();
+            stream.enter_status(crate::state::STREAM_STATUS_DELETING, now);
             // The clock, not a later caller, finishes the deletion: at that point
             // the stream leaves its cluster's record.
             stream.pending = Some(crate::state::PendingTransition {

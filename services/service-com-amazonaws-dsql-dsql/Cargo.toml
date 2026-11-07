@@ -25,6 +25,10 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Encodes the opaque `nextToken` cursor ListClusters pages with.
 hex = { workspace = true }
+# `kinesis_client` / `iam_role` / `arn`: the shared in-process clients a CreateStream
+# resolves its `targetDefinition` through — the delivery service's own streams and this
+# account's IAM records — and the one reading of a caller-supplied ARN's Region.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -33,6 +37,13 @@ emulator-core-build-support = { workspace = true }
 # `time` on top of the workspace features: the clock-settling tests await the due
 # instant rather than blocking the runtime thread.
 tokio = { workspace = true, features = ["time"] }
+# Amazon Kinesis and IAM, mounted beside Aurora DSQL on one engine so the stream-target
+# suite resolves a `targetDefinition` against the very streams and roles a client created
+# through those services' own APIs.
+service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# Percent-encodes the form fields the IAM query-protocol requests in that suite carry.
+percent-encoding = "2.3"
 
 [lints]
 workspace = true

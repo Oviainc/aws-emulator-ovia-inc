@@ -68,8 +68,8 @@ use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     ConflictException, EncryptionDetails, InternalServerException, MultiRegionProperties,
-    ResourceNotFoundException, ServiceQuotaExceededException, TargetDefinition, ValidationException,
-    ValidationExceptionField,
+    ResourceNotFoundException, ServiceQuotaExceededException, StatusReason, TargetDefinition,
+    ValidationException, ValidationExceptionField,
 };
 
 /// The `ClusterStatus` values this service drives a cluster through, spelled as
@@ -107,6 +107,29 @@ pub const STREAM_STATUS_DELETING: &str = "DELETING";
 /// See [`STREAM_STATUS_CREATING`]: the status a deleted stream reaches, at which
 /// point it is no longer held by its cluster ([`ComAmazonawsDsqlDsqlState::settle`]).
 pub const STREAM_STATUS_DELETED: &str = "DELETED";
+/// See [`STREAM_STATUS_CREATING`]: the status of a stream whose delivery target
+/// was found unusable, so no database change reaches it. `GetStream` reports the
+/// [`Stream::failure`] behind it as the `statusReason`.
+pub const STREAM_STATUS_FAILED: &str = "FAILED";
+
+/// The `StreamFailureErrorCode` values a stream's `statusReason` reports, spelled
+/// as the enum spells them on the wire (`smithy_query(query="shape",
+/// shape="StreamFailureErrorCode")`: KINESIS_THROUGHPUT_EXCEEDED |
+/// KINESIS_STREAM_NOT_FOUND | ROLE_ACCESS_DENIED | KINESIS_ACCESS_DENIED |
+/// KINESIS_KMS_ACCESS_DENIED | KINESIS_OVERSIZE_RECORD | CLUSTER_CMK_INACCESSIBLE
+/// | INTERNAL_ERROR).
+///
+/// The three below are the ones an owning service ANSWERS about a target: the
+/// delivery service reporting that it holds no such stream or that it refuses
+/// access to it, and this account's IAM reporting that the role the target names
+/// does not admit this service. The rest are about DELIVERING a record (a
+/// throughput ceiling, an oversize record) or about a store this service does not
+/// ask, and no answer grounds them, so nothing reports them.
+pub const STREAM_FAILURE_KINESIS_STREAM_NOT_FOUND: &str = "KINESIS_STREAM_NOT_FOUND";
+/// See [`STREAM_FAILURE_KINESIS_STREAM_NOT_FOUND`].
+pub const STREAM_FAILURE_KINESIS_ACCESS_DENIED: &str = "KINESIS_ACCESS_DENIED";
+/// See [`STREAM_FAILURE_KINESIS_STREAM_NOT_FOUND`].
+pub const STREAM_FAILURE_ROLE_ACCESS_DENIED: &str = "ROLE_ACCESS_DENIED";
 
 /// `EncryptionType` values (`smithy_query(query="shape", shape="EncryptionType")`).
 pub const ENCRYPTION_AWS_OWNED: &str = "AWS_OWNED_KMS_KEY";
@@ -214,6 +237,16 @@ pub struct Stream {
     pub format: String,
     /// Where the stream writes its records.
     pub target_definition: TargetDefinition,
+    /// The `StreamFailureErrorCode` the stream's delivery target was found
+    /// unusable with when the stream was created — the answer the service that
+    /// OWNS that target gave about it — or `None` when nothing answered that it
+    /// is. It is what [`Self::status_reason`] reports once the clock has settled
+    /// the stream into [`STREAM_STATUS_FAILED`].
+    pub failure: Option<&'static str>,
+    /// When this stream's [`Self::status`] last changed, which is the `updatedAt`
+    /// a `statusReason` reports. Written only through [`Self::enter_status`], so
+    /// the instant and the status it belongs to cannot drift apart.
+    pub status_updated_at: SystemTime,
     /// The stream's tags. Sorted so a read is deterministic.
     pub tags: BTreeMap<String, String>,
     /// The status change the clock owes this stream, if any.
@@ -221,6 +254,35 @@ pub struct Stream {
 }
 
 impl Stream {
+    /// Move this stream into `status` as of `at`.
+    ///
+    /// The ONE writer of [`Self::status`], so the instant the status changed is
+    /// recorded with every change rather than by whoever remembers to: that
+    /// instant is the `updatedAt` a `statusReason` reports
+    /// ([`Self::status_reason`]), and a status written without it would report a
+    /// stale one.
+    pub fn enter_status(&mut self, status: &str, at: SystemTime) {
+        self.status = status.to_string();
+        self.status_updated_at = at;
+    }
+
+    /// The `statusReason` a read of this stream reports: the failure its delivery
+    /// target was found unusable with, beside the instant the status that failure
+    /// produced was reached.
+    ///
+    /// `statusReason` is "stream status reason with error code and timestamp (if
+    /// applicable)" (`smithy_query(query="shape", shape="GetStreamOutput",
+    /// member="statusReason")`), and what makes it applicable is the stream being
+    /// in a status a failure produced — [`STREAM_STATUS_FAILED`] — so a stream in
+    /// any other status reports none, whatever its target once answered.
+    pub fn status_reason(&self) -> Option<StatusReason> {
+        let error = self.failure.filter(|_| self.status == STREAM_STATUS_FAILED)?;
+        Some(StatusReason {
+            error: error.to_string(),
+            updated_at: ::aws_smithy_types::DateTime::from(self.status_updated_at),
+        })
+    }
+
     /// Whether the stream is in a status that accepts a mutation. A stream the
     /// clock still owes a transition ([`STREAM_STATUS_CREATING`]) or one already
     /// on its way out ([`STREAM_STATUS_DELETING`], [`STREAM_STATUS_DELETED`]) is
@@ -966,7 +1028,15 @@ impl ComAmazonawsDsqlDsqlState {
                         .filter(|pending| pending.due_at <= now)
                         .map(|pending| pending.next_status);
                     if let Some(next_status) = settled {
-                        stream.status = next_status.to_string();
+                        let due_at = stream
+                            .pending
+                            .as_ref()
+                            .map_or(now, |pending| pending.due_at);
+                        // The status is reached at the instant it fell DUE, not at
+                        // the instant some later request happened to materialise
+                        // it, so the `updatedAt` a `statusReason` reports is the
+                        // same for every reader.
+                        stream.enter_status(next_status, due_at);
                         stream.pending = None;
                         if next_status == STREAM_STATUS_DELETED {
                             removed_streams.push(stream.stream_identifier.clone());

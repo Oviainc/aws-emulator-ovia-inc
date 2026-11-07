@@ -55,6 +55,8 @@ fn stored_stream(region: &str, cluster: &str, stream: &str) -> Stream {
         }),
         tags: Default::default(),
         pending: None,
+        failure: None,
+        status_updated_at: SystemTime::now(),
     }
 }
 

@@ -107,6 +107,8 @@ mod stream_lifecycle;
 mod stream_listing;
 #[path = "all/stream_target_authorization.rs"]
 mod stream_target_authorization;
+#[path = "all/stream_target_health.rs"]
+mod stream_target_health;
 #[path = "all/tag_resource.rs"]
 mod tag_resource;
 #[path = "all/tagging_arn_refusal_body.rs"]

@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The ONE construction of the in-process Kinesis client an emulated service writes a data
-//! record through, so no two services configure that hop differently.
+//! The ONE construction of the in-process Kinesis client an emulated service reaches a data
+//! stream through, so no two services configure that hop differently.
 //!
 //! A service that DELIVERS to a stream — the AWS IoT rules engine's `kinesis` topic-rule
-//! action today — reaches Kinesis the way any emulated service reaches another: the AWS SDK
-//! driven over the emulator's own in-process transport, through the operation callback
+//! action today — or that RESOLVES one a caller named against the streams Kinesis itself
+//! holds — Aurora DSQL's CDC stream target today — reaches Kinesis the way any emulated
+//! service reaches another: the AWS SDK driven over the emulator's own in-process transport,
+//! through the operation callback
 //! ([`smithy_server_runtime::OperationContext::callback`]). The transport is what makes the
-//! delivery in-process: no socket is opened, no name is resolved, and nothing outside this
+//! hop in-process: no socket is opened, no name is resolved, and nothing outside this
 //! process is reachable from it. The endpoint URL below is addressing for that transport, not
 //! a host this process connects to, and it is built from the Region alone — no part of a
 //! caller's request is a destination.
@@ -20,7 +22,7 @@
 //! are to be MIGRATED onto it, each in the change that owns its service. Nothing new should
 //! build the client by hand.
 
-/// The Kinesis client a service writes a record through, addressed to `region`.
+/// The Kinesis client a service reaches a data stream through, addressed to `region`.
 ///
 /// The transport is in-process, so there is nothing to retry, time out or watch for a stalled
 /// stream — each of those would need a sleep implementation this client is not given — and

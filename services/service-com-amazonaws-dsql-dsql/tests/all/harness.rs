@@ -79,6 +79,96 @@ impl Dsql {
         }
     }
 
+    /// An emulator holding Aurora DSQL beside the services a stream's
+    /// `targetDefinition` NAMES: Amazon Kinesis, which owns the data stream the
+    /// target addresses, and IAM, which holds the role it asks this service to
+    /// assume. One engine and one router, the shape `core/router/src/lib.rs`
+    /// mounts every service in — so a `CreateStream` resolves its target against
+    /// the very streams and roles a client created through those services' own
+    /// APIs rather than against a second copy of them.
+    pub fn with_delivery_services(region: &str) -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(service_com_amazonaws_dsql_dsql::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
+        router.register_service(
+            service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
+        );
+        router.register_service(
+            service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
+        Self {
+            router,
+            region: region.to_string(),
+        }
+    }
+
+    /// One `awsJson1_1` RPC against the service whose signing name is
+    /// `signing_name` and whose target prefix is `target_prefix` — how a client
+    /// calls Amazon Kinesis (`Kinesis_20131202`). The credential scope is what
+    /// routes it, exactly as in [`Self::call`].
+    pub async fn rpc(
+        &self,
+        signing_name: &str,
+        target_prefix: &str,
+        operation: &str,
+        body: Value,
+    ) -> Answer {
+        let request = ::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", format!("{signing_name}.{}.amazonaws.com", self.region))
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", format!("{target_prefix}.{operation}"))
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDTESTTESTTESTTEST/20260101/{}/{signing_name}/\
+                     aws4_request, SignedHeaders=host, Signature=0123456789abcdef",
+                    self.region
+                ),
+            )
+            .body(::bytes::Bytes::from(
+                serde_json::to_vec(&body).expect("a JSON body serializes"),
+            ))
+            .expect("the request builds");
+        Self::answer(self.router.dispatch(request).await)
+    }
+
+    /// One `awsQuery` call against IAM — the protocol that service speaks — as the
+    /// status and the XML document it answered.
+    pub async fn iam(&self, action: &str, fields: &[(&str, &str)]) -> (u16, String) {
+        let mut body = format!("Action={action}&Version=2010-05-08");
+        for (name, value) in fields {
+            body.push_str(&format!("&{name}={}", form_encode(value)));
+        }
+        let request = ::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "iam.amazonaws.com")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIDTESTTESTTESTTEST/20260101/us-east-1/iam/aws4_request, \
+                 SignedHeaders=host, Signature=0123456789abcdef",
+            )
+            .body(::bytes::Bytes::from(body))
+            .expect("the request builds");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        (
+            status,
+            String::from_utf8_lossy(&response.into_body()).to_string(),
+        )
+    }
+
     pub fn new() -> Self {
         Self::in_region("us-east-1")
     }
@@ -110,6 +200,12 @@ impl Dsql {
             .expect("the request builds");
 
         let response = self.router.dispatch(request).await;
+        Self::answer(response)
+    }
+
+    /// The status, the restJson1 error code and the body of one dispatched
+    /// response — the one decoding every call in this harness answers through.
+    fn answer(response: ::http::Response<::bytes::Bytes>) -> Answer {
         let status = response.status().as_u16();
         let error = response
             .headers()
@@ -294,6 +390,22 @@ pub fn percent_encode_label(value: &str) -> String {
             other => other.to_string(),
         })
         .collect()
+}
+
+/// One value as an `application/x-www-form-urlencoded` field, encoded by the
+/// `percent-encoding` crate, which is how IAM's query protocol carries a policy
+/// document. Everything outside the unreserved set is encoded.
+fn form_encode(value: &str) -> String {
+    ::percent_encoding::utf8_percent_encode(value, ::percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+/// The text of the first `<element>` of an XML document, or `None` when it carries
+/// none — how a suite reads one value out of an `awsQuery` answer.
+pub fn xml_text(document: &str, element: &str) -> Option<String> {
+    document
+        .split_once(&format!("<{element}>"))
+        .and_then(|(_, tail)| tail.split_once(&format!("</{element}>")))
+        .map(|(text, _)| text.to_string())
 }
 
 /// Let the clock's pending transition come due. The emulator never sleeps for it —

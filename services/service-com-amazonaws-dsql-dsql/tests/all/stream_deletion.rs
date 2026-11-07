@@ -403,6 +403,8 @@ fn seeded_stream(region: &str, cluster: &str, stream: &str, status: &str) -> Str
             due_at: SystemTime::now() + NOT_DUE_YET,
             next_status,
         }),
+        failure: None,
+        status_updated_at: SystemTime::now(),
     }
 }
 

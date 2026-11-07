@@ -4,8 +4,10 @@
 //!
 //! Reports a persisted stream of a cluster: the identifiers, ARN, status,
 //! creation time, ordering, format, target definition and tags `CreateStream`
-//! stored. Neither an unknown cluster nor an unknown stream is reported as an
-//! empty answer: both are `ResourceNotFoundException`.
+//! stored, and — for a stream in the status an unusable delivery target produced
+//! — the `statusReason` carrying the `StreamFailureErrorCode` behind it and the
+//! instant that status was reached. Neither an unknown cluster nor an unknown
+//! stream is reported as an empty answer: both are `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -214,9 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ordering: stream.ordering.clone(),
             format: stream.format.clone(),
             target_definition: Some(stream.target_definition.clone()),
-            // `statusReason` carries the error behind a FAILED or IMPAIRED
-            // status; a stream the clock is driving to ACTIVE has none.
-            status_reason: None,
+            // `statusReason` carries the error behind the status a FAILED
+            // delivery target produced, and nothing for a stream in any other
+            // status ([`crate::state::Stream::status_reason`]).
+            status_reason: stream.status_reason(),
             // `tags` is modelled as an optional map, and a stream created
             // without tags has none to report.
             tags: (!stream.tags.is_empty()).then(|| {
