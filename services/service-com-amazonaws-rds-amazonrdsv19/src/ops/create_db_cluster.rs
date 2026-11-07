@@ -987,7 +987,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that asked it to: generated, stored in Secrets Manager and reported as
         // `MasterUserSecret` ([`crate::state::mint_master_user_secret`]). The store's
         // guard is NOT held here — see the decision scope above.
-        let master_user_secret = if manage_master_user_password {
+        let (master_user_secret, master_user_password) = if manage_master_user_password {
             let minted = crate::state::mint_master_user_secret(
                 ctx,
                 &region,
@@ -1000,9 +1000,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .await
             .map_err(CreateDBClusterError::internal_failure)?;
-            Some(minted.secret)
+            // The generated password is the master user's, so a login on this cluster's own
+            // engine endpoint is verified against it exactly as it is against a password the
+            // request carried: it is digested here, while both halves are in hand, and the
+            // password itself goes nowhere.
+            let digested = master_username.as_deref().map(|username| {
+                crate::state::data_plane::wire_session::MasterPasswordHash::new(
+                    username,
+                    &minted.password,
+                )
+            });
+            (Some(minted.secret), digested)
         } else {
-            None
+            // The password the request carried, kept only as the digests a login can be
+            // verified against; `MasterUserPassword` itself is `@sensitive` and is never
+            // stored or reported.
+            let digested = match (master_username.as_deref(), input.master_user_password.as_deref())
+            {
+                (Some(username), Some(password)) => Some(
+                    crate::state::data_plane::wire_session::MasterPasswordHash::new(
+                        username, password,
+                    ),
+                ),
+                _ => None,
+            };
+            (None, digested)
         };
         // The identifier is answered against what the store holds NOW: the guard was
         // released while the secret was minted, so a create that raced another one for the
@@ -1026,7 +1048,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        let mut store = state.lock();
+        // The CA the cluster is created under, read under a SHORT-LIVED guard: the engine
+        // endpoint below is opened with no guard held, because binding is asynchronous and
+        // the core owns the socket, the bind interface and the port.
+        let default_ca_certificate = {
+            let store = state.lock();
+            store.default_ca_certificate(&region).to_string()
+        };
         // The version the cluster runs, and the DB cluster parameter group family its
         // default parameter group is named after: both come from the catalogue entry
         // resolved above, so the two cannot disagree.
@@ -1036,11 +1064,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // to resolve against, so what the request named stands.
             None => input.engine_version.clone(),
         };
-        let record = crate::state::DbClusterRecord {
+        let mut record = crate::state::DbClusterRecord {
             identifier: identifier.clone(),
             region: region.clone(),
             resource_id,
             endpoint_host: crate::state::mint_endpoint_host(mint),
+            // Filled in below from the cluster's own engine listener, for a cluster whose
+            // engine speaks a wire this emulator serves.
+            served_endpoint: None,
             // A newly created DB cluster is not yet usable: RDS answers `creating`, and the
             // cluster reaches `available` on its own. The due instant is stored on the
             // record, so nothing sleeps on this thread.
@@ -1059,6 +1090,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // user credential from.
             master_username,
             master_user_secret,
+            master_user_password,
             port: input
                 .port
                 .unwrap_or_else(|| crate::state::default_port(&input.engine)),
@@ -1176,13 +1208,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             domain_iam_role_name: input.domain_iam_role_name,
             global_cluster_identifier: global_cluster_identifier.clone(),
             replication_source_arn,
-            ca_certificate_identifier: input.ca_certificate_identifier.unwrap_or_else(|| {
+            ca_certificate_identifier: input
+                .ca_certificate_identifier
                 // No `CACertificateIdentifier`: the cluster is created under the CA that is
                 // the default for new launches in this region — the account's
                 // `ModifyCertificates` override when one is set, else the published system
                 // default.
-                store.default_ca_certificate(&region).to_string()
-            }),
+                .unwrap_or(default_ca_certificate),
             engine_lifecycle_support: input
                 .engine_lifecycle_support
                 .unwrap_or_else(|| crate::state::DEFAULT_ENGINE_LIFECYCLE_SUPPORT.to_string()),
@@ -1201,51 +1233,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags,
         };
 
-        let db_cluster = store.cluster_to_wire(&record);
-        let resource_id = record.resource_id.clone();
-        let engine = record.engine.clone();
-        let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
-            performance_insights_enabled: record.performance_insights_enabled,
-            database_insights_mode: Some(record.database_insights_mode.clone()),
-        };
-        let cluster_arn = record.arn();
-        store.db_clusters.insert(key, record);
-        // The create happened, so the region's event log records it: that entry is what
-        // `DescribeEvents` reports for this cluster from now on.
-        store.record_event(
-            &region,
-            crate::state::events::DB_CLUSTER_CREATED,
-            &identifier,
-            cluster_arn.clone(),
-        );
-        // A cluster that joined a global database is a MEMBER of it from now on: the
-        // global cluster's own record carries its members, so it is the record that is
-        // updated, and `DescribeGlobalClusters` reports the membership from there.
-        if let Some(global) = global_cluster_identifier
-            .as_ref()
-            .and_then(|identifier| store.global_clusters.get_mut(identifier))
-        {
-            if !global.member_cluster_arns.contains(&cluster_arn) {
-                global.member_cluster_arns.push(cluster_arn);
+        // The cluster's own ENGINE ENDPOINT, opened with the state lock released. It is
+        // opened AFTER every refusal above has been answered — so nothing binds for a
+        // create that was going to fail — and before the record is admitted to the store,
+        // so a cluster this service holds is one whose endpoint is already listening. The
+        // cluster still reports `creating` until the clock makes `available` due, and a
+        // session opened before then is refused by the engine exactly as it is against a
+        // cluster that is still coming up.
+        let endpoint = match crate::state::cluster_engine_wire(&record.engine) {
+            Some(wire) => {
+                match crate::state::open_engine_endpoint(
+                    &*self.engine,
+                    &state,
+                    crate::state::SessionTarget::DbCluster {
+                        region: region.clone(),
+                        resource_id: record.resource_id.clone(),
+                    },
+                    wire,
+                )
+                .await
+                {
+                    Ok(endpoint) => Some(endpoint),
+                    // The endpoint could not be opened, so no cluster is created — and the
+                    // secret minted for it above is deleted rather than left behind, since
+                    // the cluster that would have reported it does not exist.
+                    Err(error) => {
+                        if let Some(secret) = &record.master_user_secret {
+                            crate::state::release_orphaned_master_user_secret(
+                                ctx,
+                                &region,
+                                &secret.secret_arn,
+                            )
+                            .await;
+                        }
+                        return Err(CreateDBClusterError::internal_failure(error));
+                    }
+                }
             }
-        }
-        // The id just minted is recorded in the SHARED data-source directory, so a service
-        // that monitors this cluster (Performance Insights addresses a data source by its
-        // resource id) can tell that THIS service owns the id: the id's form cannot say so,
-        // because a global cluster's id has the same form. The monitoring settings this
-        // create persisted go in beside it, because a monitoring service cannot measure
-        // whether a feature is turned on for a cluster — this service is what the setting
-        // was given to. The RDS store is already locked here and the directory is taken
-        // second, the order its doc fixes.
-        if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
-            let mut directory = directory.lock();
-            directory.register(
-                &resource_id,
-                ::service_common::db_data_sources::SERVICE_TYPE_RDS,
-                &engine,
-            );
-            directory.record_monitoring(&resource_id, monitoring);
-        }
+            // An engine whose native wire this emulator does not speak: no listener is
+            // opened and the cluster keeps the DNS-form endpoint this service has always
+            // reported for it, rather than publishing a port that would answer nothing.
+            None => None,
+        };
+        record.served_endpoint = endpoint.as_ref().map(|endpoint| endpoint.endpoint.clone());
+
+        // The ARN of the secret this call minted, if any, kept here so a conflict below can
+        // delete it once the record that carries it has moved into the store.
+        let minted_secret_arn = record
+            .master_user_secret
+            .as_ref()
+            .map(|secret| secret.secret_arn.clone());
+
+        // Another request may have created this identifier while this one was binding, so
+        // the conflict is answered again here rather than overwriting a stored cluster.
+        // Deciding it and admitting the record happen under ONE guard, so no third request
+        // can take the identifier in between, and the state it is decided against is the
+        // state AFTER the transitions the clock has made due — a cluster the clock has
+        // already deleted does not hold the identifier. The guard is released before the
+        // conflict is ANSWERED, because answering it deletes the secret this call minted,
+        // which is a call to another service.
+        let created = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+            if store.db_clusters.contains_key(&key) {
+                None
+            } else {
+                let db_cluster = store.cluster_to_wire(&record);
+                let resource_id = record.resource_id.clone();
+                let engine = record.engine.clone();
+                let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
+                    performance_insights_enabled: record.performance_insights_enabled,
+                    database_insights_mode: Some(record.database_insights_mode.clone()),
+                };
+                let cluster_arn = record.arn();
+                store.db_clusters.insert(key.clone(), record);
+                // The listener is the cluster's: the store holds it, so it stays open for as
+                // long as the cluster does and closes with it.
+                if let Some(endpoint) = endpoint {
+                    store.db_cluster_engine_endpoints.insert(key, endpoint);
+                }
+                // The create happened, so the region's event log records it: that entry is
+                // what `DescribeEvents` reports for this cluster from now on.
+                store.record_event(
+                    &region,
+                    crate::state::events::DB_CLUSTER_CREATED,
+                    &identifier,
+                    cluster_arn.clone(),
+                );
+                // A cluster that joined a global database is a MEMBER of it from now on: the
+                // global cluster's own record carries its members, so it is the record that is
+                // updated, and `DescribeGlobalClusters` reports the membership from there.
+                if let Some(global) = global_cluster_identifier
+                    .as_ref()
+                    .and_then(|identifier| store.global_clusters.get_mut(identifier))
+                {
+                    if !global.member_cluster_arns.contains(&cluster_arn) {
+                        global.member_cluster_arns.push(cluster_arn);
+                    }
+                }
+                // The id just minted is recorded in the SHARED data-source directory, so a
+                // service that monitors this cluster (Performance Insights addresses a data
+                // source by its resource id) can tell that THIS service owns the id: the id's
+                // form cannot say so, because a global cluster's id has the same form. The
+                // monitoring settings this create persisted go in beside it, because a
+                // monitoring service cannot measure whether a feature is turned on for a
+                // cluster — this service is what the setting was given to. The RDS store is
+                // already locked here and the directory is taken second, the order its doc
+                // fixes.
+                if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
+                    let mut directory = directory.lock();
+                    directory.register(
+                        &resource_id,
+                        ::service_common::db_data_sources::SERVICE_TYPE_RDS,
+                        &engine,
+                    );
+                    directory.record_monitoring(&resource_id, monitoring);
+                }
+                Some(db_cluster)
+            }
+        };
+        let Some(db_cluster) = created else {
+            if let Some(secret) = &minted_secret_arn {
+                crate::state::release_orphaned_master_user_secret(ctx, &region, secret).await;
+            }
+            return Err(CreateDBClusterErrorModeled::DBClusterAlreadyExistsFault(
+                DBClusterAlreadyExistsFault {
+                    message: Some(crate::state::DB_CLUSTER_ALREADY_EXISTS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
 
         Ok(CreateDBClusterOutput {
             db_cluster: Some(db_cluster),

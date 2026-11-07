@@ -35,16 +35,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// The status a DB cluster and a DB instance both settle on once they are usable.
 const AVAILABLE: &str = "available";
 
-/// One row: an Aurora engine, the class a member of its clusters is created with, the port
-/// the engine accepts connections on, and the database the cluster is created with.
+/// One row: an Aurora engine, the class a member of its clusters is created with, and the
+/// database the cluster is created with.
 struct Row {
     case: &'static str,
     engine: &'static str,
     /// An instance class the orderable-options report offers for a cluster of this engine.
     class: &'static str,
-    /// The port the engine publishes as its default, which the cluster reports when the
-    /// request names none: PostgreSQL's 5432 and MySQL's 3306.
-    port: &'static str,
     database: &'static str,
 }
 
@@ -55,14 +52,12 @@ const ROWS: &[Row] = &[
         case: "an Aurora PostgreSQL cluster",
         engine: "aurora-postgresql",
         class: "db.r5.large",
-        port: "5432",
         database: "enginetruth",
     },
     Row {
         case: "an Aurora MySQL cluster",
         engine: "aurora-mysql",
         class: "db.r5.large",
-        port: "3306",
         database: "truthdb",
     },
 ];
@@ -151,9 +146,10 @@ async fn an_aurora_cluster_and_its_writer_converge_and_can_then_be_torn_down() {
         })
         .await;
 
-        // The settled cluster publishes where its engine accepts connections: an address and
-        // the port the engine listens on, which is the engine's own default for a request
-        // that named none.
+        // The settled cluster publishes where its engine accepts connections: the address
+        // and port its own engine listener answers on, which the core assigned (the port
+        // the request named, or the engine's own default, is the CONFIGURED port and is not
+        // what a client can reach here — see `state::data_plane::cluster_endpoint`).
         let endpoint = optional_text(&settled, "Endpoint").unwrap_or_default();
         assert!(
             !endpoint.is_empty(),
@@ -165,10 +161,10 @@ async fn an_aurora_cluster_and_its_writer_converge_and_can_then_be_torn_down() {
             "case {case:?}: an available cluster publishes a ReaderEndpoint, got {settled}"
         );
         let port = text(&settled, "Port");
-        assert_eq!(
-            port, row.port,
-            "case {case:?}: expected the engine's port {:?}, got {port:?}",
-            row.port
+        assert!(
+            port.parse::<u16>().is_ok_and(|port| port != 0),
+            "case {case:?}: expected the port the cluster's engine listener answers on, got \
+             {port:?}"
         );
         // The master user the cluster was created with is reported back, which is the user a
         // session on that endpoint logs in as.

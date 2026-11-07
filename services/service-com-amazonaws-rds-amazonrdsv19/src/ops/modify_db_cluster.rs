@@ -723,6 +723,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a secret minted for the cluster, one that turned it OFF has RDS "delete the
         // secret", and a rotation stakes a new password in the secret already there.
         let mut minted_master_user_secret = None;
+        let mut generated_master_user_password = None;
         let mut rotated_master_user_secret = false;
         let mut released_master_user_secret = false;
         match (
@@ -745,6 +746,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .await
                 .map_err(ModifyDBClusterError::internal_failure)?;
                 minted_master_user_secret = Some(minted.secret);
+                generated_master_user_password = Some(minted.password);
             }
             (Some(false), Some(secret)) => {
                 crate::state::release_master_user_secret(ctx, &region, &secret.secret_arn)
@@ -756,15 +758,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if input.rotate_master_user_password == Some(true) {
             if let Some(secret) = &accepted.current_master_user_secret {
-                crate::state::rotate_master_user_secret(
-                    ctx,
-                    &region,
-                    &secret.secret_arn,
-                    accepted.master_username.as_deref(),
-                    &accepted.engine,
-                )
-                .await
-                .map_err(ModifyDBClusterError::internal_failure)?;
+                generated_master_user_password = Some(
+                    crate::state::rotate_master_user_secret(
+                        ctx,
+                        &region,
+                        &secret.secret_arn,
+                        accepted.master_username.as_deref(),
+                        &accepted.engine,
+                    )
+                    .await
+                    .map_err(ModifyDBClusterError::internal_failure)?,
+                );
                 rotated_master_user_secret = true;
             }
         }
@@ -1002,8 +1006,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         // `MasterUserPassword` is `@sensitive` and RDS reports no member carrying it: it is
-        // accepted and neither stored nor returned.
-        changed |= input.master_user_password.is_some();
+        // never stored or returned as itself. What the record keeps is the DIGESTS a login
+        // on the cluster's own engine endpoint is verified against, so a modified password
+        // is the one that opens a session from now on and the old one stops working — which
+        // is what changing it means.
+        if let Some(value) = input.master_user_password.as_deref() {
+            changed = true;
+            record.master_user_password = record.master_username.as_ref().map(|username| {
+                crate::state::data_plane::wire_session::MasterPasswordHash::new(username, value)
+            });
+        }
+        // A password RDS GENERATED — for a request that turned management on, or for a
+        // rotation — is the one that opens a session on the cluster's engine endpoint from
+        // now on, so it is digested here exactly as a password the request carried is.
+        if let Some(generated) = generated_master_user_password.as_deref() {
+            changed = true;
+            record.master_user_password = record.master_username.as_ref().map(|username| {
+                crate::state::data_plane::wire_session::MasterPasswordHash::new(
+                    username, generated,
+                )
+            });
+        }
         // What the Secrets Manager calls above did, recorded on the cluster: the secret a
         // request that turned management ON minted is what the cluster reports as
         // `MasterUserSecret` from now on; turning management OFF leaves the cluster with
@@ -1035,9 +1058,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let db_cluster = store.cluster_to_wire(&record);
-        store
-            .db_clusters
-            .insert((region, record.identifier.clone()), record);
+        let renamed_key = (region, record.identifier.clone());
+        store.db_clusters.insert(renamed_key.clone(), record);
+        // A rename moves the cluster to a new key, and its engine endpoint moves with it:
+        // the listener a client is connected to stays the endpoint this cluster publishes,
+        // whatever it is now called.
+        store.move_cluster_engine_endpoint(&key, &renamed_key);
 
         Ok(ModifyDBClusterOutput {
             db_cluster: Some(db_cluster),

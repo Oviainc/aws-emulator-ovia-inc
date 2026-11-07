@@ -859,8 +859,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::open_engine_endpoint(
                     &*self.engine,
                     &state,
-                    &region,
-                    &record.dbi_resource_id,
+                    crate::state::SessionTarget::DbInstance {
+                        region: region.clone(),
+                        resource_id: record.dbi_resource_id.clone(),
+                    },
                     wire,
                 )
                 .await

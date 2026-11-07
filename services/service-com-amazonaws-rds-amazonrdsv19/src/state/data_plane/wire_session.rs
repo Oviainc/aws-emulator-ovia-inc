@@ -4,11 +4,11 @@
 //! commands a client sends that are not queries over its own tables (`SHOW`, `SET`, `USE`),
 //! and the session values a statement can read (`current_user`, `version()`, `@@version`).
 //!
-//! Everything here is decided from this service's OWN STATE — the stored DB instance, its
-//! master user, its parameter group, the session's own socket — and every statement that
-//! is a query over the instance's tables is handed to the SQL engine unchanged except for
-//! the session values substituted into it. Nothing is answered from the shape of the
-//! statement's text.
+//! Everything here is decided from this service's OWN STATE — the stored DB instance or DB
+//! cluster, its master user, its parameter group, the session's own socket — and every
+//! statement that is a query over the resource's tables is handed to the SQL engine
+//! unchanged except for the session values substituted into it. Nothing is answered from
+//! the shape of the statement's text.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -122,18 +122,50 @@ fn mysql_native_hash(password: &str) -> [u8; 20] {
     Sha1::digest(Sha1::digest(password.as_bytes())).into()
 }
 
-/// What a wire handler needs to serve every session on one DB instance's listener.
+/// WHICH resource's engine endpoint a listener serves, and how its record is found again.
+///
+/// Both kinds of endpoint are the same thing to a client — an address its ordinary driver
+/// speaks the engine's protocol on — so both are served by the same wires; what differs is
+/// the record the facts of a login are read from. Each names its resource by the IMMUTABLE
+/// id its create minted (`DbiResourceId`, `DbClusterResourceId`), never by identifier,
+/// because a rename under a live connection must not make the listener point at nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionTarget {
+    /// A DB instance's own endpoint, the address of the engine that instance runs.
+    DbInstance { region: String, resource_id: String },
+    /// A DB CLUSTER's endpoint — "the connection endpoint for the primary instance of the
+    /// DB cluster" — the address of the engine the cluster writes through.
+    DbCluster { region: String, resource_id: String },
+}
+
+impl SessionTarget {
+    /// The region the target was created in; half of its key in the store.
+    #[must_use]
+    pub fn region(&self) -> &str {
+        match self {
+            Self::DbInstance { region, .. } | Self::DbCluster { region, .. } => region,
+        }
+    }
+}
+
+/// Which kind of RDS resource an engine endpoint belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointKind {
+    /// A DB instance's own endpoint.
+    DbInstance,
+    /// A DB cluster's writer endpoint.
+    DbCluster,
+}
+
+/// What a wire handler needs to serve every session on one engine listener.
 #[derive(Clone)]
 pub struct SessionContext {
-    /// This service's store, read fresh at each login so a session sees the instance as
+    /// This service's store, read fresh at each login so a session sees the resource as
     /// it is NOW — its status, its master user, its parameter group.
     pub state: ::engine::ServiceState<ComAmazonawsRdsAmazonrdsv19State>,
-    /// The region the instance was created in; half of its key.
-    pub region: String,
-    /// The instance's `DbiResourceId`, which never changes — so a rename under a live
-    /// connection cannot make the listener point at nothing.
-    pub resource_id: String,
-    /// The instance's database.
+    /// The resource whose endpoint this listener is, and how to find its record.
+    pub target: SessionTarget,
+    /// The databases behind the endpoint.
     pub database: Arc<InstanceDatabase>,
     /// The sessions open on this endpoint, which is what `pg_stat_activity` reports and
     /// what `max_connections` is counted against.
@@ -155,74 +187,57 @@ impl SessionContext {
 
     /// The facts this session is admitted against, read once under the state lock.
     ///
-    /// `None` when the store holds no such instance any more (it was deleted while the
+    /// `None` when the store holds no such resource any more (it was deleted while the
     /// listener was still accepting), which the wire answers as an engine that is not
     /// there.
-    pub fn instance_facts(&self) -> Option<InstanceFacts> {
+    pub fn endpoint_facts(&self) -> Option<InstanceFacts> {
         let mut store = self.state.lock();
         // The transitions the clock has already made due — owed at this instant whether
         // or not anybody called, exactly as every control-plane handler materialises them
-        // — so a session is admitted against the status the instance has NOW. A client
-        // that connects without calling the control plane first still finds the instance
+        // — so a session is admitted against the status the resource has NOW. A client
+        // that connects without calling the control plane first still finds the resource
         // it would have been told about.
-        store.settle_due_transitions(&self.region);
-        let record = store.instance_by_resource_id(&self.region, &self.resource_id)?;
-        let wire = super::engine_wire(&record.engine)?;
-        let endpoint_host = store
-            .engine_endpoint(&(record.region.clone(), record.identifier.clone()))
-            .map(|endpoint| endpoint.endpoint.host.clone())
-            .unwrap_or_else(|| "localhost".to_string());
-        let server_version = record
-            .engine_version
-            .clone()
-            .or_else(|| {
-                crate::ops::describe_db_engine_versions::resolve_version(&record.engine, None)
-                    .ok()
-                    .flatten()
-                    .map(|entry| entry.engine_version.to_string())
-            })
-            .unwrap_or_default();
-        let mut databases = Vec::new();
-        if let Some(name) = &record.db_name {
-            databases.push(name.clone());
-        }
-        match wire {
-            EngineWire::Postgres => {
-                if !databases.iter().any(|name| name == POSTGRES_DEFAULT_DATABASE) {
-                    databases.push(POSTGRES_DEFAULT_DATABASE.to_string());
-                }
+        store.settle_due_transitions(self.target.region());
+        let (region, resource_id) = match &self.target {
+            // A cluster's facts come from the CLUSTER record, which is where a cluster's
+            // master user, engine version and parameter group live.
+            SessionTarget::DbCluster {
+                region,
+                resource_id,
+            } => {
+                return super::cluster_endpoint::cluster_facts(
+                    &store,
+                    region,
+                    resource_id,
+                    &self.database,
+                )
             }
-            EngineWire::MySql => {
-                databases.extend(MYSQL_SYSTEM_DATABASES.iter().map(|name| (*name).to_string()));
-            }
-        }
-        // The databases the INSTANCE comes with are created in its engine once, here,
-        // because this is where the record that names them is read. After that the engine
-        // is what says which databases the instance has, so one a client created with
-        // `CREATE DATABASE` is there for this session too and one it dropped stays gone.
-        self.database.seed(&databases);
-        let databases = self.database.database_names();
-        let default_database = match wire {
-            EngineWire::Postgres => record
-                .db_name
-                .clone()
-                .unwrap_or_else(|| POSTGRES_DEFAULT_DATABASE.to_string()),
-            EngineWire::MySql => record.db_name.clone().unwrap_or_default(),
+            SessionTarget::DbInstance {
+                region,
+                resource_id,
+            } => (region.clone(), resource_id.clone()),
         };
-        Some(InstanceFacts {
-            identifier: record.identifier.clone(),
-            engine: record.engine.clone(),
-            status: record.status.clone(),
-            wire,
-            server_version,
-            master_username: record.master_username.clone(),
-            password: record.master_user_password.clone(),
-            databases,
-            default_database,
-            requires_secure_transport: store.requires_secure_transport(record),
-            endpoint_host,
-            runtime: engine_runtime_of(&store, record),
-        })
+        let record = store.instance_by_resource_id(&region, &resource_id)?;
+        let wire = super::engine_wire(&record.engine)?;
+        Some(facts_of(
+            RecordFacts {
+                kind: EndpointKind::DbInstance,
+                identifier: record.identifier.clone(),
+                engine: record.engine.clone(),
+                status: record.status.clone(),
+                wire,
+                engine_version: record.engine_version.clone(),
+                database_name: record.db_name.clone(),
+                master_username: record.master_username.clone(),
+                password: record.master_user_password.clone(),
+                requires_secure_transport: store.requires_secure_transport(record),
+                served_host: store
+                    .engine_endpoint(&(record.region.clone(), record.identifier.clone()))
+                    .map(|endpoint| endpoint.endpoint.host.clone()),
+                runtime: engine_runtime_of(&store, record),
+            },
+            &self.database,
+        ))
     }
 
     /// The instance's engine RUNTIME as it is now, re-read for each statement a session
@@ -235,13 +250,166 @@ impl SessionContext {
     /// that, not the values its login happened to find.
     pub fn engine_runtime(&self) -> Option<EngineRuntime> {
         let store = self.state.lock();
-        let record = store.instance_by_resource_id(&self.region, &self.resource_id)?;
-        Some(engine_runtime_of(&store, record))
+        match &self.target {
+            SessionTarget::DbInstance {
+                region,
+                resource_id,
+            } => {
+                let record = store.instance_by_resource_id(region, resource_id)?;
+                Some(engine_runtime_of(&store, record))
+            }
+            SessionTarget::DbCluster {
+                region,
+                resource_id,
+            } => {
+                let record = store.cluster_by_resource_id(region, resource_id)?;
+                Some(super::cluster_endpoint::cluster_runtime_of(&store, record))
+            }
+        }
+    }
+}
+
+/// What ONE record says about the endpoint a session is being opened on: the facts that
+/// differ between a DB instance's record and a DB cluster's, read by whichever of the two
+/// the listener serves.
+///
+/// Everything the two have in COMMON is derived from this by [`facts_of`], so the two kinds
+/// of endpoint cannot drift apart on the engine version they report, the databases they
+/// have, or the database a login that names none lands in.
+pub(super) struct RecordFacts {
+    pub kind: EndpointKind,
+    pub identifier: String,
+    pub engine: String,
+    pub status: String,
+    pub wire: EngineWire,
+    /// The resource's own `EngineVersion`, where it reports one.
+    pub engine_version: Option<String>,
+    /// The database the resource was created with: `DBName` for a DB instance,
+    /// `DatabaseName` for a DB cluster.
+    pub database_name: Option<String>,
+    pub master_username: Option<String>,
+    pub password: Option<MasterPasswordHash>,
+    pub requires_secure_transport: bool,
+    /// The host the resource's own listener is bound to, for a resource the store holds one
+    /// for.
+    pub served_host: Option<String>,
+    pub runtime: EngineRuntime,
+}
+
+/// The facts a login is admitted against, derived from what one record says ([`RecordFacts`])
+/// plus what both kinds of record derive the same way:
+///
+/// * the version the engine reports for itself, which falls back to the version the
+///   engine-version catalogue publishes for the engine where the record carries none;
+/// * the databases the resource COMES WITH — the one it was created with, plus the ones the
+///   engine itself always has — created in its engine once, here, because this is where the
+///   record that names them is read. After that the engine is what says which databases the
+///   resource has, so one a client created with `CREATE DATABASE` is there for this session
+///   too and one it dropped stays gone;
+/// * the database a login that names none gets.
+pub(super) fn facts_of(record: RecordFacts, database: &Arc<InstanceDatabase>) -> InstanceFacts {
+    let server_version = record
+        .engine_version
+        .clone()
+        .or_else(|| {
+            crate::ops::describe_db_engine_versions::resolve_version(&record.engine, None)
+                .ok()
+                .flatten()
+                .map(|entry| entry.engine_version.to_string())
+        })
+        .unwrap_or_default();
+    let mut comes_with = Vec::new();
+    if let Some(name) = &record.database_name {
+        comes_with.push(name.clone());
+    }
+    match record.wire {
+        EngineWire::Postgres => {
+            if !comes_with.iter().any(|name| name == POSTGRES_DEFAULT_DATABASE) {
+                comes_with.push(POSTGRES_DEFAULT_DATABASE.to_string());
+            }
+        }
+        EngineWire::MySql => {
+            comes_with.extend(MYSQL_SYSTEM_DATABASES.iter().map(|name| (*name).to_string()));
+        }
+    }
+    database.seed(&comes_with);
+    let default_database = match record.wire {
+        EngineWire::Postgres => record
+            .database_name
+            .clone()
+            .unwrap_or_else(|| POSTGRES_DEFAULT_DATABASE.to_string()),
+        EngineWire::MySql => record.database_name.clone().unwrap_or_default(),
+    };
+    InstanceFacts {
+        kind: record.kind,
+        identifier: record.identifier,
+        engine: record.engine,
+        status: record.status,
+        wire: record.wire,
+        server_version,
+        master_username: record.master_username,
+        password: record.password,
+        databases: database.database_names(),
+        default_database,
+        requires_secure_transport: record.requires_secure_transport,
+        // A resource with no listener of its own is reached through a name this machine does
+        // not resolve, so the host a refusal names is this machine.
+        endpoint_host: record
+            .served_host
+            .unwrap_or_else(|| "localhost".to_string()),
+        runtime: record.runtime,
+    }
+}
+
+/// The parameter-group FAMILY whose engine defaults a resource runs with.
+///
+/// For a group this store holds that is the family it was created with; for one of the
+/// DEFAULT groups AWS provides — which no request creates, so this store has no record of
+/// them — it is the family the group is NAMED after (`default.postgres16`,
+/// `default.aurora-postgresql15`), which is where the create got the name from.
+pub(super) fn parameter_group_family(
+    held: Option<&str>,
+    group_name: Option<&str>,
+) -> String {
+    match held {
+        Some(family) => family.to_string(),
+        None => group_name
+            .and_then(|name| name.strip_prefix(crate::state::DEFAULT_PARAMETER_GROUP_PREFIX))
+            .unwrap_or_default()
+            .to_string(),
+    }
+}
+
+/// What a resource's engine is running with: the parameters in force (the defaults `family`
+/// publishes in `catalog`, with the values the resource's own group sets over them), when
+/// the engine came up, and the master user that owns its databases.
+///
+/// The endpoint this serves is a DB instance's own endpoint or a DB cluster's WRITER
+/// endpoint, and neither is replaying from a primary: `pg_is_in_recovery()` is true on a
+/// standby, an instance is one only where it was created as a read replica (still a scaffold
+/// in this crate, its own stub issue) and a cluster's writer never is.
+pub(super) fn running_engine(
+    family: &str,
+    catalog: Option<&'static [crate::state::ClusterParameterSpec]>,
+    group: Option<&BTreeMap<String, crate::state::ParameterSetting>>,
+    engine_started_at: f64,
+    master_username: Option<String>,
+) -> EngineRuntime {
+    EngineRuntime {
+        parameters: super::pg_server::running_parameters(
+            family,
+            catalog,
+            group,
+            engine_started_at,
+        ),
+        postmaster_start_time: engine_started_at,
+        in_recovery: false,
+        master_username,
     }
 }
 
 /// The engine runtime of `record`, read under the state lock the caller holds.
-fn engine_runtime_of(
+pub(super) fn engine_runtime_of(
     store: &ComAmazonawsRdsAmazonrdsv19State,
     record: &crate::state::DbInstanceRecord,
 ) -> EngineRuntime {
@@ -250,36 +418,17 @@ fn engine_runtime_of(
             .db_parameter_groups
             .get(&(record.region.clone(), name.to_ascii_lowercase()))
     });
-    // The engine defaults come from the parameter group's FAMILY. For a group this store
-    // holds that is the family it was created with; for one of the default groups AWS
-    // provides — which no request creates, so this store has no record of them — it is the
-    // family the group is NAMED after (`default.postgres16`), which is where
-    // `CreateDBInstance` got the name from.
-    let family = match group {
-        Some(group) => group.family.clone(),
-        None => record
-            .db_parameter_group_name
-            .as_deref()
-            .and_then(|name| name.strip_prefix(crate::state::DEFAULT_PARAMETER_GROUP_PREFIX))
-            .unwrap_or_default()
-            .to_string(),
-    };
-    EngineRuntime {
-        parameters: super::pg_server::running_parameters(
-            &family,
-            crate::state::published_db_parameters(&family),
-            group.map(|group| &group.parameters),
-            record.engine_started_at.as_secs_f64(),
-        ),
-        postmaster_start_time: record.engine_started_at.as_secs_f64(),
-        // `pg_is_in_recovery()` is true on a standby replaying from a primary. An instance
-        // is a standby only where it was created as a read replica, and
-        // `CreateDBInstanceReadReplica` is still a scaffold in this crate (its own stub
-        // issue), so no instance this store holds has a replication source to replay
-        // from: every one of them is a writer, which is what this reports.
-        in_recovery: false,
-        master_username: record.master_username.clone(),
-    }
+    let family = parameter_group_family(
+        group.map(|group| group.family.as_str()),
+        record.db_parameter_group_name.as_deref(),
+    );
+    running_engine(
+        &family,
+        crate::state::published_db_parameters(&family),
+        group.map(|group| &group.parameters),
+        record.engine_started_at.as_secs_f64(),
+        record.master_username.clone(),
+    )
 }
 
 /// What the engine of one DB instance is running with, as of now.
@@ -315,9 +464,12 @@ impl EngineRuntime {
     }
 }
 
-/// The instance a session is being opened on, as the store holds it right now.
+/// The resource a session is being opened on, as the store holds it right now.
 #[derive(Debug, Clone)]
 pub struct InstanceFacts {
+    /// Whether these are a DB instance's facts or a DB cluster's — which resource a
+    /// record of what the session did is attributable to.
+    pub kind: EndpointKind,
     pub identifier: String,
     pub engine: String,
     pub status: String,
@@ -337,6 +489,18 @@ pub struct InstanceFacts {
     /// What the instance's engine is running with: its parameters, its start time, its
     /// role.
     pub runtime: EngineRuntime,
+}
+
+impl InstanceFacts {
+    /// Whether the resource is RUNNING, so there is an engine to connect to: the status
+    /// its own kind of record reports when it is up.
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        match self.kind {
+            EndpointKind::DbInstance => self.status == crate::state::DB_INSTANCE_STATUS_AVAILABLE,
+            EndpointKind::DbCluster => self.status == crate::state::DB_CLUSTER_STATUS_AVAILABLE,
+        }
+    }
 }
 
 /// Why a login was refused. Each wire words it in its own protocol's terms.
@@ -369,18 +533,27 @@ impl LoginRefusal {
 
 /// Record a login an engine endpoint refused.
 ///
-/// Every attempt on a published endpoint is attributable: the DB instance it was made on
+/// Every attempt on a published endpoint is attributable: the resource it was made on
 /// and why it was refused. The credential the client presented is NEVER logged, and
 /// neither is the user or the database it named — those are the client's own values, and
-/// the instance plus the reason is what a reader needs.
+/// the resource plus the reason is what a reader needs.
 pub fn record_refused_login(facts: &InstanceFacts, refusal: &LoginRefusal) {
-    ::tracing::info!(
-        audit = true,
-        operation = "DbInstanceEngineSession",
-        outcome = refusal.outcome(),
-        db_instance_identifier = %facts.identifier,
-        "an engine session on a DB instance endpoint was refused"
-    );
+    match facts.kind {
+        EndpointKind::DbInstance => ::tracing::info!(
+            audit = true,
+            operation = "DbInstanceEngineSession",
+            outcome = refusal.outcome(),
+            db_instance_identifier = %facts.identifier,
+            "an engine session on a DB instance endpoint was refused"
+        ),
+        EndpointKind::DbCluster => ::tracing::info!(
+            audit = true,
+            operation = "DbClusterEngineSession",
+            outcome = refusal.outcome(),
+            db_cluster_identifier = %facts.identifier,
+            "an engine session on a DB cluster endpoint was refused"
+        ),
+    }
 }
 
 /// How a client proved its password on its own wire.
@@ -413,7 +586,7 @@ impl PasswordProof<'_> {
 /// a client its connection is not admitted at all before it asks for a password — and
 /// [`admit`] checks these again, so a wire that only calls `admit` is still correct.
 pub fn precheck(facts: &InstanceFacts, encrypted: bool) -> Result<(), LoginRefusal> {
-    if facts.status != crate::state::DB_INSTANCE_STATUS_AVAILABLE {
+    if !facts.is_available() {
         return Err(LoginRefusal::NotRunning {
             status: facts.status.clone(),
         });
@@ -435,7 +608,7 @@ pub fn admit(
     encrypted: bool,
     proof: &PasswordProof<'_>,
 ) -> Result<String, LoginRefusal> {
-    if facts.status != crate::state::DB_INSTANCE_STATUS_AVAILABLE {
+    if !facts.is_available() {
         return Err(LoginRefusal::NotRunning {
             status: facts.status.clone(),
         });

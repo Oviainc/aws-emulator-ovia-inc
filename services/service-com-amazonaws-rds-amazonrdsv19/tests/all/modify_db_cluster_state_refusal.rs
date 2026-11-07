@@ -49,8 +49,12 @@ const MULTI_AZ_SETTINGS: &[(&str, &str)] = &[
 /// The `BackupRetentionPeriod` the loser of the overlapping pair names, and the `Port` the
 /// WINNER names: the winner's change is one the cluster's instances must be restarted for,
 /// which is what leaves the cluster `modifying` for the loser to meet, and the two members
-/// differ so the row can check the refused call changed nothing.
+/// differ so the row can check the refused call changed nothing. The winner names a
+/// maintenance window beside the port, because a cluster whose engine this emulator serves
+/// publishes the port its own engine listener answers on rather than the configured one, so
+/// the port it set is not what the cluster reports back.
 const WINNING_PORT: &str = "3307";
+const WINNING_MAINTENANCE_WINDOW: &str = "sun:06:00-sun:06:30";
 const LOSING_RETENTION: &str = "9";
 
 /// How the test puts a cluster into a status the modification cannot be performed in.
@@ -315,7 +319,10 @@ async fn a_modification_of_a_cluster_in_a_blocking_state_is_refused_with_one_fix
                     modify_cluster(
                         &router,
                         &row.identifier,
-                        &owned(&[("Port", WINNING_PORT)]),
+                        &owned(&[
+                            ("Port", WINNING_PORT),
+                            ("PreferredMaintenanceWindow", WINNING_MAINTENANCE_WINDOW),
+                        ]),
                     )
                     .await,
                 );
@@ -429,11 +436,11 @@ async fn a_modification_of_a_cluster_in_a_blocking_state_is_refused_with_one_fix
         "case {:?}: the refused modification must have written nothing, got {retention:?}",
         overlapping.case
     );
-    let port = text(&settled, "Port");
+    let window = text(&settled, "PreferredMaintenanceWindow");
     assert_eq!(
-        port, WINNING_PORT,
-        "case {:?}: expected the accepted modification's value {WINNING_PORT:?} to be the \
-         one the cluster kept, got {port:?}",
+        window, WINNING_MAINTENANCE_WINDOW,
+        "case {:?}: expected the accepted modification's value \
+         {WINNING_MAINTENANCE_WINDOW:?} to be the one the cluster kept, got {window:?}",
         overlapping.case
     );
     let accepted = expect_ok(

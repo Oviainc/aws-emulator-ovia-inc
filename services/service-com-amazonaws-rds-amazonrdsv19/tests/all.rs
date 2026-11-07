@@ -37,6 +37,8 @@ mod custom_engine_version_engine_availability;
 mod db_cluster_create_record;
 #[path = "all/db_cluster_deletion.rs"]
 mod db_cluster_deletion;
+#[path = "all/db_cluster_engine_endpoint.rs"]
+mod db_cluster_engine_endpoint;
 #[path = "all/db_cluster_snapshots.rs"]
 mod db_cluster_snapshots;
 #[path = "all/db_cluster_subject_operations.rs"]

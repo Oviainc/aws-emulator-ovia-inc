@@ -95,6 +95,10 @@ pub struct Call<'a> {
     /// The `database` member, for a call that selects one. A call inside a transaction
     /// passes `None`: the transaction already names the database it was opened for.
     pub database: Option<&'a str>,
+    /// The `transactionId` the call carries, for the operations that take one — which the
+    /// chain reads against the `resourceArn`, because a transaction belongs to the
+    /// resource whose `BeginTransaction` opened it.
+    pub transaction_id: Option<&'a str>,
 }
 
 /// The refusal the message for a cluster that has no Data API endpoint: "HttpEndpoint is
@@ -135,6 +139,16 @@ fn postgresql_catalog_error(database: &str) -> String {
     )
 }
 
+/// What the service tells a caller whose `transactionId` belongs to ANOTHER resource than
+/// the one the call named — an id some other cluster's `BeginTransaction` issued.
+///
+/// Entirely fixed text, and a VALIDATION fault rather than a lookup miss: the id is not
+/// this resource's to resolve, so nothing is looked up and nothing is changed. The
+/// transaction it names may well still be running on the resource that issued it, which is
+/// what makes this a different answer from the one an id of this resource's own that
+/// resolves to nothing gets (`super::TRANSACTION_NOT_RUNNING_MESSAGE`).
+const INVALID_TRANSACTION_ID_MESSAGE: &str = "Invalid transaction ID";
+
 /// Admit one call, or report the first leg of the chain that refuses it.
 pub async fn admit<Eng: Send + Sync + 'static>(
     engine: &Eng,
@@ -161,6 +175,32 @@ pub async fn admit<Eng: Send + Sync + 'static>(
     }
     if let (Some(cluster), Some(database)) = (&cluster, call.database) {
         cluster.require_database(database, &held)?;
+    }
+    require_the_resources_own_transaction(call)?;
+    Ok(())
+}
+
+/// Refuse a `transactionId` that is one of THIS SERVICE's ids but belongs to another
+/// resource.
+///
+/// A transaction belongs to the DB cluster whose `BeginTransaction` opened it, and the id
+/// this service mints CARRIES that cluster ([`super::mint_transaction_id`]). An id of that
+/// form naming another cluster therefore cannot be resolved here at all — the transaction
+/// it names may well still be running on the cluster that issued it — so the call is an
+/// invalid argument and nothing of it is carried out. A value that is NOT one of this
+/// service's ids ([`super::is_minted_transaction_id`]) names no transaction anywhere, which
+/// is the transaction store's own answer (`super::TRANSACTION_NOT_RUNNING_MESSAGE`) and not
+/// this one.
+fn require_the_resources_own_transaction(call: &Call<'_>) -> Result<(), Refusal> {
+    let Some(transaction_id) = call.transaction_id else {
+        return Ok(());
+    };
+    if super::is_minted_transaction_id(transaction_id)
+        && !super::transaction_id_names_resource(transaction_id, call.resource_arn)
+    {
+        return Err(Refusal::Validation(
+            INVALID_TRANSACTION_ID_MESSAGE.to_string(),
+        ));
     }
     Ok(())
 }
@@ -608,6 +648,7 @@ mod tests {
             secret_arn: "arn:aws:secretsmanager:us-east-1:000000000000:secret:demo-AbCdEf",
             sql: Some("SELECT 1"),
             database: None,
+            transaction_id: None,
         }
     }
 

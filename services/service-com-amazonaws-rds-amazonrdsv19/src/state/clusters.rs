@@ -37,6 +37,12 @@ pub struct DbClusterRecord {
     pub resource_id: String,
     /// The server-assigned middle label of the cluster endpoint DNS names, minted once.
     pub endpoint_host: String,
+    /// The address the cluster's own engine listener accepts connections on, for a cluster
+    /// whose engine speaks a wire this emulator serves
+    /// ([`data_plane::cluster_endpoint::cluster_engine_wire`]); `None` for one that has no
+    /// listener, which keeps the DNS-form endpoint. What [`Self::endpoint`] and
+    /// [`Self::published_port`] report.
+    pub served_endpoint: Option<ServedEndpoint>,
     /// `Status`.
     pub status: String,
     /// The transition the clock owes this cluster, if any.
@@ -58,6 +64,11 @@ pub struct DbClusterRecord {
     /// on; `None` for one whose password the caller supplied, which has no managed secret
     /// to report.
     pub master_user_secret: Option<ManagedMasterSecret>,
+    /// The master user's password, kept only as the DIGESTS a login on the cluster's own
+    /// engine endpoint can be verified against — the password the request carried, or the
+    /// one RDS generated into the managed secret. The password itself is `@sensitive` and
+    /// is never stored or reported; see [`data_plane::wire_session::MasterPasswordHash`].
+    pub master_user_password: Option<data_plane::wire_session::MasterPasswordHash>,
     /// `Port`: the port the instances in the cluster accept connections on.
     pub port: i32,
     /// `AvailabilityZones`: where instances in the cluster can be created.
@@ -202,7 +213,14 @@ impl DbClusterRecord {
     /// `<identifier>.cluster-<server-assigned label>.<region>.<domain>` (Amazon Aurora User
     /// Guide, "Amazon Aurora connection management"), with the domain of the control plane
     /// that owns the cluster's engine — see [`endpoint_domain`].
+    ///
+    /// A cluster whose engine this emulator SERVES publishes the host its own listener is
+    /// bound to instead: that is the address a client connects to, and a name this machine
+    /// does not resolve would be no endpoint at all.
     pub fn endpoint(&self) -> String {
+        if let Some(served) = &self.served_endpoint {
+            return served.host.clone();
+        }
         format!(
             "{}.cluster-{}.{}.{}",
             self.identifier,
@@ -210,6 +228,18 @@ impl DbClusterRecord {
             self.region,
             endpoint_domain(&self.engine)
         )
+    }
+
+    /// The port a client connects to: the port the cluster's engine listener was assigned
+    /// where it has one, else the configured port.
+    ///
+    /// The core owns the port range the listener is bound in, so the configured port (what
+    /// `Port` set, which the record keeps) is what the cluster records and this is what it
+    /// publishes; for a cluster with no listener the two are the same value.
+    pub fn published_port(&self) -> i32 {
+        self.served_endpoint
+            .as_ref()
+            .map_or(self.port, |served| served.port)
     }
 
     /// The reader endpoint, which "load-balances connections across the Aurora Replicas
@@ -422,7 +452,7 @@ impl DbClusterRecord {
                 .master_user_secret
                 .as_ref()
                 .map(ManagedMasterSecret::to_wire),
-            port: Some(self.port),
+            port: Some(self.published_port()),
             endpoint: Some(self.endpoint()),
             reader_endpoint: Some(self.reader_endpoint()),
             // Only `CreateDBClusterEndpoint` adds a custom endpoint, and it is still a

@@ -178,7 +178,7 @@ async fn serve_session(
     };
 
     // 2. The instance this listener belongs to, as the store holds it now.
-    let Some(facts) = context.instance_facts() else {
+    let Some(facts) = context.endpoint_facts() else {
         return fatal(
             &mut conn,
             "57P03",

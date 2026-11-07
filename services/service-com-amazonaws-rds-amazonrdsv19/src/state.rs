@@ -260,7 +260,8 @@ pub use instances::*;
 pub use managed_master_secret::*;
 pub use master_user_credentials::*;
 pub use data_plane::{
-    capture_instance_storage, engine_wire, open_engine_endpoint, DbEngineEndpoint, EngineWire,
+    capture_instance_storage, cluster_endpoint::cluster_engine_wire, engine_wire,
+    open_engine_endpoint, wire_session::SessionTarget, DbEngineEndpoint, EngineWire,
     ServedEndpoint,
 };
 pub use ec2_subnets::{subnet_zones, SubnetZones};
@@ -444,6 +445,17 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// every engine whose wire this emulator speaks, and
     /// [`Self::settle_due_transitions`] drops it with the instance.
     pub db_engine_endpoints: BTreeMap<RegionalKey, DbEngineEndpoint>,
+    /// The live engine endpoint of each DB CLUSTER that has one, by the same
+    /// `(region, DBClusterIdentifier)` key as [`Self::db_clusters`].
+    ///
+    /// The cluster's counterpart of [`Self::db_engine_endpoints`], and the same contract:
+    /// this is where the LISTENER lives, so an entry removed from here closes the port and
+    /// severs its sessions. Bounded by the same per-region cluster quota, because an entry
+    /// exists only for a cluster this store holds — `CreateDBCluster` inserts one for every
+    /// cluster whose engine speaks a wire this emulator serves
+    /// ([`data_plane::cluster_endpoint`]), and [`Self::settle_due_transitions`] drops it
+    /// with the cluster.
+    pub db_cluster_engine_endpoints: BTreeMap<RegionalKey, DbEngineEndpoint>,
 }
 
 impl ComAmazonawsRdsAmazonrdsv19State {
@@ -540,6 +552,9 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         }
         for key in gone.drain(..) {
             self.db_clusters.remove(&key);
+            // The cluster is gone from the service, so its engine endpoint goes with it:
+            // dropping the record closes the port and severs every session on it.
+            self.db_cluster_engine_endpoints.remove(&key);
         }
         for (key, shard_group) in self
             .db_shard_groups
@@ -1338,7 +1353,9 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                 arn: cluster.arn(),
                 endpoint: cluster.endpoint(),
                 resource_id: cluster.resource_id.clone(),
-                port: cluster.port,
+                // The address and port a client reaches the cluster on, as for an
+                // instance below.
+                port: cluster.published_port(),
             });
         }
         let instance = self

@@ -80,6 +80,23 @@ impl DataApi {
             .to_string()
     }
 
+    /// Open a transaction on ANOTHER cluster of this same emulator, and return its id: the
+    /// id is bound to the resource that opened it, which is what a call naming a different
+    /// `resourceArn` is refused against.
+    pub(crate) async fn begin_transaction_on(&self, resource_arn: &str) -> String {
+        let (status, body) = self
+            .post(
+                "/BeginTransaction",
+                json!({"resourceArn": resource_arn, "secretArn": SECRET_ARN}),
+            )
+            .await;
+        assert_eq!(status, 200, "BeginTransaction failed with {body}");
+        body["transactionId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("BeginTransaction returned no transactionId: {body}"))
+            .to_string()
+    }
+
     pub(crate) async fn commit(&self, transaction_id: &str) -> (u16, Value) {
         self.post(
             "/CommitTransaction",
@@ -824,22 +841,29 @@ async fn the_json_record_format_returns_the_result_set_as_json() {
     );
 }
 
-/// RULE: a `transactionId` no open transaction answers to is HTTP 404
-/// `TransactionNotFoundException`, on every operation that takes one; a statement
-/// the ENGINE refuses is HTTP 400 `DatabaseErrorException` while a fault of the
-/// CALL — a parameter that cannot be bound, a member that names nothing — is HTTP
-/// 400 `ValidationException`; and an operation nobody has implemented still answers
-/// HTTP 501 rather than a hollow 200.
+/// RULE: a `transactionId` is refused by the CLASS of the id it is, on every operation
+/// that takes one — an id the resource the request names could have issued, which no
+/// transaction of that resource is RUNNING under, is HTTP 404
+/// `TransactionNotFoundException`, while an id that could NOT have been issued for that
+/// resource is an invalid argument, HTTP 400 `ValidationException` "Invalid transaction
+/// ID". A statement the ENGINE refuses is HTTP 400 `DatabaseErrorException` while a fault
+/// of the CALL — a parameter that cannot be bound, a member that names nothing — is HTTP
+/// 400 `ValidationException`; and an operation nobody has implemented still answers HTTP
+/// 501 rather than a hollow 200.
 #[tokio::test]
 async fn the_modelled_failures_are_what_a_client_sees() {
     let api = DataApi::new();
     api.run(json!({"sql": "CREATE TABLE things (id INT)"})).await;
 
-    let unknown = "not-an-open-transaction";
+    // An id this resource DID issue and that no longer resolves: the transaction was
+    // committed, so the id is one of this cluster's and answers to nothing.
+    let ended = api.begin_transaction(None).await;
+    let (status, body) = api.commit(&ended).await;
+    assert_eq!(status, 200, "the transaction commits: {body}");
     let calls = vec![
         (
             "ExecuteStatement",
-            api.execute(json!({"sql": "SELECT id FROM things", "transactionId": unknown}))
+            api.execute(json!({"sql": "SELECT id FROM things", "transactionId": ended}))
                 .await,
         ),
         (
@@ -847,12 +871,12 @@ async fn the_modelled_failures_are_what_a_client_sees() {
             api.batch(json!({
                 "sql": "INSERT INTO things (id) VALUES (:id)",
                 "parameterSets": [[parameter("id", json!({"longValue": 1}))]],
-                "transactionId": unknown,
+                "transactionId": ended,
             }))
             .await,
         ),
-        ("CommitTransaction", api.commit(unknown).await),
-        ("RollbackTransaction", api.rollback(unknown).await),
+        ("CommitTransaction", api.commit(&ended).await),
+        ("RollbackTransaction", api.rollback(&ended).await),
     ];
     for (operation, (status, body)) in calls {
         assert_eq!(status, 404, "case {operation}: got {body}");
@@ -862,6 +886,86 @@ async fn the_modelled_failures_are_what_a_client_sees() {
             "case {operation}: got {body}"
         );
     }
+
+    // The ids that belong to ANOTHER resource: ids of this service's own form whose
+    // resource binding is not this cluster's. The rows span that class: an id a second
+    // cluster of this emulator really issued, one a third cluster in another Region
+    // issued, and one of the same form whose binding belongs to no cluster at all. (A
+    // value that is not one of this service's ids names no transaction anywhere, and is
+    // the transaction store's own 404 — `refusal_classes` pins that sentence.)
+    const ANOTHER_CLUSTER_ARN: &str = "arn:aws:rds:us-east-1:000000000000:cluster:other";
+    const FAR_CLUSTER_ARN: &str = "arn:aws:rds:us-west-2:000000000000:cluster:far";
+    let another_clusters = api.begin_transaction_on(ANOTHER_CLUSTER_ARN).await;
+    let far_clusters = api.begin_transaction_on(FAR_CLUSTER_ARN).await;
+    // The same form, 48 hexadecimal digits, with a binding that is nobody's.
+    let bound_to_nothing = "0".repeat(48);
+    for (case, id) in [
+        ("another cluster's transaction id", another_clusters.as_str()),
+        (
+            "a transaction id of a cluster in another Region",
+            far_clusters.as_str(),
+        ),
+        (
+            "an id of the same form bound to no cluster",
+            bound_to_nothing.as_str(),
+        ),
+    ] {
+        let refusals = vec![
+            (
+                "ExecuteStatement",
+                api.execute(json!({"sql": "SELECT id FROM things", "transactionId": id}))
+                    .await,
+            ),
+            (
+                "BatchExecuteStatement",
+                api.batch(json!({
+                    "sql": "INSERT INTO things (id) VALUES (:id)",
+                    "parameterSets": [[parameter("id", json!({"longValue": 1}))]],
+                    "transactionId": id,
+                }))
+                .await,
+            ),
+            ("CommitTransaction", api.commit(id).await),
+            ("RollbackTransaction", api.rollback(id).await),
+        ];
+        for (operation, (status, body)) in refusals {
+            assert_eq!(status, 400, "case {case} on {operation}: got {body}");
+            assert_eq!(
+                error_code(&body),
+                "ValidationException",
+                "case {case} on {operation}: got {body}"
+            );
+            assert_eq!(
+                body["message"].as_str(),
+                Some("Invalid transaction ID"),
+                "case {case} on {operation}: got {body}"
+            );
+        }
+    }
+    // Nothing a refused call carried reached this cluster's data, and the transaction the
+    // other cluster opened is still usable there.
+    let rows = api
+        .run(json!({"sql": "SELECT count(*) AS rows FROM things"}))
+        .await;
+    assert_eq!(
+        rows["records"][0][0]["longValue"].as_i64(),
+        Some(0),
+        "a refused call must have written nothing, got {rows}"
+    );
+    let (status, body) = api
+        .post(
+            "/CommitTransaction",
+            json!({
+                "resourceArn": ANOTHER_CLUSTER_ARN,
+                "secretArn": SECRET_ARN,
+                "transactionId": another_clusters,
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "the other cluster's transaction must still be alive there: {body}"
+    );
 
     let refusals = vec![
         (

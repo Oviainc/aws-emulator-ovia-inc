@@ -198,6 +198,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 secret_arn: &input.secret_arn,
                 sql: None,
                 database: input.database.as_deref(),
+                // The call that MINTS an id carries none of its own.
+                transaction_id: None,
             },
         )
         .await

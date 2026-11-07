@@ -168,13 +168,18 @@ const MODIFY_CASES: &[ModifyCase] = &[
     ModifyCase {
         case: "Port at its published minimum",
         params: &[("Port", "1150")],
-        expected: &[("Port", "1150")],
+        // `Port` is not read back: a cluster whose engine this emulator serves publishes
+        // the port its own engine listener answers on, which the core assigns, so the
+        // member reports the reachable port rather than echoing the configured one. What
+        // this row still observes is that the change is accepted and takes the cluster out
+        // of service while it is applied.
+        expected: &[],
         out_of_service: true,
     },
     ModifyCase {
         case: "Port at its published maximum",
         params: &[("Port", "65535")],
-        expected: &[("Port", "65535")],
+        expected: &[],
         out_of_service: true,
     },
     ModifyCase {
@@ -258,6 +263,13 @@ const REFUSED_MODIFY_VALUES: &[(&str, &str, &str)] = &[
 async fn modify_db_cluster_writes_every_named_setting_onto_the_stored_cluster() {
     let router = emulator();
     create_available_cluster(&router, "emu-modify-cluster", &[]).await;
+    // The address the cluster publishes before any modification: its own engine listener's,
+    // which a `Port` modification does not move (the core owns the port the listener was
+    // assigned, and the configured port the request names is not what is published).
+    let published = {
+        let reported = describe_cluster(&router, "emu-modify-cluster").await;
+        (text(&reported, "Endpoint"), text(&reported, "Port"))
+    };
 
     for ModifyCase {
         case,
@@ -300,6 +312,14 @@ async fn modify_db_cluster_writes_every_named_setting_onto_the_stored_cluster() 
                  {reported}"
             );
         }
+        // Whatever the modification was, the cluster still publishes the address a client
+        // dials it at: the engine listener it was created with is the one it keeps.
+        assert_eq!(
+            (text(&reported, "Endpoint"), text(&reported, "Port")),
+            published,
+            "case {case:?}: a modification must leave the cluster on the endpoint it \
+             published, got {reported}"
+        );
     }
 
     // Every value outside a published range is refused, and the refusal leaves the
@@ -399,7 +419,9 @@ async fn two_modifications_of_one_cluster_serialise() {
     // accept connections on is one the engine has to be restarted to serve — so it leaves
     // the cluster `modifying`; a second one arriving before the clock has settled it sees a
     // state the operation cannot be performed in. One accepted, one refused — whichever
-    // order the two arrive in.
+    // order the two arrive in. Each modification carries a second, READ-BACK setting
+    // beside the port, because a cluster whose engine this emulator serves publishes the
+    // port its own listener answers on rather than the configured one.
     let first = expect_ok(
         "the accepted modification",
         call(
@@ -408,6 +430,7 @@ async fn two_modifications_of_one_cluster_serialise() {
             &[
                 ("DBClusterIdentifier", "emu-race-cluster"),
                 ("Port", "3307"),
+                ("PreferredBackupWindow", "04:00-04:30"),
             ],
         )
         .await,
@@ -426,6 +449,7 @@ async fn two_modifications_of_one_cluster_serialise() {
                 &[
                     ("DBClusterIdentifier", "emu-race-cluster"),
                     ("Port", "3308"),
+                    ("PreferredBackupWindow", "05:00-05:30"),
                 ],
             )
             .await,
@@ -437,8 +461,8 @@ async fn two_modifications_of_one_cluster_serialise() {
     wait_for_settle();
     let reported = describe_cluster(&router, "emu-race-cluster").await;
     assert_eq!(
-        text(&reported, "Port"),
-        "3307",
+        text(&reported, "PreferredBackupWindow"),
+        "04:00-04:30",
         "the accepted modification is the one the cluster keeps: {reported}"
     );
     // Once the cluster is back to `available` a further modification is taken again.
@@ -1678,10 +1702,10 @@ async fn proxy_targets_are_registered_reported_and_deregistered() {
         "a target whose database this service holds is available: {targets}"
     );
     // Each target reports the endpoint of the database behind it, which is the endpoint
-    // that database itself publishes: the DB instance target reports exactly the
-    // `Endpoint.Address` the instance's own describe reports (its engine listener's host,
-    // since this emulator serves MySQL — see `state::data_plane`), and the tracked
-    // cluster, which no listener serves, reports the DNS-form endpoint of a cluster.
+    // that database itself publishes: a DB instance target reports exactly the
+    // `Endpoint.Address` the instance's own describe reports, and a tracked cluster target
+    // exactly the `Endpoint` the cluster's own describe reports — for both of them the
+    // host of the engine listener this emulator serves them on (see `state::data_plane`).
     let instance = expect_ok(
         "the registered instance",
         call(
@@ -1698,11 +1722,14 @@ async fn proxy_targets_are_registered_reported_and_deregistered() {
         "the DB instance target must report the endpoint that instance publishes \
          ({published:?}): {targets}"
     );
+    let cluster_endpoint = text(
+        &describe_cluster(&router, "emu-proxy-cluster").await,
+        "Endpoint",
+    );
     assert!(
-        endpoints
-            .iter()
-            .any(|endpoint| endpoint.ends_with(&format!("{REGION}.rds.amazonaws.com"))),
-        "the tracked cluster target must report the cluster's own endpoint: {targets}"
+        endpoints.contains(&cluster_endpoint),
+        "the tracked cluster target must report the endpoint that cluster publishes \
+         ({cluster_endpoint:?}): {targets}"
     );
     assert_eq!(
         endpoints.len(),

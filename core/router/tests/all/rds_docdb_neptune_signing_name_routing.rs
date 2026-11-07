@@ -83,6 +83,10 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
             router.set_request_authentication(false);
 
             let runtime = tokio::runtime::Builder::new_current_thread()
+                // IO and timers are on because the calls below reach a service that opens
+                // a core listener: `CreateDBCluster` publishes the address of the engine
+                // endpoint it serves the cluster's own wire on.
+                .enable_all()
                 .build()
                 .expect("a current-thread runtime");
 

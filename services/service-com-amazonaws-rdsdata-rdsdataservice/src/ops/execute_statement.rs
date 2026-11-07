@@ -264,6 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(_) => None,
                     None => input.database.as_deref(),
                 },
+                transaction_id: input.transaction_id.as_deref(),
             },
         )
         .await

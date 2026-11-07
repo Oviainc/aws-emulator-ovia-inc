@@ -51,6 +51,8 @@ time = { version = "0.3.55", default-features = false, features = ["parsing", "m
 # `iam_authorization` / `iam_role`: the tree's ONE evaluation of IAM policy documents
 # against (action, resource), and the readings of a principal ARN, used by the
 # authorization leg of the request precondition chain (`src/state/authorization.rs`).
+# `stable_hex_id`: the digest the opaque transaction id a BeginTransaction mints carries
+# its resource binding as, taken from the same shared module rather than written again here.
 service-common = { path = "../common" }
 # The CLUSTER a request addresses is Amazon RDS's resource, so whether it exists, whether
 # its Data API HTTP endpoint is turned on and which user it was created with are ASKED of

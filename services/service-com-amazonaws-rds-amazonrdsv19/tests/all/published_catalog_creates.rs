@@ -39,9 +39,6 @@ const ACCOUNT: &str = "000000000000";
 /// `aurora-mysql` as one of its two valid values.
 const GLOBAL_ENGINE: &str = "aurora-mysql";
 
-/// The port an Aurora MySQL cluster listens on, whatever version it runs.
-const AURORA_MYSQL_PORT: &str = "3306";
-
 /// The status a freshly created DB cluster reports.
 const CREATING: &str = "creating";
 
@@ -141,7 +138,6 @@ async fn a_cluster_joins_a_global_database_at_every_published_engine_version() {
             ("GlobalClusterIdentifier", global.as_str()),
             ("DBSubnetGroup", subnet_group),
             ("Status", CREATING),
-            ("Port", AURORA_MYSQL_PORT),
             // The default cluster parameter group is named after the FAMILY the resolved
             // version belongs to, so the two reports cannot disagree about the version.
             ("DBClusterParameterGroup", &format!("default.{family}")),

@@ -66,9 +66,6 @@ struct ClusterCase {
     /// The DB cluster parameter group the cluster reports: the default group of the
     /// resolved version's family, where the request names none.
     parameter_group: &'static str,
-    /// The port the cluster reports, which is the engine's documented default where the
-    /// request names none.
-    expected_port: &'static str,
     /// `BackupRetentionPeriod` as reported — "Default: 1".
     expected_backup_retention: &'static str,
     /// `StorageEncryptionType` as reported, which follows from `StorageEncrypted` and the
@@ -100,7 +97,6 @@ const CLUSTER_CASES: &[ClusterCase] = &[
         // request that names no version.
         engine_version: "8.0.mysql_aurora.3.10.3",
         parameter_group: "default.aurora-mysql8.0",
-        expected_port: "3306",
         expected_backup_retention: "1",
         expected_encryption_type: "sse-kms",
         expected_http_endpoint: true,
@@ -145,8 +141,6 @@ const CLUSTER_CASES: &[ClusterCase] = &[
         requested_version: Some("15.8"),
         engine_version: "15.8",
         parameter_group: "default.aurora-postgresql15",
-        // The published lower bound of `Port` ("Valid Values: 1150-65535").
-        expected_port: "1150",
         // The published lower bound of `BackupRetentionPeriod` ("a value from 1 to 35").
         expected_backup_retention: "1",
         expected_encryption_type: "sse-kms",
@@ -191,8 +185,6 @@ const CLUSTER_CASES: &[ClusterCase] = &[
         // A bare major version resolves to that major version's default.
         engine_version: "5.7.mysql_aurora.2.11.6",
         parameter_group: "default.aurora-mysql5.7",
-        // The published upper bound of `Port`.
-        expected_port: "65535",
         // The published upper bound of `BackupRetentionPeriod`.
         expected_backup_retention: "35",
         // Aurora storage is encrypted either way: without KMS encryption the key is the
@@ -238,7 +230,6 @@ const CLUSTER_CASES: &[ClusterCase] = &[
         requested_version: None,
         engine_version: "8.4.4",
         parameter_group: "default.mysql8.4",
-        expected_port: "3306",
         expected_backup_retention: "1",
         // A Multi-AZ DB cluster created without encryption is not encrypted at all.
         expected_encryption_type: "none",
@@ -355,7 +346,6 @@ fn assert_reported(case: &str, label: &str, xml: &str, row: &ClusterCase) {
         ("Engine", row.engine.to_string()),
         ("EngineVersion", row.engine_version.to_string()),
         ("DBClusterParameterGroup", row.parameter_group.to_string()),
-        ("Port", row.expected_port.to_string()),
         (
             "BackupRetentionPeriod",
             row.expected_backup_retention.to_string(),
@@ -383,13 +373,23 @@ fn assert_reported(case: &str, label: &str, xml: &str, row: &ClusterCase) {
             "case {case:?}: expected <{element}> {expected:?}, got {actual:?} in {xml}"
         );
     }
-    // The two cluster endpoints: the published Aurora forms, built from the identifier and
-    // a server-minted label rather than echoed from the request.
+    // The cluster's WRITER endpoint is the address a client dials, so a cluster whose
+    // engine this emulator serves publishes the host its own engine listener is bound to —
+    // the core binds on loopback — and the port that listener answers on. The reader
+    // endpoint keeps the published Aurora form, built from the identifier and a
+    // server-minted label rather than echoed from the request: Aurora Replicas reject
+    // writes, so the writer's address is not published under it.
     let endpoint = text(xml, "Endpoint");
+    assert_eq!(
+        endpoint, "127.0.0.1",
+        "case {case:?}: expected the endpoint the cluster's engine listener is bound to, \
+         got {endpoint:?} in {xml}"
+    );
+    let port = text(xml, "Port");
     assert!(
-        endpoint.starts_with(&format!("{}.cluster-", row.stored_identifier))
-            && endpoint.ends_with(&format!(".{REGION}.rds.amazonaws.com")),
-        "case {case:?}: expected the cluster endpoint, got {endpoint:?} in {xml}"
+        port.parse::<u16>().is_ok_and(|port| port != 0),
+        "case {case:?}: expected the port the cluster's engine listener answers on, got \
+         {port:?} in {xml}"
     );
     let reader = text(xml, "ReaderEndpoint");
     assert!(

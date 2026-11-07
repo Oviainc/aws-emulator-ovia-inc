@@ -108,9 +108,14 @@ impl DbClusterSnapshotRecord {
             master_username: cluster.master_username.clone(),
             availability_zones: cluster.availability_zones.clone(),
             // "The port that the DB cluster was listening on at the time of the snapshot":
-            // a fact about the cluster's DB INSTANCES. A cluster with none had nothing
-            // listening, so the snapshot was taken on no port at all.
-            port: if cluster_has_instances { cluster.port } else { 0 },
+            // a fact about the cluster's DB INSTANCES, so it is the port the cluster
+            // PUBLISHES — the one a client was connecting to. A cluster with none had
+            // nothing listening, so the snapshot was taken on no port at all.
+            port: if cluster_has_instances {
+                cluster.published_port()
+            } else {
+                0
+            },
             storage_type: cluster.storage_type.clone(),
             storage_encrypted: cluster.storage_encrypted,
             kms_key_id: cluster.kms_key_id.clone(),

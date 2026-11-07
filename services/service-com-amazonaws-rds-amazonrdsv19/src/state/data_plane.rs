@@ -22,6 +22,8 @@
 //!
 //! * this module — the endpoint record the store holds per instance, which engine speaks
 //!   which wire, and the facts a session is admitted against ([`InstanceFacts`]);
+//! * [`cluster_endpoint`] — the same for a DB CLUSTER's writer endpoint, whose facts come
+//!   from the cluster's own record;
 //! * [`sql_engine`] — the in-process SQLite database each of an instance's databases runs
 //!   its statements against;
 //! * [`wire_session`] — what is shared by the two wires: the admission decision, the
@@ -43,6 +45,7 @@ use tokio::sync::watch;
 
 use super::{ComAmazonawsRdsAmazonrdsv19State, DbInstanceRecord, RegionalKey};
 
+pub mod cluster_endpoint;
 pub mod dialect;
 pub mod mysql_wire;
 pub mod pg_copy;
@@ -73,9 +76,8 @@ pub enum EngineWire {
 ///
 /// An AURORA DB instance is deliberately not here: its data plane is addressed through its
 /// DB CLUSTER's reader and writer endpoints, which `CreateDBCluster` publishes and which
-/// this emulator does not serve yet, so opening a listener on the member endpoint alone
-/// would publish half a cluster's data plane. It belongs with the cluster endpoint's own
-/// issue.
+/// [`cluster_endpoint`] serves, so opening a listener on the member endpoint alone would
+/// publish half a cluster's data plane.
 #[must_use]
 pub fn engine_wire(engine: &str) -> Option<EngineWire> {
     match engine.to_ascii_lowercase().as_str() {
@@ -102,6 +104,47 @@ fn postgres_forces_ssl_by_default(engine_version: &str) -> bool {
         .next()
         .and_then(|major| major.parse::<u32>().ok())
         .is_none_or(|major| major >= FORCE_SSL_DEFAULT_FROM_MAJOR_VERSION)
+}
+
+/// WHICH parameter decides that a session on `wire` must be encrypted: `rds.force_ssl` on
+/// PostgreSQL and `require_secure_transport` on MySQL and MariaDB.
+#[must_use]
+pub(crate) fn secure_transport_parameter(wire: EngineWire) -> &'static str {
+    match wire {
+        EngineWire::Postgres => "rds.force_ssl",
+        EngineWire::MySql => "require_secure_transport",
+    }
+}
+
+/// Whether an encrypted session is REQUIRED, from the value the resource's parameter group
+/// sets for [`secure_transport_parameter`] (`None` where it sets none) and the engine
+/// version the resource runs.
+///
+/// The ONE reading of that parameter, for a DB instance's endpoint and a DB cluster's
+/// alike, so the two cannot disagree about a login this emulator admits:
+///
+/// * PostgreSQL: Amazon RDS documents `rds.force_ssl`'s default as 1 for version 15 and
+///   higher and 0 for the versions before it, so the resource's own major version decides
+///   it where its group sets nothing.
+/// * MySQL and MariaDB: `require_secure_transport`, whose documented default is OFF.
+#[must_use]
+pub(crate) fn secure_transport_in_force(
+    wire: EngineWire,
+    set: Option<&str>,
+    engine_version: Option<&str>,
+) -> bool {
+    match set {
+        Some(value) => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+        None => match wire {
+            EngineWire::Postgres => {
+                postgres_forces_ssl_by_default(engine_version.unwrap_or_default())
+            }
+            EngineWire::MySql => false,
+        },
+    }
 }
 
 /// The address a DB instance's engine listener accepts connections on, which is what the
@@ -218,10 +261,6 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         let Some(wire) = engine_wire(&record.engine) else {
             return false;
         };
-        let parameter = match wire {
-            EngineWire::Postgres => "rds.force_ssl",
-            EngineWire::MySql => "require_secure_transport",
-        };
         let set = record
             .db_parameter_group_name
             .as_ref()
@@ -229,19 +268,12 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                 self.db_parameter_groups
                     .get(&(record.region.clone(), name.to_ascii_lowercase()))
             })
-            .and_then(|group| group.parameters.get(parameter));
-        match set {
-            Some(setting) => matches!(
-                setting.value.to_ascii_lowercase().as_str(),
-                "1" | "on" | "true" | "yes"
-            ),
-            None => match wire {
-                EngineWire::Postgres => postgres_forces_ssl_by_default(
-                    record.engine_version.as_deref().unwrap_or_default(),
-                ),
-                EngineWire::MySql => false,
-            },
-        }
+            .and_then(|group| group.parameters.get(secure_transport_parameter(wire)));
+        secure_transport_in_force(
+            wire,
+            set.map(|setting| setting.value.as_str()),
+            record.engine_version.as_deref(),
+        )
     }
 
     /// The DB instance in `region` whose `DbiResourceId` is `resource_id`.
@@ -303,13 +335,13 @@ pub async fn capture_instance_storage(
     })
 }
 
-/// Open the engine endpoint for the DB instance `region`/`resource_id` names, on the
-/// wire its engine speaks.
+/// Open the engine endpoint of `target` — a DB instance's own endpoint or a DB cluster's
+/// writer endpoint — on the wire its engine speaks.
 ///
 /// The core binds the socket and assigns the port; this only hands it the protocol
 /// handler and reports back where it landed. The caller stores the returned endpoint in
 /// the state — which is what keeps the port open — and publishes
-/// [`DbEngineEndpoint::endpoint`] as the instance's `Endpoint`.
+/// [`DbEngineEndpoint::endpoint`] as the resource's `Endpoint`.
 ///
 /// `Err` when this service was mounted on an engine with no listener surface, or when the
 /// core could not bind: the caller answers that with a modelled failure rather than
@@ -317,8 +349,7 @@ pub async fn capture_instance_storage(
 pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
     engine: &Eng,
     state: &::engine::ServiceState<ComAmazonawsRdsAmazonrdsv19State>,
-    region: &str,
-    resource_id: &str,
+    target: wire_session::SessionTarget,
     wire: EngineWire,
 ) -> Result<DbEngineEndpoint, String> {
     let listeners = shared_engine(engine)
@@ -335,8 +366,7 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
     let sessions = pg_sessions::SessionRegistry::default();
     let context = wire_session::SessionContext {
         state: state.clone(),
-        region: region.to_string(),
-        resource_id: resource_id.to_string(),
+        target,
         database: Arc::clone(&database),
         sessions: sessions.clone(),
         upgrader,

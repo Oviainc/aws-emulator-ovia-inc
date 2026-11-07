@@ -1407,10 +1407,10 @@ pub struct Transaction {
 
 impl Transaction {
     /// Open a transaction on `cluster`'s `database`, minting its id and taking its
-    /// snapshot. The id is opaque and unique (a version-4 UUID's 32 hex digits,
-    /// well inside the modelled 192-character limit). A cluster holds at most
-    /// [`MAX_OPEN_TRANSACTIONS`] open transactions — each is a whole copy of a
-    /// database — past which opening another is refused. A transaction that ENDED holds
+    /// snapshot. The id is opaque, unique and BOUND to the resource it was opened on
+    /// ([`mint_transaction_id`]), well inside the modelled 192-character limit. A cluster
+    /// holds at most [`MAX_OPEN_TRANSACTIONS`] open transactions — each is a whole copy of
+    /// a database — past which opening another is refused. A transaction that ENDED holds
     /// no database, so it is not one of them.
     pub fn open(
         cluster: &mut Cluster,
@@ -1425,7 +1425,7 @@ impl Transaction {
             )));
         }
         let pending = cluster.database_mut(&database_key(database))?.snapshot()?;
-        let id = uuid::Uuid::new_v4().simple().to_string();
+        let id = mint_transaction_id(resource_arn);
         let now = SystemTime::now();
         cluster.transactions.insert(
             id.clone(),
@@ -1516,6 +1516,60 @@ impl Transaction {
         }
     }
 }
+
+/// The id a `BeginTransaction` on `resource_arn` mints for the transaction it opens: an
+/// opaque token that CARRIES the resource the transaction belongs to.
+///
+/// A transaction belongs to the DB cluster it was opened on, and every later call that
+/// quotes its id names a `resourceArn` of its own: the real service can tell an id that
+/// could not have been issued for the resource it is presented with from one that resolves
+/// to nothing on a resource it could have come from, and answers the two differently
+/// ([`transaction_id_names_resource`]). So the binding travels in the id, which is what
+/// lets this emulator tell them apart too — including after the transaction has ended, when
+/// no stored record of it is left to resolve.
+///
+/// The id is a version-4 UUID's 32 hex digits — where its uniqueness and its
+/// unguessability come from — followed by a stable 16-digit mixing of the resource's ARN
+/// ([`::service_common::stable_hex_id`], which nothing authenticates on). 48 characters,
+/// well inside the modelled `Id` length of 192, and opaque: it carries no readable part of
+/// the ARN.
+#[must_use]
+pub fn mint_transaction_id(resource_arn: &str) -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        ::service_common::stable_hex_id(&[resource_arn])
+    )
+}
+
+/// Whether `transaction_id` is an id [`mint_transaction_id`] could have minted AT ALL: the
+/// form a transaction id of this service has, whichever resource issued it.
+///
+/// A value of ANOTHER form names no transaction this service ever issued, anywhere, and is
+/// answered by the transaction store as the id it has no running transaction for; this is
+/// what separates that case from an id that IS one of this service's and belongs to another
+/// resource ([`transaction_id_names_resource`]).
+#[must_use]
+pub fn is_minted_transaction_id(transaction_id: &str) -> bool {
+    transaction_id.len() == UUID_HEX_DIGITS + RESOURCE_TAG_DIGITS
+        && transaction_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Whether `transaction_id` is an id [`mint_transaction_id`] could have minted for
+/// `resource_arn` — the resource binding the id carries.
+#[must_use]
+pub fn transaction_id_names_resource(transaction_id: &str, resource_arn: &str) -> bool {
+    is_minted_transaction_id(transaction_id)
+        && transaction_id.ends_with(&::service_common::stable_hex_id(&[resource_arn]))
+}
+
+/// How many hexadecimal digits the mixing of the resource ARN carries, which is the second
+/// part of a minted transaction id ([`::service_common::stable_hex_id`]'s own width).
+const RESOURCE_TAG_DIGITS: usize = 16;
+
+/// How many hexadecimal digits a version-4 UUID's simple form carries, which is the first
+/// part of a minted transaction id.
+const UUID_HEX_DIGITS: usize = 32;
 
 /// What the engine did with one statement.
 #[derive(Debug)]

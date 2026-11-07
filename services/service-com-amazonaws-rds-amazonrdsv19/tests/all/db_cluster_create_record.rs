@@ -331,9 +331,14 @@ struct Identity {
 }
 
 /// The server-assigned label of a cluster endpoint, asserting the published form
-/// `<identifier>.cluster-<label>.<region>.rds.amazonaws.com` on the way.
+/// `<identifier>.cluster-ro-<label>.<region>.rds.amazonaws.com` on the way.
+///
+/// Read from the READER endpoint: a cluster whose engine this emulator serves publishes the
+/// address of its own engine listener as its writer `Endpoint` (see
+/// `state::data_plane::cluster_endpoint`), and the reader endpoint is where the minted
+/// label is still visible.
 fn endpoint_label(case: &str, identifier: &str, endpoint: &str) -> String {
-    let prefix = format!("{identifier}.cluster-");
+    let prefix = format!("{identifier}.cluster-ro-");
     let suffix = format!(".{REGION}.rds.amazonaws.com");
     let label = endpoint
         .strip_prefix(&prefix)
@@ -372,15 +377,15 @@ fn identity_of(case: &str, identifier: &str, cluster: &str) -> Identity {
     );
 
     let endpoint = text(cluster, "Endpoint");
-    let label = endpoint_label(case, identifier, &endpoint);
-    // The reader endpoint names the SAME cluster: the published `cluster-ro-` form over the
-    // one label.
-    let reader = text(cluster, "ReaderEndpoint");
-    let expected_reader = format!("{identifier}.cluster-ro-{label}.{REGION}.rds.amazonaws.com");
+    // The writer endpoint is the address a client dials: the host the cluster's own engine
+    // listener is bound to, which the core binds on loopback.
     assert_eq!(
-        reader, expected_reader,
-        "case {case:?}: expected the reader endpoint {expected_reader:?}, got {reader:?}"
+        endpoint, "127.0.0.1",
+        "case {case:?}: expected the host the cluster's engine listener is bound to, got \
+         {endpoint:?}"
     );
+    let reader = text(cluster, "ReaderEndpoint");
+    let label = endpoint_label(case, identifier, &reader);
 
     Identity {
         resource_id,

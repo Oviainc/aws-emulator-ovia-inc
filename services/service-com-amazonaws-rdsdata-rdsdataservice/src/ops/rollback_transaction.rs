@@ -195,6 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 secret_arn: &input.secret_arn,
                 sql: None,
                 database: None,
+                transaction_id: Some(&input.transaction_id),
             },
         )
         .await

@@ -90,8 +90,14 @@ struct EngineCase {
     engine: &'static str,
     /// The parameters this row adds beyond the two required members.
     extra: &'static [(&'static str, &'static str)],
-    /// The port the cluster must report, as the text the wire carries.
+    /// The port the cluster must report, as the text the wire carries — for a cluster whose
+    /// engine's wire this emulator does NOT serve, which is the only one that publishes its
+    /// configured port.
     expected_port: &'static str,
+    /// Whether this emulator serves the engine's own wire for such a cluster, so the
+    /// cluster publishes the address of its own engine listener rather than a DNS name and
+    /// the configured port.
+    serves_the_engines_wire: bool,
     /// The DNS domain both cluster endpoints must sit in.
     expected_domain: &'static str,
     /// The `AllocatedStorage` the cluster must report.
@@ -120,6 +126,7 @@ const ENGINE_CASES: &[EngineCase] = &[
         extra: &[],
         // The port Amazon DocumentDB publishes as its default.
         expected_port: "27017",
+        serves_the_engines_wire: false,
         expected_domain: DOCDB_DOMAIN,
         expected_allocated_storage: "1",
     },
@@ -129,6 +136,7 @@ const ENGINE_CASES: &[EngineCase] = &[
         extra: &[("Port", "27018")],
         // The request's port wins: the default only fills a port nobody asked for.
         expected_port: "27018",
+        serves_the_engines_wire: false,
         expected_domain: DOCDB_DOMAIN,
         expected_allocated_storage: "1",
     },
@@ -138,6 +146,7 @@ const ENGINE_CASES: &[EngineCase] = &[
         extra: &[],
         // `CreateDBClusterMessage$Port` of the Neptune model: "Default: 8182".
         expected_port: "8182",
+        serves_the_engines_wire: false,
         expected_domain: NEPTUNE_DOMAIN,
         expected_allocated_storage: "1",
     },
@@ -147,6 +156,7 @@ const ENGINE_CASES: &[EngineCase] = &[
         extra: &[],
         // "RDS for MySQL and Aurora MySQL - 3306".
         expected_port: "3306",
+        serves_the_engines_wire: true,
         expected_domain: RDS_DOMAIN,
         expected_allocated_storage: "1",
     },
@@ -156,6 +166,7 @@ const ENGINE_CASES: &[EngineCase] = &[
         extra: &[],
         // "RDS for PostgreSQL and Aurora PostgreSQL - 5432".
         expected_port: "5432",
+        serves_the_engines_wire: true,
         expected_domain: RDS_DOMAIN,
         expected_allocated_storage: "1",
     },
@@ -164,6 +175,7 @@ const ENGINE_CASES: &[EngineCase] = &[
         engine: "postgres",
         extra: MULTI_AZ_SETTINGS,
         expected_port: "5432",
+        serves_the_engines_wire: true,
         expected_domain: RDS_DOMAIN,
         // The size the request allocated to each DB instance in the cluster.
         expected_allocated_storage: "400",
@@ -174,11 +186,21 @@ const ENGINE_CASES: &[EngineCase] = &[
 fn assert_engine_defaults(case: &str, label: &str, cluster: &str, row: &EngineCase) {
     let case = format!("{case} ({label})");
     let port = text(cluster, "Port");
-    assert_eq!(
-        port, row.expected_port,
-        "case {case:?}: expected <Port> {:?}, got {port:?} in {cluster}",
-        row.expected_port
-    );
+    if row.serves_the_engines_wire {
+        // The cluster publishes where a client DIALS it: the port its own engine listener
+        // answers on, which the core assigns, not the engine's configured default.
+        assert!(
+            port.parse::<u16>().is_ok_and(|port| port != 0),
+            "case {case:?}: expected the port the cluster's engine listener answers on, got \
+             {port:?} in {cluster}"
+        );
+    } else {
+        assert_eq!(
+            port, row.expected_port,
+            "case {case:?}: expected <Port> {:?}, got {port:?} in {cluster}",
+            row.expected_port
+        );
+    }
     let allocated = optional_text(cluster, "AllocatedStorage");
     assert_eq!(
         allocated.as_deref(),
@@ -187,14 +209,29 @@ fn assert_engine_defaults(case: &str, label: &str, cluster: &str, row: &EngineCa
         row.expected_allocated_storage
     );
     let suffix = format!(".{REGION}.{}", row.expected_domain);
-    for (member, label) in [("Endpoint", "cluster-"), ("ReaderEndpoint", "cluster-ro-")] {
-        let endpoint = text(cluster, member);
+    // The WRITER endpoint of a cluster this emulator serves the engine's wire for is the
+    // host its listener is bound to, which the core binds on loopback; every other cluster
+    // endpoint is the published DNS form of its own control plane's domain.
+    let writer = text(cluster, "Endpoint");
+    if row.serves_the_engines_wire {
+        assert_eq!(
+            writer, "127.0.0.1",
+            "case {case:?}: expected the host the cluster's engine listener is bound to, got \
+             {writer:?} in {cluster}"
+        );
+    } else {
         assert!(
-            endpoint.contains(&format!(".{label}")) && endpoint.ends_with(&suffix),
-            "case {case:?}: expected a <{member}> of the form \
-             <identifier>.{label}<label>{suffix}, got {endpoint:?}"
+            writer.contains(".cluster-") && writer.ends_with(&suffix),
+            "case {case:?}: expected an <Endpoint> of the form \
+             <identifier>.cluster-<label>{suffix}, got {writer:?}"
         );
     }
+    let reader = text(cluster, "ReaderEndpoint");
+    assert!(
+        reader.contains(".cluster-ro-") && reader.ends_with(&suffix),
+        "case {case:?}: expected a <ReaderEndpoint> of the form \
+         <identifier>.cluster-ro-<label>{suffix}, got {reader:?}"
+    );
 }
 
 #[tokio::test]
