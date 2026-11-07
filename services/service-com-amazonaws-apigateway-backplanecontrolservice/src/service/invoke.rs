@@ -136,11 +136,13 @@
 //!   that service gave, mapped through the integration response whose `selectionPattern`
 //!   matches the status it answered with. An action of a service this emulator does not
 //!   make the call to is left to the refusal below;
-//! * `AWS_PROXY` invokes a Lambda function. Lambda's own `Invoke` answers `501` for
-//!   `RequestResponse` and `Event` — this emulator has no in-process runtime for a
-//!   deployment package (see
-//!   `services/service-com-amazonaws-lambda-awsgirapiservice/src/ops/invoke.rs`) — so no
-//!   function's answer exists to map;
+//! * `AWS_PROXY` invokes a LAMBDA FUNCTION, which is a call this emulator makes: the
+//!   function the `uri` names is invoked in process over the transport the router hands this
+//!   plane, with the proxy event the whole method request becomes, and what the handler
+//!   returned IS the method response — its status, its headers and its body, mapped by
+//!   nothing, because "the client request [is] passed through as-is" (`IntegrationType`).
+//!   The grant that admits the invocation is the function's own resource policy, read from
+//!   Lambda itself ([`lambda_proxy`]);
 //! * `HTTP`, and an `HTTP_PROXY` whose `uri` names an endpoint outside this emulator,
 //!   address an endpoint over the network, and this emulator makes no outbound connection.
 //!   The standard `HTTP` integration is not served even against an endpoint of this
@@ -218,6 +220,7 @@
 pub mod aws_integration;
 pub mod cognito_user_pools;
 pub mod execute_api_authorization;
+pub mod lambda_proxy;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -1349,6 +1352,25 @@ async fn serving<Eng: Send + Sync + 'static>(
                     req.uri(),
                     &authorizer_claims,
                 ),
+            },
+            // What a PROXY integration's event names this call by, which a template has no
+            // reference for: the request as the CLIENT sent it (its own verb, every value a
+            // repeated parameter or header carries, the endpoint it arrived on) and the
+            // records it resolved to — the `Resource` whose path matched, and the ARN of the
+            // method a grant to API Gateway is narrowed by.
+            lambda_proxy::ProxyInputs {
+                resource_id: api
+                    .resources
+                    .values()
+                    .find(|resource| resource.path == matched_path)
+                    .map(|resource| resource.id.clone())
+                    .unwrap_or_default(),
+                http_method: req.method().to_ascii_uppercase(),
+                request_path: resource_path.clone(),
+                domain_name: request_host_of(req).unwrap_or_default(),
+                multi_value_querystring: every_query_parameter(query_of(req.uri())),
+                multi_value_header: every_header(req),
+                source_arn: Some(call_of.method_arn()),
             },
         );
         // The method's own request validator, before the integration is reached: a
@@ -2695,16 +2717,24 @@ pub struct MethodRequest {
     /// own payload, parameters and context, and the stage's variables
     /// ([`mapping_template`]).
     inputs: TemplateInputs,
+    /// What a PROXY integration's event carries about the call beyond what a template reads
+    /// off it ([`lambda_proxy::ProxyInputs`]).
+    proxy: lambda_proxy::ProxyInputs,
 }
 
 impl MethodRequest {
-    /// What a request off the wire declares and accepts, and what its templates render
-    /// against.
-    fn of_request(req: &RtRequest, inputs: TemplateInputs) -> Self {
+    /// What a request off the wire declares and accepts, what its templates render
+    /// against, and what a proxy integration's event names it by.
+    fn of_request(
+        req: &RtRequest,
+        inputs: TemplateInputs,
+        proxy: lambda_proxy::ProxyInputs,
+    ) -> Self {
         Self {
             media_type: declared_media_type(req.headers().get("content-type")),
             accepted: first_media_type(req.headers().get("accept")),
             inputs,
+            proxy,
         }
     }
 
@@ -2714,11 +2744,13 @@ impl MethodRequest {
         content_type: Option<&str>,
         accept: Option<&str>,
         inputs: TemplateInputs,
+        proxy: lambda_proxy::ProxyInputs,
     ) -> Self {
         Self {
             media_type: declared_media_type(content_type),
             accepted: first_media_type(accept),
             inputs,
+            proxy,
         }
     }
 
@@ -2739,10 +2771,12 @@ pub struct IntegratedResponse {
     pub content_type: String,
     /// The rendered body, empty when no response template applies.
     pub body: Vec<u8>,
-    /// The mapped response headers the method response declares, keyed by the header name
-    /// as the mapping declares it. `content-type` is NOT among them: it is
-    /// [`Self::content_type`].
-    pub headers: BTreeMap<String, String>,
+    /// The response headers, keyed by the header name as the integration declares it, each
+    /// with EVERY value that name carries. One name carries several values where the
+    /// backend sent several (a proxy integration's `multiValueHeaders`), and exactly one
+    /// where a mapped header declares a single value. `content-type` is NOT among them: it
+    /// is [`Self::content_type`].
+    pub headers: BTreeMap<String, Vec<String>>,
 }
 
 /// An integration this call cannot be performed through: the GATEWAY RESPONSE it is
@@ -3184,6 +3218,9 @@ pub async fn performed_integration(
     call: &MethodRequest,
 ) -> Result<IntegratedResponse, UnservedIntegration> {
     if let Some(method) = method {
+        if let Some(served) = lambda_proxy::performed(ctx, region, method, call).await {
+            return served;
+        }
         if let Some(served) = aws_integration::performed(ctx, region, method, call).await {
             return served;
         }
@@ -3206,9 +3243,10 @@ pub async fn performed_integration(
 /// `HTTP_PROXY` naming an endpoint of this emulator is served by passing the request on
 /// ([`passed_through`], which [`serve_resolved`] reaches before this), an `AWS` integration
 /// naming an action this emulator serves is served by MAKING that call
-/// ([`aws_integration`], which [`performed_integration`] reaches before this), and every
-/// other one is an integration this call cannot perform rather than one whose answer is
-/// invented — see the module docs.
+/// ([`aws_integration`]), an `AWS_PROXY` is served by INVOKING the function its `uri` names
+/// ([`lambda_proxy`]) — both of which [`performed_integration`] reaches before this — and
+/// every other one is an integration this call cannot perform rather than one whose answer
+/// is invented — see the module docs.
 pub fn perform_integration(
     method: Option<&MethodEntry>,
     call: &MethodRequest,
@@ -3335,7 +3373,7 @@ fn mapped_response_headers(
     method: Option<&MethodEntry>,
     selected: &GetIntegrationResponseOutput,
     status: u16,
-) -> BTreeMap<String, String> {
+) -> BTreeMap<String, Vec<String>> {
     let declared = method
         .and_then(|method| method.method_responses.get(&status.to_string()))
         .and_then(|response| response.response_parameters.as_ref());
@@ -3351,7 +3389,8 @@ fn mapped_response_headers(
             .then(|| value.strip_prefix('\'').and_then(|rest| rest.strip_suffix('\'')))
             .flatten();
         if let Some(literal) = literal {
-            mapped.insert(name.to_string(), literal.to_string());
+            // A mapping declares ONE value for the header, so the name carries exactly it.
+            mapped.insert(name.to_string(), vec![literal.to_string()]);
         }
     }
     mapped
@@ -3369,16 +3408,20 @@ fn mapped_response_headers(
 /// skipped, and said so, so the rest of the response is still served.
 fn served_response(served: IntegratedResponse) -> RtResponse {
     let mut response = response_with(served.status, &served.content_type, served.body);
-    for (name, value) in served.headers {
-        if let Err(refused) = response
-            .headers_mut()
-            .try_insert(name.to_ascii_lowercase(), value)
-        {
-            tracing::warn!(
-                header = %name,
-                error = %refused,
-                "the mapped response header cannot be sent on the wire and is skipped"
-            );
+    for (name, values) in served.headers {
+        for value in values {
+            // APPENDED, not inserted: a name the backend sent several values under is sent
+            // as several field lines, which is the only way one name carries them all.
+            if let Err(refused) = response
+                .headers_mut()
+                .try_append(name.to_ascii_lowercase(), value)
+            {
+                tracing::warn!(
+                    header = %name,
+                    error = %refused,
+                    "the mapped response header cannot be sent on the wire and is skipped"
+                );
+            }
         }
     }
     response
@@ -3814,6 +3857,45 @@ fn sent_headers(req: &RtRequest) -> BTreeMap<String, String> {
             .or_insert_with(|| value.to_string());
     }
     sent
+}
+
+/// EVERY value `req` carries under each header name, in the order sent.
+///
+/// The multi-valued view of [`sent_headers`], which is what a PROXY integration's event
+/// carries beside the single-valued one: a name sent twice carries two values, and only this
+/// view has both.
+fn every_header(req: &RtRequest) -> BTreeMap<String, Vec<String>> {
+    let mut sent: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, value) in req.headers().iter() {
+        sent.entry(name.to_string())
+            .or_default()
+            .push(value.to_string());
+    }
+    sent
+}
+
+/// EVERY value `query` carries under each query-string name, in the order sent.
+///
+/// The multi-valued view of [`sent_query_parameters`], read by the same framework query
+/// reader so one query string is decoded one way.
+fn every_query_parameter(query: &str) -> BTreeMap<String, Vec<String>> {
+    let mut sent: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, value) in ::aws_smithy_schema_server::parse_form_urlencoded(query.as_bytes()) {
+        if name.is_empty() {
+            continue;
+        }
+        sent.entry(name).or_default().push(value);
+    }
+    sent
+}
+
+/// The endpoint host `req` was addressed on — the `Host` it carries, or the authority of its
+/// own URI — which is the domain name a PROXY integration's event reports the call arrived at.
+fn request_host_of(req: &RtRequest) -> Option<String> {
+    req.headers()
+        .get("host")
+        .or_else(|| authority_of(req.uri()))
+        .map(str::to_string)
 }
 
 /// The `$context` values of this call, keyed by the member path a mapping template writes.

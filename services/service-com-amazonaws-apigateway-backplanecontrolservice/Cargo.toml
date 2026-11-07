@@ -73,6 +73,17 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
     "rt-tokio",
     "behavior-version-latest",
 ] }
+# An `AWS_PROXY` integration names a Lambda function, and it is PERFORMED by invoking that
+# function over the same in-process transport (`service::invoke::lambda_proxy`): the proxy
+# event is handed to `Invoke` and what the handler answered becomes the method response.
+# The grant Lambda's own resource policy carries for `apigateway.amazonaws.com` is read
+# through `GetPolicy` on the same client. Only the generated client is needed.
+aws-sdk-lambda = { version = "1", default-features = false }
+# Base64 for the two members a Lambda proxy integration encodes a payload that is not UTF-8
+# text in — the event's own `isBase64Encoded` body and the handler's response body — and for
+# the `Blob` member a web ACL's `ByteMatchStatement$SearchString` is in this crate's tests.
+# The maintained coder every other service in this tree uses.
+base64 = "0.22"
 # Matches an `IntegrationResponse$selectionPattern` — "the regular expression (regex)
 # pattern used to choose an integration response based on the response from the back end" —
 # against the status a backend answered with. The maintained engine, whose matching is
@@ -101,10 +112,15 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
-# Base64 for the `Blob` member a web ACL's `ByteMatchStatement$SearchString` is, which an
-# awsJson body carries encoded: the maintained coder every other service in this tree
-# uses, rather than a hand-written copy in a test helper.
-base64 = "0.22"
+# A deployed method whose integration is `AWS_PROXY` is served by invoking a Lambda
+# function, and what the handler wrote is asserted where a client reads it — in the
+# DynamoDB table the handler put the item in — so both services are mounted on the test's
+# own engine beside this one.
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
+# The .zip deployment package such a function is created from, written in memory the way a
+# caller uploads one — the same reader/writer the Lambda crate's own invoke suites use.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # Percent-encoding for the `resourceArn` @httpLabel a tag call puts in its URI path: the
 # encoding itself is the crate's, as the sibling medialive/codeartifact suites do it,
 # rather than a tenth hand-written copy of RFC 3986.

@@ -131,6 +131,7 @@ use crate::service::invoke::{
     matched_path_parameters, performed_integration, refusal_rendering, sent_query_parameters,
     with_stage_variables, MethodRequest, JSON_CONTENT_TYPE,
 };
+use crate::service::invoke::lambda_proxy::ProxyInputs;
 use crate::service::mapping_template::TemplateInputs;
 
 /// The request this operation's execution log is a log of. A simulated invocation never
@@ -249,6 +250,33 @@ fn simulated_headers(input: &TestInvokeMethodInput) -> BTreeMap<String, String> 
     }
     for (name, value) in input.headers.iter().flatten() {
         carried.insert(name.clone(), value.clone());
+    }
+    carried
+}
+
+/// EVERY value a simulated request carries under each header name: the `multiValueHeaders`
+/// entries the caller supplied, and the single-valued `headers` for a name only that member
+/// carries.
+///
+/// The multi-valued view of [`simulated_headers`], which is what a PROXY integration's event
+/// carries beside the single-valued one.
+fn every_simulated_header(input: &TestInvokeMethodInput) -> BTreeMap<String, Vec<String>> {
+    let mut carried: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, values) in input.multi_value_headers.iter().flatten() {
+        carried.insert(name.clone(), values.clone());
+    }
+    for (name, value) in input.headers.iter().flatten() {
+        carried.entry(name.clone()).or_insert_with(|| vec![value.clone()]);
+    }
+    carried
+}
+
+/// EVERY value the simulated query string carries under each name, read by the one reader
+/// this service reads a query string with.
+fn every_simulated_query_parameter(query: Option<&str>) -> BTreeMap<String, Vec<String>> {
+    let mut carried: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, value) in sent_query_parameters(query.unwrap_or_default()) {
+        carried.insert(name, vec![value]);
     }
     carried
 }
@@ -483,6 +511,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             simulated_header(&input, CONTENT_TYPE),
             simulated_header(&input, ACCEPT),
             inputs,
+            // What a PROXY integration's event names a SIMULATED call by: the resource and
+            // the verb the caller named, the path it simulated, and every value its
+            // `multiValueHeaders` and query string carry. There is no stage and therefore
+            // no method ARN, so a grant to API Gateway has no `aws:SourceArn` to be judged
+            // against — which refuses nothing, as nothing is refused here on evidence this
+            // operation does not have.
+            ProxyInputs {
+                resource_id: input.resource_id.clone(),
+                http_method: verb.clone(),
+                request_path: path.unwrap_or(resource_path.as_str()).to_string(),
+                domain_name: String::new(),
+                multi_value_querystring: every_simulated_query_parameter(query),
+                multi_value_header: every_simulated_header(&input),
+                source_arn: None,
+            },
         );
         let performed = match with_stage_variables(&method, &simulated_variables) {
             // The api's own Region is the endpoint an `AWS` integration naming no Region of
@@ -495,7 +538,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (status, body, headers) = match performed {
             Ok(served) => {
                 let mut headers = served.headers;
-                headers.insert(CONTENT_TYPE_HEADER.to_string(), served.content_type);
+                headers.insert(CONTENT_TYPE_HEADER.to_string(), vec![served.content_type]);
                 log.line("Successfully completed execution".to_string());
                 (served.status, served.body, headers)
             }
@@ -514,7 +557,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let (status, body) = refusal_rendering(Some(&api), unserved.refusal);
                 let headers = BTreeMap::from([(
                     CONTENT_TYPE_HEADER.to_string(),
-                    JSON_CONTENT_TYPE.to_string(),
+                    vec![JSON_CONTENT_TYPE.to_string()],
                 )]);
                 (status, body, headers)
             }
@@ -527,7 +570,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "Method response headers: [{}]",
             headers
                 .iter()
-                .map(|(name, value)| format!("{name}={value}"))
+                .map(|(name, values)| format!("{name}={}", values.join(", ")))
                 .collect::<Vec<String>>()
                 .join(", ")
         ));
@@ -542,18 +585,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The rendered body as text: `body` is modelled a `String`, and a stored
             // response template is text a caller wrote.
             body: Some(String::from_utf8_lossy(&body).into_owned()),
+            // The single-valued view: the FIRST value under each name, which is what a
+            // single-valued read of a multi-valued header is.
             headers: Some(
                 headers
                     .iter()
-                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .filter_map(|(name, values)| {
+                        values.first().map(|first| (name.clone(), first.clone()))
+                    })
                     .collect::<HashMap<String, String>>(),
             ),
-            // The multi-valued view of the same headers: a mapped response header carries
-            // one value, so each name maps to the single-element list of it.
+            // The multi-valued view of the same headers: every value each name carries.
             multi_value_headers: Some(
                 headers
                     .into_iter()
-                    .map(|(name, value)| (name, vec![value]))
                     .collect::<HashMap<String, Vec<String>>>(),
             ),
             log: Some(log.rendered()),

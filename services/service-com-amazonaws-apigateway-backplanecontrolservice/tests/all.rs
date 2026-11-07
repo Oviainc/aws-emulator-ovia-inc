@@ -403,3 +403,8 @@ mod integration_representation;
 // each kind of record this control plane mints is addressed by.
 #[path = "all/minted_identifier_widths.rs"]
 mod minted_identifier_widths;
+// Appended for the reason the note above gives: a deployed method whose integration is
+// `AWS_PROXY`, served by INVOKING the Lambda function its `uri` names — across API Gateway,
+// Lambda and DynamoDB on one engine.
+#[path = "all/lambda_proxy_integration.rs"]
+mod lambda_proxy_integration;

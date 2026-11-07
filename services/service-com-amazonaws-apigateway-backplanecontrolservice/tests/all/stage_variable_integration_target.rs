@@ -545,8 +545,8 @@ async fn a_simulated_invocation_resolves_the_stage_variables_it_was_given() {
     )
     .await;
     // A Lambda proxy integration, whose `uri` is the form a stage-variable-selected
-    // function is written in. No deployment package runs in this emulator, so this one is
-    // unperformable whatever the variable resolves to — what the row asserts is WHY.
+    // function is written in. This emulator mounts no Lambda at all, so the invocation
+    // reaches nothing whatever the variable resolves to — what the row asserts is WHY.
     let (proxied, proxied_resource) = simulated_method(
         &gateway,
         "stage-variable-simulated-proxy",
@@ -590,12 +590,12 @@ async fn a_simulated_invocation_resolves_the_stage_variables_it_was_given() {
             "names the stage variable role",
         ),
         (
-            "the resolved uri names a backend this emulator cannot call",
+            "the resolved uri names a function no Lambda of this emulator answers for",
             &proxied,
             &proxied_resource,
             json!({ "stageVariables": { "fn": "orders-handler" } }),
             i64::from(CONFIGURATION_ERROR.0),
-            "names a backend this emulator cannot call",
+            "did not answer the invocation",
         ),
         (
             "the uri names a function variable the simulated map leaves out",
