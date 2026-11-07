@@ -535,9 +535,10 @@ async fn the_core_streaming_workflow_round_trips_through_state() {
         "GetStreamGroup: the running session consumes the idle capacity, got {got}"
     );
 
-    // ---- 7. Placement resolves. This emulator runs no stream server, so the
-    // session reaches the modelled failure state instead of reporting a stream that
-    // never started. ----
+    // ---- 7. Placement resolves. The group is ACTIVE, the requested location is
+    // provisioned and its one stream is free, so "Amazon GameLift Streams is
+    // successful in finding capacity for the stream" and the session reaches
+    // ACTIVE. ----
     std::thread::sleep(PAST_TRANSITION);
     let (status, got) = call(&router, "GET", &session_path, None).await;
     assert_eq!(
@@ -545,12 +546,13 @@ async fn the_core_streaming_workflow_round_trips_through_state() {
         "GetStreamSession after placement: expected 200, got {status} {got}"
     );
     assert_eq!(
-        got["Status"], "ERROR",
-        "GetStreamSession after placement: expected the modelled failure state, got {got}"
+        got["Status"], "ACTIVE",
+        "GetStreamSession after placement: expected the placed stream, got {got}"
     );
-    assert_eq!(
-        got["StatusReason"], "internalError",
-        "GetStreamSession after placement: expected a reason that says so, got {got}"
+    assert!(
+        got.get("StatusReason").is_none(),
+        "GetStreamSession after placement: StatusReason describes an ERROR or \
+         TERMINATED session, so a placed one carries none, got {got}"
     );
     assert!(
         got.get("SignalResponse").is_none(),

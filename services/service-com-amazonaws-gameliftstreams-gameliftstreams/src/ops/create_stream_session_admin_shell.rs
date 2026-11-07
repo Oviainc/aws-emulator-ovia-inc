@@ -11,24 +11,27 @@
 //! up. The operation's DOCUMENTATION (quoted further down, from the model) states
 //! the requirement as "The stream session must be in one of the following statuses:
 //! ACTIVE, CONNECTED, PENDING_CLIENT_RECONNECTION, or RECONNECTING"; the MESSAGE
-//! the service answers that refusal with is the one [`CreateStreamSessionAdminShell::handle`]
-//! builds, `Stream session '<stream session ARN>' is not in ACTIVE, CONNECTED,
+//! the service answers that refusal with is the one [`not_eligible`] builds,
+//! `Stream session '<stream session ARN>' is not in ACTIVE, CONNECTED,
 //! PENDING_CLIENT_RECONNECTION or RECONNECTING status for session access`, over the
 //! stored session's own ARN. The documentation sentence is NOT the wire text:
 //! the message is pinned by `tests/all/stream_session_admin_shell.rs`.
 //!
-//! An eligible session is answered with the modelled
-//! `StreamSessionAccessNotReadyException`, worded by that shape's own documentation,
-//! which is what is true here: the returned
-//! `SessionId`, `StreamUrl` and `TokenValue` are the credentials of a Systems
-//! Manager terminal INTO the live runtime environment of a stream session, and this
-//! emulator runs no such runtime environment — a session never reaches an eligible
-//! status (`StreamSession::advance` takes `ACTIVATING` to `ERROR`, for the same
-//! reason `CreateStreamSessionConnection` can never answer a WebRTC offer), so no
-//! terminal connection to one exists to hand out. Credentials for a websocket
-//! nothing serves would be a fabricated data plane rather than a computed response.
-//! Nothing here mints, stores or hands back a credential, so every call is answered
-//! from state alone.
+//! An eligible session is GRANTED a terminal session, which this operation creates:
+//! a Systems Manager session id over the stream session the terminal is into, the
+//! regional Systems Manager websocket endpoint of that session's data channel, and
+//! an authentication token the emulator's CREDENTIAL STORE mints — nothing here
+//! constructs a secret. The grant is persisted on the stream session with the
+//! 60-second window the operation documents ("The StreamUrl is valid for 60
+//! seconds"), so the clock releases it when the window is up and a later call mints
+//! a new one, which is exactly what the documentation says a caller does.
+//!
+//! What this emulator does NOT run is the interactive terminal at the far end of
+//! that data channel: the stream session resource, its placement, the grant and its
+//! window are real state, the shell session itself is not served here. The token is
+//! removed from the credential store as soon as its secret has been read, because it
+//! authenticates a Systems Manager data channel rather than a request to this
+//! emulator and must never be accepted as a credential of it.
 //!
 //! ## Shape of an operation
 //!
@@ -236,96 +239,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        // Materialise the transitions the clock had already made due at `now` — they
-        // were owed whether or not anybody called — so the status this request is
-        // judged against is the one the session actually holds.
-        state.materialize(now);
 
-        // Session-scoped: the resource this call addresses is the stream session its
-        // two path labels name, so an unresolvable session identifier, an absent
-        // group and an absent session are the SAME miss, reported against the
-        // composite stream session ARN — the rule `GetStreamSession` and
-        // `TerminateStreamSession` already answer by.
-        let session = crate::state::identifier_id(
-            &input.stream_session_identifier,
-            crate::state::STREAM_SESSION_RESOURCE,
-        )
-        .and_then(|session_id| {
-            state
-                .stream_group(&input.identifier)
-                .and_then(|group| group.sessions.get(&session_id))
-        });
-        let Some(session) = session else {
+        // READ PASS: hold the shared lock only long enough to resolve the stream
+        // session and judge its status, then release it so minting the token below
+        // does not run inside the critical section every other request of this
+        // service shares. The WRITE PASS re-asserts both.
+        let session_id = {
+            let mut state = state.lock();
+            // Materialise the transitions the clock had already made due at `now` —
+            // they were owed whether or not anybody called — so the status this
+            // request is judged against is the one the session actually holds.
+            state.materialize(now);
+            let session = crate::state::identifier_id(
+                &input.stream_session_identifier,
+                crate::state::STREAM_SESSION_RESOURCE,
+            )
+            .and_then(|session_id| {
+                state
+                    .stream_group(&input.identifier)
+                    .and_then(|group| group.sessions.get(&session_id))
+            });
+            // Session-scoped: the resource this call addresses is the stream session
+            // its two path labels name, so an unresolvable session identifier, an
+            // absent group and an absent session are the SAME miss, reported against
+            // the composite stream session ARN — the rule `GetStreamSession` and
+            // `TerminateStreamSession` already answer by.
+            let Some(session) = session else {
+                return Err(not_found(&region, &input));
+            };
+            if !session.admits_an_admin_shell() {
+                return Err(not_eligible(&session.arn));
+            }
+            session.id.clone()
+        };
+
+        // The token is a secret handed to the caller and is minted by the emulator's
+        // credential store, never built here. A store that minted nothing leaves the
+        // operation to refuse rather than report a token it made up — and the
+        // request itself was never the problem, so this is the server-side error.
+        let Some(token_value) = crate::state::mint_admin_shell_token(ctx.credential_store())
+        else {
             return Err(
-                CreateStreamSessionAdminShellErrorModeled::ResourceNotFoundException(
-                    crate::state::stream_session_not_found(
-                        &crate::state::resolved_stream_session_arn(
-                            &region,
-                            &input.identifier,
-                            &input.stream_session_identifier,
+                CreateStreamSessionAdminShellErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::with_internal_id(
+                            "no terminal session token could be minted for the stream session",
                         ),
-                    ),
+                    },
                 )
                 .into(),
             );
         };
 
-        // "The stream session must be in one of the following statuses: ACTIVE,
-        // CONNECTED, PENDING_CLIENT_RECONNECTION, or RECONNECTING." A session in any
-        // other status cannot carry a terminal session, and that is a value this
-        // operation refuses rather than a resource that is missing, so it is the
-        // modelled `ValidationException`. The status judged is the STORED one, and
-        // the refusal names the stored session's own ARN and the eligible statuses
-        // (the model's own `StreamSessionStatus` values), which is how the service
-        // words this refusal.
-        if !matches!(
-            session.status.as_str(),
-            crate::state::SESSION_ACTIVE
-                | crate::state::SESSION_CONNECTED
-                | crate::state::SESSION_PENDING_CLIENT_RECONNECTION
-                | crate::state::SESSION_RECONNECTING
-        ) {
-            return Err(
-                CreateStreamSessionAdminShellErrorModeled::ValidationException(
-                    ValidationException {
-                        message: crate::state::with_internal_id(format!(
-                            "Stream session '{}' is not in {}, {}, {} or {} status for \
-                             session access",
-                            session.arn,
-                            crate::state::SESSION_ACTIVE,
-                            crate::state::SESSION_CONNECTED,
-                            crate::state::SESSION_PENDING_CLIENT_RECONNECTION,
-                            crate::state::SESSION_RECONNECTING,
-                        )),
-                    },
-                )
-                .into(),
-            );
+        // WRITE PASS: one critical section that re-asserts what the read pass saw and
+        // then mints the grant and records it together, so a stream session that
+        // stopped while this request was resolving cannot end up with a terminal
+        // session opened into it after it.
+        let mut state = state.lock();
+        let suffix = state.mint_token(crate::state::ADMIN_SHELL_SESSION_SUFFIX_LENGTH);
+        let Some(session) = state
+            .stream_group_mut(&input.identifier)
+            .and_then(|group| group.sessions.get_mut(&session_id))
+        else {
+            return Err(not_found(&region, &input));
+        };
+        if !session.admits_an_admin_shell() {
+            return Err(not_eligible(&session.arn));
         }
+        let shell_session_id = crate::state::admin_shell_session_id(&session.id, &suffix);
+        let shell = crate::state::AdminShell {
+            session_id: shell_session_id.clone(),
+            stream_url: crate::state::admin_shell_stream_url(&region, &shell_session_id),
+            created_at: now,
+            // "The StreamUrl is valid for 60 seconds. After it expires, call this
+            // operation again to get a new URL."
+            expires_at: now + crate::state::ADMIN_SHELL_VALIDITY,
+        };
+        let stream_url = shell.stream_url.clone();
+        session.grant_admin_shell(shell);
 
-        // An eligible session, which this emulator never holds: the credentials this
-        // operation hands back open a terminal INTO the session's live runtime
-        // environment, and no runtime environment runs here, so the terminal
-        // connection to it is exactly what is unavailable — the condition this
-        // operation models (HTTP 409, retryable). Minting a session id, a websocket
-        // URL and a token for a channel nothing serves would report access that does
-        // not exist.
-        //
-        // The text is the one the model gives for this error shape, verbatim
-        // (`smithy_query(query="shape", shape="StreamSessionAccessNotReadyException")`),
-        // so nothing is added to it: the shape carries no member to name a session
-        // with, and nothing here knows a better reason than the one it states.
-        Err(
-            CreateStreamSessionAdminShellErrorModeled::StreamSessionAccessNotReadyException(
-                StreamSessionAccessNotReadyException {
-                    message: crate::state::with_internal_id(
-                        "The terminal connection to the stream session is not yet available. \
-                         Wait before retrying the request.",
-                    ),
-                },
-            )
-            .into(),
-        )
+        Ok(CreateStreamSessionAdminShellOutput {
+            session_id: Some(shell_session_id),
+            stream_url: Some(stream_url),
+            token_value: Some(token_value),
+        })
     }
+}
+
+/// The modelled miss for two path labels that name no stored stream session,
+/// reported against the composite stream session ARN they resolve to.
+fn not_found(
+    region: &str,
+    input: &CreateStreamSessionAdminShellInput,
+) -> CreateStreamSessionAdminShellError {
+    CreateStreamSessionAdminShellErrorModeled::ResourceNotFoundException(
+        crate::state::stream_session_not_found(&crate::state::resolved_stream_session_arn(
+            region,
+            &input.identifier,
+            &input.stream_session_identifier,
+        )),
+    )
+    .into()
+}
+
+/// The modelled refusal for a stream session in a status no terminal session can be
+/// opened into.
+///
+/// "The stream session must be in one of the following statuses: ACTIVE, CONNECTED,
+/// PENDING_CLIENT_RECONNECTION, or RECONNECTING." A session in any other status has
+/// no live runtime environment to open a terminal into, and that is a value this
+/// operation refuses rather than a resource that is missing, so it is the modelled
+/// `ValidationException`. The status judged is the STORED one, and the refusal names
+/// the stored session's own ARN and the eligible statuses (the model's own
+/// `StreamSessionStatus` values), which is how the service words this refusal.
+fn not_eligible(session_arn: &str) -> CreateStreamSessionAdminShellError {
+    CreateStreamSessionAdminShellErrorModeled::ValidationException(ValidationException {
+        message: crate::state::with_internal_id(format!(
+            "Stream session '{session_arn}' is not in {}, {}, {} or {} status for session \
+             access",
+            crate::state::SESSION_ACTIVE,
+            crate::state::SESSION_CONNECTED,
+            crate::state::SESSION_PENDING_CLIENT_RECONNECTION,
+            crate::state::SESSION_RECONNECTING,
+        )),
+    })
+    .into()
 }

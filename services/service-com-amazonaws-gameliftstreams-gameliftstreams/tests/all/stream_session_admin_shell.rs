@@ -13,11 +13,13 @@
 //! or RECONNECTING") is refused 400 `ValidationException` naming that session and
 //! the eligible statuses. Nothing it answers moves the session.
 //!
-//! The first table spans the status class: every status a stream session can hold
-//! in this emulator, reached through the API (started, settled, terminating,
-//! terminated), each asserted against the status the session reads back as. The
-//! second spans the identifier class: unknown group, unknown session, either label
-//! carrying another resource type's ARN, and both labels in ARN form.
+//! The first table spans the INELIGIBLE status class: every status a stream
+//! session can hold in this emulator that the operation refuses (started,
+//! placement failed, terminating, terminated), each asserted against the status the
+//! session reads back as. A session whose placement SUCCEEDED gets past this gate,
+//! which `stream_session_placement.rs` covers. The second table spans the
+//! identifier class: unknown group, unknown session, either label carrying another
+//! resource type's ARN, and both labels in ARN form.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -138,9 +140,14 @@ async fn an_ineligible_stream_session_status_is_refused_as_a_validation_error() 
     // the status the session is then in, whether that status is TERMINAL). The rows
     // differ along how far through its lifecycle the session is: just started,
     // settled by the clock, asked to stop, and stopped.
+    //
+    // The group holds ONE stream of capacity, which the first row's session is
+    // placed on as soon as the clock resolves it, so the placement of the second
+    // row's session finds none and ends in ERROR — the `placementTimeout` outcome
+    // `stream_session_placement.rs` pins.
     let cases: [(&str, bool, bool, &str, bool); 4] = [
         ("a freshly started session", false, false, "ACTIVATING", false),
-        ("a session the clock has settled", false, true, "ERROR", true),
+        ("a session whose placement failed", false, true, "ERROR", true),
         ("a session asked to terminate", true, false, "TERMINATING", false),
         ("a terminated session", true, true, "TERMINATED", true),
     ];

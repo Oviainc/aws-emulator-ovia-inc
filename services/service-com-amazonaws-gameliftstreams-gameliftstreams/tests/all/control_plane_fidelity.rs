@@ -870,8 +870,7 @@ async fn a_stream_session_connection_resolves_its_identifiers() {
         "case \"unknown stream session\": got {status} {got}"
     );
 
-    // A session that exists but is in a status a reconnection cannot start from, in
-    // both of the statuses this emulator can hold it in.
+    // A session that exists but is in a status a reconnection cannot start from.
     let (status, session) = call(
         &router,
         "POST",
@@ -894,7 +893,27 @@ async fn a_stream_session_connection_resolves_its_identifiers() {
         .to_string();
     let connections =
         format!("/streamgroups/{group_id}/streamsessions/{session_id}/connections");
-    for case in ["ACTIVATING", "ERROR"] {
+    let session_path = format!("/streamgroups/{group_id}/streamsessions/{session_id}");
+    // The rows span the statuses a reconnection cannot start from, in the order the
+    // session passes through them: the placement still running, the stream asked to
+    // stop, and the stream stopped.
+    for case in ["ACTIVATING", "TERMINATING", "TERMINATED"] {
+        if case == "TERMINATING" {
+            let (status, body) = call(&router, "DELETE", &session_path, None).await;
+            assert_eq!(
+                status, 204,
+                "case {case:?}: expected TerminateStreamSession 204, got {status} {body}"
+            );
+        }
+        if case == "TERMINATED" {
+            // Let the clock finish the stream it was asked to stop.
+            std::thread::sleep(PAST_TRANSITION);
+        }
+        let (_, session) = call(&router, "GET", &session_path, None).await;
+        assert_eq!(
+            session["Status"], case,
+            "case {case:?}: expected the session to be {case}, got {session}"
+        );
         let (status, got) = call(&router, "POST", &connections, Some(signal.clone())).await;
         assert_eq!(
             (status, error_code(&got).as_str()),
@@ -905,9 +924,6 @@ async fn a_stream_session_connection_resolves_its_identifiers() {
             got.get("SignalResponse").is_none(),
             "case {case:?}: no stream server ran, so nothing may answer a SignalResponse: {got}"
         );
-        // Let the clock take the session from ACTIVATING to its terminal status, and
-        // ask again.
-        std::thread::sleep(PAST_TRANSITION);
     }
 }
 

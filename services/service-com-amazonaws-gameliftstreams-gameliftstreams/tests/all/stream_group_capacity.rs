@@ -53,7 +53,10 @@ const DERIVED_CAPACITIES: [&str; 3] = [
 
 /// Create a stream group with exactly `configurations` as its locations and answer
 /// its id, ARN and the create response. The group is `ACTIVATING` on return.
-async fn group_with_locations(
+///
+/// `pub(crate)` so the other suites in this target configure a location's capacity
+/// through this one helper rather than growing a second copy of it.
+pub(crate) async fn group_with_locations(
     router: &MultiServiceRouter,
     description: &str,
     application: &str,

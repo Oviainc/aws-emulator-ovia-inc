@@ -9,17 +9,15 @@
 //! No success path exists, and that is deliberate. `SignalResponse` is "the WebRTC
 //! answer string that the stream server generates in response to the
 //! SignalRequest"; this emulator runs no stream server, so a `SignalResponse` it
-//! returned would be fabricated rather than computed. Accordingly nothing here ever
-//! reaches a session in `ACTIVE` or `PENDING_CLIENT_RECONNECTION` status —
-//! `StartStreamSession` leaves a session `ACTIVATING` and the clock takes it to
-//! `ERROR` — and the one branch that would need a stream server answers the
-//! scaffold's 501 instead of inventing a signal.
+//! returned would be fabricated rather than computed. A session whose placement
+//! succeeded does reach `ACTIVE`, so the branch that would need a stream server is
+//! reachable — and it answers the scaffold's 501 instead of inventing a signal.
 //!
 //! RESIDUAL 501 (deliberately NOT a `SCAFFOLDED, NOT IMPLEMENTED:` marker, which
 //! would re-report the whole operation as unwritten): the only 501 left is the
-//! branch for a session already in a connected status, which nothing in this
-//! emulator can produce and which no emulator without a real WebRTC stream server
-//! can answer faithfully. Every reachable call is served from state.
+//! branch for a session in a status a reconnection can start from, which no
+//! emulator without a real WebRTC stream server can answer faithfully. Every other
+//! call is served from state.
 //!
 //! ## Shape of an operation
 //!

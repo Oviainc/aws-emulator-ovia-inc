@@ -4,13 +4,17 @@
 //! Creates and PERSISTS a stream session under its stream group, in `ACTIVATING`
 //! status.
 //!
-//! A session reaches `ACTIVE` only once a stream server has started the content
-//! and answered the client's WebRTC offer (`SignalResponse` is "the WebRTC answer
-//! string that the stream server generates in response to the SignalRequest"), and
-//! this emulator runs no stream server. The resource, its ARN, its stored
-//! configuration and its status lifecycle are real; the placement resolves into the
-//! modelled failure state (`ERROR` with `StatusReason` `internalError`) rather than
-//! reporting a stream that never started. See `crate::state::StreamSession::advance`.
+//! "Amazon GameLift Streams creates the stream session resource, assigns an Amazon
+//! Resource Name (ARN) value, and begins searching for available stream capacity to
+//! run the stream. Session transitions to ACTIVATING status." The placement itself
+//! is resolved by the clock, against the capacity the hosting stream group holds:
+//! a session placed on a provisioned location with a free stream reaches `ACTIVE`,
+//! and one the group has no capacity for ends in `ERROR` with the modelled
+//! `StatusReason` for why. See `crate::state::StreamGroup::resolve_placements`.
+//!
+//! `SignalResponse` stays absent either way: the WebRTC answer is what the stream
+//! server generates in response to the offer, and this emulator runs none, so there
+//! is no peer for an answer to name.
 //!
 //! ## Shape of an operation
 //!
@@ -607,6 +611,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     created_at: now,
                     last_updated_at: now,
                     status_due_at: Some(now + crate::state::TRANSITION),
+                    admin_shells: Vec::new(),
                 };
                 let group = state
                     .stream_groups

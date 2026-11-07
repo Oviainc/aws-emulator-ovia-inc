@@ -137,6 +137,23 @@ pub const LOCATIONS_PER_STREAM_GROUP: usize = 100;
 /// defer is not a bound.
 pub const TERMINAL_SESSION_RETENTION: Duration = Duration::from_secs(60);
 
+/// How long the credentials of one administrative terminal session into a stream
+/// session are good for: "The `StreamUrl` is valid for 60 seconds. After it
+/// expires, call this operation again to get a new URL", and the token "is only
+/// valid for establishing a new connection within 60 seconds of generation"
+/// (`CreateStreamSessionAdminShell` documentation).
+pub const ADMIN_SHELL_VALIDITY: Duration = Duration::from_secs(60);
+
+/// How many administrative terminal sessions ONE stream session holds at a time.
+///
+/// Each one lives for [`ADMIN_SHELL_VALIDITY`] and the clock releases it when that
+/// window is up, so the set is already bounded in time; this is the emulator's own
+/// bound on how many a caller can hold inside one window — the oldest is released
+/// to admit a new one (see [`StreamSession::grant_admin_shell`]), so repeated calls
+/// cannot grow one session's record without end. The operation models no quota
+/// error, which is why the oldest is released rather than the call refused.
+pub const ADMIN_SHELLS_PER_SESSION: usize = 8;
+
 /// How many stream URLs ONE stream group holds at a time.
 ///
 /// Amazon GameLift Streams publishes an adjustable quota on stream URLs rather
@@ -195,6 +212,13 @@ pub const SESSION_TERMINATING: &str = "TERMINATING";
 pub const SESSION_TERMINATED: &str = "TERMINATED";
 pub const SESSION_REASON_INTERNAL_ERROR: &str = "internalError";
 pub const SESSION_REASON_API_TERMINATED: &str = "apiTerminated";
+/// "placementTimeout: Amazon GameLift Streams could not find available stream
+/// capacity to start a stream session. Increase the stream capacity in the stream
+/// group or wait until capacity becomes available" (`StatusReason` documentation).
+pub const SESSION_REASON_PLACEMENT_TIMEOUT: &str = "placementTimeout";
+/// "invalidSignalRequest: The WebRTC signal request that was sent is not valid"
+/// (`StatusReason` documentation).
+pub const SESSION_REASON_INVALID_SIGNAL_REQUEST: &str = "invalidSignalRequest";
 pub const REPLICATION_REPLICATING: &str = "REPLICATING";
 pub const REPLICATION_COMPLETED: &str = "COMPLETED";
 pub const STREAM_URL_ACTIVE: &str = "ACTIVE";
@@ -754,6 +778,30 @@ impl LocationSlot {
         self.status_due_at = Some(now + TRANSITION);
     }
 
+    /// How many stream sessions this location can run at the same time.
+    ///
+    /// The most stream capacity the service may have provisioned here: the
+    /// always-on capacity, which "indicates minimum streaming capacity which is
+    /// allocated to you and is never released back to the service", plus the
+    /// on-demand capacity, "the streaming capacity that Amazon GameLift Streams
+    /// can allocate in response to stream requests, and then de-allocate when the
+    /// session has terminated" — and never less than "the maximum capacity that
+    /// the service can allocate for you", which is what a location configured
+    /// through `MaximumCapacity` alone can scale to. A capacity the configuration
+    /// left out holds the service's default of zero ("Default is 0 when creating a
+    /// stream group or adding a location"), so a location configured through one
+    /// member alone is bounded by that one.
+    pub fn stream_capacity(&self) -> i32 {
+        let scalable = self
+            .always_on_capacity
+            .unwrap_or(0)
+            .max(0)
+            // Saturating, not checked: the capacities come from the request, so
+            // the arithmetic must not be able to overflow whatever a caller sent.
+            .saturating_add(self.on_demand_capacity.unwrap_or(0).max(0));
+        scalable.max(self.maximum_capacity.unwrap_or(0).max(0))
+    }
+
     /// Is this location still working towards a status of its own?
     ///
     /// `REMOVING` counts as well as `ACTIVATING` — "REMOVING: Amazon GameLift
@@ -1026,9 +1074,93 @@ impl StreamGroup {
         self.locations.iter().any(LocationSlot::is_settling)
     }
 
+    /// Can this group place one more stream session in `location`, beside the
+    /// sessions already placed there?
+    ///
+    /// Capacity lives in a location, and only a provisioned one holds any:
+    /// "ACTIVATING: Amazon GameLift Streams is preparing the location. You cannot
+    /// stream from ... this location yet." A session "runs on a compute resource
+    /// that a stream group has allocated", so the location can run as many streams
+    /// at once as it has stream capacity ([`LocationSlot::stream_capacity`]) and no
+    /// more. `placing` is the session being placed, which does not count against
+    /// itself.
+    fn can_place_in(&self, location: &str, placing: &str) -> bool {
+        let Some(slot) = self
+            .locations
+            .iter()
+            .find(|slot| slot.name == location && slot.status == LOCATION_ACTIVE)
+        else {
+            return false;
+        };
+        let placed = self
+            .sessions
+            .values()
+            .filter(|session| {
+                session.id != placing && session.location == location && session.is_placed()
+            })
+            .count();
+        u64::try_from(slot.stream_capacity()).unwrap_or(0) > placed as u64
+    }
+
+    /// Where `session`'s placement lands.
+    ///
+    /// "If Amazon GameLift Streams is successful in finding capacity for the
+    /// stream, the stream session status changes to ACTIVE status"; "if Amazon
+    /// GameLift Streams was not successful in finding capacity within the placement
+    /// timeout period ..., the stream session status changes to ERROR status and
+    /// StartStreamSession returns a StatusReason of placementTimeout". A group that
+    /// can no longer host streams at all (it is being deleted, or its capacity has
+    /// expired) has no capacity to find either, so it times the placement out the
+    /// same way.
+    ///
+    /// The signal request is judged first: a request that carries no WebRTC offer
+    /// the stream server could answer is the modelled `invalidSignalRequest`
+    /// rather than a capacity problem.
+    fn placement_of(&self, session: &StreamSession) -> Placement {
+        if !is_webrtc_offer(&session.signal_request) {
+            return Placement::Failed(SESSION_REASON_INVALID_SIGNAL_REQUEST);
+        }
+        if self.can_host_sessions() && self.can_place_in(&session.location, &session.id) {
+            Placement::Placed
+        } else {
+            Placement::Failed(SESSION_REASON_PLACEMENT_TIMEOUT)
+        }
+    }
+
+    /// Resolve every placement the clock had already made due at `now`.
+    ///
+    /// Placement is the group's business rather than the session's, because the
+    /// capacity a session is placed on belongs to the group's locations and is
+    /// shared with the sessions already placed there. The oldest start is resolved
+    /// first, so scarce capacity goes to the stream that asked for it first.
+    fn resolve_placements(&mut self, now: SystemTime) {
+        let mut due: Vec<(SystemTime, String)> = self
+            .sessions
+            .values()
+            .filter(|session| session.placement_due(now))
+            .map(|session| (session.created_at, session.id.clone()))
+            .collect();
+        due.sort();
+        for (_, id) in due {
+            let Some(session) = self.sessions.get(&id) else {
+                continue;
+            };
+            let Some(due_at) = session.status_due_at else {
+                continue;
+            };
+            let placement = self.placement_of(session);
+            if let Some(session) = self.sessions.get_mut(&id) {
+                session.resolve_placement(placement, due_at);
+            }
+        }
+    }
+
     /// Advance this group and its sessions. Answers `true` when the group is due
     /// to be gone (a `DELETING` group whose deletion completed).
     fn advance(&mut self, now: SystemTime) -> bool {
+        // The placements the clock owes first: their outcome is decided by the
+        // capacity this group holds right now.
+        self.resolve_placements(now);
         for session in self.sessions.values_mut() {
             session.advance(now);
         }
@@ -1101,8 +1233,10 @@ pub struct StreamSession {
     pub location: String,
     pub signal_request: String,
     /// The WebRTC answer "that the stream server generates in response to the
-    /// `SignalRequest`" (`SignalResponse` documentation). This emulator runs no
-    /// stream server, so nothing ever fills it in.
+    /// `SignalRequest`" (`SignalResponse` documentation). The answer is the stream
+    /// server's half of the WebRTC handshake, and this emulator runs no stream
+    /// server, so nothing fills it in: a value here would name a peer no client
+    /// could ever reach.
     pub signal_response: Option<String>,
     pub web_sdk_protocol_url: Option<String>,
     pub connection_timeout_seconds: Option<i32>,
@@ -1121,6 +1255,30 @@ pub struct StreamSession {
     pub last_updated_at: SystemTime,
     /// When the clock owes this session's next status transition, if any.
     pub status_due_at: Option<SystemTime>,
+    /// The administrative terminal sessions this stream session has handed out and
+    /// whose window is not up yet, oldest first (see [`AdminShell`]).
+    pub admin_shells: Vec<AdminShell>,
+}
+
+/// One administrative terminal session handed out for a stream session.
+///
+/// "Creates an administrative terminal session with full access to the live runtime
+/// environment of the Amazon GameLift Streams stream session. Use the returned
+/// credentials (SessionId, StreamUrl and TokenValue) with the Amazon Web Services
+/// Systems Manager Session Manager plugin"
+/// (`CreateStreamSessionAdminShell` documentation). The record is what makes the
+/// documented 60-second window real: the clock releases the grant when it is up,
+/// and nothing reads a token back out of it — the token is handed to the caller
+/// once and is never stored.
+#[derive(Debug, Clone)]
+pub struct AdminShell {
+    /// The Systems Manager session id this grant reported.
+    pub session_id: String,
+    /// The Systems Manager websocket endpoint this grant reported.
+    pub stream_url: String,
+    pub created_at: SystemTime,
+    /// When this grant's [`ADMIN_SHELL_VALIDITY`] is up.
+    pub expires_at: SystemTime,
 }
 
 impl StreamSession {
@@ -1129,6 +1287,23 @@ impl StreamSession {
         !matches!(
             self.status.as_str(),
             SESSION_ERROR | SESSION_TERMINATED | SESSION_TERMINATING
+        )
+    }
+
+    /// Is this session PLACED on stream capacity — running on a compute resource
+    /// the stream group allocated to it?
+    ///
+    /// Only a session whose placement succeeded is: a session that is still
+    /// `ACTIVATING` is "searching for available stream capacity" and holds none
+    /// yet, and one that has stopped or failed has given its own back. These are
+    /// the statuses a placed stream holds, from the model's `StreamSessionStatus`.
+    pub fn is_placed(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            SESSION_ACTIVE
+                | SESSION_CONNECTED
+                | SESSION_PENDING_CLIENT_RECONNECTION
+                | SESSION_RECONNECTING
         )
     }
 
@@ -1143,34 +1318,150 @@ impl StreamSession {
         self.is_terminal() && now >= self.last_updated_at + TERMINAL_SESSION_RETENTION
     }
 
+    /// Does the clock owe this session's placement by `now`? A session is
+    /// `ACTIVATING` while the service "begins searching for available stream
+    /// capacity to run the stream", and the placement resolves one [`TRANSITION`]
+    /// later.
+    fn placement_due(&self, now: SystemTime) -> bool {
+        self.status == SESSION_ACTIVATING && self.status_due_at.is_some_and(|due| now >= due)
+    }
+
+    /// Is this session in a status an administrative terminal session can be opened
+    /// into? "The stream session must be in one of the following statuses: ACTIVE,
+    /// CONNECTED, PENDING_CLIENT_RECONNECTION, or RECONNECTING"
+    /// (`CreateStreamSessionAdminShell` documentation) — the statuses of a stream
+    /// that is placed and therefore has a live runtime environment.
+    pub fn admits_an_admin_shell(&self) -> bool {
+        self.is_placed()
+    }
+
+    /// Record one administrative terminal session this stream session handed out.
+    ///
+    /// The oldest grant is released when the record is at
+    /// [`ADMIN_SHELLS_PER_SESSION`], so the set is bounded by that count as well as
+    /// by [`ADMIN_SHELL_VALIDITY`].
+    pub fn grant_admin_shell(&mut self, shell: AdminShell) {
+        while self.admin_shells.len() >= ADMIN_SHELLS_PER_SESSION {
+            self.admin_shells.remove(0);
+        }
+        self.admin_shells.push(shell);
+    }
+
+    /// Settle this session's placement, which the clock owed at `due`.
+    ///
+    /// A placed stream is `ACTIVE` and carries no `StatusReason` — that member is
+    /// "a short description of the reason the stream session is in ERROR status or
+    /// TERMINATED status" — and a placement that failed carries the reason it
+    /// failed for. Which outcome applies is the stream group's call
+    /// ([`StreamGroup::placement_of`]): it holds the capacity.
+    fn resolve_placement(&mut self, placement: Placement, due: SystemTime) {
+        self.status_due_at = None;
+        match placement {
+            Placement::Placed => {
+                self.status = SESSION_ACTIVE.to_string();
+                self.status_reason = None;
+            }
+            Placement::Failed(reason) => {
+                self.status = SESSION_ERROR.to_string();
+                self.status_reason = Some(reason.to_string());
+            }
+        }
+        // `LastUpdatedAt` is the instant the transition was DUE, not the instant
+        // it was observed, so two reads of the same session agree.
+        self.last_updated_at = due;
+    }
+
     /// Advance the transition the clock owed at `now`.
     ///
-    /// `ACTIVATING` resolves into `ERROR` with `StatusReason` `internalError`: a
-    /// session only reaches `ACTIVE` when a stream server starts the content and
-    /// answers the client's WebRTC offer, and this emulator has no stream server,
-    /// so there is no placement to report as successful.
+    /// The one transition a session owes on its own is the end of a stream that was
+    /// asked to stop; the resolution of a placement belongs to the stream group
+    /// whose capacity the stream is placed on (see
+    /// [`StreamGroup::resolve_placements`]).
     fn advance(&mut self, now: SystemTime) {
+        // "The StreamUrl is valid for 60 seconds. After it expires, call this
+        // operation again to get a new URL": a terminal session whose window is up
+        // is gone whether or not anybody asked, so the grant goes with it.
+        self.admin_shells.retain(|shell| now < shell.expires_at);
         let Some(due) = self.status_due_at else {
             return;
         };
         if now < due {
             return;
         }
-        self.status_due_at = None;
-        // `LastUpdatedAt` moves only when the status actually does.
-        match self.status.as_str() {
-            SESSION_ACTIVATING => {
-                self.status = SESSION_ERROR.to_string();
-                self.status_reason = Some(SESSION_REASON_INTERNAL_ERROR.to_string());
-                self.last_updated_at = due;
-            }
-            SESSION_TERMINATING => {
-                self.status = SESSION_TERMINATED.to_string();
-                self.last_updated_at = due;
-            }
-            _ => {}
+        if self.status == SESSION_TERMINATING {
+            self.status_due_at = None;
+            self.status = SESSION_TERMINATED.to_string();
+            // The runtime environment the stream ran in is gone with the stream, so
+            // the terminal sessions into it are gone too.
+            self.admin_shells.clear();
+            // `LastUpdatedAt` moves only when the status actually does.
+            self.last_updated_at = due;
         }
     }
+}
+
+/// How a stream session's placement resolved.
+///
+/// "Placement completion: If Amazon GameLift Streams is successful in finding
+/// capacity for the stream, the stream session status changes to ACTIVE status ...
+/// If Amazon GameLift Streams was not successful ..., the stream session status
+/// changes to ERROR status" (`StartStreamSession` documentation).
+#[derive(Debug, Clone, Copy)]
+enum Placement {
+    /// Capacity was found for the stream.
+    Placed,
+    /// It was not, for this `StreamSessionStatusReason`.
+    Failed(&'static str),
+}
+
+/// The one `SignalRequest` value that starts a stream session without carrying a
+/// WebRTC offer: "Amazon GameLift Streams also supports setting the field to
+/// \"NO_CLIENT_CONNECTION\". This will create a session without needing any browser
+/// request or Web SDK integration. The session starts up as usual and waits for a
+/// reconnection from a browser" (`SignalRequest` documentation).
+pub const NO_CLIENT_CONNECTION: &str = "NO_CLIENT_CONNECTION";
+
+/// Whether `signal_request` carries something a stream server could answer, which
+/// is what decides between a placement and the modelled `invalidSignalRequest`
+/// failure ("The WebRTC signal request that was sent is not valid").
+///
+/// `SignalRequest` is "a WebRTC ICE offer string to use when initializing a WebRTC
+/// connection. Typically, the offer is a very long JSON string", so both forms a
+/// WebRTC client hands out are accepted: the session description as a JSON object,
+/// which is what the Web SDK produces (the description itself under `sdp`, and a
+/// `type` that must be the offer rather than an answer), and a bare SDP offer. An
+/// SDP body is a sequence of `<type>=<value>` lines opening with its protocol
+/// version, and SDP has exactly one version — `v=0`. The documented
+/// [`NO_CLIENT_CONNECTION`] sentinel carries no offer at all and still starts a
+/// session.
+pub fn is_webrtc_offer(signal_request: &str) -> bool {
+    let signal_request = signal_request.trim();
+    if signal_request == NO_CLIENT_CONNECTION {
+        return true;
+    }
+    if let Ok(serde_json::Value::Object(description)) =
+        serde_json::from_str::<serde_json::Value>(signal_request)
+    {
+        if description
+            .get("type")
+            .is_some_and(|kind| kind.as_str() != Some("offer"))
+        {
+            return false;
+        }
+        return description
+            .get("sdp")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_session_description);
+    }
+    is_session_description(signal_request)
+}
+
+/// Whether `text` is an SDP body: its first line is SDP's single version line.
+fn is_session_description(text: &str) -> bool {
+    text.trim_start()
+        .lines()
+        .next()
+        .is_some_and(|version| version.trim_end() == "v=0")
 }
 
 /// A persisted stream URL, stored under the stream group that runs the stream
@@ -1275,6 +1566,65 @@ pub fn shareable_stream_url(region: &str, group_id: &str, url_id: &str, token: &
 
 /// How many characters the opaque token a shareable stream URL carries holds.
 pub const STREAM_URL_TOKEN_LENGTH: usize = 32;
+
+/// How many characters the opaque suffix of an administrative terminal session's
+/// `SessionId` holds.
+pub const ADMIN_SHELL_SESSION_SUFFIX_LENGTH: usize = 16;
+
+/// The `SessionId` one administrative terminal session reports: "an Amazon Web
+/// Services Systems Manager session identifier that uniquely identifies the
+/// requested terminal session".
+///
+/// Amazon GameLift Streams publishes no format for the value, so it is built the
+/// way a Session Manager session id is: the target the session is into — here the
+/// stream session's own id — and an opaque part that makes one grant distinct from
+/// the next. `suffix` comes from the store's mint, so two grants for one stream
+/// session never share an id and nothing about the request can be read back out of
+/// it.
+pub fn admin_shell_session_id(stream_session_id: &str, suffix: &str) -> String {
+    format!("{stream_session_id}-{suffix}")
+}
+
+/// The `StreamUrl` one administrative terminal session reports: "an Amazon Web
+/// Services Systems Manager WebSocket connection endpoint for the requested
+/// terminal session".
+///
+/// The form is the one Systems Manager hands a Session Manager client for a
+/// session's data channel — the regional `ssmmessages` websocket endpoint, the
+/// session's own id and the publish-subscribe role the client opens the channel
+/// with. The runtime environment at the far end of that channel is the stream
+/// session's own, which this emulator does not run: the grant, its id and its
+/// 60-second window are real state, the interactive terminal is not.
+pub fn admin_shell_stream_url(region: &str, session_id: &str) -> String {
+    format!(
+        "wss://ssmmessages.{region}.amazonaws.com/v1/data-channel/{session_id}\
+         ?role=publish_subscribe"
+    )
+}
+
+/// The `TokenValue` one administrative terminal session reports: "an Amazon Web
+/// Services Systems Manager authentication token that authenticates your access to
+/// the session ID and WebSocket URL".
+///
+/// The value is a secret handed to the caller, so nothing here constructs it: it
+/// comes from the one component that generates secrets, the emulator's credential
+/// store. It authenticates a Systems Manager data channel rather than a request to
+/// this emulator, so it is NOT a credential of the emulator and must never be
+/// accepted as one — which is why the minted entry is removed from the store again
+/// as soon as its secret has been read.
+///
+/// `None` when the store minted nothing, which leaves the operation to refuse
+/// rather than report a token it made up.
+pub fn mint_admin_shell_token(store: &::emulator_server::CredentialStore) -> Option<String> {
+    let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let token = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .unwrap_or_default()
+        .to_string();
+    // The terminal session's token is not a credential of this emulator; see above.
+    let _ = store.delete(&minted.id);
+    (!token.is_empty()).then_some(token)
+}
 
 /// Per-service state for com-amazonaws-gameliftstreams-gameliftstreams. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
