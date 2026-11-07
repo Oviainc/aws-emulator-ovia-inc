@@ -7,7 +7,9 @@
 //! `MonitorResource` and to `ProbeResource`), so the ARN is resolved against
 //! the ARNs the store minted for its monitors and their probes
 //! ([`crate::state::ComAmazonawsNetworkmonitorNetworkmonitorState::resolve_tagged_resource`]);
-//! an ARN no stored record carries is `ResourceNotFoundException`.
+//! an ARN no stored record carries is refused with the code AWS's tagging facade
+//! answers rather than the modelled one: 404 `NotFoundException`
+//! ([`crate::scaffolded::TAG_NOT_FOUND_CODE`]).
 //!
 //! `@readonly`: this handler takes no write at all. Unlike `GetMonitor` it does
 //! not even settle the clock's `PENDING` -> `ACTIVE` transition, because a
@@ -152,6 +154,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `resourceArn`'s `@length(20..2048)` and `@pattern("^arn:.*$")` are
         // refused by the framework BEFORE this handler runs, so an ARN that
         // reaches here is one the service could have minted.
+        //
+        // AWS decides authorization at the IAM layer, ahead of the service
+        // reading anything, so a caller whose identity-based policies do not
+        // allow this action is refused without being told whether the resource
+        // the ARN names exists.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.resource_arn,
+        )
+        .map_err(ListTagsForResourceErrorModeled::AccessDeniedException)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),
@@ -183,15 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect::<::std::collections::HashMap<String, String>>()
             });
         let Some(tags) = tags else {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "no monitor or probe with ARN {} exists",
-                        input.resource_arn
-                    )),
-                },
-            )
-            .into());
+            // The tag APIs' own not-found code, not the modelled
+            // `ResourceNotFoundException` ([`crate::scaffolded::TAG_NOT_FOUND_CODE`]).
+            return Err(crate::scaffolded::Scaffolded::tag_not_found());
         };
 
         // Read straight out of the stored record, so what this reports is what

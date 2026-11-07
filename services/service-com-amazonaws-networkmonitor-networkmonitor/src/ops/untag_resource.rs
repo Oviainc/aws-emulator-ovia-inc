@@ -6,7 +6,9 @@
 //!
 //! The target is addressed by the ARN this service MINTED and stores on the
 //! record ([`crate::state::ComAmazonawsNetworkmonitorNetworkmonitorState::resolve_tagged_resource`]),
-//! so an ARN no stored resource carries is a 404 `ResourceNotFoundException`.
+//! so an ARN no stored resource carries is refused with the code AWS's tagging
+//! facade answers rather than the modelled one: 404 `NotFoundException`
+//! ([`crate::scaffolded::TAG_NOT_FOUND_CODE`]).
 //! A resource whose teardown has already been accepted is refused with the same
 //! 404
 //! ([`crate::state::ComAmazonawsNetworkmonitorNetworkmonitorState::resolve_tagged_resource_for_mutation`]):
@@ -182,6 +184,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // EMPTY `tagKeys` is inside the modelled `@length(min: 0)`, so it is a
         // request that removes nothing rather than a bad request.
         //
+        // AWS decides authorization at the IAM layer, ahead of the service
+        // looking at the request's own input, so a caller whose identity-based
+        // policies do not allow this action is refused before any key is removed
+        // and without being told whether the resource exists.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.resource_arn,
+        )
+        .map_err(UntagResourceErrorModeled::AccessDeniedException)?;
+        //
         // Which keys a caller may name is a property of the REQUEST alone, so it
         // is judged before anything is resolved or written: the keys AWS
         // reserves for its own tags are not a caller's to remove, whatever ARN
@@ -221,12 +235,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let target = store
             .resolve_tagged_resource_for_mutation(&region, &input.resource_arn)
             .ok_or_else(|| {
-                UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!(
-                        "no monitor or probe with ARN {} exists",
-                        input.resource_arn
-                    )),
-                })
+                // The tag APIs' own not-found code, not the modelled
+                // `ResourceNotFoundException`
+                // ([`crate::scaffolded::TAG_NOT_FOUND_CODE`]).
+                crate::scaffolded::Scaffolded::tag_not_found()
             })?;
         let tags = store.tags_mut(&target).ok_or_else(|| {
             UntagResourceErrorModeled::InternalServerException(InternalServerException {

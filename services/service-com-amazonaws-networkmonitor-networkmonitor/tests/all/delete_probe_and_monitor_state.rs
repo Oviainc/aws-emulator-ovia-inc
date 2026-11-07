@@ -18,9 +18,9 @@
 //! monitor before answering.
 //!
 //! The table spans what the rule turns on: how many probes the monitor holds,
-//! how many of them the caller had switched off (none, some, all), and which
-//! half of its own lifecycle the probe was in when it was deleted (provisioning,
-//! measuring, switched off). The recorded case — a monitor's only probe
+//! how many of them the caller had switched off (none, some, all), and whether
+//! the probe had settled into service before it was deleted or was switched off
+//! while it was still provisioning. The recorded case — a monitor's only probe
 //! deactivated and then deleted — is one row.
 
 use std::time::{Duration, Instant};
@@ -238,11 +238,12 @@ async fn deleting_a_probe_never_activates_its_monitor() {
             "INACTIVE",
         ),
         (
-            "the monitor's only probe deleted while it is still provisioning",
+            "the monitor's only probe switched off while it was still provisioning, \
+             then deleted",
             1,
-            0,
+            1,
             false,
-            "PENDING",
+            "INACTIVE",
             "INACTIVE",
         ),
     ];

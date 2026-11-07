@@ -8,8 +8,8 @@
 //!
 //! * a tagging call addresses its target by the ARN this service MINTED, which
 //!   resolves to the stored monitor or the stored probe that carries it, and to
-//!   nothing otherwise — an ARN no stored resource carries is HTTP 404
-//!   `ResourceNotFoundException`;
+//!   nothing otherwise — an ARN no stored resource carries is HTTP 404 with the
+//!   error code AWS's tagging facade answers, `NotFoundException`;
 //! * `ListTagsForResource` reports the tags STORED on that one resource,
 //!   whatever their number, keys or values, and is `@readonly`: reading tags
 //!   changes nothing a later caller sees;
@@ -70,6 +70,17 @@ pub(crate) const MAX_TAGS: usize = 200;
 /// back to the protocol-defaulted 200 fails here. The rule behind it is pinned in
 /// `tag_mutation_no_content.rs`.
 pub(crate) const TAG_MUTATION_STATUS: u16 = 204;
+
+/// The wire error code the three tagging operations answer for a `resourceArn`
+/// that resolves to no monitor and no probe: `NotFoundException`, the code AWS's
+/// tagging facade states, and NOT the `ResourceNotFoundException` the model
+/// lists for these operations. Written as the literal the wire contract fixes,
+/// so a handler that drifts back to the modelled code fails here.
+pub(crate) const TAG_NOT_FOUND_CODE: &str = "NotFoundException";
+
+/// The message that refusal carries: a constant, naming nothing from the
+/// request.
+pub(crate) const TAG_NOT_FOUND_MESSAGE: &str = "Resource was not found";
 
 /// Which stored resource a case's `resourceArn` names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +229,50 @@ async fn delete_probe(
         None,
     )
     .await
+}
+
+/// `PATCH /monitors/{monitorName}/probes/{probeId}` switching the probe off —
+/// `UpdateProbe` with `state: INACTIVE`.
+///
+/// The step a monitor's own delete requires: a monitor that still holds a probe
+/// in service is not deleted, and a probe is deactivated at once, where a
+/// deleted one is only given up over the span its teardown takes.
+pub(crate) async fn deactivate_probe(
+    router: &MultiServiceRouter,
+    name: &str,
+    probe_id: &str,
+) -> (u16, Value) {
+    call(
+        router,
+        "PATCH",
+        &format!("/monitors/{name}/probes/{probe_id}"),
+        Some(r#"{"state":"INACTIVE"}"#),
+    )
+    .await
+}
+
+/// Switch every probe of `name` off and then delete the monitor, which is the
+/// order this service accepts a monitor's delete in.
+pub(crate) async fn teardown_monitor(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
+    let (status, monitor) = get_monitor(router, name).await;
+    assert_eq!(
+        status, 200,
+        "teardown of {name:?}: expected GetMonitor 200, got {status} {monitor:?}"
+    );
+    for probe in monitor
+        .get("probes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let probe_id = string_at(&probe, "probeId");
+        let (status, off) = deactivate_probe(router, name, &probe_id).await;
+        assert_eq!(
+            status, 200,
+            "teardown of {name:?}: expected UpdateProbe 200 for {probe_id}, got {status} {off:?}"
+        );
+    }
+    delete_monitor(router, name).await
 }
 
 /// `GET /tags/{resourceArn}` — `ListTagsForResource`.
@@ -525,8 +580,8 @@ async fn a_probes_stored_tags_are_what_list_tags_for_resource_reports() {
 }
 
 /// An ARN no stored monitor and no stored probe carries is 404
-/// `ResourceNotFoundException` for `ListTagsForResource`, however it differs
-/// from a stored one.
+/// `NotFoundException` for `ListTagsForResource`, however it differs from a
+/// stored one.
 #[tokio::test]
 async fn listing_tags_for_an_arn_no_resource_carries_is_not_found() {
     let router = router();
@@ -563,6 +618,11 @@ async fn listing_tags_for_an_arn_no_resource_carries_is_not_found() {
         "setup: the probe's ARN should resolve before the delete, got {status} {listed:?}"
     );
 
+    let (status, body) = deactivate_probe(&router, "doomed", &probe_id).await;
+    assert_eq!(
+        status, 200,
+        "setup: UpdateProbe should switch the probe off, got {status} {body:?}"
+    );
     let (status, body) = delete_probe(&router, "doomed", &probe_id).await;
     assert_eq!(
         status, 200,
@@ -611,8 +671,13 @@ async fn listing_tags_for_an_arn_no_resource_carries_is_not_found() {
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+            TAG_NOT_FOUND_CODE,
+            "case {case:?}: expected {TAG_NOT_FOUND_CODE}, got {body:?}"
+        );
+        assert_eq!(
+            string_at(&body, "message"),
+            TAG_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected {TAG_NOT_FOUND_MESSAGE:?}, got {body:?}"
         );
     }
 }
@@ -1088,7 +1153,7 @@ async fn a_tag_write_past_the_tag_map_maximum_is_refused_and_persists_nothing() 
 }
 
 /// An ARN no stored resource carries is refused by BOTH tagging writes with HTTP
-/// 404 `ResourceNotFoundException`, whatever shape it has.
+/// 404 `NotFoundException`, whatever shape it has.
 ///
 /// The rows differ along WHY nothing carries the ARN: the name was never
 /// created, the resource was deleted, the probe id is not one that was minted,
@@ -1113,7 +1178,7 @@ async fn tagging_an_arn_no_resource_carries_is_not_found() {
         &json!({"role": "edge"}),
     )
     .await;
-    let (status, body) = delete_monitor(&router, "untag-deleted").await;
+    let (status, body) = teardown_monitor(&router, "untag-deleted").await;
     assert_eq!(
         status, 200,
         "expected DeleteMonitor 200, got {status} {body:?}"
@@ -1162,8 +1227,8 @@ async fn tagging_an_arn_no_resource_carries_is_not_found() {
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+            TAG_NOT_FOUND_CODE,
+            "case {case:?}: expected {TAG_NOT_FOUND_CODE}, got {body:?}"
         );
 
         // The same ARN resolution, so the same refusal, for the write side.
@@ -1175,8 +1240,8 @@ async fn tagging_an_arn_no_resource_carries_is_not_found() {
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+            TAG_NOT_FOUND_CODE,
+            "case {case:?}: expected {TAG_NOT_FOUND_CODE}, got {body:?}"
         );
     }
 

@@ -7,8 +7,9 @@
 //! leaving every other stored key alone. The tags live in the resource's own
 //! record ([`crate::state`]), so what this write stores is what `GetMonitor`
 //! reports afterwards — for the monitor itself and for each probe it lists — and
-//! an ARN no stored resource answers to is
-//! refused with the modelled 404 `ResourceNotFoundException`.
+//! an ARN no stored resource answers to is refused with the code AWS's tagging
+//! facade answers rather than the modelled one: 404 `NotFoundException`
+//! ([`crate::scaffolded::TAG_NOT_FOUND_CODE`]).
 //!
 //! A write that lands in a PROBE rewrites a record the monitor holds and every
 //! read of the monitor reports, so it changed the monitor too and the monitor's
@@ -139,16 +140,16 @@ impl From<TagResourceErrorModeled> for TagResourceError {
     }
 }
 
-/// The modelled 404 for an ARN this write reaches no resource through — one no
-/// stored monitor or probe carries, and one naming a resource whose teardown has
-/// been accepted. The wording matches `UntagResource`'s: the two operations
-/// resolve their `resourceArn` the same way, so they refuse an ARN they reach
-/// nothing through the same way.
-fn not_found(resource_arn: &str) -> TagResourceError {
-    TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("no monitor or probe with ARN {resource_arn} exists")),
-    })
-    .into()
+/// The 404 for an ARN this write reaches no resource through — one no stored
+/// monitor or probe carries, and one naming a resource whose teardown has been
+/// accepted. The code is the tag APIs' own `NotFoundException` rather than the
+/// modelled `ResourceNotFoundException`
+/// ([`crate::scaffolded::TAG_NOT_FOUND_CODE`]), and the wording matches
+/// `UntagResource`'s and `ListTagsForResource`'s: the three operations resolve
+/// their `resourceArn` the same way, so they refuse an ARN they reach nothing
+/// through the same way.
+fn not_found() -> TagResourceError {
+    crate::scaffolded::Scaffolded::tag_not_found()
 }
 
 /// This service's `ValidationException` (HTTP 400), carrying `message`.
@@ -202,6 +203,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // key's and value's own length bounds, are refused by the framework
         // BEFORE this handler runs.
         //
+        // AWS decides authorization at the IAM layer, ahead of the service
+        // looking at the request's own input, so a caller whose identity-based
+        // policies do not allow this action is refused before any pair is
+        // written and without being told whether the resource exists.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.resource_arn,
+        )
+        .map_err(TagResourceErrorModeled::AccessDeniedException)?;
+        //
         // Which keys a caller may name is a property of the REQUEST alone, so it
         // is judged before anything is resolved or written: a request naming a
         // key of AWS's own namespace assigns nothing, whatever ARN it carried.
@@ -235,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // until the clock has carried the teardown through.
         let target = store
             .resolve_tagged_resource_for_mutation(&region, &input.resource_arn)
-            .ok_or_else(|| not_found(&input.resource_arn))?;
+            .ok_or_else(not_found)?;
         let tags = store.tags_mut(&target).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: Some(format!(

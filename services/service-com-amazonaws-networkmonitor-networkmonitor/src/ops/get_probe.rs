@@ -175,6 +175,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `monitorName`'s and `probeId`'s `@pattern`s are refused by the
         // framework BEFORE this handler runs, so an id that reaches here is one
         // this service could have minted.
+        //
+        // AWS decides authorization at the IAM layer, ahead of the service
+        // reading anything, so a caller whose identity-based policies do not
+        // allow this action is refused without being told whether the probe
+        // exists.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::probe_arn(&crate::state::request_region(ctx), &input.probe_id),
+        )
+        .map_err(GetProbeErrorModeled::AccessDeniedException)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetProbeErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),

@@ -197,9 +197,9 @@ async fn drain(router: &MultiServiceRouter, name: &str, probe_id: &str) -> Vec<S
 ///
 /// The table spans the class: both address families, both protocols (so a probe
 /// with a `destinationPort` and one without), a tagged probe, `packetSize` at
-/// both published bounds of its `@range(56..8500)`, and a probe deleted while it
-/// is still provisioning beside ones deleted once they are live. The recorded
-/// case (a live ICMP IPv4 probe) is one row.
+/// both published bounds of its `@range(56..8500)`, and a probe switched off
+/// while it was still provisioning beside ones deleted once they are live. The
+/// recorded case (a live ICMP IPv4 probe) is one row.
 #[tokio::test]
 async fn an_accepted_delete_drains_the_probe_through_the_modelled_teardown_states() {
     // (case, probe body, whether the probe is live before the delete)
@@ -220,7 +220,7 @@ async fn an_accepted_delete_drains_the_probe_through_the_modelled_teardown_state
             true,
         ),
         (
-            "a probe deleted while it is still provisioning",
+            "a probe switched off while it was still provisioning",
             probe_json("10.0.0.2", "ICMP", r#","packetSize":56"#),
             false,
         ),
@@ -229,6 +229,17 @@ async fn an_accepted_delete_drains_the_probe_through_the_modelled_teardown_state
     for (case, probe, live) in cases {
         let router = router();
         let (probe_id, probe_arn) = probe_fixture(&router, "teardown-host", &probe).await;
+        if !live {
+            // A probe is given up only once it has left `PENDING`, and switching
+            // it off is the other way out of that state: this row deletes a
+            // probe that never reached service.
+            let (status, off) =
+                update_probe(&router, "teardown-host", &probe_id, r#"{"state":"INACTIVE"}"#).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected UpdateProbe 200 switching the probe off, got {off:?}"
+            );
+        }
         if live {
             std::thread::sleep(PAST_ACTIVATION);
             let (_, got) = get_probe(&router, "teardown-host", &probe_id).await;
@@ -583,10 +594,10 @@ async fn repeating_the_delete_neither_restarts_nor_postpones_the_teardown() {
 /// The table spans the class the rule covers rather than the one recorded
 /// probe: both address families, both protocols (so a probe with a
 /// `destinationPort` and one without), `packetSize` at the ceiling of its
-/// `@range(56..8500)`, a probe deleted while it is still provisioning beside
-/// ones deleted once they are live, and a `modifiedAt` baseline that is still
-/// the creation instant beside ones an earlier `UpdateProbe` already moved (a
-/// configuration member, and the caller-settable `state`).
+/// `@range(56..8500)`, a probe switched off while it was still provisioning
+/// beside ones deleted once they are live, and a `modifiedAt` baseline that is
+/// still the creation instant beside ones an earlier `UpdateProbe` already moved
+/// (a configuration member, and the caller-settable `state`).
 #[tokio::test]
 async fn an_accepted_delete_moves_the_probes_own_modified_at() {
     // (case, probe body, whether the probe is live before the delete, an
@@ -612,10 +623,10 @@ async fn an_accepted_delete_moves_the_probes_own_modified_at() {
             Some(r#"{"state":"INACTIVE"}"#),
         ),
         (
-            "a probe deleted while it is still provisioning",
+            "a probe switched off while it was still provisioning",
             probe_json("10.0.4.2", "ICMP", r#","packetSize":56"#),
             false,
-            None,
+            Some(r#"{"state":"INACTIVE"}"#),
         ),
     ];
 

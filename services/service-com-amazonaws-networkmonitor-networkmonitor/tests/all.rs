@@ -17,12 +17,16 @@ mod authored_refusal_messages;
 mod client_token_record_is_the_first_creates;
 #[path = "all/client_token_replay.rs"]
 mod client_token_replay;
+#[path = "all/delete_guards.rs"]
+mod delete_guards;
 #[path = "all/delete_probe_and_monitor_state.rs"]
 mod delete_probe_and_monitor_state;
 #[path = "all/draining_probe_tag_mutations.rs"]
 mod draining_probe_tag_mutations;
 #[path = "all/idempotent_replay_state.rs"]
 mod idempotent_replay_state;
+#[path = "all/identity_authorization.rs"]
+mod identity_authorization;
 #[path = "all/list_monitors_no_position.rs"]
 mod list_monitors_no_position;
 #[path = "all/list_monitors_pagination.rs"]

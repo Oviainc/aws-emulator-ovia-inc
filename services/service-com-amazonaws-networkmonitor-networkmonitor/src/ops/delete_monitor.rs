@@ -7,6 +7,14 @@
 //! `ListMonitors` no longer includes it. An unknown name is
 //! `ResourceNotFoundException`.
 //!
+//! A monitor is given up only once nothing of it is still measuring: while it
+//! holds a probe that is in service ([`crate::state::Probe::is_in_service`]) the
+//! delete is REFUSED with `ValidationException` (400) and nothing is removed, so
+//! the ordered teardown a caller has to perform — deactivate or delete each
+//! probe, then the monitor — is the only order this service accepts. A probe the
+//! caller has switched off, and one whose own teardown has already been
+//! accepted, is not in service and blocks nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -102,6 +110,18 @@ impl From<DeleteMonitorErrorModeled> for DeleteMonitorError {
     }
 }
 
+/// This service's modelled `ValidationException` (HTTP 400), carrying `message`
+/// — the pre-delete guard's refusal
+/// ([`crate::state::monitor_probes_in_service_message`]). `ValidationException`
+/// is a service-common error of this model, and the one AWS states this guard
+/// with.
+fn validation(message: String) -> DeleteMonitorError {
+    DeleteMonitorErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `DeleteMonitor` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -138,6 +158,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AWS decides authorization at the IAM layer, ahead of the service
+        // reading anything, so a caller whose identity-based policies do not
+        // allow this action is refused before any record is touched — and is
+        // told nothing about whether the monitor exists.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::monitor_arn(
+                &crate::state::request_region(ctx),
+                &input.monitor_name,
+            ),
+        )
+        .map_err(DeleteMonitorErrorModeled::AccessDeniedException)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteMonitorErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),
@@ -146,8 +180,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A delete reaches only the region it was signed for: a monitor of
         // another region is a different resource and stays where it is.
         let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
+        // The transitions the clock already owed this monitor and its probes,
+        // materialised before the guard below reads them — among them the
+        // removal of a probe whose teardown has run its course, so a probe only
+        // this call still sees cannot refuse the delete.
+        store.settle_monitor(&region, &input.monitor_name, now);
+        // The guard is applied BEFORE anything is removed, so a refused delete
+        // leaves the monitor and every probe it holds exactly as they were and
+        // both are still readable.
+        if store
+            .monitor(&region, &input.monitor_name)
+            .is_some_and(crate::state::Monitor::has_probe_in_service)
+        {
+            return Err(validation(
+                crate::state::monitor_probes_in_service_message(&input.monitor_name),
+            ));
+        }
         // Removing the monitor removes the probes it holds with it: the probes
         // live INSIDE the record, so there is no orphan left behind.
         if store.remove_monitor(&region, &input.monitor_name).is_none() {

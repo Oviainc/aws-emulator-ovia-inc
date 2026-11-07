@@ -238,6 +238,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `monitorName`'s length bound and `@pattern`, and every probe member's
         // own constraints, are refused by the framework BEFORE this handler
         // runs, so reaching here means the input satisfies each of them.
+        //
+        // AWS decides authorization at the IAM layer, ahead of the service
+        // looking at the request's own input, so a caller whose identity-based
+        // policies do not allow this action is refused before any monitor is
+        // created. The resource is the monitor this request ASKED for, built
+        // from the name it carried.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::monitor_arn(
+                &crate::state::request_region(ctx),
+                &input.monitor_name,
+            ),
+        )
+        .map_err(CreateMonitorErrorModeled::AccessDeniedException)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateMonitorErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),

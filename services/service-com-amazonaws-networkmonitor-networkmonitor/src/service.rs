@@ -42,6 +42,13 @@
 //!
 //! ## This service's edited seams: the front door, and how a refusal is stated
 //!
+//! ## Who may call
+//!
+//! Every operation is authorized against the CALLING identity's IAM policies before it
+//! reads or writes anything ([`authorization::authorize`]), which is the step AWS takes at
+//! the IAM layer ahead of the service: an explicit `Deny` refuses the call with this
+//! service's `AccessDeniedException` and nothing is stored.
+//!
 //! A refusal the front door does NOT own — a value bound to the request URI —
 //! keeps the modelled `ValidationException` and is stated through
 //! [`Service::override_refusal`] in the words AWS uses, which
@@ -66,6 +73,8 @@
 //! violation from a URI one. [`FrontDoor`] is where that distinction lives:
 //! each modelled operation is served wrapped in it, and the wrapper reads the
 //! HTTP BINDING of the violated member off that operation's own input schema.
+
+pub mod authorization;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::Schema;

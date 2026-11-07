@@ -234,6 +234,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AWS decides authorization at the IAM layer, ahead of the service
+        // looking at the request's own input, so a caller whose identity-based
+        // policies do not allow this action is refused before anything is
+        // written and without being told whether the probe exists.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::probe_arn(&crate::state::request_region(ctx), &input.probe_id),
+        )
+        .map_err(UpdateProbeErrorModeled::AccessDeniedException)?;
         // `state` is the activate/deactivate toggle: the enum admits every
         // state a probe can be REPORTED in, including the ones the service
         // assigns itself, so the settable allow-list is checked here. Refused

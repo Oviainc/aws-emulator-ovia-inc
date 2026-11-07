@@ -185,6 +185,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // runs, so reaching here means the input satisfies each of them; the
         // documented VALUE LIST is narrower than that range, so the handler
         // applies it below.
+        //
+        // AWS decides authorization at the IAM layer, ahead of the service
+        // looking at the request's own input, so a caller whose identity-based
+        // policies do not allow this action is refused before anything is
+        // written.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::monitor_arn(
+                &crate::state::request_region(ctx),
+                &input.monitor_name,
+            ),
+        )
+        .map_err(UpdateMonitorErrorModeled::AccessDeniedException)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateMonitorErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),

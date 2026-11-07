@@ -21,7 +21,7 @@ use serde_json::Value;
 use super::monitor_and_probe::{
     create_monitor, create_probe, error_code, get_monitor, probe_json, probes_of, router, string_at,
 };
-use super::resource_tags::delete_monitor;
+use super::resource_tags::teardown_monitor;
 
 /// A `CreateMonitor` body carrying a token and an explicit `aggregationPeriod`,
 /// so a replayed answer is distinguishable from a fresh create's.
@@ -259,7 +259,9 @@ async fn a_token_whose_monitor_was_deleted_replays_nothing() {
         "setup: expected CreateProbe 200, got {status} {minted:?}"
     );
 
-    let (status, deleted) = delete_monitor(&router, "recreated").await;
+    // A monitor that still holds a probe in service is not deleted, so the probe
+    // is switched off first ([`teardown_monitor`]).
+    let (status, deleted) = teardown_monitor(&router, "recreated").await;
     assert_eq!(
         status, 200,
         "setup: expected DeleteMonitor 200, got {status} {deleted:?}"

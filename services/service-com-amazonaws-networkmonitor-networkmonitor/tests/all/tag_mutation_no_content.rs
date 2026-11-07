@@ -33,9 +33,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::resource_tags::{
-    call, filler, fixture, get_monitor, list_tags, many_tags, only_probe, router, tag_map,
-    tag_resource, untag_resource, Target, MAX_TAGS, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN,
-    TAG_MUTATION_STATUS,
+    call, deactivate_probe, filler, fixture, get_monitor, list_tags, many_tags, only_probe, router,
+    tag_map, tag_resource, untag_resource, Target, MAX_TAGS, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN,
+    TAG_MUTATION_STATUS, TAG_NOT_FOUND_CODE,
 };
 
 /// The status a success that reports content carries — Smithy's protocol default, which
@@ -392,7 +392,9 @@ async fn a_success_outside_the_tag_mutation_class_keeps_the_defaulted_status() {
         );
     }
 
-    // The two deletes report nothing either, and keep the defaulted 200.
+    // The two deletes report nothing either, and keep the defaulted 200. A probe
+    // is given up only once it has left `PENDING` and a monitor only once
+    // nothing of it is still in service, so the probe is switched off first.
     let (_, read) = get_monitor(&router, "nc-boundary").await;
     let probe = only_probe(&read);
     let probe_id = probe
@@ -400,6 +402,11 @@ async fn a_success_outside_the_tag_mutation_class_keeps_the_defaulted_status() {
         .and_then(Value::as_str)
         .expect("the fixture probe reports a probeId")
         .to_string();
+    let (status, off) = deactivate_probe(&router, "nc-boundary", &probe_id).await;
+    assert_eq!(
+        status, 200,
+        "setup: expected UpdateProbe 200 switching the probe off, got {status} {off:?}"
+    );
     let empty_output: Vec<(&str, (u16, Value))> = vec![
         (
             "DeleteProbe",
@@ -450,13 +457,13 @@ async fn a_refused_tag_mutation_keeps_its_own_status() {
             "a well-formed monitor ARN naming no stored monitor",
             "arn:aws:networkmonitor:us-west-2:000000000000:monitor/nc-no-such-monitor".to_string(),
             404,
-            "ResourceNotFoundException",
+            TAG_NOT_FOUND_CODE,
         ),
         (
             "the stored monitor's ARN under another account",
             "arn:aws:networkmonitor:us-west-2:111122223333:monitor/nc-refusals".to_string(),
             404,
-            "ResourceNotFoundException",
+            TAG_NOT_FOUND_CODE,
         ),
     ];
 

@@ -177,6 +177,94 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic unmodeled-refusal shape.
+static UNMODELED_REFUSAL_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#UnmodeledRefusal$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic unmodeled-refusal shape — the BODY (`{"message": …}`) of a
+/// refusal this service states with an error code its Smithy model does not declare.
+///
+/// In the `smithy.framework` namespace for the same reason as [`NOT_IMPLEMENTED_SCHEMA`]:
+/// `NotFoundException` is not a shape this service's model carries, so the schema must not
+/// collide with a modeled one. ONE schema serves every such refusal because a schema only
+/// shapes the body; the wire error code and the HTTP status travel beside it, on
+/// [`UnmodeledRefusal`].
+pub static UNMODELED_REFUSAL_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#UnmodeledRefusal",
+        "smithy.framework",
+        "UnmodeledRefusal",
+    ),
+    ShapeType::Structure,
+    &[&UNMODELED_REFUSAL_MESSAGE],
+);
+
+/// The wire error code the tag APIs (`ListTagsForResource`, `TagResource`,
+/// `UntagResource`) answer for a `resourceArn` naming no resource of this account.
+///
+/// The recorded responses of those operations carry `NotFoundException`, NOT the
+/// `ResourceNotFoundException` their model lists — the tag APIs are fronted by a layer
+/// with its own error taxonomy, and a client branching on the code sees that one.
+pub const TAG_NOT_FOUND_CODE: &str = "NotFoundException";
+/// The HTTP status of that refusal: 404, the status of an ABSENT resource, which is also
+/// the one the modelled `ResourceNotFoundException` carries (`httpError` 404), so only the
+/// code differs from the model.
+pub const TAG_NOT_FOUND_STATUS: u16 = 404;
+/// The text that refusal carries: a CONSTANT, naming nothing from the request.
+pub const TAG_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// One refusal this service states with an error code its model does not declare.
+///
+/// It carries its own wire code, HTTP status and message precisely because the shape is
+/// not in the model, so there is no `#[operation_error]` variant that could render it. The
+/// one this service states is [`tag_not_found`](Self::tag_not_found) (HTTP 404
+/// `NotFoundException`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmodeledRefusal {
+    /// The wire error code (`__type`, and `x-amzn-errortype` where the protocol sets it).
+    pub code: &'static str,
+    /// The HTTP status.
+    pub status: u16,
+    /// The message this refusal carries.
+    pub message: &'static str,
+}
+
+impl UnmodeledRefusal {
+    /// The tag APIs' refusal of a `resourceArn` that addresses no resource of this
+    /// account: HTTP 404 `NotFoundException`.
+    pub const fn tag_not_found() -> Self {
+        Self {
+            code: TAG_NOT_FOUND_CODE,
+            status: TAG_NOT_FOUND_STATUS,
+            message: TAG_NOT_FOUND_MESSAGE,
+        }
+    }
+}
+
+impl std::fmt::Display for UnmodeledRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for UnmodeledRefusal {}
+
+impl SerializableStruct for UnmodeledRefusal {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&UNMODELED_REFUSAL_MESSAGE, self.message)?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -185,6 +273,10 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// A refusal this service states with a code its model does not declare — so it
+    /// cannot travel as [`Modeled`](Self::Modeled). Renders with the status and code the
+    /// refusal itself carries.
+    Unmodeled(UnmodeledRefusal),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -202,6 +294,12 @@ impl<E> Scaffolded<E> {
     /// The scaffold signal for `operation`.
     pub fn not_implemented(operation: &str) -> Self {
         Self::NotImplemented(NotImplemented::new(operation))
+    }
+
+    /// Refuse the request the way the tag APIs refuse a `resourceArn` that addresses no
+    /// monitor and no probe of this account: HTTP 404 `NotFoundException`.
+    pub const fn tag_not_found() -> Self {
+        Self::Unmodeled(UnmodeledRefusal::tag_not_found())
     }
 
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.
@@ -228,6 +326,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::Unmodeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +339,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::Unmodeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,6 +354,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::Unmodeled(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -262,6 +363,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            Self::Unmodeled(_) => &UNMODELED_REFUSAL_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -274,6 +376,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            // The code the refusal itself carries: this service's tag APIs answer
+            // `NotFoundException`, which is not a shape its model declares.
+            Self::Unmodeled(e) => e.code,
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,6 +391,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            Self::Unmodeled(e) => e.status,
             Self::ValidationException(_) => 400,
         }
     }
@@ -297,6 +403,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
+            // Same reason: the synthetic shape carries no `awsQueryError` trait — and
+            // this service is restJson1, which has no query envelope at all.
+            Self::Unmodeled(_) => None,
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
         }

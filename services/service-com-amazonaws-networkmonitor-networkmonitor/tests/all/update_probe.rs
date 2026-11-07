@@ -845,7 +845,9 @@ async fn an_update_of_an_unknown_probe_is_not_found() {
 
     // A probe of `present-monitor`, deleted again: its id is well-formed and was
     // minted, and once the teardown that delete started has run its course
-    // nothing is stored under it any more.
+    // nothing is stored under it any more. A probe is given up only once it has
+    // left `PENDING`, so the clock carries it into service first.
+    std::thread::sleep(PAST_ACTIVATION);
     let (status, deleted) = call(
         &router,
         "DELETE",

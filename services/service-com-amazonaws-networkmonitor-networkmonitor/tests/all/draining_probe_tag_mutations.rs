@@ -8,8 +8,8 @@
 //! resource whose asynchronous teardown has been accepted is no longer a target
 //! for any call that would change what it still reports, so every such call —
 //! `TagResource` and `UntagResource` beside the `UpdateProbe` already pinned by
-//! `probe_teardown.rs` — is refused with the modelled 404
-//! `ResourceNotFoundException` and stores nothing, while the reporting calls
+//! `probe_teardown.rs` — is refused with the 404 the tag APIs state
+//! (`NotFoundException`) and stores nothing, while the reporting calls
 //! (`GetProbe`, `GetMonitor`, `ListTagsForResource`) keep reporting the record,
 //! in the teardown state it has reached and with the tags and `modifiedAt` the
 //! accepted delete left on it, until the clock has carried the teardown through.
@@ -24,8 +24,7 @@
 //! would change nothing, an empty write, several keys at once, a key removed, a
 //! key removed that is not carried, several keys removed at once), both address
 //! families and both protocols, `packetSize` at the ceiling of its published
-//! range, a probe deleted while it is still provisioning beside ones deleted
-//! once they are live, and both phases of a teardown a record is readable in
+//! range, and both phases of a teardown a record is readable in
 //! (`DELETING` and `DELETED`) beside the phase after it, where the record is
 //! gone.
 
@@ -39,7 +38,9 @@ use super::monitor_and_probe::{
     PAST_ACTIVATION, PAST_TEARDOWN,
 };
 use super::probe_teardown::{delete_probe, get_probe, probe_fixture, PAST_FIRST_TEARDOWN_STAGE};
-use super::resource_tags::{list_tags, tag_resource, untag_resource, TAG_MUTATION_STATUS};
+use super::resource_tags::{
+    list_tags, tag_resource, untag_resource, TAG_MUTATION_STATUS, TAG_NOT_FOUND_CODE,
+};
 use super::update_probe::timestamp;
 
 /// The tags every fixture's probe carries before its teardown is accepted,
@@ -107,8 +108,8 @@ fn mutations() -> Vec<(&'static str, Mutation)> {
     ]
 }
 
-/// Assert one tagging mutation of `resource_arn` is refused with the modelled
-/// 404: the ARN reaches no resource this call may change.
+/// Assert one tagging mutation of `resource_arn` is refused with the 404 the tag
+/// APIs state: the ARN reaches no resource this call may change.
 async fn assert_refused(
     router: &MultiServiceRouter,
     resource_arn: &str,
@@ -123,8 +124,8 @@ async fn assert_refused(
     );
     assert_eq!(
         error_code(&refused),
-        "ResourceNotFoundException",
-        "case {case:?}: expected ResourceNotFoundException, got {refused:?}"
+        TAG_NOT_FOUND_CODE,
+        "case {case:?}: expected {TAG_NOT_FOUND_CODE}, got {refused:?}"
     );
 }
 
@@ -169,9 +170,11 @@ async fn assert_probe_unchanged(
     );
 }
 
-/// Create a monitor holding one probe, tag that probe with [`baseline_tags`]
-/// while it is still a target for a tag write, accept its delete, and answer the
-/// probe's id and ARN beside the `modifiedAt` the accepted delete left on it.
+/// Create a monitor holding one probe, wait for that probe to leave `PENDING` —
+/// a probe still being provisioned is no target for a delete at all — tag it
+/// with [`baseline_tags`] while it is still a target for a tag write, accept its
+/// delete, and answer the probe's id and ARN beside the `modifiedAt` the
+/// accepted delete left on it.
 async fn draining_probe_fixture(
     router: &MultiServiceRouter,
     monitor_name: &str,
@@ -179,6 +182,13 @@ async fn draining_probe_fixture(
     case: &str,
 ) -> (String, String, f64) {
     let (probe_id, probe_arn) = probe_fixture(router, monitor_name, probe).await;
+    std::thread::sleep(PAST_ACTIVATION);
+    let (_, settled) = get_probe(router, monitor_name, &probe_id).await;
+    assert_eq!(
+        string_at(&settled, "state"),
+        "ACTIVE",
+        "case {case:?}: the probe must be live before the delete, got {settled:?}"
+    );
     let (status, written) = tag_resource(router, &probe_arn, &baseline_tags()).await;
     assert_eq!(
         status, TAG_MUTATION_STATUS,
@@ -205,7 +215,7 @@ async fn draining_probe_fixture(
 }
 
 /// A tag mutation of a probe whose teardown has been accepted is refused with
-/// the modelled 404 and stores nothing: the probe keeps the tags and the
+/// the tag APIs' 404 and stores nothing: the probe keeps the tags and the
 /// `modifiedAt` the accepted delete left on it.
 ///
 /// The table spans every shape of tag mutation, since what the rule generalises
@@ -266,27 +276,23 @@ async fn a_tag_mutation_of_a_draining_probe_is_refused_and_stores_nothing() {
 /// as for any ARN no stored resource carries — once the record is gone.
 ///
 /// The table spans both address families and both protocols (so a probe with a
-/// `destinationPort` and one without), `packetSize` at the ceiling of its
-/// published `@range(56..8500)`, and a probe deleted while it is still
-/// provisioning beside ones deleted once they are live.
+/// `destinationPort` and one without) and `packetSize` at the ceiling of its
+/// published `@range(56..8500)`.
 #[tokio::test]
 async fn the_refusal_holds_through_every_phase_of_the_teardown() {
-    // (case, probe body, whether the probe is live before the delete)
-    let cases: Vec<(&str, String, bool)> = vec![
+    // (case, probe body)
+    let cases: Vec<(&str, String)> = vec![
         (
             "the recorded case: a live ICMP IPv4 probe",
             probe_json("10.0.5.1", "ICMP", r#","packetSize":56"#),
-            true,
         ),
         (
-            "a TCP IPv6 probe with a destinationPort, deleted while still provisioning",
+            "a TCP IPv6 probe with a destinationPort",
             probe_json("2001:db8::1", "TCP", r#","destinationPort":443,"packetSize":56"#),
-            false,
         ),
         (
             "a live ICMP probe at the packetSize ceiling",
             probe_json("10.0.5.2", "ICMP", r#","packetSize":8500"#),
-            true,
         ),
     ];
     // One row of each kind of mutation is enough here: the mutation dimension is
@@ -294,43 +300,14 @@ async fn the_refusal_holds_through_every_phase_of_the_teardown() {
     let tag = Mutation::Tag(json!({"phase": "late"}));
     let untag = Mutation::Untag(&["team"]);
 
-    for (case, probe, live) in cases {
+    for (case, probe) in cases {
         let router = router();
-        if live {
-            // The probe has to reach service before the delete, so it is tagged
-            // and then deleted once the clock has carried it there.
-            let (probe_id, probe_arn) = probe_fixture(&router, "teardown-phases", &probe).await;
-            std::thread::sleep(PAST_ACTIVATION);
-            let (_, settled) = get_probe(&router, "teardown-phases", &probe_id).await;
-            assert_eq!(
-                string_at(&settled, "state"),
-                "ACTIVE",
-                "case {case:?}: the probe must be live before the delete, got {settled:?}"
-            );
-            let (status, written) = tag_resource(&router, &probe_arn, &baseline_tags()).await;
-            assert_eq!(
-                status, TAG_MUTATION_STATUS,
-                "case {case:?}: a live probe is tagged, got {status} {written:?}"
-            );
-            let (status, accepted) = delete_probe(&router, "teardown-phases", &probe_id).await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: expected DeleteProbe 200, got {status} {accepted:?}"
-            );
-            let (_, draining) = get_probe(&router, "teardown-phases", &probe_id).await;
-            let torn_down_at = timestamp(&draining, "modifiedAt");
-            run_phases(
-                &router, "teardown-phases", &probe_id, &probe_arn, torn_down_at, &tag, &untag, case,
-            )
-            .await;
-        } else {
-            let (probe_id, probe_arn, torn_down_at) =
-                draining_probe_fixture(&router, "teardown-phases", &probe, case).await;
-            run_phases(
-                &router, "teardown-phases", &probe_id, &probe_arn, torn_down_at, &tag, &untag, case,
-            )
-            .await;
-        }
+        let (probe_id, probe_arn, torn_down_at) =
+            draining_probe_fixture(&router, "teardown-phases", &probe, case).await;
+        run_phases(
+            &router, "teardown-phases", &probe_id, &probe_arn, torn_down_at, &tag, &untag, case,
+        )
+        .await;
     }
 }
 
@@ -465,6 +442,9 @@ async fn a_live_resource_beside_a_draining_probe_is_still_tagged() {
         status, TAG_MUTATION_STATUS,
         "the probe is tagged while it is still in service, got {status} {tagged:?}"
     );
+    // A probe is torn down only once it has left `PENDING`, so the delete below
+    // waits for the clock to carry it into service first.
+    std::thread::sleep(PAST_ACTIVATION);
     let (status, accepted) = delete_probe(&router, "mixed", &doomed_id).await;
     assert_eq!(
         status, 200,

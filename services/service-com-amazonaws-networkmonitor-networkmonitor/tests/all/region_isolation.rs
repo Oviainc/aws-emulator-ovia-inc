@@ -18,7 +18,9 @@
 //!   its own ARN naming its own region, its own `aggregationPeriod`, its own
 //!   probes and its own tags;
 //! * a `clientToken` replays only in the region it was sent to;
-//! * a tagging call reaches only resources of the region it was signed for.
+//! * a tagging call reaches only resources of the region it was signed for, and
+//!   an ARN of another region's resource is the tag APIs' own 404
+//!   `NotFoundException`.
 //!
 //! Each case names the region pair it drives, so the table spans several
 //! regions rather than the one pair a single example would pin.
@@ -27,6 +29,7 @@ use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::monitor_and_probe::{error_code, page_names, router, string_at};
+use super::resource_tags::TAG_NOT_FOUND_CODE;
 
 /// The one account id a generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT: &str = "000000000000";
@@ -374,7 +377,19 @@ async fn one_monitor_name_is_an_independent_resource_in_each_region() {
         );
     }
 
-    // And a delete in one region destroys only that region's record.
+    // And a delete in one region destroys only that region's record. A monitor
+    // that still holds a probe in service is not deleted, so its probe is
+    // switched off first.
+    let probe_id = only_probe_id(&get_monitor_in(&router, updated_region, NAME).await.1);
+    let (status, off) = call_in(
+        &router,
+        updated_region,
+        "PATCH",
+        &format!("/monitors/{NAME}/probes/{probe_id}"),
+        Some(r#"{"state":"INACTIVE"}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "expected UpdateProbe 200, got {status} {off:?}");
     let (status, deleted) = call_in(
         &router,
         updated_region,
@@ -498,9 +513,9 @@ async fn tagging_reaches_only_the_region_it_was_signed_for() {
                 );
                 assert_eq!(
                     error_code(&answered),
-                    "ResourceNotFoundException",
+                    TAG_NOT_FOUND_CODE,
                     "case {home:?} -> {other:?} {operation} on a {case} ARN: expected \
-                     ResourceNotFoundException, got {answered:?}"
+                     {TAG_NOT_FOUND_CODE}, got {answered:?}"
                 );
             }
 

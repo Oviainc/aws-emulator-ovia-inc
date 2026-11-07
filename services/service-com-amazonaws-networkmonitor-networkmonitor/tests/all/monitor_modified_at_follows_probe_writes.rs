@@ -175,6 +175,11 @@ async fn a_probe_write_moves_the_containing_monitors_modified_at() {
             true,
         ),
         ("CreateProbe: a second probe", Call::Create, true),
+        (
+            "UpdateProbe: that probe switched off, which a delete of it requires",
+            Call::Update(r#"{"state":"INACTIVE"}"#),
+            true,
+        ),
         ("DeleteProbe: the teardown of that probe is accepted", Call::Delete, true),
         ("DeleteProbe: a repeat of the same delete", Call::Delete, false),
     ];

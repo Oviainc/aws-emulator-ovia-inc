@@ -13,6 +13,12 @@
 //! An unknown monitor, or a probe that monitor does not hold, is
 //! `ResourceNotFoundException`.
 //!
+//! A probe is torn down only once it has SETTLED: while it is still being
+//! provisioned ([`crate::state::Probe::is_provisioning`]) the delete is REFUSED
+//! with `ValidationException` (400) and the probe is left untouched, so a caller
+//! that has to wait for a probe to leave `PENDING` before tearing it down is
+//! told so rather than served a delete of a resource that is not there yet.
+//!
 //! The monitor's own state follows the probes it holds
 //! ([`crate::state::Monitor::follow_probe_states`]), which this handler applies
 //! after the write: taking a probe away gains the monitor nothing to aggregate,
@@ -121,6 +127,17 @@ impl From<DeleteProbeErrorModeled> for DeleteProbeError {
     }
 }
 
+/// This service's modelled `ValidationException` (HTTP 400), carrying `message`
+/// — the pre-delete guard's refusal
+/// ([`crate::state::probe_pending_message`]). `ValidationException` is a
+/// service-common error of this model, and the one AWS states this guard with.
+fn validation(message: String) -> DeleteProbeError {
+    DeleteProbeErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `DeleteProbe` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -160,6 +177,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `monitorName`'s and `probeId`'s `@pattern`s are refused by the
         // framework BEFORE this handler runs, so an id that reaches here is one
         // the service could have minted.
+        //
+        // AWS decides authorization at the IAM layer, ahead of the service
+        // reading anything, so a caller whose identity-based policies do not
+        // allow this action is refused before any record is touched — and is
+        // told nothing about whether the probe exists.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::probe_arn(&crate::state::request_region(ctx), &input.probe_id),
+        )
+        .map_err(DeleteProbeErrorModeled::AccessDeniedException)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteProbeErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),
@@ -192,6 +221,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
         })?;
+        // A probe the clock has not settled yet is still being provisioned, so
+        // there is nothing to tear down: the delete is refused and the record is
+        // left exactly as it was, still readable in the state it is in. Checked
+        // after the settle walk above, so a probe whose activation was already
+        // due is deleted rather than refused.
+        if probe.is_provisioning() {
+            return Err(validation(crate::state::probe_pending_message(
+                &input.probe_id,
+            )));
+        }
         // Accepted, not performed: the probe keeps its configuration and stays
         // readable while its path is released, and the clock carries it the rest
         // of the way. The model marks this operation `@idempotent`, and the

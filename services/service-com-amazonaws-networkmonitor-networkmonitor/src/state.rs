@@ -338,6 +338,22 @@ pub fn probe_not_found_message(probe_id: &str, monitor_name: &str) -> String {
     )
 }
 
+/// The `ValidationException` message a monitor's delete is refused with while
+/// the monitor still holds a probe that is in service: the pre-delete guard
+/// AWS applies to `DeleteMonitor`, which names the monitor the request asked to
+/// delete and the state its probes have to be in first.
+pub fn monitor_probes_in_service_message(monitor_name: &str) -> String {
+    format!("All probes on monitor {monitor_name} must be inactive before deletion.")
+}
+
+/// The `ValidationException` message a probe's delete is refused with while the
+/// probe has not left [`PROBE_STATE_PENDING`]: the pre-delete guard AWS applies
+/// to `DeleteProbe`, which names the probe the request asked to delete and the
+/// state it must not still be in.
+pub fn probe_pending_message(probe_id: &str) -> String {
+    format!("Probe {probe_id} must not be in pending state before deletion.")
+}
+
 /// The resource an ARN names, as a message states it: the last `/`- or
 /// `:`-separated segment (`subnet-0123…` of a subnet ARN, `my-topic` of an SNS
 /// topic ARN). The whole string when it carries no separator.
@@ -1243,6 +1259,18 @@ impl Probe {
                 .checked_add(PROBE_TEARDOWN_STAGE)
                 .is_some_and(|forgotten_at| now >= forgotten_at)
         })
+    }
+
+    /// Whether this probe is still being provisioned, i.e. has not left
+    /// [`PROBE_STATE_PENDING`].
+    ///
+    /// Read AFTER the clock has been settled
+    /// ([`ComAmazonawsNetworkmonitorNetworkmonitorState::settle_monitor`]), so a
+    /// probe whose activation was already due answers `false`: what this reports
+    /// is a probe that is not settled YET, which is the state a delete of it is
+    /// refused on.
+    pub fn is_provisioning(&self) -> bool {
+        self.state == PROBE_STATE_PENDING
     }
 
     /// Whether a caller has switched this probe off.

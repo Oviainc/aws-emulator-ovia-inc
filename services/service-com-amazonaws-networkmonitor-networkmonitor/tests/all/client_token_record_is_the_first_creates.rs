@@ -23,7 +23,7 @@
 use super::client_token_replay::{monitor_body, probe_body};
 use super::monitor_and_probe::{
     create_monitor, create_probe, error_code, get_monitor, probes_of, router, string_at,
-    PAST_TEARDOWN,
+    PAST_ACTIVATION, PAST_TEARDOWN,
 };
 use super::probe_teardown::delete_probe;
 
@@ -331,6 +331,9 @@ async fn a_token_whose_probe_is_gone_records_the_probe_the_next_create_mints() {
         status, 200,
         "setup: expected the first CreateProbe 200, got {status} {first:?}"
     );
+    // A probe is given up only once it has left `PENDING`, so the delete below
+    // waits for the clock to carry it into service first.
+    std::thread::sleep(PAST_ACTIVATION);
     let (status, deleted) = delete_probe(&router, "respawn", &string_at(&first, "probeId")).await;
     assert_eq!(
         status, 200,
