@@ -61,11 +61,14 @@ pub mod events;
 /// The action-type catalog: an action type's identity, the records this account holds
 /// for the custom ones, and the action types the service itself provides.
 mod action_types;
+/// The action types the service PROVIDES itself, with the artifact counts, configuration
+/// properties and deep links each provider documents.
+mod built_in_catalog;
 // Named rather than a glob, so what `crate::state` publishes stays explicit — the same
 // way the re-exports below name what they take.
-pub use action_types::{
-    validate_action_type_declaration, ActionTypeKey, ActionTypeRecord, BuiltInActionType,
-    BUILT_IN_ACTION_TYPES,
+pub use action_types::{validate_action_type_declaration, ActionTypeKey, ActionTypeRecord};
+pub use built_in_catalog::{
+    BuiltInActionType, BuiltInConfigurationProperty, BUILT_IN_ACTION_TYPES,
 };
 
 pub use driver::advance;

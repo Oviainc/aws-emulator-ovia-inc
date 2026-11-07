@@ -209,10 +209,22 @@ async fn registered(emulator: &Emulator) -> Vec<Value> {
 struct CreateCase {
     case: &'static str,
     request: Value,
-    /// `actionType` members that must be ABSENT, because the request carried none.
-    absent: &'static [&'static str],
+    /// `actionType` members the request carried nothing for, which the answer reports as
+    /// the EMPTY form of their modelled type (`settings` as `{}`,
+    /// `actionConfigurationProperties` as `[]`) rather than leaving out.
+    empty: &'static [&'static str],
     /// Whether the create answer must echo a `tags` list.
     tags_echoed: bool,
+}
+
+/// Whether `value` is the empty form of the type it is: an object or a list with nothing
+/// in it.
+fn is_empty(value: &Value) -> bool {
+    match value {
+        Value::Object(members) => members.is_empty(),
+        Value::Array(elements) => elements.is_empty(),
+        _ => false,
+    }
 }
 
 /// RULE: a created custom action type is stored under its
@@ -232,7 +244,7 @@ async fn every_created_custom_action_type_round_trips_through_list_action_types(
                 "inputArtifactDetails": {"minimumCount": 0, "maximumCount": 0},
                 "outputArtifactDetails": {"minimumCount": 0, "maximumCount": 0},
             }),
-            absent: &["settings", "actionConfigurationProperties"],
+            empty: &["settings", "actionConfigurationProperties"],
             tags_echoed: false,
         },
         CreateCase {
@@ -250,7 +262,7 @@ async fn every_created_custom_action_type_round_trips_through_list_action_types(
                     "maximumCount": MAX_ARTIFACT_COUNT,
                 },
             }),
-            absent: &["settings", "actionConfigurationProperties"],
+            empty: &["settings", "actionConfigurationProperties"],
             tags_echoed: false,
         },
         CreateCase {
@@ -263,7 +275,7 @@ async fn every_created_custom_action_type_round_trips_through_list_action_types(
                 "inputArtifactDetails": {"minimumCount": 1, "maximumCount": 2},
                 "outputArtifactDetails": {"minimumCount": 0, "maximumCount": 1},
             }),
-            absent: &["actionConfigurationProperties"],
+            empty: &["actionConfigurationProperties"],
             tags_echoed: false,
         },
         CreateCase {
@@ -287,7 +299,7 @@ async fn every_created_custom_action_type_round_trips_through_list_action_types(
                 "outputArtifactDetails": {"minimumCount": 0, "maximumCount": 3},
                 "tags": tags(3),
             }),
-            absent: &[],
+            empty: &[],
             tags_echoed: true,
         },
         CreateCase {
@@ -301,7 +313,7 @@ async fn every_created_custom_action_type_round_trips_through_list_action_types(
                 "outputArtifactDetails": {"minimumCount": 0, "maximumCount": 0},
                 "tags": tags(MAX_TAGS_PER_RESOURCE),
             }),
-            absent: &["settings"],
+            empty: &["settings"],
             tags_echoed: true,
         },
     ];
@@ -317,7 +329,7 @@ async fn every_created_custom_action_type_round_trips_through_list_action_types(
             "inputArtifactDetails": {"minimumCount": 0, "maximumCount": 1},
             "outputArtifactDetails": {"minimumCount": 0, "maximumCount": 1},
         }),
-        absent: &["settings"],
+        empty: &["settings"],
         tags_echoed: false,
     }));
 
@@ -325,7 +337,7 @@ async fn every_created_custom_action_type_round_trips_through_list_action_types(
     for CreateCase {
         case,
         request,
-        absent,
+        empty,
         tags_echoed,
     } in &cases
     {
@@ -338,11 +350,17 @@ async fn every_created_custom_action_type_round_trips_through_list_action_types(
             contains(&expected, created),
             "case {case:?}: expected the create answer to carry {expected}, got {created}"
         );
-        for member in *absent {
+        for member in *empty {
+            let reported = created.get(member).unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: every modelled member is reported, so {member} must be \
+                     there even when the request carried nothing for it, got {created}"
+                )
+            });
             assert!(
-                created.get(member).is_none(),
-                "case {case:?}: the request carried no {member}, so the answer must not either, \
-                 got {created}"
+                is_empty(reported),
+                "case {case:?}: the request carried no {member}, so the answer reports it \
+                 empty, got {created}"
             );
         }
         match (tags_echoed, answer.get("tags")) {

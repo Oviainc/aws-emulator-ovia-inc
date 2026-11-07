@@ -376,6 +376,9 @@ async fn a_registered_action_type_is_reported_from_the_store() {
         response["actionTypes"],
         json!([{
             "id": {
+                // The awsJson shape discriminator this service's wire form carries on an
+                // `ActionType`'s id, beside the four members the shape declares.
+                "__type": "ActionTypeId",
                 "category": "Test",
                 "owner": "Custom",
                 "provider": "My-Tester_2",

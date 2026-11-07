@@ -46,6 +46,8 @@
 //! a property of serving a call rather than of any one operation, which is why it is wired
 //! here once instead of in 44 handlers.
 
+/// The wire form of an `ActionType`: the awsJson shape discriminator its `id` carries.
+pub mod action_type_wire_form;
 pub mod management_events;
 
 use service_common::audited_operation::AuditedDefinition;

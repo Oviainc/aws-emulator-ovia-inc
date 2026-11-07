@@ -133,13 +133,19 @@ impl ActionTypeRecord {
     }
 
     /// This action type as `ListActionTypes` and `CreateCustomActionType` report it.
+    ///
+    /// Every member `ActionType` declares is REPORTED, whether or not this record holds
+    /// anything for it: an action type with no URLs carries `settings` as the empty
+    /// structure and one with no configuration parameters carries
+    /// `actionConfigurationProperties` as the empty list, because a client reads the
+    /// properties it must fill in off that list and an absent member is not a list it
+    /// can read as "none" — the same reason `ActionType$actionConfigurationProperties`
+    /// is modelled `@length(min: 0)` rather than as a member that may be missing.
     pub fn to_action_type(&self, key: &ActionTypeKey) -> ActionType {
         ActionType {
             id: key.to_id(),
-            settings: self.settings.clone(),
-            // An absent list and an empty one state the same fact, and AWS omits the
-            // member.
-            action_configuration_properties: optional_list(self.configuration_properties.clone()),
+            settings: Some(self.settings.clone().unwrap_or_default()),
+            action_configuration_properties: Some(self.configuration_properties.clone()),
             input_artifact_details: self.input_artifact_details.clone(),
             output_artifact_details: self.output_artifact_details.clone(),
         }
@@ -232,183 +238,6 @@ fn validate_action_type_properties(properties: &[ActionTypeProperty]) -> Result<
     Ok(())
 }
 
-/// One entry of the catalog of action types this service provides itself: the four
-/// `ActionTypeId` members and the artifact counts the action's reference page
-/// documents.
-#[derive(Debug, Clone, Copy)]
-pub struct BuiltInActionType {
-    /// An `ActionCategory` value.
-    pub category: &'static str,
-    /// An `ActionOwner` value — `AWS` for an action the service runs itself,
-    /// `ThirdParty` for one a partner integration runs.
-    pub owner: &'static str,
-    /// The provider of the service the action calls.
-    pub provider: &'static str,
-    /// The action type's version.
-    pub version: &'static str,
-    /// `(minimumCount, maximumCount)` of the action's input artifacts.
-    pub input_artifacts: (i32, i32),
-    /// `(minimumCount, maximumCount)` of the action's output artifacts.
-    pub output_artifacts: (i32, i32),
-}
-
-impl BuiltInActionType {
-    /// This entry's identity.
-    pub fn key(&self) -> ActionTypeKey {
-        ActionTypeKey {
-            category: self.category.to_string(),
-            owner: self.owner.to_string(),
-            provider: self.provider.to_string(),
-            version: self.version.to_string(),
-        }
-    }
-
-    /// This entry as a stored record: available in every Region, and carrying no
-    /// `settings` or configuration properties, because those are per-provider detail
-    /// this emulator does not model rather than values to invent.
-    pub fn record(&self) -> ActionTypeRecord {
-        ActionTypeRecord {
-            settings: None,
-            configuration_properties: Vec::new(),
-            input_artifact_details: ArtifactDetails {
-                minimum_count: self.input_artifacts.0,
-                maximum_count: self.input_artifacts.1,
-            },
-            output_artifact_details: ArtifactDetails {
-                minimum_count: self.output_artifacts.0,
-                maximum_count: self.output_artifacts.1,
-            },
-            region: None,
-            // Nobody tagged an action type the service provides itself.
-            tags: Vec::new(),
-        }
-    }
-}
-
-/// The action types this service provides on its own — the ones no caller created —
-/// as `ListActionTypes` ("a summary of all CodePipeline action types associated with
-/// your account") reports them beside the account's own registrations.
-///
-/// Source: the page `ActionTypeId$provider` and `ActionTypeId$owner` both link to in
-/// their model documentation, "Valid action types and providers in CodePipeline"
-/// (<https://docs.aws.amazon.com/codepipeline/latest/userguide/reference-pipeline-structure.html#actions-valid-providers>),
-/// which lists each category's providers and their owners; the artifact counts are
-/// the input- and output-artifact counts that page's per-action structure reference
-/// documents for each one. Every version is `1`, the only version those actions
-/// publish. Providers whose documented input-artifact count exceeds
-/// `MaximumArtifactCount`'s modelled `@range(max: 5)` are left out rather than
-/// reported with a count the model cannot carry.
-pub const BUILT_IN_ACTION_TYPES: [BuiltInActionType; 14] = [
-    BuiltInActionType {
-        category: "Approval",
-        owner: "AWS",
-        provider: "Manual",
-        version: "1",
-        input_artifacts: (0, 0),
-        output_artifacts: (0, 0),
-    },
-    BuiltInActionType {
-        category: "Build",
-        owner: "AWS",
-        provider: "CodeBuild",
-        version: "1",
-        input_artifacts: (1, 5),
-        output_artifacts: (0, 5),
-    },
-    BuiltInActionType {
-        category: "Deploy",
-        owner: "AWS",
-        provider: "CodeDeploy",
-        version: "1",
-        input_artifacts: (1, 1),
-        output_artifacts: (0, 0),
-    },
-    BuiltInActionType {
-        category: "Deploy",
-        owner: "AWS",
-        provider: "ECS",
-        version: "1",
-        input_artifacts: (1, 1),
-        output_artifacts: (0, 0),
-    },
-    BuiltInActionType {
-        category: "Deploy",
-        owner: "AWS",
-        provider: "ElasticBeanstalk",
-        version: "1",
-        input_artifacts: (1, 1),
-        output_artifacts: (0, 0),
-    },
-    BuiltInActionType {
-        category: "Deploy",
-        owner: "AWS",
-        provider: "S3",
-        version: "1",
-        input_artifacts: (1, 1),
-        output_artifacts: (0, 0),
-    },
-    BuiltInActionType {
-        category: "Invoke",
-        owner: "AWS",
-        provider: "Lambda",
-        version: "1",
-        input_artifacts: (0, 5),
-        output_artifacts: (0, 5),
-    },
-    BuiltInActionType {
-        category: "Source",
-        owner: "AWS",
-        provider: "CodeCommit",
-        version: "1",
-        input_artifacts: (0, 0),
-        output_artifacts: (1, 1),
-    },
-    BuiltInActionType {
-        category: "Source",
-        owner: "AWS",
-        provider: "CodeStarSourceConnection",
-        version: "1",
-        input_artifacts: (0, 0),
-        output_artifacts: (1, 1),
-    },
-    BuiltInActionType {
-        category: "Source",
-        owner: "AWS",
-        provider: "ECR",
-        version: "1",
-        input_artifacts: (0, 0),
-        output_artifacts: (1, 1),
-    },
-    BuiltInActionType {
-        category: "Source",
-        owner: "AWS",
-        provider: "S3",
-        version: "1",
-        input_artifacts: (0, 0),
-        output_artifacts: (1, 1),
-    },
-    BuiltInActionType {
-        category: "Source",
-        owner: "ThirdParty",
-        provider: "GitHub",
-        version: "1",
-        input_artifacts: (0, 0),
-        output_artifacts: (1, 1),
-    },
-    BuiltInActionType {
-        category: "Test",
-        owner: "AWS",
-        provider: "CodeBuild",
-        version: "1",
-        input_artifacts: (1, 5),
-        output_artifacts: (0, 5),
-    },
-    BuiltInActionType {
-        category: "Test",
-        owner: "AWS",
-        provider: "DeviceFarm",
-        version: "1",
-        input_artifacts: (1, 1),
-        output_artifacts: (0, 0),
-    },
-];
+// The catalog of action types the service provides ITSELF — the entries and their
+// per-provider detail — lives in [`super::built_in_catalog`], beside this module rather
+// than in it, so neither file holds two concerns.
