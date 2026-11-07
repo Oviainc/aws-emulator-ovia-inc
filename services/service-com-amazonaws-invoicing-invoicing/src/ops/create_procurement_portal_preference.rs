@@ -169,6 +169,17 @@ impl From<CreateProcurementPortalPreferenceErrorModeled> for CreateProcurementPo
     }
 }
 
+/// The sentence a create is refused with when the portal identifiers it states already
+/// identify a stored preference: FIXED text for this error class, which interpolates
+/// nothing from the request or from state — no ARN, no portal name and neither identifier
+/// of the pair, each of which travels in the shape's own members instead.
+///
+/// Recorded behaviour: the model documents no message for `ConflictException`, so the
+/// wording is AWS's own for the duplicate-portal-identifiers conflict, which is the only
+/// thing distinguishing it from the other refusals of this plane that carry no identifier.
+const DUPLICATE_PORTAL_IDENTIFIERS_MESSAGE: &str =
+    "There is a procurement portal preference already existed with same portal identifiers";
+
 /// The `resourceType` a `ConflictException` of this operation names: the resource the
 /// ARN it reports is one of.
 const RESOURCE_TYPE: &str = "procurement-portal-preference";
@@ -348,11 +359,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(existing) = store.procurement_portal_preference_by_identity(&identity) {
             return Err(CreateProcurementPortalPreferenceErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(
-                        "A procurement portal preference already exists for this portal and \
-                         buyer/supplier pair"
-                            .to_string(),
-                    ),
+                    message: Some(DUPLICATE_PORTAL_IDENTIFIERS_MESSAGE.to_string()),
                     resource_id: Some(existing.preference.procurement_portal_preference_arn.clone()),
                     resource_type: Some(RESOURCE_TYPE.to_string()),
                     // The procurement-portal plane keys the text as `Message` (see

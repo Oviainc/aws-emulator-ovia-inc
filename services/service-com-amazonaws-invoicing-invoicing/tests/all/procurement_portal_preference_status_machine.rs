@@ -8,15 +8,15 @@
 //!
 //! The rules under test, each spanned by a table rather than one request:
 //!
-//! * `SendProcurementPortalValidation` issues the validation code and then reports whether
-//!   the DELIVERY of the test e-invoice carrying it could be confirmed: it can be confirmed
-//!   only for a preference that configures the endpoint that document goes to — the test
+//! * `SendProcurementPortalValidation` issues the validation code and then reports the
+//!   DELIVERY of the test e-invoice carrying it, which this emulator makes to no
+//!   procurement portal: the call names the delivery target it could not reach — the test
 //!   environment's endpoint when the stated connection-testing method replays into that
-//!   environment, the portal's own delivery endpoint otherwise — and a preference that
-//!   configures none is answered the modelled `ValidationException` with the fixed sentence
-//!   that refusal carries. The code is outstanding either way, which is what makes that
-//!   refusal's own remedy work: a caller that finds the code in the portal's
-//!   rejected-invoice log submits it and completes the verification.
+//!   environment, the portal's own delivery endpoint otherwise — and states that the
+//!   delivery was not confirmed for a preference that configures neither. The code is
+//!   outstanding either way, which is what makes that refusal's own remedy work: a caller
+//!   that finds the code in the portal's rejected-invoice log submits it and completes the
+//!   verification.
 //! * `UpdateProcurementPortalPreferenceStatus` applies only a move a CALLER may ask for: a
 //!   status the service assigns itself, and a pair the lifecycle does not provide, are
 //!   refused with the modelled `ValidationException` whose message states the detail the
@@ -32,10 +32,10 @@ use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
 use crate::refused_procurement_portal_writes::{
-    accepted_update_round, arn_of, call, create_with_confirmable_delivery, emulator_with_engine,
+    accepted_update_round, arn_of, call, create_with_delivery_endpoint, emulator_with_engine,
     error_code, error_text, get_preference, last_update, minimal_create, ok, outstanding_code,
-    shifted, validate_preference, version, without_write_markers, PORTAL_INSTANCE_ENDPOINT,
-    PORTAL_NAMES,
+    shifted, undeliverable_sentence, validate_preference, version, without_write_markers,
+    DELIVERY_NOT_CONFIRMED, PORTAL_INSTANCE_ENDPOINT, PORTAL_NAMES,
 };
 
 /// The statuses of `ProcurementPortalPreferenceStatus` this table names
@@ -59,16 +59,6 @@ const TEST_ENV_REPLAY_TEST: &str = "TEST_ENV_REPLAY_TEST";
 /// The endpoint the test environment of a portal delivers e-invoices to
 /// (`TestEnvPreference$ProcurementPortalInstanceEndpoint`), inside that member's `^\S+$`.
 const TEST_ENV_ENDPOINT: &str = "https://test.portal.example.com/cxml";
-
-/// The sentence AWS answers when it could not confirm the delivery of the test e-invoice:
-/// recorded behaviour, and FIXED text for this error class — it carries nothing of the
-/// request and nothing of the preference's state.
-const DELIVERY_NOT_CONFIRMED: &str = "We could not confirm delivery of the test e-invoice. The \
-     OTP may have been sent but rejected by your procurement portal's business-rule \
-     validation. Check your portal's rejected-invoice log for the OTP (for example, in Coupa \
-     open Setup then Integrations then cXML Errors; in SAP Business Network review your \
-     Invoice Rules) and submit it to complete verification. If the OTP is not there, verify \
-     your portal configuration or contact support.";
 
 /// The two planes of a preference, each as the model spells its status members, with the
 /// key the refusal's echoed detail carries them under.
@@ -118,8 +108,9 @@ fn test_env_preference() -> Value {
     })
 }
 
-/// One row of the delivery-confirmation table: what the preference configures, and whether
-/// the service can confirm the delivery of the test e-invoice under it.
+/// One row of the delivery table: what the preference configures, and the endpoint the
+/// test e-invoice of its connection test is delivered TO under that configuration — `None`
+/// for a configuration that names no such endpoint at all.
 struct DeliveryRow {
     label: &'static str,
     /// The connection-testing method stated, or `None` for a preference whose e-invoice
@@ -129,7 +120,7 @@ struct DeliveryRow {
     portal_endpoint: bool,
     /// Whether the test environment's delivery endpoint is configured.
     test_env_endpoint: bool,
-    confirmable: bool,
+    target: Option<&'static str>,
 }
 
 /// The rows: both connection-testing methods and no method at all, crossed with the
@@ -142,70 +133,72 @@ fn delivery_rows() -> Vec<DeliveryRow> {
             method: None,
             portal_endpoint: false,
             test_env_endpoint: false,
-            confirmable: false,
+            target: None,
         },
         DeliveryRow {
             label: "no method, the portal endpoint",
             method: None,
             portal_endpoint: true,
             test_env_endpoint: false,
-            confirmable: true,
+            target: Some(PORTAL_INSTANCE_ENDPOINT),
         },
         DeliveryRow {
             label: "no method, the test environment endpoint only",
             method: None,
             portal_endpoint: false,
             test_env_endpoint: true,
-            confirmable: false,
+            target: None,
         },
         DeliveryRow {
             label: "a dollar test in production, the portal endpoint",
             method: Some(PROD_ENV_DOLLAR_TEST),
             portal_endpoint: true,
             test_env_endpoint: false,
-            confirmable: true,
+            target: Some(PORTAL_INSTANCE_ENDPOINT),
         },
         DeliveryRow {
             label: "a dollar test in production, the test environment endpoint only",
             method: Some(PROD_ENV_DOLLAR_TEST),
             portal_endpoint: false,
             test_env_endpoint: true,
-            confirmable: false,
+            target: None,
         },
         DeliveryRow {
             label: "a replay in the test environment, its endpoint",
             method: Some(TEST_ENV_REPLAY_TEST),
             portal_endpoint: false,
             test_env_endpoint: true,
-            confirmable: true,
+            target: Some(TEST_ENV_ENDPOINT),
         },
         DeliveryRow {
             label: "a replay in the test environment, the portal endpoint only",
             method: Some(TEST_ENV_REPLAY_TEST),
             portal_endpoint: true,
             test_env_endpoint: false,
-            confirmable: false,
+            target: None,
         },
         DeliveryRow {
             label: "a replay in the test environment, both endpoints",
             method: Some(TEST_ENV_REPLAY_TEST),
             portal_endpoint: true,
             test_env_endpoint: true,
-            confirmable: true,
+            target: Some(TEST_ENV_ENDPOINT),
         },
     ]
 }
 
 /// RULE: the call that starts a portal validation issues the validation code and reports
-/// whether the delivery of the test e-invoice carrying it could be CONFIRMED — which it can
-/// be only for a preference that configures the endpoint that document is delivered to, the
-/// test environment's own endpoint when the stated connection-testing method replays into
-/// that environment and the portal's delivery endpoint otherwise. A preference that
-/// configures none is answered the modelled `ValidationException` with the fixed sentence
-/// that refusal carries, and the code it issued is outstanding either way: submitting the
-/// code the refusal tells the caller to retrieve completes the verification.
+/// the DELIVERY of the test e-invoice carrying it — which this emulator makes to no
+/// procurement portal, so the call is refused rather than claiming a delivery nothing
+/// performed: it names the delivery target (the endpoint the document goes to, the test
+/// environment's own when the stated connection-testing method replays into that
+/// environment and the portal's delivery endpoint otherwise, with the portal's cXML invoice
+/// path under it) when the preference configures that endpoint, and states that the
+/// delivery was not confirmed when it configures none. The code it issued is outstanding
+/// either way: submitting the code the refusal tells the caller to retrieve completes the
+/// verification.
 #[tokio::test]
-async fn a_send_reports_whether_the_test_einvoice_delivery_is_confirmed() {
+async fn a_send_reports_the_delivery_of_the_test_einvoice_it_could_not_make() {
     let (router, engine) = emulator_with_engine();
 
     for (index, row) in delivery_rows().iter().enumerate() {
@@ -232,38 +225,27 @@ async fn a_send_reports_whether_the_test_einvoice_delivery_is_confirmed() {
             &json!({"ProcurementPortalPreferenceArn": arn}),
         )
         .await;
-        if row.confirmable {
-            assert_eq!(
-                status, 200,
-                "case {}: a delivery the service can confirm is answered with the ARN, got \
-                 {status} {body}",
-                row.label
-            );
-            assert_eq!(
-                arn_of(&body),
-                arn,
-                "case {}: the answer names the preference it was asked about, got {body}",
-                row.label
-            );
-        } else {
-            assert_eq!(
-                status, 400,
-                "case {}: a delivery the service cannot confirm is refused, got {status} {body}",
-                row.label
-            );
-            assert_eq!(
-                error_code(&body),
-                "ValidationException",
-                "case {}: expected the modelled ValidationException, got {body}",
-                row.label
-            );
-            assert_eq!(
-                error_text(&body),
-                DELIVERY_NOT_CONFIRMED,
-                "case {}: the refusal carries the sentence this error class states, got {body}",
-                row.label
-            );
-        }
+        assert_eq!(
+            status, 400,
+            "case {}: a delivery the service could not make is refused, got {status} {body}",
+            row.label
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {}: expected the modelled ValidationException, got {body}",
+            row.label
+        );
+        let expected = match row.target {
+            Some(endpoint) => undeliverable_sentence(endpoint),
+            None => DELIVERY_NOT_CONFIRMED.to_string(),
+        };
+        assert_eq!(
+            error_text(&body),
+            expected,
+            "case {}: the refusal carries the sentence this error class states, got {body}",
+            row.label
+        );
 
         // The code is issued whatever the call ANSWERED, which is what the refusal's own
         // remedy rests on — and issuing it is one write of the resource, so the version
@@ -471,7 +453,7 @@ async fn preference_holding(
         &ok(
             router,
             "CreateProcurementPortalPreference",
-            &create_with_confirmable_delivery(
+            &create_with_delivery_endpoint(
                 PORTAL_NAMES[index % PORTAL_NAMES.len()],
                 &format!("BUYER-MACHINE-{index}"),
                 &format!("SUPPLIER-MACHINE-{index}"),
@@ -737,8 +719,8 @@ fn the_connection_test(arn: &str, _code: Option<&str>) -> Value {
 async fn a_read_back_reports_what_the_accepted_calls_left() {
     let (router, engine) = emulator_with_engine();
 
-    // (label, whether the preference can confirm a test delivery, the calls, the status the
-    //  e-invoice plane ends at)
+    // (label, whether the preference configures the endpoint its test e-invoice goes to,
+    //  the calls, the status the e-invoice plane ends at)
     let lifecycles: Vec<(&str, bool, Vec<Call>, &str)> = vec![
         (
             "a configuration write, then three refusals",
@@ -752,7 +734,7 @@ async fn a_read_back_reports_what_the_accepted_calls_left() {
                     writes: true,
                 },
                 Call {
-                    label: "the send whose delivery cannot be confirmed",
+                    label: "the send that has no endpoint to deliver to",
                     operation: "SendProcurementPortalValidation",
                     request: a_validation_start,
                     expected_status: 400,
@@ -783,7 +765,7 @@ async fn a_read_back_reports_what_the_accepted_calls_left() {
                     label: "the send",
                     operation: "SendProcurementPortalValidation",
                     request: a_validation_start,
-                    expected_status: 200,
+                    expected_status: 400,
                     writes: true,
                 },
                 Call {
@@ -811,7 +793,7 @@ async fn a_read_back_reports_what_the_accepted_calls_left() {
                     label: "the send",
                     operation: "SendProcurementPortalValidation",
                     request: a_validation_start,
-                    expected_status: 200,
+                    expected_status: 400,
                     writes: true,
                 },
                 Call {
@@ -840,12 +822,12 @@ async fn a_read_back_reports_what_the_accepted_calls_left() {
         ),
     ];
 
-    for (index, (label, confirmable, calls, ends_at)) in lifecycles.iter().enumerate() {
+    for (index, (label, with_endpoint, calls, ends_at)) in lifecycles.iter().enumerate() {
         let portal = PORTAL_NAMES[index % PORTAL_NAMES.len()];
         let buyer = format!("BUYER-LIFECYCLE-{index}");
         let supplier = format!("SUPPLIER-LIFECYCLE-{index}");
-        let create = if *confirmable {
-            create_with_confirmable_delivery(portal, &buyer, &supplier)
+        let create = if *with_endpoint {
+            create_with_delivery_endpoint(portal, &buyer, &supplier)
         } else {
             minimal_create(portal, &buyer, &supplier)
         };

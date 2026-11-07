@@ -700,8 +700,8 @@ fn seed_preference(engine: &Arc<engine::InMemoryEngine>, arn: &str, portal: &str
             selector: None,
             procurement_portal_shared_secret: None,
             // The endpoint the test e-invoice of a portal validation is delivered to, so
-            // the send that issues a code can confirm that delivery and answer the
-            // modelled 200 (see `crate::refused_procurement_portal_writes`).
+            // the send that issues a code has a delivery TARGET to name in the refusal it
+            // answers (see `crate::refused_procurement_portal_writes`).
             procurement_portal_instance_endpoint: Some(
                 "https://portal.example.com/cxml".to_string(),
             ),
@@ -738,18 +738,25 @@ fn seed_preference(engine: &Arc<engine::InMemoryEngine>, arn: &str, portal: &str
 /// `SendProcurementPortalValidation` is that call — the model documents it as initiating
 /// the validation by issuing a validation code — so the code is issued over the wire and
 /// then READ from state: the modelled response carries only the ARN, because the real
-/// service delivers the code through the configured procurement portal.
+/// service delivers the code through the configured procurement portal. The call itself
+/// REFUSES, reporting the delivery of the test e-invoice this emulator could not make,
+/// while the code it issued stays outstanding.
 async fn issue_code(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     arn: &str,
 ) -> String {
-    ok(
+    let (status, body) = call(
         router,
         "SendProcurementPortalValidation",
         &json!({"ProcurementPortalPreferenceArn": arn}),
     )
     .await;
+    assert_eq!(
+        status, 400,
+        "case issue a code for {arn}: the send reports the delivery it could not make, got \
+         {status} {body}"
+    );
     outstanding_code(engine, arn).unwrap_or_else(|| {
         panic!("case issue a code: the send must leave a code outstanding for {arn}")
     })
@@ -862,22 +869,11 @@ async fn portal_validation_accepts_only_the_code_it_issued() {
         "case verify before any send: expected the modelled validation error, got {body}"
     );
 
-    // The send is the call that ISSUES a code: it answers 200 with the ARN it was asked
-    // about and leaves that preference's own code outstanding.
+    // The send is the call that ISSUES a code: it reports the delivery of the test
+    // e-invoice this emulator could not make and leaves that preference's own code
+    // outstanding, which is what the flow runs on.
     for arn in [&first, &second] {
-        let answered = ok(
-            &router,
-            "SendProcurementPortalValidation",
-            &json!({"ProcurementPortalPreferenceArn": arn}),
-        )
-        .await;
-        assert_eq!(
-            answered
-                .get("ProcurementPortalPreferenceArn")
-                .and_then(Value::as_str),
-            Some(arn.as_str()),
-            "case send {arn}: the send answers with the ARN it was asked about, got {answered}"
-        );
+        let _ = issue_code(&router, &engine, arn).await;
     }
 
     let issued = outstanding_code(&engine, &first)

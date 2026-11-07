@@ -22,7 +22,7 @@
 use serde_json::json;
 
 use crate::refused_procurement_portal_writes::{
-    accepted_update_round, arn_of, call, create_with_confirmable_delivery, emulator_with_engine,
+    accepted_update_round, arn_of, call, create_with_delivery_endpoint, emulator_with_engine,
     get_preference, issue_code, ok, outstanding_code, shifted, PORTAL_NAMES,
 };
 
@@ -42,7 +42,7 @@ async fn a_rejected_validation_code_leaves_the_other_preferences_alone() {
         &ok(
             &router,
             "CreateProcurementPortalPreference",
-            &create_with_confirmable_delivery(PORTAL_NAMES[0], "BUYER-SUBJECT", "SUPPLIER-SUBJECT"),
+            &create_with_delivery_endpoint(PORTAL_NAMES[0], "BUYER-SUBJECT", "SUPPLIER-SUBJECT"),
         )
         .await,
     );
@@ -50,7 +50,7 @@ async fn a_rejected_validation_code_leaves_the_other_preferences_alone() {
         &ok(
             &router,
             "CreateProcurementPortalPreference",
-            &create_with_confirmable_delivery(
+            &create_with_delivery_endpoint(
                 PORTAL_NAMES[1],
                 "BUYER-BYSTANDER",
                 "SUPPLIER-BYSTANDER",

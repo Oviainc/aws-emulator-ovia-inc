@@ -45,6 +45,8 @@ mod modelled_refusal_on_every_implemented_operation;
 mod own_account_and_request_derived_refusals;
 #[path = "all/portal_endpoint_must_be_a_secure_url.rs"]
 mod portal_endpoint_must_be_a_secure_url;
+#[path = "all/portal_preference_conflict_and_delivery_refusals.rs"]
+mod portal_preference_conflict_and_delivery_refusals;
 #[path = "all/portal_validation_code_issue.rs"]
 mod portal_validation_code_issue;
 #[path = "all/procurement_portal_error_message_key.rs"]
@@ -93,6 +95,8 @@ mod state_roundtrip;
 mod status_update_needs_an_enabled_plane;
 #[path = "all/tag_write_quota_counts_distinct_keys.rs"]
 mod tag_write_quota_counts_distinct_keys;
+#[path = "all/the_requester_reads_its_own_account.rs"]
+mod the_requester_reads_its_own_account;
 #[path = "all/validation_message_wording.rs"]
 mod validation_message_wording;
 #[path = "all/wire_envelope_and_error_detail.rs"]

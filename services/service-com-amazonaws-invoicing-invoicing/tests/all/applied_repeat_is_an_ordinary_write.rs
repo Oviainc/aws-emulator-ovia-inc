@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
 use crate::refused_procurement_portal_writes::{
-    arn_of, create_with_confirmable_delivery, emulator_with_engine, get_preference, last_update, ok,
+    arn_of, create_with_delivery_endpoint, emulator_with_engine, get_preference, last_update, ok,
     validate_preference, version, PORTAL_NAMES, STATUS_TEST_INITIALIZED,
 };
 
@@ -429,7 +429,7 @@ async fn an_applied_status_update_under_a_spent_token_is_an_ordinary_write() {
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &create_with_confirmable_delivery(
+                &create_with_delivery_endpoint(
                     row.portal,
                     &format!("BUYER-ORDINARY-{index}"),
                     &format!("SUPPLIER-ORDINARY-{index}"),

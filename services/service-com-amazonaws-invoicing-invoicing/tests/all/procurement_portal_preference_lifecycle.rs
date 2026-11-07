@@ -41,7 +41,7 @@ use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
 // The members every applied write of this resource advances, stripped in ONE place for
 // every suite of this plane that compares a configuration across such a write.
-use crate::refused_procurement_portal_writes::without_write_markers;
+use crate::refused_procurement_portal_writes::{error_text, without_write_markers};
 
 /// The status each enabled plane of a preference carries until a validation moves it: one
 /// of the values `ProcurementPortalPreferenceStatus` admits (`smithy_query(query="shape",
@@ -721,47 +721,62 @@ async fn a_delete_removes_the_preference_from_every_reader() {
 
 /// RULE: the call that starts a validation ISSUES the validation code the flow runs on —
 /// the model documents it as initiating the validation process by issuing a validation code
-/// — and answers the modelled 200 with the ARN it was asked about when the service can
-/// CONFIRM the delivery of the test e-invoice carrying that code, which it can for a
-/// preference that configures the endpoint the document goes to and cannot for one that
-/// configures none. The code never travels on the wire (the modelled output carries only
-/// the ARN, because the real service delivers it through the portal), issuing it writes no
-/// CONFIGURATION — only the `Version` and `LastUpdateDate` every applied write of the
-/// resource advances — and a code the caller did not receive still completes nothing.
+/// — and then reports the DELIVERY of the test e-invoice carrying that code, which this
+/// emulator makes to no procurement portal: the call is refused with the modelled
+/// `ValidationException`, naming the delivery target it could not reach for a preference
+/// that configures the endpoint the document goes to and stating that the delivery was not
+/// confirmed for one that configures none. The code never travels on the wire (the modelled
+/// output carries only the ARN, because the real service delivers it through the portal),
+/// issuing it writes no CONFIGURATION — only the `Version` and `LastUpdateDate` every
+/// applied write of the resource advances — and a code the caller did not receive still
+/// completes nothing.
 ///
 /// The rows differ along which portal endpoints the preference configures (none, the portal
 /// instance endpoint, the test environment's endpoint, both), because the endpoint is where
 /// the real service delivers the code: with no connection-testing method stated, the test
-/// e-invoice goes to the portal's own delivery endpoint, so that is the one that decides
-/// the answer.
+/// e-invoice goes to the portal's own delivery endpoint, so that is the one the refusal
+/// names.
 #[tokio::test]
-async fn a_send_issues_a_validation_code_and_confirms_what_it_can_deliver() {
+async fn a_send_issues_a_validation_code_and_reports_the_delivery_it_could_not_make() {
     let router = emulator();
 
-    // (label, the portal instance endpoint, the test environment's endpoint, the answer)
-    let rows: Vec<(&str, Option<&str>, Option<&str>, u16)> = vec![
-        ("no endpoint configured", None, None, 400),
-        (
-            "a portal instance endpoint",
-            Some("https://portal.example.com/invoices"),
-            None,
-            200,
-        ),
-        (
-            "a test environment endpoint",
-            None,
-            Some("https://test.portal.example.com/invoices"),
-            400,
-        ),
-        (
-            "both endpoints",
-            Some("https://portal.example.com/invoices"),
-            Some("https://test.portal.example.com/invoices"),
-            200,
-        ),
+    // One row: what the preference configures, and the delivery target the refusal names.
+    struct SendRow {
+        label: &'static str,
+        endpoint: Option<&'static str>,
+        test_endpoint: Option<&'static str>,
+        target: Option<&'static str>,
+    }
+    let rows: Vec<SendRow> = vec![
+        SendRow {
+            label: "no endpoint configured",
+            endpoint: None,
+            test_endpoint: None,
+            target: None,
+        },
+        SendRow {
+            label: "a portal instance endpoint",
+            endpoint: Some("https://portal.example.com/invoices"),
+            test_endpoint: None,
+            target: Some("https://portal.example.com/invoices"),
+        },
+        SendRow {
+            label: "a test environment endpoint",
+            endpoint: None,
+            test_endpoint: Some("https://test.portal.example.com/invoices"),
+            target: None,
+        },
+        SendRow {
+            label: "both endpoints",
+            endpoint: Some("https://portal.example.com/invoices"),
+            test_endpoint: Some("https://test.portal.example.com/invoices"),
+            target: Some("https://portal.example.com/invoices"),
+        },
     ];
 
-    for (index, (label, endpoint, test_endpoint, expected_status)) in rows.iter().enumerate() {
+    for (index, row) in rows.iter().enumerate() {
+        let (label, endpoint, test_endpoint, target) =
+            (row.label, row.endpoint, row.test_endpoint, row.target);
         let mut create = minimal_create(
             PORTAL_NAMES[index % PORTAL_NAMES.len()],
             &format!("BUYER-SEND-{index}"),
@@ -782,45 +797,42 @@ async fn a_send_issues_a_validation_code_and_confirms_what_it_can_deliver() {
         let arn = arn_of(&ok(&router, "CreateProcurementPortalPreference", &create).await);
         let before = get_preference(&router, &arn).await;
 
-        // The answer is the same on a first call, on a repeat, and on the `ClientToken`
-        // replay of that repeat — which answers with the ARN the call it replays returned.
-        // Only the two calls that ISSUE a code write the resource: the replay issues none.
+        // The answer is the same on a first call, on a repeat, and on a repeat of the
+        // `ClientToken`: a refused call records no answer for a later one to replay, so each
+        // of the three ISSUES a code of its own and each one writes the resource.
         let mut issued_codes = 0;
-        for attempt in ["no token", "with a token", "the token replayed"] {
+        for attempt in ["no token", "with a token", "the token repeated"] {
             let mut request = json!({"ProcurementPortalPreferenceArn": arn});
             if attempt != "no token" {
                 request["ClientToken"] = json!("send-token-1");
             }
-            let replayed = attempt == "the token replayed" && *expected_status == 200;
             let (status, body) = call(&router, "SendProcurementPortalValidation", &request).await;
-            if !replayed {
-                issued_codes += 1;
-            }
+            issued_codes += 1;
             assert_eq!(
-                status,
-                if replayed { 200 } else { *expected_status },
-                "case {label} ({attempt}): expected HTTP {expected_status}, got {status} {body}"
+                status, 400,
+                "case {label} ({attempt}): the send reports the delivery it could not make, \
+                 got {status} {body}"
             );
-            if status == 200 {
-                assert_eq!(
-                    body.get("ProcurementPortalPreferenceArn")
-                        .and_then(Value::as_str),
-                    Some(arn.as_str()),
-                    "case {label} ({attempt}): the answer names the preference it was asked \
-                     about, got {body}"
-                );
-                // The code is delivered out of band: no member of the answer carries it.
-                assert_eq!(
-                    body.as_object().map(|members| members.len()),
-                    Some(1),
-                    "case {label} ({attempt}): the answer carries the ARN alone, got {body}"
-                );
-            } else {
-                assert_eq!(
-                    error_code(&body),
-                    "ValidationException",
-                    "case {label} ({attempt}): expected the modelled validation error, got \
-                     {body}"
+            assert_eq!(
+                error_code(&body),
+                "ValidationException",
+                "case {label} ({attempt}): expected the modelled validation error, got {body}"
+            );
+            // The refusal states what this emulator could not deliver: the target under the
+            // configured endpoint when there is one, and the delivery-unconfirmed sentence
+            // when the preference configures none.
+            let names_a_target = error_text(&body).contains("unable to deliver");
+            assert_eq!(
+                names_a_target,
+                target.is_some(),
+                "case {label} ({attempt}): a configured endpoint is named as the delivery \
+                 target and nothing else is, got {body}"
+            );
+            if let Some(target) = target {
+                assert!(
+                    error_text(&body).contains(&format!("{target}/cxml/invoices")),
+                    "case {label} ({attempt}): the refusal names the delivery target \
+                     {target}/cxml/invoices, got {body}"
                 );
             }
         }

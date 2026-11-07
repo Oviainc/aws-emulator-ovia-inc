@@ -20,8 +20,9 @@
 //!   the flow's `Code` is quoted in, which the verify then accepts — over the portals the
 //!   enum admits, at several configuration-version counts, and however many sends preceded
 //!   it (a later send retires the code an earlier one issued);
-//! * a `ClientToken` replay of a send answers with the ARN the first call returned and
-//!   issues no second code, while any other send issues a fresh one;
+//! * every send issues a code of its own whatever `ClientToken` it carries: a refused call
+//!   records no answer for a later one to replay, and this emulator's send reports the
+//!   delivery of the test e-invoice it could not make;
 //! * a completed validation can be started again: the next send issues a code of its own
 //!   and the consumed one completes nothing;
 //! * issuing a code writes no CONFIGURATION, so no configuration member a reader reports
@@ -39,8 +40,9 @@ use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 use service_com_amazonaws_invoicing_invoicing::state::ComAmazonawsInvoicingInvoicingState;
 
 use crate::refused_procurement_portal_writes::{
-    accepted_update_round, arn_of, call, create_with_confirmable_delivery, emulator_with_engine,
-    get_preference, minimal_create, ok, outstanding_code, PORTAL_NAMES,
+    accepted_update_round, arn_of, call, create_with_delivery_endpoint, emulator_with_engine,
+    error_code, error_text, get_preference, minimal_create, ok, outstanding_code,
+    undeliverable_sentence, PORTAL_INSTANCE_ENDPOINT, PORTAL_NAMES,
 };
 
 /// How many decimal digits an issued validation code has: the form
@@ -103,18 +105,26 @@ fn version(preference: &Value) -> i64 {
         .unwrap_or_else(|| panic!("expected a Version in {preference}"))
 }
 
-/// One send, asserting the modelled answer: HTTP 200 carrying the ARN it was asked about.
-async fn send(router: &MultiServiceRouter, case: &str, request: &Value) -> String {
-    let body = ok(router, "SendProcurementPortalValidation", request).await;
-    let answered = arn_of(&body);
+/// One send, asserting the modelled answer: the refusal that reports the delivery of the
+/// test e-invoice this emulator could not make — HTTP 400 `ValidationException`, naming the
+/// delivery target when the preference configures the endpoint the document goes to. The
+/// code the call ISSUED is outstanding either way, which is the work under test here.
+async fn send(router: &MultiServiceRouter, case: &str, request: &Value) {
+    let (status, body) = call(router, "SendProcurementPortalValidation", request).await;
     assert_eq!(
-        Some(answered.as_str()),
-        request
-            .get("ProcurementPortalPreferenceArn")
-            .and_then(Value::as_str),
-        "case {case}: the send answers with the ARN it was asked about, got {body}"
+        status, 400,
+        "case {case}: the send reports the delivery it could not make, got {status} {body}"
     );
-    answered
+    assert_eq!(
+        error_code(&body),
+        "ValidationException",
+        "case {case}: expected the modelled ValidationException, got {body}"
+    );
+    assert_eq!(
+        error_text(&body),
+        undeliverable_sentence(PORTAL_INSTANCE_ENDPOINT),
+        "case {case}: the refusal names the delivery target it could not reach, got {body}"
+    );
 }
 
 /// One row: a preference reached through a chosen number of successful configuration
@@ -185,7 +195,7 @@ async fn every_send_issues_a_code_the_verify_then_accepts() {
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &create_with_confirmable_delivery(
+                &create_with_delivery_endpoint(
                     row.portal,
                     &format!("BUYER-ISSUE-{index}"),
                     &format!("SUPPLIER-ISSUE-{index}"),
@@ -354,16 +364,17 @@ async fn every_send_issues_a_code_the_verify_then_accepts() {
     }
 }
 
-/// RULE: under `@idempotency`, a replay of a request — the same `ClientToken` against the
-/// same resource — answers with what the first call answered and performs its work once,
-/// so the code that call issued stays the outstanding one; a request that is not a replay
-/// issues again.
+/// RULE: a `ClientToken` records an ANSWER for a later call carrying it to replay, and a
+/// call that was refused has none — so every send starts the validation again: it issues a
+/// code of its own, which retires the code the previous send issued, whatever token it
+/// carries and whether that token was used before.
 ///
 /// The rows differ along the token's shape, inside `BasicStringWithoutSpace`'s
 /// `@length(0..1024)` and `^\S+$` (`smithy_query(query="operation",
-/// operation="SendProcurementPortalValidation")`).
+/// operation="SendProcurementPortalValidation")`), and along whether a send states one at
+/// all.
 #[tokio::test]
-async fn a_replayed_send_issues_no_second_code() {
+async fn every_send_issues_a_fresh_code_whatever_token_it_carries() {
     let (router, engine) = emulator_with_engine();
 
     let longest = "t".repeat(1024);
@@ -375,7 +386,7 @@ async fn a_replayed_send_issues_no_second_code() {
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &create_with_confirmable_delivery(
+                &create_with_delivery_endpoint(
                     PORTAL_NAMES[index % PORTAL_NAMES.len()],
                     &format!("BUYER-REPLAY-{index}"),
                     &format!("SUPPLIER-REPLAY-{index}"),
@@ -383,54 +394,58 @@ async fn a_replayed_send_issues_no_second_code() {
             )
             .await,
         );
-        let request = json!({"ProcurementPortalPreferenceArn": arn, "ClientToken": token});
+        // The sends of this row: the token repeated, then one stating no token and one
+        // stating another, so neither a repeat nor a fresh token is what decides.
+        let requests = [
+            ("the token stated", json!({"ProcurementPortalPreferenceArn": arn, "ClientToken": token})),
+            ("the token repeated", json!({"ProcurementPortalPreferenceArn": arn, "ClientToken": token})),
+            ("the token repeated again", json!({"ProcurementPortalPreferenceArn": arn, "ClientToken": token})),
+            ("no token at all", json!({"ProcurementPortalPreferenceArn": arn})),
+            (
+                "another token",
+                json!({"ProcurementPortalPreferenceArn": arn, "ClientToken": format!("another-token-{index}")}),
+            ),
+        ];
 
-        send(&router, &format!("token {token:?} first"), &request).await;
-        let issued = outstanding_code(&engine, &arn)
-            .unwrap_or_else(|| panic!("case token {token:?}: the send must issue a code"));
+        let mut previous: Option<String> = None;
+        let mut writes = version(&get_preference(&router, &arn).await);
+        for (shape, request) in requests {
+            let case = format!("token {token:?}, {shape}");
+            send(&router, &case, &request).await;
+            writes += 1;
+            let issued = outstanding_code(&engine, &arn)
+                .unwrap_or_else(|| panic!("case {case}: the send must issue a code"));
+            if let Some(previous) = previous.as_deref() {
+                assert_ne!(
+                    issued, previous,
+                    "case {case}: a send issues a code of its own, got the previous \
+                     {previous:?}"
+                );
 
-        // Replayed twice: the answer is the same and no further code is issued.
-        for replay in 1..=2 {
-            send(
-                &router,
-                &format!("token {token:?} replay {replay}"),
-                &request,
-            )
-            .await;
+                // The code the previous send issued is retired by this one.
+                let (status, body) = call(
+                    &router,
+                    "VerifyProcurementPortalValidation",
+                    &json!({"ProcurementPortalPreferenceArn": arn, "Code": previous}),
+                )
+                .await;
+                writes += 1;
+                assert_eq!(
+                    status, 400,
+                    "case {case}: the code a later send replaced completes nothing, got \
+                     {status} {body}"
+                );
+            }
+            // Each issued code is one write of the resource, and so is each refused
+            // submission of a retired one.
+            let reported = get_preference(&router, &arn).await;
             assert_eq!(
-                outstanding_code(&engine, &arn).as_deref(),
-                Some(issued.as_str()),
-                "case token {token:?} replay {replay}: a replay issues no second code"
+                version(&reported),
+                writes,
+                "case {case}: expected Version {writes} after {writes} applied writes, got \
+                 {reported}"
             );
-        }
-
-        // A send that is NOT a replay issues again, so the token is what makes a replay.
-        for other in [
-            json!({"ProcurementPortalPreferenceArn": arn}),
-            json!({"ProcurementPortalPreferenceArn": arn, "ClientToken": format!("another-token-{index}")}),
-        ] {
-            send(&router, &format!("token {token:?} not a replay"), &other).await;
-            let reissued = outstanding_code(&engine, &arn).unwrap_or_else(|| {
-                panic!("case token {token:?}: a send that is no replay must issue a code")
-            });
-            assert_ne!(
-                reissued, issued,
-                "case token {token:?}: a send that is no replay issues a fresh code, got the \
-                 previous {issued:?}"
-            );
-
-            // The code the first send issued is retired by it.
-            let (status, body) = call(
-                &router,
-                "VerifyProcurementPortalValidation",
-                &json!({"ProcurementPortalPreferenceArn": arn, "Code": issued}),
-            )
-            .await;
-            assert_eq!(
-                status, 400,
-                "case token {token:?}: the code a later send replaced completes nothing, got \
-                 {status} {body}"
-            );
+            previous = Some(issued);
         }
     }
 }
@@ -449,7 +464,7 @@ async fn a_completed_validation_can_be_started_again() {
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &create_with_confirmable_delivery(
+                &create_with_delivery_endpoint(
                     portal,
                     &format!("BUYER-REDO-{index}"),
                     &format!("SUPPLIER-REDO-{index}"),

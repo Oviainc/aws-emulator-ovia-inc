@@ -159,13 +159,38 @@ pub(crate) fn minimal_create(portal: &str, buyer: &str, supplier: &str) -> Value
 pub(crate) const PORTAL_INSTANCE_ENDPOINT: &str = "https://portal.example.com/cxml";
 
 /// A create request like [`minimal_create`], configuring in addition the endpoint the test
-/// e-invoice of a portal validation is delivered to — so the service can CONFIRM that
-/// delivery and `SendProcurementPortalValidation` answers the modelled 200 rather than the
-/// delivery-unconfirmed refusal.
-pub(crate) fn create_with_confirmable_delivery(portal: &str, buyer: &str, supplier: &str) -> Value {
+/// e-invoice of a portal validation is delivered to — so the send that issues a code has a
+/// delivery TARGET, and the refusal it answers names that target rather than reporting that
+/// there was nothing to deliver to.
+pub(crate) fn create_with_delivery_endpoint(portal: &str, buyer: &str, supplier: &str) -> Value {
     let mut request = minimal_create(portal, buyer, supplier);
     request["ProcurementPortalInstanceEndpoint"] = json!(PORTAL_INSTANCE_ENDPOINT);
     request
+}
+
+/// The sentence a send is refused with when there is no endpoint for the test e-invoice to
+/// be delivered to at all: recorded behaviour, and FIXED text for this error class — it
+/// carries nothing of the request and nothing of the preference's state.
+pub(crate) const DELIVERY_NOT_CONFIRMED: &str = "We could not confirm delivery of the test \
+     e-invoice. The OTP may have been sent but rejected by your procurement portal's \
+     business-rule validation. Check your portal's rejected-invoice log for the OTP (for \
+     example, in Coupa open Setup then Integrations then cXML Errors; in SAP Business Network \
+     review your Invoice Rules) and submit it to complete verification. If the OTP is not \
+     there, verify your portal configuration or contact support.";
+
+/// The fixed path under a configured endpoint that the test e-invoice is delivered to: the
+/// portal's cXML invoice intake, which the refusal below names under the endpoint.
+pub(crate) const DELIVERY_PATH: &str = "/cxml/invoices";
+
+/// The whole sentence a send is refused with when the test e-invoice could not be delivered
+/// to the endpoint the preference configures for it: the delivery TARGET is the only
+/// substituted part, and every other word is fixed text for this error class.
+pub(crate) fn undeliverable_sentence(endpoint: &str) -> String {
+    format!(
+        "We were unable to deliver the test e-invoice to the endpoint {}{DELIVERY_PATH}. Please \
+         confirm the endpoint URL is correct and reachable, then try again.",
+        endpoint.trim_end_matches('/')
+    )
 }
 
 /// Carry every enabled plane of `arn` to [`STATUS_VALIDATED`] by completing its portal
@@ -509,7 +534,8 @@ struct Step {
     operation: &'static str,
     request: fn(&Subject) -> Value,
     /// Whether this call SUCCEEDS at all — which is not the same thing as writing the
-    /// resource: a send that cannot confirm its delivery, and a refused submission, write.
+    /// resource: a send that reports the delivery it could not make, and a refused
+    /// submission, both write.
     succeeds: bool,
     /// Whether this call WRITES the preference — which is exactly when the reported
     /// version advances.
@@ -528,18 +554,20 @@ fn accepted_status_update(subject: &Subject) -> Value {
 /// The steps a sequence is built from, each named once here so a row is just an order.
 fn step(label: &'static str) -> Step {
     match label {
-        "accepted send" => Step {
+        "refused send" => Step {
             label,
             operation: "SendProcurementPortalValidation",
             request: send_validation,
-            succeeds: true,
+            // The send reports the delivery it could not make, and the code it ISSUED on
+            // the way is a write of the preference.
+            succeeds: false,
             writes: true,
         },
-        "accepted send with a token" => Step {
+        "refused send with a token" => Step {
             label,
             operation: "SendProcurementPortalValidation",
             request: send_validation_with_token,
-            succeeds: true,
+            succeeds: false,
             writes: true,
         },
         "refused verify" => Step {
@@ -593,7 +621,7 @@ async fn the_version_counts_the_applied_writes_only() {
         (
             "refusals before the writes",
             vec![
-                "accepted send",
+                "refused send",
                 "refused verify",
                 "refused status update",
                 "accepted update",
@@ -604,18 +632,18 @@ async fn the_version_counts_the_applied_writes_only() {
             "refusals between the writes",
             vec![
                 "accepted update",
-                "accepted send",
+                "refused send",
                 "accepted status update",
                 "refused verify",
-                "accepted send with a token",
+                "refused send with a token",
                 "accepted update",
             ],
         ),
         (
             "nothing but refusals",
             vec![
-                "accepted send",
-                "accepted send",
+                "refused send",
+                "refused send",
                 "refused verify",
                 "refused status update",
             ],
@@ -630,7 +658,7 @@ async fn the_version_counts_the_applied_writes_only() {
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &create_with_confirmable_delivery(portal, &buyer, &supplier),
+                &create_with_delivery_endpoint(portal, &buyer, &supplier),
             )
             .await,
         );
@@ -718,17 +746,38 @@ async fn the_version_counts_the_applied_writes_only() {
 /// the validation by issuing a validation code — so the code is issued over the wire and
 /// then READ from state: the modelled response carries only the ARN, because the real
 /// service delivers the code through the configured procurement portal.
+///
+/// The call itself REFUSES: this emulator delivers no test e-invoice to a procurement
+/// portal, so the send reports the delivery it could not make (the sentence naming the
+/// delivery target when the preference configures one, and [`DELIVERY_NOT_CONFIRMED`] when
+/// it configures none) while the code it issued stays outstanding — which is what the
+/// refusal's own remedy rests on, and what this helper hands back.
 pub(crate) async fn issue_code(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     arn: &str,
 ) -> String {
-    ok(
+    let (status, body) = call(
         router,
         "SendProcurementPortalValidation",
         &json!({"ProcurementPortalPreferenceArn": arn}),
     )
     .await;
+    assert_eq!(
+        status, 400,
+        "case issue a code for {arn}: the send reports the delivery it could not make, got \
+         {status} {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ValidationException",
+        "case issue a code for {arn}: expected the modelled ValidationException, got {body}"
+    );
+    let text = error_text(&body);
+    assert!(
+        text == DELIVERY_NOT_CONFIRMED || text.starts_with("We were unable to deliver"),
+        "case issue a code for {arn}: expected one of this error class's sentences, got {text:?}"
+    );
     outstanding_code(engine, arn).unwrap_or_else(|| {
         panic!("case issue a code: the send must leave a code outstanding for {arn}")
     })
@@ -899,7 +948,7 @@ async fn a_rejected_validation_code_records_the_attempt_it_reports() {
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &create_with_confirmable_delivery(row.portal, &buyer, &supplier),
+                &create_with_delivery_endpoint(row.portal, &buyer, &supplier),
             )
             .await,
         );

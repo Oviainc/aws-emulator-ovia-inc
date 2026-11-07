@@ -13,9 +13,9 @@
 //! fresh code instead of the previous code's spent one, and the number it drives its
 //! "retry or ask again" decision off stays inside the budget it is stated against.
 //!
-//! Its counterpart, which pins the count to the ISSUING rather than to the call: a send
-//! that is a `@idempotency` REPLAY issues no second code, so it starts no second budget
-//! either — the attempts already made against the outstanding code still count.
+//! Its counterpart, which pins the count to the ISSUING rather than to any call that
+//! writes: a configuration update issues no code, so it starts no second budget either —
+//! the attempts already made against the outstanding code still count.
 //!
 //! Each test is a table: the rows differ along how many submissions were refused before a
 //! fresh code is asked for (none, one, exactly the budget, past it), whether the earlier
@@ -26,9 +26,10 @@ use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
 use crate::refused_procurement_portal_writes::{
-    arn_of, call, create_with_confirmable_delivery, emulator_with_engine, error_code, error_text,
-    get_preference, invalid_code_sentence, issue_code, ok, outstanding_code, shifted, version,
-    without_write_markers, PORTAL_NAMES, VERIFICATION_ATTEMPT_BUDGET,
+    accepted_update_round, arn_of, call, create_with_delivery_endpoint, emulator_with_engine,
+    error_code, error_text, get_preference, invalid_code_sentence, issue_code, ok,
+    outstanding_code, shifted, version, without_write_markers, PORTAL_NAMES,
+    VERIFICATION_ATTEMPT_BUDGET,
 };
 
 /// How many submissions one round refuses: one past the budget, so each round also shows
@@ -169,7 +170,7 @@ async fn a_freshly_issued_code_is_refused_from_the_first_attempt() {
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &create_with_confirmable_delivery(
+                &create_with_delivery_endpoint(
                     row.portal,
                     &format!("BUYER-BUDGET-{index}"),
                     &format!("SUPPLIER-BUDGET-{index}"),
@@ -261,49 +262,46 @@ async fn a_freshly_issued_code_is_refused_from_the_first_attempt() {
 }
 
 /// RULE (the same one, from its other side): the count restarts because a code was
-/// ISSUED, so a send that issues none — an `@idempotency` replay, the same `ClientToken`
-/// against the same preference — leaves the attempts already made against the outstanding
-/// code counted, and the next refusal continues from them.
+/// ISSUED, so a call that WRITES the preference without issuing one — a configuration
+/// update — leaves the attempts already made against the outstanding code counted, and the
+/// next refusal continues from them.
 ///
-/// The rows differ along the token's shape, inside `BasicStringWithoutSpace`'s
-/// `@length(0..1024)` and `^\S+$` (`smithy_query(query="operation",
-/// operation="SendProcurementPortalValidation")`), and along how many submissions were
-/// refused before the replay — below the budget and past it.
+/// The rows differ along how many submissions were refused before that write arrives —
+/// below the budget, at it and past it.
 #[tokio::test]
-async fn a_replayed_send_starts_no_fresh_budget() {
+async fn a_write_that_issues_no_code_starts_no_fresh_budget() {
     let (router, engine) = emulator_with_engine();
 
-    let longest = "t".repeat(1024);
     let cases: &[(&str, u32)] = &[
-        ("t", 1),
-        ("a-client-token", 2),
-        ("9f2b-4c1d", VERIFICATION_ATTEMPT_BUDGET + 1),
-        (longest.as_str(), VERIFICATION_ATTEMPT_BUDGET),
+        ("one refusal before the write", 1),
+        ("two refusals before the write", 2),
+        (
+            "one refusal past the budget before the write",
+            VERIFICATION_ATTEMPT_BUDGET + 1,
+        ),
+        ("the budget spent before the write", VERIFICATION_ATTEMPT_BUDGET),
     ];
 
-    for (index, (token, failures_before_replay)) in cases.iter().enumerate() {
+    for (index, (label, failures_before_write)) in cases.iter().enumerate() {
         let arn = arn_of(
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &create_with_confirmable_delivery(
+                &create_with_delivery_endpoint(
                     PORTAL_NAMES[index % PORTAL_NAMES.len()],
-                    &format!("BUYER-REPLAY-BUDGET-{index}"),
-                    &format!("SUPPLIER-REPLAY-BUDGET-{index}"),
+                    &format!("BUYER-OTHER-WRITE-BUDGET-{index}"),
+                    &format!("SUPPLIER-OTHER-WRITE-BUDGET-{index}"),
                 ),
             )
             .await,
         );
-        let send = json!({"ProcurementPortalPreferenceArn": arn, "ClientToken": token});
-        ok(&router, "SendProcurementPortalValidation", &send).await;
-        let issued = outstanding_code(&engine, &arn)
-            .unwrap_or_else(|| panic!("case token {token:?}: the send must issue a code"));
+        let issued = issue_code(&router, &engine, &arn).await;
         let wrong = shifted(&issued);
 
-        for attempt in 1..=*failures_before_replay {
+        for attempt in 1..=*failures_before_write {
             refused(
                 &router,
-                &format!("token {token:?} before the replay, attempt {attempt}"),
+                &format!("{label}, attempt {attempt}"),
                 &arn,
                 &wrong,
                 attempt,
@@ -311,32 +309,37 @@ async fn a_replayed_send_starts_no_fresh_budget() {
             .await;
         }
 
-        // The replay answers for the first call and issues nothing, so the count it would
-        // have restarted stands where those refusals left it.
-        ok(&router, "SendProcurementPortalValidation", &send).await;
+        // A configuration write issues no code, so the count it would have restarted
+        // stands where those refusals left it — and the code stays the outstanding one.
+        ok(
+            &router,
+            "PutProcurementPortalPreference",
+            &accepted_update_round(&arn, index as i64),
+        )
+        .await;
         assert_eq!(
             outstanding_code(&engine, &arn).as_deref(),
             Some(issued.as_str()),
-            "case token {token:?}: a replay issues no second code"
+            "case {label}: a write that issues no code leaves the outstanding one alone"
         );
         refused(
             &router,
-            &format!("token {token:?} after the replay"),
+            &format!("{label}, after the write"),
             &arn,
             &wrong,
-            failures_before_replay + 1,
+            failures_before_write + 1,
         )
         .await;
 
-        // A send that is NOT a replay issues a code, and THAT restarts the count.
+        // A SEND issues a code, and THAT restarts the count.
         let fresh = issue_code(&router, &engine, &arn).await;
         assert_ne!(
             fresh, issued,
-            "case token {token:?}: a send that is no replay issues a fresh code"
+            "case {label}: a send issues a fresh code"
         );
         refused(
             &router,
-            &format!("token {token:?} after a fresh code"),
+            &format!("{label} after a fresh code"),
             &arn,
             &shifted(&fresh),
             1,
@@ -359,7 +362,7 @@ async fn a_fresh_code_restarts_only_its_own_preferences_count() {
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &create_with_confirmable_delivery(
+                &create_with_delivery_endpoint(
                     portal,
                     &format!("BUYER-ISOLATED-{index}"),
                     &format!("SUPPLIER-ISOLATED-{index}"),

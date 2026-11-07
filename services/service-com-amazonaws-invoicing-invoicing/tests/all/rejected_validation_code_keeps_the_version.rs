@@ -19,7 +19,7 @@
 use serde_json::{json, Value};
 
 use crate::refused_procurement_portal_writes::{
-    arn_of, call, create_with_confirmable_delivery, emulator_with_engine, get_preference,
+    arn_of, call, create_with_delivery_endpoint, emulator_with_engine, get_preference,
     issue_code, last_update, listed_summary, ok, shifted, version, PORTAL_NAMES,
 };
 
@@ -41,7 +41,7 @@ async fn the_version_a_rejected_code_left_survives_every_read() {
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &create_with_confirmable_delivery(
+                &create_with_delivery_endpoint(
                     portal,
                     &format!("BUYER-READS-{index}"),
                     &format!("SUPPLIER-READS-{index}"),

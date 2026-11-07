@@ -16,12 +16,16 @@
 //!
 //! Issuing the code is one half of what the call does; the other is DELIVERING the test
 //! e-invoice that carries it to the endpoint the preference configures for it, and whether
-//! that delivery can be CONFIRMED is what decides the answer: a delivery is confirmed by
-//! the endpoint it reached, so a preference that configures no endpoint for its test
-//! e-invoice ([`test_einvoice_delivery_endpoint`]) leaves the service with nothing to
-//! confirm and the call answers the modelled `ValidationException` (HTTP 400) stating that
-//! the delivery was not confirmed. The code it issued stays outstanding either way, which
-//! is what that refusal's own remedy rests on: a caller that finds the code in the portal's
+//! that delivery ARRIVED is what decides the answer. This emulator holds no procurement
+//! portal and opens no connection to one, so no test e-invoice is ever delivered to a
+//! configured endpoint: the call reports the delivery it could not make rather than a
+//! delivery nothing performed, as the modelled `ValidationException` (HTTP 400) — naming
+//! the delivery target it could not reach ([`undeliverable_test_einvoice`]) for a
+//! preference that configures the endpoint its test e-invoice goes to
+//! ([`test_einvoice_delivery_endpoint`]), and stating that the delivery was not confirmed
+//! ([`TEST_EINVOICE_DELIVERY_NOT_CONFIRMED`]) for one that configures none, where there is
+//! not even a target to name. The code it issued stays outstanding either way, which is
+//! what both refusals' own remedy rests on: a caller that finds the code in the portal's
 //! rejected-invoice log submits it to `VerifyProcurementPortalValidation` and completes the
 //! verification.
 //!
@@ -35,18 +39,20 @@
 //! code is retired and the fresh code carries its own failed-attempt budget — the count a
 //! refusal of `VerifyProcurementPortalValidation` reports counts submissions against the
 //! code currently outstanding, so asking for a new code (the remedy that refusal names)
-//! really does restore it. That is what a client asking for a fresh code gets. Under
-//! `@idempotency`, a replay — the same `ClientToken` against the same preference — answers
-//! with the ARN the first call returned and issues no second code, so the code that call
-//! issued stays outstanding and the attempts already made against it still count.
+//! really does restore it. That is what a client asking for a fresh code gets. The
+//! `ClientToken` of `@idempotency` records nothing here, because no send of this emulator
+//! completes: a call that answers an error leaves no answer for a later one to replay, so
+//! a repeat of the token is a fresh attempt — it issues its own code and is answered on
+//! its own merits.
 //!
 //! Issuing a code writes no CONFIGURATION: no configuration member moves here, and no
 //! plane's verification status moves either — nothing has verified the connection until a
 //! code comes back. What the call DOES write is the validation state of the preference, so
 //! it advances `Version` and `LastUpdateDate` the way every applied write of this resource
-//! does ([`crate::state::StoredProcurementPortalPreference::record_write`]) — a later
-//! `GetProcurementPortalPreference` / `ListProcurementPortalPreferences` therefore reports
-//! the configuration the last configuration write left, at the version this call produced.
+//! does ([`crate::state::StoredProcurementPortalPreference::record_write`]) — the refused
+//! delivery attempt is recorded, so a later `GetProcurementPortalPreference` /
+//! `ListProcurementPortalPreferences` reports the configuration the last configuration
+//! write left, at the version this call produced.
 //!
 //! ## Shape of an operation
 //!
@@ -198,31 +204,66 @@ fn test_einvoice_delivery_endpoint(preference: &ProcurementPortalPreference) -> 
     preference.procurement_portal_instance_endpoint.as_deref()
 }
 
-/// Whether the service can CONFIRM that the test e-invoice carrying the issued code
-/// reached the procurement portal.
+/// The path under a configured endpoint that the test e-invoice is delivered to: the
+/// cXML invoice intake of the procurement portal, which is where the document carrying the
+/// validation code is POSTed.
 ///
-/// A delivery is confirmed by the endpoint it was delivered TO, so the service can confirm
-/// one only for a preference that configures the endpoint its test e-invoice goes to
-/// ([`test_einvoice_delivery_endpoint`]): a preference that configures none leaves the
-/// service with nowhere to deliver the document and nothing to confirm, and the call
-/// answers the modelled 400 instead of the ARN.
+/// Recorded behaviour, and FIXED text: the refusal below names the endpoint it could not
+/// deliver to with this suffix appended to the endpoint the preference configures, whatever
+/// that endpoint is.
+const TEST_EINVOICE_DELIVERY_PATH: &str = "/cxml/invoices";
+
+/// The delivery target of the test e-invoice: the endpoint the preference configures for it
+/// with the portal's cXML invoice path under it.
 ///
-/// Recorded behaviour: the refusal AWS answers names exactly that outcome — the code "may
-/// have been sent but rejected by your procurement portal's business-rule validation", the
-/// remedy is the portal's rejected-invoice log, and the last resort is to "verify your
-/// portal configuration" ([`TEST_EINVOICE_DELIVERY_NOT_CONFIRMED`]).
-fn test_einvoice_delivery_is_confirmable(preference: &ProcurementPortalPreference) -> bool {
-    test_einvoice_delivery_endpoint(preference).is_some()
+/// A single `/` joins the two, so an endpoint stored with a trailing slash names the same
+/// target as one stored without it — the path is one path however the endpoint spells its
+/// own end.
+fn test_einvoice_delivery_target(endpoint: &str) -> String {
+    format!(
+        "{}{TEST_EINVOICE_DELIVERY_PATH}",
+        endpoint.trim_end_matches('/')
+    )
 }
 
-/// The sentence a send is refused with when the delivery of the test e-invoice cannot be
-/// confirmed: it states that the delivery was not confirmed, that the code may still have
-/// reached the portal and been rejected by its business-rule validation, where to find it
-/// there, and what to do when it is not there.
+/// The sentence a send is refused with when the test e-invoice could not be DELIVERED to
+/// the endpoint the preference configures for it: it names the delivery target that did not
+/// receive it and states the remedy — confirm the endpoint URL and try again.
+///
+/// Recorded behaviour: the only substituted part is the delivery target
+/// ([`test_einvoice_delivery_target`], the configured endpoint with the portal's cXML
+/// invoice path under it); every other word is fixed text for this error class.
+///
+/// Held to the bound the model gives the member it travels in
+/// ([`crate::service::validation::bounded_message`]), as every message this service words
+/// from stored values is — an endpoint is a `BasicStringWithoutSpace` of up to 1024
+/// characters, so a legal endpoint can word a sentence longer than `BasicString` holds.
+fn undeliverable_test_einvoice(endpoint: &str) -> ValidationException {
+    ValidationException {
+        message: Some(crate::service::validation::bounded_message(format!(
+            "We were unable to deliver the test e-invoice to the endpoint {}. Please confirm \
+             the endpoint URL is correct and reachable, then try again.",
+            test_einvoice_delivery_target(endpoint)
+        ))),
+        // `other` is one of the model's `ValidationExceptionReason` values
+        // ([`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]): no member of the
+        // request is at fault — the delivery the call attempted did not arrive.
+        reason: Some("other".to_string()),
+        // The procurement-portal plane keys the text as `Message`
+        // ([`crate::ops::types::MessageKey`]).
+        message_key: MessageKey::Capitalised,
+        ..Default::default()
+    }
+}
+
+/// The sentence a send is refused with when there is no endpoint for the test e-invoice to
+/// be delivered to at all: it states that the delivery was not confirmed, that the code may
+/// still have reached the portal and been rejected by its business-rule validation, where to
+/// find it there, and what to do when it is not there.
 ///
 /// Recorded behaviour, and FIXED text for this error class: it reproduces nothing of the
 /// request and nothing of the preference's state — the outcome it reports is the same for
-/// every preference whose connection test the service cannot confirm.
+/// every preference whose connection test the service has no target for.
 const TEST_EINVOICE_DELIVERY_NOT_CONFIRMED: &str = "We could not confirm delivery of the test \
      e-invoice. The OTP may have been sent but rejected by your procurement portal's \
      business-rule validation. Check your portal's rejected-invoice log for the OTP (for \
@@ -287,17 +328,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut store = state.lock();
-        let client_token = input.client_token.as_deref();
-        // This request carries nothing beside the preference its ARN names and the
-        // token, so the ARN the ledger key already states IS the whole request
-        // (`crate::state::empty_request_digest`).
-        let request_digest = crate::state::empty_request_digest();
+        // `@idempotencyToken`: a token records an ANSWER for a later call to replay, and no
+        // send of this emulator has one — every call answers one of the two refusals below,
+        // so there is nothing to replay. A repeat of the token is therefore a fresh attempt
+        // at the delivery, issuing its own code and answered on its own merits.
+        let _ = input.client_token;
 
         // The ARN has to name a preference this emulator holds: validation is state
         // ABOUT a preference, so there is nothing to start for one that does not exist.
-        // The model declares `ResourceNotFoundException` (HTTP 404) for exactly this.
-        // Checked BEFORE the idempotency replay, so a replay against a preference that is
-        // gone reports it gone rather than answering for it.
+        // The model declares `ResourceNotFoundException` (HTTP 404) for exactly this, and
+        // it is answered before anything is issued, so no validation state is created for
+        // a preference that is not there.
         if !store
             .procurement_portal_preferences
             .contains_key(&input.procurement_portal_preference_arn)
@@ -312,30 +353,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // `@idempotent`: a replay (the same `ClientToken` against the same preference)
-        // answers with the ARN the first call returned and issues NO second code, so the
-        // code that call issued is still the one a submission has to match.
-        if let Some(arn) = store.replayed_result(
-            Self::NAME,
-            &input.procurement_portal_preference_arn,
-            &request_digest,
-            client_token,
-        ) {
-            return Ok(SendProcurementPortalValidationOutput {
-                procurement_portal_preference_arn: arn,
-            });
-        }
-
         // Issuing the code IS this operation's work, so this call writes the validation
         // state of the preference: the code it mints becomes the outstanding one and any
         // code an earlier send left is retired, which is what a client asking for a fresh
         // code gets.
         let code = store.issue_portal_validation_code();
         let issued_at = crate::state::now();
-        // The same resolution as the one above, repeated only because the replay lookup in
-        // between borrows the store immutably: there is ONE not-found refusal on this
-        // path, and under the single lock held here this arm cannot fire — it answers with
-        // that same modelled 404 rather than panicking if it ever could.
+        // The same resolution as the one above, repeated only because the check in between
+        // borrows the store immutably: there is ONE not-found refusal on this path, and
+        // under the single lock held here this arm cannot fire — it answers with that same
+        // modelled 404 rather than panicking if it ever could.
         let stored = store
             .procurement_portal_preferences
             .get_mut(&input.procurement_portal_preference_arn)
@@ -361,28 +388,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource, which that helper records.
         stored.issue_validation(code, issued_at);
 
-        // The code is issued; whether the test e-invoice carrying it got THROUGH to the
-        // portal is the other half of this call, and for a connection test the service
-        // does not drive it cannot be confirmed. The code stays outstanding, because the
-        // refusal's own remedy is to submit the code the portal logged as rejected.
-        if !test_einvoice_delivery_is_confirmable(&stored.preference) {
-            return Err(
-                SendProcurementPortalValidationErrorModeled::ValidationException(
-                    test_einvoice_delivery_not_confirmed(),
-                )
-                .into(),
-            );
-        }
-
-        store.record_result(
-            Self::NAME,
-            &input.procurement_portal_preference_arn,
-            &request_digest,
-            client_token,
-            &input.procurement_portal_preference_arn,
-        );
-        Ok(SendProcurementPortalValidationOutput {
-            procurement_portal_preference_arn: input.procurement_portal_preference_arn,
-        })
+        // The code is issued; DELIVERING the test e-invoice that carries it to the portal
+        // is the other half of this call, and this emulator holds no procurement portal and
+        // opens no connection to one, so that document reaches no endpoint. The call reports
+        // the delivery it could not make rather than one nothing performed: it names the
+        // delivery target the document did not reach when the preference configures the
+        // endpoint that document goes to, and states that the delivery was not confirmed
+        // when it configures none, where there is no target to name. The code stays
+        // outstanding either way, because both refusals' own remedy is to submit the code
+        // the portal logged as rejected.
+        Err(
+            SendProcurementPortalValidationErrorModeled::ValidationException(
+                match test_einvoice_delivery_endpoint(&stored.preference) {
+                    Some(endpoint) => undeliverable_test_einvoice(endpoint),
+                    None => test_einvoice_delivery_not_confirmed(),
+                },
+            )
+            .into(),
+        )
     }
 }

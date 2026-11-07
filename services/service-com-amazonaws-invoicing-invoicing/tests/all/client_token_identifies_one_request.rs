@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
 use crate::refused_procurement_portal_writes::{
-    accepted_update_round, arn_of, call, create_with_confirmable_delivery, emulator_with_engine,
+    accepted_update_round, arn_of, call, create_with_delivery_endpoint, emulator_with_engine,
     error_code, error_text, get_preference, invalid_code_sentence, issue_code, ok,
     outstanding_code, shifted, validate_preference, version, PORTAL_NAMES,
     STATUS_TEST_INITIALIZED,
@@ -173,7 +173,7 @@ async fn a_spent_token_does_not_excuse_the_code_check() {
         &ok(
             &router,
             "CreateProcurementPortalPreference",
-            &create_with_confirmable_delivery(
+            &create_with_delivery_endpoint(
                 PORTAL_NAMES[1],
                 "BUYER-ELSEWHERE",
                 "SUPPLIER-ELSEWHERE",
@@ -189,7 +189,7 @@ async fn a_spent_token_does_not_excuse_the_code_check() {
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &create_with_confirmable_delivery(
+                &create_with_delivery_endpoint(
                     row.portal,
                     &format!("BUYER-SPENT-{index}"),
                     &format!("SUPPLIER-SPENT-{index}"),
@@ -363,7 +363,7 @@ async fn a_status_update_under_a_spent_token_states_its_own_move() {
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &create_with_confirmable_delivery(
+                &create_with_delivery_endpoint(
                     row.portal,
                     &format!("BUYER-STATUS-{index}"),
                     &format!("SUPPLIER-STATUS-{index}"),
@@ -702,7 +702,7 @@ async fn a_configuration_write_under_a_spent_token_writes_its_own_configuration(
             &ok(
                 &router,
                 "CreateProcurementPortalPreference",
-                &create_with_confirmable_delivery(
+                &create_with_delivery_endpoint(
                     PORTAL_NAMES[index % PORTAL_NAMES.len()],
                     &format!("BUYER-PUT-{index}"),
                     &format!("SUPPLIER-PUT-{index}"),
@@ -904,7 +904,7 @@ async fn a_preference_create_under_a_spent_token_is_not_replayed_for_another_req
 
     for (index, row) in preference_create_rows().into_iter().enumerate() {
         let label = row.label;
-        let mut recorded = create_with_confirmable_delivery(
+        let mut recorded = create_with_delivery_endpoint(
             PORTAL_NAMES[index % PORTAL_NAMES.len()],
             &format!("BUYER-CREATE-{index}"),
             &format!("SUPPLIER-CREATE-{index}"),
