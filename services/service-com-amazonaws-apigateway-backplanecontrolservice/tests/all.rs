@@ -19,6 +19,9 @@
 #[path = "all/documentation_part_creation.rs"]
 mod documentation_part_creation;
 // Declared here, at the head, for the reason the entry above records.
+#[path = "all/stage_lambda_proxy_integration.rs"]
+mod stage_lambda_proxy_integration;
+// Declared here, at the head, for the reason the entry above records.
 #[path = "all/passed_through_integration.rs"]
 mod passed_through_integration;
 #[path = "all/stage_web_acl_edge.rs"]

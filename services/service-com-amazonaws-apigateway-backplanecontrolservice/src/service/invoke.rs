@@ -621,6 +621,24 @@ const API_CONFIGURATION_ERROR: GatewayRefusal = GatewayRefusal {
     message_member: MESSAGE_MEMBER,
 };
 
+/// The integration's backend had not answered by the integration's own `timeoutInMillis`
+/// ("custom timeout between 50 and 29,000 milliseconds", `Integration$timeoutInMillis`), so
+/// the call has no backend answer to map: `504` through `INTEGRATION_TIMEOUT`
+/// ([`crate::state::default_gateway_status_code`] gives that type's own status), carrying
+/// the sentence API Gateway answers an integration that ran out of time with.
+///
+/// This is what bounds a request to a deployed stage whose integration reaches a backend
+/// that runs for its own time ([`lambda_proxy`]): the wait is the api's own stored number
+/// rather than anything a request chooses, and a request that reaches it is ANSWERED rather
+/// than held open.
+const INTEGRATION_TIMEOUT: GatewayRefusal = GatewayRefusal {
+    response_type: "INTEGRATION_TIMEOUT",
+    message: Cow::Borrowed("Endpoint request timed out"),
+    error_type: None,
+    validation_detail: Cow::Borrowed(""),
+    message_member: MESSAGE_MEMBER,
+};
+
 /// The method is authorized by an `Authorizer` whose decision this emulator cannot
 /// obtain — the authorizer runs a Lambda function, and no deployment package runs here.
 /// `500` `{"message":"Internal server error"}`, the same class API Gateway reports when it

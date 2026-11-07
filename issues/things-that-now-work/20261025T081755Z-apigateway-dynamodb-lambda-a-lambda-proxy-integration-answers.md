@@ -10,6 +10,25 @@ Issue-Commit: ffece56e68e804f0450b8a83661b5d243139afbd
 
 > _Note: this issue was identified against the code base at commit `ffece56e68e804f0450b8a83661b5d243139afbd`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+_Status update:_ both causes are addressed on the `execute-api` data plane. An `AWS_PROXY`
+integration is now PERFORMED — the method request is handed to the function as one proxy
+event, the envelope the function returned is the method response, a return value that is no
+envelope is answered `502`, and the invocation is made only where the function's own
+resource-based policy grants `apigateway.amazonaws.com` `lambda:InvokeFunction` for the ARN of
+the method being invoked (`src/service/invoke/lambda_proxy.rs`). The wait for the function's
+answer is the integration's own `timeoutInMillis`, after which the call is answered through the
+api's `INTEGRATION_TIMEOUT` gateway response, so a request to a deployed stage always
+terminates. `tests/all/stage_lambda_proxy_integration.rs` drives the whole path end to end
+across API Gateway, AWS Lambda and Amazon DynamoDB.
+
+The `apigw-proxy-invoke-denied-without-lambda-resource-policy-for-that-path` replay key PASSES.
+The `apigw-lambda-ddb-pipeline-positive` key's own assertion (`assert status == 200`) no longer
+fires — the stage serves that call `200` with the handler's body and the item it wrote is
+readable from DynamoDB — but the check is still killed at the harness's 60 s cap inside its own
+`_poll_until` helper, on a step after that assertion which the replay could not place and which
+is not in the `AWS_PROXY` path (the verdict is identical under two independent implementations
+of that path). Whatever that poll waits for is unowned by this report.
+
 ## Operation
 PutIntegration
 

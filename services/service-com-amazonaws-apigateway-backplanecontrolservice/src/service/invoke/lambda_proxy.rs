@@ -62,10 +62,14 @@
 //!   is no function answer to pass through, so the call is answered the way every integration
 //!   this stage cannot perform is, through the api's own `API_CONFIGURATION_ERROR` gateway
 //!   response ([`super::API_CONFIGURATION_ERROR`], `500` with
-//!   `{"message":"Internal server error"}`).
+//!   `{"message":"Internal server error"}`);
+//! * the invocation was made and the function had not answered by the integration's own
+//!   `timeoutInMillis` ([`waited_for`]): the wait is the api's stored number, so a request to
+//!   a deployed stage is answered whatever the function does with its own time — through the
+//!   api's `INTEGRATION_TIMEOUT` gateway response ([`super::INTEGRATION_TIMEOUT`], `504`).
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use ::base64::Engine as _;
 use ::serde_json::{json, Map, Value};
@@ -73,9 +77,10 @@ use ::service_common::iam_authorization::{self as iam, Decision};
 use ::smithy_server_runtime::OperationContext;
 
 use crate::ops::put_integration::LAMBDA_PROXY_INTEGRATION_TYPE;
+use crate::ops::types::GetIntegrationOutput;
 
 use super::{IntegratedResponse, MethodRequest, UnservedIntegration, API_CONFIGURATION_ERROR,
-            JSON_CONTENT_TYPE};
+            INTEGRATION_TIMEOUT, JSON_CONTENT_TYPE};
 
 /// The vendor field of every AWS integration ARN, from the form `Integration$uri`
 /// documents: `arn:aws:apigateway:{region}:{subdomain}:path|action/…`.
@@ -170,6 +175,29 @@ const HEADERS_WITHHELD_FROM_THE_EVENT: &[&str] = &["authorization", "x-amz-secur
 /// rather than one buffered without bound.
 const MAX_PROXY_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 
+/// How long this call waits for the function's answer: the integration's own
+/// `timeoutInMillis`, "custom timeout between 50 and 29,000 milliseconds"
+/// (`Integration$timeoutInMillis`), so the wait is a stored number of this api's and never
+/// one a request chose. A stored value outside the range `PutIntegration` accepts is read as
+/// the DEFAULT that member documents, which is what a record carrying none means.
+///
+/// A backend that has not answered by then has not answered the CALL: API Gateway stops
+/// waiting and answers through the api's own `INTEGRATION_TIMEOUT` gateway response, which
+/// is what keeps a request to a deployed stage bounded whatever the function does with its
+/// own time.
+fn waited_for(integration: &GetIntegrationOutput) -> Duration {
+    let stored = integration.timeout_in_millis;
+    let millis = if (crate::ops::put_integration::MIN_TIMEOUT_IN_MILLIS
+        ..=crate::ops::put_integration::MAX_TIMEOUT_IN_MILLIS)
+        .contains(&stored)
+    {
+        stored
+    } else {
+        crate::ops::put_integration::DEFAULT_TIMEOUT_IN_MILLIS
+    };
+    Duration::from_millis(u64::try_from(millis).unwrap_or_default())
+}
+
 /// What a PROXY integration's event carries about the call beyond what a mapping template
 /// reads off it.
 ///
@@ -230,7 +258,7 @@ pub(super) async fn performed(
     } else {
         addressed_region.to_string()
     };
-    Some(served(ctx, &at, function, call).await)
+    Some(served(ctx, &at, function, call, waited_for(integration)).await)
 }
 
 /// The two parts of an `AWS_PROXY` `uri` that decide the invocation: the Region of the
@@ -261,11 +289,16 @@ fn invoked_function(uri: &str) -> Option<(&str, &str)> {
 
 /// The method response this call earns: the function's policy decides whether the
 /// invocation is made, the run decides what it answered, and that answer IS the response.
+///
+/// `within` is how long the integration waits for that answer ([`waited_for`]): the wait is
+/// bounded here rather than left to the function's own runtime, so the caller is answered
+/// whatever the run does with its time.
 async fn served(
     ctx: &OperationContext<'_>,
     region: &str,
     function: &str,
     call: &MethodRequest,
+    within: Duration,
 ) -> Result<IntegratedResponse, UnservedIntegration> {
     let client = lambda_client(ctx, region);
     if let Some(reason) = unpermitted(&client, function, call).await {
@@ -282,13 +315,34 @@ async fn served(
             .to_string(),
     })?;
     bounded(payload.len())?;
-    let answer = client
+    let invocation = client
         .invoke()
         .function_name(function)
         .invocation_type(::aws_sdk_lambda::types::InvocationType::RequestResponse)
         .payload(::aws_sdk_lambda::primitives::Blob::new(payload))
-        .send()
-        .await;
+        .send();
+    let answer = match ::tokio::time::timeout(within, invocation).await {
+        Ok(answer) => answer,
+        // The integration's own timeout fell due with no answer, so the backend did not
+        // answer this call: the request is answered through the api's `INTEGRATION_TIMEOUT`
+        // gateway response rather than held open for a run that is still going.
+        Err(_elapsed) => {
+            ::tracing::warn!(
+                waited_ms = within.as_millis(),
+                "the proxy integration's function did not answer within the integration's \
+                 timeout"
+            );
+            return Err(UnservedIntegration {
+                refusal: INTEGRATION_TIMEOUT,
+                reason: format!(
+                    "the AWS_PROXY integration's function did not answer within the \
+                     integration's timeoutInMillis of {}, so the call has no function \
+                     answer to pass through",
+                    within.as_millis()
+                ),
+            });
+        }
+    };
     let answered = match answer {
         Ok(answered) => answered,
         Err(error) => {
@@ -823,6 +877,40 @@ fn header_value(carried: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How long the integration waits for the function's answer, over the values a stored
+    /// `timeoutInMillis` can carry: the rows differ along where the stored number sits
+    /// relative to the range `Integration$timeoutInMillis` documents (each published bound,
+    /// a value inside it, one past each bound, and the zero a record that was never given
+    /// one would carry).
+    #[test]
+    fn the_wait_is_the_integrations_own_timeout() {
+        let default = u64::try_from(crate::ops::put_integration::DEFAULT_TIMEOUT_IN_MILLIS)
+            .expect("the documented default is a positive number of milliseconds");
+        let rows: [(&str, i32, u64); 7] = [
+            ("the documented default, which PutIntegration stores for a request naming none",
+             crate::ops::put_integration::DEFAULT_TIMEOUT_IN_MILLIS, default),
+            ("the lowest value the member admits", 50, 50),
+            ("a value inside the range", 1_500, 1_500),
+            ("the highest value the member admits", 29_000, 29_000),
+            ("one millisecond below the lowest", 49, default),
+            ("one millisecond above the highest", 29_001, default),
+            ("a record carrying no value at all", 0, default),
+        ];
+        for (case, stored, expected) in rows {
+            let integration = GetIntegrationOutput {
+                timeout_in_millis: stored,
+                ..GetIntegrationOutput::default()
+            };
+            let waited = waited_for(&integration);
+            assert_eq!(
+                waited,
+                Duration::from_millis(expected),
+                "case {case:?}: expected a {expected} ms wait for a stored {stored}, got \
+                 {waited:?}"
+            );
+        }
+    }
 
     /// One `uri` row: the case, the value, and the Region and function it names (`None` for
     /// a value that names no function-invoking action at all).
