@@ -48,6 +48,7 @@ use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10 as own
 use service_com_amazonaws_eventbridge_awsevents as owner_events;
 use service_com_amazonaws_glue_awsglue as owner_glue;
 use service_com_amazonaws_kms_trentservice as owner_kms;
+use service_com_amazonaws_lambda_awsgirapiservice as owner_lambda;
 use service_com_amazonaws_secretsmanager_secretsmanager as owner_secretsmanager;
 use service_com_amazonaws_sfn_awsstepfunctions as owner_sfn;
 use service_com_amazonaws_sqs_amazonsqs as owner_sqs;
@@ -225,6 +226,7 @@ pub fn visit<Eng: Send + Sync + 'static>(
         "events" => events(engine, arn, change),
         "glue" => glue(engine, arn, change),
         "kms" => kms(engine, arn, change),
+        "lambda" => lambda(engine, arn, change),
         "secretsmanager" => secretsmanager(engine, arn, change),
         "states" => states(engine, arn, change),
         _ => Resolution::Unowned,
@@ -337,6 +339,33 @@ pub fn tagged_resources<Eng: Send + Sync + 'static>(
     if let Some(state) = owner_kms::state::service_state(engine) {
         for key in state.lock().keys.values() {
             record(key.arn.clone(), key.tags.clone());
+        }
+    }
+    if let Some(state) = owner_lambda::state::service_state(engine) {
+        let mut state = state.lock();
+        // Like the secrets below, a capacity provider or an event source mapping
+        // whose removal the clock has already made due is gone: it was owed at
+        // this instant whether or not anybody called, so what the clock owes is
+        // materialised before this projection is read rather than reporting a
+        // resource the owning service no longer has.
+        state.materialize_all(SystemTime::now());
+        // Every resource type that service holds a tag set for, each under the
+        // ARN it minted for it — which already carries the Region the resource
+        // lives in, so the caller's Region filter applies to these rows exactly
+        // as it does to any other owner's. Only the UNQUALIFIED function ARN is a
+        // row: a version and an alias carry no tag set of their own, so neither
+        // is a resource this API reports.
+        for function in state.functions.values() {
+            record(function.arn.clone(), function.tags.clone());
+        }
+        for provider in state.capacity_providers.values() {
+            record(provider.arn.clone(), provider.tags.clone());
+        }
+        for mapping in state.event_source_mappings.values() {
+            record(mapping.arn.clone(), mapping.tags.clone());
+        }
+        for config in state.code_signing_configs.values() {
+            record(config.arn.clone(), config.tags.clone());
         }
     }
     if let Some(state) = owner_secretsmanager::state::service_state(engine) {
@@ -716,6 +745,60 @@ fn glue<Eng: Send + Sync + 'static>(
         }
     }
     Resolution::Present { tags: Some(pairs) }
+}
+
+/// AWS Lambda: a function, a capacity provider, an event source mapping or a
+/// code-signing configuration — the four resources that service holds a tag set
+/// for — each carrying its own tags, which are therefore the tags this API reads
+/// and writes.
+///
+/// The ARN is read and resolved by that service's OWN reader of a tagging
+/// `Resource` ([`owner_lambda::state::resolve_resource_tags`], which every one of
+/// its `/2017-03-31/tags/{Resource}` operations goes through), so the resource
+/// kinds this API can tag, the record each ARN resolves to and the refusal an ARN
+/// that names no tag set earns are that service's own, with no second copy here
+/// to drift from them. Both of its refusals travel as that service's own identity:
+/// an ARN naming no resource it holds is its 404 `ResourceNotFoundException`
+/// (`Function not found: <arn>` for a function), and an ARN that carries no tag
+/// set at all — a function qualified by a version or an alias, which "Lambda does
+/// not support adding tags to" — is its 400 `InvalidParameterValueException`
+/// (`smithy_query(query="operation", operation="TagResource")` on the Lambda
+/// model declares both).
+///
+/// The Region comes off the ARN rather than from the request, which is the same
+/// Region: `addressable_arn` has already refused an ARN of any other, and that
+/// service resolves a function ARN against the Region the ARN names.
+fn lambda<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    arn: &ParsedArn,
+    change: Option<&Change<'_>>,
+) -> Resolution {
+    let Some(state) = owner_lambda::state::service_state(engine) else {
+        return Resolution::Unowned;
+    };
+    let mut state = state.lock();
+    let tags = match owner_lambda::state::resolve_resource_tags(
+        &mut state,
+        &arn.arn,
+        &arn.region,
+        SystemTime::now(),
+    ) {
+        Ok(tags) => tags,
+        Err(owner_lambda::state::TagResolveFailure::Invalid(message)) => {
+            return absent("InvalidParameterValueException", message)
+        }
+        Err(owner_lambda::state::TagResolveFailure::NotFound(message)) => {
+            return absent_with_status(404, "ResourceNotFoundException", message)
+        }
+    };
+    if let Some(change) = change {
+        if let Err(would_hold) = change.apply(tags) {
+            return Resolution::TooManyTags(would_hold);
+        }
+    }
+    Resolution::Present {
+        tags: Some(tags.clone()),
+    }
 }
 
 /// Amazon KMS: a customer managed key, whose tags are the key's own.

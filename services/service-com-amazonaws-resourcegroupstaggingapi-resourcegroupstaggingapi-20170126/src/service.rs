@@ -41,9 +41,32 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The one half of a constraint refusal the framework cannot state — the
+/// COLLECTION a clause about a collection member is about; see the module's own
+/// header.
+mod submitted_collections;
+use submitted_collections::QuotingSubmittedCollections;
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each
+/// wrapped in [`QuotingSubmittedCollections`] and keyed by its operation shape
+/// name — the routing key `ServerHttpProtocol::routing_key` resolves and the
+/// generated table is keyed by.
+macro_rules! wrap_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                stringify!($operation),
+                ::std::boxed::Box::new(QuotingSubmittedCollections::new(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
+}
 
 /// The `com-amazonaws-resourcegroupstaggingapi-resourcegroupstaggingapi-20170126` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -52,6 +75,14 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The same modelled operations the generated table holds, each wrapped in
+    /// [`QuotingSubmittedCollections`] — so a constraint clause about a
+    /// collection member states the collection the request carried. Keyed by the
+    /// routing key the protocol resolves (the key the generated table uses) and
+    /// built from the SAME shared engine, so a wrapped operation reads and writes
+    /// the one store. Held on the service because
+    /// [`Service::override_operation`] hands back a borrow of `self`.
+    quoting_submitted_collections: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -59,8 +90,23 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut quoting_submitted_collections = OperationRoutingTable::new();
+        wrap_operations!(
+            quoting_submitted_collections,
+            engine,
+            describe_report_creation::DescribeReportCreation,
+            get_compliance_summary::GetComplianceSummary,
+            get_resources::GetResources,
+            get_tag_keys::GetTagKeys,
+            get_tag_values::GetTagValues,
+            list_required_tags::ListRequiredTags,
+            start_report_creation::StartReportCreation,
+            tag_resources::TagResources,
+            untag_resources::UntagResources,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            quoting_submitted_collections,
         }
     }
 }
@@ -91,8 +137,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        //
+        // NOT a re-route: the operation served is the one the generated routing
+        // table names for this request, wrapped so that a constraint clause about a
+        // collection member states the collection the request carried (see
+        // [`submitted_collections`]). The routing DECISION stays the model's — the
+        // key is resolved by the service's own protocol — and a key this table does
+        // not hold declines here, leaving the generated table and the router's
+        // routing-error path unchanged. The wrapper declares the wrapped
+        // operation's own auth schemes, so nothing about signing changes.
+        let operation = self.entry.protocol().routing_key(req).ok()?;
+        self.quoting_submitted_collections.get(operation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

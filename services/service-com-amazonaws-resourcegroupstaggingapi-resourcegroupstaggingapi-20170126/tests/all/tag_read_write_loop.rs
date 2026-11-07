@@ -175,9 +175,9 @@ const ARN_FORMS: &[(&str, &str, Option<&str>)] = &[
     ),
     // `resource-type:resource-id`.
     (
-        "arn:aws:lambda:us-east-1:123456789012:function:packer",
-        "lambda",
-        Some("lambda:function"),
+        "arn:aws:logs:us-east-1:123456789012:log-group:packer",
+        "logs",
+        Some("logs:log-group"),
     ),
     // A global resource: no region segment at all.
     (

@@ -42,3 +42,6 @@ mod pagination_termination;
 
 #[path = "all/elb_tagged_resource_index.rs"]
 mod elb_tagged_resource_index;
+
+#[path = "all/lambda_tagged_resource_index.rs"]
+mod lambda_tagged_resource_index;
