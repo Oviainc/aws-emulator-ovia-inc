@@ -6,7 +6,7 @@
 //! names; a key that is not set is left alone. A removal that changes the
 //! tunnel's tag set stamps the record's `lastUpdatedAt`, which the tunnel
 //! reports beside those tags. A key in the reserved
-//! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace is refused with HTTP 400
+//! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace is refused with
 //! `ValidationException` and removes nothing.
 //!
 //! ## Shape of an operation

@@ -3,7 +3,10 @@
 //! @op CloseTunnel
 //!
 //! Moves the tunnel to `CLOSED` and disconnects both ends; with `delete` set it
-//! removes the tunnel's data outright, so a later `DescribeTunnel` answers 404.
+//! removes the tunnel's data outright, so a later `DescribeTunnel` refuses with
+//! the modelled `ResourceNotFoundException`. The HTTP status that refusal — or any
+//! other modelled error of this service — arrives with is computed in one place,
+//! [`crate::scaffolded::wire_status`], and is not restated here.
 //!
 //! ## Shape of an operation
 //!

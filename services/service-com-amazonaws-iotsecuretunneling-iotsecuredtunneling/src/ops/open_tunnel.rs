@@ -12,13 +12,15 @@
 //!
 //! A request whose `destinationConfig.services` names more streams than a
 //! tunnel is multiplexed over ([`crate::state::MAX_SERVICES_PER_TUNNEL`]) is
-//! refused with HTTP 400 `ValidationException` before anything is minted,
+//! refused with `ValidationException` before anything is minted,
 //! stored or handed out. A request past an exhausted limit — the tunnels this
 //! account holds OPEN in this Region ([`crate::state::MAX_CONCURRENT_TUNNELS`]),
 //! the records the store keeps at all
 //! ([`crate::state::MAX_RETAINED_TUNNELS`]) or the tags one tunnel would carry
 //! ([`crate::state::MAX_TAGS_PER_TUNNEL`]) — is refused with the modelled
-//! `LimitExceededException` (HTTP 403), equally before anything is minted.
+//! `LimitExceededException`, equally before anything is minted. The HTTP status
+//! a modelled error of this service arrives with is computed in one place,
+//! [`crate::scaffolded::wire_status`], and is not restated here.
 //!
 //! ## Shape of an operation
 //!
@@ -194,8 +196,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The quota is on the tunnels this account holds OPEN in this Region
         // (`MAX_CONCURRENT_TUNNELS`), which is what the modelled
-        // `LimitExceededException` ("Thrown when a tunnel limit is exceeded",
-        // HTTP 403) exists to report: a closed tunnel holds no slot, so closing
+        // `LimitExceededException` ("Thrown when a tunnel limit is exceeded")
+        // exists to report: a closed tunnel holds no slot, so closing
         // one — with or without `delete` — makes room for this open. Refused
         // before anything is minted, so a refused open neither stores a record
         // nor hands out a token.
@@ -234,7 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `TagResource`, at the same count and in the same words, before
         // anything is stored. The modelled `TagList` length bounds one request's
         // list; this bounds what one tunnel accumulates, and an exhausted limit
-        // is reported with the same modelled `LimitExceededException` (HTTP 403)
+        // is reported with the same modelled `LimitExceededException`
         // as the tunnel count above, which this handler wraps the message in.
         if let Some(message) =
             store.tag_limit_refusal(&tunnel_arn, input.tags.as_deref().unwrap_or(&[]))

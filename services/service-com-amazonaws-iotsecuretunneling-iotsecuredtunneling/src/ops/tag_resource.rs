@@ -6,10 +6,12 @@
 //! overwriting a tag that already carries that key; a merge that changes the
 //! tunnel's tag set stamps the record's `lastUpdatedAt`, which the tunnel reports
 //! beside those tags. A key in the reserved
-//! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace is refused with HTTP 400
+//! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace is refused with
 //! `ValidationException` and stores nothing; a request that would take the tunnel
 //! past [`crate::state::MAX_TAGS_PER_TUNNEL`] tags is refused with the modelled
-//! `LimitExceededException` (HTTP 403) and also stores nothing.
+//! `LimitExceededException` and also stores nothing. The HTTP status a modelled
+//! error of this service arrives with is computed in one place,
+//! [`crate::scaffolded::wire_status`], and is not restated here.
 //!
 //! ## Shape of an operation
 //!
@@ -78,7 +80,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iotsecuretunneling-iots
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-// `LimitExceededException` — "Thrown when a tunnel limit is exceeded" (HTTP 403) — is a
+// `LimitExceededException` — "Thrown when a tunnel limit is exceeded" — is a
 // shape the SERVICE models that this operation does not list, widened in through
 // `extra_errors` so the per-tunnel tag limit is refused with the one error this service
 // models for an exhausted limit rather than with a code it never emits.
@@ -186,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // repeated calls, so the rule is applied through the one state helper
         // both tagging entry points share — and the store is left untouched when
         // the request would take it past the limit. An exhausted limit is what
-        // this service's `LimitExceededException` (HTTP 403) reports, so this
+        // this service's `LimitExceededException` reports, so this
         // handler wraps the helper's message in that modelled error, the same one
         // `OpenTunnel` answers for this limit and for the tunnel count.
         if let Some(message) = store.tag_limit_refusal(&input.resource_arn, &input.tags) {

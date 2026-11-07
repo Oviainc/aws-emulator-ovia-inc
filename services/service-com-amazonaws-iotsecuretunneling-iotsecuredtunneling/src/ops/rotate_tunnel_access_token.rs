@@ -16,16 +16,19 @@
 //! ([`crate::state::MAX_SERVICES_PER_TUNNEL`]).
 //!
 //! Those three refusals concern a request whose SHAPE the service accepts, and
-//! AWS answers them with HTTP 400 and the wire error code `ValidationException`
-//! — a code this model declares on no operation, which is why it comes from
+//! AWS answers them with the wire error code `ValidationException` — a code this
+//! model declares on no operation, which is why it comes from
 //! [`crate::scaffolded::Scaffolded::validation`] and not from the generated
-//! error enum. The operation's one MODELLED error, `ResourceNotFoundException`
-//! (404), answers the OTHER class and only it: a `tunnelId` this Region's
-//! endpoint holds no record for. The two are not interchangeable — a closed
-//! tunnel is still readable through `DescribeTunnel`, so answering it as a
-//! missing resource would tell a client the record is gone. The whole mapping of
-//! refusal class to status, code and message is pinned by
-//! `tests/all/rotate_refusal_error_contract.rs`.
+//! error enum. The operation's one MODELLED error,
+//! `ResourceNotFoundException`, answers the OTHER class and only it: a
+//! `tunnelId` this Region's endpoint holds no record for. The two are not
+//! interchangeable — a closed tunnel is still readable through
+//! `DescribeTunnel`, so answering it as a missing resource would tell a client
+//! the record is gone. The status each class arrives with is whatever the one
+//! place that computes it — [`crate::scaffolded::wire_status`] for a modelled
+//! error, the refusal channel itself for the other — gives it, and is not
+//! restated here; the whole mapping of refusal class to status, code and message
+//! is pinned by `tests/all/rotate_refusal_error_contract.rs`.
 //!
 //! ## Shape of an operation
 //!
@@ -227,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Credentials are only reissued for a tunnel that is still live: a closed
         // tunnel can never be connected to, so AWS refuses to mint a client access
         // token for one. The record is still describable, so this is the
-        // request-time refusal (400 `ValidationException`) and NOT the modelled
+        // request-time `ValidationException` refusal and NOT the modelled
         // not-found error, which says the endpoint holds no such tunnel; the check
         // runs before any token is minted or stored, so a refused call leaves the
         // record exactly as it was.

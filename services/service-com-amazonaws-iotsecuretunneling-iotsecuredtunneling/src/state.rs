@@ -13,6 +13,10 @@
 //! lookup names that Region: see
 //! [`ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState::tunnel`] and the
 //! accessors beside it.
+//!
+//! The refusal messages here name the modelled error that reports them and never
+//! its HTTP status: the status every modelled error of this service arrives with
+//! is computed in one place, [`crate::scaffolded::wire_status`].
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,7 +37,7 @@ pub const MAX_LIST_PAGE_SIZE: i32 = 100;
 
 /// The tunnels one account may hold OPEN at the same time in one Region.
 ///
-/// The quota the modelled `LimitExceededException` (HTTP 403, "Thrown when a
+/// The quota the modelled `LimitExceededException` ("Thrown when a
 /// tunnel limit is exceeded") reports is a quota on CONCURRENCY: a tunnel
 /// occupies one of these slots only while its status is `TunnelStatus::Open`,
 /// so a tunnel that has been closed — by `CloseTunnel` or by its
@@ -83,7 +87,7 @@ pub const MAX_RETAINED_TUNNELS: usize = 500;
 /// [`MAX_RETAINED_TUNNELS`] records and none of them is closed, so nothing can
 /// be evicted to make room.
 ///
-/// Reported with the same modelled `LimitExceededException` (HTTP 403) as
+/// Reported with the same modelled `LimitExceededException` as
 /// [`tunnel_limit_message`], the one error this service models for an exhausted
 /// limit; the text names the limit and what releases a record.
 pub fn tunnel_record_limit_message() -> String {
@@ -100,7 +104,7 @@ pub fn tunnel_record_limit_message() -> String {
 /// (`length(min: 1, max: 200)`) bounds ONE request's list but not the set a
 /// resource accumulates over repeated `TagResource` calls, so the accumulated
 /// key count is bounded here: a request that would take a tunnel past it is
-/// refused — with the modelled `LimitExceededException` (HTTP 403), the one
+/// refused — with the modelled `LimitExceededException`, the one
 /// error this service models for an exhausted limit — and stores nothing. This
 /// is also what keeps the tag store from growing without bound in a long-lived
 /// emulator — each key and value is bounded by the modelled `@length`

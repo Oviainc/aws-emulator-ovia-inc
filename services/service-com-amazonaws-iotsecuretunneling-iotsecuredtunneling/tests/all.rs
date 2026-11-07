@@ -35,6 +35,8 @@ mod member_update_stamp;
 mod minted_tunnel_id_form;
 #[path = "all/modeled_error_wire_status.rs"]
 mod modeled_error_wire_status;
+#[path = "all/one_status_source_across_handlers.rs"]
+mod one_status_source_across_handlers;
 #[path = "all/owed_close_settled_by_every_entry_point.rs"]
 mod owed_close_settled_by_every_entry_point;
 #[path = "all/record_eviction_order.rs"]
