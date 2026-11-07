@@ -34,6 +34,13 @@ aws-sdk-iam = { version = "1", default-features = false }
 # the URL-encoded form IAM reports a document in — shared with every other service that
 # resolves a caller-supplied execution role.
 service-common = { path = "../common" }
+# The `cron(...)` and `at(...)` halves of a `ScheduleExpression` are read by
+# maintained parsers rather than by a hand-written grammar; `chrono` is what the
+# cron parser is written in, and `chrono-tz` carries the IANA database a
+# `ScheduleExpressionTimezone` has to name a zone of.
+cron = "0.15"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

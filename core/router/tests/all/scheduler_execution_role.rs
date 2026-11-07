@@ -2,12 +2,13 @@
 
 //! EventBridge Scheduler resolves a schedule's execution role against IAM.
 //!
-//! The rule under test: EventBridge Scheduler verifies `Target.RoleArn` when the
-//! schedule is WRITTEN — not when it fires — and refuses the request with HTTP
-//! 400 `ValidationException`, persisting nothing, unless that role exists in
-//! this account and its trust policy lets the Scheduler service principal
-//! assume it. A request naming a role that does exist and does trust Scheduler
-//! is created normally.
+//! The rule under test: EventBridge Scheduler resolves `Target.RoleArn` when a schedule is
+//! CREATED — not when it fires, and not on every later write — and refuses the create with
+//! HTTP 400 `ValidationException`, persisting nothing, unless that role exists in this
+//! account and its trust policy lets the Scheduler service principal assume it. A request
+//! naming a role that does exist and does trust Scheduler is created normally. `UpdateSchedule`
+//! does NOT re-resolve it: once a schedule exists, the role it names is the invocation's
+//! problem, so an update applies even when that role has since been deleted.
 //!
 //! This suite needs TWO services on one engine — the scheduler reaches IAM
 //! through the in-process callback, so a single-service router has no IAM to ask
@@ -16,8 +17,8 @@
 //! `Action`/`Service` string, each as a list, a `Deny` statement, a policy
 //! naming only another service), where the role lives (the default path and a
 //! role under a path), which account the ARN names, whether the role was ever
-//! created, and both operations that take a `Target` (`CreateSchedule` and
-//! `UpdateSchedule`).
+//! created or has since been deleted, and both operations that take a `Target`
+//! (`CreateSchedule` and `UpdateSchedule`).
 //!
 //! Assembling the whole router costs stack (see `boot_serve.rs`), so it is built
 //! — and the requests driven — on a sized thread.
@@ -409,53 +410,80 @@ fn a_schedule_is_written_only_for_an_execution_role_iam_holds_and_scheduler_may_
                 }
             }
 
-            // `UpdateSchedule` applies the same gate, and a refused update
-            // leaves the stored schedule exactly as it was.
-            let good = role_arn("scheduler-role");
-            let bad = role_arn("never-created-role");
-            let (status, body) = scheduler(
+            // `UpdateSchedule` does NOT apply the gate: the role is assumed when
+            // the schedule is INVOKED, so once a schedule exists every update to
+            // it applies, whatever IAM now holds for the role it names. Every row
+            // is a role the CREATE path above refused, so each proves the
+            // difference between the two paths rather than the state of one role.
+            let update_cases: [(&str, String); 3] = [
+                // The role the schedule was created with, DELETED out of band and
+                // then re-affirmed by the update.
+                ("the deleted role, re-affirmed", role_arn("scheduler-role")),
+                ("a role that was never created", role_arn("never-created-role")),
+                (
+                    "a role of another account",
+                    "arn:aws:iam::123456789012:role/scheduler-role".to_string(),
+                ),
+            ];
+            let (status, body) = iam(
                 &router,
                 &runtime,
-                "PUT",
-                "/schedules/trusted",
-                Some(schedule_body(&bad)),
+                "DeleteRole",
+                &[("RoleName", "scheduler-role")],
             );
-            assert_eq!(
-                (status, error_code(&body).as_str()),
-                (400, "ValidationException"),
-                "UpdateSchedule onto an absent role must be refused, got {status} {body}"
-            );
-            assert_eq!(
-                error_message(&body),
-                ROLE_REFUSAL,
-                "UpdateSchedule: expected the execution-role refusal, got {body}"
-            );
-            let (status, body) = scheduler(&router, &runtime, "GET", "/schedules/trusted", None);
             assert_eq!(
                 status, 200,
-                "the schedule must survive a refused update, got {status} {body}"
-            );
-            assert_eq!(
-                body.get("Target")
-                    .and_then(|target| target.get("RoleArn"))
-                    .and_then(serde_json::Value::as_str),
-                Some(good.as_str()),
-                "a refused update must leave the stored role unchanged, got {body}"
+                "setup: DeleteRole scheduler-role: got {status} {body}"
             );
 
-            // The same update onto a role IAM does hold succeeds, so the gate is
-            // the role and not the operation.
-            let (status, body) = scheduler(
-                &router,
-                &runtime,
-                "PUT",
-                "/schedules/trusted",
-                Some(schedule_body(&role_arn("scheduler-role-lists"))),
-            );
-            assert_eq!(
-                status, 200,
-                "UpdateSchedule onto a trusted role must succeed, got {status} {body}"
-            );
+            for (index, (case, role_arn)) in update_cases.into_iter().enumerate() {
+                let (status, body) = scheduler(
+                    &router,
+                    &runtime,
+                    "PUT",
+                    "/schedules/trusted",
+                    Some(schedule_body(&role_arn)),
+                );
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: UpdateSchedule must apply whatever IAM holds for the \
+                     role, got {status} {body}"
+                );
+                let (status, body) =
+                    scheduler(&router, &runtime, "GET", "/schedules/trusted", None);
+                assert_eq!(
+                    (
+                        status,
+                        body.get("Target")
+                            .and_then(|target| target.get("RoleArn"))
+                            .and_then(serde_json::Value::as_str)
+                    ),
+                    (200, Some(role_arn.as_str())),
+                    "case {case:?}: the update must have applied, dangling reference and \
+                     all, got {status} {body}"
+                );
+
+                // The CREATE path still resolves that same role, so the gate moved
+                // off `UpdateSchedule` rather than off the service.
+                let (status, body) = scheduler(
+                    &router,
+                    &runtime,
+                    "POST",
+                    &format!("/schedules/created-with-row-{index}"),
+                    Some(schedule_body(&role_arn)),
+                );
+                assert_eq!(
+                    (status, error_code(&body).as_str()),
+                    (400, "ValidationException"),
+                    "case {case:?}: CreateSchedule must still refuse an unassumable role, \
+                     got {status} {body}"
+                );
+                assert_eq!(
+                    error_message(&body),
+                    ROLE_REFUSAL,
+                    "case {case:?}: expected the execution-role refusal, got {body}"
+                );
+            }
         })
         .expect("spawn the execution-role thread")
         .join()

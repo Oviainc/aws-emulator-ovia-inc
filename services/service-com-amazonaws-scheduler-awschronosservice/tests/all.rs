@@ -19,6 +19,8 @@ mod list_tags_for_resource_bounds;
 mod reserved_schedule_group;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/schedule_definition_rules.rs"]
+mod schedule_definition_rules;
 #[path = "all/schedule_group_listing.rs"]
 mod schedule_group_listing;
 #[path = "all/schedule_group_read.rs"]

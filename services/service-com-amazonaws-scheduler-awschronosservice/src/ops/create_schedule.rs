@@ -201,14 +201,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The schedule's own definition: the expression it fires on, the zone that
+        // expression is read in, and the window its instants bound. All three are
+        // request validation, so they are answered before anything is looked up.
+        let now = ::std::time::SystemTime::now();
+        if let Some(message) = crate::state::schedule_expression_violation(&input.schedule_expression)
+            .or_else(|| {
+                crate::state::schedule_expression_timezone_violation(
+                    input.schedule_expression_timezone.as_deref(),
+                )
+            })
+            .or_else(|| {
+                crate::state::schedule_window_violation(input.start_date, input.end_date, now)
+            })
+        {
+            return Err(
+                CreateScheduleErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let group_name = crate::state::effective_group_name(input.group_name.as_deref());
 
         // EventBridge Scheduler resolves the execution role when the schedule is
-        // WRITTEN, so a role this account does not hold — or one that does not
+        // CREATED, so a role this account does not hold — or one that does not
         // let Scheduler assume it — is refused here, before anything is
-        // persisted. The IAM lookup runs before the store is locked: the guard
-        // is not held across an await.
+        // persisted. A later `UpdateSchedule` does not resolve it again. The IAM
+        // lookup runs before the store is locked: the guard is not held across an
+        // await.
         if let Some(message) =
             crate::state::execution_role_violation(ctx, &region, &input.target.role_arn).await
         {
@@ -218,7 +239,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.settle(now);
 
@@ -234,11 +254,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A group whose deletion is under way takes no new schedules: it and
         // everything in it is on its way out ("Deleting a schedule group results
         // in EventBridge Scheduler deleting all schedules associated with the
-        // group"), which is the inconsistent state ConflictException names.
+        // group"), so the request names a group that cannot hold the schedule it
+        // asks for — a request-validation failure (400), not a conflict a client
+        // may retry.
         if store.group_is_deleting(&group_name) {
             return Err(
-                CreateScheduleErrorModeled::ConflictException(ConflictException {
-                    message: format!("Schedule group {group_name} is being deleted."),
+                CreateScheduleErrorModeled::ValidationException(ValidationException {
+                    message: crate::state::group_is_being_deleted(&group_name),
                 })
                 .into(),
             );
@@ -275,8 +297,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn: arn.clone(),
                 schedule_expression: input.schedule_expression,
                 schedule_expression_timezone: input.schedule_expression_timezone,
-                start_date: input.start_date,
-                end_date: input.end_date,
+                // Both instants are held at the resolution the service reports
+                // them at, so every later read answers the instant that was
+                // stored rather than the finer one the request stated.
+                start_date: input.start_date.map(crate::state::to_millisecond_precision),
+                end_date: input.end_date.map(crate::state::to_millisecond_precision),
                 description: input.description,
                 state: input
                     .state

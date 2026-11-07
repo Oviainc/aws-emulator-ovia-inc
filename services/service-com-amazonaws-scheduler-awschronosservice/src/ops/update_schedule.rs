@@ -210,12 +210,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let group_name = crate::state::effective_group_name(input.group_name.as_deref());
 
-        // The same execution-role gate as `CreateSchedule`: an update that moves
-        // a schedule onto a role Scheduler cannot assume is refused, and the
-        // stored schedule is left as it was.
-        let region = crate::state::request_region(ctx.parts());
-        if let Some(message) =
-            crate::state::execution_role_violation(ctx, &region, &input.target.role_arn).await
+        // The schedule's own definition, held to the same rules `CreateSchedule`
+        // holds it to: both operations carry the same members, so an update
+        // cannot move a schedule onto an expression, zone or window a create
+        // would have refused.
+        //
+        // The target's execution role is NOT re-resolved here. EventBridge
+        // Scheduler assumes that role when the schedule is INVOKED, so an update
+        // to an existing schedule — even one re-affirming a role that has since
+        // been deleted — applies, dangling reference and all; only the create
+        // resolves it, which is where the reference is first taken.
+        let now = ::std::time::SystemTime::now();
+        if let Some(message) = crate::state::schedule_expression_violation(&input.schedule_expression)
+            .or_else(|| {
+                crate::state::schedule_expression_timezone_violation(
+                    input.schedule_expression_timezone.as_deref(),
+                )
+            })
+            .or_else(|| {
+                crate::state::schedule_window_violation(input.start_date, input.end_date, now)
+            })
         {
             return Err(
                 UpdateScheduleErrorModeled::ValidationException(ValidationException { message })
@@ -223,9 +237,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let now = ::std::time::SystemTime::now();
+        let _ = ctx;
         let mut store = state.lock();
         store.settle(now);
+
+        // The GROUP is resolved before the schedule inside it, so a request naming
+        // a group this account does not hold reports THAT group as missing rather
+        // than asserting it exists and the schedule does not. A group whose
+        // deletion is under way is already without the schedules it held
+        // ("Deleting a schedule group results in EventBridge Scheduler deleting
+        // all schedules associated with the group"), so it holds nothing for an
+        // update to address either.
+        if !store.group_exists(&group_name) || store.group_is_deleting(&group_name) {
+            return Err(UpdateScheduleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::group_does_not_exist(&group_name),
+                },
+            )
+            .into());
+        }
 
         let Some(record) = store
             .schedules
@@ -244,8 +274,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (name, group, ARN) and `creation_date` are the only fields kept.
         record.schedule_expression = input.schedule_expression;
         record.schedule_expression_timezone = input.schedule_expression_timezone;
-        record.start_date = input.start_date;
-        record.end_date = input.end_date;
+        record.start_date = input.start_date.map(crate::state::to_millisecond_precision);
+        record.end_date = input.end_date.map(crate::state::to_millisecond_precision);
         record.description = input.description;
         record.state = input
             .state

@@ -277,7 +277,7 @@ async fn deleting_a_group_removes_it_and_its_schedules_when_the_clock_makes_that
         .await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (409, "ConflictException"),
+            (400, "ValidationException"),
             "case {case:?}: a DELETING group must take no new schedule, got {status} {body}"
         );
 

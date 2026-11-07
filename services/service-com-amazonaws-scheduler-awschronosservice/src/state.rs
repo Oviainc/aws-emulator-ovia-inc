@@ -6,6 +6,15 @@
 //! `ScheduleGroup` (named, holds tags) and the `Schedule`s inside it. Both live
 //! here, keyed so the ordered maps enumerate deterministically — which is what
 //! lets `ListSchedules` resume from an opaque page token.
+//!
+//! The rules a schedule's own definition has to satisfy — its expression, the
+//! zone that expression is read in, and the window its instants bound — live in
+//! [`schedule_definition`] and are re-exported here, so both operations that
+//! write a schedule reach them the way they reach the rest of this module.
+
+mod schedule_definition;
+
+pub use schedule_definition::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
@@ -423,6 +432,17 @@ pub fn group_does_not_exist(name: &str) -> String {
     format!("Schedule group {name} does not exist.")
 }
 
+/// The `ValidationException` message for a request addressed at a schedule group
+/// whose deletion is under way.
+///
+/// "When you delete a group, it remains in a DELETING state until all of its
+/// associated schedules are deleted" (`DeleteScheduleGroup`): the group is on its
+/// way out, so it holds no schedule a write could address — which is a statement
+/// about the request, not a conflict a client may retry.
+pub fn group_is_being_deleted(name: &str) -> String {
+    format!("Schedule group {name} is being deleted.")
+}
+
 /// The `ResourceNotFoundException` message for a schedule the addressed group
 /// does not hold.
 ///
@@ -561,9 +581,12 @@ fn trust_policy_admits(document: &str, principal: &str) -> bool {
 /// Refuse a target whose execution role EventBridge Scheduler could not assume.
 ///
 /// EventBridge Scheduler resolves `Target.RoleArn` against IAM when the schedule
-/// is written — not when it fires — and refuses the request with 400
-/// `ValidationException`, persisting nothing, unless that role exists in this
-/// account and its trust policy lets the Scheduler service principal assume it.
+/// is CREATED and refuses that create with 400 `ValidationException`, persisting
+/// nothing, unless the role exists in this account and its trust policy lets the
+/// Scheduler service principal assume it. It is NOT resolved again on every later
+/// control-plane write: the role is assumed when the schedule is invoked, so
+/// `UpdateSchedule` applies whatever IAM holds for the role by then — which is why
+/// only `CreateSchedule` calls this.
 /// IAM is reached the way any emulated service reaches another: through the
 /// in-process callback ([`smithy_server_runtime::OperationContext::callback`]),
 /// so this crate names no other service crate.
