@@ -153,13 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(reference) => reference,
             Err(crate::state::TagArnRefusal::NotThisServicesArn) => {
                 return Err(ListTagsForResourceErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!(
-                            "resourceArn {} is not a CodeArtifact resource ARN.",
-                            input.resource_arn
-                        ),
-                        reason: Some("CANNOT_PARSE".to_string()),
-                    },
+                    crate::state::unaddressable_arn_refusal(&input.resource_arn),
                 )
                 .into());
             }

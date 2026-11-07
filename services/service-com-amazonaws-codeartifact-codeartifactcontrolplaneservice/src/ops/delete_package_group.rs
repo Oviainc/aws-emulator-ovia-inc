@@ -201,10 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.package_group == crate::state::ROOT_PACKAGE_GROUP_PATTERN {
             return Err(DeletePackageGroupErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
-                        "Package group '{}' is the root package group of its domain and cannot be deleted.",
-                        input.package_group
-                    ),
+                    message: crate::state::ROOT_PACKAGE_GROUP_NOT_DELETABLE_MESSAGE.to_string(),
                     reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
                 },
             )

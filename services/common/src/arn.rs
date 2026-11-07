@@ -107,6 +107,30 @@ pub fn parse(value: &str) -> Option<Arn<'_>> {
     })
 }
 
+/// How many colon-separated fields an ARN is written with: the literal `arn`, the
+/// partition, the vendor, the Region, the account and the resource.
+pub const ARN_FIELDS: usize = 6;
+
+/// Whether `value` carries the [`ARN_FIELDS`] colon-separated fields an ARN is written
+/// with at all.
+///
+/// The coarsest question an ARN parse answers, and the only one that can be answered
+/// without knowing whose ARN the value would have been: a value with fewer fields has too
+/// few separators to be read as an ARN by any service. A service whose refusal for "this
+/// is not an ARN" is worded differently from its refusal for "this is an ARN of another
+/// vendor" asks this before it asks [`parse_of`]; one that words both the same way needs
+/// only [`parse`].
+///
+/// A value carrying the six fields may still not be a well-formed ARN — [`parse`] also
+/// requires the first field to be literally `arn` and the partition, the vendor and the
+/// resource to be non-empty.
+#[must_use]
+pub fn has_arn_fields(value: &str) -> bool {
+    // `take` stops the count at six: the resource field may carry further colons, and
+    // every field past the sixth belongs to it.
+    value.split(':').take(ARN_FIELDS).count() == ARN_FIELDS
+}
+
 /// The vendor (service namespace) field of the ARN `value`, or `None` when `value`
 /// is not a well-formed resource ARN.
 ///
@@ -397,10 +421,57 @@ fn names_identity(resource: &str, resource_type: &str, segments: usize) -> bool 
 #[cfg(test)]
 mod tests {
     use super::{
-        is_iam_principal_arn, is_resource_arn_of, parse, parse_of, region_label, region_of,
-        resource_id_of_type, resource_type, vendor, Requirement, ACM_CERTIFICATE, IAM_ROLE,
-        S3_OBJECT, SECRETS_MANAGER_SECRET,
+        has_arn_fields, is_iam_principal_arn, is_resource_arn_of, parse, parse_of, region_label,
+        region_of, resource_id_of_type, resource_type, vendor, Requirement, ACM_CERTIFICATE,
+        IAM_ROLE, S3_OBJECT, SECRETS_MANAGER_SECRET,
     };
+
+    /// The field count is read on its own: a value carrying the six fields has the
+    /// separators an ARN is written with even where the parse rejects it for another
+    /// reason, and a value carrying fewer has not.
+    #[test]
+    fn the_separator_count_is_read_apart_from_the_rest_of_the_parse() {
+        // (case, value, whether the six fields are present)
+        let rows: &[(&str, &str, bool)] = &[
+            (
+                "a well-formed ARN",
+                "arn:aws:codeartifact:us-east-1:000000000000:domain/d",
+                true,
+            ),
+            (
+                "a resource field carrying further colons",
+                "arn:aws:states:us-east-1:000000000000:execution:machine:run",
+                true,
+            ),
+            ("an empty region and account", "arn:aws:s3:::bucket/key", true),
+            (
+                "six fields whose last is empty",
+                "arn:aws:codeartifact:us-east-1:000000000000:",
+                true,
+            ),
+            (
+                "six fields that do not begin with arn",
+                "urn:aws:codeartifact:us-east-1:000000000000:domain/d",
+                true,
+            ),
+            (
+                "five fields",
+                "arn:aws:codeartifact:us-east-1:000000000000",
+                false,
+            ),
+            ("four fields", "arn:aws:codeartifact:not-an-arn", false),
+            ("no separator at all", "codeartifact", false),
+            ("the empty string", "", false),
+        ];
+
+        for (case, value, expected) in rows {
+            let read = has_arn_fields(value);
+            assert_eq!(
+                read, *expected,
+                "case {case:?}: expected has_arn_fields {expected:?} for {value:?}, got {read:?}"
+            );
+        }
+    }
 
     /// The vendor field is read from the third position, whatever the resource
     /// field's own shape, and only from a value that carries all six fields.

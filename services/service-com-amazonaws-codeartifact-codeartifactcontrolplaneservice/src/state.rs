@@ -2206,35 +2206,42 @@ pub const POLICY_REVISION_CONFLICT_MESSAGE: &str = "Provided policy version conf
 /// repository families. The document is parsed ONLY to check it: its structure is never
 /// rewritten, and the only thing dropped on the way into the store is the whitespace
 /// between its tokens ([`stored_policy_document`]).
+///
+/// Every document the policy parser cannot read as a policy is refused with the SAME
+/// sentence ([`INVALID_POLICY_DOCUMENT_MESSAGE`]): what the parser choked on is the
+/// service's own business, so the refusal states neither the position it stopped at nor
+/// the JSON type the document turned out to be. The modelled `reason` is the one thing
+/// that separates the two ways a document can fail to be a policy: a value no parser
+/// could read at all (`CANNOT_PARSE`) against one that read as JSON but is not a policy
+/// object, which is the submitted FIELD failing a rule of this service.
 pub fn policy_document_refusal(document: &str) -> Option<ValidationException> {
     match serde_json::from_str::<serde_json::Value>(document) {
         Ok(serde_json::Value::Object(_)) => None,
-        Ok(other) => Some(ValidationException {
-            message: format!(
-                "policyDocument must be a JSON policy object; got a JSON {}.",
-                json_type_name(&other)
-            ),
-            reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        Ok(_) => Some(ValidationException {
+            message: INVALID_POLICY_DOCUMENT_MESSAGE.to_string(),
+            reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
         }),
-        Err(error) => Some(ValidationException {
-            message: format!("policyDocument is not valid JSON: {error}."),
-            reason: Some("CANNOT_PARSE".to_string()),
+        Err(_) => Some(ValidationException {
+            message: INVALID_POLICY_DOCUMENT_MESSAGE.to_string(),
+            reason: Some(VALIDATION_REASON_CANNOT_PARSE.to_string()),
         }),
     }
 }
 
-/// The JSON type name of a `policyDocument` that parsed but is not a policy object, so
-/// the refusal says what the caller actually sent.
-fn json_type_name(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "boolean",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
-}
+/// The `ValidationException` message a resource-policy write states for a `policyDocument`
+/// that is not a policy document.
+///
+/// ENTIRELY fixed text: it names neither the member it was read from nor anything about
+/// the document, so the sentence is the same for every document the policy parser rejects
+/// and leaks nothing about how the document is parsed here.
+pub const INVALID_POLICY_DOCUMENT_MESSAGE: &str = "Policy document isn't a valid policy document";
+
+/// The `ValidationExceptionReason` a request member carries when its value could not be
+/// read at all — the other half of [`VALIDATION_REASON_FIELD_FAILED`], which is a value
+/// that was read and then failed a rule. (`ValidationExceptionReason` models exactly
+/// `CANNOT_PARSE`, `ENCRYPTION_KEY_ERROR`, `FIELD_VALIDATION_FAILED`, `OTHER` and
+/// `UNKNOWN_OPERATION`; see `VALIDATION_EXCEPTION_REASON_VALUES` in `ops::types`.)
+pub const VALIDATION_REASON_CANNOT_PARSE: &str = "CANNOT_PARSE";
 
 /// Whether a caller-supplied `policyRevision` authorises writing over the policy a
 /// resource currently holds (`current`).
@@ -2783,13 +2790,87 @@ fn coordinate_display_name(namespace: Option<&str>, package: &str, version: &str
 }
 
 /// The `ConflictException` message for a create whose package-group pattern is already
-/// held in the addressed domain.
+/// held in the addressed domain, as CodeArtifact itself words it — the resource kind
+/// capitalised, the identifying PATTERN single-quoted, the domain and the owning account
+/// bare, and no sentence-final period.
+///
+/// A package-group pattern is unique per domain, and a domain is shared across accounts
+/// through `domainOwner`, so the sentence names the three things the collision is scoped
+/// by: the pattern, the domain holding it and the account owning that domain.
 pub fn package_group_already_exists_message(
     domain: &str,
     owner: &str,
     package_group: &str,
 ) -> String {
-    format!("Package group '{package_group}' in domain '{domain}' owned by '{owner}' already exists.")
+    format!("Package Group '{package_group}' already exists in domain {domain} owned by account {owner}")
+}
+
+/// The `ValidationException` message `DeletePackageGroup` states for the domain's ROOT
+/// package group.
+///
+/// ENTIRELY fixed text, the root pattern included: the root group is the one group this
+/// API cannot delete, and `/*` is that group's own identifier
+/// ([`ROOT_PACKAGE_GROUP_PATTERN`]) rather than a value read off the request.
+pub const ROOT_PACKAGE_GROUP_NOT_DELETABLE_MESSAGE: &str =
+    "The root package group, '/*', cannot be deleted.";
+
+/// The `ResourceNotFoundException` message an ASSET-addressing read states for an asset
+/// name the addressed package version does not hold.
+///
+/// An asset is addressed by the package-version coordinate holding it plus its own name,
+/// so the refusal reports both: the repository it looked in by the NAME the request
+/// addressed it by, the whole coordinate it resolved rendered as the
+/// `PackageVersionCoordinateEntity` of [`package_version_coordinate`] (format upper-cased
+/// and namespace included), and the asset name that missed. The coordinate is the part
+/// that tells a caller WHICH version was resolved, so a wrong-format or wrong-namespace
+/// lookup is distinguishable from an asset the right version genuinely does not hold.
+/// Distinct from [`package_version_not_found_message`], which is the sentence for a
+/// coordinate holding no version at all.
+pub fn asset_not_found_message(
+    repository: &str,
+    format: &str,
+    namespace: Option<&str>,
+    package: &str,
+    version: &str,
+    asset: &str,
+) -> String {
+    format!(
+        "Asset not found in repo. RepositoryName = '{repository}', packageCoordinate = '{}', \
+         assetName = '{asset}'.",
+        package_version_coordinate(format, namespace, package, version)
+    )
+}
+
+/// The `ValidationException` a caller-supplied `resourceArn` owes when it addresses no
+/// resource of this service's namespace at all.
+///
+/// TWO sentences, because a client distinguishes two different mistakes and so does AWS:
+///
+/// * a value that is not written as an ARN — fewer than the six colon-separated fields an
+///   ARN has ([`service_common::arn::has_arn_fields`]) — never reaches a service's own
+///   namespace check, so it is refused by the ARN PARSER, in the parser's own sentence
+///   about ARN SYNTAX; and
+/// * a value that IS written as an ARN but names another vendor (or is otherwise not one
+///   of this service's ARNs) is refused for naming nothing this API can address.
+///
+/// Collapsing the two would make a syntactically broken string and a well-formed ARN of
+/// another service indistinguishable. Stated here, once, for every operation that takes a
+/// caller-supplied `resourceArn` ([`resolve_taggable`] is the lookup they share), so the
+/// three tagging operations cannot word the same refusal differently.
+#[must_use]
+pub fn unaddressable_arn_refusal(resource_arn: &str) -> ValidationException {
+    let message = if ::service_common::arn::has_arn_fields(resource_arn) {
+        format!("resourceArn {resource_arn} is not a CodeArtifact resource ARN.")
+    } else {
+        format!(
+            "Invalid ARN: {resource_arn} can't be parsed because it doesn't have enough \
+             separators."
+        )
+    };
+    ValidationException {
+        message,
+        reason: Some(VALIDATION_REASON_CANNOT_PARSE.to_string()),
+    }
 }
 
 /// The `ValidationExceptionReason` a refused member carries: the request reached the

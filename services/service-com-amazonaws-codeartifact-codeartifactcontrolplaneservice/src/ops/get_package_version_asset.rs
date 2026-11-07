@@ -321,9 +321,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(asset) = version.assets.get(&input.asset) else {
             return Err(not_found(
-                format!(
-                    "Asset {} not found in package version {} {} in repository {}.",
-                    input.asset, input.package, input.package_version, input.repository
+                crate::state::asset_not_found_message(
+                    &input.repository,
+                    &input.format,
+                    input.namespace.as_deref(),
+                    &input.package,
+                    &input.package_version,
+                    &input.asset,
                 ),
                 &input.asset,
                 crate::state::ASSET_RESOURCE_TYPE,
