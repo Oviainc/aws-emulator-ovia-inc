@@ -262,6 +262,16 @@ pub use event_source_authorization::unreadable_event_source;
 pub mod vpc_attachment_authorization;
 pub use vpc_attachment_authorization::unattachable_vpc_config;
 
+/// Whether IAM lets the principal an INVOCATION speaks for invoke the function it names — the
+/// decision every invoking operation takes before the function is reached — lives in
+/// [`invoke_authorization`], beside the two readings above. It is re-exported here for the
+/// same reason as [`capacity_provider`]: the function record whose resource-based policy it
+/// reads, and the store that holds it, stay in this module.
+pub mod invoke_authorization;
+pub use invoke_authorization::{
+    authorize_invocation, INVOKE_ASYNC_ACTION, INVOKE_FUNCTION_ACTION,
+};
+
 /// The ASYNCHRONOUS-INVOCATION CONFIGURATION of a function, version or alias — the record
 /// the `…FunctionEventInvokeConfig` operations read and write, and whether the function's
 /// execution role lets Lambda deliver a record to the destinations one names — lives in

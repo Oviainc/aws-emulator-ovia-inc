@@ -33,8 +33,14 @@ tracing = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # A mapping is also accepted against what the invoked function's EXECUTION ROLE may read on
 # the event source (`state::event_source_authorization`): the role's policies live in the
-# IAM emulator's store, reached through that same shared engine.
+# IAM emulator's store, reached through that same shared engine. The same store holds the
+# identity-based policies an INVOCATION is authorized against
+# (`state::invoke_authorization`).
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# An invocation is authorized against the principal its access key id speaks for, which is
+# the session the token service minted that key for — the same record `GetCallerIdentity`
+# answers from (`state::invoke_authorization`), reached through the shared engine.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # CodeSha256 is the SHA-256 of the stored deployment package...
 sha2 = { workspace = true }
 # ...reported base64-encoded, as the model's CodeSha256 member describes it.

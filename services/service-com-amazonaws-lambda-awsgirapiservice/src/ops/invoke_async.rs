@@ -258,6 +258,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
+        // Lambda decides an invocation at the IAM layer, BEFORE the function is reached. This
+        // entry point's own action is the deprecated `lambda:InvokeAsync` the IAM Service
+        // Authorization Reference publishes for it, so a grant of the synchronous action is
+        // not a grant of this one (`crate::state::invoke_authorization`). Asked first, with
+        // no store guard held, so a refused invocation queues nothing and runs nothing.
+        crate::state::authorize_invocation(
+            &*self.engine,
+            ctx,
+            crate::state::INVOKE_ASYNC_ACTION,
+            &region,
+            &input.function_name,
+            None,
+        )?;
         let mut store = state.lock();
 
         // `InvokeAsync` carries no `Qualifier` parameter of its own, so the only

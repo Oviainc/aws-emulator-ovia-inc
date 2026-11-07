@@ -201,6 +201,8 @@ mod invocation_count_series;
 mod invocation_refusal_diagnostics;
 #[path = "all/invoke_addressed_function.rs"]
 mod invoke_addressed_function;
+#[path = "all/invoke_identity_authorization.rs"]
+mod invoke_identity_authorization;
 #[path = "all/kinesis_event_source_delivery.rs"]
 mod kinesis_event_source_delivery;
 #[path = "all/kinesis_event_source_handler_run.rs"]

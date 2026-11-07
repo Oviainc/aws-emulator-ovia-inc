@@ -278,6 +278,18 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
+        // Lambda decides an invocation at the IAM layer, BEFORE the function is reached: this
+        // entry point needs "permission for the `lambda:InvokeFunction` action" exactly as
+        // `Invoke` does, so the same gate answers it (`crate::state::invoke_authorization`).
+        // Asked first, with no store guard held, so a refused invocation runs nothing.
+        crate::state::authorize_invocation(
+            &*self.engine,
+            ctx,
+            crate::state::INVOKE_FUNCTION_ACTION,
+            &region,
+            &input.function_name,
+            input.qualifier.as_deref(),
+        )?;
 
         // The resource an INVOCATION addresses is a function AT a version: `Qualifier`
         // "specif[ies] a version or alias to invoke a published version of the function",

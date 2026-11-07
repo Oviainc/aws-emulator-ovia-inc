@@ -411,6 +411,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .to_string();
 
         let region = crate::state::request_region(ctx);
+        // Lambda decides an invocation at the IAM layer, BEFORE the function is reached: an
+        // invocation whose calling principal is granted `lambda:InvokeFunction` on the
+        // addressed function neither by its own identity-based policies nor by that
+        // function's resource-based policy is refused with the 403 `AccessDeniedException`
+        // (`crate::state::invoke_authorization`). It is asked first, with no store guard
+        // held, so a refused invocation resolves nothing, queues nothing, meters nothing and
+        // runs nothing — and tells an unauthorized caller nothing about what the account
+        // holds. The DRY RUN is decided here too: it "validate[s] parameter values and
+        // verif[ies] that the user or role has permission to invoke the function".
+        crate::state::authorize_invocation(
+            &*self.engine,
+            ctx,
+            crate::state::INVOKE_FUNCTION_ACTION,
+            &region,
+            &input.function_name,
+            input.qualifier.as_deref(),
+        )?;
         let now = ::std::time::SystemTime::now();
         // "Set to Tail to include the execution log in the response. Applies to
         // synchronously invoked functions only."
