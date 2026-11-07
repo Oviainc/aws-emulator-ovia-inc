@@ -205,6 +205,8 @@ mod invoke_addressed_function;
 mod kinesis_event_source_delivery;
 #[path = "all/kinesis_event_source_handler_run.rs"]
 mod kinesis_event_source_handler_run;
+#[path = "all/kinesis_event_source_handler_writes_dynamodb.rs"]
+mod kinesis_event_source_handler_writes_dynamodb;
 #[path = "all/layer_archive_unzipped_size.rs"]
 mod layer_archive_unzipped_size;
 #[path = "all/layer_listing.rs"]

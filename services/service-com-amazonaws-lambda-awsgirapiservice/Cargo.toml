@@ -149,6 +149,10 @@ tokio = { workspace = true, features = ["time"] }
 # reports for the function.
 service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# The sink a handler's OWN outbound call writes in the stream-driven pipeline test is a
+# DynamoDB table, mounted on that same engine so the item is read back where a client
+# reads it.
+service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 
 [lints]
 workspace = true
