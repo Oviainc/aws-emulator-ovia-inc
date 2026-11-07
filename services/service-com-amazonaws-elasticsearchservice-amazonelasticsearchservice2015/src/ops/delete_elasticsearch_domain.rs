@@ -159,12 +159,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .domains
             .remove(&crate::state::domain_key(&region, &input.domain_name))
         else {
-            return Err(DeleteElasticsearchDomainErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Domain not found: {}", input.domain_name)),
-                },
-            )
-            .into());
+            // The resource named is not there: HTTP 404
+            // (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`), not the
+            // `@httpError(409)` the model annotates on the shape.
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                DeleteElasticsearchDomainErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Domain not found: {}", input.domain_name)),
+                    },
+                ),
+            ));
         };
 
         // The removed record is what the response reports. The removal is

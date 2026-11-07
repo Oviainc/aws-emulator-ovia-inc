@@ -157,12 +157,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .domains
             .get(&crate::state::domain_key(&region, &input.domain_name))
         else {
-            return Err(DescribeElasticsearchDomainErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Domain not found: {}", input.domain_name)),
-                },
-            )
-            .into());
+            // The resource named is not there, which this API answers with HTTP 404
+            // (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`) and not with the
+            // `@httpError(409)` the model annotates on the shape.
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                DescribeElasticsearchDomainErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Domain not found: {}", input.domain_name)),
+                    },
+                ),
+            ));
         };
 
         Ok(DescribeElasticsearchDomainOutput {

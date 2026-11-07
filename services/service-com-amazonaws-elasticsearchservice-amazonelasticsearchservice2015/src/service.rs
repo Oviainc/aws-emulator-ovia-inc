@@ -43,40 +43,46 @@
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
+use std::collections::BTreeSet;
 use std::sync::Arc;
+
+/// The members of `refusal` whose clauses state NO submitted value: the ones the request
+/// broke SEVERAL constraints of.
+///
+/// This front door echoes the value a member submitted while it has ONE thing to say
+/// about that member, and states the member and its requirements alone once it has
+/// several: what distinguishes the clauses of such a report is the requirement each
+/// names, and the value is the same in all of them. A member with one violation keeps the
+/// echo, whatever it carried and wherever it was bound — a URI label, a query parameter,
+/// a body member nested in a structure.
+///
+/// Empty for a refusal that is not a constraint report, which keeps every clause the
+/// framework's.
+fn members_stated_without_their_value(refusal: &Refusal) -> BTreeSet<String> {
+    let Refusal::Invalid(violations) = refusal else {
+        return BTreeSet::new();
+    };
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut several: BTreeSet<String> = BTreeSet::new();
+    for violation in violations {
+        if !seen.insert(violation.path.as_str()) {
+            several.insert(violation.path.clone());
+        }
+    }
+    several
+}
 
 /// Whether the request these `parts` came from resolves to this service's signing name
 /// AND addresses a first URI path segment this model publishes
 /// (`crate::ROUTE_PATH_SEGMENTS`).
 ///
-/// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable owner
-/// of that rule, and it is CALLED here rather than re-implemented. It takes a whole
-/// `http::Request` while [`Service::can_handle`] is handed only the request's parts, so
-/// the two things it reads — the URI and the headers — are re-presented to it as a
-/// bodiless request. It reads neither the body nor the method, so nothing it decides on is
-/// missing.
-///
-/// `services/common`'s `claims_request` states the same rule over `Parts` and is what a
-/// service under a shared signing name normally calls; it is not used here only because
-/// depending on it edits `Cargo.lock`, which this repository's serialized squash merge
-/// refuses whenever another change lands against it — the same reason
-/// `services/service-com-amazonaws-wisdom-wisdomservice/src/service.rs` calls the
-/// framework predicate directly and records the migration as a one-line follow-up. The
-/// rule is identical: `claims_request`'s path conjunct for a REST model IS
-/// `claims_modeled_path`, which mirrors this framework function.
+/// `services/common`'s `claims_request` is the fleet's owner of that rule and is CALLED
+/// here rather than re-implemented: it states it over `Parts`, which is exactly what
+/// [`Service::can_handle`] is handed. `None` for the RPC service-shape id because this
+/// model is `restJson1`, so the discriminator is the model-derived path space alone —
+/// the same conjunct the framework's own predicate applies.
 fn claims_own_path_space(parts: &http::request::Parts, signing_name: &str) -> bool {
-    let Ok(mut request) = http::Request::builder()
-        .uri(parts.uri.clone())
-        .body(bytes::Bytes::new())
-    else {
-        return false;
-    };
-    *request.headers_mut() = parts.headers.clone();
-    emulator_server::can_handle_based_on_route_key_and_path(
-        &request,
-        signing_name,
-        crate::ROUTE_PATH_SEGMENTS,
-    )
+    ::service_common::claims_request(parts, signing_name, crate::ROUTE_PATH_SEGMENTS, None)
 }
 
 /// The `com-amazonaws-elasticsearchservice-amazonelasticsearchservice2015` emulated service: the generated [`ServiceDefinition`] plus
@@ -149,16 +155,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it.
+        //
+        // This API states a constraint refusal in the AWS envelope the framework
+        // already renders, with ONE rendering of its own: a `@pattern` requirement
+        // quotes the expression a value has to satisfy, not the whole-value pair the
+        // model wraps that expression in — a model's `^…$` is how it demands a total
+        // match, and the service publishes the expression inside it. The CHECK is
+        // unchanged (the boundary still runs the model's pattern as written); only the
+        // quoting differs, and the code travels with the message as it must.
+        //
+        // The other thing that is this service's own is the VALUE half of a clause: a
+        // member the request broke SEVERAL constraints of is stated without the value it
+        // submitted ([`members_stated_without_their_value`]).
+        //
+        // The words are the fleet's one home for them rather than a copy here, so this
+        // service's refusals cannot drift from another's.
+        //
+        // An authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure.
+        let without_value = members_stated_without_their_value(refusal);
+        ::service_common::validation_message::aws_validation_refusal_withholding(
+            refusal,
+            |path| without_value.contains(path),
+        )
     }
 
     fn override_routing_error(

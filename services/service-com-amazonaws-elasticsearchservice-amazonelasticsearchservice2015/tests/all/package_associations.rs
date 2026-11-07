@@ -579,8 +579,8 @@ async fn a_resource_the_region_does_not_hold_is_not_found() {
         )
         .await;
         assert_eq!(
-            refused.status, 409,
-            "case {case:?}: the associate must be refused with 409, got {} {}",
+            refused.status, 404,
+            "case {case:?}: the associate must be refused with 404, got {} {}",
             refused.status, refused.body
         );
         assert!(
@@ -602,8 +602,8 @@ async fn a_resource_the_region_does_not_hold_is_not_found() {
         ),
     ] {
         assert_eq!(
-            answer.status, 409,
-            "case {case:?}: the list must be refused with 409, got {} {}",
+            answer.status, 404,
+            "case {case:?}: the list must be refused with 404, got {} {}",
             answer.status, answer.body
         );
         assert!(

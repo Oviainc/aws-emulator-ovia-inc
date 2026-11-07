@@ -162,14 +162,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .packages
             .get(&crate::state::package_key(&region, &input.package_id))
         else {
-            return Err(
+            // The resource named is not there: HTTP 404
+            // (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`), not the
+            // `@httpError(409)` the model annotates on the shape.
+            return Err(crate::scaffolded::Scaffolded::not_found(
                 GetPackageVersionHistoryErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(format!("Package not found: {}", input.package_id)),
                     },
-                )
-                .into(),
-            );
+                ),
+            ));
         };
 
         // Newest first, so the version a domain would associate heads the first

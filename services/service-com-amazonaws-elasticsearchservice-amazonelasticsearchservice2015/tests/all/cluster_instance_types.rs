@@ -194,7 +194,7 @@ async fn an_instance_type_outside_the_enum_is_refused_and_stores_nothing() {
 
         let read = describe(&router, name).await;
         assert_eq!(
-            read.status, 409,
+            read.status, 404,
             "case {case:?} ({instance_type:?}): a refused create must store no domain, got {} {}",
             read.status, read.body
         );

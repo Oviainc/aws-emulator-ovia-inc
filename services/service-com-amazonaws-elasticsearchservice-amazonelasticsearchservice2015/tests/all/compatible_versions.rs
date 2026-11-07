@@ -354,7 +354,7 @@ async fn a_domain_with_no_stored_version_gets_the_whole_catalog() {
     );
 }
 
-/// Asking for a domain this region does not hold is refused with HTTP 409
+/// Asking for a domain this region does not hold is refused with HTTP 404
 /// `ResourceNotFoundException` — including a name held in ANOTHER region, since
 /// a domain is held per region.
 #[tokio::test]
@@ -385,8 +385,8 @@ async fn an_unknown_domain_is_refused() {
     ] {
         let answer = compatible(&router, Some(name)).await;
         assert_eq!(
-            answer.status, 409,
-            "case {case:?}: must be refused with 409, got {} {}",
+            answer.status, 404,
+            "case {case:?}: must be refused with 404, got {} {}",
             answer.status, answer.body
         );
         assert!(

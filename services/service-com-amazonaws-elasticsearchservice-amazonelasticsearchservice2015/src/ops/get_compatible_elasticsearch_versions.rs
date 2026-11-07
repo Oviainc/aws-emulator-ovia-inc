@@ -182,14 +182,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .domains
             .get(&crate::state::domain_key(&region, &domain_name))
         else {
-            return Err(
+            // The resource named is not there: HTTP 404
+            // (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`), not the
+            // `@httpError(409)` the model annotates on the shape.
+            return Err(crate::scaffolded::Scaffolded::not_found(
                 GetCompatibleElasticsearchVersionsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(format!("Domain not found: {domain_name}")),
                     },
-                )
-                .into(),
-            );
+                ),
+            ));
         };
 
         // The domain's STORED version is the source of its upgrade paths. A

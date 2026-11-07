@@ -24,6 +24,8 @@ tracing = { workspace = true }
 # Opaque, stable per-domain suffix for a generated search endpoint.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The fleet's home for how a boundary refusal is worded (`override_refusal`).
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

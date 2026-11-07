@@ -23,6 +23,8 @@ mod domain_lifecycle;
 mod domain_tags;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/missing_resource_not_found_status.rs"]
+mod missing_resource_not_found_status;
 #[path = "all/outbound_cross_cluster_search_connections.rs"]
 mod outbound_cross_cluster_search_connections;
 #[path = "all/package_associations.rs"]
@@ -31,6 +33,10 @@ mod package_associations;
 mod package_versions;
 #[path = "all/packages.rs"]
 mod packages;
+#[path = "all/pattern_refusal_quoting.rs"]
+mod pattern_refusal_quoting;
+#[path = "all/refusal_value_echo.rs"]
+mod refusal_value_echo;
 #[path = "all/shared_es_signing_name_claim.rs"]
 mod shared_es_signing_name_claim;
 #[path = "all/state_roundtrip.rs"]

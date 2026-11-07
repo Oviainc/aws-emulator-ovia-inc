@@ -719,7 +719,11 @@ async fn creating_an_existing_domain_name_echoes_the_stored_domain_and_changes_n
 }
 
 /// RULE 5b: every per-domain operation reports an unknown name as
-/// `ResourceNotFoundException` (HTTP 409) — not a 501, and not an empty 200.
+/// `ResourceNotFoundException` (HTTP 404) — not a 501, and not an empty 200.
+/// The status is the one this API answers a missing resource with, which is not
+/// the `@httpError(409)` its model annotates on the shape; the whole rule, over
+/// every refusal of that class, lives in
+/// `tests/all/missing_resource_not_found_status.rs`.
 #[tokio::test]
 async fn an_unknown_domain_is_not_found_by_every_per_domain_operation() {
     let router = router();
@@ -747,8 +751,8 @@ async fn an_unknown_domain_is_not_found_by_every_per_domain_operation() {
         for (operation, answer) in answers {
             let label = format!("{operation} on {name}");
             assert_eq!(
-                answer.status, 409,
-                "case {label:?}: an unknown domain must answer 409, got {} {}",
+                answer.status, 404,
+                "case {label:?}: an unknown domain must answer 404, got {} {}",
                 answer.status, answer.body
             );
             assert!(
@@ -809,14 +813,14 @@ async fn delete_removes_only_that_domain_from_every_read() {
 
         let gone = describe(&router, name).await;
         assert_eq!(
-            gone.status, 409,
-            "case {label:?}: describing a deleted domain must answer 409, got {} {}",
+            gone.status, 404,
+            "case {label:?}: describing a deleted domain must answer 404, got {} {}",
             gone.status, gone.body
         );
         let again = delete(&router, name).await;
         assert_eq!(
-            again.status, 409,
-            "case {label:?}: deleting it twice must answer 409, got {} {}",
+            again.status, 404,
+            "case {label:?}: deleting it twice must answer 404, got {} {}",
             again.status, again.body
         );
 
@@ -1071,7 +1075,7 @@ async fn the_same_domain_name_in_another_region_is_another_domain() {
     );
     assert_eq!(
         describe_in(&router, regions[0], name).await.status,
-        409,
+        404,
         "the deleted region's domain must be gone"
     );
     for region in &regions[1..] {
@@ -1116,7 +1120,7 @@ async fn creating_past_the_per_region_domain_quota_is_refused() {
     );
     assert_eq!(
         describe(&router, "quota-domain-over").await.status,
-        409,
+        404,
         "the refused domain must not have been stored"
     );
 
@@ -1201,7 +1205,7 @@ async fn a_snapshot_suspension_window_is_held_to_its_documented_maximum() {
             );
             assert_eq!(
                 describe(&router, &name).await.status,
-                409,
+                404,
                 "case {label:?}: a refused create must store nothing"
             );
         }

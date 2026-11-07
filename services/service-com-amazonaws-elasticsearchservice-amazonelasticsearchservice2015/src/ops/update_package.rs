@@ -164,12 +164,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .packages
             .get_mut(&crate::state::package_key(&region, &input.package_id))
         else {
-            return Err(UpdatePackageErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Package not found: {}", input.package_id)),
-                },
-            )
-            .into());
+            // The resource named is not there: HTTP 404
+            // (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`), not the
+            // `@httpError(409)` the model annotates on the shape.
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                UpdatePackageErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Package not found: {}", input.package_id)),
+                    },
+                ),
+            ));
         };
 
         // The emulator's bound on the one growth site inside a package record.

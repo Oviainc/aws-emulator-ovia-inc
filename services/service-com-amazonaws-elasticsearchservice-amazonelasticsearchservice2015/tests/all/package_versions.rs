@@ -444,8 +444,8 @@ async fn a_package_the_region_does_not_hold_is_not_found() {
         )
         .await;
         assert_eq!(
-            read.status, 409,
-            "case {case:?}: the history must be refused with 409, got {} {}",
+            read.status, 404,
+            "case {case:?}: the history must be refused with 404, got {} {}",
             read.status, read.body
         );
         assert!(
@@ -467,8 +467,8 @@ async fn a_package_the_region_does_not_hold_is_not_found() {
         )
         .await;
         assert_eq!(
-            updated.status, 409,
-            "case {case:?}: the update must be refused with 409, got {} {}",
+            updated.status, 404,
+            "case {case:?}: the update must be refused with 404, got {} {}",
             updated.status, updated.body
         );
         assert!(

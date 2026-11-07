@@ -162,12 +162,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .domains
             .contains_key(&crate::state::domain_key(&region, &input.domain_name))
         {
-            return Err(ListPackagesForDomainErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Domain not found: {}", input.domain_name)),
-                },
-            )
-            .into());
+            // The resource named is not there: HTTP 404
+            // (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`), not the
+            // `@httpError(409)` the model annotates on the shape.
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                ListPackagesForDomainErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Domain not found: {}", input.domain_name)),
+                    },
+                ),
+            ));
         }
 
         // Order-stable, because the store is keyed by package id within one

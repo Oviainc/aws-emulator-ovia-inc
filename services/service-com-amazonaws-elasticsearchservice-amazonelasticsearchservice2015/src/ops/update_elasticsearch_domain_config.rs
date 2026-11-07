@@ -325,14 +325,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .domains
             .get_mut(&crate::state::domain_key(&region, &input.domain_name))
         else {
-            return Err(
+            // The resource named is not there: HTTP 404
+            // (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`), not the
+            // `@httpError(409)` the model annotates on the shape.
+            return Err(crate::scaffolded::Scaffolded::not_found(
                 UpdateElasticsearchDomainConfigErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(format!("Domain not found: {}", input.domain_name)),
                     },
-                )
-                .into(),
-            );
+                ),
+            ));
         };
 
         // The merge runs on a COPY, which is committed only when this is not a dry

@@ -174,23 +174,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&crate::state::package_key(&region, &input.package_id))
             .cloned()
         else {
-            return Err(AssociatePackageErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Package not found: {}", input.package_id)),
-                },
-            )
-            .into());
+            // The resource named is not there: HTTP 404
+            // (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`), not the
+            // `@httpError(409)` the model annotates on the shape.
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                AssociatePackageErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Package not found: {}", input.package_id)),
+                    },
+                ),
+            ));
         };
         let Some(domain) = store
             .domains
             .get(&crate::state::domain_key(&region, &input.domain_name))
         else {
-            return Err(AssociatePackageErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Domain not found: {}", input.domain_name)),
-                },
-            )
-            .into());
+            // Same refusal class, same status, for the other resource the URI names.
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                AssociatePackageErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Domain not found: {}", input.domain_name)),
+                    },
+                ),
+            ));
         };
 
         // THE SOFTWARE-VERSION GATE, which runs before any write: a domain that
