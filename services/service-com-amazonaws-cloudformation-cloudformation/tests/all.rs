@@ -173,6 +173,8 @@ mod in_flight_resource_status;
 mod initiating_resource_events;
 #[path = "all/in_place_resource_updates.rs"]
 mod in_place_resource_updates;
+#[path = "all/lambda_permission_stack_updates.rs"]
+mod lambda_permission_stack_updates;
 #[path = "all/list_change_sets.rs"]
 mod list_change_sets;
 #[path = "all/list_element_refusals.rs"]

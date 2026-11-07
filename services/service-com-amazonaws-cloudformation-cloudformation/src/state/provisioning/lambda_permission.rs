@@ -107,6 +107,66 @@ pub(super) async fn create(
     Ok(Created::default())
 }
 
+/// Apply a CHANGED declaration to the statement a stack added, through the two calls Lambda
+/// publishes for a policy statement: the statement in force is removed and the DECLARED one
+/// is added, so the function's policy ends up holding exactly the grant the declaration
+/// states rather than the stack failing while the caller's change went nowhere.
+///
+/// There is no call that edits a statement in place — `AddPermission` adds one and
+/// `RemovePermission` removes one — which is why every property of this type publishes
+/// "Update requires: Replacement". The statement is replaced under the same statement id,
+/// this resource's physical id: that is the id `Ref` returns for the type and the one the
+/// removal addresses the statement by, so the resource keeps the identity the stack
+/// published for it.
+///
+/// The OLD statement is removed from the function the record names, which is the function it
+/// was added to; the new one is added to the function the DECLARATION names, so a declaration
+/// that moves the grant to another function leaves none behind on the first.
+///
+/// The removal precedes the add, because both statements are the same statement id and
+/// Lambda holds one statement per id. A declared grant the ADD is refused for therefore
+/// leaves the function without that statement for the length of this call, so the statement in
+/// force is PUT BACK before the refusal is reported: the resource is reported failed with
+/// Lambda's own refusal and the function keeps the grant it had, rather than the stack rolling
+/// back over a function whose policy quietly lost a statement (a rollback re-declares the
+/// configuration in force, which this walk then has nothing to apply for). The two checks that
+/// can be made without calling anything — the function the declaration names, and a property
+/// this module does not apply — are made before the removal for the same reason.
+pub(super) async fn update(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
+    let declaration = StoredResource {
+        properties: declared.clone(),
+        ..resource.clone()
+    };
+    refuse_unmapped_properties(&declaration)?;
+    // The function the declaration names is resolved BEFORE the statement in force is
+    // removed, so a declaration that names none leaves the grant it asked to change alone.
+    function_of(&declaration)?;
+    delete(ctx, region, resource).await?;
+    match create(ctx, region, &declaration).await {
+        Ok(created) => Ok(created),
+        Err(refusal) => {
+            if let Err(restoring) = create(ctx, region, resource).await {
+                // Lambda refused to put the statement in force back. Nothing else can
+                // restore it, so the resource's own refusal is still what the deployment
+                // reports, and this is recorded so the lost statement is diagnosable.
+                tracing::warn!(
+                    logical_id = %resource.logical_id,
+                    statement_id = %resource.physical_resource_id,
+                    code = %restoring.code,
+                    "the statement in force could not be put back after the declared grant \
+                     was refused"
+                );
+            }
+            Err(refusal)
+        }
+    }
+}
+
 /// Remove the statement a stack added, addressed by the function it was added to and the
 /// statement id that is this resource's physical id.
 ///

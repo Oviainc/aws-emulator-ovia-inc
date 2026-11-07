@@ -681,7 +681,6 @@ fn resolve_answer(
         &deployment.configuration,
         route,
         &route_path,
-        resolved.invoke_path,
         req,
         authorizer,
     )))
@@ -900,6 +899,28 @@ fn stage_of<'s>(api: &'s Api, invoke_path: &str) -> Option<(&'s Stage, String)> 
     api.stages
         .get(crate::state::DEFAULT_STAGE_NAME)
         .map(|stage| (stage, normalised_path(invoke_path)))
+}
+
+/// The path the api's OWN endpoint was addressed at for this invoke, which is what a proxy
+/// event reports (`rawPath`, the `1.0` event's `path`, and `requestContext`'s own `path`).
+///
+/// It is the stage's invoke URL path, composed from the stage and the path within it rather
+/// than taken from the request as it arrived: "the stage name is TYPICALLY appended to this
+/// URI to form a complete path to a deployed API stage" (`Api$ApiEndpoint`), so a NAMED
+/// stage is reached with its name as the first segment and reports it, while the stage that
+/// serves the api's root ([`crate::state::DEFAULT_STAGE_NAME`]) is reached with no stage
+/// segment at all and so reports none — its name is a reserved word of this service, never a
+/// path segment of a deployment.
+///
+/// That is what keeps the event's path the one AWS reports for the same route: a client on
+/// this machine cannot resolve the api's endpoint, so it carries the api id, the local
+/// marker or the root stage's own name in the PATH instead ([`resolve`]), and none of those
+/// is part of the path the api was addressed at.
+fn endpoint_path(stage: &Stage, route_path: &str) -> String {
+    if stage.stage_name == crate::state::DEFAULT_STAGE_NAME {
+        return normalised_path(route_path);
+    }
+    normalised_path(&format!("{}/{route_path}", stage.stage_name))
 }
 
 /// `path` with exactly one leading `/` and no trailing one (except for the root itself), so
@@ -1241,7 +1262,6 @@ fn dispatch(
     deployed: &DeployedConfiguration,
     route: &Route,
     route_path: &str,
-    invoke_path: &str,
     req: &RtRequest,
     authorizer: Option<(Authorizer, Vec<String>)>,
 ) -> dispatch::Dispatch {
@@ -1255,10 +1275,10 @@ fn dispatch(
     dispatch::Dispatch {
         request: proxy_event::ProxyRequest {
             method: req.method().to_string(),
-            // The path AWS's own event reports is the one within the API — the stage
-            // segment included, because the invoke URL carries it — whichever of the three
-            // addressings a local client reached this emulator by.
-            raw_path: normalised_path(invoke_path),
+            // The path AWS's own event reports is the one the api's OWN endpoint was
+            // addressed at ([`endpoint_path`]), whichever addressing a local client reached
+            // this emulator by.
+            raw_path: endpoint_path(stage, route_path),
             route_path: route_path.to_string(),
             raw_query_string: query_of(req.uri()).unwrap_or_default().to_string(),
             headers: request_headers(req),

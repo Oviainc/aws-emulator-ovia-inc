@@ -9060,6 +9060,7 @@ dependencies = [
  "percent-encoding",
  "quick-xml",
  "serde_json",
+ "service-com-amazonaws-apigatewayv2-apigatewayv2",
  "service-com-amazonaws-codepipeline-codepipeline-20150709",
  "service-com-amazonaws-cognitoidentity-awscognitoidentityservice",
  "service-com-amazonaws-dynamodb-dynamodb-20120810",

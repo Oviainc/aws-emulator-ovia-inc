@@ -102,6 +102,14 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
     router.register_service(
         service_com_amazonaws_sfn_awsstepfunctions::EmulatedService::new(Arc::clone(&engine)),
     );
+    // Amazon API Gateway v2, for the `AWS::ApiGatewayV2::Api` a stack really creates there,
+    // so a suite that deploys an HTTP api — and a grant that names it — reads the api back
+    // through that service's own wire.
+    router.register_service(
+        service_com_amazonaws_apigatewayv2_apigatewayv2::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
+    );
     (router, engine)
 }
 

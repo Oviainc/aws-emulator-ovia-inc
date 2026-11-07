@@ -961,9 +961,12 @@ impl Owner {
             // a success that dropped the caller's change.
             Self::LambdaLayerVersion => Ok(None),
             // A statement of a policy cannot be CHANGED in place: `AddPermission` adds one
-            // and `RemovePermission` removes one, so a changed declaration is reported as
-            // not applied rather than as a success that dropped the caller's change.
-            Self::LambdaPermission => Ok(None),
+            // and `RemovePermission` removes one, so a changed declaration is applied by
+            // replacing the statement with the two calls Lambda publishes
+            // ([`lambda_permission::update`]).
+            Self::LambdaPermission => lambda_permission::update(ctx, region, resource, declared)
+                .await
+                .map(Some),
             // Neither an association nor a route table has a property that can change on the
             // resource that exists (both of an association's are its identity, and a route
             // table's VPC is create-only), every property of a gateway, of an attachment and
@@ -2626,12 +2629,12 @@ const MAX_REPOINTED_NESTING: usize = 64;
 /// resource it names really publishes.
 ///
 /// Matched WHOLE value — or, where the stand-in is an identifier CloudFormation computed
-/// rather than a name the declaration asked for ([`Minted::composed`]), as one whole
-/// slash-separated SEGMENT of a longer value, which is the one form a template composes an
-/// identifier into (`integrations/<IntegrationId>`). Never as any shorter run of
-/// characters: a stand-in is often the NAME the declaration asked for, so a longer value
-/// that merely contains one (an association named `<rule name>-assoc`) is a value of its
-/// own and is left exactly as written.
+/// rather than a name the declaration asked for ([`Minted::composed`]), as one whole TOKEN
+/// of a longer value ([`retokenised`]), which is how a template composes an identifier into
+/// one of its own strings (`integrations/<IntegrationId>`, or the ARN an `Fn::Sub` builds
+/// around a `Ref`). Never as any shorter run of characters: a stand-in is often the NAME the
+/// declaration asked for, so a longer value that merely contains one (an association named
+/// `<rule name>-assoc`) is a value of its own and is left exactly as written.
 ///
 /// Called by [`reconcile`] for the identifiers minted in the walk it is driving. A resource
 /// is never re-pointed with its OWN pair — it cannot reference itself, and for a type whose
@@ -2650,8 +2653,8 @@ struct Minted {
     stand_in: String,
     /// What that reference has to carry now.
     assigned: String,
-    /// Whether the stand-in may also be matched INSIDE a longer value, as one whole
-    /// slash-separated segment of it.
+    /// Whether the stand-in may also be matched INSIDE a longer value, as one whole token
+    /// of it ([`retokenised`]).
     ///
     /// True only where the stand-in is an identifier CloudFormation COMPUTED rather than
     /// the name the declaration asked for: such a value is not one a template composed out
@@ -2659,8 +2662,11 @@ struct Minted {
     /// this resource put it there. That is how an API Gateway v2 route names the
     /// integration it is wired to — `Target: !Join ['/', ['integrations', !Ref
     /// Integration]]`, which is the `integrations/<IntegrationId>` form that service
-    /// accepts — so without this such a route would be created pointing at an integration
-    /// id nothing minted.
+    /// accepts — and how a template builds the ARN of a resource it declares, with the
+    /// reference inside a longer string (`!Sub 'arn:aws:execute-api:${AWS::Region}:\
+    /// ${AWS::AccountId}:${Api}/*/*'`). Without this, such a route would be created
+    /// pointing at an integration id nothing minted, and such a grant made for an api id
+    /// nothing minted.
     composed: bool,
 }
 
@@ -2678,22 +2684,9 @@ fn repoint(properties: &mut Value, minted: &[Minted], depth: usize) {
                 *text = minted.assigned.clone();
                 return;
             }
-            for minted in minted
-                .iter()
-                .filter(|minted| minted.composed && !minted.stand_in.contains('/'))
-            {
-                if text.split('/').any(|segment| segment == minted.stand_in) {
-                    *text = text
-                        .split('/')
-                        .map(|segment| {
-                            if segment == minted.stand_in {
-                                minted.assigned.as_str()
-                            } else {
-                                segment
-                            }
-                        })
-                        .collect::<Vec<&str>>()
-                        .join("/");
+            for minted in minted.iter().filter(|minted| minted.composed) {
+                if let Some(repointed) = retokenised(text, &minted.stand_in, &minted.assigned) {
+                    *text = repointed;
                 }
             }
         }
@@ -2709,6 +2702,65 @@ fn repoint(properties: &mut Value, minted: &[Minted], depth: usize) {
         }
         _ => {}
     }
+}
+
+/// Whether `character` can be part of one IDENTIFIER: an ASCII letter or digit, a hyphen or
+/// an underscore, which is what the identifiers AWS services assign are made of.
+///
+/// It is the boundary [`retokenised`] matches a stand-in at: a stand-in whose neighbour in a
+/// longer value is one of these is part of a longer token of that value, so it is not a
+/// reference to the resource and is left exactly as written.
+fn is_identifier_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '-' || character == '_'
+}
+
+/// `text` with every WHOLE-TOKEN occurrence of `stand_in` replaced by `assigned`, or `None`
+/// for a text that carries none.
+///
+/// This is how a reference COMPOSED INTO a longer string reaches the identifier its resource
+/// really has: a template builds the ARN of a resource it declares out of its own text and
+/// that reference (`!Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/*'`),
+/// so the identifier sits inside a longer value delimited by whatever the template wrote
+/// around it — a colon, a slash, a quote, a space — rather than being the whole value or one
+/// whole slash-separated segment of it.
+///
+/// A token is bounded by any character an identifier cannot carry
+/// ([`is_identifier_character`]), so a stand-in that merely begins or ends a longer
+/// identifier is left alone. Only a stand-in CloudFormation itself computed is matched this
+/// way ([`Minted::composed`]): a value a declaration asked for is a value of its own
+/// wherever it appears.
+fn retokenised(text: &str, stand_in: &str, assigned: &str) -> Option<String> {
+    if stand_in.is_empty() {
+        return None;
+    }
+    let mut repointed = String::new();
+    let mut cursor = 0;
+    let mut replaced = false;
+    while let Some(offset) = text[cursor..].find(stand_in) {
+        let at = cursor + offset;
+        let end = at + stand_in.len();
+        let bounded = text[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !is_identifier_character(character))
+            && text[end..]
+                .chars()
+                .next()
+                .is_none_or(|character| !is_identifier_character(character));
+        repointed.push_str(&text[cursor..at]);
+        if bounded {
+            repointed.push_str(assigned);
+            replaced = true;
+        } else {
+            repointed.push_str(stand_in);
+        }
+        cursor = end;
+    }
+    if !replaced {
+        return None;
+    }
+    repointed.push_str(&text[cursor..]);
+    Some(repointed)
 }
 
 /// Record the identity an owning service ASSIGNED to a resource it created: the id its
@@ -4393,6 +4445,95 @@ async fn callback_credentials(
         credentials.access_key_id().to_string(),
         credentials.secret_access_key().to_string(),
     ))
+}
+
+#[cfg(test)]
+mod repointed_token_tests {
+    use super::retokenised;
+
+    /// A stand-in CloudFormation computed is re-pointed wherever a template composed it into
+    /// one of its own strings — and left exactly as written where it is only part of a longer
+    /// identifier, which is a value of its own rather than a reference to the resource.
+    ///
+    /// The rows span the delimiters a template puts around such a reference and the ways a
+    /// longer identifier can carry the same characters.
+    #[test]
+    fn a_composed_stand_in_is_re_pointed_at_token_boundaries_only() {
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            // The whole value, and the forms an ARN composes the reference into.
+            ("abc123", "abc123", Some("zzz999")),
+            (
+                "between a colon and a slash",
+                "arn:aws:execute-api:us-east-1:000000000000:abc123/*/*",
+                Some("arn:aws:execute-api:us-east-1:000000000000:zzz999/*/*"),
+            ),
+            (
+                "at the end of the value",
+                "arn:aws:execute-api:us-east-1:000000000000:abc123",
+                Some("arn:aws:execute-api:us-east-1:000000000000:zzz999"),
+            ),
+            (
+                "one whole slash-separated segment",
+                "integrations/abc123",
+                Some("integrations/zzz999"),
+            ),
+            (
+                "more than once in one value",
+                "abc123/stage/abc123",
+                Some("zzz999/stage/zzz999"),
+            ),
+            // ...and the negative branch: part of a longer identifier, so not a reference.
+            ("a suffixed identifier", "abc123-assoc", None),
+            ("a prefixed identifier", "the-abc123", None),
+            ("an underscore away from a boundary", "abc123_two", None),
+            ("a longer identifier around it", "xabc123x", None),
+            ("a value that does not carry it", "arn:aws:sns:us-east-1:000000000000:q", None),
+        ];
+        for (case, text, expected) in cases {
+            let answered = retokenised(text, "abc123", "zzz999");
+            assert_eq!(
+                answered.as_deref(),
+                *expected,
+                "case {case:?}: re-pointing {text:?} answered {answered:?}"
+            );
+        }
+    }
+
+    /// A stand-in that CARRIES a slash is matched by the same rule: a slash is no character
+    /// of an identifier, so such a stand-in is re-pointed where the whole of it is a token of
+    /// a longer value and left alone where a longer identifier runs into it.
+    #[test]
+    fn a_slash_bearing_stand_in_follows_the_same_boundary_rule() {
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            ("the whole value", "apis/abc123", Some("zzz999")),
+            (
+                "composed into a longer value",
+                "arn:aws:execute-api:us-east-1:0:apis/abc123/*",
+                Some("arn:aws:execute-api:us-east-1:0:zzz999/*"),
+            ),
+            ("a longer identifier ahead of it", "the-apis/abc123", None),
+            ("a longer identifier after it", "apis/abc123-assoc", None),
+        ];
+        for (case, text, expected) in cases {
+            let answered = retokenised(text, "apis/abc123", "zzz999");
+            assert_eq!(
+                answered.as_deref(),
+                *expected,
+                "case {case:?}: re-pointing {text:?} answered {answered:?}"
+            );
+        }
+    }
+
+    /// A stand-in that is not there, and the empty one, re-point nothing: an empty value is
+    /// no identifier a reference could have resolved to.
+    #[test]
+    fn nothing_is_re_pointed_for_an_empty_stand_in() {
+        let answered = retokenised("arn:aws:execute-api:us-east-1:0:abc123/*", "", "zzz999");
+        assert_eq!(
+            answered, None,
+            "expected an empty stand-in to re-point nothing, got {answered:?}"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -69,7 +69,7 @@ const FORBIDDEN: u16 = 403;
 const UNAUTHORIZED: u16 = 401;
 
 /// This service and AWS Lambda on ONE engine, with request authentication off.
-fn emulator_with_lambda() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator_with_lambda() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -175,7 +175,7 @@ fn package(source: &str) -> Vec<u8> {
 
 /// Create a function whose code is `source` and bring the activation the clock owes forward,
 /// so no case here waits for the provisioning window. Answers its ARN.
-async fn given_function(
+pub(crate) async fn given_function(
     emulator: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     case: &str,
@@ -247,7 +247,7 @@ fn activate(engine: &Arc<engine::InMemoryEngine>) {
 
 /// An api, one integration, one route over it and one stage with auto-deploy on. Answers
 /// `(ApiId, the host its ApiEndpoint names)`.
-async fn given_api(
+pub(crate) async fn given_api(
     emulator: &MultiServiceRouter,
     case: &str,
     integration: Value,
@@ -327,7 +327,7 @@ fn root_stage() -> Value {
 }
 
 /// A Lambda proxy integration over `function_arn` in `payload_format`.
-fn lambda_integration(function_arn: &str, payload_format: &str) -> Value {
+pub(crate) fn lambda_integration(function_arn: &str, payload_format: &str) -> Value {
     json!({
         "integrationType": "AWS_PROXY",
         "integrationUri": function_arn,
@@ -346,7 +346,7 @@ const INFERRED: &str = "def lambda_handler(event, context):\n    return {'ok': T
 
 /// A handler that ECHOES the event it was given as its response body, which is how the
 /// event's own members are asserted.
-const ECHO_EVENT: &str = "import json\n\
+pub(crate) const ECHO_EVENT: &str = "import json\n\
      def lambda_handler(event, context):\n\
      \x20   return {'statusCode': 200, 'headers': {'content-type': 'application/json'},\n\
      \x20            'body': json.dumps(event)}\n";

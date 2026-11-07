@@ -83,6 +83,8 @@ mod empty_answer_framing;
 mod http_api_backend_dispatch;
 #[path = "all/http_api_cors_data_plane.rs"]
 mod http_api_cors_data_plane;
+#[path = "all/http_api_event_path.rs"]
+mod http_api_event_path;
 #[path = "all/http_api_integration_fault_status.rs"]
 mod http_api_integration_fault_status;
 #[path = "all/http_api_jwt_data_plane.rs"]

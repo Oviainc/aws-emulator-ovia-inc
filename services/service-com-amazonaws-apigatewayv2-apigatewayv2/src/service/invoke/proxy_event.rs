@@ -79,9 +79,11 @@ pub const PAYLOAD_FORMAT_2_0: &str = "2.0";
 pub struct ProxyRequest {
     /// The request's method, exactly as it arrived.
     pub method: String,
-    /// The path WITHIN the api, which is what AWS's own event reports: the stage segment
-    /// included, because the invoke URL carries it ("the stage name is typically appended
-    /// to this URI to form a complete path to a deployed API stage", `Api$ApiEndpoint`).
+    /// The path the api's own endpoint was addressed at, which is what AWS's own event
+    /// reports: a NAMED stage's segment included, because that stage's invoke URL carries it
+    /// ("the stage name is typically appended to this URI to form a complete path to a
+    /// deployed API stage", `Api$ApiEndpoint`), and no stage segment at all for the stage
+    /// that serves the api's root.
     pub raw_path: String,
     /// The path within the STAGE, which is what the route key matched.
     pub route_path: String,
