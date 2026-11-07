@@ -12,9 +12,11 @@
 //! operations needs: [`take_turn`], the one conversation turn `RecognizeText`
 //! and `RecognizeUtterance` are two encodings of, [`headers`], the wire form of
 //! the structured `x-amz-lex-*` headers `PutSession` and `RecognizeUtterance`
-//! answer with, [`bot_model`], the built bot locale a turn is interpreted
-//! against, and [`nlu`], the interpretation and dialog of one turn.
+//! answer with, [`bot_model`], the built bot locale a call is served against,
+//! [`bot_definition`], what that bot says about a dialog state a caller seeds,
+//! and [`nlu`], the interpretation and dialog of one turn.
 
+pub mod bot_definition;
 pub mod bot_model;
 pub mod headers;
 pub mod nlu;

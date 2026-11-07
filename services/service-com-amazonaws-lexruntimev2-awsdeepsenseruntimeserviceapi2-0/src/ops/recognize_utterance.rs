@@ -165,10 +165,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::bot_model::{built_locale, BotLocaleModel, LocaleUnavailable};
 use crate::state::headers::{
     decode_string_map, decode_struct, encode_json, encode_text, member_schema, HeaderRejected,
 };
-use crate::state::bot_model::{built_locale, BotLocaleModel, LocaleUnavailable};
 use crate::state::{
     asks_for_speech, AttributesRefused, SessionKey, SessionStoreFull, TurnRefused, AUDIO_PREFIX,
     MAX_UTTERANCE_CHARS, TEXT_CONTENT_TYPE,
@@ -255,7 +255,7 @@ fn store_full(error: SessionStoreFull) -> RecognizeUtteranceError {
     .into()
 }
 
-/// The bot and locale the request addresses hold no model this runtime can
+/// The bot alias and locale the request addresses hold no model this runtime can
 /// interpret an utterance against, or the control plane that holds them cannot
 /// be reached at all — the same refusals the sibling `RecognizeText` gives,
 /// since both operations are one turn against one built locale: an alias id
@@ -476,7 +476,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The built bot locale the utterance is interpreted against, resolved
         // before the session store is touched exactly as the sibling
-        // `RecognizeText` resolves it.
+        // `RecognizeText` resolves it — the bot/alias PAIR first, then that
+        // version's locale.
         let model: BotLocaleModel = built_locale(
             &*self.engine,
             &input.bot_id,

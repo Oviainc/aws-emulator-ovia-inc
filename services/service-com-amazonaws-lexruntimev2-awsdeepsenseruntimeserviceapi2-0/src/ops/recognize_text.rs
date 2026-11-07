@@ -2,10 +2,11 @@
 
 //! @op RecognizeText
 //!
-//! Advances the conversation one turn: loads (or implicitly starts) the session
-//! addressed by the four `@httpLabel` values, folds in the dialog state and
-//! request attributes the caller supplied, persists the result, and reports it
-//! back with the interpretation of the turn.
+//! Advances the conversation one turn: resolves the bot, alias and locale the
+//! four `@httpLabel` values address against the Lex V2 models control plane,
+//! loads (or implicitly starts) the session they name, folds in the dialog state
+//! and request attributes the caller supplied, persists the result, and reports
+//! it back with the interpretation of the turn.
 //!
 //! ## Shape of an operation
 //!
@@ -120,7 +121,7 @@ fn refused(error: AttributesRefused) -> RecognizeTextError {
     .into()
 }
 
-/// The bot and locale the request addresses hold no model this runtime can
+/// The bot alias and locale the request addresses hold no model this runtime can
 /// interpret an utterance against, or the control plane that holds them cannot
 /// be reached at all.
 ///
@@ -259,9 +260,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // What the utterance is interpreted against: the bot locale the alias
         // this request addresses points at, which the client built through the
-        // Lex Models V2 control plane. Resolved BEFORE the session store is
-        // touched, so a turn for a locale with no built model is refused without
-        // starting a conversation.
+        // Lex Models V2 control plane. The PAIR is resolved, not the two ids
+        // separately, and resolution happens BEFORE the session store is
+        // touched, so a turn addressed to an alias that bot does not have, or to
+        // a locale with no built model, is refused without starting a
+        // conversation.
         let model: BotLocaleModel = built_locale(
             &*self.engine,
             &input.bot_id,

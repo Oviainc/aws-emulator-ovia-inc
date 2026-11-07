@@ -285,7 +285,7 @@ async fn the_cross_service_build_then_talk_sequence_reaches_one_service_per_call
             let answer = dispatch(&router, step.method, &step.path, &step.body).await;
             assert_not_a_router_refusal(&step.case, &answer);
         }
-        // The runtime serves a turn against the model the build produced, so the
+        // The runtime serves a call only against the model the build produced, so the
         // conversation below waits for the locale to reach `Built`.
         wait_until_built(&router, &bot_id, run.locale).await;
 

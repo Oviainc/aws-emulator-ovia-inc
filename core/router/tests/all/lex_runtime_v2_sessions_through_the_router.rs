@@ -199,7 +199,7 @@ async fn a_runtime_v2_session_is_seeded_advanced_read_and_deleted_through_the_wh
 
         // ---- and the locale the conversation is held in, built ---------------------
         //
-        // The runtime interprets a turn against the model a build produced, so a bot can
+        // The runtime serves a call only against the model a build produced, so a bot can
         // only be conversed with once the locale is built: the authoring and the build are
         // the cross-service suite's, reused rather than copied.
         author_and_build_locale(&router, &bot_id, run.locale).await;

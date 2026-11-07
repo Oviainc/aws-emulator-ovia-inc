@@ -22,7 +22,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::Emulator;
+use crate::harness::{Emulator, INTENT, SLOT};
 
 /// The content type a text session answers with when the caller asks for none.
 const TEXT_CONTENT_TYPE: &str = "text/plain;charset=utf-8";
@@ -124,8 +124,9 @@ fn lifecycle_cases() -> Vec<Case> {
 async fn a_session_is_created_read_advanced_and_deleted() {
     for case in lifecycle_cases() {
         let emulator = Emulator::new();
-        // The bot the session hangs off: a turn is interpreted against a built
-        // locale, so the labels this row addresses have to name one.
+        // The bot the session hangs off: every call that needs the bot's runtime
+        // model is served only against a built locale, so the labels this row
+        // addresses have to name one.
         emulator.built_locale(case.bot_id, case.bot_alias_id, case.locale_id);
         let path = case.session_path();
 
@@ -411,6 +412,13 @@ async fn sessions_under_different_labels_are_distinct() {
         ),
     ];
 
+    // Every label combination addresses a bot locale of its own: a session is
+    // created only for labels that resolve to a built locale, so each row needs
+    // the one it names.
+    for (_, case, _) in &variants {
+        emulator.built_locale(case.bot_id, case.bot_alias_id, case.locale_id);
+    }
+
     for (name, case, marker) in &variants {
         let put = emulator
             .send(
@@ -423,8 +431,9 @@ async fn sessions_under_different_labels_are_distinct() {
             .await;
         assert_eq!(
             put.status, 200,
-            "case {name:?}: PutSession must succeed, got {}",
-            put.status
+            "case {name:?}: PutSession must succeed, got {} {:?}",
+            put.status,
+            String::from_utf8_lossy(&put.body)
         );
     }
 
@@ -675,6 +684,7 @@ async fn an_active_context_lives_for_its_turns_to_live() {
 #[tokio::test]
 async fn values_outside_the_modelled_constraints_are_refused() {
     let emulator = Emulator::new();
+    emulator.built_locale("ABCDEFGHIJ", "TSTALIASID", "en_US");
     let ok_state = json!({"sessionState": {"dialogAction": {"type": "Delegate"}}});
 
     // (case, botId, sessionId, body, expected status) — each row sits on a
@@ -868,6 +878,7 @@ async fn the_text_of_a_turn_is_bounded_by_the_model() {
 #[tokio::test]
 async fn an_audio_response_content_type_is_refused() {
     let emulator = Emulator::new();
+    emulator.built_locale("ABCDEFGHIJ", "TSTALIASID", "en_US");
     let path = "/bots/ABCDEFGHIJ/botAliases/TSTALIASID/botLocales/en_US/sessions/content-type";
 
     // The accepted values come from `RecognizeUtterance$responseContentType`:
@@ -1144,16 +1155,16 @@ async fn a_request_attribute_in_the_reserved_namespace_is_refused() {
 /// exact bytes of one known payload gunzip back to the JSON of the stored value.
 #[tokio::test]
 async fn the_lex_headers_are_gzipped_and_base64_encoded() {
-    let emulator = Emulator::new();
-    let path = "/bots/ABCDEFGHIJ/botAliases/TSTALIASID/botLocales/en_US/sessions/encoding";
+    let (emulator, bot) = Emulator::with_bot().await;
+    let path = bot.session_path("encoding");
     let put = emulator
         .send(
             "POST",
-            path,
+            &path,
             Some(json!({
                 "sessionState": {
-                    "dialogAction": {"type": "ElicitSlot", "slotToElicit": "Size"},
-                    "intent": {"name": "OrderPizza", "state": "InProgress"},
+                    "dialogAction": {"type": "ElicitSlot", "slotToElicit": SLOT},
+                    "intent": {"name": INTENT, "state": "InProgress"},
                     "sessionAttributes": {"cart": "2"},
                 },
                 "messages": [{"content": "What size?", "contentType": "PlainText"}],
@@ -1197,8 +1208,8 @@ async fn the_lex_headers_are_gzipped_and_base64_encoded() {
     assert_eq!(
         decoded,
         json!({
-            "dialogAction": {"type": "ElicitSlot", "slotToElicit": "Size"},
-            "intent": {"name": "OrderPizza", "state": "InProgress"},
+            "dialogAction": {"type": "ElicitSlot", "slotToElicit": SLOT},
+            "intent": {"name": INTENT, "state": "InProgress"},
             "sessionAttributes": {"cart": "2"},
             "originatingRequestId": originating_request_id,
         }),

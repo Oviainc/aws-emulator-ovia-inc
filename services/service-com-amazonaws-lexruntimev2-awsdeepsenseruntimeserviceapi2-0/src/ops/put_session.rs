@@ -3,9 +3,12 @@
 //! @op PutSession
 //!
 //! Creates or replaces the stored session addressed by the four `@httpLabel`
-//! values, persisting the dialog state, messages and request attributes the
-//! caller supplied, and reports the stored session back on the `x-amz-lex-*`
-//! response headers.
+//! values: resolves the bot, alias and locale they address against the Lex V2
+//! models control plane, validates the dialog state the caller seeded against
+//! that bot locale, persists the state, messages and request attributes, and
+//! reports the stored session back on the `x-amz-lex-*` response headers — with
+//! the bot's own authored messages for the dialog state it enters when the
+//! request carried none.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +105,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::bot_definition::SeedRefused;
+use crate::state::bot_model::{built_locale, LocaleUnavailable};
 use crate::state::headers::{encode_json, member_schema};
 // `asks_for_speech` and `TEXT_CONTENT_TYPE` are `crate::state`'s, because the
 // two operations that take a `responseContentType` must answer the same way for
@@ -145,6 +150,47 @@ fn internal(message: impl Into<String>) -> PutSessionError {
 /// An attribute map the caller has to fix: the member and the rule it broke are
 /// in the message, so the request can be fixed from it.
 fn refused(error: AttributesRefused) -> PutSessionError {
+    PutSessionErrorModeled::ValidationException(ValidationException {
+        message: error.message(),
+    })
+    .into()
+}
+
+/// The bot alias and locale this session is addressed to hold no model this
+/// runtime can serve, so there is no bot to hold a conversation with — the same
+/// two refusals the operations that take a turn give, worded as Amazon Lex V2
+/// words each: an alias id that is not an alias of that bot resolves to nothing,
+/// while a locale that was never built has no runtime model.
+fn locale_unavailable(
+    error: LocaleUnavailable,
+    bot_id: &str,
+    bot_alias_id: &str,
+) -> PutSessionError {
+    match error {
+        LocaleUnavailable::UnknownBotAlias => {
+            PutSessionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: crate::state::bot_model::bot_alias_not_valid_message(
+                    bot_id,
+                    bot_alias_id,
+                ),
+            })
+            .into()
+        }
+        LocaleUnavailable::NotBuilt => {
+            PutSessionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: crate::state::bot_model::BOT_LOCALE_NOT_VALID_MESSAGE.to_string(),
+            })
+            .into()
+        }
+        LocaleUnavailable::StoreUnavailable => {
+            internal("the Lex V2 bot definitions are unavailable")
+        }
+    }
+}
+
+/// A seeded dialog state naming something the addressed bot locale does not
+/// define: the caller's to fix, so the modelled `ValidationException`.
+fn seed_refused(error: SeedRefused) -> PutSessionError {
     PutSessionErrorModeled::ValidationException(ValidationException {
         message: error.message(),
     })
@@ -260,6 +306,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| internal("the Lex V2 runtime session store is unavailable"))?;
 
+        // A session is a conversation with ONE bot alias in one locale, so the
+        // three that address it have to resolve to a model Amazon Lex V2 has
+        // built — the bot/alias PAIR, then that version's locale — and the
+        // dialog state the caller seeds has to be one that bot could be in: both
+        // are checked before anything is stored, so a refused seed creates no
+        // session.
+        let locale = built_locale(
+            &*self.engine,
+            &input.bot_id,
+            &input.bot_alias_id,
+            &input.locale_id,
+        )
+        .map_err(|error| locale_unavailable(error, &input.bot_id, &input.bot_alias_id))?;
+        locale
+            .check_session_state(&input.session_state)
+            .map_err(seed_refused)?;
+
         // Refuse an attribute map this operation may not store before a session
         // is created for it: these are the two maps it stores, both bounded, and
         // `requestAttributes` may not name the reserved namespace either.
@@ -271,6 +334,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(refused)?;
         check_request_attributes("requestAttributes", None, input.request_attributes.as_ref())
             .map_err(refused)?;
+
+        // "A list of messages that were last sent to the user ... ordered based
+        // on how you return the messages from you Lambda function or the order
+        // that the messages are defined in the bot": a request that carries its
+        // own messages sets them, and one that carries NONE enters the dialog
+        // state it seeded, so what was last sent is what the BOT authors for
+        // that state (the elicited slot's prompt, an intent's confirmation or
+        // its closing response).
+        //
+        // The member is optional and its list is `len 0..10`, so an empty list
+        // and an absent member are two different things a caller can say: a
+        // caller that sends one sent the messages it meant to, and they are
+        // stored as given rather than replaced by the bot's.
+        let messages = match input.messages {
+            Some(messages) => messages,
+            None => locale.authored_messages(&input.session_state),
+        };
 
         let now = SystemTime::now();
         let session_id = input.session_id;
@@ -291,7 +371,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // sessions and refuses to grow the store past its cap.
             let session = store.session_mut(key, now).map_err(store_full)?;
             session.replace_session_state(input.session_state, now);
-            session.messages = input.messages.unwrap_or_default();
+            session.messages = messages;
             // The dialog this call replaces is gone, and so are the
             // interpretations an earlier turn of it produced: this operation
             // "creates a new session or modifies an existing session", and an

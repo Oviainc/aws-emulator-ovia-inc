@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The emulator every suite in this crate drives, and the encoding its
-//! structured headers carry.
+//! The emulator every suite in this crate drives, the encoding its structured
+//! headers carry, and the bot its turns run against.
 //!
 //! Each test builds the service over one shared engine, registers it with the
 //! real [`MultiServiceRouter`], and dispatches buffered HTTP requests — so what
@@ -9,31 +9,91 @@
 //! called directly.
 //!
 //! The Lex Models V2 control plane is mounted on the SAME engine, because the
-//! bot a turn is interpreted against is its resource: this runtime refuses a
-//! turn addressed to a bot locale with no built model, so a suite that drives a
-//! turn needs a locale that was built. A suite about the bot drives that control
-//! plane over HTTP like any client ([`Emulator::send`] reaches it, since each
-//! service claims its own modelled routes); a suite about the SESSION, where the
-//! bot is only a fixture, asks for one through [`Emulator::built_locale`].
+//! bot a call is served against is its resource: this runtime refuses a call
+//! addressed to a bot alias it cannot resolve or to a locale with no built
+//! model, so a suite that drives one needs a bot that was built. A suite about
+//! the bot drives that control plane over HTTP like any client
+//! ([`Emulator::built_bot`] is that sequence: `CreateBot`, `CreateBotLocale`,
+//! `CreateIntent`, `CreateSlot`, `UpdateIntent`, `BuildBotLocale`); a suite
+//! about the SESSION, where the bot is only a fixture addressed by the fixed
+//! labels its table fixes, asks for one through [`Emulator::built_locale`].
 
 use bytes::Bytes;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use serde_json::Value;
+use serde_json::{json, Value};
 use service_com_amazonaws_lexmodelsv2_lexmodelbuildingservicev2 as lexmodels;
 use smithy_server_runtime::MultiServiceRouter;
 use std::io::{Read, Write};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use service_com_amazonaws_lexruntimev2_awsdeepsenseruntimeserviceapi2_0::EmulatedService;
+
+/// The bot version every locale created here belongs to: the working copy, which
+/// is what the alias Amazon Lex keeps for testing a bot points at.
+pub(crate) const DRAFT: &str = "DRAFT";
+
+/// An IAM role ARN satisfying the control plane's modelled `RoleArn`
+/// (len 32..2048, pattern `^arn:aws:iam::[0-9]{12}:role/.*$`).
+const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lex-demo";
+
+/// The alias Amazon Lex V2 keeps for testing a bot, created with the bot — the
+/// alias a bot created through the control plane is addressed through.
+pub(crate) const TEST_ALIAS: &str = lexmodels::state::TEST_BOT_ALIAS_ID;
+
+/// The intent [`Emulator::built_bot`] declares in each of its locales.
+pub(crate) const INTENT: &str = "OrderPizza";
+
+/// The one slot of [`INTENT`], and the prompt authored on it.
+pub(crate) const SLOT: &str = "Size";
+/// The message of the slot's `valueElicitationSetting.promptSpecification`.
+pub(crate) const SLOT_PROMPT: &str = "What size pizza would you like?";
+/// The message of the intent's `intentConfirmationSetting.promptSpecification`.
+pub(crate) const CONFIRMATION_PROMPT: &str = "Shall I place the order?";
+/// The message of the intent's `intentClosingSetting.closingResponse`.
+pub(crate) const CLOSING_MESSAGE: &str = "Your order is on its way";
+
+/// A bot the control plane created, with the locales it built for it.
+#[derive(Debug, Clone)]
+pub(crate) struct Bot {
+    /// The `botId` the control plane minted.
+    pub(crate) bot_id: String,
+    /// The alias Amazon Lex keeps for testing the bot, created with it.
+    pub(crate) alias_id: String,
+    /// The locales whose model was built, in the order they were created.
+    pub(crate) locales: Vec<String>,
+}
+
+impl Bot {
+    /// The session URI for `session_id` in `locale_id`.
+    pub(crate) fn session_path_in(&self, locale_id: &str, session_id: &str) -> String {
+        format!(
+            "/bots/{}/botAliases/{}/botLocales/{locale_id}/sessions/{session_id}",
+            self.bot_id, self.alias_id
+        )
+    }
+
+    /// The session URI for `session_id` in this bot's first built locale.
+    pub(crate) fn session_path(&self, session_id: &str) -> String {
+        self.session_path_in(self.locale(), session_id)
+    }
+
+    /// This bot's first built locale.
+    pub(crate) fn locale(&self) -> &str {
+        self.locales
+            .first()
+            .map(String::as_str)
+            .expect("the fixture bot has at least one locale")
+    }
+}
 
 /// The emulator under test: one shared engine, the runtime and the control plane
 /// that holds its bots, driven through the router every front door uses.
 pub(crate) struct Emulator {
-    router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
+    router: MultiServiceRouter,
 }
 
 impl Emulator {
@@ -44,7 +104,16 @@ impl Emulator {
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
         router.register_service(lexmodels::EmulatedService::new(Arc::clone(&engine)));
-        Self { router, engine }
+        Self { engine, router }
+    }
+
+    /// The emulator plus one bot whose `en_US` locale the control plane built,
+    /// declaring [`INTENT`] and its prompted slot — what a suite that needs a
+    /// bot with content to talk to asks for.
+    pub(crate) async fn with_bot() -> (Self, Bot) {
+        let emulator = Self::new();
+        let bot = emulator.built_bot("PizzaBot", &["en_US"]).await;
+        (emulator, bot)
     }
 
     /// Give the bot, alias and locale those labels address a BUILT locale that
@@ -143,11 +212,49 @@ impl Emulator {
         content_type: &str,
         headers: &[(&str, &str)],
     ) -> Reply {
+        self.dispatch(
+            method,
+            path,
+            body,
+            content_type,
+            headers,
+            "runtime-v2-lex.us-east-1.amazonaws.com",
+        )
+        .await
+    }
+
+    /// Dispatch one request to the Lex Models V2 control plane, which answers on
+    /// its own endpoint host.
+    pub(crate) async fn send_control_plane(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Reply {
+        let payload = body.map(|b| b.to_string()).unwrap_or_default();
+        self.dispatch(
+            method,
+            path,
+            Bytes::from(payload),
+            "application/json",
+            &[],
+            "models-v2-lex.us-east-1.amazonaws.com",
+        )
+        .await
+    }
+
+    async fn dispatch(
+        &self,
+        method: &str,
+        path: &str,
+        body: Bytes,
+        content_type: &str,
+        headers: &[(&str, &str)],
+        host: &str,
+    ) -> Reply {
         let mut builder = http::Request::builder()
             .method(method)
-            .uri(format!(
-                "https://runtime-v2-lex.us-east-1.amazonaws.com{path}"
-            ))
+            .uri(format!("https://{host}{path}"))
             // The routing key: the SigV4 credential scope names the `lex`
             // signing name, which is how a request reaches this service.
             .header(
@@ -156,6 +263,7 @@ impl Emulator {
                  Credential=AKIDEXAMPLE/20260102/us-east-1/lex/aws4_request, \
                  SignedHeaders=host, Signature=0123456789abcdef",
             )
+            .header("host", host)
             .header("content-type", content_type);
         for (name, value) in headers {
             builder = builder.header(*name, *value);
@@ -172,6 +280,263 @@ impl Emulator {
             headers,
             body,
         }
+    }
+
+    // --- the control plane, driven as a client drives it ----------------------
+
+    /// Create a bot named `name` and answer the `botId` the control plane
+    /// minted.
+    pub(crate) async fn create_bot(&self, name: &str) -> String {
+        let reply = self
+            .send_control_plane(
+                "PUT",
+                "/bots",
+                Some(json!({
+                    "botName": name,
+                    "roleArn": ROLE_ARN,
+                    "dataPrivacy": {"childDirected": false},
+                    "idleSessionTTLInSeconds": 300,
+                })),
+            )
+            .await;
+        assert_eq!(
+            reply.status,
+            202,
+            "CreateBot {name:?}: expected 202, got {} {:?}",
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
+        );
+        reply
+            .json()
+            .get("botId")
+            .and_then(Value::as_str)
+            .expect("CreateBot reports the botId it minted")
+            .to_string()
+    }
+
+    /// Add a locale to `bot_id`'s working copy, WITHOUT building it.
+    pub(crate) async fn create_locale(&self, bot_id: &str, locale_id: &str) {
+        let reply = self
+            .send_control_plane(
+                "PUT",
+                &format!("/bots/{bot_id}/botversions/{DRAFT}/botlocales"),
+                Some(json!({
+                    "localeId": locale_id,
+                    "nluIntentConfidenceThreshold": 0.40,
+                })),
+            )
+            .await;
+        assert_eq!(
+            reply.status,
+            202,
+            "CreateBotLocale {locale_id:?}: expected 202, got {} {:?}",
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
+        );
+    }
+
+    /// Declare [`INTENT`] in that locale, with one required, prompted slot
+    /// ([`SLOT`]), a confirmation prompt and a closing response — a locale
+    /// Amazon Lex can build.
+    pub(crate) async fn create_intent_with_slot(&self, bot_id: &str, locale_id: &str) {
+        let intents = format!("/bots/{bot_id}/botversions/{DRAFT}/botlocales/{locale_id}/intents");
+        let authored = json!({
+            "intentName": INTENT,
+            "sampleUtterances": [{"utterance": "I want to order a pizza"}],
+            "intentConfirmationSetting": {
+                "promptSpecification": {
+                    "messageGroups": [{
+                        "message": {"plainTextMessage": {"value": CONFIRMATION_PROMPT}},
+                    }],
+                    "maxRetries": 2,
+                },
+            },
+            "intentClosingSetting": {
+                "closingResponse": {
+                    "messageGroups": [{
+                        "message": {"plainTextMessage": {"value": CLOSING_MESSAGE}},
+                    }],
+                },
+            },
+        });
+        let created = self
+            .send_control_plane("PUT", &intents, Some(authored.clone()))
+            .await;
+        assert_eq!(
+            created.status,
+            200,
+            "CreateIntent in {locale_id:?}: expected 200, got {} {:?}",
+            created.status,
+            String::from_utf8_lossy(&created.body)
+        );
+        let intent_id = created
+            .json()
+            .get("intentId")
+            .and_then(Value::as_str)
+            .expect("CreateIntent reports the intentId it minted")
+            .to_string();
+
+        let slot = self
+            .send_control_plane(
+                "PUT",
+                &format!("{intents}/{intent_id}/slots"),
+                Some(json!({
+                    "slotName": SLOT,
+                    // A built-in slot type, so the fixture needs no slot type of
+                    // its own to elicit values against.
+                    "slotTypeId": "AMAZON.AlphaNumeric",
+                    "valueElicitationSetting": {
+                        "slotConstraint": "Required",
+                        "promptSpecification": {
+                            "messageGroups": [{
+                                "message": {"plainTextMessage": {"value": SLOT_PROMPT}},
+                            }],
+                            "maxRetries": 2,
+                        },
+                    },
+                })),
+            )
+            .await;
+        assert_eq!(
+            slot.status,
+            200,
+            "CreateSlot in {locale_id:?}: expected 200, got {} {:?}",
+            slot.status,
+            String::from_utf8_lossy(&slot.body)
+        );
+        let slot_id = slot
+            .json()
+            .get("slotId")
+            .and_then(Value::as_str)
+            .expect("CreateSlot reports the slotId it minted")
+            .to_string();
+
+        // Every slot of an intent has to be ordered by that intent's
+        // `slotPriorities` for the locale to build, and ordering them is
+        // `UpdateIntent`'s — which replaces the intent, so everything authored
+        // above is sent again with the priority.
+        let mut update = authored;
+        update["slotPriorities"] = json!([{"priority": 1, "slotId": slot_id}]);
+        let updated = self
+            .send_control_plane("PUT", &format!("{intents}/{intent_id}"), Some(update))
+            .await;
+        assert_eq!(
+            updated.status,
+            200,
+            "UpdateIntent in {locale_id:?}: expected 200, got {} {:?}",
+            updated.status,
+            String::from_utf8_lossy(&updated.body)
+        );
+    }
+
+    /// Submit a build for that locale and let the transition the clock owes fall
+    /// due, so the locale is in its built state when the next read settles it.
+    pub(crate) async fn build_locale(&self, bot_id: &str, locale_id: &str) {
+        let reply = self
+            .send_control_plane(
+                "POST",
+                &format!("/bots/{bot_id}/botversions/{DRAFT}/botlocales/{locale_id}"),
+                None,
+            )
+            .await;
+        assert_eq!(
+            reply.status,
+            202,
+            "BuildBotLocale {locale_id:?}: expected 202, got {} {:?}",
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
+        );
+        self.settle_control_plane();
+    }
+
+    /// Move every status transition the control plane has scheduled to due NOW.
+    ///
+    /// The ONE thing written into the control plane's store by hand here: the
+    /// clock. A created bot settles and a submitted build settles after a span
+    /// that service chooses, and no operation exposes that instant, so a suite
+    /// that would otherwise sleep for it moves it instead.
+    pub(crate) fn settle_control_plane(&self) {
+        let state = lexmodels::state::service_state(&*self.engine)
+            .expect("the control plane's store is reachable through the shared engine");
+        let mut store = state.lock();
+        let now = Instant::now();
+        for bot in store.bots.values_mut() {
+            if let Some((status, _)) = bot.pending_status.take() {
+                bot.pending_status = Some((status, now));
+            }
+            bot.settle();
+        }
+        for locale in store.bot_locales.values_mut() {
+            if let Some((status, _)) = locale.pending_status.take() {
+                locale.pending_status = Some((status, now));
+            }
+            locale.settle();
+        }
+    }
+
+    /// Create a bot with a BUILT locale per entry of `locales`, each declaring
+    /// [`INTENT`] and its prompted slot — the whole sequence a client drives.
+    pub(crate) async fn built_bot(&self, name: &str, locales: &[&str]) -> Bot {
+        let bot_id = self.create_bot(name).await;
+        for locale_id in locales {
+            self.create_locale(&bot_id, locale_id).await;
+            self.create_intent_with_slot(&bot_id, locale_id).await;
+            self.build_locale(&bot_id, locale_id).await;
+        }
+        Bot {
+            bot_id,
+            alias_id: TEST_ALIAS.to_string(),
+            locales: locales.iter().map(|id| (*id).to_string()).collect(),
+        }
+    }
+
+    /// Add a second alias of `bot`, pointing at the same working copy, and
+    /// answer the bot as that alias addresses it.
+    ///
+    /// Seeded into the control plane's own store because its `CreateBotAlias`
+    /// is still a 501 scaffold: the record is the one `BotAlias` that service
+    /// builds for an alias of a bot, so what the runtime resolves is the control
+    /// plane's own state either way.
+    pub(crate) fn second_alias(&self, bot: &Bot, alias_id: &str) -> Bot {
+        let state = lexmodels::state::service_state(&*self.engine)
+            .expect("the control plane's store is reachable through the shared engine");
+        let mut alias = lexmodels::state::BotAlias::test_alias(&bot.bot_id, SystemTime::now());
+        alias.bot_alias_id = alias_id.to_string();
+        alias.bot_alias_name = format!("{alias_id}Name");
+        state
+            .lock()
+            .bot_aliases
+            .insert(lexmodels::state::bot_alias_key(&bot.bot_id, alias_id), alias);
+        Bot {
+            bot_id: bot.bot_id.clone(),
+            alias_id: alias_id.to_string(),
+            locales: bot.locales.clone(),
+        }
+    }
+
+    /// The build state the control plane reports for that locale, as
+    /// `DescribeBotLocale` answers it.
+    pub(crate) async fn bot_locale_status(&self, bot_id: &str, locale_id: &str) -> String {
+        let reply = self
+            .send_control_plane(
+                "GET",
+                &format!("/bots/{bot_id}/botversions/{DRAFT}/botlocales/{locale_id}"),
+                None,
+            )
+            .await;
+        assert_eq!(
+            reply.status,
+            200,
+            "DescribeBotLocale {locale_id:?}: expected 200, got {} {:?}",
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
+        );
+        reply
+            .json()
+            .get("botLocaleStatus")
+            .and_then(Value::as_str)
+            .expect("DescribeBotLocale reports the locale's status")
+            .to_string()
     }
 }
 
@@ -203,6 +568,17 @@ impl Reply {
             .get("__type")
             .and_then(Value::as_str)
             .unwrap_or("<no __type>")
+            .to_string()
+    }
+
+    /// The `Message` a failed call carries, as restJson1 renders an error's
+    /// `@error` member.
+    pub(crate) fn error_message(&self) -> String {
+        let body = self.json();
+        ["message", "Message"]
+            .iter()
+            .find_map(|name| body.get(*name).and_then(Value::as_str))
+            .unwrap_or("<no message>")
             .to_string()
     }
 

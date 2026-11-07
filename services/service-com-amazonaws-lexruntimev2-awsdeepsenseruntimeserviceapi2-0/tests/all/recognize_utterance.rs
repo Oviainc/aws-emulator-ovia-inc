@@ -112,7 +112,6 @@ fn agreement_cases() -> Vec<Case> {
             seed: Some(json!({
                 "sessionState": {
                     "dialogAction": {"type": "Delegate"},
-                    "intent": {"name": "Commander", "state": "InProgress"},
                     "sessionAttributes": {"étape": "2"},
                 },
                 "messages": [

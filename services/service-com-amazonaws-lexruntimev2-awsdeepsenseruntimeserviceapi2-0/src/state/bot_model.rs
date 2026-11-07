@@ -64,12 +64,12 @@ pub const RESOLUTION_STRATEGY_TOP_RESOLUTION: &str = "TopResolution";
 /// `PlainText`, and the three other members of the runtime's
 /// `MessageContentType` enum (`MESSAGE_CONTENT_TYPE_VALUES`): which one a
 /// message carries is read off the authored message's own shape.
-const CONTENT_TYPE_PLAIN_TEXT: &str = "PlainText";
-/// See [`CONTENT_TYPE_PLAIN_TEXT`].
+pub(crate) const MESSAGE_CONTENT_TYPE_PLAIN_TEXT: &str = "PlainText";
+/// See [`MESSAGE_CONTENT_TYPE_PLAIN_TEXT`].
 const CONTENT_TYPE_CUSTOM_PAYLOAD: &str = "CustomPayload";
-/// See [`CONTENT_TYPE_PLAIN_TEXT`].
+/// See [`MESSAGE_CONTENT_TYPE_PLAIN_TEXT`].
 const CONTENT_TYPE_SSML: &str = "SSML";
-/// See [`CONTENT_TYPE_PLAIN_TEXT`].
+/// See [`MESSAGE_CONTENT_TYPE_PLAIN_TEXT`].
 const CONTENT_TYPE_IMAGE_RESPONSE_CARD: &str = "ImageResponseCard";
 
 /// One built locale, as a turn reads it.
@@ -101,6 +101,9 @@ pub struct ModelIntent {
     pub sample_utterances: Vec<String>,
     /// The slots of the intent, in the order `slotPriorities` elicits them.
     pub slots: Vec<ModelSlot>,
+    /// The messages the intent's `intentConfirmationSetting` prompt asks the
+    /// user to confirm it with; empty when none is authored.
+    pub confirmation_messages: Vec<Message>,
     /// The messages the intent's `intentClosingSetting` closing response sends
     /// once the intent is ready to be fulfilled; empty when none is authored or
     /// when the setting is not `active`.
@@ -231,8 +234,8 @@ pub fn resolve_slot_value(slot_type: Option<&ModelSlotType>, said: &str) -> Opti
     })
 }
 
-/// Why a turn cannot be interpreted against the bot and locale it addresses.
-#[derive(Debug, Clone, Copy)]
+/// Why a call cannot be served against the bot and locale it addresses.
+#[derive(Debug, Clone)]
 pub enum LocaleUnavailable {
     /// The `botId`/`botAliasId` pair the request addressed resolves to no alias
     /// of that bot, so there is no bot version — and therefore no locale — to
@@ -251,11 +254,12 @@ pub enum LocaleUnavailable {
 /// control plane's store.
 ///
 /// The alias is what the runtime is addressed by, and an alias points at one
-/// version of the bot, so the version whose locale is served is the alias's own.
-/// A locale is servable only in `Built`, the status AWS documents as the one
-/// where "the bot is ready for use and can be tested using any utterance":
-/// every other status — including the `NotBuilt` a freshly created locale sits
-/// in — has no runtime model behind it.
+/// version of the bot, so the version whose locale is served is the alias's own
+/// — which is why the `botId`/`botAliasId` PAIR is what resolves, and an alias
+/// that is not that bot's addresses nothing. A locale is then servable only in
+/// `Built`, the status AWS documents as the one where "the bot is ready for use
+/// and can be tested using any utterance": every other status — including the
+/// `NotBuilt` a freshly created locale sits in — has no runtime model behind it.
 pub fn built_locale<Eng: Send + Sync + 'static>(
     engine: &Eng,
     bot_id: &str,
@@ -304,6 +308,12 @@ pub fn built_locale<Eng: Send + Sync + 'static>(
                 .map(|sample| sample.utterance.clone())
                 .collect(),
             slots: elicitation_order(&control_plane, intent, bot_id, &bot_version, locale_id),
+            confirmation_messages: intent
+                .intent_confirmation_setting
+                .as_ref()
+                .and_then(|setting| setting.prompt_specification.as_ref())
+                .map(|prompt| response_messages(&prompt.message_groups))
+                .unwrap_or_default(),
             closing_messages: intent
                 .intent_closing_setting
                 .as_ref()
@@ -436,7 +446,7 @@ fn runtime_message(message: &authored::Message) -> Option<Message> {
     if let Some(plain_text) = &message.plain_text_message {
         return Some(Message {
             content: Some(plain_text.value.clone()),
-            content_type: CONTENT_TYPE_PLAIN_TEXT.to_string(),
+            content_type: MESSAGE_CONTENT_TYPE_PLAIN_TEXT.to_string(),
             image_response_card: None,
         });
     }
@@ -474,3 +484,6 @@ fn runtime_message(message: &authored::Message) -> Option<Message> {
         }),
     })
 }
+
+#[cfg(test)]
+mod tests;
