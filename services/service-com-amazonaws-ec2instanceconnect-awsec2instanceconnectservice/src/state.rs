@@ -6,11 +6,12 @@
 //! answer either operation gives is computed from four things kept here:
 //!
 //! * [`ComAmazonawsEc2instanceconnectAwsec2instanceconnectserviceState::instances`] — the
-//!   instance registry: whether an instance exists, which Availability Zone it is in, what
-//!   lifecycle state it is in, and whether its instance type supports the serial console.
-//!   This service models no operation that launches an instance (it has exactly two, both
-//!   key pushes), so the registry is seeded (see [`seed_instances`]) and is the single place
-//!   an EC2 emulator with `RunInstances` would publish instances for this service to read.
+//!   FALLBACK instance registry: whether an instance exists, which Availability Zone it is
+//!   in, what lifecycle state it is in, and whether its instance type supports the serial
+//!   console. An instance is EC2's resource, not this service's (this service models no
+//!   operation that launches one), so a push ASKS EC2 about the id it names ([`ec2`]) and
+//!   what EC2 answers decides it; this registry is what a push reads only when no EC2 can
+//!   be asked at all (see [`seed_instances`]).
 //! * `pushed_keys` / `serial_console_keys` — the keys that were pushed, each with the
 //!   instant it expires. An expired key is treated as absent on lookup.
 //! * `serial_console_access_enabled` — the account-level serial-console toggle that
@@ -28,6 +29,26 @@ use std::hash::{BuildHasher, Hasher};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aws_smithy_schema_server::constraints::{path, Violation, ViolationKind};
+
+pub mod ec2;
+
+/// The Region a hop into another service is made in when the request carries no SigV4
+/// credential scope to read one from (an unsigned call). Matches the Region the emulator's
+/// own generated shared config defaults to.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The Region a request is scoped to: the one its SigV4 credential scope names, or
+/// [`DEFAULT_REGION`] when the request carries no scope.
+///
+/// Deliberately a per-crate copy of a helper other service crates also hold: the function
+/// that owns the parsing (`emulator_server::sigv4_credential_scope`) lives in the vendored,
+/// read-only framework.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| !region.is_empty())
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
 
 /// How long a pushed key stays usable.
 ///
@@ -241,10 +262,12 @@ pub enum InstanceState {
     Pending,
     /// Running — the only state a key can be pushed to.
     Running,
-    /// On its way down.
+    /// Being stopped.
     Stopping,
     /// Stopped.
     Stopped,
+    /// Being terminated.
+    ShuttingDown,
     /// Terminated.
     Terminated,
 }
@@ -271,7 +294,9 @@ impl InstanceState {
         match self {
             Self::Running => None,
             Self::Pending => Some(ConnectBlocked::NotYetAvailable),
-            Self::Stopping | Self::Stopped | Self::Terminated => Some(ConnectBlocked::InvalidState),
+            Self::Stopping | Self::Stopped | Self::ShuttingDown | Self::Terminated => {
+                Some(ConnectBlocked::InvalidState)
+            }
         }
     }
 
@@ -282,8 +307,26 @@ impl InstanceState {
             Self::Running => "running",
             Self::Stopping => "stopping",
             Self::Stopped => "stopped",
+            Self::ShuttingDown => "shutting-down",
             Self::Terminated => "terminated",
         }
+    }
+
+    /// The state EC2 named, read back off the wire: the `InstanceStateName` value
+    /// `DescribeInstances` reports in `Instance$State` ([`Self::as_str`] is the same
+    /// spelling the other way round). `None` for a value this service does not know, so a
+    /// caller never guesses a lifecycle state EC2 did not name.
+    pub fn from_ec2_name(name: &str) -> Option<Self> {
+        [
+            Self::Pending,
+            Self::Running,
+            Self::Stopping,
+            Self::Stopped,
+            Self::ShuttingDown,
+            Self::Terminated,
+        ]
+        .into_iter()
+        .find(|state| state.as_str() == name)
     }
 }
 
@@ -395,14 +438,14 @@ pub struct ComAmazonawsEc2instanceconnectAwsec2instanceconnectserviceState {
     /// Keys pushed by `SendSerialConsoleSSHPublicKey`, keyed by (instance id, serial port).
     pub serial_console_keys: HashMap<(String, i32), PushedKey>,
     /// The account-level EC2 serial console toggle (EC2's `EnableSerialConsoleAccess` /
-    /// `DisableSerialConsoleAccess`), which the serial-console refusal reads.
+    /// `DisableSerialConsoleAccess`), which the serial-console refusal reads when EC2
+    /// cannot be asked for it ([`ec2::serial_console_access_enabled`]).
     ///
     /// Starts DISABLED, which is the account's own starting value: serial-console access
     /// is granted at the account level and is not granted until `EnableSerialConsoleAccess`
     /// grants it — the modelled `SerialConsoleAccessDisabledException` says so itself ("To
     /// authorize your account, run the EnableSerialConsoleAccess API"). That API belongs to
-    /// EC2, not to this service, so until the EC2 emulator implements it this field is
-    /// where it would write.
+    /// EC2, not to this service, so where EC2 is mounted its own status is what decides.
     pub serial_console_access_enabled: bool,
     /// The most recent served calls, newest last, at most [`MAX_RECORDED_REQUESTS`].
     pub requests: Vec<RequestRecord>,
@@ -420,16 +463,15 @@ fn process_seed() -> u64 {
     hasher.finish()
 }
 
-/// The instances this service starts with.
+/// The instances this service falls back on when EC2 cannot be asked.
 ///
-/// This service models no operation that launches, stops or terminates an instance, so
-/// without a seed the registry would be empty and every push would answer 404 — the registry
-/// could not decide that any instance exists. The fleet below is therefore a fixture standing
-/// in for EC2's own `RunInstances`: four instances that between them reach every branch the
-/// two operations have (running Nitro, stopped, running but not serial-console capable,
-/// terminated). A test registers its own instances with
-/// [`ComAmazonawsEc2instanceconnectAwsec2instanceconnectserviceState::register_instance`],
-/// and when the EC2 emulator grows an instance store this seed is what it replaces.
+/// An instance is EC2's resource and a push asks EC2 about the id it names ([`ec2`]), so in
+/// an emulator that mounts EC2 these records are not what decides a push. They exist for
+/// the emulator that mounts this service ALONE, where no service can answer for an
+/// instance and an empty registry would answer 404 for every push: four instances that
+/// between them reach every branch the two operations have (running Nitro, stopped, running
+/// but not serial-console capable, terminated). A test registers its own instances with
+/// [`ComAmazonawsEc2instanceconnectAwsec2instanceconnectserviceState::register_instance`].
 ///
 /// The zone names use `us-east-1`, the region the emulator writes into the SDK shared config
 /// it hands clients (`vendor/server/src/lib.rs`, `region = us-east-1`).

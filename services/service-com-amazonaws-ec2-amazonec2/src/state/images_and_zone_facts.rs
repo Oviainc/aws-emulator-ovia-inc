@@ -1753,6 +1753,39 @@ pub fn published_image_specs() -> Vec<ImageSpec> {
                 "2024-09-03T22:17:11.000Z",
             )
         },
+        // The STANDARD Amazon Linux 2 variant — the one whose published name carries no
+        // kernel or `minimal` qualifier, `amzn2-ami-hvm-<version>-<architecture>-gp2` — in
+        // each architecture Amazon publishes it for (the
+        // `/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2` and
+        // `…-arm64-gp2` public parameters). It is published from the same release as the
+        // qualified variants below, so all of them carry that release's version, minutes
+        // apart as one release's variants are built.
+        ImageSpec {
+            description: "Amazon Linux 2 AMI 2.0.20241113.1 x86_64 HVM gp2".to_string(),
+            boot_mode: Some(BOOT_MODE_LEGACY_BIOS.to_string()),
+            root_volume_type: IMAGE_ROOT_VOLUME_TYPE_GP2.to_string(),
+            public_ssm_parameter_name: Some(
+                "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2".to_string(),
+            ),
+            ..published_amazon_image(
+                "amzn2-ami-hvm-2.0.20241113.1-x86_64-gp2",
+                "x86_64",
+                "2024-11-13T18:17:12.000Z",
+            )
+        },
+        ImageSpec {
+            description: "Amazon Linux 2 AMI 2.0.20241113.1 arm64 HVM gp2".to_string(),
+            boot_mode: Some(BOOT_MODE_UEFI.to_string()),
+            root_volume_type: IMAGE_ROOT_VOLUME_TYPE_GP2.to_string(),
+            public_ssm_parameter_name: Some(
+                "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-arm64-gp2".to_string(),
+            ),
+            ..published_amazon_image(
+                "amzn2-ami-hvm-2.0.20241113.1-arm64-gp2",
+                "arm64",
+                "2024-11-13T18:19:04.000Z",
+            )
+        },
         ImageSpec {
             description: "Amazon Linux 2 Kernel 5.10 AMI 2.0.20241113.1 x86_64 HVM gp2"
                 .to_string(),

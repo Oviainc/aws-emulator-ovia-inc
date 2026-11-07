@@ -185,12 +185,16 @@ async fn every_deprecated_catalog_image_is_deprecated_and_of_a_realistic_age() {
         "an audit must find the deprecated Amazon Linux 2 builds under the family's own \
          name pattern, got {matching:?}"
     );
-    assert!(
-        matching
-            .iter()
-            .all(|image| image.deprecation_time.is_some()),
-        "every build the pattern matches is one of the deprecated ones, got {matching:?}"
-    );
+    for spec in &deprecated {
+        let name = &spec.name;
+        assert!(
+            matching
+                .iter()
+                .any(|image| &image.name == name && image.deprecation_time.is_some()),
+            "case {name:?}: the family's own name pattern must report that build as one of \
+             the deprecated ones, got {matching:?}"
+        );
+    }
 }
 
 /// The contrast an audit reads: a name-filtered read leaves the deprecated builds out, and
@@ -221,11 +225,15 @@ async fn a_name_filtered_read_hides_the_deprecated_builds_unless_asked_for() {
                  asks for one, got {deprecated:?}"
             );
             if pattern == AL2_NAME_PATTERN {
-                assert_eq!(
-                    reported.is_empty(),
-                    !include,
-                    "case {case:?}: every build matching that pattern is deprecated, so \
-                     the set is empty unless the request asks for them, got {reported:?}"
+                // The family's own current build is published whatever the request asks
+                // about deprecated ones: the flag adds the deprecated builds beside it
+                // rather than deciding whether the family is reported at all.
+                assert!(
+                    reported
+                        .iter()
+                        .any(|image| image.deprecation_time.is_none()),
+                    "case {case:?}: the family's current build must be reported whatever \
+                     the request asks about deprecated ones, got {reported:?}"
                 );
             } else {
                 assert!(

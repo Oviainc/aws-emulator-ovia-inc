@@ -2,18 +2,20 @@
 
 //! @op SendSSHPublicKey
 //!
-//! Pushes an SSH public key at a registered EC2 instance and stores it against
+//! Pushes an SSH public key at an EC2 instance and stores it against
 //! (instance id, OS user) for [`crate::state::PUSHED_KEY_TTL`]. Every answer is computed
-//! from [`crate::state::ComAmazonawsEc2instanceconnectAwsec2instanceconnectserviceState`]:
-//! the instance registry decides found / not found, the instance's lifecycle state decides
-//! whether a connection is possible at all, and the instance's Availability Zone decides
-//! whether the zone the caller named is the right one.
+//! from what the owner of the instance says and from
+//! [`crate::state::ComAmazonawsEc2instanceconnectAwsec2instanceconnectserviceState`]: EC2
+//! decides found / not found, the instance's lifecycle state decides whether a connection
+//! is possible at all, and the instance's Availability Zone decides whether the zone the
+//! caller named is the right one.
 //!
 //! ## Decision order
 //!
 //! 1. `InstanceOSUser` satisfies the `@pattern` the model declares for it — the one
 //!    constraint the framework cannot evaluate — else `InvalidArgsException`;
-//! 2. the instance is in the registry, else `EC2InstanceNotFoundException`;
+//! 2. EC2 holds the instance ([`crate::state::ec2`], this service's own registry only when
+//!    no EC2 can be asked), else `EC2InstanceNotFoundException`;
 //! 3. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
 //!    still launching) or `EC2InstanceStateInvalidException` (going down, stopped or
 //!    terminated);
@@ -187,10 +189,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation needs none of it — the request
-        // is fully described by its input members.
-        let _ = ctx;
-
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             SendSSHPublicKeyErrorModeled::ServiceException(ServiceException {
                 message: Some(
@@ -198,6 +196,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             })
         })?;
+
+        // The instance is EC2's resource, so EC2 is asked about it BEFORE this service's
+        // store is locked: nothing of this service is held while another service answers,
+        // and the hop stays in the Region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
+        let owner_says = crate::state::ec2::instance(ctx, &region, &input.instance_id).await;
+
         let mut state = store.lock();
 
         // One instant for the whole call, so the record's `pushed_at`, its expiry and the
@@ -223,8 +228,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The instance must be in the registry: `EC2InstanceNotFoundException`.
-        let instance = state.instance(&input.instance_id).cloned().ok_or_else(|| {
+        // The instance must exist: `EC2InstanceNotFoundException`. What EC2 — the service
+        // that owns instances — answered about the id decides that, and this service's own
+        // registry is read only when no EC2 could be asked at all.
+        let found = match owner_says {
+            crate::state::ec2::InstanceLookup::Owned(instance) => Some(instance),
+            crate::state::ec2::InstanceLookup::Absent => None,
+            crate::state::ec2::InstanceLookup::Unanswered => {
+                state.instance(&input.instance_id).cloned()
+            }
+        };
+        let instance = found.ok_or_else(|| {
             SendSSHPublicKeyErrorModeled::EC2InstanceNotFoundException(
                 EC2InstanceNotFoundException {
                     message: Some("Instance not found.".to_string()),

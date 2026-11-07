@@ -624,6 +624,7 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
             vec![
                 "al2023-ami-2023.6.20241121.0-kernel-6.1-arm64",
                 "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-arm64",
+                "amzn2-ami-hvm-2.0.20241113.1-arm64-gp2",
                 "app-golden-2026-01-arm64",
             ],
         ),
@@ -635,6 +636,7 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
             vec![
                 "al2023-ami-2023.6.20241121.0-kernel-6.1-arm64",
                 "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-arm64",
+                "amzn2-ami-hvm-2.0.20241113.1-arm64-gp2",
                 "app-golden-2026-01-arm64",
                 "legacy-i386-image",
             ],
@@ -671,6 +673,8 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
             "block-device-mapping.volume-type",
             vec!["gp2".into()],
             with_deprecated_catalog(&[
+                "amzn2-ami-hvm-2.0.20241113.1-x86_64-gp2",
+                "amzn2-ami-hvm-2.0.20241113.1-arm64-gp2",
                 "amzn2-ami-kernel-5.10-hvm-2.0.20241113.1-x86_64-gp2",
                 "amzn2-ami-minimal-hvm-2.0.20241113.1-x86_64-ebs",
             ]),
@@ -681,12 +685,14 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
             vec![
                 "al2023-ami-2023.6.20241121.0-kernel-6.1-arm64",
                 "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-arm64",
+                "amzn2-ami-hvm-2.0.20241113.1-arm64-gp2",
             ],
         ),
         (
             "boot-mode",
             vec!["legacy-bios".into()],
             with_deprecated_catalog(&[
+                "amzn2-ami-hvm-2.0.20241113.1-x86_64-gp2",
                 "amzn2-ami-kernel-5.10-hvm-2.0.20241113.1-x86_64-gp2",
                 "amzn2-ami-minimal-hvm-2.0.20241113.1-x86_64-ebs",
             ]),
@@ -978,6 +984,7 @@ async fn several_filters_are_joined_with_an_and() {
                 ("block-device-mapping.volume-type", &["gp2"][..]),
             ],
             with_deprecated_catalog(&[
+                "amzn2-ami-hvm-2.0.20241113.1-x86_64-gp2",
                 "amzn2-ami-kernel-5.10-hvm-2.0.20241113.1-x86_64-gp2",
                 "amzn2-ami-minimal-hvm-2.0.20241113.1-x86_64-ebs",
             ]),

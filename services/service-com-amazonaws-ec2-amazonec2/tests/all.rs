@@ -15,6 +15,14 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// Resolving a launch AMI the documented way out of the published catalog: every variant
+// Amazon publishes has a CURRENT build — available and not deprecated — so `Owners=amazon`
+// plus that variant's published name pattern and `state=available` reports an image, and the
+// newest match launches. Declared beside `prefix_lists` for the reason the note above gives:
+// the sorted neighbourhood and the tail of this file are where every new ec2 suite inserts
+// its lines.
+#[path = "all/published_amazon_linux_catalog.rs"]
+mod published_amazon_linux_catalog;
 // The account's EC2 serial console access: the one persisted account-level boolean
 // `EnableSerialConsoleAccess` and `DisableSerialConsoleAccess` move and
 // `GetSerialConsoleAccessStatus` reports, with the `ManagedBy` every value carries and the

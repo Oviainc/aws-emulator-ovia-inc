@@ -2,15 +2,16 @@
 
 //! @op SendSerialConsoleSSHPublicKey
 //!
-//! Pushes an SSH public key at a registered EC2 instance's serial console and stores it
+//! Pushes an SSH public key at an EC2 instance's serial console and stores it
 //! against (instance id, serial port) for [`crate::state::PUSHED_KEY_TTL`]. Every answer is
-//! computed from
+//! computed from what the owner of the instance says ([`crate::state::ec2`]) and from
 //! [`crate::state::ComAmazonawsEc2instanceconnectAwsec2instanceconnectserviceState`].
 //!
 //! ## Decision order
 //!
 //! 1. the account has serial-console access, else `SerialConsoleAccessDisabledException`;
-//! 2. the instance is in the registry, else `EC2InstanceNotFoundException`;
+//! 2. EC2 holds the instance ([`crate::state::ec2`], this service's own registry only when
+//!    no EC2 can be asked), else `EC2InstanceNotFoundException`;
 //! 3. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
 //!    still launching) or `EC2InstanceStateInvalidException` (going down, stopped or
 //!    terminated);
@@ -206,10 +207,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation needs none of it — the request
-        // is fully described by its input members.
-        let _ = ctx;
-
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             SendSerialConsoleSSHPublicKeyErrorModeled::ServiceException(ServiceException {
                 message: Some(
@@ -217,6 +214,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             })
         })?;
+
+        // The instance and the account's serial-console status are both EC2's to report, so
+        // EC2 is asked for them BEFORE this service's store is locked: nothing of this
+        // service is held while another service answers, and both hops stay in the Region
+        // this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
+        let owner_access = crate::state::ec2::serial_console_access_enabled(ctx, &region).await;
+        let owner_says = crate::state::ec2::instance(ctx, &region, &input.instance_id).await;
+
         let mut state = store.lock();
 
         // One instant for the whole call, so the record's `pushed_at`, its expiry and the
@@ -228,7 +234,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // any instance. The message names the account the call was made under — AWS's own
         // construction for this error — which is the emulator's account id
         // (`engine::emulator_account_id`), never a literal.
-        if !state.serial_console_access_enabled {
+        // Granting it is EC2's own `EnableSerialConsoleAccess`, so EC2's status is what
+        // decides wherever EC2 can be asked; the toggle this service keeps answers only for
+        // an emulator that mounts no EC2.
+        if !owner_access.unwrap_or(state.serial_console_access_enabled) {
             return Err(
                 SendSerialConsoleSSHPublicKeyErrorModeled::SerialConsoleAccessDisabledException(
                     SerialConsoleAccessDisabledException {
@@ -243,8 +252,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The instance must be in the registry: `EC2InstanceNotFoundException`.
-        let instance = state.instance(&input.instance_id).cloned().ok_or_else(|| {
+        // The instance must exist: `EC2InstanceNotFoundException`. Same rule, and the same
+        // hop into the owner of the instance, as `SendSSHPublicKey`.
+        let found = match owner_says {
+            crate::state::ec2::InstanceLookup::Owned(instance) => Some(instance),
+            crate::state::ec2::InstanceLookup::Absent => None,
+            crate::state::ec2::InstanceLookup::Unanswered => {
+                state.instance(&input.instance_id).cloned()
+            }
+        };
+        let instance = found.ok_or_else(|| {
             SendSerialConsoleSSHPublicKeyErrorModeled::EC2InstanceNotFoundException(
                 EC2InstanceNotFoundException {
                     message: Some("Instance not found.".to_string()),
