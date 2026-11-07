@@ -1,0 +1,46 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: bedrock-agent-runtime__lambda__s3vectors.cfn-deploy-lambda-bedrock-s3vectors-full-stack-positive bedrock-agent-runtime__lambda__s3vectors.cfn-deploy-wrong-execution-role-mismatch-negative bedrock-agent-runtime__lambda__s3vectors.cfn-stack-update-add-bedrock-agent-permission-positive bedrock-agent-runtime__lambda__s3vectors.cfn-stack-update-add-s3vectors-permission-positive
+Issue-Key: bedrock-agent-runtime__lambda__s3vectors.cfn-deploy-lambda-bedrock-s3vectors-full-stack-positive|_poll_until#4|AssertionError|raise AssertionError(
+Issue-Key: bedrock-agent-runtime__lambda__s3vectors.cfn-deploy-wrong-execution-role-mismatch-negative|_poll_until#10|AssertionError|raise AssertionError(
+Issue-Key: bedrock-agent-runtime__lambda__s3vectors.cfn-stack-update-add-bedrock-agent-permission-positive|_poll_until#4|AssertionError|raise AssertionError(
+Issue-Key: bedrock-agent-runtime__lambda__s3vectors.cfn-stack-update-add-s3vectors-permission-positive|_poll_until#4|AssertionError|raise AssertionError(
+Issue-Commit: d6cb6c274eaec5e2dce099ad9d2ddf00c4faf8ea
+
+# Lambda Python runtime's bundled botocore knows no s3vectors or bedrock-agent-runtime service model: boto3.client() in a handler raises UnknownServiceError instead of calling the service
+
+> _Note: this issue was identified against the code base at commit `d6cb6c274eaec5e2dce099ad9d2ddf00c4faf8ea`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+Invoke
+
+## Description
+One net-new root cause in the emulator's managed Python Lambda execution environment, reached through four CloudFormation-deployed cross-service checks.
+
+Related open work (does NOT cover these four checks — the suite marked none of them owned, and their failure now happens at a different point in the check): 20261105T105400Z-bedrock-agent-runtime-lambda-s3vectors-2-net-new.md describes the earlier states of this same environment (no boto3 at all; then a CPython without the _socket extension). Those import faults are no longer what these four checks observe: `import boto3` now succeeds and the handler body runs. The environment now fails one layer later, which is the cause filed here.
+
+=== Cause 1 of 1: the SDK the runtime exposes to a handler carries no service data for s3vectors or bedrock-agent-runtime, so client construction fails before any request is made ===
+Failing check ids (4): bedrock-agent-runtime__lambda__s3vectors.cfn-deploy-lambda-bedrock-s3vectors-full-stack-positive, .cfn-deploy-wrong-execution-role-mismatch-negative, .cfn-stack-update-add-bedrock-agent-permission-positive, .cfn-stack-update-add-s3vectors-permission-positive.
+
+AWS: recorded behavior only for the contents of the managed runtime — the Smithy model describes the Invoke wire shape, not the execution environment. On AWS's managed python3.12 runtime, a handler built from Code.ZipFile containing only index.py can do `boto3.client("s3vectors")` and `boto3.client("bedrock-agent-runtime")`: the preinstalled boto3/botocore carry the service models for every service the account can call, so the client constructs and the call goes out, after which the result is decided by the function's execution-role permissions (success, or the service's own 403 AccessDeniedException). Smithy (lambda Invoke -> InvocationResponse): StatusCode is httpResponseCode, FunctionError is header X-Amz-Function-Error, Payload is the httpPayload blob, http {method POST, uri /2015-03-31/functions/{FunctionName}/invocations}. For s3vectors, Smithy models ListVectors with AccessDeniedException (HTTP 403, errorKind client) — that, not a client-construction failure, is the only refusal shape a permission-less role can produce.
+
+Emulator: `boto3.client("s3vectors")` and `boto3.client("bedrock-agent-runtime")` inside the deployed function both raise botocore's UnknownServiceError, which botocore raises when it can find no data file for the requested service name. The handlers in these checks catch the exception and report the exception class name, so each invocation returns {'s3vectors': {'ok': False, 'error_code': 'UnknownServiceError'}, 'bedrock': {'ok': False, 'error_code': 'UnknownServiceError'}}. No request ever reaches s3vectors or bedrock-agent-runtime: the message's fixed text is botocore's own ("Unknown service: '<service-name>'. Valid service names are: ..."), and the variable part is the service name taken from the boto3.client() call — it is not an AWS-produced error at all. Every one of the four checks consequently spins out its 60s wait for the role's permissions to take effect and fails with "<description> not met within 60s. Last result: {...UnknownServiceError...}".
+
+Why: a client gets a Lambda that can run code and import the SDK but cannot address the two services these functions exist to call. The positive arms (full stack, and each stack update that adds a permission) can never observe the intended success, and — worse for the negative arms — a role that genuinely lacks s3vectors or bedrock permissions yields the SAME UnknownServiceError as a role that has them, so the emulator cannot distinguish "denied by IAM" (403 AccessDeniedException) from "service unknown to the SDK". A user concludes their deployment package or service name is wrong, when on real AWS the identical function works with no vendoring.
+
+Fix: the Lambda service's execution-environment component — the part that assembles the Python interpreter and the boto3/botocore install it puts on the handler's sys.path for Invoke. The SDK it exposes must carry service data for every service the emulator serves (here s3vectors and bedrock-agent-runtime) and be pointed at the emulator's endpoints/credentials, the way the managed python3.12 runtime resolves any service name. Not the Invoke serializer: the Invoke response wire shape is correct (200, FunctionError/Payload as modeled); the SDK inside the sandbox is incomplete.
+
+Traces: the four failing check ids above; see trace_ids.
+
+## Evidence
+Expected (AWS): lambda Invoke(FunctionName=<fn>, InvocationType=RequestResponse) on a CFN-deployed python3.12 function whose handler does boto3.client("s3vectors").list_vector_buckets() and boto3.client("bedrock-agent-runtime").list_sessions() -> HTTP 200, no X-Amz-Function-Error, Payload = {"s3vectors": {"ok": true, "count": <int>}, "bedrock": {"ok": true, "count": <int>}} when the execution role grants those actions, and {"ok": false, "error_code": "AccessDeniedException"} (the service's modeled 403) for the arm whose role does not.
+Actual (emulator): both client constructions raise botocore UnknownServiceError inside the sandbox, so the handler returns {'s3vectors': {'ok': False, 'error_code': 'UnknownServiceError'}, 'bedrock': {'ok': False, 'error_code': 'UnknownServiceError'}} on every invocation. Harness evidence, from _poll_until in each check: "AssertionError: deployed Lambda role IAM permissions to become effective not met within 60s. Last result: {'s3vectors': {'ok': False, 'error_code': 'UnknownServiceError'}, 'bedrock': {'ok': False, 'error_code': 'UnknownServiceError'}}" (cfn-deploy-lambda-bedrock-s3vectors-full-stack-positive); "AssertionError: positive-control role IAM permissions to become effective not met within 60s. Last result: {... 'UnknownServiceError' ...}" (cfn-deploy-wrong-execution-role-mismatch-negative); "AssertionError: initial role permissions to become effective not met within 60s. Last result: {... 'UnknownServiceError' ...}" (both cfn-stack-update-add-* checks). The error class and message are botocore's, raised client-side in the sandbox; its fixed text is "Unknown service: '<name>'. Valid service names are: ..." with <name> taken from the boto3.client() call. Generated function/role/stack names, per-invocation request ids and timestamps vary per run and are not requirements.
+
+## Steps to Reproduce
+1. Clone the repo and run the behavioral suite (run_behavioral_suite) against the built emulator.
+2. CreateStack with a template containing an AWS::IAM::Role (lambda.amazonaws.com trust, inline policy allowing s3vectors:ListVectorBuckets and bedrock:ListSessions plus logs:*) and an AWS::Lambda::Function (Runtime=python3.12, Handler=index.handler, Code.ZipFile = index.py only) whose handler does:
+   s3v = boto3.client("s3vectors"); s3v.list_vector_buckets()  and  bar = boto3.client("bedrock-agent-runtime"); bar.list_sessions(), returning {"ok": ...} or the caught exception's error code for each.
+3. Wait for CREATE_COMPLETE, then lambda Invoke(FunctionName=<stack output FunctionName>, InvocationType=RequestResponse, Payload={}).
+4. Observe the payload reports error_code 'UnknownServiceError' for BOTH clients instead of ok=true (or, for a role without the grant, the service's AccessDeniedException). A minimal reproduction needs no AWS call: a handler whose body is only `boto3.client("s3vectors")` raises the same UnknownServiceError.
+5. Repeat with an UpdateStack that adds the missing s3vectors (resp. bedrock) permission to the role — the result is unchanged, because the SDK never resolves the service name.
