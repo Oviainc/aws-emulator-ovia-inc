@@ -160,17 +160,20 @@ impl<Eng> AcceptConnectionProposal<Eng> {
 /// Judge everything the REQUEST ITSELF carries, before anything the request NAMES is
 /// resolved.
 ///
-/// A tag set outside what this service stores, and a value outside the constraints the
+/// An `activationKey` whose text is not the encoding the member is written in, a tag set
+/// outside what this service stores, and a value outside the constraints the
 /// model puts on the `AttachPoint` member that carries it, are faults in the INPUT
 /// whatever the `activationKey` names — so judging them here is what keeps a verdict
 /// about a resource (a key that resolves to no proposal, a proposal whose acceptance has
 /// already been made, a connection an acceptance can no longer be made on) from masking
-/// them, and a caller branching on the error code can tell "I sent something that is not
-/// an attach-point identifier" or "I sent a tag key I may not write" from "this proposal
-/// does not exist" or "this proposal was already accepted". The same ordering both
+/// them, and a caller branching on the error code can tell "the key I pasted is not a
+/// key at all", "I sent something that is not an attach-point identifier" or "I sent a
+/// tag key I may not write" from "this proposal does not exist" or "this proposal was
+/// already accepted". The same ordering both
 /// sibling tag writers of this crate (`TagResource`, `UntagResource`) and the sibling
-/// reader of this union (`ListConnections`) apply, through the same two rules
-/// (`crate::state::tag_write_violation`, `crate::state::judge_attach_point_value`).
+/// reader of this union (`ListConnections`) apply, through the same three rules
+/// (`crate::state::activation_key_encoding_violation`,
+/// `crate::state::tag_write_violation`, `crate::state::judge_attach_point_value`).
 ///
 /// Nothing is written and nothing is resolved here, so a refused acceptance leaves the
 /// proposal exactly as it was. What the acceptance would LEAVE on the connection — the
@@ -179,6 +182,24 @@ impl<Eng> AcceptConnectionProposal<Eng> {
 fn judge_request(
     input: &AcceptConnectionProposalInput,
 ) -> Result<(), AcceptConnectionProposalError> {
+    // The `activationKey`'s own well-formedness, by the one rule both operations that
+    // take the member apply to it
+    // (`crate::state::activation_key_encoding_violation`): the member carries the
+    // partner portal's encoded capture of what a creation request chose, so text that is
+    // not base64 carries no capture and could never name a proposal of any account.
+    // Judged HERE, ahead of every resolution below, so the probe a client runs first
+    // (`DescribeConnectionProposal`) and the acceptance that follows it answer the same
+    // text identically; the key is `@sensitive`, so the refusal reproduces nothing of
+    // it.
+    if let Some(message) = crate::state::activation_key_encoding_violation(&input.activation_key) {
+        return Err(
+            AcceptConnectionProposalErrorModeled::InterconnectValidationException(
+                InterconnectValidationException { message },
+            )
+            .into(),
+        );
+    }
+
     // The entries the request carries, each inside the lengths the model gives `TagKey`
     // and `TagValue` and none of them in the namespace AWS reserves for its own system
     // tags. (The boundary validator holds a LIST's members to their target's

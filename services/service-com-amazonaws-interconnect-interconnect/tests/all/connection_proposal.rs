@@ -535,9 +535,10 @@ async fn a_deleted_connections_activation_key_names_no_proposal() {
     }
 }
 
-/// An `activationKey` that resolves to no stored proposal is the operation's
-/// modelled 404, whatever shape the key has — and the refusal never echoes the key,
-/// which `ActivationKey` marks `@sensitive`.
+/// An `activationKey` that is base64 text but resolves to no stored proposal is the
+/// operation's modelled 404, whatever shape the key has — and the refusal never echoes
+/// the key, which `ActivationKey` marks `@sensitive`. (Text that is not base64 at all is
+/// a fault in the REQUEST, which [`crate::activation_key_is_base64`] covers.)
 #[tokio::test]
 async fn describe_connection_proposal_refuses_a_key_that_names_no_proposal() {
     use service_com_amazonaws_interconnect_interconnect::state::proposal_not_retrievable_message;
@@ -561,15 +562,19 @@ async fn describe_connection_proposal_refuses_a_key_that_names_no_proposal() {
         )
         .await;
 
-    // Rows differ in the SHAPE of the unresolvable key: unrelated, a prefix of a real
-    // one, a real one with a suffix, a case variant, and both published
-    // `ActivationKey` length bounds (`@length(min: 1, max: 2048)`).
+    // Rows differ in the SHAPE of the unresolvable key, every one of them base64 text so
+    // that what they test is the resolution and not the encoding: unrelated, a prefix of
+    // a real one, a real one with a suffix, a case variant, the shortest text the
+    // encoding admits and the published `ActivationKey` maximum (`@length(max: 2048)`).
+    // A key whose text is not base64 at all is a fault in the REQUEST, which
+    // [`crate::activation_key_is_base64`] covers at every length including the published
+    // minimum.
     let mut absent: Vec<String> = vec![
-        "not-an-activation-key".to_string(),
+        "bm90QW5BY3RpdmF0aW9uS2V5".to_string(),
         known[..known.len() - 1].to_string(),
-        format!("{known}EXTRA"),
+        format!("{known}MORE"),
         known.to_ascii_lowercase(),
-        "A".to_string(),
+        "AA".to_string(),
         "A".repeat(2048),
     ];
     absent.retain(|candidate| *candidate != known);

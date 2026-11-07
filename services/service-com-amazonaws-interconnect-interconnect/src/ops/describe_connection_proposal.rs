@@ -75,11 +75,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-interconnect-interconne
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.interconnect#DescribeConnectionProposal",
-    extra_errors = ["ResourceNotFoundException", "InterconnectServerException"]
+    extra_errors = [
+        "ResourceNotFoundException",
+        "InterconnectValidationException",
+        "InterconnectServerException",
+    ]
 )]
 #[derive(Debug)]
 pub enum DescribeConnectionProposalErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    InterconnectValidationException(InterconnectValidationException),
     InterconnectServerException(InterconnectServerException),
 }
 
@@ -146,6 +151,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // What the REQUEST itself carries is judged BEFORE anything it names is
+        // resolved: the `activationKey` is the partner portal's encoded capture of the
+        // parameters a creation request chose, so text that is not base64 carries no
+        // capture and could never name a proposal of any account — a fault in the input
+        // (the modelled `InterconnectValidationException`, HTTP 400), not a resource
+        // this Region does not hold. The judgement is
+        // `crate::state::activation_key_encoding_violation`, the one rule both
+        // operations that take the member apply, so the sibling acceptance refuses the
+        // same text the same way and with the same wording; the key itself is
+        // `@sensitive`, so the refusal reproduces nothing of it.
+        if let Some(message) = crate::state::activation_key_encoding_violation(&input.activation_key)
+        {
+            return Err(
+                DescribeConnectionProposalErrorModeled::InterconnectValidationException(
+                    InterconnectValidationException { message },
+                )
+                .into(),
+            );
+        }
 
         // Reporting only (`@readonly`): the one write below settles transitions the
         // clock had ALREADY made due and drops records whose retention had run out —

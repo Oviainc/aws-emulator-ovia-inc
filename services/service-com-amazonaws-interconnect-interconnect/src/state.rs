@@ -1063,8 +1063,12 @@ pub fn new_shared_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// A fresh `ActivationKey` — the opaque token the creator brings to the partner
-/// portal. 32 uppercase hex characters, well inside the modelled 1..2048 length.
+/// A fresh `ActivationKey` — the token the creator brings to the partner portal. 32
+/// uppercase hex characters, well inside the modelled 1..2048 length.
+///
+/// Those characters are all in the base64 alphabet and the count is a whole number of
+/// base64 groups, so a minted key is base64 text ([`is_base64_activation_key`]) and the
+/// two operations that take the member read it rather than refusing it.
 pub fn new_activation_key() -> String {
     uuid::Uuid::new_v4()
         .simple()
@@ -1146,6 +1150,58 @@ pub fn proposal_not_retrievable_message() -> String {
     format!(
         "{REFUSAL_ENVELOPE}Unable to retrieve a connection proposal for the supplied activationKey, as it does not exist"
     )
+}
+
+/// The coding an `ActivationKey`'s text is written in.
+///
+/// An activation key is not an opaque handle: it is the partner portal's ENCODED
+/// capture of what a creation request chose — "This key captures the desired parameters
+/// from the initial creation request" (`DescribeConnectionProposal$activationKey`) — so
+/// text that is not base64 carries no capture to read and names no proposal of any
+/// account.
+///
+/// Read with the standard base64 alphabet, the way a general-purpose base64 reader
+/// reads it: `=` padding is accepted but not required, and the bits a final partial
+/// group leaves over are not held to canonical zeroes, so every text some base64
+/// WRITER could have produced is accepted. What is refused is text that encodes
+/// nothing at all: a character outside the alphabet, padding in the middle of the text,
+/// or a final group of one character, which carries fewer bits than one byte needs.
+const ACTIVATION_KEY_ENCODING: ::base64::engine::general_purpose::GeneralPurpose =
+    ::base64::engine::general_purpose::GeneralPurpose::new(
+        &::base64::alphabet::STANDARD,
+        ::base64::engine::general_purpose::GeneralPurposeConfig::new()
+            .with_decode_padding_mode(::base64::engine::DecodePaddingMode::Indifferent)
+            .with_decode_allow_trailing_bits(true),
+    );
+
+/// Whether `activation_key` is base64 text at all ([`ACTIVATION_KEY_ENCODING`]).
+///
+/// A property of the VALUE the request carried and of nothing else, so the answer does
+/// not depend on which proposals this store holds.
+pub fn is_base64_activation_key(activation_key: &str) -> bool {
+    ::base64::Engine::decode(&ACTIVATION_KEY_ENCODING, activation_key).is_ok()
+}
+
+/// Why `activation_key` is not an activation key at all — or `None` when its text is
+/// base64, and so could name a proposal.
+///
+/// The ONE rule both operations that take the member apply to it
+/// (`DescribeConnectionProposal`, `AcceptConnectionProposal`), judged on the REQUEST
+/// alone and therefore BEFORE the key is resolved against this store: the encoding is
+/// what makes the value an activation key, so a value that is not one is a fault in the
+/// input rather than a resource the account does not hold, and a caller can tell "the
+/// text I pasted is not a key" from "that proposal does not exist".
+pub fn activation_key_encoding_violation(activation_key: &str) -> Option<String> {
+    (!is_base64_activation_key(activation_key)).then(activation_key_not_base64_message)
+}
+
+/// How the service words an `activationKey` whose text is not base64.
+///
+/// Entirely FIXED text, with no variable part: `ActivationKey` is `@sensitive`, so the
+/// refusal reproduces nothing of the value the request carried — not its text, not its
+/// length and not where its first bad character was.
+pub fn activation_key_not_base64_message() -> String {
+    format!("{REFUSAL_ENVELOPE}The provided activation key is not valid base64")
 }
 
 /// How `UpdateConnection` words an identifier that names no stored connection.

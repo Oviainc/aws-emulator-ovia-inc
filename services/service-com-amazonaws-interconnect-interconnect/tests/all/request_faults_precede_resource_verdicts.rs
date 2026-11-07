@@ -439,7 +439,10 @@ async fn an_acceptances_own_faults_are_reported_before_its_proposal_is_resolved(
         AcceptVerdict {
             name: "an activationKey that was never issued".to_string(),
             region: DEFAULT_SIGNING_REGION,
-            activation_key: "an-activation-key-no-portal-ever-issued".to_string(),
+            // Base64 text — the encoding is what makes a value an activation key at
+            // all, so a key that merely names nothing has to be well-formed for this
+            // row to reach the resource verdict.
+            activation_key: "bm9Qb3J0YWxFdmVySXNzdWVkVGhpcw".to_string(),
             attach_point: json!({ "directConnectGateway": first }),
             status: 404,
             code: NOT_FOUND_CODE,
