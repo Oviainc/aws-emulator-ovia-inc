@@ -29,6 +29,10 @@ mod stage_web_acl_association_report;
 mod aws_service_integration;
 #[path = "all/account_settings.rs"]
 mod account_settings;
+// The account's CloudWatch role resolved against IAM: which `cloudwatchRoleArn` an
+// `UpdateAccount` patch stores, and which one names a role API Gateway could never assume.
+#[path = "all/account_logging_role.rs"]
+mod account_logging_role;
 #[path = "all/api_key_collection.rs"]
 mod api_key_collection;
 #[path = "all/api_key_collection_members.rs"]
@@ -117,6 +121,10 @@ mod sdk_types;
 mod service_claim;
 #[path = "all/stage_collection.rs"]
 mod stage_collection;
+// The access log format a stage may carry: which `accessLogSettings.format` identifies the
+// request the line is about, and what the refusal of one that identifies none states.
+#[path = "all/stage_access_log_format.rs"]
+mod stage_access_log_format;
 #[path = "all/stage_export.rs"]
 mod stage_export;
 #[path = "all/stage_invoke.rs"]

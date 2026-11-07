@@ -40,6 +40,8 @@ Issue-Commit: f4e5251e6df88363d8e23ace2ff5bff3be31b423
 
 # API Gateway deployed-stage invoke, account logging role and log delivery: 9 causes (34 checks)
 
+> _Causes 1–5 are FIXED. Causes 6–9 are not, and are re-filed with their own replay keys as `issues/things-that-do-not-work/20261029T180026Z-apigateway-dynamodb-lambda-logs-4-of-the-9-causes-remain-open.md` so they are not recorded as working: access-log and execution-log delivery to CloudWatch Logs, the REST `AWS` DynamoDB integration, the DynamoDB-Streams event source mapping, and the lambda-side trust negatives. That report also carries what the fix of causes 1–5 established about each of them._
+
 > _Note: this issue was identified against the code base at commit `f4e5251e6df88363d8e23ace2ff5bff3be31b423`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

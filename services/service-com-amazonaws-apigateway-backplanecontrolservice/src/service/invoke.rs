@@ -128,7 +128,7 @@
 //! `requestParameters` entry outside the mapping forms below is an integration this call
 //! cannot perform rather than a mapping silently dropped.
 //!
-//! Every other integration type names a backend this emulator cannot call:
+//! Every other integration type names a backend outside this api's own records:
 //!
 //! * an `AWS` integration names ANOTHER SERVICE'S ACTION, and where that action is one this
 //!   emulator serves it is PERFORMED by making the call, in process, over the transport the
@@ -3205,7 +3205,8 @@ fn unusable_vpc_link(
 /// The one entry point both sides of this module's work reach — the data plane above and
 /// `TestInvokeMethod`, which reports what this performs — so one stored configuration is
 /// performed one way whichever side drives it. An `AWS` integration naming a service call
-/// this emulator makes is performed by MAKING that call ([`aws_integration`]); every other
+/// this emulator makes is performed by MAKING that call ([`aws_integration`]), an
+/// `AWS_PROXY` integration by INVOKING the function it names ([`lambda_proxy`]); every other
 /// integration is performed from the api's own records alone ([`perform_integration`]),
 /// which needs no transport and is therefore still reachable on its own.
 ///

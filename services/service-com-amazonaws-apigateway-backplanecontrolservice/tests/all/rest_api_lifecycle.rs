@@ -126,6 +126,21 @@ impl Gateway {
     }
 }
 
+/// One emulator with this service AND AWS IAM mounted on ONE shared engine.
+///
+/// The account's CloudWatch role is resolved against IAM over the in-process transport, so
+/// the service that answers that `GetRole` has to be mounted on the same router. Built on the
+/// one constructor above, so this service is mounted and the router configured exactly once
+/// in this target.
+pub(crate) fn gateway_with_iam() -> Gateway {
+    let mut gateway = Gateway::new();
+    let engine = Arc::clone(&gateway.engine);
+    gateway.router.register_service(
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(engine),
+    );
+    gateway
+}
+
 /// `CreateRestApi` for `name`, returning the API id and its root resource id.
 pub(crate) async fn create_api(gateway: &Gateway, name: &str) -> (String, String) {
     let answer = gateway

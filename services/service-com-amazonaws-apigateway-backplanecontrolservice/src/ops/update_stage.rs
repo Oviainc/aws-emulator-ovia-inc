@@ -329,9 +329,46 @@ const THROTTLE_BURST_RANGE: ::std::ops::RangeInclusive<i32> = 0..=i32::MAX;
 /// The throttle rate's range; see [`THROTTLE_BURST_RANGE`].
 const THROTTLE_RATE_RANGE: ::std::ops::RangeInclusive<f64> = 0.0..=f64::MAX;
 
-/// The context variable every access log format must carry: "The format must include at
-/// least `$context.requestId`" (`AccessLogSettings$format`).
-const ACCESS_LOG_REQUIRED_CONTEXT_VARIABLE: &str = "$context.requestId";
+/// The context variables an access log format may carry the REQUEST IDENTIFIER as, one of
+/// which every format has to name.
+///
+/// `AccessLogSettings$format` states the requirement — "The format must include at least
+/// `$context.requestId`" — and API Gateway accepts EITHER identifier of the request in its
+/// place: `$context.extendedRequestId` is the same request's id under the member API
+/// Gateway reports it as on the response, so a format naming it identifies the request the
+/// line is about just as well. A recorded refusal of a format naming neither enumerates
+/// both, which is what [`access_log_identifier_requirement`] words: a caller told to add one
+/// of two variables can satisfy the rule with either, where one told to add a single
+/// variable may apply a fix that is still refused.
+const ACCESS_LOG_REQUEST_IDENTIFIERS: &[&str] =
+    &["$context.requestId", "$context.extendedRequestId"];
+
+/// The requirement a refused access log format failed, naming EVERY variable that satisfies
+/// it, in the order [`ACCESS_LOG_REQUEST_IDENTIFIERS`] lists them.
+///
+/// Built from that list rather than written out, so the sentence and the check can never
+/// name different variables.
+fn access_log_identifier_requirement() -> String {
+    ACCESS_LOG_REQUEST_IDENTIFIERS.join(" or ")
+}
+
+/// Whether `format` names one of [`ACCESS_LOG_REQUEST_IDENTIFIERS`] as a REFERENCE rather
+/// than as the prefix of a longer name.
+///
+/// A `$context` reference ends where its member name ends, so a format naming
+/// `$context.requestIdentity` names a different member and satisfies nothing: an occurrence
+/// counts only when what follows it is not another character a member name may carry (a
+/// letter, a digit or an underscore), which is also true at the very end of the format.
+fn identifies_the_request(format: &str) -> bool {
+    ACCESS_LOG_REQUEST_IDENTIFIERS.iter().any(|variable| {
+        format.match_indices(variable).any(|(at, _)| {
+            format[at + variable.len()..]
+                .chars()
+                .next()
+                .is_none_or(|next| !next.is_ascii_alphanumeric() && next != '_')
+        })
+    })
+}
 
 /// The sentence API Gateway refuses an `op` a stage supports no path for with.
 ///
@@ -820,12 +857,16 @@ fn apply_access_log_patch(entry: &mut StageEntry, patch: &Patch) -> Result<(), P
             }
             patch_optional_string(&mut settings.format, &nested, MAX_STRING_CHARS)?;
             // From `AccessLogSettings$format`: "The format must include at least
-            // $context.requestId."
+            // $context.requestId." EITHER identifier of the request satisfies it
+            // ([`ACCESS_LOG_REQUEST_IDENTIFIERS`]), named as a reference rather than as the
+            // prefix of a longer member ([`identifies_the_request`]), and the refusal names
+            // them all, so the caller is told the whole rule rather than one half of it.
             if let Some(format) = &settings.format {
-                if !format.contains(ACCESS_LOG_REQUIRED_CONTEXT_VARIABLE) {
+                if !identifies_the_request(format) {
                     return Err(PatchFailure::BadRequest(format!(
-                        "{} must include at least {ACCESS_LOG_REQUIRED_CONTEXT_VARIABLE}, got {format:?}",
-                        patch.path
+                        "{} must include at least {}",
+                        patch.path,
+                        access_log_identifier_requirement()
                     )));
                 }
             }
