@@ -14,9 +14,11 @@
 //! resource policy answers with. What this module adds is the half only S3 knows:
 //!
 //! * the CONTEXT the request carries — the condition keys a statement may be written over,
-//!   taken from the request's own members ([`ObjectWriteContext`]) — so a clause over one of
-//!   them is DECIDED rather than unknown, which is what makes a policy that conditions a
-//!   write on an encryption header enforceable at all;
+//!   taken from the request's own members ([`ObjectWriteContext`]) and from the facts this
+//!   gate holds for every request ([`global_conditions`]: who the caller is, which account it
+//!   and the resource belong to) — so a clause over one of them is DECIDED rather than
+//!   unknown, which is what makes a policy that conditions a write on an encryption header,
+//!   or a grant that conditions a read on the resource's owning account, enforceable at all;
 //! * the KEYS this service declares it models ([`PUBLISHED_CONDITION_KEYS`]): absence of one
 //!   of these from the context means "the request carries no value", which IAM reads under a
 //!   negated operator, an `IfExists` spelling and a `Null` clause, while absence of any other
@@ -86,10 +88,39 @@ const PREFIX_KEY: &str = "s3:prefix";
 /// published list).
 const DELIMITER_KEY: &str = "s3:delimiter";
 
+/// The global condition keys that name the calling PRINCIPAL, which this gate holds exactly
+/// for every request it judges: "aws:PrincipalArn — the ARN of the principal that made the
+/// request" and "aws:PrincipalAccount — the account the principal belongs to" (AWS General
+/// Reference, *Global condition context keys*).
+///
+/// "For IAM roles, the request context returns the ARN of the role, not the ARN of the user
+/// that assumed the role" (`aws:PrincipalArn`), so a request signed by an assumed-role
+/// session answers that key with the ROLE's ARN — the identity whose policies are in force —
+/// while the ARN a refusal names stays the session's, which is what STS reports for that
+/// credential.
+const PRINCIPAL_ARN_KEY: &str = "aws:PrincipalArn";
+const PRINCIPAL_ACCOUNT_KEY: &str = "aws:PrincipalAccount";
+
+/// The global condition key naming the account that OWNS the resource the request addressed
+/// ("aws:ResourceAccount", same published list).
+///
+/// This gate ANSWERS it rather than leaving it open, because it knows: this emulator serves
+/// ONE account, and that account owns every bucket it holds — the same fact the
+/// confused-deputy guard of every operation is decided by
+/// ([`expected_bucket_owner_refusal`]). The owning account is not in a bucket's own ARN
+/// (`arn:aws:s3:::<bucket>` carries no account segment), which is why it is answered from the
+/// account this emulator serves rather than parsed out of the resource.
+const RESOURCE_ACCOUNT_KEY: &str = "aws:ResourceAccount";
+
 /// Every condition key a request judged here carries a value for when its member is present,
 /// and so DECLARES this service models — the keys whose absence from the context is decided
 /// ("the request carries none") rather than unknown. Every other key keeps the undecided
 /// reading, which refuses nothing.
+///
+/// The two keys naming the PRINCIPAL are last, because only a decision that resolved the
+/// caller can answer them: [`CALLER_FREE_CONDITION_KEYS`] is this list without them, and
+/// `the_two_published_lists_differ_by_the_principal_keys` in this module's tests holds the two
+/// to that relation.
 pub const PUBLISHED_CONDITION_KEYS: &[&str] = &[
     SECURE_TRANSPORT_KEY,
     ACL_KEY,
@@ -101,7 +132,83 @@ pub const PUBLISHED_CONDITION_KEYS: &[&str] = &[
     MAX_KEYS_KEY,
     PREFIX_KEY,
     DELIMITER_KEY,
+    RESOURCE_ACCOUNT_KEY,
+    PRINCIPAL_ARN_KEY,
+    PRINCIPAL_ACCOUNT_KEY,
 ];
+
+/// The keys a decision taken WITHOUT the caller resolved publishes ([`policy_denial`], whose
+/// principal is this service's own stand-in rather than the identity that signed): every key
+/// above except the two naming the principal.
+///
+/// Publishing a key is saying this service ANSWERS it, and a key published with no value is
+/// decided as ABSENT — which a negated clause over it HOLDS for. So a gate that cannot name
+/// the caller must not publish the principal keys: a clause over them stays undecided there,
+/// and only [`super::request_authorization::denial`], which resolved the signing identity,
+/// decides one.
+pub const CALLER_FREE_CONDITION_KEYS: &[&str] = &[
+    SECURE_TRANSPORT_KEY,
+    ACL_KEY,
+    STORAGE_CLASS_KEY,
+    SERVER_SIDE_ENCRYPTION_KEY,
+    KMS_KEY_ID_KEY,
+    COPY_SOURCE_KEY,
+    METADATA_DIRECTIVE_KEY,
+    MAX_KEYS_KEY,
+    PREFIX_KEY,
+    DELIMITER_KEY,
+    RESOURCE_ACCOUNT_KEY,
+];
+
+/// The keys of [`PUBLISHED_CONDITION_KEYS`] that name the principal, which are the difference
+/// between the two lists above — see `the_two_published_lists_differ_by_the_principal_keys`.
+#[cfg(test)]
+const PRINCIPAL_CONDITION_KEYS: &[&str] = &[PRINCIPAL_ARN_KEY, PRINCIPAL_ACCOUNT_KEY];
+
+/// The global condition key a gate answers from the account this emulator serves, for EVERY
+/// request: which account owns the resource addressed ([`RESOURCE_ACCOUNT_KEY`]).
+///
+/// A clause over it is therefore DECIDED rather than left open, which is what makes a grant
+/// scoped to the resource's owner — the shape a publishing or deployment role's policy is
+/// written in — enforceable at all.
+///
+/// ONE place, so the bucket-policy half ([`policy_denial`]) and the full authorization gate
+/// ([`super::request_authorization::denial`]) judge one document alike.
+#[must_use]
+pub fn resource_conditions() -> Vec<(String, String)> {
+    vec![(
+        RESOURCE_ACCOUNT_KEY.to_string(),
+        ::engine::emulator_account_id().to_string(),
+    )]
+}
+
+/// [`resource_conditions`] together with the keys naming the PRINCIPAL that signed the
+/// request: who it is ([`PRINCIPAL_ARN_KEY`]) and which account it belongs to
+/// ([`PRINCIPAL_ACCOUNT_KEY`]).
+///
+/// `identity_arn` is the ARN of the identity whose policies are in force — the ROLE behind an
+/// assumed-role session, the user behind a long-term key (see [`PRINCIPAL_ARN_KEY`]). Only a
+/// decision that RESOLVED the signing identity may use this, and it publishes
+/// [`PUBLISHED_CONDITION_KEYS`]: a caller speaking for nobody carries no ARN, so its principal
+/// keys are reported absent rather than guessed, while a gate holding no identity at all
+/// publishes [`CALLER_FREE_CONDITION_KEYS`] and leaves a clause over them undecided.
+#[must_use]
+pub fn global_conditions(identity_arn: &str) -> Vec<(String, String)> {
+    let mut context = resource_conditions();
+    if identity_arn.is_empty() {
+        return context;
+    }
+    context.push((PRINCIPAL_ARN_KEY.to_string(), identity_arn.to_string()));
+    // The account is read out of the principal's ARN through the tree's one ARN parse, so an
+    // ARN carrying none reports no account rather than a guess.
+    if let Some(account) = ::service_common::arn::parse(identity_arn)
+        .map(|parsed| parsed.account.to_string())
+        .filter(|account| !account.is_empty())
+    {
+        context.push((PRINCIPAL_ACCOUNT_KEY.to_string(), account));
+    }
+    context
+}
 
 /// The number of keys a listing returns when the request names no `max-keys`: "sets the
 /// maximum number of keys returned in the response. By default, the action returns up to
@@ -207,6 +314,12 @@ pub fn read_conditions() -> Vec<(String, String)> {
 /// a statement denying the account refuses each of its principals. Only a DENY is reported:
 /// this emulator serves one account and the caller is that account, so a document that says
 /// nothing about the request leaves the bucket's own owner able to act on it.
+///
+/// This decision does NOT resolve the signing identity — the principal above is this
+/// service's stand-in for the account itself — so it answers only the resource's owning
+/// account ([`resource_conditions`]) and publishes [`CALLER_FREE_CONDITION_KEYS`]: a clause
+/// over who the caller is stays undecided here rather than being decided against a principal
+/// nothing read off the request.
 pub fn policy_denial(
     policy: Option<&str>,
     action: &str,
@@ -217,39 +330,48 @@ pub fn policy_denial(
     let caller = caller_principal_arn();
     let mut principals = vec![caller.clone()];
     principals.extend(account_principals(&caller));
+    let mut context = conditions.to_vec();
+    context.extend(resource_conditions());
     let outcome = resource_outcome_prepared(
         &PreparedDocument::read(policy),
         &Request::new(action, resource, &principals)
-            .with_context(conditions)
-            .with_published_keys(PUBLISHED_CONDITION_KEYS),
+            .with_context(&context)
+            .with_published_keys(CALLER_FREE_CONDITION_KEYS),
     );
-    deny_is_decided(&outcome).then(|| explicit_resource_policy_denial(action, resource))
+    deny_is_decided(&outcome, CALLER_FREE_CONDITION_KEYS)
+        .then(|| explicit_resource_policy_denial(action, resource))
 }
 
-/// Whether `outcome` is a deny this evaluation could DECIDE — the only kind that refuses.
+/// Whether `outcome` is a deny this decision could DECIDE — the only kind that refuses.
 ///
-/// A key the decision needed and this service does not model leaves the statement undecided,
+/// A key the decision needed and this service does not answer leaves the statement undecided,
 /// and the evaluation's reading of an undecided `Deny` is that it still refuses — fail-closed,
 /// which is right where a GRANT is at stake and wrong for a refusal, because it would refuse
-/// calls on every bucket whose policy conditions anything nothing here models. A key this
-/// service DOES model is decided by its absence, so a report of one says only that the
+/// calls on every bucket whose policy conditions anything nothing here models. A key the
+/// decision DID publish is decided by its absence, so a report of one says only that the
 /// request carried no value for it.
+///
+/// `published` is the list THIS decision published ([`PUBLISHED_CONDITION_KEYS`] where the
+/// signing identity was resolved, [`CALLER_FREE_CONDITION_KEYS`] where it was not), because
+/// "answered" is a property of the decision rather than of the service: a principal key the
+/// caller-free decision could not answer must leave its statement undecided there even though
+/// the full gate answers it.
 ///
 /// One place, so the bucket-policy half ([`policy_denial`]) and the full authorization gate
 /// ([`super::request_authorization::denial`]) read an undecided deny the same way.
 #[must_use]
-pub fn deny_is_decided(outcome: &Outcome) -> bool {
+pub fn deny_is_decided(outcome: &Outcome, published: &[&str]) -> bool {
     outcome.decision == Decision::Denied
         && !outcome
             .required_context_keys
             .iter()
-            .any(|key| !models(key))
+            .any(|key| !models(key, published))
 }
 
-/// Whether this service ANSWERS the condition key `key`, compared the way a condition key's
-/// name is compared everywhere ([`PUBLISHED_CONDITION_KEYS`]).
-fn models(key: &str) -> bool {
-    PUBLISHED_CONDITION_KEYS
+/// Whether the decision that published `published` ANSWERS the condition key `key`, compared
+/// the way a condition key's name is compared everywhere.
+fn models(key: &str, published: &[&str]) -> bool {
+    published
         .iter()
         .any(|known| known.eq_ignore_ascii_case(key))
 }
@@ -284,6 +406,101 @@ pub fn expected_bucket_owner_refusal<E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two published lists differ by exactly the principal keys: the full list is what a
+    /// decision that resolved the signing identity publishes, and the caller-free one is that
+    /// list without the keys only such a decision can answer.
+    #[test]
+    fn the_two_published_lists_differ_by_the_principal_keys() {
+        for key in CALLER_FREE_CONDITION_KEYS {
+            assert!(
+                PUBLISHED_CONDITION_KEYS.contains(key),
+                "case {key:?}: expected every caller-free key to be published by the full \
+                 gate too, got none"
+            );
+        }
+        for key in PRINCIPAL_CONDITION_KEYS {
+            assert!(
+                PUBLISHED_CONDITION_KEYS.contains(key) && !CALLER_FREE_CONDITION_KEYS.contains(key),
+                "case {key:?}: expected a principal key to be published only where the caller \
+                 is resolved, got caller_free={}",
+                CALLER_FREE_CONDITION_KEYS.contains(key)
+            );
+        }
+        let difference = PUBLISHED_CONDITION_KEYS.len() - CALLER_FREE_CONDITION_KEYS.len();
+        assert_eq!(
+            difference,
+            PRINCIPAL_CONDITION_KEYS.len(),
+            "case \"the two lists\": expected them to differ by the {} principal key(s), got \
+             {difference}",
+            PRINCIPAL_CONDITION_KEYS.len()
+        );
+    }
+
+    /// A clause over who the CALLER is stays undecided on the bucket-policy-only decision,
+    /// which never resolved the signing identity: neither a deny that names this service's
+    /// stand-in principal nor one that excludes it may refuse the call there.
+    #[test]
+    fn a_principal_clause_is_undecided_without_a_resolved_caller() {
+        let caller = caller_principal_arn();
+        let documents: &[(&str, String)] = &[
+            (
+                "a deny naming the stand-in principal",
+                format!(
+                    "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Deny\",\
+                     \"Principal\":\"*\",\"Action\":\"s3:PutObject\",\
+                     \"Resource\":\"arn:aws:s3:::subject/*\",\"Condition\":\
+                     {{\"StringEquals\":{{\"aws:PrincipalArn\":\"{caller}\"}}}}}}]}}"
+                ),
+            ),
+            (
+                "a deny over every principal but one",
+                "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\
+                 \"Principal\":\"*\",\"Action\":\"s3:PutObject\",\
+                 \"Resource\":\"arn:aws:s3:::subject/*\",\"Condition\":\
+                 {\"StringNotEquals\":{\"aws:PrincipalArn\":\
+                 \"arn:aws:iam::000000000000:role/publisher\"}}}]}"
+                    .to_string(),
+            ),
+        ];
+        for (case, document) in documents {
+            let denial = policy_denial(
+                Some(document),
+                "s3:PutObject",
+                "arn:aws:s3:::subject/reports/held.csv",
+                &read_conditions(),
+            );
+            assert_eq!(
+                denial, None,
+                "case {case:?}: expected the clause to stay undecided where the caller is not \
+                 resolved, got {denial:?}"
+            );
+        }
+    }
+
+    /// The account owning the resource IS answered on that same decision, so a deny scoped to
+    /// it refuses — which is what makes a bucket policy written over the owner enforceable.
+    #[test]
+    fn the_resource_account_is_answered_without_a_resolved_caller() {
+        let document = format!(
+            "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Deny\",\
+             \"Principal\":\"*\",\"Action\":\"s3:PutObject\",\
+             \"Resource\":\"arn:aws:s3:::subject/*\",\"Condition\":\
+             {{\"StringEquals\":{{\"aws:ResourceAccount\":\"{}\"}}}}}}]}}",
+            ::engine::emulator_account_id()
+        );
+        let denial = policy_denial(
+            Some(&document),
+            "s3:PutObject",
+            "arn:aws:s3:::subject/reports/held.csv",
+            &read_conditions(),
+        );
+        assert!(
+            denial.is_some(),
+            "case \"a deny scoped to the resource's owning account\": expected the refusal, got \
+             {denial:?}"
+        );
+    }
 
     /// A document denying `s3:PutObject` to everyone unless the write names the encryption
     /// algorithm `required`, which is how a bucket makes encryption mandatory.

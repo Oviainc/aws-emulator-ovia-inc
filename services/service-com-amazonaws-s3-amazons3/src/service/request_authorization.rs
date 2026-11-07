@@ -129,6 +129,10 @@ pub struct Caller {
     /// Every spelling of the principal a policy may name IT by: the ARN STS reports, and the
     /// ARN of the IAM role behind an assumed-role session. These decide a GRANT.
     pub principals: Vec<String>,
+    /// The ARN of the IDENTITY whose policies are in force: the role behind an assumed-role
+    /// session, else the principal's own ARN. It is what `aws:PrincipalArn` answers with
+    /// (`authorization::global_conditions`), and empty for a caller that speaks for nobody.
+    pub identity_arn: String,
     /// The spellings that name the ACCOUNT the principal belongs to rather than the
     /// principal: they decide a deny and never grant (see the module docs).
     pub account_principals: Vec<String>,
@@ -225,6 +229,7 @@ pub fn request_caller<Eng: Send + Sync + 'static>(
             caller.unreadable_attachment = !policies.uncarried.is_empty();
         }
     }
+    caller.identity_arn = identity_arn;
     caller
 }
 
@@ -245,6 +250,13 @@ pub fn denial(
 ) -> Option<String> {
     let refusal = |reason: &str| Some(state::authorization_denial(&caller.arn, action, resource, reason));
     let prepared = policy.map(iam::PreparedDocument::read);
+    // The condition context the decision is taken over: what the REQUEST carried, plus the
+    // global keys this gate holds for every request (who the caller is, which account it and
+    // the resource belong to), so a statement written over one of those decides rather than
+    // standing undecided.
+    let mut context = conditions.to_vec();
+    context.extend(authorization::global_conditions(&caller.identity_arn));
+    let conditions: &[(String, String)] = &context;
 
     // An explicit deny wins over every grant, including the account's own credential.
     if let Some(prepared) = &prepared {
@@ -252,7 +264,10 @@ pub fn denial(
         let denying = iam::Request::new(action, resource, &denied_spellings)
             .with_context(conditions)
             .with_published_keys(PUBLISHED_CONDITION_KEYS);
-        if authorization::deny_is_decided(&iam::resource_outcome_prepared(prepared, &denying)) {
+        if authorization::deny_is_decided(
+            &iam::resource_outcome_prepared(prepared, &denying),
+            PUBLISHED_CONDITION_KEYS,
+        ) {
             return refusal(state::RESOURCE_POLICY_DENY_REASON);
         }
     }
@@ -261,7 +276,7 @@ pub fn denial(
         .with_published_keys(PUBLISHED_CONDITION_KEYS);
     let documents = iam::prepare_documents(&caller.documents);
     let identity_said = iam::identity_outcome_prepared(&documents, &granting);
-    if authorization::deny_is_decided(&identity_said) {
+    if authorization::deny_is_decided(&identity_said, PUBLISHED_CONDITION_KEYS) {
         return refusal(IDENTITY_POLICY_DENY_REASON);
     }
     if identity_said.decision == Decision::Allowed || caller.identity_is_unbounded() {

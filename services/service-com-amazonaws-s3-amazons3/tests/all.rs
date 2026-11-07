@@ -131,6 +131,8 @@ mod error_message_envelope;
 mod error_messages;
 #[path = "all/general_purpose_bucket_names.rs"]
 mod general_purpose_bucket_names;
+#[path = "all/global_condition_keys.rs"]
+mod global_condition_keys;
 #[path = "all/head_object_read_back.rs"]
 mod head_object_read_back;
 #[path = "all/identity_authorization.rs"]
