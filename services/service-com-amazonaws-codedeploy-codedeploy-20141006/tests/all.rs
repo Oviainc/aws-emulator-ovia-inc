@@ -43,6 +43,8 @@ mod deployment_group_alarm_counts;
 mod deployment_group_defaults;
 #[path = "all/deployment_group_update.rs"]
 mod deployment_group_update;
+#[path = "all/deployment_progress_refusal_sentences.rs"]
+mod deployment_progress_refusal_sentences;
 #[path = "all/deployment_target_record_readability.rs"]
 mod deployment_target_record_readability;
 #[path = "all/deployment_targets.rs"]

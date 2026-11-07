@@ -188,6 +188,61 @@ pub fn deployment_not_started(deployment_id: &str) -> String {
     format!("The deployment {deployment_id} has not started")
 }
 
+/// The INTERNAL state name of a deployment status.
+///
+/// CodeDeploy reports a deployment's progress to a client as a
+/// `DeploymentStatus` member (`smithy_query(query="shape",shape="DeploymentStatus")`:
+/// Created | Queued | InProgress | Baking | Succeeded | Failed | Stopped |
+/// Ready), and names the same state INTERNALLY as an upper-snake-case token —
+/// the form every value set this service puts on the wire uses (`DeploymentType`
+/// is IN_PLACE | BLUE_GREEN). The two names differ for exactly one state: a
+/// deployment a caller stopped, whose API status is `Stopped`, is `ABORTED`
+/// internally, which is the internal state a refusal about a stopped deployment
+/// reports.
+///
+/// Derived from the status rather than tabulated, so a status this service does
+/// not itself drive a deployment through still has its internal name.
+pub fn deployment_internal_state(status: &str) -> String {
+    if status == DEPLOYMENT_STATUS_STOPPED {
+        return DEPLOYMENT_INTERNAL_STATE_ABORTED.to_string();
+    }
+    let mut internal = String::with_capacity(status.len() + 2);
+    for (index, character) in status.char_indices() {
+        if index > 0 && character.is_uppercase() {
+            internal.push('_');
+        }
+        internal.extend(character.to_uppercase());
+    }
+    internal
+}
+
+/// See [`deployment_internal_state`]: the internal state of a deployment a
+/// caller stopped, the one whose internal name is not its API status.
+pub const DEPLOYMENT_INTERNAL_STATE_ABORTED: &str = "ABORTED";
+
+/// `DeploymentAlreadyCompletedException` (HTTP 400): the deployment id the
+/// request named and the INTERNAL state the deployment settled in
+/// ([`deployment_internal_state`]), which is the state a refusal about a
+/// deployment's progress reports — so a caller learns which outcome it was
+/// refused for, and every operation that acts on a deployment in flight words
+/// that refusal the same way.
+pub fn deployment_already_completed(deployment_id: &str, status: &str) -> String {
+    format!(
+        "The deployment {deployment_id} has already completed, current state {}.",
+        deployment_internal_state(status)
+    )
+}
+
+/// `UnsupportedActionForDeploymentTypeException` (HTTP 400): the deployment id
+/// the request named and the `DeploymentType` the deployment runs as
+/// ([`Deployment::deployment_type`]), so a caller refused for its deployment's
+/// type learns which type was rejected rather than only that one was.
+pub fn unsupported_action_for_deployment_type(deployment_id: &str, deployment_type: &str) -> String {
+    format!(
+        "Operation is not supported for the deployment {deployment_id} of type {deployment_type}."
+    )
+}
+
 /// `DeploymentTargetDoesNotExistException` (HTTP 400): the deployment the target
 /// does not belong to, which is what the shape's own sentence says ("The
 /// provided target ID does not belong to the attempted deployment"), and the

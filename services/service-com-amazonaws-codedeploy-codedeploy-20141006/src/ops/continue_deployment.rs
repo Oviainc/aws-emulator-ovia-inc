@@ -235,10 +235,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     ContinueDeploymentErrorModeled::UnsupportedActionForDeploymentTypeException(
                         UnsupportedActionForDeploymentTypeException {
-                            message: Some(format!(
-                                "Operation is not supported for the deployment {deployment_id} \
-                                 of type {}.",
-                                deployment.deployment_type()
+                            message: Some(crate::state::unsupported_action_for_deployment_type(
+                                &deployment_id,
+                                deployment.deployment_type(),
                             )),
                         },
                     ),
@@ -250,9 +249,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     ContinueDeploymentErrorModeled::DeploymentAlreadyCompletedException(
                         DeploymentAlreadyCompletedException {
-                            message: Some(format!(
-                                "The deployment {deployment_id} is already complete with status {}",
-                                deployment.status
+                            message: Some(crate::state::deployment_already_completed(
+                                &deployment_id,
+                                &deployment.status,
                             )),
                         },
                     ),

@@ -211,9 +211,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     SkipWaitTimeForInstanceTerminationErrorModeled::DeploymentAlreadyCompletedException(
                         DeploymentAlreadyCompletedException {
-                            message: Some(format!(
-                                "The deployment {deployment_id} is already complete with status {}",
-                                deployment.status
+                            message: Some(crate::state::deployment_already_completed(
+                                &deployment_id,
+                                &deployment.status,
                             )),
                         },
                     ),
@@ -226,9 +226,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     SkipWaitTimeForInstanceTerminationErrorModeled::UnsupportedActionForDeploymentTypeException(
                         UnsupportedActionForDeploymentTypeException {
-                            message: Some(format!(
-                                "The deployment {deployment_id} is not a blue/green deployment, so \
-                                 it has no instance termination wait to skip"
+                            message: Some(crate::state::unsupported_action_for_deployment_type(
+                                &deployment_id,
+                                deployment.deployment_type(),
                             )),
                         },
                     ),

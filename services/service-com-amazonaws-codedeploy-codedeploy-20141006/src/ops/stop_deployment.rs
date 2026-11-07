@@ -210,10 +210,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     StopDeploymentErrorModeled::DeploymentAlreadyCompletedException(
                         DeploymentAlreadyCompletedException {
-                            message: Some(format!(
-                                "The deployment {deployment_id} is already complete: its status \
-                                 is {status}",
-                                status = deployment.status
+                            message: Some(crate::state::deployment_already_completed(
+                                &deployment_id,
+                                &deployment.status,
                             )),
                         },
                     ),
