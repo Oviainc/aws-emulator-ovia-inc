@@ -58,16 +58,20 @@ const MAX_RESULTS_MIN: i64 = 1;
 /// See [`MAX_RESULTS_MIN`].
 const MAX_RESULTS_MAX: i64 = 100;
 
-/// One emulator whose store already holds `events`.
+/// One emulator whose internet-event feed is exactly `events`.
 ///
 /// `crate::monitor_lifecycle::emulator` drops the engine it builds, and a seeded case
-/// needs it: the events a real service would have observed are written straight into the
-/// store, because the API models no operation that creates one.
+/// needs it. The store comes with the service's own feed (an internet event is an
+/// observation the service makes, so no account starts without one, and
+/// `crate::feed_and_query_results` covers it); a case whose rows name the exact set a
+/// listing must report replaces that feed with its own fixture, so what it asserts is its
+/// own records and nothing else.
 fn emulator_holding(events: &[InternetEventRecord]) -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     {
         let state = service_state(&*engine).expect("the service's own store");
         let mut store = state.lock();
+        store.internet_events.clear();
         for event in events {
             store.record_internet_event(event.clone());
         }
@@ -232,10 +236,9 @@ fn id_set(ids: &[&str]) -> BTreeSet<String> {
 }
 
 #[tokio::test]
-async fn an_emulator_that_has_observed_nothing_lists_no_internet_events() {
-    // No modelled operation mints an internet event — it is the service's own observation
-    // of the public internet — so a store that holds none reports an empty list rather
-    // than an invented one.
+async fn an_emulator_whose_feed_holds_nothing_lists_no_internet_events() {
+    // The reporting path invents nothing: an internet-event store that holds no record
+    // reports an empty list, under every filter and page size.
     let router = emulator_holding(&[]);
 
     let (status, listed) = call(&router, "GET", EVENTS_PATH, None).await;
@@ -772,15 +775,6 @@ async fn a_request_outside_the_contract_is_refused_and_one_inside_it_is_not() {
             case: "a NextToken this service never minted",
             query: "NextToken=not-a-token".to_string(),
             names: "NextToken",
-        },
-        RefusalCase {
-            case: "a time frame whose start is after its end",
-            query: format!(
-                "StartTime={}&EndTime={}",
-                query_time(base),
-                query_time(shifted(base, -60))
-            ),
-            names: "StartTime",
         },
     ];
 

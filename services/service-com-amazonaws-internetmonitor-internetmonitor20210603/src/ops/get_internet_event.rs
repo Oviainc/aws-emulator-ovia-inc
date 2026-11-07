@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInternetEvent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInternetEvent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInternetEvent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the one internet event the request names, from the feed [`crate::state`] holds
+//! (see `crate::state::seed_internet_events`): an internet event is an observation the
+//! service makes of the public internet, shown on one global outages map to every account,
+//! so this `@readonly` operation resolves the `EventId` against that store and refuses an
+//! id it does not hold with the modelled `ValidationException` (HTTP 400) rather than
+//! inventing an event. `EventStatus` is derived from `EndedAt` by the record itself, so
+//! this report and `ListInternetEvents`' summary of the same event cannot disagree.
 //!
 //! ## Shape of an operation
 //!
@@ -157,20 +156,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInternetEvent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInternetEventErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInternetEvent"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetInternetEventError::Modeled(GetInternetEventErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("internet event store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // A reporting operation: the store is read and never written, so what a later
+        // caller sees is unchanged by this call.
+        let store = state.lock();
+
+        // An `EventId` the feed does not hold names no internet event, which is the same
+        // refusal this service answers for any resource id it cannot resolve, worded by the
+        // one rule in `crate::state` and naming the event's own resource path.
+        let Some(event) = store.internet_events.get(&input.event_id) else {
+            return Err(GetInternetEventErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::invalid_resource_id_message(
+                    &crate::state::internet_event_resource_path(&input.event_id),
+                )),
+            })
+            .into());
+        };
+
+        Ok(GetInternetEventOutput {
+            event_id: event.event_id.clone(),
+            event_arn: event.event_arn.clone(),
+            started_at: crate::state::wire_timestamp(event.started_at),
+            ended_at: event.ended_at.map(crate::state::wire_timestamp),
+            client_location: event.client_location.clone(),
+            event_type: event.event_type.clone(),
+            event_status: event.status().to_string(),
+        })
     }
 }

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/error_code_member.rs"]
 mod error_code_member;
+#[path = "all/feed_and_query_results.rs"]
+mod feed_and_query_results;
 #[path = "all/health_events.rs"]
 mod health_events;
 #[path = "all/internet_events.rs"]

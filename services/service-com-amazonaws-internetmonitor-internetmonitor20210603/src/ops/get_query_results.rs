@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetQueryResults
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetQueryResults`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetQueryResults::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the repository of data a started query holds: the `Fields` that repository is
+//! made of and the `Data` rows the query selected, paged by `MaxResults` with an opaque
+//! `NextToken`.
+//!
+//! A `QueryId` is "an internally-generated identifier for a specific query" of one
+//! monitor, so this `@readonly` operation resolves (`MonitorName`, `QueryId`) against the
+//! query store [`crate::state`] holds and refuses an id no query of that monitor carries
+//! with the modelled `ValidationException` (HTTP 400) — the same lookup and the same
+//! wording `GetQueryStatus` and `StopQuery` answer with, so the query interface cannot
+//! disagree with itself about which ids exist.
+//!
+//! The query interface "sets up a repository of data that is a subset of your
+//! application's Internet Monitor data" (`FilterParameter`'s documentation), so the rows
+//! are projected from the Internet Monitor data this service holds for the query's
+//! monitor — the measurements its health events carry for each impacted client location —
+//! bounded by the query's own `StartTime`/`EndTime` and narrowed by the
+//! `FilterParameters` it was started with. Nothing is invented: a monitor whose stored
+//! measurements hold no row inside the window reports none.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +99,233 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page `MaxResults` allows, from its modelled range 1..1000 (see
+/// `smithy_query(query="operation",operation="GetQueryResults")`). An absent `MaxResults`
+/// takes a full page.
+const MAX_PAGE_SIZE: i32 = 1000;
+
+/// The `Operator` member that NEGATES a filter; every other value compares for equality
+/// (see `crate::ops::types::OPERATOR_VALUES`, which declares exactly `EQUALS` and
+/// `NOT_EQUALS`).
+const OPERATOR_NOT_EQUALS: &str = "NOT_EQUALS";
+
+/// The `QueryType` member whose results are the measurements themselves: one row per
+/// measurement the monitor holds inside the query's window (see
+/// `crate::ops::types::QUERY_TYPE_VALUES`).
+const MEASUREMENTS_QUERY_TYPE: &str = "MEASUREMENTS";
+
+/// The `QueryType` members whose results are the impacted CLIENT LOCATIONS rather than
+/// every measurement: one row per location, carrying that location's most recent
+/// measurement inside the query's window (see `crate::ops::types::QUERY_TYPE_VALUES`).
+const LOCATION_QUERY_TYPES: &[&str] = &["TOP_LOCATIONS", "TOP_LOCATION_DETAILS"];
+
+/// One measurement of the repository a query reports: when it was taken, and the client
+/// location it was taken for.
+///
+/// This is the Internet Monitor data this service holds — a monitor's health events carry
+/// one [`ImpactedLocation`] per client location, each with that location's
+/// `InternetHealth` measurements — so a row is a projection of stored state and never a
+/// fabricated measurement.
+struct MeasurementRow<'a> {
+    /// The instant the measurement was taken, which bounds the row against the query's
+    /// own `StartTime`/`EndTime`.
+    at: ::std::time::SystemTime,
+    /// The stored location the row projects.
+    location: &'a ImpactedLocation,
+}
+
+/// One column of that repository: the `QueryField` it is reported as, and how a row's
+/// value for it is rendered.
+///
+/// One catalog drives `Fields`, every value in `Data` and the `FilterParameters` lookup,
+/// so the three cannot disagree about what a column is called or what it holds.
+struct Column {
+    /// The `QueryField` `Name`.
+    name: &'static str,
+    /// The `QueryField` `Type`: the model describes a field as a "name-data type pair,
+    /// such as availability_score-float"
+    /// (`smithy_query(query="doc",shape="GetQueryResultsOutput",member="Fields")`).
+    kind: &'static str,
+    /// This column's value for one row, rendered as the string `QueryData` carries
+    /// (`QueryData` is a list of lists of strings); a member the stored record leaves
+    /// unset renders as the empty string.
+    value: fn(&MeasurementRow<'_>) -> String,
+}
+
+/// The repository's columns: the members the model declares for a measured client
+/// location — `ImpactedLocation`, and the `InternetHealth` /
+/// `AvailabilityMeasurement` / `PerformanceMeasurement` / `RoundTripTime` shapes it
+/// carries (`smithy_query(query="shape",shape="ImpactedLocation,InternetHealth,AvailabilityMeasurement,PerformanceMeasurement,RoundTripTime")`)
+/// — each named in the model's own `name-data type` form.
+const COLUMNS: &[Column] = &[
+    Column {
+        name: "timestamp",
+        kind: "timestamp",
+        value: |row| {
+            crate::state::wire_timestamp(row.at)
+                .fmt(::aws_smithy_types::date_time::Format::DateTime)
+                .unwrap_or_default()
+        },
+    },
+    Column {
+        name: "as_name",
+        kind: "string",
+        value: |row| row.location.as_name.clone(),
+    },
+    Column {
+        name: "as_number",
+        kind: "integer",
+        value: |row| row.location.as_number.to_string(),
+    },
+    Column {
+        name: "country",
+        kind: "string",
+        value: |row| row.location.country.clone(),
+    },
+    Column {
+        name: "subdivision",
+        kind: "string",
+        value: |row| text(row.location.subdivision.as_deref()),
+    },
+    Column {
+        name: "metro",
+        kind: "string",
+        value: |row| text(row.location.metro.as_deref()),
+    },
+    Column {
+        name: "city",
+        kind: "string",
+        value: |row| text(row.location.city.as_deref()),
+    },
+    Column {
+        name: "latitude",
+        kind: "float",
+        value: |row| number(row.location.latitude),
+    },
+    Column {
+        name: "longitude",
+        kind: "float",
+        value: |row| number(row.location.longitude),
+    },
+    Column {
+        name: "status",
+        kind: "string",
+        value: |row| row.location.status.clone(),
+    },
+    Column {
+        name: "service_location",
+        kind: "string",
+        value: |row| text(row.location.service_location.as_deref()),
+    },
+    Column {
+        name: "availability_score",
+        kind: "float",
+        value: |row| number(availability(row).and_then(|measured| measured.experience_score)),
+    },
+    Column {
+        name: "performance_score",
+        kind: "float",
+        value: |row| number(performance(row).and_then(|measured| measured.experience_score)),
+    },
+    Column {
+        name: "percent_of_total_traffic_impacted",
+        kind: "float",
+        value: |row| {
+            number(
+                availability(row).and_then(|measured| measured.percent_of_total_traffic_impacted),
+            )
+        },
+    },
+    Column {
+        name: "percent_of_client_location_impacted",
+        kind: "float",
+        value: |row| {
+            number(
+                availability(row)
+                    .and_then(|measured| measured.percent_of_client_location_impacted),
+            )
+        },
+    },
+    Column {
+        name: "rtt_p50",
+        kind: "float",
+        value: |row| number(round_trip_time(row).and_then(|rtt| rtt.p50)),
+    },
+    Column {
+        name: "rtt_p90",
+        kind: "float",
+        value: |row| number(round_trip_time(row).and_then(|rtt| rtt.p90)),
+    },
+    Column {
+        name: "rtt_p95",
+        kind: "float",
+        value: |row| number(round_trip_time(row).and_then(|rtt| rtt.p95)),
+    },
+];
+
+/// A string member's value, or the empty string for one the stored record leaves unset.
+fn text(value: Option<&str>) -> String {
+    value.unwrap_or_default().to_string()
+}
+
+/// A numeric member's value, or the empty string for one the stored record leaves unset.
+fn number(value: impl Into<Option<f64>>) -> String {
+    value
+        .into()
+        .map_or_else(String::new, |measured| measured.to_string())
+}
+
+/// The availability measurement of a row's location, if it carries one.
+fn availability<'a>(row: &'a MeasurementRow<'_>) -> Option<&'a AvailabilityMeasurement> {
+    row.location
+        .internet_health
+        .as_ref()?
+        .availability
+        .as_ref()
+}
+
+/// The performance measurement of a row's location, if it carries one.
+fn performance<'a>(row: &'a MeasurementRow<'_>) -> Option<&'a PerformanceMeasurement> {
+    row.location
+        .internet_health
+        .as_ref()?
+        .performance
+        .as_ref()
+}
+
+/// The round-trip time of a row's performance measurement, if it carries one.
+fn round_trip_time<'a>(row: &'a MeasurementRow<'_>) -> Option<&'a RoundTripTime> {
+    performance(row)?.round_trip_time.as_ref()
+}
+
+/// Whether `row` satisfies every `FilterParameter` the query was started with.
+///
+/// "For each filter, you specify a field (such as `city`), an operator (such as
+/// `not_equals`), and a value or array of values": a filter keeps a row whose value for
+/// the named field is one of the values it lists, and `NOT_EQUALS` keeps exactly the rows
+/// equality would not. A filter that names no field constrains nothing; one that names a
+/// field the repository has no column for matches no row's value, so equality keeps
+/// nothing and its negation keeps everything.
+fn keeps(row: &MeasurementRow<'_>, filters: &[FilterParameter]) -> bool {
+    filters.iter().all(|filter| {
+        let Some(field) = filter.field.as_deref() else {
+            return true;
+        };
+        let empty: Vec<String> = Vec::new();
+        let values = filter.values.as_ref().unwrap_or(&empty);
+        let matched = COLUMNS
+            .iter()
+            .find(|column| column.name == field)
+            .map(|column| (column.value)(row))
+            .is_some_and(|value| values.contains(&value));
+        if filter.operator.as_deref() == Some(OPERATOR_NOT_EQUALS) {
+            !matched
+        } else {
+            matched
+        }
+    })
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -125,6 +362,87 @@ impl From<GetQueryResultsErrorModeled> for GetQueryResultsError {
     }
 }
 
+/// The rows a completed query reports, in one stable order.
+///
+/// Every row comes from the Internet Monitor data stored for the query's monitor: one per
+/// client location of each health event whose measurement instant lies inside the query's
+/// own `StartTime`/`EndTime`, kept only when the query's `FilterParameters` keep it. The
+/// `QueryType` then decides which of those rows the repository holds:
+///
+/// * the measurement type reports every row ([`MEASUREMENTS_QUERY_TYPE`]);
+/// * the location types report one row per client location ([`LOCATION_QUERY_TYPES`]),
+///   carrying that location's most recent measurement in the window;
+/// * the remaining types are the traffic-routing and suggestion reports, which AWS
+///   computes from traffic this emulator does not route — it holds no such data, so their
+///   repository has no rows rather than invented ones.
+fn selected_rows<'a>(
+    store: &'a crate::state::ComAmazonawsInternetmonitorInternetmonitor20210603State,
+    query: &'a crate::state::QueryRecord,
+) -> Vec<MeasurementRow<'a>> {
+    let measured: Vec<MeasurementRow<'a>> = store
+        .health_events_for(&query.monitor_name)
+        .filter(|event| {
+            let at = crate::state::epoch_seconds(event.started_at);
+            at >= query.start_time && at <= query.end_time
+        })
+        .flat_map(|event| {
+            event
+                .impacted_locations
+                .iter()
+                .map(move |location| MeasurementRow {
+                    at: event.started_at,
+                    location,
+                })
+        })
+        .filter(|row| keeps(row, &query.filter_parameters))
+        .collect();
+
+    if query.query_type == MEASUREMENTS_QUERY_TYPE {
+        return measured;
+    }
+    if !LOCATION_QUERY_TYPES.contains(&query.query_type.as_str()) {
+        // The remaining types report traffic-routing and overall-traffic SUGGESTIONS, which
+        // AWS computes from the traffic it routes for the monitor's resources. This
+        // emulator routes none and holds no routing or prediction data of any kind, so the
+        // honest repository for those types is the columns the query asked for and no rows:
+        // reporting a row here would be a suggestion nothing computed. The caller can tell
+        // the two apart through the query's own status, which `GetQueryStatus` reports.
+        return Vec::new();
+    }
+
+    // One row per client location, which is what a location report is: the location's
+    // most recent measurement in the window wins, and the rows come out in one stable
+    // order because the map is keyed by the location's own identity.
+    let mut by_location: ::std::collections::BTreeMap<LocationKey, MeasurementRow<'a>> =
+        ::std::collections::BTreeMap::new();
+    for row in measured {
+        let key = location_key(row.location);
+        match by_location.get(&key) {
+            Some(held) if held.at >= row.at => {}
+            _ => {
+                by_location.insert(key, row);
+            }
+        }
+    }
+    by_location.into_values().collect()
+}
+
+/// A client location's identity, as the members that name a place rather than measure it:
+/// a location report holds one row per distinct value of this (see
+/// `smithy_query(query="shape",shape="ImpactedLocation")`).
+type LocationKey = (i64, String, String, String, String);
+
+/// The [`LocationKey`] of one stored location.
+fn location_key(location: &ImpactedLocation) -> LocationKey {
+    (
+        location.as_number,
+        location.country.clone(),
+        location.subdivision.clone().unwrap_or_default(),
+        location.city.clone().unwrap_or_default(),
+        location.metro.clone().unwrap_or_default(),
+    )
+}
+
 /// The `GetQueryResults` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -159,20 +477,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetQueryResults` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetQueryResultsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetQueryResults"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetQueryResultsError::Modeled(GetQueryResultsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("monitor store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // The token is opaque to the caller: it names how many rows of this query's
+        // repository a previous page already reported, so one this service did not mint is
+        // a bad request rather than an empty page.
+        let resume_after = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => {
+                match crate::state::decode_page_token(token)
+                    .and_then(|resume| resume.parse::<usize>().ok())
+                {
+                    Some(resume) => resume,
+                    None => {
+                        return Err(GetQueryResultsErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(
+                                    "NextToken is not a token this service issued.".to_string(),
+                                ),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        // `MaxResults` is modelled 1..1000, so the boundary validator has already refused
+        // anything outside that; an absent one takes the maximum page. The clamp keeps the
+        // page size inside the modelled range even if a request ever reached here
+        // unvalidated.
+        let page_size = usize::try_from(
+            input.max_results.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE),
+        )
+        .unwrap_or(1);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Materialise the clock-owed QUEUED -> RUNNING -> SUCCEEDED transitions before
+        // reading, so this report answers for the status the query already had at `now`.
+        store.settle_all(now);
+
+        // One lookup, keyed by BOTH halves the request names: a `QueryId` identifies a
+        // query of one monitor, so an id another monitor's query carries — or one nothing
+        // minted — resolves nothing and is refused rather than answered with an empty
+        // result schema.
+        let Some(query) = store.query_for(&input.monitor_name, &input.query_id).cloned() else {
+            return Err(GetQueryResultsErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::INVALID_QUERY_ID_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        // A query that has not completed has produced no rows yet — its caller polls
+        // `GetQueryStatus` for that — and one that was canceled or failed produced none at
+        // all, so only a `SUCCEEDED` query reports rows. The repository's own columns are
+        // reported either way: they are what the query asked for, not what it found.
+        let rows: Vec<MeasurementRow<'_>> =
+            if query.status == crate::state::QUERY_STATUS_SUCCEEDED {
+                selected_rows(&store, &query)
+            } else {
+                Vec::new()
+            };
+
+        // One past the page, so the presence of a further row is what decides whether
+        // there is a `NextToken` — never a token that pages to nothing.
+        let page: Vec<&MeasurementRow<'_>> = rows
+            .iter()
+            .skip(resume_after)
+            .take(page_size.saturating_add(1))
+            .collect();
+        let next_token = (page.len() > page_size).then(|| {
+            crate::state::encode_page_token(&resume_after.saturating_add(page_size).to_string())
+        });
+
+        Ok(GetQueryResultsOutput {
+            fields: COLUMNS
+                .iter()
+                .map(|column| QueryField {
+                    name: Some(column.name.to_string()),
+                    r#type: Some(column.kind.to_string()),
+                })
+                .collect(),
+            data: page
+                .into_iter()
+                .take(page_size)
+                .map(|row| {
+                    COLUMNS
+                        .iter()
+                        .map(|column| (column.value)(row))
+                        .collect::<Vec<String>>()
+                })
+                .collect(),
+            next_token,
+        })
     }
 }

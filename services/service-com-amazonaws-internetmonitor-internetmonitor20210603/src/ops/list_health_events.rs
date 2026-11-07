@@ -213,16 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let window_start = input.start_time.map(|at| at.as_secs_f64());
         let window_end = input.end_time.map(|at| at.as_secs_f64());
-        // A window that ends before it starts selects no instant at all, so it is a bad
-        // request rather than an empty page.
-        if let (Some(start), Some(end)) = (window_start, window_end) {
-            if start > end {
-                return Err(ListHealthEventsErrorModeled::ValidationException(ValidationException {
-                    message: Some("StartTime must not be after EndTime.".to_string()),
-                })
-                .into());
-            }
-        }
+        // A window whose start is after its end selects no instant at all, so it is
+        // refused with the one wording this service uses for that class (the rule lives in
+        // `crate::state`, which every operation that carries a window shares).
+        crate::state::ordered_time_window(window_start, window_end)
+            .map_err(ListHealthEventsErrorModeled::ValidationException)?;
 
         // The token is opaque to the caller, so one this service did not mint is a bad
         // request rather than an empty page.

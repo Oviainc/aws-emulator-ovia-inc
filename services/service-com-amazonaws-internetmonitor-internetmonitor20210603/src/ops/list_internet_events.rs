@@ -10,8 +10,8 @@
 //! Internet events are observations Internet Monitor makes of the public internet, not
 //! resources a caller creates: the model declares no operation that mints one and this
 //! operation is `@readonly`, so it reports exactly the records the store holds (see
-//! [`crate::state::InternetEventRecord`]) — an empty list while it holds none — and writes
-//! nothing.
+//! [`crate::state::InternetEventRecord`]) — the service's own feed, which every account
+//! reads whether or not it has configured anything — and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -202,17 +202,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .map(::aws_smithy_types::DateTime::as_secs_f64)
             .unwrap_or_else(|| crate::state::epoch_seconds(now));
-        if start_bound.is_some_and(|start| start > end_bound) {
-            return Err(ListInternetEventsErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(
-                        "StartTime must not be later than EndTime: the time frame holds no instant."
-                            .to_string(),
-                    ),
-                },
-            )
-            .into());
-        }
+        // A window whose start is after its end selects no instant, so it is refused with
+        // the one wording this service uses for that class (the rule lives in
+        // `crate::state`, which every operation that carries a window shares).
+        crate::state::ordered_time_window(start_bound, Some(end_bound))
+            .map_err(ListInternetEventsErrorModeled::ValidationException)?;
 
         // The token is opaque to the caller, so one this service did not mint is a bad
         // request rather than an empty page.

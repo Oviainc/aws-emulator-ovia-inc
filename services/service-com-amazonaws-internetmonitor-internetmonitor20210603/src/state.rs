@@ -12,7 +12,10 @@
 //! `(MonitorName, EventId)`, so `ListHealthEvents` reports exactly the events recorded for
 //! the monitor it names and a monitor nothing has recorded an event for reports none.
 //! The service's **internet events** (see [`InternetEventRecord`]), which
-//! `ListInternetEvents` reports, live in their own store beside them.
+//! `ListInternetEvents` and `GetInternetEvent` report, live in their own store beside
+//! them, holding the feed [`internet_event_feed`] observes for the service itself (an
+//! internet event is a global observation every account reads, not a resource a caller
+//! creates).
 //!
 //! The query interface's **queries** (see [`QueryRecord`]) live in one store keyed by
 //! `QueryId`: `StartQuery` mints one, `GetQueryStatus` reports its status and `StopQuery`
@@ -22,6 +25,12 @@
 //! The small helpers below (region, ARN, wire timestamp, epoch seconds, page token) live
 //! beside the store rather than in one operation's file because several handlers need
 //! exactly the same rule and two copies of it would be two rules.
+
+mod internet_event_feed;
+
+pub use internet_event_feed::{
+    seed_event_id, seed_internet_events, INTERNET_EVENT_FEED_WINDOW, SEEDED_INTERNET_EVENTS,
+};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
@@ -349,9 +358,10 @@ impl QueryRecord {
 /// Internet events are the service's own observations of the global internet, never
 /// something a caller creates: the model declares no operation that creates, updates or
 /// deletes one, and both operations that report them (`ListInternetEvents`,
-/// `GetInternetEvent`) are `@readonly`. This emulator measures no internet traffic, so it
-/// observes no event and invents none: the reporting operations answer from exactly the
-/// records this store holds, which is an empty list until something puts a record here.
+/// `GetInternetEvent`) are `@readonly`. The feed every account reads is therefore a
+/// property of the service, held in this store from the moment it exists (see
+/// [`seed_internet_events`]), and the reporting operations answer from exactly the records
+/// it holds.
 #[derive(Debug, Clone)]
 pub struct InternetEventRecord {
     /// `EventId` — the store's key, kept on the record so a value-only scan can report
@@ -491,7 +501,11 @@ impl HealthEventRecord {
 /// (`CreateMonitor` answers its modelled `LimitExceededException` at the cap), and the two
 /// idempotency maps are capped at [`MAX_CLIENT_TOKENS`] entries each and expire after
 /// [`CLIENT_TOKEN_RETENTION`] (see [`Self::record_create_token`]).
-#[derive(Debug, Default)]
+///
+/// A fresh store holds no monitor, no query and no health event — those exist only once a
+/// caller creates them — but it DOES hold the service's own internet-event feed, which no
+/// caller creates (see [`Default`] and [`seed_internet_events`]).
+#[derive(Debug)]
 pub struct ComAmazonawsInternetmonitorInternetmonitor20210603State {
     /// Every monitor, keyed by `MonitorName`. A `BTreeMap` so `ListMonitors` pages over a
     /// stable total order and its `NextToken` can name a resume point. Bounded by
@@ -507,8 +521,9 @@ pub struct ComAmazonawsInternetmonitorInternetmonitor20210603State {
     /// Every internet event the service knows about, keyed by `EventId`. A `BTreeMap` so
     /// `ListInternetEvents` pages over a stable total order and its `NextToken` can name a
     /// resume point. Bounded by [`MAX_INTERNET_EVENTS`] and written through
-    /// [`Self::record_internet_event`]; empty until something records an event, which is
-    /// what an emulator that measures no internet traffic reports (see
+    /// [`Self::record_internet_event`]; a fresh store already holds the service's own feed
+    /// (see [`seed_internet_events`]), because an internet event is an observation the
+    /// service makes of the public internet rather than anything a caller creates (see
     /// [`InternetEventRecord`]).
     pub internet_events: BTreeMap<String, InternetEventRecord>,
     /// Every health event, keyed by `(MonitorName, EventId)`. A `BTreeMap` so one
@@ -524,6 +539,28 @@ pub struct ComAmazonawsInternetmonitorInternetmonitor20210603State {
     /// The next query sequence number, which [`mint_query_id`] renders into a `QueryId`.
     /// Monotonic for the life of the store, so no two queries can be handed the same id.
     pub next_query_seq: u64,
+}
+
+impl Default for ComAmazonawsInternetmonitorInternetmonitor20210603State {
+    /// A fresh store: no monitor, query, health event or idempotency record — a caller
+    /// has created none yet — and the service's own internet-event feed, which no caller
+    /// creates and which every account therefore reads from the first call (see
+    /// [`seed_internet_events`]).
+    fn default() -> Self {
+        let mut store = Self {
+            monitors: BTreeMap::new(),
+            create_client_tokens: HashMap::new(),
+            update_client_tokens: HashMap::new(),
+            internet_events: BTreeMap::new(),
+            health_events: BTreeMap::new(),
+            queries: BTreeMap::new(),
+            next_query_seq: 0,
+        };
+        for event in seed_internet_events(SystemTime::now()) {
+            store.record_internet_event(event);
+        }
+        store
+    }
 }
 
 impl ComAmazonawsInternetmonitorInternetmonitor20210603State {
@@ -696,10 +733,11 @@ impl ComAmazonawsInternetmonitorInternetmonitor20210603State {
     /// stores is never the one dropped and what is held is the most recent view of
     /// internet health.
     ///
-    /// No operation of this service calls it: the API models none that creates an internet
-    /// event, so today the only writers are tests and fixtures seeding the events a real
-    /// service would have observed (see [`InternetEventRecord`]). Any future writer belongs
-    /// here rather than beside it, so one store stays the single source of truth.
+    /// The API models no operation that creates an internet event, so the writers are this
+    /// store's own construction — which seeds the feed the service observes for itself
+    /// (see [`seed_internet_events`]) — and tests. Any future writer belongs here rather
+    /// than beside it, so one store stays the single source of truth for both reporting
+    /// operations.
     pub fn record_internet_event(&mut self, record: InternetEventRecord) {
         // One eviction per record over the ceiling, each found as a running minimum rather
         // than by sorting the whole map.
@@ -790,7 +828,14 @@ pub fn monitor_arn(region: &str, monitor_name: &str) -> String {
 /// is a global observation of the public internet, shown on one outages map to every
 /// customer, not a resource that lives in the region the request was signed for.
 pub fn internet_event_arn(event_id: &str) -> String {
-    ::engine::emulator_arn(ARN_NAMESPACE, "", &format!("internet-event/{event_id}"))
+    ::engine::emulator_arn(ARN_NAMESPACE, "", &internet_event_resource_path(event_id))
+}
+
+/// The resource path an internet event is identified by: the resource half of
+/// [`internet_event_arn`], and what [`invalid_resource_id_message`] names it with, so the
+/// ARN and the refusal that names the same event cannot spell it differently.
+pub fn internet_event_resource_path(event_id: &str) -> String {
+    format!("internet-event/{event_id}")
 }
 
 /// A health event's ARN:
@@ -863,15 +908,39 @@ pub const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
 /// request named with, carried by the modelled `ValidationException` (HTTP 400).
 pub const INVALID_QUERY_ID_MESSAGE: &str = "Invalid query ID provided";
 
+/// The message this service words a request whose time window selects no instant with,
+/// carried by the modelled `ValidationException` (HTTP 400). The text is fixed: it states
+/// the class of the failure and names neither bound, nor a member, nor any value from the
+/// request.
+pub const INVALID_TIME_WINDOW_MESSAGE: &str = "Invalid time window specified";
+
+/// Refuse a time window whose start instant lies after its end instant, which selects no
+/// instant at all.
+///
+/// One rule — and so one wording, [`INVALID_TIME_WINDOW_MESSAGE`] — for every operation
+/// that bounds instants by a window the request carries (`ListInternetEvents`,
+/// `ListHealthEvents`), so none of them can word the same refusal differently. Both bounds
+/// are optional in the model: a window with only one bound, or with neither, holds instants
+/// and is not refused. The caller lifts the returned exception into its own operation's
+/// error channel, the only part that differs between them.
+pub fn ordered_time_window(start: Option<f64>, end: Option<f64>) -> Result<(), ValidationException> {
+    match (start, end) {
+        (Some(start), Some(end)) if start > end => Err(ValidationException {
+            message: Some(INVALID_TIME_WINDOW_MESSAGE.to_string()),
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// The message this service words a resource id the request named but this account does
 /// not hold with, carried by the modelled `ValidationException` (HTTP 400): it states the
 /// resource PATH the request named, which is what identifies the resource inside the
 /// account (`health-event/<MonitorName>/<EventId>` for a health event,
 /// `monitor/<MonitorName>` for a monitor).
 ///
-/// One rule for every operation whose addressed resource is reached THROUGH a monitor
-/// rather than being the monitor itself, so the two cannot word the same refusal
-/// differently.
+/// One rule for every operation whose addressed resource is NOT the monitor the request
+/// names — one reached through a monitor, or an internet event
+/// ([`internet_event_resource_path`]) — so they cannot word the same refusal differently.
 pub fn invalid_resource_id_message(resource_path: &str) -> String {
     format!("resourceID is invalid: {resource_path}")
 }

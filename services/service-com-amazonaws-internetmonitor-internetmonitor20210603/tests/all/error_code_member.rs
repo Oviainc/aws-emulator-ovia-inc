@@ -229,7 +229,7 @@ async fn every_refusal_names_its_exception_in_the_code_member() {
 }
 
 #[tokio::test]
-async fn a_success_and_a_scaffold_signal_carry_no_code_member() {
+async fn a_success_carries_no_code_member() {
     let router = emulator();
     create_monitor(&router, json!({ "MonitorName": MONITOR })).await;
 
@@ -237,6 +237,7 @@ async fn a_success_and_a_scaffold_signal_carry_no_code_member() {
     for (case, path) in [
         ("GetMonitor", format!("/v20210603/Monitors/{MONITOR}")),
         ("ListMonitors", "/v20210603/Monitors".to_string()),
+        ("ListInternetEvents", "/v20210603/InternetEvents".to_string()),
     ] {
         let (status, body) = call(&router, "GET", &path, None).await;
         assert_eq!(
@@ -249,23 +250,26 @@ async fn a_success_and_a_scaffold_signal_carry_no_code_member() {
         );
     }
 
-    // The 501 for an operation nobody has written yet is the emulator's own signal rather
-    // than one of this service's exceptions, so it is left exactly as the framework
-    // rendered it.
+    // Including the single-event read of the service's own internet-event feed, whose id
+    // comes from the listing rather than from a constant.
+    let (_, listed) = call(&router, "GET", "/v20210603/InternetEvents", None).await;
+    let event_id = listed["InternetEvents"][0]["EventId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the feed must report an event, got {listed}"))
+        .to_string();
     let (status, body) = call(
         &router,
         "GET",
-        &format!("/v20210603/Monitors/{MONITOR}/Queries/some-query/Results"),
+        &format!("/v20210603/InternetEvents/{event_id}"),
         None,
     )
     .await;
     assert_eq!(
-        status, 501,
-        "a scaffolded operation: expected 501, got {status} with {body}"
+        status, 200,
+        "GetInternetEvent: expected 200, got {status} with {body}"
     );
     assert!(
         body.get("code").is_none(),
-        "a scaffold signal is not an Internet Monitor exception, so it must carry no code \
-         member, got {body}"
+        "GetInternetEvent: a success must carry no code member, got {body}"
     );
 }

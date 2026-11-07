@@ -1358,14 +1358,14 @@ async fn a_monitor_name_no_monitor_carries_is_refused_with_the_modelled_error() 
 }
 
 #[tokio::test]
-async fn the_operations_outside_this_slice_still_answer_501() {
+async fn the_reads_of_the_query_and_internet_event_surface_answer_from_state() {
     let router = emulator();
     create_monitor(&router, json!({ "MonitorName": "untouched-monitor" })).await;
 
-    // A stub answers 501 NotImplemented rather than an empty success, so the stub census
-    // stays honest while these operations are filed separately. The query interface's
-    // own operations (StartQuery, GetQueryStatus, StopQuery) are implemented and have
-    // their own suite; `GetQueryResults` is still filed on its own.
+    // Both of these were the crate's last scaffolds. Neither answers 501 any more: each
+    // resolves what the request names against the store and refuses what it cannot
+    // resolve with the modelled 400 `ValidationException`. What each one SERVES is
+    // covered end to end by `crate::feed_and_query_results`.
     let cases: Vec<(&str, &str, String, Option<Value>)> = vec![
         (
             "GetQueryResults",
@@ -1376,7 +1376,7 @@ async fn the_operations_outside_this_slice_still_answer_501() {
         (
             "GetInternetEvent",
             "GET",
-            "/v20210603/InternetEvents/some-event-id".to_string(),
+            "/v20210603/InternetEvents/no-such-event".to_string(),
             None,
         ),
     ];
@@ -1384,8 +1384,8 @@ async fn the_operations_outside_this_slice_still_answer_501() {
     for (case, method, path, body) in cases {
         let (status, response) = call(&router, method, &path, body).await;
         assert_eq!(
-            status, 501,
-            "case {case}: expected 501, got {status} with {response}"
+            status, 400,
+            "case {case}: expected 400, got {status} with {response}"
         );
     }
 }
