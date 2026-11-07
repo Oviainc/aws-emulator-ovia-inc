@@ -262,7 +262,10 @@ async fn a_failed_update_reports_the_summary_sentence_alone() {
             member("StackName", stack),
             member(
                 "TemplateBody",
-                &one_bucket(json!({"VersioningConfiguration": {"Status": "Enabled"}})),
+                // A property no Amazon S3 call this emulator makes writes on a bucket that
+                // exists: the ones it DOES write (the tag set, the versioning state) are
+                // applied to the live bucket instead (`bucket_property_updates.rs`).
+                &one_bucket(json!({"WebsiteConfiguration": {"IndexDocument": "index.html"}})),
             ),
         ],
     )

@@ -67,12 +67,20 @@ fn template_without_the_protected_resource(free_value: &str) -> String {
 }
 
 /// What a row expects of the update: the stack completes it, or the policy denies it with
-/// this statement index and this action against this logical id.
+/// this statement index — counted from ONE, as the document numbers its statements to a
+/// reader — and the action and resource THAT statement forbids.
 enum Expected {
     Completed,
     Denied {
         statement: &'static str,
+        /// The action the denied resource's update plans, which is what a denial reports
+        /// where NO statement allows it (there is no statement to quote then).
         action: &'static str,
+        /// The `Action` the denying statement itself carries, which is what a denial
+        /// attributed to a statement reports.
+        denies: &'static str,
+        /// ...and its `Resource`.
+        protects: &'static str,
         logical_id: &'static str,
     },
 }
@@ -106,8 +114,10 @@ fn policy_cases() -> Vec<PolicyCase> {
             ]),
             updated: template("policy-deny-all-modify-protected", "v2", "v2"),
             expected: Expected::Denied {
-                statement: "1",
+                statement: "2",
                 action: "Update:Modify",
+                denies: "Update:*",
+                protects: "LogicalResourceId/Protected",
                 logical_id: "Protected",
             },
         },
@@ -121,8 +131,10 @@ fn policy_cases() -> Vec<PolicyCase> {
             ]),
             updated: template("policy-deny-modify-protected", "v2", "v1"),
             expected: Expected::Denied {
-                statement: "1",
+                statement: "2",
                 action: "Update:Modify",
+                denies: "Update:Modify",
+                protects: "LogicalResourceId/Protected",
                 logical_id: "Protected",
             },
         },
@@ -136,23 +148,32 @@ fn policy_cases() -> Vec<PolicyCase> {
             ]),
             updated: template("policy-deny-replace-renamed", "v1", "v1"),
             expected: Expected::Denied {
-                statement: "1",
+                statement: "2",
                 action: "Update:Replace",
+                denies: "Update:Replace",
+                protects: "LogicalResourceId/Protected",
                 logical_id: "Protected",
             },
         },
         PolicyCase {
+            // A `Resource` WILDCARD covering the protected resource rather than its logical
+            // id spelled out, because the update DROPS that resource: a stored statement
+            // naming a logical id the submitted template does not declare is refused before
+            // the update is weighed at all
+            // (`stored_stack_policy_validation.rs` is the suite that pins that refusal).
             case: "Deny Update:Delete, with the update dropping the resource",
             stack: "policy-deny-delete",
             policy: policy_of(&[
                 ALLOW_EVERYTHING,
                 r#"{"Effect":"Deny","Action":"Update:Delete","Principal":"*",
-                    "Resource":"LogicalResourceId/Protected"}"#,
+                    "Resource":"LogicalResourceId/Prot*"}"#,
             ]),
             updated: template_without_the_protected_resource("v1"),
             expected: Expected::Denied {
-                statement: "1",
+                statement: "2",
                 action: "Update:Delete",
+                denies: "Update:Delete",
+                protects: "LogicalResourceId/Prot*",
                 logical_id: "Protected",
             },
         },
@@ -183,20 +204,23 @@ fn policy_cases() -> Vec<PolicyCase> {
             ]),
             updated: template("policy-deny-wildcard-resource-protected", "v2", "v1"),
             expected: Expected::Denied {
-                statement: "1",
+                statement: "2",
                 action: "Update:Modify",
+                denies: "Update:*",
+                protects: "LogicalResourceId/Prot*",
                 logical_id: "Protected",
             },
         },
         PolicyCase {
-            case: "a Deny naming another resource, with the update modifying both",
+            case: "a Deny naming another resource of the template, which the update leaves \
+                   alone",
             stack: "policy-deny-another-resource",
             policy: policy_of(&[
                 ALLOW_EVERYTHING,
                 r#"{"Effect":"Deny","Action":"Update:*","Principal":"*",
-                    "Resource":"LogicalResourceId/SomethingElse"}"#,
+                    "Resource":"LogicalResourceId/Free"}"#,
             ]),
-            updated: template("policy-deny-another-resource-protected", "v2", "v2"),
+            updated: template("policy-deny-another-resource-protected", "v2", "v1"),
             expected: Expected::Completed,
         },
         PolicyCase {
@@ -210,8 +234,10 @@ fn policy_cases() -> Vec<PolicyCase> {
             ]),
             updated: template("policy-deny-matching-type-protected", "v2", "v1"),
             expected: Expected::Denied {
-                statement: "1",
+                statement: "2",
                 action: "Update:Modify",
+                denies: "Update:*",
+                protects: "*",
                 logical_id: "Protected",
             },
         },
@@ -240,6 +266,8 @@ fn policy_cases() -> Vec<PolicyCase> {
             expected: Expected::Denied {
                 statement: "none",
                 action: "Update:Modify",
+                denies: "",
+                protects: "",
                 logical_id: "Free",
             },
         },
@@ -254,6 +282,8 @@ fn policy_cases() -> Vec<PolicyCase> {
             expected: Expected::Denied {
                 statement: "none",
                 action: "Update:Modify",
+                denies: "",
+                protects: "",
                 logical_id: "Protected",
             },
         },
@@ -434,6 +464,8 @@ async fn an_update_action_a_stack_policy_denies_does_not_happen() {
             Expected::Denied {
                 statement,
                 action,
+                denies,
+                protects,
                 logical_id,
             } => {
                 assert_eq!(
@@ -448,9 +480,11 @@ async fn an_update_action_a_stack_policy_denies_does_not_happen() {
                         "Action denied by stack policy: No statement allows [{action}] for \
                          resource [LogicalResourceId/{logical_id}];"
                     ),
+                    // The statement that denied it, by its position in the document counted
+                    // from one, and what THAT statement forbids.
                     index => format!(
                         "Action denied by stack policy: Statement [#{index}] does not allow \
-                         [{action}] for resource [LogicalResourceId/{logical_id}];"
+                         [{denies}] for resource [{protects}];"
                     ),
                 };
                 let failed: Vec<&(String, String, String)> = log
@@ -657,8 +691,8 @@ async fn executing_a_change_set_is_held_to_the_stack_policy_too() {
         "case {case:?}: expected the denied execution to roll the stack back, got \
          {reported:?} with {log:?}"
     );
-    let wanted = "Action denied by stack policy: Statement [#1] does not allow \
-                  [Update:Modify] for resource [LogicalResourceId/Protected];";
+    let wanted = "Action denied by stack policy: Statement [#2] does not allow \
+                  [Update:*] for resource [LogicalResourceId/Protected];";
     assert!(
         log.iter().any(|(resource, status_value, reason)| {
             resource == "Protected"

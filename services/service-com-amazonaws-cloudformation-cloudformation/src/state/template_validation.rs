@@ -27,7 +27,9 @@
 //!   condition it does not declare, are unresolved DEPENDENCIES: the section they appear in
 //!   is named, because that is where the author has to look — while an `Fn::GetAtt` reading
 //!   an attribute off a resource the template does not declare is reported for the FUNCTION
-//!   instance that read it;
+//!   instance that read it, as is an `Fn::Sub` whose dotted `${Name.Attribute}` reference
+//!   names no resource attribute at all ([`substitution_attribute_refusal`], which the
+//!   operations that only SUMMARISE a template are held to as well);
 //! * an `Fn::FindInMap` whose keys the `Mappings` section does not carry resolves to
 //!   nothing — unless the lookup names a `DefaultValue` to fall back to;
 //! * and a dependency CYCLE among the declared resources is refused, since no creation
@@ -703,23 +705,123 @@ fn substitution_refusal(
         _ => return None,
     };
     for (name, path) in template::substitution_names(source) {
-        if variables.is_some_and(|supplied| supplied.contains_key(&name)) {
+        // "Fn::Sub: [ String, { Var1Name: Var1Value, … } ]": a variable the substitution
+        // SUPPLIES is substituted whatever it is spelled like, so a key carrying the whole
+        // dotted reference supplies that reference as much as a bare name supplies a bare
+        // one.
+        if supplied(variables, &name, path.as_deref()) {
             continue;
         }
-        let known = match path {
-            // `${Name.Attribute}` reads an attribute off a RESOURCE.
-            Some(_) => declared.resources.contains(name.as_str()),
-            None => {
-                declared.parameters.contains(name.as_str())
-                    || declared.resources.contains(name.as_str())
-                    || PSEUDO_PARAMETERS.contains(&name.as_str())
+        match path {
+            // `${Name.Attribute}` reads an attribute off a RESOURCE — it is an `Fn::GetAtt`
+            // by another spelling — so a reference whose own first segment names no declared
+            // resource is no resource attribute at all, and is reported for the reference it
+            // spelled ([`invalid_resource_attribute`]).
+            Some(reference) => {
+                if !declared.resources.contains(name.as_str()) {
+                    return Some(invalid_resource_attribute(&reference));
+                }
             }
-        };
-        if !known {
-            return Some(unresolved_dependency_in(&name, section));
+            None => {
+                if !declared.parameters.contains(name.as_str())
+                    && !declared.resources.contains(name.as_str())
+                    && !PSEUDO_PARAMETERS.contains(&name.as_str())
+                {
+                    return Some(unresolved_dependency_in(&name, section));
+                }
+            }
         }
     }
     None
+}
+
+/// Whether the substitution's own variable map supplies this variable: by the name as
+/// written, and — for a dotted reference — by the whole reference, which is how such a key is
+/// spelled in the map.
+fn supplied(
+    variables: Option<&::serde_json::Map<String, Value>>,
+    name: &str,
+    reference: Option<&str>,
+) -> bool {
+    variables.is_some_and(|supplied| {
+        supplied.contains_key(name)
+            || reference.is_some_and(|reference| supplied.contains_key(reference))
+    })
+}
+
+/// `Some(message)` for an `Fn::Sub` anywhere in `template` whose dotted reference names no
+/// resource attribute of it — the one rule of a substitution that is about the REFERENCE
+/// rather than about an unresolved name, so an operation that validates no dependencies can
+/// still be held to it.
+///
+/// Read over the same sections every other rule of this pass reads ([`sections`]), so a
+/// reference in any of them is reported.
+pub fn substitution_attribute_refusal(template: &Template) -> Option<String> {
+    let resources: BTreeSet<&str> = template
+        .resources
+        .iter()
+        .map(|resource| resource.logical_id.as_str())
+        .collect();
+    sections(template).find_map(|(_, node)| attribute_reference_in(&node, &resources, 0))
+}
+
+/// [`substitution_attribute_refusal`] over one node.
+fn attribute_reference_in(
+    node: &Value,
+    resources: &BTreeSet<&str>,
+    depth: usize,
+) -> Option<String> {
+    if depth > template::MAX_TEMPLATE_DEPTH {
+        return None;
+    }
+    match node {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| attribute_reference_in(item, resources, depth + 1)),
+        Value::Object(members) => members.iter().find_map(|(key, member)| {
+            if key == "Fn::Sub" {
+                if let Some(message) = dotted_reference_refusal(member, resources) {
+                    return Some(message);
+                }
+            }
+            attribute_reference_in(member, resources, depth + 1)
+        }),
+        _ => None,
+    }
+}
+
+/// `Some(message)` for one `Fn::Sub` whose source string carries a dotted reference naming
+/// no declared resource, honouring the substitution's own variable map exactly as
+/// [`substitution_refusal`] does.
+fn dotted_reference_refusal(argument: &Value, resources: &BTreeSet<&str>) -> Option<String> {
+    let (source, variables) = match argument {
+        Value::String(source) => (source.as_str(), None),
+        Value::Array(parts) => (
+            parts.first()?.as_str()?,
+            parts.get(1).and_then(Value::as_object),
+        ),
+        _ => return None,
+    };
+    template::substitution_names(source)
+        .into_iter()
+        .find_map(|(name, path)| {
+            let reference = path?;
+            if supplied(variables, &name, Some(&reference)) {
+                return None;
+            }
+            (!resources.contains(name.as_str())).then(|| invalid_resource_attribute(&reference))
+        })
+}
+
+/// How an `Fn::Sub` whose dotted reference is no resource attribute is refused.
+///
+/// A TEMPLATE error rather than a template-FORMAT one, and it names the FUNCTION instance
+/// rather than the section, exactly as the `Fn::GetAtt` form of the same mistake does
+/// ([`get_att_undefined_resource`]): the document is well formed and the variable is well
+/// spelled — what is wrong is the reference it reads, which is the one thing the message
+/// states.
+fn invalid_resource_attribute(reference: &str) -> String {
+    format!("Template error: instance of Fn::Sub references invalid resource attribute {reference}")
 }
 
 /// The logical name an `Fn::GetAtt` reads its attribute off, or `None` when the argument

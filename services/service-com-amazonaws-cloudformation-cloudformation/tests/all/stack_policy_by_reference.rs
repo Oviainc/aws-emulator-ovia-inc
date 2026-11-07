@@ -247,8 +247,8 @@ async fn a_stack_policy_staged_in_amazon_s3_becomes_the_policy_the_stack_carries
         let reasons: Vec<String> = xml_texts(&body, "ResourceStatusReason");
         assert!(
             reasons.iter().any(|reason| reason
-                == "Action denied by stack policy: Statement [#1] does not allow \
-                    [Update:Modify] for resource [LogicalResourceId/Protected];"),
+                == "Action denied by stack policy: Statement [#2] does not allow \
+                    [Update:*] for resource [LogicalResourceId/Protected];"),
             "case {case:?}: expected the staged policy's own denial, got {reasons:?}"
         );
         assert!(

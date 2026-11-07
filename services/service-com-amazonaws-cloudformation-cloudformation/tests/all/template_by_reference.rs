@@ -583,16 +583,20 @@ async fn a_template_url_that_resolves_to_no_readable_object_is_refused() {
         "case \"the refused stack name\": expected no stack to exist, got {code} {body}"
     );
 
-    // A STACK SET operation words the SAME refused read differently: what Amazon S3
-    // answered, whatever it refused the read for — so an object the bucket does not hold is
-    // reported as Amazon S3's own sentence rather than as the object's absence. The rows
-    // differ along which refusal Amazon S3 gave (an absent key, an absent bucket) and which
-    // stack set operation took the reference.
+    // A STACK SET operation reports the SAME sentence — one unreadable object is not
+    // described three ways — inside the envelope the StackSets control plane answers its own
+    // refusals in, whose only variable part is the request id THIS response reports. The rows
+    // differ along which refusal Amazon S3 gave (an absent key, which CloudFormation reports
+    // as the object's absence; an absent bucket, which it reports as what Amazon S3 answered)
+    // and which stack set operation took the reference.
     let set_rows: Vec<(&str, String, String)> = vec![
         (
             "a key the staging bucket does not hold",
             Style::VirtualHostedRegional.url("absent.template.json"),
-            s3_error("The specified key does not exist."),
+            format!(
+                "S3 object does not exist. Bucket: {STAGING_BUCKET}, Key: \
+                 absent.template.json. Error: NoSuchKey"
+            ),
         ),
         (
             "a bucket nothing created",
@@ -640,11 +644,42 @@ async fn a_template_url_that_resolves_to_no_readable_object_is_refused() {
                 Some("ValidationError"),
                 "case {case:?}: {action} must answer a ValidationError, got {body}"
             );
+            // The sentence, then the control plane's envelope: the request id in it is the
+            // one THIS response reports, so a client reads one id for one call.
+            let request_id = xml_text(&body, "RequestId").unwrap_or_default();
+            let wanted = format!(
+                "{expected} (Service: AmazonCloudFormation; Status Code: 400; Error Code: \
+                 ValidationError; Request ID: {request_id}; Proxy: null)"
+            );
             assert_eq!(
                 xml_text(&body, "Message").as_deref(),
-                Some(expected.as_str()),
-                "case {case:?}: {action} must report what Amazon S3 answered, got {body}"
+                Some(wanted.as_str()),
+                "case {case:?}: {action} must report the fetch sentence inside the control \
+                 plane's envelope, got {body}"
+            );
+            assert_eq!(
+                request_id.len(),
+                36,
+                "case {case:?}: {action} must report one request id, got {body}"
             );
         }
     }
+
+    // A refused reference writes nothing here either: the StackSet whose create was refused
+    // does not exist, which is the modelled `StackSetNotFoundException`.
+    let (code, body) = call(
+        &router,
+        "DescribeStackSet",
+        &[member("StackSetName", "never-created-set")],
+    )
+    .await;
+    assert_eq!(
+        code, 404,
+        "case \"the refused stack set name\": expected no StackSet to exist, got {code} {body}"
+    );
+    assert_eq!(
+        xml_text(&body, "Code").as_deref(),
+        Some("StackSetNotFoundException"),
+        "case \"the refused stack set name\": expected the modelled not-found, got {body}"
+    );
 }

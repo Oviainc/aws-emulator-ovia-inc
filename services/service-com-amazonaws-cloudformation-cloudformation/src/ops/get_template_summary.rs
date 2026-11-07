@@ -474,6 +474,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(refusal) = template::resources_refusal(&declared) {
             return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
         }
+        // An `Fn::Sub` reads a dotted `${Name.Attribute}` as a resource attribute and
+        // nothing else, so a reference whose name is no resource of the template is one
+        // CloudFormation refuses up front — on this read as much as on the operations that
+        // deploy the body, which is what makes a template this call accepts a deployable one
+        // (`crate::state::template_validation::substitution_attribute_refusal`).
+        if let Some(refusal) =
+            crate::state::template_validation::substitution_attribute_refusal(&declared)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
+        }
 
         // "If set to True, any unrecognized resource types generate warnings and not an
         // error. Any unrecognized resource types are returned in the Warnings output

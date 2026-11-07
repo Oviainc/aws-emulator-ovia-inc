@@ -1672,6 +1672,12 @@ pub mod stack;
 mod failure_summary;
 pub use failure_summary::*;
 
+/// Which stack a stack is NESTED IN, derived from the records the store already holds
+/// ([`stack_nesting`]).
+mod stack_nesting;
+
+pub use stack_nesting::Nesting;
+
 pub use stack::StoredStack;
 
 /// The `Name` a resource's own declaration asks for, read by `provisioning` as well as by

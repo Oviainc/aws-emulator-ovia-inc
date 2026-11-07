@@ -22,8 +22,11 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-# `tokio::time` drives the tests' wait past a stack transition's due instant.
-tokio = { workspace = true, features = ["time"] }
+# `tokio::time` drives the tests' wait past a stack transition's due instant, and
+# `tokio::spawn` serves each in-process provisioning call on a task of its own, so a chain
+# of them does not pile one request's frames onto another's stack (see
+# `state::provisioning::dispatch`).
+tokio = { workspace = true, features = ["time", "rt"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }

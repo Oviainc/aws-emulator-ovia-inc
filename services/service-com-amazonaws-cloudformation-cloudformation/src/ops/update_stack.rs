@@ -62,6 +62,12 @@
 //! every resource exactly as they were. `StackPolicyBody` replaces the stack's stored
 //! policy, which `GetStackPolicy` reports back.
 //!
+//! The policy the stack ALREADY carries is also validated against the submitted template
+//! before any of that ([`crate::state::stack_policy::unknown_logical_id`]): a stored
+//! statement protecting a logical id the submitted template does not declare refuses the
+//! call outright with HTTP 400 `ValidationError`, and the stack keeps its status, its events
+//! and its policy.
+//!
 //! Members this slice stores but has nothing to act on: `ResourceTypes`.
 //! `DisableValidation` turns off pre-deployment validation. `StackPolicyURL` and
 //! `StackPolicyDuringUpdateURL` name those same two policies in Amazon S3: each object is
@@ -313,6 +319,30 @@ fn disables_rollback(input: &UpdateStackInput) -> Option<bool> {
             )
             .then_some(true)
         })
+}
+
+/// The logical ids the template this update submits declares: what the stored stack policy
+/// is validated against ([`crate::state::stack_policy::unknown_logical_id`]).
+///
+/// Read off the stage the update would DEPLOY — the same document the plan below is computed
+/// from — so a resource a transform's expansion contributes is a logical id the template
+/// references, and a template this service cannot process declares none here (the
+/// deployment's own failure is what reports that).
+fn submitted_logical_ids(
+    submitted_body: &str,
+    submitted_stage: &crate::state::template::Processed,
+) -> Vec<String> {
+    submitted_stage
+        .body(submitted_body)
+        .and_then(crate::state::declared_template)
+        .map(|template| {
+            template
+                .resources
+                .iter()
+                .map(|resource| resource.logical_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The resource actions an update PLANS, as the stack policy in force is asked about them.
@@ -794,6 +824,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             _ => processed_template,
         };
+
+        // The policy the stack ALREADY carries is validated against the template this
+        // update submits BEFORE anything else is weighed: "stack policies can only be
+        // applied to logical ids referenced in the template", so a stored statement naming
+        // a logical id the submitted template does not declare refuses the call outright —
+        // nothing is deployed, no event is recorded and the stack keeps the status it has
+        // ([`crate::state::stack_policy::unknown_logical_id`]).
+        if let Some(stored_policy) = &previous.stack_policy_body {
+            crate::state::stack_policy::unknown_logical_id(
+                stored_policy,
+                &submitted_logical_ids(&included_body, &processed_template),
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        }
 
         // CloudFormation refuses an update that would change nothing about the stack. What
         // decides that is the template the update would DEPLOY — the one its transforms

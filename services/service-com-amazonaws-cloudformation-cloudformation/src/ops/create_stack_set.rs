@@ -270,11 +270,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ctx,
                     &crate::state::request_region(ctx.parts()),
                     url,
-                    // A STACK SET operation reports a read Amazon S3 refused as what Amazon
-                    // S3 ANSWERED, whatever it refused it for — the refusal this operation's
-                    // own recorded answer carries, where a stack operation reports an absent
-                    // object as its absence instead.
-                    crate::state::template_url::Refused::AsAmazonS3Answered,
+                    // A refusal of the STACK SETS control plane carries the same fetch
+                    // sentence every operation that reads a reference reports, inside the
+                    // envelope that control plane answers its refusals in
+                    // (`crate::state::template_url::Refused`).
+                    crate::state::template_url::Refused::AsAStackSetsControlPlaneOperation,
                 )
                 .await
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?,

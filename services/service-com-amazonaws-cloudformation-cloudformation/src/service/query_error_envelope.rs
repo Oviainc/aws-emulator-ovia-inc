@@ -180,6 +180,26 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for RequestIdEnvelopeOperation<
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
+            // A constraint a LIST's ELEMENTS break is stated at the list member, quoting the
+            // list the request sent — which needs the REQUEST, so it is decided here rather
+            // than in `Service::override_refusal`
+            // ([`crate::service::list_element_refusals`]). The violations are the
+            // framework's own, so this cannot refuse a request the framework would accept;
+            // every other refusal is left to the framework and to that seam. The definition
+            // is read, used and dropped inside the statement, because
+            // `&dyn ErasedServiceDefinition` is not `Sync` and holding it across an await
+            // below would make this future non-`Send`.
+            let stated = crate::service::list_element_refusals::stated(
+                svc.definition().protocol(),
+                req,
+            );
+            if let Some((violations, refused)) = stated {
+                return svc.definition().refusal_response(
+                    ::aws_smithy_schema_server::ProtocolError::Invalid(violations),
+                    Some(refused),
+                    req,
+                );
+            }
             match modeled_operation(svc, req) {
                 Some(op) => {
                     // A resource-signal wait whose `Timeout` has run out failed its stack's

@@ -209,12 +209,64 @@ mod lambda_event_source_mapping;
 mod lambda_function;
 mod lambda_layer_version;
 mod lambda_permission;
+/// `AWS::CloudFormation::Stack`: the NESTED STACK a stack declares, created in
+/// CloudFormation itself ([`nested_stack`]).
+mod nested_stack;
+/// `AWS::S3::Bucket`: the halves of that type's provider the catalogue cannot carry — how a
+/// changed declaration reaches a bucket that exists, and how the provider words a refusal.
+mod s3_bucket;
 mod step_functions_state_machine;
 
 /// Custom resources: the provider a template names in a resource's `ServiceToken`, the
 /// request CloudFormation sends it on every stack operation touching the resource, and the
 /// answer the provider PUTs to the `ResponseURL` the request carries.
 pub mod custom_resource;
+
+/// AWS's reserved tag-key namespace: "the `aws:` prefix is reserved for AWS use". Matched
+/// case-insensitively, as the services that refuse it match it.
+pub(super) const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` is in that namespace — the ONE reading of the rule for the per-type providers
+/// beside this algorithm, so a second provider cannot come to read it differently.
+///
+/// A service refuses such a key on every call that takes a caller's tag set ("Your TagKey
+/// cannot be prefixed with aws:"), and the three `aws:cloudformation:*` tags AWS sets from
+/// inside itself have no public call to set them through here — so a provider leaves them off
+/// rather than sending them to be refused: a deployment must not fail over tags CloudFormation
+/// adds of its own accord. ([`super::provisioner::Provisioner::applicable_tags`] is the
+/// catalogue's own reading of it, for the types it carries.)
+pub(super) fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// Those of a propagated tag set an owning service's own tagging call will TAKE: every key
+/// outside the reserved namespace ([`is_reserved_tag_key`]).
+pub(super) fn applicable_tags(propagated: &[(String, String)]) -> Vec<(String, String)> {
+    propagated
+        .iter()
+        .filter(|(key, _)| !is_reserved_tag_key(key))
+        .cloned()
+        .collect()
+}
+
+/// Whether two tag sets are the same SET: a tag set is keyed by its keys, so the order the two
+/// were read in says nothing about whether they agree.
+///
+/// Read by every provider that RECONCILES a tag set — one that asks the owning service what
+/// the resource carries before writing ([`s3_bucket::retag`], [`nested_stack::retag`]) — so
+/// one comparison serves them all.
+pub(super) fn tag_sets_agree(
+    in_force: &[(String, String)],
+    wanted: &[(String, String)],
+) -> bool {
+    in_force.len() == wanted.len()
+        && wanted.iter().all(|(key, value)| {
+            in_force
+                .iter()
+                .any(|(held, carried)| held == key && carried == value)
+        })
+}
 
 /// The awsJson media types the services this module calls speak, named once here because
 /// [`call_json_rpc`] takes the one the called service's own model declares: an answer is
@@ -292,6 +344,11 @@ pub struct StackProvenance {
     pub stack_id: String,
     /// The stack-level `Tags` in force, in the order the stack records them.
     pub tags: Vec<(String, String)>,
+    /// The `Capabilities` in force on the stack — what the operation deploying it
+    /// ACKNOWLEDGED. Carried because a resource that is itself a STACK is created under the
+    /// parent operation's acknowledgement ("if you have IAM resources in nested stacks, you
+    /// must specify CAPABILITY_IAM"), which CloudFormation does not ask for a second time.
+    pub capabilities: Vec<String>,
     /// Whether the deployment in force on the stack runs in the EXPRESS deployment mode,
     /// which is part of how a failure of these resources is REPORTED: the mode names itself
     /// in the summary of what could not be created
@@ -570,6 +627,10 @@ pub(super) enum Owner {
     /// identity pool, and the role attachment that binds the pool's IAM roles to it. Which
     /// of them it is travels with the owner, as for the Amazon EC2 types above.
     CognitoIdentityPool(cognito_identity_pool::Kind),
+    /// `AWS::CloudFormation::Stack`, whose arms are [`nested_stack`]'s: the owning service is
+    /// CloudFormation itself, so a nested stack is created by the same `CreateStack` a
+    /// client calls.
+    NestedStack,
     /// `AWS::StepFunctions::StateMachine`, whose arms are
     /// [`step_functions_state_machine`]'s.
     StepFunctionsStateMachine,
@@ -602,6 +663,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     if let Some(kind) = cognito_identity_pool::kind_of(resource_type) {
         return Some(Owner::CognitoIdentityPool(kind));
     }
+    if resource_type == nested_stack::CLOUDFORMATION_STACK {
+        return Some(Owner::NestedStack);
+    }
     if resource_type == step_functions_state_machine::STEP_FUNCTIONS_STATE_MACHINE {
         return Some(Owner::StepFunctionsStateMachine);
     }
@@ -617,6 +681,7 @@ impl Owner {
         region: &str,
         resource: &StoredResource,
         propagated: &[(String, String)],
+        acknowledged: &[String],
     ) -> Result<Created, Refusal> {
         match self {
             Self::Builtin(provisioner) => {
@@ -649,6 +714,24 @@ impl Owner {
             }
             Self::CognitoIdentityPool(kind) => {
                 cognito_identity_pool::create(ctx, region, kind, resource, propagated).await
+            }
+            // A nested stack carries the stack-level tags CloudFormation propagates to the
+            // resources it creates and is created under the acknowledgement the parent's own
+            // operation gave, which `CreateStack` takes as its `Tags` and `Capabilities`.
+            //
+            // BOXED, unlike every other arm: this call reaches CloudFormation's OWN
+            // `CreateStack`, so the whole deploy-a-stack chain — this walk included — runs
+            // again inside it. Boxing keeps the inner chain's state off this future, so the
+            // stack a request needs does not multiply with the nesting the template declares.
+            Self::NestedStack => {
+                Box::pin(nested_stack::create(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                    acknowledged,
+                ))
+                .await
             }
             Self::StepFunctionsStateMachine => {
                 step_functions_state_machine::create(ctx, region, resource, propagated).await
@@ -699,6 +782,11 @@ impl Owner {
             // A pool exists, and its role configuration is in force, from the moment the
             // owning service's own call answers.
             Self::CognitoIdentityPool(_) => Ok(cognito_identity_pool::ready()),
+            // `CreateStack` answers as soon as the stack's creation has STARTED, so the
+            // parent's resource is held open until CloudFormation reports the child settled.
+            Self::NestedStack => {
+                Box::pin(nested_stack::readiness(ctx, region, physical_resource_id)).await
+            }
             Self::StepFunctionsStateMachine => Ok(step_functions_state_machine::readiness()),
         }
     }
@@ -740,6 +828,10 @@ impl Owner {
             // publishes no attribute this emulator computes, so there is nothing left to
             // read once either resource is up.
             Self::CognitoIdentityPool(_) => Ok(BTreeMap::new()),
+            // A nested stack's own id is what its create answered with, and the outputs a
+            // parent reads off it are the CHILD's outputs rather than attributes this walk
+            // reads back, so there is nothing to read once the child is up.
+            Self::NestedStack => Ok(BTreeMap::new()),
             // A state machine's `Arn` and `Name` are the ones its own create answered with,
             // so there is nothing left to read once the resource is up.
             Self::StepFunctionsStateMachine => Ok(BTreeMap::new()),
@@ -783,6 +875,11 @@ impl Owner {
             // `DeleteIdentityPool` takes the pool away as it answers, and the call that
             // clears a pool's roles leaves nothing behind either.
             Self::CognitoIdentityPool(_) => Ok(Removal::Gone),
+            // `DeleteStack` starts the child's deletion, so the parent's resource is held
+            // open until CloudFormation no longer holds the stack.
+            Self::NestedStack => {
+                Box::pin(nested_stack::removal(ctx, region, physical_resource_id)).await
+            }
             Self::StepFunctionsStateMachine => {
                 step_functions_state_machine::removal(ctx, region, physical_resource_id).await
             }
@@ -797,8 +894,16 @@ impl Owner {
         region: &str,
         resource: &StoredResource,
         declared: &Value,
+        propagated: &[(String, String)],
+        acknowledged: &[String],
     ) -> Result<Option<Created>, Refusal> {
         match self {
+            // The bucket's own provider, whose update half lives beside this algorithm
+            // ([`s3_bucket`]): a property Amazon S3 publishes a call to write on a live
+            // bucket is applied to the bucket the stack created rather than replacing it.
+            Self::Builtin(Provisioner::S3Bucket) => {
+                s3_bucket::update(ctx, region, resource, declared).await
+            }
             Self::Builtin(provisioner) => {
                 provisioner.update(ctx, region, resource, declared).await
             }
@@ -833,6 +938,20 @@ impl Owner {
             Self::CognitoIdentityPool(kind) => {
                 cognito_identity_pool::update(ctx, region, kind, resource, declared).await
             }
+            // A nested stack is CHANGED by CloudFormation's own `UpdateStack`, under the id
+            // the create minted, so the child keeps its identity and its resources. Boxed for
+            // the reason [`Self::create`]'s arm records.
+            Self::NestedStack => {
+                Box::pin(nested_stack::update(
+                    ctx,
+                    region,
+                    resource,
+                    declared,
+                    propagated,
+                    acknowledged,
+                ))
+                .await
+            }
             Self::StepFunctionsStateMachine => {
                 step_functions_state_machine::update(ctx, region, resource, declared).await
             }
@@ -850,6 +969,13 @@ impl Owner {
         propagated: &[(String, String)],
     ) -> Result<(), Refusal> {
         match self {
+            // A bucket's tags are Amazon S3's own `PutBucketTagging`/`DeleteBucketTagging`,
+            // which is where the set a bucket must end up carrying is reconciled
+            // ([`s3_bucket::retag`]) — the create's tagging call applies to the bucket it
+            // creates and to no bucket that already exists.
+            Self::Builtin(Provisioner::S3Bucket) => {
+                s3_bucket::retag(ctx, region, resource, declared, propagated).await
+            }
             Self::Builtin(provisioner) => {
                 provisioner
                     .retag(ctx, region, resource, declared, propagated)
@@ -877,6 +1003,15 @@ impl Owner {
             // A pool's tags are replaced by its own update call, which carries the
             // declaration's whole configuration, so nothing is asked about them here.
             Self::CognitoIdentityPool(_) => Ok(()),
+            // A nested stack's own tags are the ones its `UpdateStack` carries, over the
+            // template it already has: the set it must end up with is reconciled here, since
+            // a deployment can state the stack's tags differently with no declaration
+            // changing at all ([`nested_stack::retag`]). Boxed for the reason
+            // [`Self::create`]'s arm records.
+            Self::NestedStack => {
+                Box::pin(nested_stack::retag(ctx, region, resource, declared, propagated))
+                    .await
+            }
             // The tags of a state machine that already exists are reconciled by no arm here
             // yet ([`Provisioner::retag`]'s own default), so nothing is asked about them.
             Self::StepFunctionsStateMachine => Ok(()),
@@ -935,6 +1070,11 @@ impl Owner {
             Self::CognitoIdentityPool(kind) => {
                 cognito_identity_pool::delete(ctx, region, kind, resource).await
             }
+            // CloudFormation takes no snapshot of a stack on the way out: there is no such
+            // call, so a `Snapshot` deletion policy on this type deletes the nested stack —
+            // and each resource of it under ITS own deletion policies — with no snapshot
+            // invented for it. Boxed for the reason [`Self::create`]'s arm records.
+            Self::NestedStack => Box::pin(nested_stack::delete(ctx, region, resource)).await,
             // Step Functions takes no snapshot of a state machine on the way out: there is no
             // such call, so a `Snapshot` deletion policy on this type deletes the machine with
             // no snapshot invented for it.
@@ -993,6 +1133,11 @@ impl Owner {
             Self::CognitoIdentityPool(kind) => {
                 cognito_identity_pool::actual_configuration(ctx, region, kind, resource).await
             }
+            // A nested stack's own configuration is its TEMPLATE, and the drift of a nested
+            // stack is detected by running a detection against that stack itself ("perform
+            // DetectStackDrift directly on the nested stack"), so this arm reads nothing
+            // back for the parent's resource rather than guessing at it.
+            Self::NestedStack => Ok(None),
             Self::StepFunctionsStateMachine => {
                 step_functions_state_machine::actual_configuration(
                     ctx,
@@ -1022,6 +1167,9 @@ impl Owner {
             Self::Ec2VpcNetwork(_) => message.to_string(),
             // Amazon Cognito Identity's does the same.
             Self::CognitoIdentityPool(_) => message.to_string(),
+            // The nested-stack provider reports what CloudFormation answered as it came: the
+            // child's own refusal, which is the account of why the stack was not created.
+            Self::NestedStack => message.to_string(),
             // AWS Step Functions' does the same.
             Self::StepFunctionsStateMachine => message.to_string(),
         }
@@ -1243,7 +1391,11 @@ pub async fn advance_stabilisations(
                                 &replaced.logical_id,
                                 &replaced.resource_type,
                                 &replaced.physical_resource_id,
-                                &handler_failure_reason(None, refusal),
+                                &handler_failure_reason(
+                                    None,
+                                    refusal,
+                                    &replaced.physical_resource_id,
+                                ),
                             );
                         }
                         stack.release_stabilisation(&barrier, now);
@@ -1279,6 +1431,7 @@ pub async fn advance_stabilisations(
                                 &handler_failure_reason(
                                     owner_for(&barrier.resource_type),
                                     &refusal,
+                                    &barrier.physical_resource_id,
                                 ),
                             )
                         } else {
@@ -1758,7 +1911,11 @@ pub async fn reconcile(
                             outcome.transitions.push(ResourceTransition::finished(
                                 &resource,
                                 super::resource_status::UPDATE_FAILED,
-                                Some(handler_failure_reason(None, &refusal)),
+                                Some(handler_failure_reason(
+                                    None,
+                                    &refusal,
+                                    &resource.physical_resource_id,
+                                )),
                             ));
                             outcome.resources.push(resource);
                             break;
@@ -1771,7 +1928,14 @@ pub async fn reconcile(
                         // THIS resource ([`super::service_role`]).
                         super::service_role::on_resource(
                             super::service_role::target_of(&resource),
-                            provisioner.update(ctx, region, &resource, &deployed_properties),
+                            provisioner.update(
+                                ctx,
+                                region,
+                                &resource,
+                                &deployed_properties,
+                                &stack.tags_for(&resource.logical_id),
+                                &stack.capabilities,
+                            ),
                         )
                         .await
                     }
@@ -1789,6 +1953,74 @@ pub async fn reconcile(
                     Ok(Some(updated)) => {
                         resource.attributes.extend(updated.attributes);
                         resource.properties = declared_properties.clone();
+                        // ...and whether the change has been CARRIED OUT is that service's
+                        // to say, exactly as it is for a create: a change it accepted
+                        // without having applied it yet holds the resource — and so the
+                        // operation — open until it reports the resource ready again
+                        // ([`super::stabilising::Awaited::Updated`]). A type whose change
+                        // takes effect as the call answers reports `Ready` without asking
+                        // anything, so nothing waits for it.
+                        let readiness = match owner_for(&resource.resource_type) {
+                            Some(provisioner) => {
+                                provisioner
+                                    .readiness(
+                                        ctx,
+                                        region,
+                                        &resource.physical_resource_id,
+                                        Some(&resource.properties),
+                                    )
+                                    .await
+                            }
+                            None => Ok(Readiness::Ready),
+                        };
+                        match readiness {
+                            Ok(Readiness::Ready) => {}
+                            Ok(Readiness::Pending(state)) => {
+                                outcome.stabilising.push(Stabilising {
+                                    awaited: super::stabilising::Awaited::Updated,
+                                    logical_id: resource.logical_id.clone(),
+                                    resource_type: resource.resource_type.clone(),
+                                    physical_resource_id: resource
+                                        .physical_resource_id
+                                        .clone(),
+                                    reported_state: state,
+                                    provider_request: None,
+                                });
+                            }
+                            // That service says the change is not going to take effect, so
+                            // waiting it out would report a resource as changed that is not:
+                            // the update of this resource failed, carrying what it said.
+                            Ok(Readiness::Failed(reason)) => {
+                                outcome.failure = Some(super::resource_failure_summary(
+                                    super::failed_action::UPDATE,
+                                    [resource.logical_id.as_str()],
+                                ));
+                                outcome.transitions.push(ResourceTransition::finished(
+                                    &resource,
+                                    super::resource_status::UPDATE_FAILED,
+                                    Some(reason),
+                                ));
+                                outcome.resources.push(resource);
+                                break;
+                            }
+                            // The service could not be asked at all. One unanswered read is
+                            // no evidence about the resource, and the change WAS accepted,
+                            // so the wait is opened and the next read asks again — exactly
+                            // as a create's is.
+                            Err(_) => {
+                                outcome.stabilising.push(Stabilising {
+                                    awaited: super::stabilising::Awaited::Updated,
+                                    logical_id: resource.logical_id.clone(),
+                                    resource_type: resource.resource_type.clone(),
+                                    physical_resource_id: resource
+                                        .physical_resource_id
+                                        .clone(),
+                                    reported_state: super::resource_status::UPDATE_IN_PROGRESS
+                                        .to_string(),
+                                    provider_request: None,
+                                });
+                            }
+                        }
                     }
                     Ok(None) => {
                         let unsupported = format!(
@@ -1822,6 +2054,7 @@ pub async fn reconcile(
                             Some(handler_failure_reason(
                                 owner_for(&resource.resource_type),
                                 &refusal,
+                                &resource.physical_resource_id,
                             )),
                         ));
                         outcome.resources.push(resource);
@@ -1880,6 +2113,7 @@ pub async fn reconcile(
                         Some(handler_failure_reason(
                             owner_for(&resource.resource_type),
                             &refusal,
+                            &resource.physical_resource_id,
                         )),
                     ));
                     outcome.resources.push(resource);
@@ -1989,7 +2223,7 @@ pub async fn reconcile(
                     outcome.transitions.push(ResourceTransition::failed(
                         &resource,
                         super::resource_status::CREATE_FAILED,
-                        handler_failure_reason(None, &refusal),
+                        handler_failure_reason(None, &refusal, &resource.physical_resource_id),
                     ));
                     outcome.resources.push(resource);
                     break;
@@ -2014,7 +2248,7 @@ pub async fn reconcile(
                 };
                 super::service_role::on_resource(
                     super::service_role::target_of(&asked),
-                    provisioner.create(ctx, region, &asked, &tags),
+                    provisioner.create(ctx, region, &asked, &tags, &stack.capabilities),
                 )
                 .await
             }
@@ -2167,7 +2401,11 @@ pub async fn reconcile(
                         outcome.transitions.push(ResourceTransition::finished(
                             &resource,
                             super::resource_status::CREATE_FAILED,
-                            Some(handler_failure_reason(owner, &refusal)),
+                            Some(handler_failure_reason(
+                                owner,
+                                &refusal,
+                                &resource.physical_resource_id,
+                            )),
                         ));
                         outcome.resources.push(resource);
                         break;
@@ -2182,7 +2420,7 @@ pub async fn reconcile(
                 outcome.transitions.push(ResourceTransition::failed(
                     &resource,
                     super::resource_status::CREATE_FAILED,
-                    handler_failure_reason(owner, &refusal),
+                    handler_failure_reason(owner, &refusal, &resource.physical_resource_id),
                 ));
                 outcome.resources.push(resource);
                 break;
@@ -2883,7 +3121,11 @@ async fn delete_pass(
                 // The snapshot the policy asked for could not be taken, so the resource is
                 // NOT deleted: deleting it would destroy the data the policy exists to
                 // preserve. The refusal is reported exactly as a refused delete is.
-                let reason = handler_failure_reason(owner, &refusal);
+                let reason = handler_failure_reason(
+                    owner,
+                    &refusal,
+                    &outcome.resources[index].physical_resource_id,
+                );
                 if on_refusal == OnRefusal::Abandon {
                     outcome.transitions.push(ResourceTransition::finished(
                         resource,
@@ -2990,6 +3232,7 @@ async fn delete_pass(
                 let reason = handler_failure_reason(
                     owner_for(&outcome.resources[index].resource_type),
                     &refusal,
+                    &outcome.resources[index].physical_resource_id,
                 );
                 if on_refusal == OnRefusal::Abandon {
                     // ABANDONED: nothing more is asked of the owning service, so the
@@ -3355,7 +3598,12 @@ fn handler_error_code(code: &str) -> &'static str {
 /// ([`super::provisioner::Provisioner::handler_message`]): for a type whose provider words a
 /// refusal through the class it put it in, that wording is part of what CloudFormation
 /// quotes. A type this emulator has no provisioner for reports the refusal as it came.
-fn handler_failure_reason(owner: Option<Owner>, refusal: &Refusal) -> String {
+///
+/// `identifier` is the resource the refusal is about, as its owning service knows it: a
+/// provider that names the resource in its own report of a refusal — a bucket whose name is
+/// already taken ([`s3_bucket::handler_message`]) — states it from here, so the event says
+/// WHICH resource the refusal was about.
+fn handler_failure_reason(owner: Option<Owner>, refusal: &Refusal, identifier: &str) -> String {
     // A service that worded no message at all still named the error, and the code is then
     // all there is to report.
     let message = if refusal.message.is_empty() {
@@ -3365,6 +3613,11 @@ fn handler_failure_reason(owner: Option<Owner>, refusal: &Refusal) -> String {
     };
     let class = handler_error_code(&refusal.code);
     let message = match owner {
+        // The bucket provider's own wording, which lives beside this algorithm for the
+        // reason [`s3_bucket`] records.
+        Some(Owner::Builtin(Provisioner::S3Bucket)) => {
+            s3_bucket::handler_message(class, identifier, message)
+        }
         Some(provisioner) => provisioner.handler_message(class, message),
         None => message.to_string(),
     };
@@ -3467,6 +3720,24 @@ pub(super) async fn call_query(
     action: &str,
     parameters: &[(String, String)],
 ) -> Result<String, Refusal> {
+    call_query_carrying(ctx, signing_name, region, version, action, parameters, Vec::new())
+        .await
+}
+
+/// [`call_query`], with HEADERS the caller adds to the request beside the ones the wire needs.
+///
+/// For a call whose CHAIN matters: the nested-stack provider carries the deployment a call is
+/// already inside on the request, because each level is a request of its own and the bound on
+/// that chain has to travel with it ([`nested_stack`]). Everything else is [`call_query`]'s.
+pub(super) async fn call_query_carrying(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    signing_name: &str,
+    region: &str,
+    version: &str,
+    action: &str,
+    parameters: &[(String, String)],
+    carried: Vec<(&'static str, String)>,
+) -> Result<String, Refusal> {
     // Under the stack's service role, exactly as [`call_json_rpc`] is: an awsQuery request
     // names the operation it invokes in its `Action` parameter.
     if let Some(denied) = denied_by_the_service_role(signing_name, Some(action)) {
@@ -3479,7 +3750,8 @@ pub(super) async fn call_query(
         body.push('=');
         body.push_str(&percent_encoded(value));
     }
-    let headers = vec![("content-type", FORM_URLENCODED.to_string())];
+    let mut headers = vec![("content-type", FORM_URLENCODED.to_string())];
+    headers.extend(carried);
     let (status, payload) =
         dispatch(ctx, signing_name, region, "POST", "/", headers, body.into_bytes())
         .await
@@ -3889,6 +4161,15 @@ fn refusal_of(signing_name: &str, status: u16, document: &Value) -> Refusal {
 /// every operation to `POST /` and names what it acts on in its document — or, for
 /// awsQuery, in its form body — while a REST protocol binds each operation to its own
 /// method and path.
+///
+/// The call itself is served on a TASK of its own. It reaches the called service's whole
+/// deserialize → handle → serialize chain, and for a type whose owning service is
+/// CloudFormation itself — a nested stack — that chain deploys a stack, which provisions its
+/// own resources through this same function: a chain of calls would otherwise pile every
+/// level's frames onto the stack of the ONE request that started it, and the emulator's worker
+/// stack is a fixed size. A task starts from the top of a worker's stack, so one call costs
+/// one level however deeply a template nests. The answer is awaited right here, so the call is
+/// still synchronous to the walk that made it.
 async fn dispatch(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     signing_name: &str,
@@ -3924,12 +4205,26 @@ async fn dispatch(
     );
     let request = ::aws_smithy_runtime_api::http::Request::try_from(request)
         .map_err(|error| error.to_string())?;
-    let response = ::aws_smithy_runtime_api::client::http::HttpConnector::call(
-        &ctx.callback().http_connector(),
-        request,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
+    // The connector is a cloneable handle to the router, so the task owns everything it
+    // needs and borrows nothing of this request's context. It is taken from the CALLBACK, so
+    // the chain's recursion depth is stamped on the request exactly as it is for a call made
+    // here (`smithy_server_runtime::CallbackRecursionDepth`).
+    let connector = ctx.callback().http_connector();
+    // ABORTED WITH THE CALLER: the task's handle is held in a guard that aborts it when
+    // dropped, so a request that goes away — a client that disconnected, a wait that ran out
+    // — takes the work it started with it instead of leaving it running (and spawning
+    // further levels of its own).
+    let mut served = AbortedWithTheCaller(::tokio::spawn(async move {
+        ::aws_smithy_runtime_api::client::http::HttpConnector::call(&connector, request).await
+    }));
+    let response = served
+        .answered()
+        .await
+        // The task was cancelled or panicked: nothing answered, which is what the caller is
+        // told. A panic in another service's handler is that service's own fault and is not
+        // swallowed — it is reported as the failure of this call.
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
     let status = response.status().as_u16();
     let payload = response
         .body()
@@ -3937,6 +4232,32 @@ async fn dispatch(
         .ok_or("the in-process answer carried a streaming body")?
         .to_vec();
     Ok((status, payload))
+}
+
+/// One in-process call's task, held so that dropping this guard ABORTS it.
+///
+/// `tokio::spawn` detaches: dropping a `JoinHandle` leaves the task running, and for a call
+/// that re-enters this walk that means a request nobody is waiting for any more goes on
+/// deploying (and spawning further levels). The guard makes the task's lifetime the caller's:
+/// the awaiting future owns it, and whatever drops that future — a disconnected client, a
+/// ceiling that ran out, a cancelled operation — stops the work it set off.
+struct AbortedWithTheCaller<T>(::tokio::task::JoinHandle<T>);
+
+impl<T> AbortedWithTheCaller<T> {
+    /// What the task answered, awaited through the handle the guard holds (a `JoinHandle` is
+    /// `Unpin`, so it is polled in place and the guard keeps ownership until the answer or the
+    /// cancellation).
+    async fn answered(&mut self) -> Result<T, ::tokio::task::JoinError> {
+        (&mut self.0).await
+    }
+}
+
+impl<T> Drop for AbortedWithTheCaller<T> {
+    fn drop(&mut self) {
+        // A task that has already answered is finished, and aborting a finished task does
+        // nothing — so this is the cancellation path only.
+        self.0.abort();
+    }
 }
 
 /// SigV4-sign one in-process request to another emulated service, in place.

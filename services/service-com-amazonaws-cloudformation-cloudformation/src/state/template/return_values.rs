@@ -1733,6 +1733,14 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // in force is the one that service answered. The pool's own NAME is its `Name`
         // attribute, which the create reports.
         || resource_type == COGNITO_IDENTITY_POOL
+        // A NESTED STACK is one more, and the clearest case of it: "Ref returns the stack
+        // ID" of the stack CloudFormation created for the resource, which carries the unique
+        // id that service minted for it — the name the naming rules compute is only what the
+        // create was made under, exactly as a security group's is
+        // (`crate::state::provisioning`'s nested-stack provider). That stack id is also what
+        // `DescribeStackResource` reports as the resource's `PhysicalResourceId`, and the
+        // handle every call on the child stack takes.
+        || resource_type == crate::state::STACK_RESOURCE_TYPE
 }
 
 /// The type of an IAM access key: the long-term credential of an IAM user, under the

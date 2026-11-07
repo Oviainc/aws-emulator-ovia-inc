@@ -27,6 +27,8 @@ mod bucket_lifecycle_tag_filters;
 mod bucket_metrics_and_lifecycle_configurations;
 #[path = "all/bucket_notification_configuration.rs"]
 mod bucket_notification_configuration;
+#[path = "all/bucket_property_updates.rs"]
+mod bucket_property_updates;
 #[path = "all/callback_signature.rs"]
 mod callback_signature;
 #[path = "all/cancelled_update.rs"]
@@ -173,6 +175,8 @@ mod initiating_resource_events;
 mod in_place_resource_updates;
 #[path = "all/list_change_sets.rs"]
 mod list_change_sets;
+#[path = "all/list_element_refusals.rs"]
+mod list_element_refusals;
 #[path = "all/list_generated_templates.rs"]
 mod list_generated_templates;
 #[path = "all/list_imports_pages.rs"]
@@ -199,6 +203,8 @@ mod malformed_policy_document_rollback;
 mod management_event_recording;
 #[path = "all/nested_resource_outputs.rs"]
 mod nested_resource_outputs;
+#[path = "all/nested_stacks.rs"]
+mod nested_stacks;
 #[path = "all/no_echo_parameters.rs"]
 mod no_echo_parameters;
 #[path = "all/operation_events.rs"]
@@ -365,6 +371,10 @@ mod stack_teardown_events;
 mod state_roundtrip;
 #[path = "all/stop_stack_set_operation.rs"]
 mod stop_stack_set_operation;
+#[path = "all/stored_stack_policy_validation.rs"]
+mod stored_stack_policy_validation;
+#[path = "all/substitution_resource_attributes.rs"]
+mod substitution_resource_attributes;
 #[path = "all/tags_only_stack_updates.rs"]
 mod tags_only_stack_updates;
 #[path = "all/template_by_reference.rs"]
@@ -421,6 +431,8 @@ mod update_stack_export_in_use;
 mod update_stack_instances;
 #[path = "all/validate_template.rs"]
 mod validate_template;
+#[path = "all/validation_event_paths.rs"]
+mod validation_event_paths;
 #[path = "all/vpc_network_teardown.rs"]
 mod vpc_network_teardown;
 #[path = "all/waf_regional_ip_set_resources.rs"]

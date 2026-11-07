@@ -69,6 +69,7 @@
 
 pub mod custom_resource_plane;
 pub mod double_members;
+pub mod list_element_refusals;
 pub mod management_events;
 pub mod query_error_envelope;
 
@@ -127,13 +128,50 @@ const TEMPLATE_STAGE_VALUE_SET: &[&str] = &[
     crate::ops::get_template::TEMPLATE_STAGE_ORIGINAL,
 ];
 
+/// `StackStatus`, in the order CloudFormation's OWN input validation lists its value set.
+///
+/// It is not the order the model declares the enum in
+/// (`smithy_query(query="shape", shape="StackStatus")` gives the lifecycle order,
+/// `[CREATE_IN_PROGRESS, CREATE_FAILED, CREATE_COMPLETE, …]`) and it is neither sorted nor
+/// grouped by lifecycle — so a value outside the set is refused from THIS order rather than
+/// from the declaration. The set itself is the model's, value for value: these are the 23
+/// values that `smithy_query` lists, re-ordered and not added to.
+const STACK_STATUS_VALUE_SET: &[&str] = &[
+    "REVIEW_IN_PROGRESS",
+    "CREATE_FAILED",
+    "UPDATE_ROLLBACK_FAILED",
+    "UPDATE_ROLLBACK_IN_PROGRESS",
+    "CREATE_IN_PROGRESS",
+    "IMPORT_ROLLBACK_IN_PROGRESS",
+    "UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS",
+    "ROLLBACK_IN_PROGRESS",
+    "IMPORT_IN_PROGRESS",
+    "DELETE_COMPLETE",
+    "UPDATE_COMPLETE",
+    "UPDATE_IN_PROGRESS",
+    "DELETE_FAILED",
+    "IMPORT_COMPLETE",
+    "UPDATE_FAILED",
+    "DELETE_IN_PROGRESS",
+    "ROLLBACK_COMPLETE",
+    "ROLLBACK_FAILED",
+    "IMPORT_ROLLBACK_COMPLETE",
+    "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS",
+    "CREATE_COMPLETE",
+    "IMPORT_ROLLBACK_FAILED",
+    "UPDATE_ROLLBACK_COMPLETE",
+];
+
 /// Every enum of this service whose value set its own refusals state in an order other than
 /// the model's declaration order.
 ///
 /// Keyed by the SET rather than by an operation or a member, so each entry governs every
 /// member that targets that enum and one refusal cannot drift from another's.
-const SERVICE_ORDERED_ENUM_VALUE_SETS: &[&[&str]] =
-    &[REGISTRATION_STATUS_VALUE_SET, TEMPLATE_STAGE_VALUE_SET];
+const SERVICE_ORDERED_ENUM_VALUE_SETS: &[&[&str]] = &[
+    REGISTRATION_STATUS_VALUE_SET,
+    TEMPLATE_STAGE_VALUE_SET,
+    STACK_STATUS_VALUE_SET,
+];
 
 /// The order this service states `allowed` in, when it is one of the sets
 /// [`SERVICE_ORDERED_ENUM_VALUE_SETS`] names — compared as a SET, so the model's declaration

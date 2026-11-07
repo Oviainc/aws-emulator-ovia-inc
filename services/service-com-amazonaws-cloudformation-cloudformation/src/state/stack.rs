@@ -2316,6 +2316,7 @@ impl StoredStack {
                 .iter()
                 .map(|tag| (tag.key.clone(), tag.value.clone()))
                 .collect(),
+            capabilities: self.capabilities.clone(),
             // The mode the stack's deployments run in, which is part of how a failure of
             // these resources is reported ([`provisioning::StackProvenance::express`]).
             express: super::stored_deployment_mode(self.deployment_config.as_ref())

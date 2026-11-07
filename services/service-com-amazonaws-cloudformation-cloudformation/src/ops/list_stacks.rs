@@ -71,13 +71,18 @@ use crate::state::StoredStack;
 /// One stored stack as the modelled `StackSummary` shape.
 ///
 /// `TemplateDescription` is the template's own `Description`, `DeletionTime` is set only
-/// once the stack's deletion has completed, and `ParentId`/`RootId` are absent because
-/// nested stacks are not implemented. `LastOperations` is the operation the stack last
+/// once the stack's deletion has completed, and `ParentId`/`RootId` are the stack this one is
+/// NESTED IN and the top of that chain, derived from the resource record that created it
+/// ([`crate::state::stack_nesting`]) — both absent for a top-level stack, which is nested in
+/// nothing. `LastOperations` is the operation the stack last
 /// opened, which `StackSummary` reports alongside `Stack`; `DriftInformation` is the
 /// result of the last drift detection that ran against the stack — the same stored result
 /// `DescribeStacks` reports, in the SUMMARY spelling of the same two members, so the two
 /// reads of one stack cannot disagree about it.
-fn stack_summary(stored: &StoredStack) -> StackSummary {
+fn stack_summary(
+    nesting: &crate::state::Nesting,
+    stored: &StoredStack,
+) -> StackSummary {
     StackSummary {
         stack_id: Some(stored.stack_id.clone()),
         stack_name: stored.stack_name.clone(),
@@ -87,8 +92,8 @@ fn stack_summary(stored: &StoredStack) -> StackSummary {
         deletion_time: stored.deletion_time.map(crate::state::timestamp),
         stack_status: stored.status.clone(),
         stack_status_reason: stored.status_reason.clone(),
-        parent_id: None,
-        root_id: None,
+        parent_id: nesting.parent_id_of(stored),
+        root_id: nesting.root_id_of(stored),
         drift_information: crate::state::stack_drift_information_summary(stored),
         last_operations: crate::state::last_operation_views(stored.last_operation()),
     }
@@ -191,10 +196,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stacks of the Region the request was signed for.
         let region = crate::state::request_region(ctx.parts());
         let filter = input.stack_status_filter.as_deref().unwrap_or_default();
-        let matching: Vec<StackSummary> = store
+        // The store is read through ONE shared borrow, and the nesting relation every
+        // summary's `ParentId`/`RootId` is derived from is built once for the whole read:
+        // the relation is a function of the other stacks' resource records, not of the stack
+        // the summary is about.
+        let view = &*store;
+        let nesting = view.nesting_in(&region);
+        let matching: Vec<StackSummary> = view
             .stacks_in(&region)
             .filter(|stack| filter.is_empty() || filter.contains(&stack.status))
-            .map(stack_summary)
+            .map(|stack| stack_summary(&nesting, stack))
             .collect();
         // `@paginated(inputToken: NextToken, outputToken: NextToken,
         // items: StackSummaries)`: one response carries one bounded page.

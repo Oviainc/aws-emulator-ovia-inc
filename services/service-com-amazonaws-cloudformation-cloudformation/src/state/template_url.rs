@@ -62,6 +62,11 @@
 //!   classified the refusal as stands in its place, so no refusal this module cannot place
 //!   becomes a claim that the object is not there.
 //!
+//! Both sentences are the SAME for every operation that fetches a reference, so the same
+//! unreadable object is never reported three ways; an operation of the STACK SETS control
+//! plane carries that sentence inside the SDK envelope every refusal of that control plane
+//! comes in ([`Refused`]).
+//!
 //! Text that addresses no object at all is refused before anything is read.
 //!
 //! ## Bounds
@@ -163,18 +168,46 @@ const ABSENT_OBJECT_CODES: &[&str] = &["NoSuchKey", "NoSuchVersion"];
 
 /// How a refused READ is worded for the OPERATION that took the reference.
 ///
-/// Both wordings below are CloudFormation's, and which one a refusal carries is the
-/// operation's: a stack operation reports an object the bucket does not hold as that
-/// object's absence ([`unreadable_object`]), while a STACK SET operation reports what Amazon
-/// S3 answered whatever it refused the read for ([`s3_error`]) — the two are what the
-/// recorded refusals of those operations carry, and neither is derived from the other.
+/// The SENTENCE is the same for every operation that fetches a reference — which refusal it
+/// was decides it ([`unreadable_object`] for an object Amazon S3 said is not there,
+/// [`s3_error`] for every other) — so three operations that cannot read the same object
+/// cannot report three different things about it. What the OPERATION decides is only whether
+/// that sentence is carried on its own, as a stack operation reports it, or inside the
+/// envelope the STACK SETS control plane appends to every refusal it answers
+/// ([`with_control_plane_envelope`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refused {
-    /// An object the bucket does not hold as that object's ABSENCE, and every other refusal
-    /// as what Amazon S3 answered.
+    /// The sentence on its own, as a stack operation reports it.
     AbsenceAsAbsence,
-    /// What Amazon S3 answered, whatever it refused the read for.
-    AsAmazonS3Answered,
+    /// The same sentence inside the StackSets control plane's own refusal envelope.
+    AsAStackSetsControlPlaneOperation,
+}
+
+/// The service the StackSets control plane's refusal envelope names: the control plane is
+/// CloudFormation's own, so the exception an SDK raises for a refused StackSets call carries
+/// that service's name.
+const CONTROL_PLANE_SERVICE: &str = "AmazonCloudFormation";
+
+/// The status and the error code that envelope states: a refused request, under the code
+/// CloudFormation refuses a bad reference with.
+const CONTROL_PLANE_REFUSAL_STATUS: u16 = 400;
+const CONTROL_PLANE_REFUSAL_CODE: &str = "ValidationError";
+
+/// `sentence` inside the envelope an AWS SDK appends to a refusal of the StackSets control
+/// plane: `(Service: <service>; Status Code: <status>; Error Code: <code>; Request ID: <id>;
+/// Proxy: null)`.
+///
+/// The request id is the only per-run field, and it belongs to the RESPONSE rather than to
+/// this sentence: the marker [`super::REQUEST_ID_PLACEHOLDER`] stands in for it here and the
+/// layer that finishes the response writes the one id that response reports. Nothing else of
+/// the request reaches the envelope.
+fn with_control_plane_envelope(sentence: &str) -> String {
+    format!(
+        "{sentence} (Service: {CONTROL_PLANE_SERVICE}; Status Code: \
+         {CONTROL_PLANE_REFUSAL_STATUS}; Error Code: {CONTROL_PLANE_REFUSAL_CODE}; Request ID: \
+         {}; Proxy: null)",
+        super::REQUEST_ID_PLACEHOLDER
+    )
 }
 
 /// What Amazon S3 answered a refused read with, as the message CloudFormation reports for
@@ -191,15 +224,17 @@ fn refused_read_message(
     code: Option<&str>,
     message: Option<&str>,
 ) -> String {
-    match (code, message) {
-        (Some(code), _)
-            if refused == Refused::AbsenceAsAbsence && ABSENT_OBJECT_CODES.contains(&code) =>
-        {
-            unreadable_object(object, code)
-        }
+    let sentence = match (code, message) {
+        (Some(code), _) if ABSENT_OBJECT_CODES.contains(&code) => unreadable_object(object, code),
         (_, Some(message)) => s3_error(message),
         (Some(code), None) => s3_error(code),
         (None, None) => s3_error(UNIDENTIFIED_FAILURE),
+    };
+    match refused {
+        Refused::AbsenceAsAbsence => sentence,
+        // The StackSets control plane answers its own refusals inside the SDK envelope every
+        // call of it carries, the sentence included.
+        Refused::AsAStackSetsControlPlaneOperation => with_control_plane_envelope(&sentence),
     }
 }
 
@@ -725,9 +760,8 @@ mod tests {
 
     /// What Amazon S3 answered a refused read with, as the message CloudFormation reports
     /// for it — one row per refusal class, in the wording the operation that took the
-    /// reference carries: a stack operation reports an absent object as absence and
-    /// everything else as what Amazon S3 said, while a STACK SET operation reports what
-    /// Amazon S3 said whatever it refused the read for.
+    /// reference carries: the same sentence for every operation, inside the StackSets
+    /// control plane's own refusal envelope for an operation of that control plane.
     #[test]
     fn a_refused_read_is_reported_as_the_class_of_refusal_it_was() {
         let object = Object {
@@ -756,12 +790,13 @@ mod tests {
             ),
             (
                 "the same key, on a stack set operation",
-                Refused::AsAmazonS3Answered,
+                Refused::AsAStackSetsControlPlaneOperation,
                 Some("NoSuchKey"),
                 Some("The specified key does not exist."),
-                "S3 error: The specified key does not exist.\nFor more information check \
-                 http://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html"
-                    .to_string(),
+                with_control_plane_envelope(
+                    "S3 object does not exist. Bucket: assets, Key: templates/main.json. \
+                     Error: NoSuchKey",
+                ),
             ),
             (
                 "a version the bucket does not hold",
@@ -801,12 +836,13 @@ mod tests {
             ),
             (
                 "a refusal that identified nothing at all",
-                Refused::AsAmazonS3Answered,
+                Refused::AsAStackSetsControlPlaneOperation,
                 None,
                 None,
-                "S3 error: InternalFailure\nFor more information check \
-                 http://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html"
-                    .to_string(),
+                with_control_plane_envelope(
+                    "S3 error: InternalFailure\nFor more information check \
+                     http://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html",
+                ),
             ),
         ];
         for (case, refused, code, message, expected) in rows {

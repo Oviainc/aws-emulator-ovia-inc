@@ -96,8 +96,11 @@ use crate::state::StoredStack;
 ///
 /// The members this emulator has nothing to report for are absent rather than invented:
 ///
-/// * `ParentId`, `RootId` — nested stacks are not implemented, so no stack here has any.
 /// * `DetailedStatus` — nothing in this slice produces one.
+///
+/// `ParentId` and `RootId` are the stack this one is NESTED IN and the top of that chain,
+/// derived from the resource record that created it ([`crate::state::stack_nesting`]) — both
+/// absent for a top-level stack, which is nested in nothing.
 ///
 /// `Outputs` is the stack's evaluated outputs: one entry per output the template declares,
 /// as of the create or update that COMPLETED (see `crate::state::StoredStack`) — so a
@@ -106,7 +109,7 @@ use crate::state::StoredStack;
 /// `DriftInformation` is the result of the last drift detection that COMPLETED against the
 /// stack, with the instant the most recent detection was initiated on it: `NOT_CHECKED`
 /// with no timestamp until `DetectStackDrift` has run one.
-fn stack_view(stored: &StoredStack) -> Stack {
+fn stack_view(nesting: &crate::state::Nesting, stored: &StoredStack) -> Stack {
     Stack {
         stack_id: Some(stored.stack_id.clone()),
         stack_name: stored.stack_name.clone(),
@@ -133,8 +136,8 @@ fn stack_view(stored: &StoredStack) -> Stack {
         role_arn: stored.role_arn.clone(),
         tags: crate::state::tag_views(&stored.tags),
         enable_termination_protection: Some(stored.enable_termination_protection),
-        parent_id: None,
-        root_id: None,
+        parent_id: nesting.parent_id_of(stored),
+        root_id: nesting.root_id_of(stored),
         drift_information: crate::state::stack_drift_information(stored),
         retain_except_on_create: stored.retain_except_on_create,
         deletion_mode: stored.deletion_mode.clone(),
@@ -266,7 +269,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.next_token.as_deref(),
         )
         .map_err(crate::scaffolded::Scaffolded::validation_error)?;
-        let stacks: Vec<Stack> = page.into_iter().map(stack_view).collect();
+        // The nesting relation the two members below are derived from, built once for this
+        // read: it is a function of the other stacks' resource records rather than of the
+        // stack each view is about.
+        let nesting = store.nesting_in(&region);
+        let stacks: Vec<Stack> = page
+            .into_iter()
+            .map(|stored| stack_view(&nesting, stored))
+            .collect();
 
         Ok(DescribeStacksOutput {
             stacks: Some(stacks),
