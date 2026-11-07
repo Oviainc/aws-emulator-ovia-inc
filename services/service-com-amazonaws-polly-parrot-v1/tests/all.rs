@@ -70,6 +70,8 @@ mod synthesis_tasks;
 mod task_page_token_minting;
 #[path = "all/task_report_bounds.rs"]
 mod task_report_bounds;
+#[path = "all/task_id_refusal_class.rs"]
+mod task_id_refusal_class;
 #[path = "all/task_id_validity.rs"]
 mod task_id_validity;
 #[path = "all/task_retention.rs"]
