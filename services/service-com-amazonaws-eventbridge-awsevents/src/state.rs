@@ -2631,6 +2631,10 @@ pub struct ComAmazonawsEventbridgeAwseventsState {
     delivered_bytes: usize,
     /// Monotonic counter behind [`Self::next_event_id`]; never reused in a run.
     event_seq: u64,
+    /// What the schedule clock has already done for the rules of this store that
+    /// fire on a `ScheduleExpression`, and which clock is driving them
+    /// ([`schedule`]).
+    pub schedules: schedule::Schedules,
 }
 
 /// The store comes up holding no bus RECORD at all: the account's `default` bus
@@ -2659,6 +2663,7 @@ impl Default for ComAmazonawsEventbridgeAwseventsState {
             invocations: VecDeque::new(),
             delivered_bytes: 0,
             event_seq: 0,
+            schedules: schedule::Schedules::default(),
         }
     }
 }
@@ -4930,6 +4935,14 @@ pub mod event_pattern;
 /// connection holds and the parameters the connection and the target each
 /// contribute to the request.
 pub mod invocation;
+
+/// The SCHEDULE a rule fires on: when a rule carrying a `ScheduleExpression` is
+/// due, and what firing one hands its targets.
+///
+/// "Rules with `ScheduleExpressions` self-trigger based on the given schedule"
+/// (`PutRule`), so nothing a client does makes such a rule fire: its own schedule
+/// does, which is what that module performs.
+pub mod schedule;
 
 
 

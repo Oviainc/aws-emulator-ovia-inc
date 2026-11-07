@@ -183,6 +183,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         rule.state = crate::state::RULE_STATE_ENABLED.to_string();
+        // An enabled rule is triggered again — by a published event, and by its own
+        // `ScheduleExpression` where it carries one — so the clock that fires a schedule
+        // rule is started here too (`crate::state::schedule`). The store's lock is dropped
+        // first: starting the clock takes it.
+        drop(store);
+        crate::state::schedule::drive_schedule_clock(&self.engine, ctx.callback());
         Ok(EnableRuleOutput)
     }
 }

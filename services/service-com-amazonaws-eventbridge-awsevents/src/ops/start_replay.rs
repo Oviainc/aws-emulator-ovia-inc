@@ -419,7 +419,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let rule_arn = crate::state::rule_arn(&region, &destination_bus, &rule.name);
                 for target in &rule.targets {
                     let Some(outcome) = crate::ops::put_events::deliver(
-                        ctx,
+                        ctx.callback(),
                         &region,
                         &mut clients,
                         &stores,

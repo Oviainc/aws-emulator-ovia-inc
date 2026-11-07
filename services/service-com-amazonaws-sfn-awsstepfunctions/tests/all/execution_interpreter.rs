@@ -837,8 +837,9 @@ async fn waits_inside_an_iteration_and_a_retry_interval_hold_the_outcome() {
     );
 }
 
-/// A definition that declares `TimeoutSeconds` and runs past it ends `TIMED_OUT`
-/// with ASL's own `States.Timeout`, rather than succeeding late.
+/// A definition that declares `TimeoutSeconds` and runs past it ends `TIMED_OUT`,
+/// rather than succeeding late — reporting that status and nothing else, because what
+/// ran out is the execution's own allowance rather than anything one state did.
 #[tokio::test]
 async fn an_execution_past_its_definition_timeout_times_out() {
     let emulator = Emulator::new();
@@ -861,10 +862,13 @@ async fn an_execution_past_its_definition_timeout_times_out() {
         Some("TIMED_OUT"),
         "case timeout: an execution past its TimeoutSeconds times out, got {after:?}"
     );
-    assert_eq!(
-        after.get("error").and_then(Value::as_str),
-        Some("States.Timeout"),
-        "case timeout: a timed-out execution reports States.Timeout, got {after:?}"
+    assert!(
+        after.get("error").is_none_or(Value::is_null),
+        "case timeout: a machine-level timeout names no error, got {after:?}"
+    );
+    assert!(
+        after.get("cause").is_none_or(Value::is_null),
+        "case timeout: a machine-level timeout names no cause, got {after:?}"
     );
     assert!(
         after.get("output").is_none_or(Value::is_null),

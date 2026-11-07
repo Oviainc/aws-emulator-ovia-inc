@@ -17,8 +17,10 @@ emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
 # `time`: an api-destination delivery bounds each attempt at the endpoint by the
-# client execution timeout AWS documents for one (`ops::put_events`).
-tokio = { workspace = true, features = ["time"] }
+# client execution timeout AWS documents for one (`ops::put_events`), and the
+# schedule clock waits between its passes with it rather than parking a worker
+# thread; `rt` is the handle it spawns that one task onto (`state::schedule`).
+tokio = { workspace = true, features = ["rt", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 # `unbounded_depth`: the parser's own depth default is replaced by this service's
@@ -83,6 +85,11 @@ service-com-amazonaws-kms-trentservice = { workspace = true }
 # model — so the delivery writes the very store `GetWorkflowRuns` reads, exactly
 # as this service's own metrics are written into CloudWatch's.
 service-com-amazonaws-glue-awsglue = { workspace = true }
+# The `cron(...)` half of a rule's `ScheduleExpression` is read by this maintained
+# parser rather than by a hand-written one, and `chrono` (which it is written in)
+# is what the instants it names are read as (`state::schedule`).
+cron = "0.15"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

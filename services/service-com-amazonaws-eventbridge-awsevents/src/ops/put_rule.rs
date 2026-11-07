@@ -352,6 +352,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags,
         };
         bus.rules.insert(input.name, record);
+        // A rule that fires on a `ScheduleExpression` is triggered by nothing a client
+        // does, so the clock that fires it is started here — the one call that could have
+        // brought such a rule into existence (`crate::state::schedule`). The store's lock
+        // is dropped first: starting the clock takes it.
+        drop(store);
+        crate::state::schedule::drive_schedule_clock(&self.engine, ctx.callback());
 
         Ok(PutRuleOutput {
             rule_arn: Some(arn),

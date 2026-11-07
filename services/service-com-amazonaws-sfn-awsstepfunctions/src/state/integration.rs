@@ -78,7 +78,10 @@
 //! same resource. What the task reports is the function's OWN response payload
 //! ([`reported_result`]): the members around it on the wire — the status, the version
 //! that ran — are facts of the API call rather than of the function's output, and this
-//! form reports the output alone.
+//! form reports the output alone. An invocation Lambda SERVED whose function ERRORED is
+//! not an output at all: the unit of work failed, so the task fails with the error's own
+//! class out of the document the run produced and that document as its cause
+//! ([`function_error`]).
 //!
 //! ## The run-a-job (`.sync`) pattern
 //!
@@ -829,6 +832,17 @@ pub struct Call {
 const FUNCTION_NAME_MEMBER: &str = "FunctionName";
 /// See [`FUNCTION_NAME_MEMBER`].
 const PAYLOAD_MEMBER: &str = "Payload";
+
+/// The member of `Invoke`'s OUTPUT that carries Lambda's own signal that the invocation
+/// ran but the function ERRORED — "If present, indicates that an error occurred during
+/// function execution" — which that operation binds to the `x-amz-function-error`
+/// response header ([`LAMBDA_REST`]).
+const FUNCTION_ERROR_MEMBER: &str = "FunctionError";
+
+/// The member of the error document a failed run answers with that names the error's own
+/// CLASS, which is the name a `Task` state reports for such a failure, so a definition
+/// retrying or catching the exception the handler raised names that class.
+const ERROR_TYPE_MEMBER: &str = "errorType";
 
 impl Call {
     /// The document the invoked operation receives as its INPUT, for a task whose state
@@ -2601,12 +2615,18 @@ pub async fn call_api(
             // `Resource` that named the FUNCTION reports the function's own payload
             // out of that response instead.
             match read {
-                Ok(document) if call.invokes.is_some() => Ok(invocation_payload(call, &document)),
-                Ok(document) if call.sdk_envelope => Ok(with_sdk_envelope(
-                    in_epoch_millis(document, call.epoch_millis),
-                    &answered,
-                )),
-                Ok(document) => Ok(in_epoch_millis(document, call.epoch_millis)),
+                // An invocation Lambda SERVED whose function ERRORED is not a result:
+                // the unit of work this task is failed, so it is read as the failure it
+                // is before any result is built out of the answer.
+                Ok(document) => match function_error(call, &document) {
+                    Some(failed) => Err(failed),
+                    None if call.invokes.is_some() => Ok(invocation_payload(call, &document)),
+                    None if call.sdk_envelope => Ok(with_sdk_envelope(
+                        in_epoch_millis(document, call.epoch_millis),
+                        &answered,
+                    )),
+                    None => Ok(in_epoch_millis(document, call.epoch_millis)),
+                },
                 other => other,
             }
         }
@@ -2638,6 +2658,53 @@ const SDK_HTTP_METADATA: &str = "SdkHttpMetadata";
 fn invocation_payload(call: &Call, document: &Value) -> Value {
     let member = call.rest.map_or(PAYLOAD_MEMBER, |rest| rest.response_payload);
     document.get(member).cloned().unwrap_or(Value::Null)
+}
+
+/// The failure a Lambda invocation that RAN and whose function ERRORED is to the `Task`
+/// state that asked for it, or `None` for any other answer.
+///
+/// An invocation is served with HTTP 200 whether the function returned a value or
+/// raised: "The status code in the API response doesn't reflect function errors", and
+/// what distinguishes the two is [`FUNCTION_ERROR_MEMBER`], which Lambda sets only when
+/// "an error occurred during function execution". A `Task` state's work is the function's
+/// RUN, so a run that errored is a failed task rather than a result whose document
+/// happens to describe an error — and the name the state reports for it is the error's
+/// own class out of the document the run produced, which is what a `Retry` or a `Catch`
+/// naming the exception the handler raised matches. A document carrying no class leaves
+/// Lambda's own signal for the failure, under the `<service>.<code>` form every other
+/// failed call of that service is named by.
+///
+/// The cause is the error document ITSELF, as the run produced it, so the message and the
+/// trace the handler raised reach the client rather than a sentence written here.
+///
+/// Pure, so the reading of every answer form is pinned by this module's own tests.
+fn function_error(call: &Call, document: &Value) -> Option<Failed> {
+    if call.api.namespace != LAMBDA_NAMESPACE || call.operation != LAMBDA_INVOKE_OPERATION {
+        return None;
+    }
+    let signal = document
+        .get(FUNCTION_ERROR_MEMBER)
+        .and_then(Value::as_str)
+        .filter(|signal| !signal.is_empty())?;
+    let payload = document.get(call.rest.map_or(PAYLOAD_MEMBER, |rest| rest.response_payload));
+    let error = payload
+        .and_then(|payload| payload.get(ERROR_TYPE_MEMBER))
+        .and_then(Value::as_str)
+        .filter(|class| !class.is_empty())
+        .map_or_else(
+            || format!("{}.{signal}", call.api.sdk_id),
+            str::to_string,
+        );
+    let cause = match payload {
+        Some(Value::String(text)) => text.clone(),
+        Some(document) => document.to_string(),
+        None => format!(
+            "{} reported a '{signal}' function error for this invocation, and the run produced \
+             no error document",
+            call.api.sdk_id
+        ),
+    };
+    Some(Failed { error, cause })
 }
 
 /// The member a task's result carries the call's response metadata under: the

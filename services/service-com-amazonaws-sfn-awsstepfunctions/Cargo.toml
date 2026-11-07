@@ -85,6 +85,14 @@ hex = { workspace = true }
 # mounted beside Step Functions on the one engine the test router builds, the same shape
 # `core/router/src/lib.rs` mounts them in, so the call a task makes is served for real.
 service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
+# The same, for the service a `Task` state whose `Resource` names a Lambda FUNCTION
+# invokes (`tests/all/lambda_task_control_flow.rs`): the function really runs there, so
+# the control flow around the task is driven by what the run answered.
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# A deployment package is a .zip archive the suite above writes in memory...
+zip = { version = "9", default-features = false, features = ["deflate"] }
+# ...and `FunctionCode$ZipFile` is a blob, which a restJson1 request carries base64-encoded.
+base64 = "0.22"
 # The service that owns the dataset a `Map` state's `ItemReader` reads, mounted the same
 # way in `tests/all/map_item_reader.rs`, so the objects the reader lists and gets are
 # really stored by S3's own handlers.

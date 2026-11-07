@@ -93,6 +93,28 @@ pub(super) fn return_values(
             attributes.insert("Name".to_string(), name.to_string());
             (arn, attributes)
         }
+        // "Ref returns the ARN of the state machine"; Fn::GetAtt: Arn, Name. This is the
+        // type `super::provisioning` creates in AWS Step Functions itself, which then answers
+        // with the machine's own ARN — the same ARN this computes, since both are built from
+        // the one account id this emulator mints and the machine's name, which is how Step
+        // Functions keys a state machine (`state_machine_arn` in its own state module). The
+        // name is the declared `StateMachineName` where the template states one, as it is for
+        // every type whose name is a property, and the generated one otherwise.
+        STEP_FUNCTIONS_STATE_MACHINE => {
+            let declared = properties
+                .get("StateMachineName")
+                .and_then(|value| text(value, scope, 0, budget))
+                .filter(|declared| !declared.is_empty());
+            let machine = declared.unwrap_or_else(|| name.to_string());
+            let arn = ::emulator_server::emulator_arn(
+                STEP_FUNCTIONS_ARN_NAMESPACE,
+                region,
+                &format!("stateMachine:{machine}"),
+            );
+            attributes.insert("Arn".to_string(), arn.clone());
+            attributes.insert("Name".to_string(), machine);
+            (arn, attributes)
+        }
         // "Ref returns the user pool ID"; Fn::GetAtt: Arn
         // ("arn:aws:cognito-idp:us-east-1:123412341234:userpool/us-east-1_123412341"),
         // ProviderName ("The provider name of the Amazon Cognito user pool") and
@@ -1505,6 +1527,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         EVENTS_RULE => &["Arn"],
         SSM_PARAMETER => &["Type", "Value"],
         STEP_FUNCTIONS_ACTIVITY => &["Arn", "Name"],
+        STEP_FUNCTIONS_STATE_MACHINE => &["Arn", "Name"],
         SCHEDULER_SCHEDULE_GROUP | SCHEDULER_SCHEDULE => &["Arn"],
         _ => &[],
     }
@@ -2516,6 +2539,12 @@ pub const STEP_FUNCTIONS_ARN_NAMESPACE: &str = "states";
 /// activity", so the handle a stack publishes for one is the ARN `sfn DescribeActivity`
 /// answers with.
 pub const STEP_FUNCTIONS_ACTIVITY: &str = "AWS::StepFunctions::Activity";
+
+/// An AWS Step Functions state machine's resource type. Also created in that service, and
+/// "Ref returns the ARN of the state machine" — an ARN that is a total function of the
+/// Region, the account and the machine's name, so the handle a stack publishes for one is
+/// the ARN `sfn DescribeStateMachine` answers with.
+pub const STEP_FUNCTIONS_STATE_MACHINE: &str = "AWS::StepFunctions::StateMachine";
 
 /// A Systems Manager Parameter Store parameter's resource type (the SSM model:
 /// `cloudFormationName: SSM`). This is a type `super::provisioning` creates in Systems

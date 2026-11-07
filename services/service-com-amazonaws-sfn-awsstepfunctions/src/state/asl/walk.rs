@@ -43,6 +43,37 @@ impl Interpreter<'_> {
         })
     }
 
+    /// Credit the `waited` a service-integration call took back to the deadline above.
+    ///
+    /// The walk is BLOCKED while a call it asked for is in flight — in another
+    /// service's handler, which for a Lambda invocation runs a caller's own code — so
+    /// that span is not interpretation and is not charged to the interpreter's own
+    /// deadline. It is charged instead to what is left of [`MAX_CALL_WAIT_DURATION`],
+    /// which bounds it across the whole walk: once that is spent, the time a further
+    /// call takes falls on the deadline again, so the thread one run holds is bounded
+    /// whatever its definition asks for.
+    pub(super) fn spent_calling(&mut self, waited: Duration) {
+        let credited = waited.min(self.call_wait_left);
+        self.call_wait_left -= credited;
+        self.deadline = super::super::after(self.deadline, credited);
+    }
+
+    /// Whether the definition's own `TimeoutSeconds` has run out by `at`, the offset
+    /// into the run the next state would begin at.
+    ///
+    /// "The maximum number of seconds an execution of the state machine can run. If it
+    /// runs longer than the specified time, the execution fails with a States.Timeout
+    /// error name": the execution ENDS at that span, so a run still going there makes
+    /// no further transition — and asks for no further work of another service — rather
+    /// than running on to the emulator's own ceilings. What such a run is REPORTED as
+    /// is the definition's timeout, which [`super::interpret`] answers for it.
+    pub(super) fn past_timeout(&mut self, at: Duration) -> bool {
+        if self.timeout_left.is_some_and(|left| at > left) {
+            self.timed_out = true;
+        }
+        self.timed_out
+    }
+
     /// Walk a NESTED state list — a `Map` iteration or a `Parallel` branch — one
     /// level deeper, refusing a definition that nests past [`MAX_NESTING_DEPTH`].
     ///
@@ -102,6 +133,20 @@ impl Interpreter<'_> {
         let mut current = input;
         let mut at = at;
         loop {
+            // The definition's own `TimeoutSeconds` comes FIRST: an execution still
+            // going when it falls due has ENDED there, so it makes no further
+            // transition — and the emulator's own ceilings below never decide the
+            // outcome of a run the definition already bounded.
+            if self.past_timeout(at) {
+                return Branch {
+                    outcome: Err(Failure {
+                        error: Some(super::TIMEOUT_ERROR.to_string()),
+                        cause: None,
+                    }),
+                    end: at,
+                    suspended: false,
+                };
+            }
             if let Some(failure) = self.out_of_time() {
                 return Branch {
                     outcome: Err(failure),
@@ -1626,7 +1671,16 @@ impl Interpreter<'_> {
                 me.push_submit_failure(name, &resource_type, &action, &failure, at, &call);
                 return (Err(failure), at);
             }
+            let began = super::super::now();
             let answered = me.tasks.perform(&call, &request, within);
+            // The span the walk spent BLOCKED in that call is not interpretation, so it
+            // is credited back to the deadline and charged to the allowance that bounds
+            // the waiting one run may do ([`Interpreter::spent_calling`]).
+            me.spent_calling(
+                super::super::now()
+                    .duration_since(began)
+                    .unwrap_or_default(),
+            );
             // The identifier of the job a run-a-job call STARTED is read from the
             // answer as the invoked model spells it, before that answer becomes the
             // task's result in the convention the `Resource` reports it in

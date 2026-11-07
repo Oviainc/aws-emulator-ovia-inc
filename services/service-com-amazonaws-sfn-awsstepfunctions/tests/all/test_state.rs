@@ -631,7 +631,8 @@ struct MockedErrorCase {
 /// catcher makes it `CAUGHT_ERROR` and carries the error output to its own `Next`,
 /// and a failure neither answers for is `FAILED`.
 ///
-/// Rows vary along the error the mock names and the number of attempts the request
+/// Rows vary along the error the mock names — including the one name the catcher's
+/// documented wildcard does not take over — and the number of attempts the request
 /// says have already been taken, which is what crosses the retrier's `MaxAttempts`.
 #[tokio::test]
 async fn a_mocked_error_is_answered_by_the_state_s_own_retry_and_catch() {
@@ -653,11 +654,11 @@ async fn a_mocked_error_is_answered_by_the_state_s_own_retry_and_catch() {
             interval: Some(6),
         },
         MockedErrorCase {
-            case: "the retrier out of attempts, with no catcher for the error",
+            case: "the retrier out of attempts falls through to the catcher",
             error: "Lambda.TooManyRequestsException",
             taken: Some(2),
-            status: "FAILED",
-            next_state: None,
+            status: "CAUGHT_ERROR",
+            next_state: Some("Recover"),
             interval: None,
         },
         MockedErrorCase {
@@ -669,8 +670,11 @@ async fn a_mocked_error_is_answered_by_the_state_s_own_retry_and_catch() {
             interval: None,
         },
         MockedErrorCase {
-            case: "an error neither the retrier nor the catcher names",
-            error: "Lambda.ServiceException",
+            // "States.TaskFailed acts as a wildcard that matches any known error name
+            // except for States.Timeout": the one error this catcher does not take
+            // over, so the state fails with it.
+            case: "the one error the catcher's wildcard excludes",
+            error: "States.Timeout",
             taken: None,
             status: "FAILED",
             next_state: None,

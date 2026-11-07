@@ -135,6 +135,8 @@ mod rule_match_metrics;
 mod rule_metric_dimension_sets;
 #[path = "all/rule_state_control.rs"]
 mod rule_state_control;
+#[path = "all/scheduled_rule_firing.rs"]
+mod scheduled_rule_firing;
 #[path = "all/state_machine_execution_naming.rs"]
 mod state_machine_execution_naming;
 #[path = "all/state_roundtrip.rs"]

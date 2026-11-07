@@ -286,6 +286,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // response reports, so "no failures" is `[]` and never an absent member:
         // a client iterating `FailedEntries` must not have to tell an empty
         // result from an unsupported one.
+        // The targets of a rule that fires on a `ScheduleExpression` are what a firing
+        // hands the scheduled event to, so the clock that fires it is started here too —
+        // a rule put before its targets is schedulable from this call on
+        // (`crate::state::schedule`). The store's lock is dropped first: starting the
+        // clock takes it.
+        drop(store);
+        crate::state::schedule::drive_schedule_clock(&self.engine, ctx.callback());
+
         Ok(PutTargetsOutput {
             failed_entry_count: 0,
             failed_entries: Some(Vec::new()),

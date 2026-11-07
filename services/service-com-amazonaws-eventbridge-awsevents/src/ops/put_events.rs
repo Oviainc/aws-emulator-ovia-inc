@@ -584,7 +584,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // invocation was made, and a refusal for want of a
                         // permission is not one AWS counts there.
                         dead_letter_refusal(
-                            ctx,
+                            ctx.callback(),
                             &mut clients,
                             &dispatch.region,
                             &handover,
@@ -596,7 +596,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         outcome
                     } else {
                         let Some(outcome) = deliver(
-                            ctx,
+                            ctx.callback(),
                             &dispatch.region,
                             &mut clients,
                             &stores,
@@ -1463,46 +1463,59 @@ impl CompiledRule {
         Some(Self {
             name: rule.name.clone(),
             pattern,
-            targets: rule
-                .targets
-                .iter()
-                .map(|target| CompiledTarget {
-                    id: target.id.clone(),
-                    arn: target.arn.clone(),
-                    role_arn: target.role_arn.clone(),
-                    input: target.input.clone(),
-                    input_path: target.input_path.clone(),
-                    transformer: target
-                        .raw
-                        .input_transformer
-                        .as_ref()
-                        .map(Transformer::of),
-                    dead_letter_arn: target
-                        .raw
-                        .dead_letter_config
-                        .as_ref()
-                        .and_then(|config| config.arn.clone()),
-                    maximum_retry_attempts: target
-                        .raw
-                        .retry_policy
-                        .as_ref()
-                        .and_then(|policy| policy.maximum_retry_attempts),
-                    api_destination: api_destination(store, &target.arn),
-                    http_parameters: target.raw.http_parameters.clone(),
-                    partition_key_path: target
-                        .raw
-                        .kinesis_parameters
-                        .as_ref()
-                        .map(|parameters| parameters.partition_key_path.clone()),
-                    message_group_id: target
-                        .raw
-                        .sqs_parameters
-                        .as_ref()
-                        .and_then(|parameters| parameters.message_group_id.clone()),
-                })
-                .collect(),
+            targets: compiled_targets(rule, store),
         })
     }
+}
+
+/// The targets of `rule`, compiled for the delivery pass.
+///
+/// `pub(crate)` for the OTHER caller: a rule that self-triggers on its
+/// `ScheduleExpression` is matched by no published event, so it is never compiled
+/// as a routing rule ([`CompiledRule::of`] answers `None` for one) — but a firing
+/// of it hands its targets the same envelope through the same [`deliver`], so its
+/// targets are compiled the same way (`crate::state::schedule`).
+pub(crate) fn compiled_targets(
+    rule: &crate::state::RuleRecord,
+    store: &crate::state::ComAmazonawsEventbridgeAwseventsState,
+) -> Vec<CompiledTarget> {
+    rule.targets
+        .iter()
+        .map(|target| CompiledTarget {
+            id: target.id.clone(),
+            arn: target.arn.clone(),
+            role_arn: target.role_arn.clone(),
+            input: target.input.clone(),
+            input_path: target.input_path.clone(),
+            transformer: target
+                .raw
+                .input_transformer
+                .as_ref()
+                .map(Transformer::of),
+            dead_letter_arn: target
+                .raw
+                .dead_letter_config
+                .as_ref()
+                .and_then(|config| config.arn.clone()),
+            maximum_retry_attempts: target
+                .raw
+                .retry_policy
+                .as_ref()
+                .and_then(|policy| policy.maximum_retry_attempts),
+            api_destination: api_destination(store, &target.arn),
+            http_parameters: target.raw.http_parameters.clone(),
+            partition_key_path: target
+                .raw
+                .kinesis_parameters
+                .as_ref()
+                .map(|parameters| parameters.partition_key_path.clone()),
+            message_group_id: target
+                .raw
+                .sqs_parameters
+                .as_ref()
+                .and_then(|parameters| parameters.message_group_id.clone()),
+        })
+        .collect()
 }
 
 /// The API destination `arn` names, as the invocation needs it — `None` when the
@@ -1644,7 +1657,7 @@ impl DeliveryBudget {
 /// event onto a bus and the bus's rules deliver it, so the delivery rules above
 /// are stated ONCE and hold for a replayed event as they do for a published one.
 pub(crate) async fn deliver(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     clients: &mut Clients,
     stores: &Stores<'_>,
@@ -1715,7 +1728,7 @@ pub(crate) async fn deliver(
         Some((code, message)) => crate::state::InvocationOutcome::Failed { code, message },
         None => {
             kind.invoke(
-                ctx, clients, stores, region, handover, body, &mut retries, budget,
+                callback, clients, stores, region, handover, body, &mut retries, budget,
             )
             .await
         }
@@ -1725,7 +1738,8 @@ pub(crate) async fn deliver(
     // the dead-letter queue configured for that target" and counts it on
     // `FailedInvocations`. Both follow from the SAME outcome, so they happen in
     // one place.
-    dead_letter_refusal(ctx, clients, region, handover, body, &outcome, retries.as_ref()).await;
+    dead_letter_refusal(callback, clients, region, handover, body, &outcome, retries.as_ref())
+        .await;
     // Every handover that reached the target's API is counted on the rule's own
     // invocation metrics, whichever way it went — a rule that is delivering is
     // as observable as one that is failing.
@@ -1836,7 +1850,7 @@ const GLUE_CONCURRENT_RUNS_EXCEEDED_CODE: &str = "ConcurrentRunsExceededExceptio
 /// ATTEMPTED is nothing AWS would dead-letter: a gap in this emulator is not an
 /// event the target refused.
 async fn dead_letter_refusal(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
     region: &str,
     handover: &Handover<'_>,
@@ -1865,7 +1879,7 @@ async fn dead_letter_refusal(
     let dlq_region =
         ::service_common::arn::region_of(dead_letter_arn, SQS_ARN_NAMESPACE).unwrap_or(region);
     dead_letter(
-        ctx, clients, dlq_region, &queue, dead_letter_arn, handover, body, code, message,
+        callback, clients, dlq_region, &queue, dead_letter_arn, handover, body, code, message,
         retries,
     )
     .await;
@@ -2325,7 +2339,7 @@ impl TargetKind {
     #[allow(clippy::too_many_arguments)]
     async fn invoke(
         self,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        callback: &smithy_server_runtime::EmbeddedEmulator,
         clients: &mut Clients,
         stores: &Stores<'_>,
         region: &str,
@@ -2350,7 +2364,7 @@ impl TargetKind {
                 // One client for both calls this delivery makes on the queue:
                 // the handle is a copy over the shared in-process transport, so
                 // it addresses the same endpoint the cached one does.
-                let client = clients.sqs(ctx, region).clone();
+                let client = clients.sqs(callback, region).clone();
                 // The QUEUE's own policy decides this delivery before anything
                 // is enqueued ([`queue_delivery_refusal`]).
                 if let Some(refusal) =
@@ -2400,7 +2414,7 @@ impl TargetKind {
             Self::Function => {
                 // One client for both calls this delivery makes on the function,
                 // for the reason the queue branch above gives.
-                let client = clients.lambda(ctx, region).clone();
+                let client = clients.lambda(callback, region).clone();
                 // The FUNCTION's own resource-based policy decides this delivery
                 // before anything is invoked ([`function_delivery_refusal`]).
                 if let Some(refusal) =
@@ -2424,7 +2438,7 @@ impl TargetKind {
             Self::Topic => {
                 // One client for both calls this delivery makes on the topic,
                 // for the reason the queue branch above gives.
-                let client = clients.sns(ctx, region).clone();
+                let client = clients.sns(callback, region).clone();
                 // The TOPIC's own access policy decides this delivery before
                 // anything is published ([`topic_delivery_refusal`]).
                 if let Some(refusal) =
@@ -2436,7 +2450,7 @@ impl TargetKind {
             }
             Self::StateMachine => outcome(
                 clients
-                    .sfn(ctx, region)
+                    .sfn(callback, region)
                     .start_execution()
                     .state_machine_arn(arn)
                     // The execution's input is the whole event envelope, and the
@@ -2465,7 +2479,7 @@ impl TargetKind {
                 );
                 outcome(
                     clients
-                        .kinesis(ctx, region)
+                        .kinesis(callback, region)
                         .put_record()
                         .stream_arn(arn)
                         // The record's data is the whole event envelope, and its
@@ -2487,7 +2501,7 @@ impl TargetKind {
                 // name is resolved and nothing outside this process can be
                 // reached, so the endpoint's host, scheme and address range
                 // decide nothing but which emulated service claims it.
-                invoke_api_destination(ctx, target, body, retries, budget).await
+                invoke_api_destination(callback, target, body, retries, budget).await
             }
             // A Glue workflow is reached through the store of the Glue service
             // in this SAME engine rather than through a client: the ingress
@@ -2695,7 +2709,7 @@ const API_DESTINATION_NOT_DELIVERED: &str = "ApiDestinationInvocationFailed";
 /// The connection's authorization material and both sides' HTTP parameters ARE
 /// merged into the request ([`attempt_api_destination`]).
 async fn invoke_api_destination(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     target: &CompiledTarget,
     body: &str,
     retries: &mut Option<Retries>,
@@ -2740,7 +2754,7 @@ async fn invoke_api_destination(
              emulator; the delivery stops at the bound"
         );
     }
-    let transport = ctx.callback().http_connector();
+    let transport = callback.http_connector();
     let mut last = String::new();
     let mut made = 0;
     // Whether the REQUEST's endpoint-wait budget is what stopped the attempts,
@@ -3327,7 +3341,7 @@ fn function_invoke_refusal(function_arn: &str, action: &str) -> (String, String)
 /// have enqueued it.
 #[allow(clippy::too_many_arguments)]
 async fn dead_letter(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
     region: &str,
     queue: &str,
@@ -3353,7 +3367,7 @@ async fn dead_letter(
             ));
         }
     }
-    let client = clients.sqs(ctx, region).clone();
+    let client = clients.sqs(callback, region).clone();
     if queue_delivery_refusal(
         &client,
         queue,
@@ -3479,7 +3493,7 @@ macro_rules! callback_client {
     ($field:ident, $sdk:ident, $endpoint:literal) => {
         fn $field(
             &mut self,
-            ctx: &smithy_server_runtime::OperationContext<'_>,
+            callback: &smithy_server_runtime::EmbeddedEmulator,
             region: &str,
         ) -> &::$sdk::Client {
             if self
@@ -3489,8 +3503,8 @@ macro_rules! callback_client {
             {
                 let config = ::$sdk::Config::builder()
                     .behavior_version(::$sdk::config::BehaviorVersion::latest())
-                    .http_client(ctx.callback().http_client())
-                    .credentials_provider(ctx.callback().aws_credentials_provider())
+                    .http_client(callback.http_client())
+                    .credentials_provider(callback.aws_credentials_provider())
                     .region(::$sdk::config::Region::new(region.to_string()))
                     .endpoint_url(format!("https://{}.{region}.amazonaws.com", $endpoint))
                     .retry_config(::$sdk::config::retry::RetryConfig::disabled())

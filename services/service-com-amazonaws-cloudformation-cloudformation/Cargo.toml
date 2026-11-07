@@ -111,6 +111,12 @@ service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 # (`state::provisioning::cognito_identity_pool`): a suite that deploys one must have its
 # owning service mounted beside CloudFormation, or the create is refused and the stack fails.
 service-com-amazonaws-cognitoidentity-awscognitoidentityservice = { workspace = true }
+# AWS Step Functions, for the `AWS::StepFunctions::StateMachine` a stack really creates
+# there — including the one an `AWS::Serverless::StateMachine` becomes
+# (`state::provisioning::step_functions_state_machine`): a suite that deploys one must have
+# its owning service mounted beside CloudFormation, or the create is refused and the stack
+# fails.
+service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
 
 [lints]
 workspace = true

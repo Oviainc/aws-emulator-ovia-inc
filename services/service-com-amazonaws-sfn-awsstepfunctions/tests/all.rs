@@ -97,6 +97,8 @@ mod integration_member_names;
 mod json_parse_diagnostics;
 #[path = "all/jsonata_states.rs"]
 mod jsonata_states;
+#[path = "all/lambda_task_control_flow.rs"]
+mod lambda_task_control_flow;
 #[path = "all/list_state_machine_aliases_pages.rs"]
 mod list_state_machine_aliases_pages;
 #[path = "all/map_item_reader.rs"]

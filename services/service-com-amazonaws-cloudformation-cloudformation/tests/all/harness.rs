@@ -96,6 +96,12 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             Arc::clone(&engine),
         ),
     );
+    // AWS Step Functions, for the `AWS::StepFunctions::StateMachine` a stack really creates
+    // there — including the one an `AWS::Serverless::StateMachine` becomes — so a suite that
+    // deploys one reads the machine back through that service's own wire.
+    router.register_service(
+        service_com_amazonaws_sfn_awsstepfunctions::EmulatedService::new(Arc::clone(&engine)),
+    );
     (router, engine)
 }
 

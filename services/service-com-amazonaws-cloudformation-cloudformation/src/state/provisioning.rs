@@ -209,6 +209,7 @@ mod lambda_event_source_mapping;
 mod lambda_function;
 mod lambda_layer_version;
 mod lambda_permission;
+mod step_functions_state_machine;
 
 /// Custom resources: the provider a template names in a resource's `ServiceToken`, the
 /// request CloudFormation sends it on every stack operation touching the resource, and the
@@ -569,6 +570,9 @@ pub(super) enum Owner {
     /// identity pool, and the role attachment that binds the pool's IAM roles to it. Which
     /// of them it is travels with the owner, as for the Amazon EC2 types above.
     CognitoIdentityPool(cognito_identity_pool::Kind),
+    /// `AWS::StepFunctions::StateMachine`, whose arms are
+    /// [`step_functions_state_machine`]'s.
+    StepFunctionsStateMachine,
 }
 
 /// The owner of a template resource type, or `None` for a type this emulator leaves
@@ -597,6 +601,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if let Some(kind) = cognito_identity_pool::kind_of(resource_type) {
         return Some(Owner::CognitoIdentityPool(kind));
+    }
+    if resource_type == step_functions_state_machine::STEP_FUNCTIONS_STATE_MACHINE {
+        return Some(Owner::StepFunctionsStateMachine);
     }
     provisioner_for(resource_type).map(Owner::Builtin)
 }
@@ -642,6 +649,9 @@ impl Owner {
             }
             Self::CognitoIdentityPool(kind) => {
                 cognito_identity_pool::create(ctx, region, kind, resource, propagated).await
+            }
+            Self::StepFunctionsStateMachine => {
+                step_functions_state_machine::create(ctx, region, resource, propagated).await
             }
         }
     }
@@ -689,6 +699,7 @@ impl Owner {
             // A pool exists, and its role configuration is in force, from the moment the
             // owning service's own call answers.
             Self::CognitoIdentityPool(_) => Ok(cognito_identity_pool::ready()),
+            Self::StepFunctionsStateMachine => Ok(step_functions_state_machine::readiness()),
         }
     }
 
@@ -729,6 +740,9 @@ impl Owner {
             // publishes no attribute this emulator computes, so there is nothing left to
             // read once either resource is up.
             Self::CognitoIdentityPool(_) => Ok(BTreeMap::new()),
+            // A state machine's `Arn` and `Name` are the ones its own create answered with,
+            // so there is nothing left to read once the resource is up.
+            Self::StepFunctionsStateMachine => Ok(BTreeMap::new()),
         }
     }
 
@@ -769,6 +783,9 @@ impl Owner {
             // `DeleteIdentityPool` takes the pool away as it answers, and the call that
             // clears a pool's roles leaves nothing behind either.
             Self::CognitoIdentityPool(_) => Ok(Removal::Gone),
+            Self::StepFunctionsStateMachine => {
+                step_functions_state_machine::removal(ctx, region, physical_resource_id).await
+            }
         }
     }
 
@@ -816,6 +833,9 @@ impl Owner {
             Self::CognitoIdentityPool(kind) => {
                 cognito_identity_pool::update(ctx, region, kind, resource, declared).await
             }
+            Self::StepFunctionsStateMachine => {
+                step_functions_state_machine::update(ctx, region, resource, declared).await
+            }
         }
     }
 
@@ -857,6 +877,9 @@ impl Owner {
             // A pool's tags are replaced by its own update call, which carries the
             // declaration's whole configuration, so nothing is asked about them here.
             Self::CognitoIdentityPool(_) => Ok(()),
+            // The tags of a state machine that already exists are reconciled by no arm here
+            // yet ([`Provisioner::retag`]'s own default), so nothing is asked about them.
+            Self::StepFunctionsStateMachine => Ok(()),
         }
     }
 
@@ -912,6 +935,12 @@ impl Owner {
             Self::CognitoIdentityPool(kind) => {
                 cognito_identity_pool::delete(ctx, region, kind, resource).await
             }
+            // Step Functions takes no snapshot of a state machine on the way out: there is no
+            // such call, so a `Snapshot` deletion policy on this type deletes the machine with
+            // no snapshot invented for it.
+            Self::StepFunctionsStateMachine => {
+                step_functions_state_machine::delete(ctx, region, resource).await
+            }
         }
     }
 
@@ -964,6 +993,14 @@ impl Owner {
             Self::CognitoIdentityPool(kind) => {
                 cognito_identity_pool::actual_configuration(ctx, region, kind, resource).await
             }
+            Self::StepFunctionsStateMachine => {
+                step_functions_state_machine::actual_configuration(
+                    ctx,
+                    region,
+                    &resource.physical_resource_id,
+                )
+                .await
+            }
         }
     }
 
@@ -985,6 +1022,8 @@ impl Owner {
             Self::Ec2VpcNetwork(_) => message.to_string(),
             // Amazon Cognito Identity's does the same.
             Self::CognitoIdentityPool(_) => message.to_string(),
+            // AWS Step Functions' does the same.
+            Self::StepFunctionsStateMachine => message.to_string(),
         }
     }
 }

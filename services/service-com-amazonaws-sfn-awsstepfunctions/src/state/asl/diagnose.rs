@@ -225,7 +225,8 @@ pub fn warning(code: &'static str, location: Option<String>, message: impl ::std
 }
 
 /// Where one diagnostic was found: the enclosing machine's own location followed
-/// by `member`, or `None` for the definition as a whole.
+/// by `member`, or `None` for the definition as a whole ([`Diagnostic::stated`] is
+/// what a refusal states an absent one as).
 ///
 /// `prefix` is itself bounded (every caller builds one through [`nested_at`]), so
 /// the only caller-sized part of a location is the one member named here.

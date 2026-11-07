@@ -156,7 +156,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Map, Value};
 use serde_json_path::JsonPath;
 
-use super::integration::{Failed, Tasks};
+use super::integration::{Failed, Tasks, TASK_FAILED_ERROR};
 
 mod diagnose;
 mod intrinsics;
@@ -430,7 +430,35 @@ pub const MAX_GLOB_CHARS: usize = 256;
 /// on a blocking thread (`StartExecution` and `RedriveExecution` hand it to
 /// `spawn_blocking`), so an over-budget interpretation never occupies an async
 /// worker.
+///
+/// It bounds the INTERPRETER's own work and nothing else. The span a `Task` state spends
+/// waiting for the call that IS its work is not interpretation — the walk is blocked in
+/// another service's handler, which for a Lambda invocation RUNS a caller's own code —
+/// so that span is credited back to this deadline as it is spent and bounded on its own
+/// by [`super::integration::MAX_CALL_DURATION`] per call and by
+/// [`MAX_CALL_WAIT_DURATION`] across the run ([`Interpreter::spent_calling`]). Were it
+/// charged here instead, the ceiling on the emulator's own work would decide the outcome
+/// of every definition that asks for more than a couple of calls, which is not an
+/// outcome any definition can reach on the real service.
 pub const MAX_INTERPRET_DURATION: Duration = Duration::from_secs(2);
+
+/// The longest ONE interpretation spends WAITING for the service-integration calls its
+/// `Task` states' work is made of, across the whole walk.
+///
+/// Emulator bound, NOT an AWS duration, and the companion of
+/// [`MAX_INTERPRET_DURATION`]: one interpretation holds one blocking thread for its
+/// whole duration, including while a call it asked for is in flight, so what has to be
+/// bounded is the time that thread can be held. [`super::integration::MAX_CALL_DURATION`]
+/// bounds ONE call and [`MAX_STATE_TRANSITIONS`] bounds how many a run may make; this
+/// bounds their product, so the thread a run holds is held for at most this plus the
+/// interpreter's own deadline however many calls the definition asks for.
+///
+/// It is wide enough for the calls a real workload makes — a poll loop whose every
+/// revisit invokes a function, each invocation running that function's own code — and far
+/// narrower than the span a client waits for a reply in: a definition whose loop never
+/// terminates holds its thread for at most this, and whoever started the execution (a
+/// client, or an EventBridge rule firing on its own schedule) is answered inside it.
+pub const MAX_CALL_WAIT_DURATION: Duration = Duration::from_secs(30);
 
 /// The most values `States.ArrayRange` builds.
 ///
@@ -2065,6 +2093,21 @@ enum Entry {    /// At the definition's `StartAt`, with the execution's own inpu
     At(String, Value),
 }
 
+/// The definition-level `TimeoutSeconds` `document` declares, as a span.
+///
+/// "TimeoutSeconds (Optional) … The maximum number of seconds an execution of the state
+/// machine can run. If it runs longer than the specified time, the execution fails with
+/// a States.Timeout error name." It bounds the whole execution, so it is read once —
+/// before the walk, which STOPS at it ([`Interpreter::past_timeout`]), and after it, to
+/// report a run that got past it ([`interpret`]) — and a value that is not a whole
+/// number of seconds declares no bound to measure.
+fn definition_timeout(document: &Value) -> Option<Duration> {
+    document
+        .get("TimeoutSeconds")
+        .and_then(Value::as_u64)
+        .map(Duration::from_secs)
+}
+
 /// One walk of `definition`, and whether the reply [`Entry::Reply`] carries was
 /// applied in it.
 ///
@@ -2211,6 +2254,13 @@ fn interpret(
         // bounds how long this call spends interpreting, which is what makes the
         // walk interruptible.
         deadline: super::after(super::now(), MAX_INTERPRET_DURATION),
+        call_wait_left: MAX_CALL_WAIT_DURATION,
+        // What is left of a definition-level `TimeoutSeconds` for this walk: the span
+        // the execution had already spent counts towards it, so what remains is what
+        // this walk's own offsets are judged against — both as it goes and once it is
+        // done (below).
+        timeout_left: definition_timeout(&document).map(|timeout| timeout.saturating_sub(elapsed)),
+        timed_out: false,
         retry_count: 0,
         steps: Vec::new(),
         first_event_id,
@@ -2264,6 +2314,9 @@ fn interpret(
     let mut waiting = interpreter.waiting.take();
     let mut parked = interpreter.parked.take();
     let abandoned = std::mem::take(&mut interpreter.abandoned);
+    // Whether the walk STOPPED at the definition's own timeout rather than reaching an
+    // outcome of its own, which the reporting below answers for.
+    let stopped_at_timeout = interpreter.timed_out;
     let mut steps = interpreter.steps;
     // One execution's Map Runs are reported "in the order their states were entered",
     // which is the position each one carries. A nested Distributed Map inside another's
@@ -2310,10 +2363,9 @@ fn interpret(
     // an execution had already spent before this walk — the time a task it was
     // suspended at stayed outstanding, say — counts towards it, so what is left of the
     // timeout for THIS walk is what its own offsets are judged against.
-    if let Some(seconds) = document.get("TimeoutSeconds").and_then(Value::as_u64) {
-        let timeout = Duration::from_secs(seconds);
+    if let Some(timeout) = definition_timeout(&document) {
         let remaining = timeout.saturating_sub(elapsed);
-        if end > remaining {
+        if end > remaining || stopped_at_timeout {
             let kept = steps
                 .into_iter()
                 .filter(|step| step.after <= remaining)
@@ -2344,11 +2396,13 @@ fn interpret(
                 super::EVENT_EXECUTION_TIMED_OUT,
                 super::EXECUTION_STATUS_TIMED_OUT,
                 None,
-                Some(TIMEOUT_ERROR.to_string()),
-                Some(format!(
-                    "the execution ran for longer than the {seconds} seconds its definition's \
-                     'TimeoutSeconds' allows"
-                )),
+                // RECORDED: a machine-level timeout reports the STATUS and nothing
+                // else — no `error` and no `cause` — unlike the task-level
+                // `TimeoutSeconds`, which fails its state with [`TIMEOUT_ERROR`]. What
+                // ran out is the execution's own allowance rather than anything a state
+                // did, so there is no failure to name.
+                None,
+                None,
             )
             .with_map_runs(kept_map_runs);
             // The execution ended at the timeout, so a job it had started is waited
@@ -2605,8 +2659,27 @@ struct Interpreter<'tasks> {
     /// nesting a definition can ask for is capped rather than left to the stack.
     depth: usize,
     /// When this interpretation must stop, whatever it is doing: see
-    /// [`MAX_INTERPRET_DURATION`].
+    /// [`MAX_INTERPRET_DURATION`]. Pushed forward by the span each
+    /// service-integration call the walk waited for took, which is time the walk was
+    /// blocked in another service rather than interpreting
+    /// ([`Interpreter::spent_calling`]).
     deadline: SystemTime,
+    /// What is LEFT of [`MAX_CALL_WAIT_DURATION`]: the span this walk may still spend
+    /// waiting for the calls its `Task` states' work is made of. Spent as each call
+    /// answers, and what bounds the thread one run can hold.
+    call_wait_left: Duration,
+    /// What is left of the definition-level `TimeoutSeconds` for THIS walk — the
+    /// timeout less the span the execution had already spent — for a definition that
+    /// declares one.
+    ///
+    /// "TimeoutSeconds … the maximum number of seconds an execution of the state
+    /// machine can run": an execution still going at that span ENDS there, so the walk
+    /// stops at it instead of running on to the emulator's own ceilings, and the run is
+    /// reported as the timeout it is ([`Interpreter::past_timeout`]).
+    timeout_left: Option<Duration>,
+    /// Whether the walk STOPPED because the span above ran out, which is what makes the
+    /// run's outcome the definition's own timeout whatever the walk returned.
+    timed_out: bool,
     /// Which `Retry` attempt the state being run is on, which it reads through
     /// `$$.State.RetryCount`. A nested `Map` iteration or `Parallel` branch runs its
     /// own states, each with its own count, so [`Interpreter::nested_walk`] starts
@@ -3216,6 +3289,13 @@ pub fn activity_retry(
 /// execution to fail. A retry or catch on States.ALL won't catch States.Runtime
 /// errors." A definition that names `States.Runtime` itself does not catch it
 /// either, because it is not an error the execution can recover from.
+///
+/// [`TASK_FAILED_ERROR`] is the OTHER wildcard the language documents: "States.TaskFailed
+/// […] When used in a retry or catch, States.TaskFailed acts as a wildcard that matches
+/// any known error name except States.Timeout" — so a retrier naming it takes over the
+/// failure a task's own work reported, whatever that work named it, which is how a
+/// definition retries a service call or a function that failed without naming the
+/// service's error itself.
 fn errors_match(entry: &Map<String, Value>, error: &str) -> bool {
     if error == RUNTIME_ERROR {
         return false;
@@ -3224,10 +3304,11 @@ fn errors_match(entry: &Map<String, Value>, error: &str) -> bool {
         .get("ErrorEquals")
         .and_then(Value::as_array)
         .is_some_and(|names| {
-            names
-                .iter()
-                .filter_map(Value::as_str)
-                .any(|name| name == error || name == "States.ALL")
+            names.iter().filter_map(Value::as_str).any(|name| {
+                name == error
+                    || name == ALL_ERRORS
+                    || (name == TASK_FAILED_ERROR && error != TIMEOUT_ERROR)
+            })
         })
 }
 
@@ -4286,6 +4367,11 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         budget: MAX_STATE_TRANSITIONS,
         depth: 0,
         deadline: super::after(super::now(), MAX_INTERPRET_DURATION),
+        call_wait_left: MAX_CALL_WAIT_DURATION,
+        // `TestState` tests ONE state, with no execution and so no definition-level
+        // `TimeoutSeconds` around it: nothing here bounds the span the state runs in.
+        timeout_left: None,
+        timed_out: false,
         // The state is tested as the attempt the request says it is on, which is what
         // it reads through `$$.State.RetryCount`.
         retry_count: test.retries_taken,
