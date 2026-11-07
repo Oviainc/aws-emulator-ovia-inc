@@ -442,7 +442,8 @@ pub struct Directory {
     pub groups: BTreeMap<String, Group>,
     /// Reverse index over [`Group::members`]: folded member name → the folded names
     /// of the groups holding it. Derived state, maintained only by
-    /// [`Directory::add_member`] and [`Directory::delete_user`].
+    /// [`Directory::add_member`], [`Directory::remove_member`] and
+    /// [`Directory::delete_user`].
     groups_by_member: HashMap<String, BTreeSet<String>>,
 }
 
@@ -555,6 +556,26 @@ impl Directory {
             .or_default()
             .insert(group_key.to_string());
         true
+    }
+
+    /// Forget the membership of `member_key` in `group_key`'s group, on the group's
+    /// record and in the reverse index at once, so the two sides of one membership
+    /// never disagree about whether it is still held.
+    ///
+    /// Answers the membership that was removed, or `None` when no group of that name
+    /// holds that member — which is how a caller tells a removal it performed from
+    /// there being nothing to remove.
+    pub fn remove_member(&mut self, group_key: &str, member_key: &str) -> Option<Membership> {
+        let membership = self.groups.get_mut(group_key)?.members.remove(member_key)?;
+        if let Some(groups) = self.groups_by_member.get_mut(member_key) {
+            groups.remove(group_key);
+            // An index entry naming no group would answer for a member in no group,
+            // so the entry goes with the last membership it held.
+            if groups.is_empty() {
+                self.groups_by_member.remove(member_key);
+            }
+        }
+        Some(membership)
     }
 
     /// The groups of this directory that hold `member_key`, in folded-group-name
@@ -933,6 +954,22 @@ pub fn member_not_found(directory_id: &str, member_name: &str) -> ResourceNotFou
     ResourceNotFoundException {
         message: Some(format!(
             "member {member_name} was not found in directory {directory_id}"
+        )),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for a membership a group does not hold.
+///
+/// The membership is the resource a removal names, so a group that does not hold the
+/// member has nothing of that name to remove.
+pub fn membership_not_found(
+    directory_id: &str,
+    group_name: &str,
+    member_name: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "member {member_name} is not a member of group {group_name} in directory {directory_id}"
         )),
     }
 }

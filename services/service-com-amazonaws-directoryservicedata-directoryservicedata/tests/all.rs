@@ -25,6 +25,9 @@ mod group_search;
 #[path = "all/groups_for_member.rs"]
 mod groups_for_member;
 
+#[path = "all/membership_removal.rs"]
+mod membership_removal;
+
 #[path = "all/request_layer_envelopes.rs"]
 mod request_layer_envelopes;
 

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveGroupMember
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveGroupMember`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveGroupMember::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes an object of the directory out of one of its groups: the membership is
+//! forgotten on the group's record in [`crate::state`] and in the reverse index with
+//! it, so neither `ListGroupMembers` nor `ListGroupsForMember` reports it afterwards.
+//! An unknown group, an unknown member and a member the group does not hold are each
+//! `ResourceNotFoundException`, and the `ClientToken` ledger makes a repeat of the
+//! same call answer as the call it repeats.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +169,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveGroupMember` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveGroupMemberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveGroupMember"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RemoveGroupMemberErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the directory object store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let group_key = crate::state::fold(&input.group_name);
+        let member_key = crate::state::fold(&input.member_name);
+        // What this call IS, for the `@idempotencyToken` ledger: the same token with
+        // these inputs replays, the same token with different ones conflicts.
+        let fingerprint = crate::state::fingerprint(&[
+            Self::NAME,
+            &input.directory_id,
+            &group_key,
+            &member_key,
+            &input
+                .member_realm
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+        ]);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        match store.claim_token(input.client_token.as_deref(), &fingerprint, now) {
+            // The first call already took this member out, so the replay answers as it
+            // did rather than as the removal of a membership that is already gone.
+            crate::state::TokenClaim::Replayed(_) => return Ok(RemoveGroupMemberOutput {}),
+            crate::state::TokenClaim::Conflict => {
+                return Err(RemoveGroupMemberErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(
+                            "ClientToken was already used for a request with different parameters"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            crate::state::TokenClaim::Fresh => {}
+        }
+
+        // A removal only ever forgets a membership, so it writes no directory record
+        // of its own: a `DirectoryId` nothing has written to holds no group to remove
+        // a member from.
+        let Some(directory) = store.directories.get_mut(&input.directory_id) else {
+            return Err(RemoveGroupMemberErrorModeled::ResourceNotFoundException(
+                crate::state::group_not_found(&input.directory_id, &input.group_name),
+            )
+            .into());
+        };
+
+        if !directory.groups.contains_key(&group_key) {
+            return Err(RemoveGroupMemberErrorModeled::ResourceNotFoundException(
+                crate::state::group_not_found(&input.directory_id, &input.group_name),
+            )
+            .into());
+        }
+
+        // `MemberRealm` names the domain the member comes from; this directory holds
+        // objects only in its own realm, so a member from another one is not an object
+        // of it and no group of it holds one.
+        let member_in_realm =
+            crate::state::realm_matches(input.member_realm.as_deref(), &directory.realm);
+        if !member_in_realm || !directory.holds_object(&member_key) {
+            return Err(RemoveGroupMemberErrorModeled::ResourceNotFoundException(
+                crate::state::member_not_found(&input.directory_id, &input.member_name),
+            )
+            .into());
+        }
+
+        // The membership itself is the resource this call names: an object of the
+        // directory that this group does not hold leaves nothing of that name to take
+        // out of it.
+        if directory.remove_member(&group_key, &member_key).is_none() {
+            return Err(RemoveGroupMemberErrorModeled::ResourceNotFoundException(
+                crate::state::membership_not_found(
+                    &input.directory_id,
+                    &input.group_name,
+                    &input.member_name,
+                ),
+            )
+            .into());
+        }
+
+        store.record_token(input.client_token, fingerprint, None, now);
+
+        Ok(RemoveGroupMemberOutput {})
     }
 }
