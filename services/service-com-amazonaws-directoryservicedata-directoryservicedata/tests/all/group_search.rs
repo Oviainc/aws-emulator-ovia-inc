@@ -126,17 +126,20 @@ async fn whole_inventory(router: &MultiServiceRouter, directory: &str) -> Vec<Va
 /// The groups every case in the tables below searches: the same string sits on
 /// different attributes of different groups, so only the attribute a request names can
 /// decide which of them it reports. Attribute names satisfy `LdapDisplayName`'s
-/// `^[A-Za-z*][A-Za-z-*]*$`, and the stored values cover every arm of the modelled
-/// `AttributeValue` union (`smithy_query(query="shape", shape="AttributeValue")`).
+/// `^[A-Za-z*][A-Za-z-*]*$`, and every value is sent as the `AttributeValue` `S` member,
+/// the one this API takes (`smithy_query(query="shape", shape="AttributeValue")`: S, N,
+/// BOOL, SS — the other three are refused, which the `directory_authorization` suite
+/// covers), with the values varying in form so no case passes on the shape of a value.
 async fn populate(router: &MultiServiceRouter) {
     let creates = [
         json!({
             "SAMAccountName": "engineers",
             "OtherAttributes": {
                 "Description": {"S": "Engineering"},
-                "Floor": {"N": 7},
-                "Shared": {"BOOL": true},
-                "Alias": {"SS": ["eng", "eng-team"]},
+                "Floor": {"S": "7"},
+                "Shared": {"S": "true"},
+                "Alias": {"S": "eng-team"},
+                "ShortName": {"S": "eng"},
             },
         }),
         json!({
@@ -239,15 +242,20 @@ async fn a_search_matches_only_the_attributes_the_request_named() {
             &["Description"],
             &["all-staff", "engineers"],
         ),
-        ("a stored number attribute", "7", &["Floor"], &["engineers"]),
         (
-            "a stored boolean attribute",
+            "a stored attribute whose value reads as a number",
+            "7",
+            &["Floor"],
+            &["engineers"],
+        ),
+        (
+            "a stored attribute whose value reads as a boolean",
             "true",
             &["Shared"],
             &["engineers"],
         ),
         (
-            "one value of a multi-valued attribute",
+            "a stored attribute whose value carries punctuation",
             "eng-team",
             &["Alias"],
             &["engineers"],
@@ -295,9 +303,9 @@ async fn a_search_matches_only_the_attributes_the_request_named() {
             &["eng"],
         ),
         (
-            "the same string as one value of another group's attribute",
+            "the same string as the value another group's attribute holds",
             "eng",
-            &["Alias"],
+            &["ShortName"],
             &["engineers"],
         ),
     ];

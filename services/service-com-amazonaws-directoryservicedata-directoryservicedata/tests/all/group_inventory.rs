@@ -18,11 +18,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::validation_envelope::{call, emulator, Answer, DIRECTORY};
-
-/// A second `DirectoryId` satisfying `^d-[0-9a-f]{10}$`, for the cases that are about
-/// one directory not answering for another.
-const OTHER_DIRECTORY: &str = "d-00abcdef99";
+use super::validation_envelope::{call, emulator, Answer, DIRECTORY, OTHER_DIRECTORY};
 
 /// The largest page `MaxResults` admits (`@range(min: 1, max: 250)`), spelled out here
 /// rather than imported so a wrong bound in the implementation fails.

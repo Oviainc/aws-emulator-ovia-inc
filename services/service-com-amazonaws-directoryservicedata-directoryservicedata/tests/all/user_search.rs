@@ -27,7 +27,8 @@ const OTHER_DIRECTORY: &str = "d-00abcdef99";
 /// A third, for the paging case, so its users cannot perturb the table above.
 const PAGED_DIRECTORY: &str = "d-00000000aa";
 
-/// A `DirectoryId` nothing is ever written to.
+/// A `DirectoryId` nothing is ever written to — held by the account all the same, so what
+/// it reports is "this directory holds no objects" and not the gate's refusal.
 const UNUSED_DIRECTORY: &str = "d-aaaaaaaaaa";
 
 /// The largest page `MaxResults` admits (`@range(min: 1, max: 250)`), spelled out here
@@ -40,9 +41,15 @@ const SIGNED_FOR_DS_DATA: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/us-east-1/ds-data/aws4_request, \
      SignedHeaders=host, Signature=abc";
 
-/// One emulator: a router carrying only this service, over one shared engine.
+/// One emulator: a router carrying only this service, over one shared engine, with the
+/// account holding every directory these cases address — every operation of this data
+/// plane is gated on that.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    super::validation_envelope::hold_directories(
+        &engine,
+        &[DIRECTORY, OTHER_DIRECTORY, PAGED_DIRECTORY, UNUSED_DIRECTORY],
+    );
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine));
@@ -138,9 +145,11 @@ fn matched_names(answer: &Answer) -> Vec<String> {
 /// attributes of different users, so only the attribute a request names can decide
 /// which of them it reports.
 async fn populate(router: &MultiServiceRouter) {
-    // Attribute names satisfy `LdapDisplayName`'s `^[A-Za-z*][A-Za-z-*]*$`, and the
-    // value forms cover every arm of the modelled `AttributeValue` union
-    // (`smithy_query(query="shape", shape="AttributeValue")`: S, N, BOOL, SS).
+    // Attribute names satisfy `LdapDisplayName`'s `^[A-Za-z*][A-Za-z-*]*$`, and every
+    // value is sent as the `AttributeValue` `S` member, the one this API takes
+    // (`smithy_query(query="shape", shape="AttributeValue")`: S, N, BOOL, SS — the other
+    // three are refused, which the `directory_authorization` suite covers), with the
+    // values varying in form so no row can pass on the shape of a value.
     let creates = [
         json!({
             "SAMAccountName": "alice",
@@ -149,9 +158,9 @@ async fn populate(router: &MultiServiceRouter) {
             "EmailAddress": "ada@corp.example.com",
             "OtherAttributes": {
                 "Description": {"S": "Engineering"},
-                "Floor": {"N": 7},
-                "Contractor": {"BOOL": true},
-                "Telephone": {"SS": ["555-0100", "555-0101"]},
+                "Floor": {"S": "7"},
+                "Contractor": {"S": "true"},
+                "Telephone": {"S": "555-0101"},
             },
         }),
         json!({
@@ -258,15 +267,20 @@ async fn a_search_matches_only_the_attributes_the_request_named() {
             &["Description"],
             &["alice", "bob"],
         ),
-        ("a stored number attribute", "7", &["Floor"], &["alice"]),
         (
-            "a stored boolean attribute",
+            "a stored attribute whose value reads as a number",
+            "7",
+            &["Floor"],
+            &["alice"],
+        ),
+        (
+            "a stored attribute whose value reads as a boolean",
             "true",
             &["Contractor"],
             &["alice"],
         ),
         (
-            "one value of a multi-valued attribute",
+            "a stored attribute whose value carries punctuation",
             "555-0101",
             &["Telephone"],
             &["alice"],

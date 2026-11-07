@@ -27,6 +27,16 @@ use smithy_server_runtime::MultiServiceRouter;
 /// A `DirectoryId` satisfying `^d-[0-9a-f]{10}$`.
 pub(super) const DIRECTORY: &str = "d-1234567890";
 
+/// A second one, for the suites that are about one directory not answering for another.
+/// Both are directories this account holds; the gate's own case is an id held by nobody.
+pub(super) const OTHER_DIRECTORY: &str = "d-00abcdef99";
+
+/// A third, for the suites whose paging cases need a directory of their own, and a fourth
+/// nothing is ever written to — held by the account all the same, so what it reports is
+/// "this directory holds no objects" and not the gate's refusal.
+pub(super) const PAGED_DIRECTORY: &str = "d-00000000aa";
+pub(super) const UNUSED_DIRECTORY: &str = "d-aaaaaaaaaa";
+
 /// The error code every refusal below carries: the shape
 /// `com.amazonaws.directoryservicedata#ValidationException`, `@httpError` 400.
 pub(super) const VALIDATION_EXCEPTION: &str = "ValidationException";
@@ -86,12 +96,39 @@ const SIGNED_FOR_DS_DATA: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=abc";
 
 /// One emulator: a router carrying only this service, over one shared engine.
+///
+/// The engine's shared AD directory inventory holds the directories these suites address
+/// before any request is served: every operation of this data plane is gated on the account
+/// HOLDING the directory a request names ([`hold_directories`]).
 pub(super) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    hold_directories(
+        &engine,
+        &[DIRECTORY, OTHER_DIRECTORY, PAGED_DIRECTORY, UNUSED_DIRECTORY],
+    );
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine));
     router
+}
+
+/// Record that the account holds `directories`, as the AWS Directory Service CONTROL plane
+/// records a directory it creates.
+///
+/// The data plane under test creates no directory — `CreateDirectory` / `CreateMicrosoftAD`
+/// belong to the control plane — so a suite addressing a directory of this account puts it
+/// in the one shared inventory the gate reads
+/// (`service_com_amazonaws_directoryservicedata_directoryservicedata::state::ad_directory_inventory`),
+/// which is exactly what a create would have left there. An id NOT registered here is an id
+/// the account does not hold, which is the gate's own case.
+pub(super) fn hold_directories(engine: &engine::InMemoryEngine, directories: &[&str]) {
+    let inventory = service_com_amazonaws_directoryservicedata_directoryservicedata::state::
+        ad_directory_inventory(engine)
+        .expect("the shared engine holds the AD directory inventory");
+    let mut held = inventory.lock();
+    for directory in directories {
+        held.register(directory);
+    }
 }
 
 /// What the emulator answered: the status, the `x-amzn-errortype` header and the body.
@@ -161,6 +198,19 @@ pub(super) async fn call(
 pub(super) fn one_violation(value: &str, member: &str, requirement: &str) -> String {
     format!(
         "1 validation error detected: Value {value} at '{member}' \
+         failed to satisfy constraint: {requirement}"
+    )
+}
+
+/// The same envelope for a member whose value the refusal WITHHOLDS: the value half of the
+/// clause is gone, and the member path and the requirement are still stated.
+///
+/// That is what the model's `@sensitive` decides (`SearchUsersRequest$SearchString`,
+/// `CreateUserRequest$GivenName` / `$Surname` / `$EmailAddress` and every other member
+/// carrying the trait); a member without it is stated through [`one_violation`].
+pub(super) fn one_withheld_violation(member: &str, requirement: &str) -> String {
+    format!(
+        "1 validation error detected: Value at '{member}' \
          failed to satisfy constraint: {requirement}"
     )
 }
@@ -318,8 +368,8 @@ fn cases() -> Vec<Case> {
                 "SearchString": longest_search_string.clone(),
                 "SearchAttributes": ["cn"],
             }),
-            message: one_violation(
-                &format!("'{longest_search_string}'"),
+            // `SearchString` is `@sensitive`, so the clause states no value at all.
+            message: one_withheld_violation(
                 "searchString",
                 &format!("Member must have length less than or equal to {SEARCH_STRING_CEILING}"),
             ),

@@ -57,7 +57,7 @@
 //!   which operation it names — for every service whose published target prefix carries
 //!   dots of its own, which the framework's first-dot readers cannot route;
 //!
-//! Beside them, nine SHARED STORES live here, each held once in the shared engine so
+//! Beside them, ten SHARED STORES live here, each held once in the shared engine so
 //! the services on either side of a hand-off cannot hold two copies of one fact:
 //!
 //! * [`acm_certificate_associations`], the directory of which resources reference an ACM
@@ -98,7 +98,11 @@
 //! * [`ses_identities`], the account's email identity registry — the ONE set of
 //!   identities Amazon SES's two APIs publish, written by whichever surface records or
 //!   deletes an identity and read by both, so an identity created with the modern API
-//!   is listed, reported and gated on by the legacy one and the other way round.
+//!   is listed, reported and gated on by the legacy one and the other way round;
+//! * [`ad_directories`], the inventory of which Active Directory directories the account
+//!   holds — written by the AWS Directory Service control plane, which creates and deletes
+//!   them, and read by the Directory Service DATA plane, whose own API creates no directory
+//!   and so cannot tell a directory of this account from one that is not.
 //!
 //! # Why a shared rule
 //!
@@ -242,6 +246,11 @@ pub mod rds_event_source_types;
 /// The directory of which resources of the other services reference an ACM certificate,
 /// written by the service that owns the referencing resource and read by ACM.
 pub mod acm_certificate_associations;
+/// The inventory of which Active Directory directories the account holds, written by the
+/// AWS Directory Service control plane — which creates and deletes them — and read by the
+/// Directory Service DATA plane, which serves the objects inside a directory and creates
+/// none, so it cannot tell a directory of this account from one that is not on its own.
+pub mod ad_directories;
 /// The SageMaker job directory the SageMaker control plane writes when it creates a job
 /// of a reinforcement-fine-tuning category, and the AgenticRFT job runtime data plane
 /// reads to resolve the job ARN its callers carry.

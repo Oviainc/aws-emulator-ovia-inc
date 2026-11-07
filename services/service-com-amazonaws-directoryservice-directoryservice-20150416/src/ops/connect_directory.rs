@@ -317,6 +317,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         store.directories.insert(directory_id.clone(), record);
 
+        // The account now holds this directory, which is a fact the DATA plane needs and
+        // cannot read from its own records: it creates no directory, so a `DirectoryId` it
+        // is called with is one of this account's only because a create recorded it.
+        if let Some(inventory) = crate::state::ad_directory_inventory(&*self.engine) {
+            inventory.lock().register(&directory_id);
+        }
+
         // Read the id back out of the store, so the response cannot name a directory the
         // insert did not persist.
         let stored = store

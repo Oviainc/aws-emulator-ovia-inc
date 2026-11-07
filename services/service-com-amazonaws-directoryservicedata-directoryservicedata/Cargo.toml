@@ -29,6 +29,9 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Renders an opaque `NextToken` cursor, and the SHA-256 fingerprint above, as text.
 hex = { workspace = true }
+# Runs the `@pattern` the model declares for an attribute NAME — the key of the attribute
+# map, whose constraints the framework's validating walk does not capture.
+regex = "1.13"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

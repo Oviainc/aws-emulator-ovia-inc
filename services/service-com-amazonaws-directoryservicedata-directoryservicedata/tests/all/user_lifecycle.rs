@@ -47,9 +47,19 @@ const SIGNED_FOR_DS_DATA: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/us-east-1/ds-data/aws4_request, \
      SignedHeaders=host, Signature=abc";
 
-/// One emulator: a router carrying only this service, over one shared engine.
+/// A `DirectoryId` the account holds that nothing is ever written to, so what it reports
+/// is "this directory holds no objects" and not the authorization gate's refusal.
+const UNUSED_DIRECTORY: &str = "d-aaaaaaaaaa";
+
+/// One emulator: a router carrying only this service, over one shared engine, with the
+/// account holding every directory these cases address — every operation of this data
+/// plane is gated on that.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    super::validation_envelope::hold_directories(
+        &engine,
+        &[DIRECTORY, OTHER_DIRECTORY, UNUSED_DIRECTORY],
+    );
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine));
@@ -287,14 +297,17 @@ fn user_cases() -> Vec<(&'static str, Value)> {
             json!({"SAMAccountName": "MixedCase", "Surname": "Case"}),
         ),
         (
-            "attributes of all four AttributeValue types",
+            // The `S` member is the one this API takes a value as, so a row covering
+            // several attributes varies their NAMES and values, not the union member;
+            // the other three members are refused, which `directory_authorization`
+            // covers.
+            "several attributes, each sent as the AttributeValue S member",
             json!({
                 "SAMAccountName": "attrs",
                 "OtherAttributes": {
                     "description": {"S": "the whole attribute catalogue"},
-                    "codePage": {"N": 437},
-                    "enabled": {"BOOL": true},
-                    "servicePrincipalName": {"SS": ["host/a.corp.example.com", "host/b.corp.example.com"]},
+                    "codePage": {"S": "437"},
+                    "servicePrincipalName": {"S": "host/a.corp.example.com"},
                 },
             }),
         ),
@@ -540,7 +553,7 @@ async fn describe_user_projects_only_the_requested_attributes() {
             "SAMAccountName": "projected",
             "OtherAttributes": {
                 "description": {"S": "a described object"},
-                "codePage": {"N": 437},
+                "codePage": {"S": "437"},
                 "co": {"S": "Antarctica"},
             },
         }),
@@ -557,7 +570,7 @@ async fn describe_user_projects_only_the_requested_attributes() {
         (
             "another one, asked for in a different case",
             json!(["CODEPAGE"]),
-            json!({"codePage": {"N": 437}}),
+            json!({"codePage": {"S": "437"}}),
         ),
         (
             "two of the three",
@@ -672,8 +685,9 @@ async fn list_users_pages_through_the_stored_users_in_order() {
         whole.body
     );
 
-    // A directory nothing was written to holds nothing, and is not created by reading.
-    let empty = list_users(&router, "d-aaaaaaaaaa", &json!({})).await;
+    // A directory the account holds that nothing was written to holds nothing, and is
+    // not created by reading.
+    let empty = list_users(&router, UNUSED_DIRECTORY, &json!({})).await;
     assert_eq!(
         empty.status, 200,
         "ListUsers on an unused directory must be accepted, got {} with {:?}",
@@ -1247,14 +1261,17 @@ async fn a_request_outside_a_modelled_constraint_is_refused() {
     let router = emulator();
     create_user(&router, DIRECTORY, &json!({"SAMAccountName": "stored"})).await;
 
-    // DirectoryId: `^d-[0-9a-f]{10}$`.
+    // DirectoryId: `^d-[0-9a-f]{10}$`. A value outside the pattern is the constraint
+    // layer's refusal; a well-formed id the account does not hold is the authorization
+    // gate's (403), which the `directory_authorization` suite owns.
     let directory_cases = [
         ("not a directory id at all", "bad-id", 400),
         ("too few hex digits", "d-123456789", 400),
         ("too many hex digits", "d-12345678901", 400),
         ("hex digits out of range", "d-zzzzzzzzzz", 400),
         ("upper-case hex", "d-123456789A", 400),
-        ("a well-formed id nothing wrote to", "d-ffffffffff", 200),
+        ("a well-formed id the account does not hold", "d-ffffffffff", 403),
+        ("a well-formed id the account holds", UNUSED_DIRECTORY, 200),
     ];
     for (case, directory, status) in directory_cases {
         let answer = list_users(&router, directory, &json!({})).await;

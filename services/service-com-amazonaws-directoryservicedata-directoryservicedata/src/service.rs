@@ -85,7 +85,22 @@
 //! the list, a `@pattern` quoted as the expression a value must satisfy). Every path
 //! that words a refusal — the per-operation wrapper below, the refusal seam and the
 //! routing-error seam — goes through that one module, so the three cannot disagree.
+//!
+//! # The layers an ACCEPTED request still passes
+//!
+//! Past the request layer, two refusals are owed by every operation alike rather than by
+//! any one handler, so [`InModelledEnvelope`] answers them for all 17 in the order AWS
+//! does, each in its own module:
+//!
+//! 1. [`attribute_values`] — the semantic attribute layer: which member of the
+//!    `AttributeValue` union this service takes a value as.
+//! 2. [`authorization`] — the directory-authorization gate: a `DirectoryId` the account
+//!    does not hold is refused before any handler resolves anything inside it, so the
+//!    refusal precedes pagination-token parsing and `ClientToken` semantics and discloses
+//!    nothing about the directory.
 
+pub mod attribute_values;
+pub mod authorization;
 pub mod validation;
 
 use std::collections::HashMap;
@@ -150,6 +165,7 @@ macro_rules! wrap_operations {
                 stringify!($operation),
                 ::std::boxed::Box::new(InModelledEnvelope::new(
                     crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                    ::std::sync::Arc::clone(&$engine),
                 )) as ::std::boxed::Box<dyn ErasedOperation>,
             );
         )+
@@ -208,20 +224,25 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// re-implemented: a request this service does not refuse is handed to the generated
 /// `ErasedOperation::run`, which owns deserialize -> validate -> handle -> serialize,
 /// telemetry and every modelled error.
-struct InModelledEnvelope<O> {
+struct InModelledEnvelope<O, Eng> {
     operation: O,
+    /// The SAME shared engine the wrapped operation was constructed from, for the two
+    /// layers that answer BEFORE it: the directory-authorization gate reads the shared AD
+    /// directory inventory through it ([`crate::state::ad_directory_inventory`]).
+    engine: Arc<Eng>,
 }
 
-impl<O> InModelledEnvelope<O> {
-    /// Wrap one operation, already constructed from the shared engine.
-    fn new(operation: O) -> Self {
-        Self { operation }
+impl<O, Eng> InModelledEnvelope<O, Eng> {
+    /// Wrap one operation, already constructed from the shared engine, over that engine.
+    fn new(operation: O, engine: Arc<Eng>) -> Self {
+        Self { operation, engine }
     }
 }
 
-impl<O> ErasedOperation for InModelledEnvelope<O>
+impl<O, Eng> ErasedOperation for InModelledEnvelope<O, Eng>
 where
     O: Operation + ErasedOperation,
+    Eng: Send + Sync + 'static,
 {
     fn run<'r>(
         &'r self,
@@ -239,6 +260,27 @@ where
             {
                 return refusal;
             }
+
+            // The two refusals this service owes for an attribute, read off ONE parse of
+            // the request body: a NAME outside the constraints the model declares for a
+            // map's KEY (which the framework's walk cannot collect) in the constraint
+            // layer's own envelope, and a VALUE sent as a union member this API does not
+            // take in this service's semantic grammar with its `Reason`. Both precede the
+            // authorization gate below, as the recorded ordering has them.
+            if let Some(refusal) =
+                attribute_values::refusing_attributes(O::INPUT_SCHEMA, request_body(req))
+            {
+                let (message, reason) = refusal.stated();
+                return invalid_request(protocol, message, reason);
+            }
+
+            // The directory-authorization gate, ahead of every handler: a directory the
+            // account does not hold is refused before anything inside it is resolved, and
+            // before a `NextToken` or a `ClientToken` is read.
+            if let Some(refusal) = authorization::refusing_request(protocol, &*self.engine, req) {
+                return refusal;
+            }
+
             self.operation.run(svc, req, ctx).await
         })
     }
@@ -252,9 +294,7 @@ where
 
 /// This service's answer to `violations`: HTTP 400 `ValidationException` with the
 /// prose in the `Message` member the model declares, serialized through that shape's
-/// own schema. `None` when there is nothing to refuse — and also when the error
-/// cannot be serialized, which leaves the framework's walk to refuse the request in
-/// its own envelope rather than answering a 400 with no reason at all.
+/// own schema. `None` only when there is nothing to refuse.
 ///
 /// The prose is [`validation::refusal_message`]'s: `input_schemas` are the input shapes
 /// a clause stated at a LIST member reads that member's element constraint set off, and
@@ -268,13 +308,33 @@ fn validation_exception(
 ) -> Option<RtResponse> {
     let message =
         validation::refusal_message(violations, input_schemas, |member| lists.get(member).cloned())?;
+    // `Reason` names a rule beyond the modelled constraints (an unknown `NextToken`, an
+    // attribute this directory does not hold); a member outside its declared constraint
+    // has no such reason, and the layers that do know one state it themselves.
+    Some(invalid_request(protocol, message, None))
+}
+
+/// This service's `ValidationException` carrying `message`, and `reason` when the layer
+/// that refused the request knows one: HTTP 400 with the prose in the `Message` member the
+/// model declares, serialized through that shape's own schema.
+///
+/// The ONE place a `ValidationException` is rendered here, so the constraint layer and
+/// every semantic layer answer in one envelope and cannot drift apart in anything but the
+/// prose and the `Reason` each owns.
+///
+/// A decision to refuse never degrades into success, so this answers a response in every
+/// case: where the shape cannot be serialized through its own schema, the same status,
+/// error code and members are written directly ([`modelled_error_response`]) rather than
+/// letting the request fall through to a handler — which for a semantic refusal would STORE
+/// what the layer refused.
+fn invalid_request(
+    protocol: &dyn ServerHttpProtocol,
+    message: String,
+    reason: Option<&str>,
+) -> RtResponse {
     let refused = crate::ops::types::shared_types::ValidationException {
         message: Some(message),
-        // `Reason` names a rule beyond the modelled constraints (an unknown
-        // `NextToken`, an attribute this directory does not hold); a member outside
-        // its declared constraint has no such reason, and the handlers that do know
-        // one set it themselves.
-        reason: None,
+        reason: reason.map(str::to_string),
     };
     protocol
         .serialize_error(
@@ -283,7 +343,43 @@ fn validation_exception(
             VALIDATION_EXCEPTION,
             VALIDATION_EXCEPTION_STATUS,
         )
-        .ok()
+        .unwrap_or_else(|_| {
+            modelled_error_response(
+                VALIDATION_EXCEPTION,
+                VALIDATION_EXCEPTION_STATUS,
+                refused.message.as_deref(),
+                refused.reason.as_deref(),
+            )
+        })
+}
+
+/// One modelled error of this service written WITHOUT its schema: the status its
+/// `@httpError` declares, the shape named in `x-amzn-errortype` as every modelled error of
+/// this service is named, and the `Message` / `Reason` members the model declares, through
+/// the JSON writer so any text escapes.
+///
+/// The fallback every refusal path here shares for an error the protocol cannot serialize
+/// through the shape's own schema: the refusal is still answered, in the same envelope
+/// members a client reads, because a refusal that falls through is served.
+pub(super) fn modelled_error_response(
+    code: &str,
+    status: u16,
+    message: Option<&str>,
+    reason: Option<&str>,
+) -> RtResponse {
+    let mut body = serde_json::Map::new();
+    body.insert("__type".to_string(), Value::String(code.to_string()));
+    if let Some(message) = message {
+        body.insert("Message".to_string(), Value::String(message.to_string()));
+    }
+    if let Some(reason) = reason {
+        body.insert("Reason".to_string(), Value::String(reason.to_string()));
+    }
+    let mut response = json_response(status, Value::Object(body).to_string());
+    response
+        .headers_mut()
+        .insert("x-amzn-errortype", code.to_string());
+    response
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {

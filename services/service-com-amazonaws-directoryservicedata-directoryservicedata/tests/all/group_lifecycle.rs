@@ -19,11 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
-use super::validation_envelope::{call, emulator, Answer, DIRECTORY};
-
-/// A second `DirectoryId` (`^d-[0-9a-f]{10}$`), for the cases that are about one
-/// directory not answering for another.
-const OTHER_DIRECTORY: &str = "d-00abcdef99";
+use super::validation_envelope::{call, emulator, Answer, DIRECTORY, OTHER_DIRECTORY};
 
 /// `GroupType`'s modelled values, from
 /// `smithy_query(query="shape", shape="GroupType")` — "Distribution", "Security".
@@ -152,16 +148,19 @@ fn group_cases() -> Vec<(String, Value)> {
             json!({"SAMAccountName": "MixedCaseGroup"}),
         ),
         (
-            "attributes of all four AttributeValue types".to_string(),
+            // Every attribute value goes as the `S` member, the one this API takes;
+            // the other three members of the union are refused, which the
+            // `directory_authorization` suite covers.
+            "several attributes, each sent as the AttributeValue S member".to_string(),
             json!({
                 "SAMAccountName": "attrgroup",
                 "GroupType": "Distribution",
                 "GroupScope": "Universal",
                 "OtherAttributes": {
                     "description": {"S": "the whole attribute catalogue"},
-                    "groupType": {"N": 4},
-                    "isCriticalSystemObject": {"BOOL": false},
-                    "servicePrincipalName": {"SS": ["host/a.corp.example.com", "host/b.corp.example.com"]},
+                    "groupType": {"S": "4"},
+                    "isCriticalSystemObject": {"S": "FALSE"},
+                    "servicePrincipalName": {"S": "host/a.corp.example.com"},
                 },
             }),
         ),
@@ -424,9 +423,9 @@ async fn describe_group_projects_only_the_requested_attributes() {
     let stored = json!({
         "description": {"S": "the finance department"},
         "info": {"S": "owned by finance"},
-        "groupType": {"N": 2},
-        "isCriticalSystemObject": {"BOOL": true},
-        "servicePrincipalName": {"SS": ["host/finance.corp.example.com"]},
+        "groupType": {"S": "2"},
+        "isCriticalSystemObject": {"S": "TRUE"},
+        "servicePrincipalName": {"S": "host/finance.corp.example.com"},
     });
     create_group(
         &router,

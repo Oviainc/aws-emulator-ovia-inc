@@ -10,15 +10,18 @@
 //! this module is where each is answered, every one delegated to the shared renderer that
 //! owns it:
 //!
-//! * **The value half of a clause is the value the REQUEST carried.** The framework's walk
-//!   has no rendering for a COLLECTION — `@length` on a list is checked on the member before
-//!   the walk descends into its elements, so what it stores is a SUMMARY of the size
-//!   (`<n> items`), text no caller ever sent — and it ELIDES a long value at a ceiling of its
-//!   own, behind a marker naming the byte count. Both are replaced by the value as the
-//!   request's own rendering of it reads: a list as `[<element>, …]`
+//! * **The value half of a clause is the value the REQUEST carried, unless the model
+//!   WITHHOLDS it.** The framework's walk has no rendering for a COLLECTION — `@length` on
+//!   a list is checked on the member before the walk descends into its elements, so what it
+//!   stores is a SUMMARY of the size (`<n> items`), text no caller ever sent — and it
+//!   ELIDES a long value at a ceiling of its own, behind a marker naming the byte count.
+//!   Both are replaced by the value as the request's own rendering of it reads: a list as
+//!   `[<element>, …]`
 //!   (`service_common::validation_message::quoting_the_submitted_collection`), a scalar as
-//!   the bytes submitted (`…::quoting_the_whole_submitted_value`, which also puts back the
-//!   value the walk WITHHELD for a `@sensitive` member, the one this service's clauses state).
+//!   the bytes submitted (`…::quoting_the_whole_submitted_value`). A member the model marks
+//!   `@sensitive` is the one exception and is restored NOWHERE: the walk withheld its value
+//!   as the violation was recorded, and the clause this service states is the one the walk
+//!   wrote — the member and the requirement, and no value at all.
 //! * **A constraint broken by a list's ELEMENTS is stated at the LIST.** The framework
 //!   reports one clause per offending element, at `<list>.<position>.member`, naming only the
 //!   constraint that element broke; this service states ONE clause at `<list>`, quoting the
@@ -30,6 +33,9 @@
 //! * **An enumerated type's value set is stated in the order this service PUBLISHES it in**,
 //!   which is a property of the enum rather than of the request and is not the order the
 //!   model declares its members in ([`PUBLISHED_ENUM_VALUE_SETS`]).
+//! * **The clauses of ONE refusal are stated in this service's own fixed order**, by the
+//!   member path each is stated at ([`in_stated_clause_order`]) — neither the order the
+//!   request wrote its members in nor the order the model declares them.
 //!
 //! A `@pattern` requirement is quoted as the EXPRESSION a value must satisfy rather than as
 //! the model's anchored literal, through the tree's one statement of that rendering
@@ -113,8 +119,9 @@ fn in_published_enum_order(violation: &Violation) -> Violation {
 
 /// Every violation that refuses `req` before `O`'s handler runs — a `@required` member
 /// absent, or a value outside a declared constraint — with each clause's value half stating
-/// what the caller submitted, and with every list of scalars the request carried, keyed by the
-/// member path a clause names that list at.
+/// what the caller submitted (except for a member the model WITHHOLDS the value of), and
+/// with every list of scalars the request carried, keyed by the member path a clause names
+/// that list at.
 ///
 /// Both halves come out of ONE read of the request, the tree's shared collecting walk
 /// (`service_common::validation::refusing_violations_with_mapped_echoes`): the violations are
@@ -131,6 +138,13 @@ pub fn refusing_request<O: Operation>(
     let violations = refused
         .into_iter()
         .map(|(violation, echo)| {
+            // A member the model marks `@sensitive` keeps the clause the walk wrote, which
+            // names the member and the requirement and states NO value: the value is the
+            // one thing such a clause must not disclose, so neither restoring rule below
+            // is asked about it and the request's bytes never leave the walk.
+            if violation.sensitive {
+                return violation;
+            }
             // A collection's clause states the collection, a scalar's the bytes submitted;
             // each rule touches only its own clause, so the two compose rather than overlap.
             let quoted = quoting_the_submitted_collection(violation, echo.clone());
@@ -138,6 +152,26 @@ pub fn refusing_request<O: Operation>(
         })
         .collect();
     (violations, lists)
+}
+
+/// The order this service states the clauses of ONE refusal in: by the member path each
+/// clause is stated at, in lexicographic order.
+///
+/// A request that breaks the constraints of two members is refused with both clauses in one
+/// message, and which clause comes first is a property of the SERVICE: it is neither the
+/// order the request wrote its members in nor the order the model declares them, so one
+/// request always reads back one message however a client happened to serialize it.
+///
+/// Only the ORDER changes: each clause, its member path, its echoed value and its
+/// requirement keep coming from the framework. The sort is STABLE, so two clauses about ONE
+/// member keep the order the framework's walk collected them in — which of a member's
+/// requirements is reported first is the walk's to say and not this module's — and the walk
+/// hands over at most its own ceiling of violations, so the work is bounded by the tree's
+/// shared walk rather than by one request.
+fn in_stated_clause_order(violations: &[Violation]) -> Vec<Violation> {
+    let mut ordered = violations.to_vec();
+    ordered.sort_by(|left, right| left.path.cmp(&right.path));
+    ordered
 }
 
 /// The prose this service states for `violations`: how many of the request's values failed,
@@ -155,7 +189,10 @@ pub fn refusal_message(
     input_schemas: &[&'static Schema],
     quoted_collection: impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
-    let stated: Vec<Violation> = violations.iter().map(in_published_enum_order).collect();
+    let stated: Vec<Violation> = in_stated_clause_order(violations)
+        .iter()
+        .map(in_published_enum_order)
+        .collect();
     aws_validation_refusal_over_elements_quoting(
         &Refusal::Invalid(stated),
         input_schemas,

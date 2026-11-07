@@ -72,9 +72,12 @@ const SIGNED_FOR_DS_DATA: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/us-east-1/ds-data/aws4_request, \
      SignedHeaders=host, Signature=abc";
 
-/// One emulator: a router carrying only this service, over one shared engine.
+/// One emulator: a router carrying only this service, over one shared engine, with the
+/// account holding the directory these cases address — every operation of this data plane
+/// is gated on that, so a request that is meant to reach its handler needs it.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    super::validation_envelope::hold_directories(&engine, &[DIRECTORY]);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine));

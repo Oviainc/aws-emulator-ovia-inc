@@ -3936,3 +3936,27 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsDirectoryserviceDirectoryservice20150416State>)
 }
+
+/// The SHARED AD directory inventory in the shared engine: call it with a handler's
+/// `&*self.engine`.
+///
+/// A directory is created and deleted HERE and its objects are served by the Directory
+/// Service DATA plane, which creates no directory of its own — so which directories the
+/// account holds is ONE record under one shared type
+/// ([`::service_common::ad_directories::AdDirectoryInventory`]) rather than a second copy
+/// inside [`ComAmazonawsDirectoryserviceDirectoryservice20150416State`]: the engine keys
+/// state by TYPE, so a copy of its own here would be invisible to the plane that reads it.
+///
+/// LOCK ORDER: a handler takes [`service_state`] first and this inventory second, which is
+/// the order every writer of it keeps.
+pub fn ad_directory_inventory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::ad_directories::AdDirectoryInventory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::ad_directories::AdDirectoryInventory,
+            >,
+        )
+}

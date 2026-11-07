@@ -18,6 +18,10 @@
 #[path = "all/cloudformation_fifo_resource_generated_names.rs"]
 mod cloudformation_fifo_resource_generated_names;
 // Declared here, in this same head region, for the reason the entry above records: the
+// appended tail and the sorted `d…` span are both regions concurrently landing suites add
+// their line to.
+#[path = "all/directory_data_plane_authorization.rs"]
+mod directory_data_plane_authorization;
 // appended tail and the sorted `k…` span are both regions concurrently landing suites add
 // their line to.
 #[path = "all/kinesisvideo_discovered_data_plane.rs"]

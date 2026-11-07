@@ -10,7 +10,11 @@
 //! * [`Directory`] — one per `DirectoryId`, holding that directory's realm, its SID
 //!   authority, its users and its groups. The directory itself is created by the `ds`
 //!   control plane, which this data-plane API does not model, so the first write to a
-//!   `DirectoryId` materialises the record (a read never does).
+//!   `DirectoryId` materialises the record (a read never does) — and only for a
+//!   `DirectoryId` that plane recorded the account as holding
+//!   ([`ad_directory_inventory`], which every request is gated on ahead of any handler
+//!   by [`crate::service::authorization`]), so no record here names a directory the
+//!   account does not have.
 //! * [`User`] / [`Group`] — keyed by the case-folded `SAMAccountName`, because AD
 //!   treats that name as case insensitive. A `BTreeMap` keyed that way is also the
 //!   total order the paginated list operations index into, so a page boundary is
@@ -951,4 +955,32 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsDirectoryservicedataDirectoryservicedataState>)
+}
+
+/// The SHARED AD directory inventory in the shared engine: which directories the account
+/// holds, as the control plane that creates and deletes them recorded it. Call it with a
+/// handler's `&*self.engine`.
+///
+/// This API creates no directory — `CreateDirectory` / `CreateMicrosoftAD` /
+/// `DeleteDirectory` belong to the Directory Service control plane — so whether a
+/// `DirectoryId` names a directory of this account is knowable here only from that plane's
+/// own record. It is ONE record under one shared type
+/// ([`::service_common::ad_directories::AdDirectoryInventory`]) rather than a copy inside
+/// [`ComAmazonawsDirectoryservicedataDirectoryservicedataState`]: the engine keys state by
+/// TYPE, so a copy of its own here would be invisible to the plane that writes it.
+///
+/// LOCK ORDER: this inventory is taken and RELEASED before [`service_state`] is locked (the
+/// authorization gate in `crate::service::authorization` is its only reader here), so a
+/// request never holds both at once and the writer's order — its own store first, this one
+/// second — cannot invert against it.
+pub fn ad_directory_inventory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::ad_directories::AdDirectoryInventory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::ad_directories::AdDirectoryInventory,
+            >,
+        )
 }
