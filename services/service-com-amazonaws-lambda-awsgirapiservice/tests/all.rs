@@ -207,6 +207,8 @@ mod invocation_concurrency;
 mod invocation_count_series;
 #[path = "all/invocation_log_delivery.rs"]
 mod invocation_log_delivery;
+#[path = "all/invocation_log_group_search.rs"]
+mod invocation_log_group_search;
 #[path = "all/invocation_refusal_diagnostics.rs"]
 mod invocation_refusal_diagnostics;
 #[path = "all/invoke_addressed_function.rs"]

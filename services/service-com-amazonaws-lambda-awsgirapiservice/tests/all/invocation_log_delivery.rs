@@ -50,15 +50,19 @@ const REGION: &str = "us-east-1";
 const UNKNOWN_ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
 
 /// The IAM action namespace CloudWatch Logs' calls are named in.
-const LOGS: &str = "logs";
+pub(crate) const LOGS: &str = "logs";
 
 /// The three calls the runtime makes to deliver one invocation's log. Source: the actions
 /// AWS's own managed execution-role policy for a function (`AWSLambdaBasicExecutionRole`)
 /// grants.
-const LOG_WRITES: [&str; 3] = ["CreateLogGroup", "CreateLogStream", "PutLogEvents"];
+pub(crate) const LOG_WRITES: [&str; 3] = ["CreateLogGroup", "CreateLogStream", "PutLogEvents"];
 
 /// Lambda, CloudWatch Logs and IAM over ONE shared engine.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` so the sibling suite that reads a delivered log through the group-wide search
+/// ([`crate::invocation_log_group_search`]) mounts the same three services rather than a
+/// second copy of this harness.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = router_on(&engine);
     router.register_service(
@@ -75,7 +79,25 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// One CloudWatch Logs call (`awsJson1_1`, `Logs_20140328.<Operation>`), as its parsed body.
-async fn logs(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
+///
+/// `pub(crate)` for the reason [`emulator`] is.
+pub(crate) async fn logs(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
+    logs_answer(router, case, operation, body).await.1
+}
+
+/// The SAME call, with the STATUS it answered beside its body — for a caller that asserts the
+/// refusal itself rather than the content.
+pub(crate) async fn logs_answer(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -102,7 +124,7 @@ async fn logs(router: &MultiServiceRouter, case: &str, operation: &str, body: &V
         status < 500,
         "case {case:?}: CloudWatch Logs {operation} answered {status}: {parsed}"
     );
-    parsed
+    (status, parsed)
 }
 
 /// The names of the log groups whose name starts with `prefix`.
@@ -194,28 +216,32 @@ async fn delivered(
 }
 
 /// A function the suite creates: its deployment package, its runtime and where it logs.
-struct Created<'a> {
-    case: &'a str,
-    name: &'a str,
+///
+/// `pub(crate)` for the reason [`emulator`] is.
+pub(crate) struct Created<'a> {
+    pub(crate) case: &'a str,
+    pub(crate) name: &'a str,
     /// The handler's source.
-    source: &'a str,
+    pub(crate) source: &'a str,
     /// The runtime that runs it, which decides the package's one entry and the handler name.
-    runtime: &'a str,
+    pub(crate) runtime: &'a str,
     /// The execution role it runs as.
-    role: &'a str,
+    pub(crate) role: &'a str,
     /// The group its configuration names, or `None` to take the default.
-    log_group: Option<&'a str>,
+    pub(crate) log_group: Option<&'a str>,
 }
 
 /// The runtime most rows use. The delivery is the HOST's, so the cheaper engine runs the rows
 /// that do not assert a runtime's own output; the python rows below name python themselves.
-const NODE_RUNTIME: &str = "nodejs20.x";
+pub(crate) const NODE_RUNTIME: &str = "nodejs20.x";
 
 /// The runtime whose own error report one row asserts.
-const PYTHON_RUNTIME: &str = "python3.12";
+pub(crate) const PYTHON_RUNTIME: &str = "python3.12";
 
 /// Create `function` and wait until it reports `Active`.
-async fn create_function(router: &MultiServiceRouter, function: &Created<'_>) {
+///
+/// `pub(crate)` for the reason [`emulator`] is.
+pub(crate) async fn create_function(router: &MultiServiceRouter, function: &Created<'_>) {
     let python = function.runtime.starts_with("python");
     let (handler, package) = if python {
         (
@@ -258,7 +284,9 @@ async fn create_function(router: &MultiServiceRouter, function: &Created<'_>) {
 /// `X-Amz-Log-Result` is "the last 4 KB of the execution log, which is base64-encoded", so for
 /// the small logs below it IS the whole log — which makes it the independent statement of what
 /// the delivery has to have put into the group.
-async fn invoke(router: &MultiServiceRouter, case: &str, name: &str) -> (String, Value) {
+///
+/// `pub(crate)` for the reason [`emulator`] is.
+pub(crate) async fn invoke(router: &MultiServiceRouter, case: &str, name: &str) -> (String, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("{FUNCTIONS_URI}/{name}/invocations"))
