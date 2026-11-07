@@ -649,10 +649,12 @@ pub const DEVICE_DISCOVERY_STATUS_SUCCEEDED: &str = "SUCCEEDED";
 /// `StartDeviceDiscovery` answers with a job the model reports under
 /// `DeviceDiscoveryStatus`, whose `RUNNING` value says the run outlives the call that
 /// started it: the clock completes it. AWS publishes no duration for a discovery run, so
-/// this span is CHOSEN — inside the emulator's 250..750 ms window, so a caller that reads
-/// straight after the start still observes [`DEVICE_DISCOVERY_STATUS_RUNNING`]. It is
+/// this span is CHOSEN — long enough that a client POLLING `GetDeviceDiscovery` (or
+/// filtering `ListDeviceDiscoveries` on [`DEVICE_DISCOVERY_STATUS_RUNNING`]) observes the
+/// running phase over several reads rather than racing one read against the due instant,
+/// which is what makes a completion wait, timeout or retry path exercisable here. It is
 /// stored as a due instant ([`DeviceDiscovery::finishes_at`]) and never slept on.
-pub const DEVICE_DISCOVERY_DURATION: Duration = Duration::from_millis(500);
+pub const DEVICE_DISCOVERY_DURATION: Duration = Duration::from_secs(3);
 
 /// The `DiscoveryModification` of a device no earlier discovery of this account reported.
 pub const DISCOVERY_MODIFICATION_DISCOVERED: &str = "DISCOVERED";
