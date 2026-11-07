@@ -61,7 +61,7 @@ use omni::ops::types::{
 };
 use omni::state::{
     ACCESS_PROFILE_RESOURCE_TYPE, ALERT_EVALUATION_INTERVALS, ALERT_STATE_NODATA,
-    NOTIFICATION_STATUS_DISABLED, NOTIFICATION_STATUS_ENABLED,
+    ASSUME_ACCESS_PROFILE_ACTION, NOTIFICATION_STATUS_DISABLED, NOTIFICATION_STATUS_ENABLED,
 };
 
 /// The region the suite signs for; the handlers record the signed region on each
@@ -239,7 +239,13 @@ impl Omni {
                         principal_attributes: None,
                     },
                     scoped_actions: Some(vec![ScopedActions {
-                        actions: vec!["cloudwatch:GetTelemetry".to_string()],
+                        // The action assuming the profile IS, beside one the alert also
+                        // needs: the trust the handler reads is the assume action scoped
+                        // to this profile.
+                        actions: vec![
+                            ASSUME_ACCESS_PROFILE_ACTION.to_string(),
+                            "cloudwatch:GetTelemetry".to_string(),
+                        ],
                         resources: Some(vec![ResourceScope {
                             resource_type: ACCESS_PROFILE_RESOURCE_TYPE.to_string(),
                             resource_arns: Some(vec![profile_arn.to_string()]),

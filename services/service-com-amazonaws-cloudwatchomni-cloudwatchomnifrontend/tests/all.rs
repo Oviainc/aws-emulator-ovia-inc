@@ -17,6 +17,8 @@ mod access_grant_lifecycle;
 mod access_profile_lifecycle;
 #[path = "all/alert_lifecycle.rs"]
 mod alert_lifecycle;
+#[path = "all/alert_profile_trust.rs"]
+mod alert_profile_trust;
 #[path = "all/domain_space_lifecycle.rs"]
 mod domain_space_lifecycle;
 #[path = "all/omni_dashboard_lifecycle.rs"]

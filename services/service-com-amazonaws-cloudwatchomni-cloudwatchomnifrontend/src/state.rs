@@ -124,6 +124,25 @@ pub const ACCESS_GRANT_PERMISSION_CUSTOM: &str = "CUSTOM";
 /// IDC_USER principals").
 pub const ACCESS_GRANT_PRINCIPAL_TYPE_IDC_USER: &str = "IDC_USER";
 
+/// `AccessGrantPrincipalType`'s value for an access profile — its model doc is "An
+/// access profile." A grant held by this principal type authorizes the profile itself,
+/// which is a different thing from authorizing an alert to assume that profile.
+pub const ACCESS_GRANT_PRINCIPAL_TYPE_ACCESS_PROFILE: &str = "ACCESS_PROFILE";
+
+/// `AccessGrantPrincipalType`'s value for an alert — its model doc is "An alert.",
+/// enumerated separately from ACCESS_PROFILE ("An access profile."). A grant held by
+/// this principal type is what authorizes an alert to assume the access profile the
+/// grant is scoped to; a grant held by any other principal type, the profile itself
+/// included, is not that grant.
+pub const ACCESS_GRANT_PRINCIPAL_TYPE_ALERT: &str = "ALERT";
+
+/// The action an alert's trust grant carries to assume an access profile, named in the
+/// refusal a missing trust grant earns ([`alert_trust_rejection`]): this service's IAM
+/// action prefix, which is also its [`ARN_NAMESPACE`], and the action's own name.
+///
+/// [`alert_trust_rejection`]: ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::alert_trust_rejection
+pub const ASSUME_ACCESS_PROFILE_ACTION: &str = "cloudwatch:AssumeAccessProfile";
+
 /// The resource type name that names an access profile in a `ResourceScope`.
 ///
 /// `ResourceScope.resourceType`'s model doc is "Resource type name (e.g., \"DataSet\",
@@ -493,6 +512,103 @@ impl ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
         named
     }
 
+    /// Whether an ALERT-principal trust grant that names the assume action is recorded
+    /// against the access profile `profile_id` — the grant an alert assumes that profile
+    /// through.
+    ///
+    /// Three things have to hold, and each is what a modelled member says it is:
+    ///
+    /// * the grant's principal type is [`ACCESS_GRANT_PRINCIPAL_TYPE_ALERT`].
+    ///   `AccessGrantPrincipalType` enumerates ALERT ("An alert.") separately from every
+    ///   other principal type, ACCESS_PROFILE ("An access profile.") included, so the
+    ///   principal a grant names decides WHO it authorizes: a grant whose principal is
+    ///   the profile itself, or a user or a role, authorizes that principal, not an alert;
+    /// * one group of its scoped actions names [`ASSUME_ACCESS_PROFILE_ACTION`], the
+    ///   action assuming the profile is;
+    /// * that SAME group's resource scopes reach this profile — `ScopedActions` is "a
+    ///   group of actions ... together with the resource scopes ... that apply to exactly
+    ///   those actions", so an action in one group is not scoped by another group's
+    ///   resources. `ResourceScope.resourceArns` "when absent, defaults to \"*\"", i.e.
+    ///   every resource of that `resourceType`.
+    ///
+    /// This is a different question from the `assumeStatus` [`access_profile_view`]
+    /// reports: that member is "the calling principal's authorization to assume this
+    /// access profile", so a profile may be assumable by the caller and still carry no
+    /// trust an alert can use.
+    ///
+    /// Linear in the grants recorded against the profile ([`access_profiles_scoped_by`]
+    /// records them), which [`ACCESS_GRANT_QUOTA`] bounds, times the scope groups the
+    /// model bounds at 20 of 10.
+    ///
+    /// [`access_profiles_scoped_by`]: Self::access_profiles_scoped_by
+    pub fn alert_trust_grant_exists(&self, profile_id: &str) -> bool {
+        let Some(profile) = self.access_profiles.get(profile_id) else {
+            return false;
+        };
+        let profile_arn = profile.profile.arn.as_str();
+        profile
+            .assume_grant_ids
+            .iter()
+            .filter_map(|grant_id| self.access_grants.get(grant_id))
+            .filter(|stored| {
+                stored.grant.principal.principal_type == ACCESS_GRANT_PRINCIPAL_TYPE_ALERT
+            })
+            .any(|stored| grant_assumes_profile(&stored.grant, profile_arn))
+    }
+
+    /// Why an alert may not assume the access profile `profile_id`, or `None` when it
+    /// may ([`alert_trust_grant_exists`]).
+    ///
+    /// The refusal states the condition that failed and the step that clears it: the
+    /// profile the request named, and the trust grant the caller has to create on it.
+    /// It is not the `AssumeStatus` DENIED sentence, which reports a different
+    /// condition — the CALLING principal's own authorization to assume the profile —
+    /// and would send a caller to its credentials instead of to the missing grant.
+    ///
+    /// [`alert_trust_grant_exists`]: Self::alert_trust_grant_exists
+    pub fn alert_trust_rejection(&self, profile_id: &str) -> Option<String> {
+        if self.alert_trust_grant_exists(profile_id) {
+            return None;
+        }
+        Some(format!(
+            "The alert cannot assume access profile {profile_id}. Grant the profile a \
+             trust grant with principalType={ACCESS_GRANT_PRINCIPAL_TYPE_ALERT} \
+             (customAction {ASSUME_ACCESS_PROFILE_ACTION}) before creating the alert."
+        ))
+    }
+
+    /// The ids of the access grants that reference the access profile `profile_id`.
+    ///
+    /// `DeleteAccessProfile`'s doc: "An access profile cannot be deleted while access
+    /// grants reference it." A grant references a profile either way round: its resource
+    /// scopes name the profile, which is what [`access_profiles_scoped_by`] records as
+    /// the profile's `assume_grant_ids`, or the profile IS the principal the grant is
+    /// held by ([`ACCESS_GRANT_PRINCIPAL_TYPE_ACCESS_PROFILE`] with that `principalId`).
+    ///
+    /// Linear in the number of stored grants, which [`ACCESS_GRANT_QUOTA`] bounds.
+    ///
+    /// [`access_profiles_scoped_by`]: Self::access_profiles_scoped_by
+    pub fn grants_referencing_profile(&self, profile_id: &str) -> Vec<String> {
+        let scoped = self
+            .access_profiles
+            .get(profile_id)
+            .map(|stored| stored.assume_grant_ids.clone())
+            .unwrap_or_default();
+        let mut referencing: Vec<String> = self
+            .access_grants
+            .values()
+            .filter(|stored| {
+                let principal = &stored.grant.principal;
+                scoped.contains(&stored.grant.grant_id)
+                    || (principal.principal_type == ACCESS_GRANT_PRINCIPAL_TYPE_ACCESS_PROFILE
+                        && principal.principal_id.as_deref() == Some(profile_id))
+            })
+            .map(|stored| stored.grant.grant_id.clone())
+            .collect();
+        referencing.sort();
+        referencing
+    }
+
     /// The dashboard `space_id` holds under `name`, if the store holds one.
     ///
     /// Linear in the number of stored dashboards, which [`OMNI_DASHBOARD_QUOTA`] bounds.
@@ -802,6 +918,30 @@ pub fn space_summary(space: &Space) -> SpaceSummary {
         created_at: space.created_at,
         updated_at: space.updated_at,
     }
+}
+
+/// Whether one group of `grant`'s scoped actions both names the action assuming an
+/// access profile is and scopes that same group to the profile `profile_arn`.
+///
+/// `ScopedActions` is "a group of actions within an access grant, together with the
+/// resource scopes and context conditions that apply to exactly those actions", so the
+/// pairing is per group: an action listed in one group is not scoped by another group's
+/// resources. A scope reaches the profile when its `resourceType` is
+/// [`ACCESS_PROFILE_RESOURCE_TYPE`] and its `resourceArns` name that ARN or are absent —
+/// `resourceArns`'s model doc: "When absent, defaults to \"*\"".
+fn grant_assumes_profile(grant: &AccessGrant, profile_arn: &str) -> bool {
+    grant.scoped_actions.iter().flatten().any(|group| {
+        group
+            .actions
+            .iter()
+            .any(|action| action == ASSUME_ACCESS_PROFILE_ACTION)
+            && group.resources.iter().flatten().any(|scope| {
+                scope.resource_type == ACCESS_PROFILE_RESOURCE_TYPE
+                    && scope.resource_arns.as_ref().is_none_or(|arns| {
+                        arns.is_empty() || arns.iter().any(|arn| arn == profile_arn)
+                    })
+            })
+    })
 }
 
 /// Project a stored access profile into the `AccessProfile` an operation returns.
