@@ -27,7 +27,7 @@ pub(crate) struct Emulator {
 
 impl Emulator {
     pub(crate) fn new() -> Self {
-        Self::mounted(false)
+        Self::mounted(false, false)
     }
 
     /// One emulator with CloudWatch mounted beside CodeDeploy on the SAME engine.
@@ -36,12 +36,21 @@ impl Emulator {
     /// them drives both services through this one front door — the way the router
     /// mounts them — rather than reaching into either store.
     pub(crate) fn with_cloudwatch() -> Self {
-        Self::mounted(true)
+        Self::mounted(true, false)
     }
 
-    /// The one constructor behind both: CodeDeploy, and CloudWatch when
-    /// `cloudwatch` asks for it, on one shared engine.
-    fn mounted(cloudwatch: bool) -> Self {
+    /// One emulator with AWS Lambda mounted beside CodeDeploy on the SAME engine.
+    ///
+    /// The alias an Lambda deployment shifts traffic on belongs to Lambda, so a
+    /// suite about that shift creates the function and reads the alias through
+    /// Lambda's own front door rather than reaching into its store.
+    pub(crate) fn with_lambda() -> Self {
+        Self::mounted(false, true)
+    }
+
+    /// The one constructor behind all three: CodeDeploy, and CloudWatch or AWS
+    /// Lambda when asked for, on one shared engine.
+    fn mounted(cloudwatch: bool, lambda: bool) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing; routing is by `X-Amz-Target`.
@@ -56,6 +65,13 @@ impl Emulator {
                 service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
                     Arc::clone(&engine),
                 ),
+            );
+        }
+        if lambda {
+            router.register_service(
+                service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(Arc::clone(
+                    &engine,
+                )),
             );
         }
         Self { router, engine }
@@ -146,6 +162,36 @@ impl Emulator {
             "cloudwatch {operation} must succeed, got {status} with body {answered}"
         );
         serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+    }
+
+    /// One `restJson1` request against the LAMBDA emulator through the same front
+    /// door, answering its HTTP status and parsed body.
+    ///
+    /// Lambda's model declares `restJson1`, so the request is addressed by method
+    /// and URI rather than by a target header, and the SigV4 credential scope is
+    /// what routes it to the `lambda` signing name; the suite verifies no
+    /// signature. Only meaningful on an [`Emulator::with_lambda`].
+    pub(crate) async fn lambda(&self, method: &str, uri: &str, body: Value) -> (u16, Value) {
+        let request = ::http::Request::builder()
+            .method(method)
+            .uri(format!("https://lambda.us-east-1.amazonaws.com{uri}"))
+            .header("host", "lambda.us-east-1.amazonaws.com")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/lambda/\
+                 aws4_request, SignedHeaders=host, Signature=0000",
+            )
+            .body(bytes::Bytes::from(body.to_string()))
+            .expect("the request is well formed");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let parsed = if response.body().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+        };
+        (status, parsed)
     }
 }
 

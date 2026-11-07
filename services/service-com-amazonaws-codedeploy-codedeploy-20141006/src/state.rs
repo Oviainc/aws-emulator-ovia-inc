@@ -24,6 +24,10 @@ pub mod alarm_gate;
 /// linking the two records.
 pub mod rollback;
 
+/// The traffic shift an Lambda deployment performs: the one place a revision's
+/// AppSpec is read, and the one place the alias it names is moved.
+pub mod lambda_traffic_shift;
+
 use crate::ops::types::{
     AlarmConfiguration, AutoRollbackConfiguration, BlueGreenDeploymentConfiguration,
     DeploymentStyle, EC2DeploymentOptions, EC2TagFilter, EC2TagSet, ECSService, LoadBalancerInfo,
@@ -1359,6 +1363,14 @@ pub struct Deployment {
     /// Whether the termination wait has started, materialised by the clock; see
     /// [`ComAmazonawsCodedeployCodedeploy20141006State::advance_clock`].
     pub instance_termination_wait_time_started: bool,
+    /// The traffic shift this deployment performs, read ONCE out of its revision
+    /// when the deployment was recorded; `None` for a deployment whose revision
+    /// declares none (see [`lambda_traffic_shift::declared_shift`]).
+    pub lambda_traffic_shift: Option<lambda_traffic_shift::LambdaTrafficShift>,
+    /// How far that shift has got, which is also what keeps the clock from
+    /// settling a deployment whose shift has not happened yet; see
+    /// [`lambda_traffic_shift::TrafficShiftProgress`].
+    pub traffic_shift: lambda_traffic_shift::TrafficShiftProgress,
 }
 
 /// The result a validation function reported for one of a deployment's
@@ -2096,6 +2108,13 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
             if deployment.start_time_ms.is_some()
                 && deployment.complete_time_ms.is_none()
                 && deployment.completes_at_ms <= now_ms
+                // A deployment whose traffic shift is being carried out right now
+                // is NOT settled: the outcome it reaches has to follow the shift,
+                // so the pass carrying it out writes back what it came to first
+                // (see `lambda_traffic_shift::apply_due_shifts`), and the next
+                // pass settles it.
+                && deployment.traffic_shift
+                    != lambda_traffic_shift::TrafficShiftProgress::InFlight
             {
                 deployment.status = terminal_status(deployment.target_count()).to_string();
                 deployment.complete_time_ms = Some(deployment.completes_at_ms);
@@ -3855,9 +3874,10 @@ fn content_digest(content: &str) -> String {
 /// clock-owed deployment transition already applied.
 ///
 /// EVERY handler goes through here, so no handler can observe an unseeded store,
-/// a deployment that should already have completed, or one the alarms its group
-/// polls have already stopped. `None` means the engine is not the shared
-/// in-memory one — answer it with a modelled server error.
+/// a deployment that should already have completed, one the alarms its group
+/// polls have already stopped, or one reporting success for a traffic shift that
+/// was never carried out. `None` means the engine is not the shared in-memory one
+/// — answer it with a modelled server error.
 pub fn with_state<Eng: Send + Sync + 'static, R>(
     engine: &Eng,
     body: impl FnOnce(&mut ComAmazonawsCodedeployCodedeploy20141006State) -> R,
@@ -3868,6 +3888,12 @@ pub fn with_state<Eng: Send + Sync + 'static, R>(
     // settles anything: a deployment the alarms had already stopped must not
     // reach a successful outcome at the instant its stop was owed.
     alarm_gate::poll_alarms(engine);
+    // The traffic shift writes AWS Lambda's own function store, with this store
+    // unlocked for the same reason, and runs after the gate and before the clock:
+    // a deployment the alarms stopped shifts no traffic, and no deployment is
+    // given a successful outcome before the shift its revision described has
+    // happened.
+    lambda_traffic_shift::apply_due_shifts(engine);
     let mut guard = state.lock();
     let now = now_ms();
     guard.ensure_seeded(now);

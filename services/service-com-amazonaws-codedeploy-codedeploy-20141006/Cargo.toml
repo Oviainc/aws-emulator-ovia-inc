@@ -29,6 +29,17 @@ hex = { workspace = true }
 # which lives in the CloudWatch emulator's alarm store: it is reached through the
 # shared engine and needs the owning service's state TYPE.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# An Lambda deployment SHIFTS TRAFFIC by moving the alias its revision's AppSpec
+# names, and that alias lives in the AWS Lambda emulator's own function store:
+# the move is written there through the shared engine, which needs the owning
+# service's state TYPE (`state::lambda_traffic_shift`).
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# An Lambda revision IS the AppSpec file, "formatted as JSON or YAML stored as a
+# RawString", so the function, alias and versions a deployment shifts are read
+# out of it with a maintained YAML 1.2 implementation (YAML 1.2 is a superset of
+# JSON, so one parser reads both forms); yaml-rust2 is the pure-Rust one the
+# other services that read caller-supplied YAML already use.
+yaml-rust2 = { version = "0.10", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

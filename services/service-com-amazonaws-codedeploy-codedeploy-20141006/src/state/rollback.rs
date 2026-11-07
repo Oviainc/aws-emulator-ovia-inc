@@ -25,9 +25,9 @@
 use crate::ops::types::RollbackInfo;
 
 use super::{
-    deployment_completion_due, deployment_start_due, revision_key, termination_wait,
-    ComAmazonawsCodedeployCodedeploy20141006State, Deployment, DEPLOYMENT_CREATOR_ROLLBACK,
-    DEPLOYMENT_STATUS_CREATED,
+    deployment_completion_due, deployment_start_due, lambda_traffic_shift, revision_key,
+    termination_wait, ComAmazonawsCodedeployCodedeploy20141006State, Deployment,
+    DEPLOYMENT_CREATOR_ROLLBACK, DEPLOYMENT_STATUS_CREATED,
 };
 
 /// Roll `deployment_id` back: mint the rollback deployment this group has a
@@ -102,6 +102,11 @@ pub fn record_rollback(
                     .and_then(|application| application.deployment_groups.get(group_name))
             })
             .map_or((false, 0), termination_wait);
+        // The traffic shift the rollback performs is the one the revision it
+        // redeploys describes, read exactly as a client's own deployment of that
+        // revision reads it: a rollback moves the alias back by re-pointing it,
+        // rather than by undoing anything.
+        let declared_shift = lambda_traffic_shift::declared_shift(&compute_platform, &revision);
         state.record_deployment(Deployment {
             deployment_id: rollback_id,
             application_name,
@@ -145,6 +150,8 @@ pub fn record_rollback(
             terminates_original_instances,
             termination_wait_millis,
             instance_termination_wait_time_started: false,
+            lambda_traffic_shift: declared_shift,
+            traffic_shift: lambda_traffic_shift::TrafficShiftProgress::Declared,
         });
     }
 

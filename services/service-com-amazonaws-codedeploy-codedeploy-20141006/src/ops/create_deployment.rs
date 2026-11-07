@@ -347,6 +347,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested_config = input.deployment_config_name;
         let requested_revision = input.revision;
         let requested_auto_rollback = input.auto_rollback_configuration;
+        // The traffic shift the revision DECLARES, read out of its content here —
+        // before the store is taken, so reading caller-supplied content is work no
+        // other caller waits on. Whether the deployment performs it is decided
+        // inside, by the application's compute platform.
+        let declared_shift = requested_revision
+            .as_ref()
+            .and_then(crate::state::lambda_traffic_shift::declared_in_revision);
 
         let outcome = crate::state::with_state(&*self.engine, |state| {
             let Some(application) = state.applications.get(&application_name) else {
@@ -463,6 +470,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let create_time_ms = crate::state::now_ms();
             let deployment_id = state.mint_deployment_id();
             let used_revision = revision.clone();
+            // The traffic shift this deployment performs: a Lambda deployment's
+            // revision IS the AppSpec, and what it declares is what the
+            // deployment moves. Only that compute platform shifts traffic between
+            // function versions.
+            let lambda_traffic_shift = declared_shift.filter(|_| {
+                compute_platform == crate::state::lambda_traffic_shift::COMPUTE_PLATFORM_LAMBDA
+            });
             // `record_deployment` indexes it as the newest and drops the oldest
             // history past the store's retention bound.
             state.record_deployment(crate::state::Deployment {
@@ -506,6 +520,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 terminates_original_instances,
                 termination_wait_millis,
                 instance_termination_wait_time_started: false,
+                lambda_traffic_shift,
+                // Nothing has been shifted yet: the clock owes the shift at the
+                // instant it owes the deployment completed traffic routing.
+                traffic_shift: crate::state::lambda_traffic_shift::TrafficShiftProgress::Declared,
             });
             // Deploying a revision is also how CodeDeploy learns it: the
             // application's registry records this use, registering the revision
