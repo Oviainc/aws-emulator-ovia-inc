@@ -541,13 +541,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
         // over those same parts ([`crate::state::multipart_object_etag`]) rather than the
         // digest of the assembled bytes.
         let etag = crate::state::multipart_object_etag(&assembled);
-        // The checksum the completed object carries, under the algorithm the INITIATING
-        // request named: "when you perform a CreateMultipartUpload request, you specify the
-        // checksum algorithm" and the checksum type "determines how part-level checksums are
-        // combined to create an object-level checksum for multipart objects"
+        // The checksum the completed object carries: "when you perform a
+        // CreateMultipartUpload request, you specify the checksum algorithm" and the
+        // checksum type "determines how part-level checksums are combined to create an
+        // object-level checksum for multipart objects"
         // (`CompleteMultipartUploadRequest$ChecksumType`). Computed here from the parts this
         // completion assembled — the only place that sees them all — so the value describes
-        // the object that was written; an upload that named no algorithm stores no checksum.
+        // the object that was written. An upload that named NO algorithm still completes
+        // into an object carrying one, under the algorithm every object S3 stores is
+        // protected by when the client named none
+        // ([`crate::state::DEFAULT_CHECKSUM_ALGORITHM`]), which is why the value and its type
+        // are reported here and by every later read of the object.
         //
         // The `Checksum*` members THIS request carries, on the parts and on the object, are
         // the client's own values for the same bytes: the response reports what the emulator

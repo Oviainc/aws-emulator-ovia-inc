@@ -434,10 +434,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let object_parts = (asked(crate::state::OBJECT_ATTRIBUTE_OBJECT_PARTS)
             && !object.parts.is_empty())
         .then(|| {
-            // A part is reported only for an object that carries an additional checksum, so
-            // a multipart object stored under no checksum algorithm pages no part at all and
-            // nothing about it is truncated — only how many parts it has.
-            let reports_parts = object.checksum.is_some();
+            // A part is reported only for an object whose PARTS carry checksums of their own
+            // — "if an additional checksum … isn't applied to the object specified in the
+            // request, the response doesn't return the Part element" — so a multipart object
+            // whose upload named no algorithm pages no part at all and nothing about it is
+            // truncated, only how many parts it has. The object-level checksum every stored
+            // object carries is not a part-level one, so it is not what decides this.
+            let reports_parts = object.parts.iter().any(|part| part.checksum.is_some());
             let above_marker: Vec<&crate::state::ObjectPartRecord> = object
                 .parts
                 .iter()

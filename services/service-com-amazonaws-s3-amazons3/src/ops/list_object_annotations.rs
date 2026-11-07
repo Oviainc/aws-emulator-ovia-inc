@@ -356,11 +356,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 last_modified: ::aws_smithy_types::DateTime::from(annotation.last_modified),
                 size: annotation.size(),
                 e_tag: Some(annotation.etag.clone()),
-                // "The checksum algorithm used for the annotation" — nothing in this
-                // emulator computes a checksum of an annotation, so none was stored and
-                // none is reported rather than one being invented, exactly as a read of the
-                // same annotation reports none.
-                checksum_algorithm: None,
+                // "The checksum algorithm used for the annotation" — the algorithm the write
+                // that recorded this payload computed its checksum under, read off the
+                // stored record, so the listing names the same algorithm whose member a read
+                // of that annotation reports the value in. An annotation recorded under no
+                // checksum algorithm reports none rather than one being invented.
+                checksum_algorithm: annotation
+                    .checksum
+                    .as_ref()
+                    .map(|checksum| vec![checksum.algorithm.clone()]),
                 // "The replication status of the annotation" describes a replication rule
                 // nothing here runs, so nothing is reported for it either.
                 replication_status: None,

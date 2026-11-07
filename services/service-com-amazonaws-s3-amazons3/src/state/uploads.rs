@@ -705,6 +705,19 @@ pub const CHECKSUM_TYPE_COMPOSITE: &str = "COMPOSITE";
 /// checksums.
 pub const FULL_OBJECT_CHECKSUM_ALGORITHMS: [&str; 1] = ["CRC64NVME"];
 
+/// The `ChecksumAlgorithm` an object S3 stores carries when the request that stored it
+/// named none of its own.
+///
+/// S3 protects every object it stores with a checksum, so an object is stored with one
+/// whether or not a client asked for it: the value is reported by the write that stored the
+/// object and by every later read of it. The algorithm of that default is the one the model
+/// states is "always a full object checksum" (`ChecksumCRC64NVME` on every output that
+/// carries it) and the only `Checksum*` member whose documentation does NOT carry the
+/// "only present if the checksum was uploaded with the object" caveat its siblings do
+/// (`GetObjectOutput$ChecksumCRC32` and the rest) — so it is the one a client never
+/// uploaded that is nonetheless there to read.
+pub const DEFAULT_CHECKSUM_ALGORITHM: &str = "CRC64NVME";
+
 /// The `ChecksumAlgorithm` values a multipart object may carry a
 /// [`CHECKSUM_TYPE_FULL_OBJECT`] checksum under.
 ///
@@ -824,9 +837,11 @@ pub fn composite_checksum(algorithm: &str, parts: &[&[u8]]) -> Option<String> {
 }
 
 /// The checksum one completed multipart upload's object carries: its value and its
-/// `ChecksumType`, under the algorithm the upload was initiated with — or `None` when the
-/// upload named no algorithm, or named one this emulator cannot compute, in which case the
-/// object carries no checksum at all rather than one it did not compute.
+/// `ChecksumType`, under the algorithm the upload was initiated with — or, for an upload
+/// that named no algorithm at all, under [`DEFAULT_CHECKSUM_ALGORITHM`], because the object
+/// a completion stores carries a checksum whether or not the upload configured one. `None`
+/// only for an algorithm this emulator cannot compute, in which case the object carries no
+/// checksum rather than one it did not compute.
 ///
 /// The type is the one [`settle_multipart_checksum_type`] settles for the upload's
 /// algorithm and the type it asked for — the same rule the initiation reported and recorded
@@ -839,7 +854,7 @@ pub fn multipart_checksum(
     requested_type: Option<&str>,
     parts: &[&[u8]],
 ) -> Option<ObjectChecksum> {
-    let algorithm = algorithm?;
+    let algorithm = algorithm.unwrap_or(DEFAULT_CHECKSUM_ALGORITHM);
     let checksum_type = settle_multipart_checksum_type(algorithm, requested_type)?;
     let value = if checksum_type == CHECKSUM_TYPE_COMPOSITE {
         composite_checksum(algorithm, parts)?

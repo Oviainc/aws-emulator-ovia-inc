@@ -162,8 +162,7 @@ pub struct Object {
 /// `PutObjectAnnotation` recorded under a name, which `GetObjectAnnotation` answers with.
 ///
 /// The name is not here — it is the key the object holds this record under
-/// ([`Object::annotations`]) — and neither is a checksum: nothing in this emulator computes
-/// one, so none is recorded and none is reported.
+/// ([`Object::annotations`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Annotation {
     /// The annotation's bytes, exactly as the request carried them.
@@ -174,15 +173,26 @@ pub struct Annotation {
     /// When the annotation was last written, which is what a read of it reports as
     /// `Last-Modified` and a listing of them as `AnnotationEntry$LastModified`.
     pub last_modified: SystemTime,
+    /// The checksum the write that recorded this payload computed OVER that payload, under
+    /// the algorithm the request named, or `None` for a write that named none.
+    ///
+    /// An annotation payload is checksummed the way a stored object's bytes are — the write
+    /// reports the value it computed and a later read reports the STORED one
+    /// ([`ObjectChecksum`]) — so `PutObjectAnnotation`'s answer, a `GetObjectAnnotation`
+    /// that enabled the checksum mode and the `ChecksumAlgorithm` a listing reports for the
+    /// annotation can never disagree.
+    pub checksum: Option<ObjectChecksum>,
 }
 
 impl Annotation {
-    /// The annotation `payload` makes, written at `at`: the payload with the entity tag of
-    /// those bytes beside it, so no caller derives a tag of its own.
-    pub fn new(payload: Vec<u8>, at: SystemTime) -> Self {
+    /// The annotation `payload` makes, written at `at` and checksummed as `checksum`: the
+    /// payload with the entity tag of those bytes beside it, so no caller derives a tag of
+    /// its own.
+    pub fn new(payload: Vec<u8>, at: SystemTime, checksum: Option<ObjectChecksum>) -> Self {
         Self {
             etag: object_etag(&payload),
             last_modified: at,
+            checksum,
             payload,
         }
     }
@@ -193,11 +203,17 @@ impl Annotation {
         i64::try_from(self.payload.len()).unwrap_or(i64::MAX)
     }
 
-    /// How many bytes this annotation retains: its payload AND the entity tag kept beside
-    /// it, the way [`UploadedPart::retained_bytes`] counts a part's, so no annotation
-    /// escapes the budgets a stored object's bytes are bounded by.
+    /// How many bytes this annotation retains: its payload AND the strings kept beside it —
+    /// the entity tag and the recorded checksum — the way [`UploadedPart::retained_bytes`]
+    /// counts a part's, so no annotation escapes the budgets a stored object's bytes are
+    /// bounded by.
     pub fn retained_bytes(&self) -> usize {
-        self.payload.len() + self.etag.len()
+        self.payload.len()
+            + self.etag.len()
+            + self
+                .checksum
+                .as_ref()
+                .map_or(0, ObjectChecksum::retained_bytes)
     }
 }
 

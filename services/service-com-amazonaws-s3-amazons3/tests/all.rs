@@ -301,6 +301,8 @@ mod signature_refusal_wording;
 mod sse_kms_decrypt_authorization;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stored_payload_checksums.rs"]
+mod stored_payload_checksums;
 #[path = "all/version_id_classification.rs"]
 mod version_id_classification;
 #[path = "all/write_checksum_header_count.rs"]

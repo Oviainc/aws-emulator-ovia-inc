@@ -259,6 +259,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .naming_annotation(&input.annotation_name));
         };
 
+        // WHICH members carry that stored checksum, and whether this read reports it at all
+        // (see the members below).
+        let reported = crate::state::reported_checksums(
+            annotation
+                .checksum
+                .as_ref()
+                .filter(|_| input.checksum_mode.is_some()),
+        );
+
         Ok(GetObjectAnnotationOutput {
             // The stored bytes, with the size and the entity tag OF those bytes: "The size
             // of the annotation payload, in bytes" and "The entity tag of the annotation",
@@ -276,12 +285,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // (`PutObjectAnnotation`), so the algorithm reported here is that object's, and
             // nothing is reported for an object stored under none.
             server_side_encryption: object.encryption.sse_algorithm.clone(),
+            // The checksum the write STORED with the annotation, under the member its
+            // algorithm names and with the type it was computed under — mapped by the one
+            // place that mapping lives ([`crate::state::reported_checksums`]), so this read
+            // answers exactly the value `PutObjectAnnotation` computed over the payload it
+            // recorded. Reported only to a read that asked for it, the way `GetObject`
+            // reports an object's: `ChecksumMode` is this operation's own
+            // `requestValidationModeMember`
+            // (`smithy_query(query="operation",operation="GetObjectAnnotation")`), and "to
+            // retrieve the checksum, this mode must be enabled". An annotation recorded
+            // under no checksum algorithm reports none however the mode is set.
+            checksum_crc32: reported.crc32,
+            checksum_crc32_c: reported.crc32c,
+            checksum_crc64_nvme: reported.crc64nvme,
+            checksum_sha1: reported.sha1,
+            checksum_sha256: reported.sha256,
+            checksum_sha512: reported.sha512,
+            checksum_md5: reported.md5,
+            checksum_xxhash64: reported.xxhash64,
+            checksum_xxhash3: reported.xxhash3,
+            checksum_xxhash128: reported.xxhash128,
+            checksum_type: reported.checksum_type,
             // Everything else this output can carry describes something no stored annotation
-            // here has, so none of it is reported rather than being invented. The
-            // `Checksum*` members and `ChecksumType` are the case `ChecksumMode` asks about
-            // — "If checksum mode is enabled … Amazon S3 returns the STORED checksum" — and
-            // no checksum was stored with the annotation, so an enabled mode is answered the
-            // way a read of an annotation recorded without one is: with none of them.
+            // here has, so none of it is reported rather than being invented:
             // `ReplicationStatus` describes a replication rule nothing here runs, and
             // `RequestCharged` a Requester Pays charge this emulator does not model.
             ..GetObjectAnnotationOutput::default()

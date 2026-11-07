@@ -252,20 +252,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // annotation is recorded. The codes and the sentences are the store's
         // ([`crate::state::verify_declared_integrity`]), the same ones `PutObject` and
         // `UploadPart` answer the same headers with.
+        let declared = declared_checksums(&input);
         crate::state::verify_declared_integrity(
             input.content_md5.as_deref(),
-            &crate::state::DeclaredChecksums {
-                crc32: input.checksum_crc32.as_deref(),
-                crc32c: input.checksum_crc32_c.as_deref(),
-                crc64nvme: input.checksum_crc64_nvme.as_deref(),
-                sha1: input.checksum_sha1.as_deref(),
-                sha256: input.checksum_sha256.as_deref(),
-                sha512: input.checksum_sha512.as_deref(),
-                md5: input.checksum_md5.as_deref(),
-                xxhash64: input.checksum_xxhash64.as_deref(),
-                xxhash3: input.checksum_xxhash3.as_deref(),
-                xxhash128: input.checksum_xxhash128.as_deref(),
-            },
+            &declared,
             &input.annotation_payload,
         )
         .map_err(|rejection| {
@@ -389,8 +379,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let server_side_encryption = object.encryption.sse_algorithm.clone();
         let object_version_id = object.version_id.clone();
 
-        let annotation =
-            crate::state::Annotation::new(input.annotation_payload, ::std::time::SystemTime::now());
+        // The checksum this write stores with the annotation: the digest of the payload it
+        // recorded, under the algorithm the request named — an individual `Checksum*`
+        // member first, because "if you provide an individual checksum, Amazon S3 ignores
+        // any provided ChecksumAlgorithm parameter"
+        // (`PutObjectRequest$ChecksumAlgorithm`), else the `ChecksumAlgorithm` member
+        // itself. A payload is checksummed WHOLE, so the type is `FULL_OBJECT`: there are
+        // no parts for a composition to be taken over.
+        //
+        // The VALUE is always the one computed here over the stored bytes, never the one the
+        // request carried: the two are equal by the time this runs (the verification above
+        // refused the write otherwise), so what is stored and reported describes the payload
+        // rather than echoing a header. A write that names no algorithm stores no checksum,
+        // which is what makes a later read of such an annotation report none.
+        let checksum = declared
+            .named_algorithm()
+            .map(str::to_string)
+            .or_else(|| input.checksum_algorithm.clone())
+            .and_then(|algorithm| {
+                crate::state::full_object_checksum(&algorithm, &input.annotation_payload).map(
+                    |value| crate::state::ObjectChecksum {
+                        algorithm,
+                        value,
+                        checksum_type: crate::state::CHECKSUM_TYPE_FULL_OBJECT.to_string(),
+                    },
+                )
+            });
+        let reported = crate::state::reported_checksums(checksum.as_ref());
+
+        let annotation = crate::state::Annotation::new(
+            input.annotation_payload,
+            ::std::time::SystemTime::now(),
+            checksum,
+        );
         let etag = annotation.etag.clone();
 
         // Recorded through the one place an annotation is ever recorded, because it is the
@@ -488,13 +509,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The server-side encryption algorithm used to encrypt the annotation", which
             // is the parent object's, reported only when that object carries one.
             server_side_encryption,
+            // The digest of the payload just stored, under the member its algorithm names,
+            // with the `ChecksumType` that says it was computed over the whole of it —
+            // mapped by the one place that mapping lives
+            // ([`crate::state::reported_checksums`]), so the value this write answers and
+            // the one a later read of the same annotation reports are one value. A write
+            // that named no algorithm reports none of them.
+            checksum_crc32: reported.crc32,
+            checksum_crc32_c: reported.crc32c,
+            checksum_crc64_nvme: reported.crc64nvme,
+            checksum_sha1: reported.sha1,
+            checksum_sha256: reported.sha256,
+            checksum_sha512: reported.sha512,
+            checksum_md5: reported.md5,
+            checksum_xxhash64: reported.xxhash64,
+            checksum_xxhash3: reported.xxhash3,
+            checksum_xxhash128: reported.xxhash128,
+            checksum_type: reported.checksum_type,
             // Everything else this output can carry describes something no stored
             // annotation here has, so none of it is reported rather than being invented:
-            // the `Checksum*` members and `ChecksumType` need a checksum this handler
-            // neither computed nor verified (the request's own checksum headers are not
-            // echoed back as if they had been checked), and `RequestCharged` reports a
-            // Requester Pays charge this emulator does not model.
+            // `RequestCharged` reports a Requester Pays charge this emulator does not
+            // model.
             ..PutObjectAnnotationOutput::default()
         })
+    }
+}
+
+/// The `Checksum*` members of this request, as the store's one mapping from member to
+/// `ChecksumAlgorithm` reads them ([`crate::state::DeclaredChecksums`]) — the same mapping
+/// `PutObject` and `UploadPart` hand their own members over through.
+fn declared_checksums(input: &PutObjectAnnotationInput) -> crate::state::DeclaredChecksums<'_> {
+    crate::state::DeclaredChecksums {
+        crc32: input.checksum_crc32.as_deref(),
+        crc32c: input.checksum_crc32_c.as_deref(),
+        crc64nvme: input.checksum_crc64_nvme.as_deref(),
+        sha1: input.checksum_sha1.as_deref(),
+        sha256: input.checksum_sha256.as_deref(),
+        sha512: input.checksum_sha512.as_deref(),
+        md5: input.checksum_md5.as_deref(),
+        xxhash64: input.checksum_xxhash64.as_deref(),
+        xxhash3: input.checksum_xxhash3.as_deref(),
+        xxhash128: input.checksum_xxhash128.as_deref(),
     }
 }
