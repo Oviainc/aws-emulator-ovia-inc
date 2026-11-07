@@ -71,15 +71,22 @@ pub(super) struct FunctionDelivery {
     /// reaches a FIFO queue, which takes no message without a group.
     message_group_id: Option<String>,
     message_deduplication_id: Option<String>,
+    /// What the TOPIC asks to have logged about this delivery, and `None` when it asks for
+    /// nothing ([`crate::state::delivery_status`]).
+    logged: Option<state::delivery_status::Logged>,
 }
 
 impl FunctionDelivery {
     /// The invocation `subscription` owes for `published`, whose body over this protocol is
     /// `protocol_body`, or `None` when its endpoint names no function.
+    ///
+    /// `logged` is what the topic asks to have logged about a delivery over this protocol,
+    /// carried with the invocation so the record that follows it needs nothing from the store.
     pub(super) fn of(
         subscription: &state::SubscriptionRecord,
         published: &PublishedMessage,
         protocol_body: &str,
+        logged: Option<state::delivery_status::Logged>,
     ) -> Option<Self> {
         let endpoint = subscription.endpoint.as_deref()?;
         let target = FunctionLocation::of_function_arn(endpoint)?;
@@ -101,7 +108,31 @@ impl FunctionDelivery {
                 .and_then(QueueLocation::of_queue_arn),
             message_group_id: published.message_group_id.clone(),
             message_deduplication_id: published.message_deduplication_id.clone(),
+            logged,
         })
+    }
+
+    /// Write the delivery-status record of this invocation, where the topic asked for one.
+    ///
+    /// The record reports an invocation that has already been attempted, so it is written
+    /// after the attempt and never instead of it.
+    pub(super) async fn record_status(
+        &self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        invoked: bool,
+    ) {
+        let Some(logged) = self.logged.as_ref() else {
+            return;
+        };
+        logged
+            .record(
+                ctx,
+                &self.subscription_arn,
+                &self.topic_arn,
+                &self.target.function_arn,
+                invoked,
+            )
+            .await;
     }
 
     /// How many bytes this invocation hands to the function: what it costs the request's
@@ -126,6 +157,9 @@ impl FunctionDelivery {
             message_group_id: self.message_group_id.clone(),
             message_deduplication_id: self.message_deduplication_id.clone(),
             dead_letter: None,
+            // The delivery this copy stands in for has already been reported, so the copy
+            // asks for no record of its own.
+            logged: None,
         })
     }
 }

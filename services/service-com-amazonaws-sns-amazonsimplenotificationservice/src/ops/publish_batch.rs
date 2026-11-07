@@ -121,10 +121,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-// The SQS fan-out of a publish is defined ONCE, by `Publish`: a batched publish delivers the
-// same envelope to the same subscriptions.
+// The subscriber fan-out of a publish is defined ONCE, by `Publish`: a batched publish
+// delivers the same envelope to the same subscriptions.
 use super::publish::{
-    deliver_to_subscribers, subscription_deliveries, Deliveries, DeliveryBudget,
+    deliver_to_endpoints, subscription_deliveries, Deliveries, DeliveryBudget,
 };
 use crate::state::{self, MessageRequest, PublishedMessage};
 
@@ -497,7 +497,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .filter(|sub| state::filter_policy::admits(sub, &published, &mut matching))
                     .cloned()
                     .collect();
-                deliveries.absorb(subscription_deliveries(&accepted, &published, &mut budget));
+                deliveries.absorb(subscription_deliveries(
+                    &accepted,
+                    &published,
+                    Some(&topic),
+                    &mut budget,
+                ));
                 for recipient in &accepted {
                     store.record_delivery(&recipient.arn, ::std::sync::Arc::clone(&published));
                 }
@@ -519,7 +524,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             (successful, failed, deliveries)
         };
-        deliver_to_subscribers(ctx, &deliveries).await;
+        deliver_to_endpoints(ctx, &deliveries).await;
 
         Ok(PublishBatchOutput {
             successful: Some(successful),

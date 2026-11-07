@@ -18,6 +18,19 @@ pub mod filter_policy;
 /// The address-matching condition of a filter policy (`cidr`), which
 /// [`filter_policy`] reads beside the conditions that compare values.
 pub mod message_filter;
+/// What a topic configured with delivery-status feedback roles LOGS about each delivery
+/// it attempted.
+pub mod delivery_status;
+
+/// The service principal Amazon SNS performs a DELIVERY as.
+///
+/// A subscription's endpoint is another service's resource, and SNS reaches it as a service
+/// principal rather than as that resource's owner — "you must ensure that the Amazon SQS
+/// queue policy allows the Amazon SNS topic to send messages to the queue", and the same
+/// `lambda:InvokeFunction` grant is what lets a subscribed function be invoked. It is also
+/// the principal a topic's delivery-status feedback role has to trust for SNS to assume it
+/// ([`delivery_status`]).
+pub const SERVICE_PRINCIPAL: &str = "sns.amazonaws.com";
 
 /// The region an ARN carries when the request names none.
 ///

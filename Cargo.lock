@@ -5710,7 +5710,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -16951,6 +16951,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-cloudwatchlogs",
  "aws-sdk-lambda",
  "aws-sdk-sqs",
  "aws-smithy-runtime-api",
@@ -16963,6 +16964,8 @@ dependencies = [
  "ipnet",
  "serde",
  "serde_json",
+ "service-com-amazonaws-cloudwatchlogs-logs-20140328",
+ "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-lambda-awsgirapiservice",
  "service-com-amazonaws-sqs-amazonsqs",
  "service-common",

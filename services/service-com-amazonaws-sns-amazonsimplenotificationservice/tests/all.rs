@@ -29,6 +29,9 @@ mod data_protection_policy;
 #[path = "all/delivery_policy_and_message_branches.rs"]
 mod delivery_policy_and_message_branches;
 
+#[path = "all/delivery_status_logging.rs"]
+mod delivery_status_logging;
+
 #[path = "all/empty_policy_attribute_value.rs"]
 mod empty_policy_attribute_value;
 

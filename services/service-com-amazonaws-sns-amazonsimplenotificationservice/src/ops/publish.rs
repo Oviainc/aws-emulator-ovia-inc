@@ -152,7 +152,7 @@ use crate::state::{self, MessageRequest, PublishedMessage};
 
 /// The `lambda`-protocol half of this operation's fan-out, which is reached from the same
 /// two functions the `sqs` half is ([`subscription_deliveries`] and
-/// [`deliver_to_subscribers`]): a subscribed FUNCTION is addressed by another service's API
+/// [`deliver_to_endpoints`]): a subscribed FUNCTION is addressed by another service's API
 /// and governed by that function's own resource policy, so it is one concern of its own
 /// rather than more branches in this file.
 ///
@@ -351,7 +351,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut store = store.lock();
             publish_into_store(&mut store, input, &destination)?
         };
-        deliver_to_subscribers(ctx, &deliveries).await;
+        deliver_to_endpoints(ctx, &deliveries).await;
         Ok(output)
     }
 }
@@ -444,8 +444,12 @@ fn publish_into_store(
         .filter(|sub| state::filter_policy::admits(sub, &published, &mut matching))
         .cloned()
         .collect();
-    let deliveries =
-        subscription_deliveries(&subscriptions, &published, &mut DeliveryBudget::new());
+    let deliveries = subscription_deliveries(
+        &subscriptions,
+        &published,
+        Some(&topic),
+        &mut DeliveryBudget::new(),
+    );
     for subscription in &subscriptions {
         store.record_delivery(&subscription.arn, ::std::sync::Arc::clone(&published));
     }
@@ -543,6 +547,35 @@ pub struct QueueDelivery {
     /// Where this message is parked when the delivery cannot be made: the dead-letter queue
     /// the subscription's own `RedrivePolicy` names, or `None` when it asks for no redrive.
     dead_letter: Option<QueueLocation>,
+    /// What the TOPIC asks to have logged about this delivery, and `None` when it asks for
+    /// nothing ([`crate::state::delivery_status`]). A dead-letter COPY carries none: the
+    /// delivery it stands in for has already been reported.
+    logged: Option<state::delivery_status::Logged>,
+}
+
+impl QueueDelivery {
+    /// Write the delivery-status record of this delivery, where the topic asked for one.
+    ///
+    /// The record reports a delivery that has already been attempted, so it is written after
+    /// the attempt and never instead of it.
+    async fn record_status(
+        &self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        delivered: bool,
+    ) {
+        let Some(logged) = self.logged.as_ref() else {
+            return;
+        };
+        logged
+            .record(
+                ctx,
+                &self.subscription_arn,
+                &self.topic_arn,
+                &self.target.queue_arn,
+                delivered,
+            )
+            .await;
+    }
 }
 
 /// One SQS queue a message is handed to, however it was addressed — as a subscription's
@@ -676,16 +709,21 @@ fn report_exhausted_budget(subscription_arn: &str) {
 /// message is still RECORDED against the subscription, so nothing claims a delivery that did
 /// not happen.
 ///
+/// `topic` is the topic the message was published to, which is what says whether each
+/// delivery is to be LOGGED ([`crate::state::delivery_status`]); `None` for a replay of a
+/// topic that is no longer there, which asks for no record.
+///
 /// The body of one protocol is rendered at most once per publish, and the RAW form of it is
 /// shared by every raw subscriber, so a fan-out does not re-serialize it per subscriber; the
 /// ENVELOPED form is rendered per subscription, because it carries that subscription's own
 /// unsubscribe link.
-/// `pub(crate)` with [`deliver_to_subscribers`]: `PublishBatch` publishes the same messages to
+/// `pub(crate)` with [`deliver_to_endpoints`]: `PublishBatch` publishes the same messages to
 /// the same subscriptions, so it goes through this one definition of the envelope and the
 /// fan-out rather than a second copy, and shares one budget across its entries.
 pub(crate) fn subscription_deliveries(
     subscriptions: &[state::SubscriptionRecord],
     published: &PublishedMessage,
+    topic: Option<&state::TopicRecord>,
     budget: &mut DeliveryBudget,
 ) -> Deliveries {
     // The body the subscribers of each protocol receive, rendered on first use: the whole
@@ -696,6 +734,11 @@ pub(crate) fn subscription_deliveries(
     let mut raw_body: Option<::std::sync::Arc<str>> = None;
     let mut deliveries = Deliveries::default();
     for subscription in subscriptions {
+        // What the topic asks to have logged about a delivery over THIS subscription's
+        // protocol, read once per subscription and carried with the delivery, so the write
+        // that follows the attempt needs nothing from the store.
+        let logged =
+            state::delivery_status::Logged::of(topic, &subscription.protocol, published);
         match subscription.protocol.as_str() {
             SQS_PROTOCOL => {
                 let Some(target) = QueueTarget::of(subscription) else {
@@ -735,6 +778,7 @@ pub(crate) fn subscription_deliveries(
                     message_group_id: published.message_group_id.clone(),
                     message_deduplication_id: published.message_deduplication_id.clone(),
                     dead_letter: target.dead_letter,
+                    logged,
                 });
             }
             function_delivery::LAMBDA_PROTOCOL => {
@@ -744,6 +788,7 @@ pub(crate) fn subscription_deliveries(
                     subscription,
                     published,
                     protocol_body,
+                    logged,
                 ) else {
                     continue;
                 };
@@ -777,7 +822,7 @@ pub(crate) fn subscription_deliveries(
 /// the replay the same way — `Subscribe` and `SetSubscriptionAttributes` — through this
 /// one definition, so the redelivery does not depend on which call configured it. The
 /// deliveries are returned rather than performed: they are handed to
-/// [`deliver_to_subscribers`] with the store's lock released, exactly as a publish's are.
+/// [`deliver_to_endpoints`] with the store's lock released, exactly as a publish's are.
 pub(crate) fn replay_deliveries(
     store: &mut crate::state::ComAmazonawsSnsAmazonsimplenotificationserviceState,
     subscription_arn: &str,
@@ -806,6 +851,10 @@ pub(crate) fn replay_deliveries(
         return Deliveries::default();
     };
     let archived = store.archived_messages(&subscription.topic_arn, from, until);
+    // The topic the replayed messages were published to, which is what says whether a
+    // redelivery is to be logged — read once, because every message of one replay goes to
+    // one subscription of one topic.
+    let topic = store.topics.get(&subscription.topic_arn).cloned();
     // ONE budget for the whole replay, so the (archived messages x body bytes) product it
     // fans out is capped the way a publish's fan-out is, and ONE matching budget, so the
     // filter evaluation the replay costs is capped the way a publish's is.
@@ -817,7 +866,12 @@ pub(crate) fn replay_deliveries(
         if !state::filter_policy::admits(&subscription, &message, &mut matching) {
             continue;
         }
-        deliveries.absorb(subscription_deliveries(&recipients, &message, &mut budget));
+        deliveries.absorb(subscription_deliveries(
+            &recipients,
+            &message,
+            topic.as_ref(),
+            &mut budget,
+        ));
         store.record_delivery(subscription_arn, ::std::sync::Arc::clone(&message));
     }
     if let Some(held) = store.subscriptions.get_mut(subscription_arn) {
@@ -931,8 +985,9 @@ impl QueueTarget {
     }
 }
 
-/// Deliver each message this publish owes to the endpoint its subscription names, and park
-/// the ones that could not be delivered in that subscription's dead-letter queue.
+/// Deliver each message this publish owes to the endpoint its subscription names, park
+/// the ones that could not be delivered in that subscription's dead-letter queue, and log
+/// what came of each attempt where the topic asked for it.
 ///
 /// An endpoint is reached the way any emulated service reaches another: through the
 /// in-process callback ([`smithy_server_runtime::OperationContext::callback`]), so this crate
@@ -955,7 +1010,12 @@ impl QueueTarget {
 /// itself would have received, in that subscription's own delivery format, because that is
 /// the message that could not be delivered — whichever endpoint kind the subscription
 /// addresses.
-pub(crate) async fn deliver_to_subscribers(
+///
+/// Whatever came of the attempt, a topic carrying a feedback role for that subscription's
+/// protocol has one delivery-status record written for it
+/// ([`crate::state::delivery_status`]): the record reports a delivery that has already been
+/// attempted, so it is written after the attempt and never instead of it.
+pub(crate) async fn deliver_to_endpoints(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     deliveries: &Deliveries,
 ) {
@@ -964,7 +1024,11 @@ pub(crate) async fn deliver_to_subscribers(
     let mut waiting = RetryBudget::new();
     let mut queues = Queues::new(ctx);
     for delivery in &deliveries.queues {
-        if queues.hand_over(&delivery.target, delivery, &mut waiting).await {
+        let delivered = queues
+            .hand_over(&delivery.target, delivery, &mut waiting)
+            .await;
+        delivery.record_status(ctx, delivered).await;
+        if delivered {
             continue;
         }
         let Some(dead_letter) = delivery.dead_letter.as_ref() else {
@@ -977,7 +1041,9 @@ pub(crate) async fn deliver_to_subscribers(
     }
     let mut functions = function_delivery::Functions::new(ctx);
     for delivery in &deliveries.functions {
-        if functions.invoke(delivery, &mut waiting).await {
+        let invoked = functions.invoke(delivery, &mut waiting).await;
+        delivery.record_status(ctx, invoked).await;
+        if invoked {
             continue;
         }
         let Some(parked) = delivery.dead_letter_copy() else {
@@ -1268,7 +1334,10 @@ impl<'ctx, 'op> Queues<'ctx, 'op> {
 
 /// The service principal an SNS delivery is performed as: the identity a subscribed
 /// endpoint's own policy has to grant for a notification to reach it.
-const SNS_SERVICE_PRINCIPAL: &str = "sns.amazonaws.com";
+///
+/// The crate's one spelling of it, shared with the delivery-status writer, which needs the
+/// same principal to be trusted by the feedback role it assumes.
+const SNS_SERVICE_PRINCIPAL: &str = state::SERVICE_PRINCIPAL;
 
 /// The IAM action a delivery to a subscribed queue performs on that queue.
 const SEND_MESSAGE_ACTION: &str = "sqs:SendMessage";

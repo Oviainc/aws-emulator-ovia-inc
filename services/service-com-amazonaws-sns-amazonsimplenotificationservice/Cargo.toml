@@ -45,6 +45,10 @@ aws-sdk-sqs = { version = "1", default-features = false }
 # asynchronously and whose resource-based policy it reads first
 # (`ops::publish::function_delivery`).
 aws-sdk-lambda = { version = "1", default-features = false }
+# The AWS SDK for CloudWatch Logs, over the same callback: a topic carrying
+# `<Protocol>{Success,Failure}FeedbackRoleArn` writes one delivery-status record per
+# delivery into `sns/<region>/<account-id>/<topic-name>` (`state::delivery_status`).
+aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # The `cidr` matcher of a subscription's filter policy asks whether an address lies in a
 # network, which this parses rather than splitting the text by hand
 # (`state::message_filter`).
@@ -63,10 +67,17 @@ service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # where that service holds it: on the function's asynchronous queue, and in what the
 # function's own handler did.
 service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# And the two services a delivery-status record needs: the IAM store the feedback role is
+# resolved in, and the CloudWatch Logs store the record is read back from.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # A deployment package the delivery tests upload is a .zip archive they write in memory, as
 # `FunctionCode$ZipFile` carries it: base64 of a .zip.
 zip = { version = "9", default-features = false, features = ["deflate"] }
 base64 = "0.22"
+# `time` on top of the workspace features: a delivery is made after the publishing call is
+# answered, and the tests wait that span out rather than parking a thread.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true
