@@ -13,12 +13,15 @@
 //! `purchaseOrderReference` with that charge (and associates nothing when the
 //! call supplied none), stamps `updatedAt` with the approving call while every
 //! value the send recorded (and `createdAt`) stays as it was; a request in any
-//! other status is refused with a `ConflictException`, an id pair that names no
-//! stored request with the modelled `ResourceNotFoundException` resolved PARENT
-//! FIRST, and nothing in any answer is echoed from the approving call's own
-//! input. Every later reader — `GetAgreementPaymentRequest`,
-//! `ListAgreementPaymentRequests` and `ListAgreementCharges` — reports that same
-//! record.
+//! other status is refused with a `ConflictException`, a `paymentRequestId`
+//! that names no stored request of that agreement with the modelled
+//! `ResourceNotFoundException`, an `agreementId` that resolves to no agreement
+//! with the modelled input fault on that member (the rule over the whole
+//! payment-request family lives in
+//! `tests/all/payment_request_agreement_ids.rs`), and nothing in any answer is
+//! echoed from the approving call's own input. Every later reader —
+//! `GetAgreementPaymentRequest`, `ListAgreementPaymentRequests` and
+//! `ListAgreementCharges` — reports that same record.
 //!
 //! The rows span what the rule generalises over: the length of the request's
 //! name within its published bounds, the shape of the charge amount, whether the
@@ -49,10 +52,8 @@ const REJECTED: &str = "REJECTED";
 /// See [`APPROVED`].
 const CANCELLED: &str = "CANCELLED";
 
-/// The resource kinds a lookup names in `resourceType` — `ResourceType`'s values
+/// The resource kind a lookup names in `resourceType` — a `ResourceType` value
 /// (`smithy_query(query="shape", shape="ResourceType")`).
-const AGREEMENT: &str = "Agreement";
-/// See [`AGREEMENT`].
 const PAYMENT_REQUEST: &str = "PaymentRequest";
 
 /// The `agreementType` every agreement this service mints carries, which is what
@@ -718,14 +719,17 @@ async fn approving_a_request_that_is_not_pending_approval_is_a_conflict() {
 // The id pair
 // ---------------------------------------------------------------------------
 
-/// The required id pair is resolved PARENT FIRST: an `agreementId` that names no
-/// agreement is reported as the missing `Agreement`, and a `paymentRequestId`
-/// that names no request of THAT agreement — including one that belongs to
-/// another agreement — as the missing `PaymentRequest`. Nothing is written by a
-/// refusal, with or without a purchase order reference on the refused call.
+/// The required id pair is resolved in the class each id belongs to: an
+/// `agreementId` that resolves to no agreement is the input fault on that member
+/// (`payment_request_agreement_ids` spans that half of the rule over every
+/// operation on a payment request), and a `paymentRequestId` that names no
+/// request of THAT agreement — including one that belongs to another agreement —
+/// is the missing `PaymentRequest`. Nothing is written by a refusal, with or
+/// without a purchase order reference on the refused call.
 ///
-/// The rows span which id of the pair names nothing and the form of that id
-/// within its modelled pattern, including both published length bounds.
+/// The rows span the form of the child id within its modelled pattern, including
+/// both published length bounds, and whether it names a stored request of
+/// another agreement.
 #[tokio::test]
 async fn an_id_pair_that_names_no_stored_payment_request_is_not_found() {
     let router = emulator();
@@ -734,27 +738,12 @@ async fn an_id_pair_that_names_no_stored_payment_request_is_not_found() {
     let other_agreement = agreement_with_variable_term(&router, "ap-prapairs2", TERM_ID).await;
     let other_request = sent(&router, &other_agreement, TERM_ID, "Other probe", "16").await;
 
-    // `AgreementId` is `@length(1, 64)` `^[A-Za-z0-9_/-]+$` and
     // `PaymentRequestId` is `@length(1, 64)` `^pr-[a-zA-Z0-9]+$`
     // (`smithy_query(query="operation",
-    // operation="AcceptAgreementPaymentRequest")`), so every id below satisfies
-    // its member's constraints and reaches the lookup, including both published
-    // length bounds.
+    // operation="AcceptAgreementPaymentRequest")`), so every child id below
+    // satisfies its member's constraints and reaches the lookup, including both
+    // published length bounds.
     let rows: Vec<(&str, String, String, &str, String)> = vec![
-        (
-            "the shortest agreement id, naming no agreement",
-            "A".to_string(),
-            payment_request_id.clone(),
-            AGREEMENT,
-            "A".to_string(),
-        ),
-        (
-            "the longest agreement id, 64 characters",
-            "z".repeat(64),
-            payment_request_id.clone(),
-            AGREEMENT,
-            "z".repeat(64),
-        ),
         (
             "the shortest payment request id the pr- pattern admits",
             agreement_id.clone(),

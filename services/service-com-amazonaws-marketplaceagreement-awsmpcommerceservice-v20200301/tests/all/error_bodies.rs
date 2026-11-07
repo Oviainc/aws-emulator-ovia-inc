@@ -61,8 +61,9 @@ const BILLING_ADJUSTMENT_REQUEST: &str = "BillingAdjustmentRequest";
 /// What a `ValidationExceptionField` states about a member that carried a value
 /// the service does not accept. Spelled out here rather than imported, so a
 /// change of wording in the service fails this test instead of agreeing with
-/// it.
-const FIELD_INVALID: &str = "Member is invalid.";
+/// it. The recorded AWS responses for this service carry this class
+/// unpunctuated, unlike the absent-member class ("Member is required.").
+const FIELD_INVALID: &str = "Member is invalid";
 
 /// `RequestId`'s modelled constraints: `@length(min: 1, max: 128)` and
 /// `^[A-Za-z0-9-]+$` (`smithy_query(query="shape", shape="RequestId")`),

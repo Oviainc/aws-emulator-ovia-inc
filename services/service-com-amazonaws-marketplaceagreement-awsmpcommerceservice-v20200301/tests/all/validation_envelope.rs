@@ -47,8 +47,10 @@ const SIGNED_FOR_US_EAST_1: &str = "AWS4-HMAC-SHA256 \
 /// What a `ValidationExceptionField` says about a member that carried a value
 /// the service does not accept, and about one that carried none. Spelled out
 /// here rather than imported, so a change of wording in the service fails this
-/// test instead of silently agreeing with it.
-const FIELD_INVALID: &str = "Member is invalid.";
+/// test instead of silently agreeing with it. The recorded AWS responses for
+/// this service carry the present-but-unacceptable class unpunctuated and the
+/// absent class punctuated.
+const FIELD_INVALID: &str = "Member is invalid";
 /// See [`FIELD_INVALID`]. The absent-member class states the requirement the
 /// member is under, not the value it did not carry.
 const FIELD_MISSING: &str = "Member is required.";

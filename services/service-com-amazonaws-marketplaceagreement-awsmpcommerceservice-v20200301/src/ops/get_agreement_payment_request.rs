@@ -200,19 +200,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_before_lookup(&input.agreement_id, now);
 
         // A payment request is a child of the agreement it was sent under, and
-        // this call names both. Resolution goes PARENT-FIRST, so
-        // `ResourceNotFoundException`'s `resourceType` and `resourceId` name the
-        // OUTERMOST resource that failed to resolve, the way the sibling
-        // `GetBillingAdjustmentRequest` and `GetAgreementCancellationRequest`
-        // resolve their own parent/child pairs.
-        if !store.agreements.contains_key(&input.agreement_id) {
-            // The lookup found nothing: the modelled not-found body, at the
-            // status this service answers it with (`state::NOT_FOUND_STATUS`).
-            return Err(crate::state::not_found(
-                GetAgreementPaymentRequestErrorModeled::ResourceNotFoundException(
-                    crate::state::agreement_not_found(&input.agreement_id),
-                ),
-            ));
+        // this call names both. The CHILD is the resource this call looks for;
+        // `agreementId` only says which agreement it was sent under, so a value
+        // that resolves to no agreement of the account is a fault in the input
+        // and is answered on that member — the modelled `ValidationException`
+        // carrying `INVALID_AGREEMENT_ID` and a `fields` entry naming
+        // `agreementId`, through the one path every operation on a payment
+        // request refuses the member with
+        // (`crate::state::...::unknown_agreement_refusal`), which is also what
+        // `SendAgreementPaymentRequest` and `ListAgreementPaymentRequests`
+        // answer. `ResourceNotFoundException` is left to the resource this call
+        // does look for, below: a client branching on the code would otherwise
+        // read "the agreement was deleted or belongs to another account" for a
+        // request it could repair, and would be told nothing about WHICH member
+        // to repair.
+        if let Some(refusal) = store.unknown_agreement_refusal(Some(&input.agreement_id)) {
+            return Err(
+                GetAgreementPaymentRequestErrorModeled::ValidationException(refusal).into(),
+            );
         }
 
         // The agreement resolved, so the child is what this call looks for.

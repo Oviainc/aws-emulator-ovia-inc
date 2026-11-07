@@ -1058,10 +1058,8 @@ async fn a_payment_request_needs_an_active_agreement_with_that_variable_term() {
     );
 }
 
-/// The resource kinds a lookup that found nothing names in `resourceType` —
-/// `ResourceType`'s values (`smithy_query(query="shape", shape="ResourceType")`).
-const AGREEMENT: &str = "Agreement";
-/// See [`AGREEMENT`].
+/// The resource kind a lookup that found nothing names in `resourceType` — a
+/// `ResourceType` value (`smithy_query(query="shape", shape="ResourceType")`).
 const PAYMENT_REQUEST: &str = "PaymentRequest";
 
 pub(crate) async fn get(
@@ -1324,10 +1322,14 @@ async fn a_payment_request_is_reported_in_full_from_what_was_sent() {
 }
 
 /// Both ids select: a payment request is reported only for the agreement it was
-/// sent under, and an id naming no stored request of that agreement is the
-/// modelled `ResourceNotFoundException`, naming in `resourceType`/`resourceId`
-/// the OUTERMOST resource that failed to resolve, at the status this service
-/// answers a lookup that found nothing with (see `tests/all/unknown_ids.rs`).
+/// sent under, and a `paymentRequestId` naming no stored request of that
+/// agreement is the modelled `ResourceNotFoundException`, naming the resource
+/// that was looked for in `resourceType`/`resourceId`, at the status this
+/// service answers a lookup that found nothing with (see
+/// `tests/all/unknown_ids.rs`). An `agreementId` that resolves to no agreement
+/// is the input fault on that member instead — the class every operation on a
+/// payment request answers for it, spanned in
+/// `tests/all/payment_request_agreement_ids.rs`.
 #[tokio::test]
 async fn a_payment_request_is_found_only_under_the_agreement_it_was_sent_for() {
     let router = emulator();
@@ -1345,23 +1347,13 @@ async fn a_payment_request_is_found_only_under_the_agreement_it_was_sent_for() {
     );
 
     // (case, agreementId, paymentRequestId, the resource the refusal names, its id)
-    let unknown_agreement = "agmt-ffffffffffffffff".to_string();
-    let mut cases: Vec<(String, String, String, &str, String)> = vec![
-        (
-            "the stored request under another agreement of the same account".to_string(),
-            second.clone(),
-            stored.clone(),
-            PAYMENT_REQUEST,
-            stored.clone(),
-        ),
-        (
-            "an agreement id naming no agreement at all".to_string(),
-            unknown_agreement.clone(),
-            stored.clone(),
-            AGREEMENT,
-            unknown_agreement,
-        ),
-    ];
+    let mut cases: Vec<(String, String, String, &str, String)> = vec![(
+        "the stored request under another agreement of the same account".to_string(),
+        second.clone(),
+        stored.clone(),
+        PAYMENT_REQUEST,
+        stored.clone(),
+    )];
     for (case, id) in unknown_payment_request_ids() {
         cases.push((
             format!("{case}, under the agreement that holds one"),

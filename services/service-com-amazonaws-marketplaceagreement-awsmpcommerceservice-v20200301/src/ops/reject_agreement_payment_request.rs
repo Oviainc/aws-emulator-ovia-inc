@@ -218,17 +218,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_payment_requests(now);
 
         // A payment request is a child of the agreement it was sent under, and
-        // this call names both. Resolution goes PARENT-FIRST, so
-        // `ResourceNotFoundException`'s `resourceType` and `resourceId` name the
-        // OUTERMOST resource that failed to resolve, the way the sibling
-        // `CancelAgreementPaymentRequest` and `GetAgreementPaymentRequest`
-        // resolve the same pair.
-        if !store.agreements.contains_key(&input.agreement_id) {
-            return Err(crate::state::not_found(
-                RejectAgreementPaymentRequestErrorModeled::ResourceNotFoundException(
-                    crate::state::agreement_not_found(&input.agreement_id),
-                ),
-            ));
+        // this call names both. The CHILD is the resource this call acts on;
+        // `agreementId` only says which agreement it was sent under, so a value
+        // that resolves to no agreement of the account is a fault in the input
+        // and is answered on that member, through the one path every operation
+        // on a payment request refuses the member with
+        // (`crate::state::...::unknown_agreement_refusal`) — the same refusal
+        // the sibling `CancelAgreementPaymentRequest` and
+        // `GetAgreementPaymentRequest` answer. `ResourceNotFoundException` is
+        // left to the resource this call does look for, below.
+        if let Some(refusal) = store.unknown_agreement_refusal(Some(&input.agreement_id)) {
+            return Err(
+                RejectAgreementPaymentRequestErrorModeled::ValidationException(refusal).into(),
+            );
         }
 
         // The agreement resolved, so the child is what this call acts on. Both

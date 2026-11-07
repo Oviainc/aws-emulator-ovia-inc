@@ -71,6 +71,8 @@ mod listing_resolution_order;
 mod optional_input_empty_pages;
 #[path = "all/page_token_scopes.rs"]
 mod page_token_scopes;
+#[path = "all/payment_request_agreement_ids.rs"]
+mod payment_request_agreement_ids;
 #[path = "all/payment_request_approval.rs"]
 mod payment_request_approval;
 #[path = "all/payment_request_auto_approval.rs"]

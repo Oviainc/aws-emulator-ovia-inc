@@ -20,7 +20,9 @@
 //! ("obtains details about the terms in an agreement",
 //! `smithy_query(query="operation", operation="GetAgreementTerms")`) and an
 //! agreement every call that resolves one holds, while an id no end date ever
-//! created is still refused as the agreement that was looked for.
+//! created is still refused by every one of them — as the agreement that was
+//! looked for where the agreement is the resource, and as the input fault on the
+//! member where the call acts on a payment request that agreement only scopes.
 //!
 //! The rows differ along what the rule generalises over: which contract length
 //! the acceptor purchased, how many whole lengths have passed since it was
@@ -49,6 +51,7 @@ use crate::agreement_lifecycle::{
 };
 use crate::agreement_renewals::renewing_terms;
 use crate::billing_adjustments::{entry, submit};
+use crate::error_bodies::assert_input_fault;
 use crate::purchase_order_updates::{charges, items, references};
 
 /// The resource kinds a not-found refusal names in `resourceType`, from
@@ -66,6 +69,11 @@ const BILLING_ADJUSTMENT_REQUEST: &str = "BillingAdjustmentRequest";
 /// The status this service answers a lookup that found nothing with, which the
 /// crate's `unknown_ids` suite pins against the recorded AWS responses.
 const NOT_FOUND_STATUS: u16 = 400;
+
+/// The `ValidationExceptionReason` a call that takes `agreementId` as INPUT
+/// refuses a value naming no agreement with
+/// (`smithy_query(query="shape", shape="ValidationExceptionReason")`).
+const INVALID_AGREEMENT_ID: &str = "INVALID_AGREEMENT_ID";
 
 /// Ids of the CHILD resources these calls name beside the agreement, each
 /// within its modelled pattern — `^pr-[a-zA-Z0-9]+$`, `^acr-[a-zA-Z0-9]+$` and
@@ -352,6 +360,20 @@ enum Expect {
     ChildNotFound(&'static str, &'static str),
 }
 
+/// How one call answers an `agreementId` that resolves to no agreement of the
+/// store.
+#[derive(Clone, Copy)]
+enum Unresolvable {
+    /// The agreement is the resource the call looks for, or the one it acts
+    /// upon, so the reference is the modelled not-found naming `Agreement`.
+    NotFound,
+    /// The call acts on a payment request, and `agreementId` only says which
+    /// agreement that request was sent under — so a value naming no agreement
+    /// is the input fault on that member
+    /// (`payment_request_agreement_ids`).
+    InputFault,
+}
+
 /// One call whose answer depends on the ONE agreement an id member of its input
 /// names.
 struct SingleAgreement {
@@ -362,6 +384,8 @@ struct SingleAgreement {
     /// accepts — so the only thing a row varies is the agreement it names.
     others: Value,
     expect: Expect,
+    /// How the call refuses an id that names no agreement at all.
+    unresolvable: Unresolvable,
 }
 
 impl SingleAgreement {
@@ -384,30 +408,35 @@ fn single_agreement_calls() -> Vec<SingleAgreement> {
             member: "agreementId",
             others: json!({}),
             expect: Expect::Served("/agreementId"),
+            unresolvable: Unresolvable::NotFound,
         },
         SingleAgreement {
             operation: "GetAgreementTerms",
             member: "agreementId",
             others: json!({}),
             expect: Expect::Served("/acceptedTerms/0"),
+            unresolvable: Unresolvable::NotFound,
         },
         SingleAgreement {
             operation: "GetAgreementEntitlements",
             member: "agreementId",
             others: json!({}),
             expect: Expect::Served("/agreementEntitlements/0"),
+            unresolvable: Unresolvable::NotFound,
         },
         SingleAgreement {
             operation: "GetAgreementPaymentRequest",
             member: "agreementId",
             others: json!({"paymentRequestId": UNKNOWN_PAYMENT_REQUEST}),
             expect: Expect::ChildNotFound(PAYMENT_REQUEST, UNKNOWN_PAYMENT_REQUEST),
+            unresolvable: Unresolvable::InputFault,
         },
         SingleAgreement {
             operation: "AcceptAgreementPaymentRequest",
             member: "agreementId",
             others: json!({"paymentRequestId": UNKNOWN_PAYMENT_REQUEST}),
             expect: Expect::ChildNotFound(PAYMENT_REQUEST, UNKNOWN_PAYMENT_REQUEST),
+            unresolvable: Unresolvable::InputFault,
         },
         SingleAgreement {
             operation: "RejectAgreementPaymentRequest",
@@ -417,12 +446,14 @@ fn single_agreement_calls() -> Vec<SingleAgreement> {
                 "rejectionReason": "The invoice has already been settled",
             }),
             expect: Expect::ChildNotFound(PAYMENT_REQUEST, UNKNOWN_PAYMENT_REQUEST),
+            unresolvable: Unresolvable::InputFault,
         },
         SingleAgreement {
             operation: "CancelAgreementPaymentRequest",
             member: "agreementId",
             others: json!({"paymentRequestId": UNKNOWN_PAYMENT_REQUEST}),
             expect: Expect::ChildNotFound(PAYMENT_REQUEST, UNKNOWN_PAYMENT_REQUEST),
+            unresolvable: Unresolvable::InputFault,
         },
         SingleAgreement {
             operation: "GetAgreementCancellationRequest",
@@ -432,6 +463,7 @@ fn single_agreement_calls() -> Vec<SingleAgreement> {
                 AGREEMENT_CANCELLATION_REQUEST,
                 UNKNOWN_CANCELLATION_REQUEST,
             ),
+            unresolvable: Unresolvable::NotFound,
         },
         SingleAgreement {
             operation: "AcceptAgreementCancellationRequest",
@@ -441,6 +473,7 @@ fn single_agreement_calls() -> Vec<SingleAgreement> {
                 AGREEMENT_CANCELLATION_REQUEST,
                 UNKNOWN_CANCELLATION_REQUEST,
             ),
+            unresolvable: Unresolvable::NotFound,
         },
         SingleAgreement {
             operation: "RejectAgreementCancellationRequest",
@@ -453,6 +486,7 @@ fn single_agreement_calls() -> Vec<SingleAgreement> {
                 AGREEMENT_CANCELLATION_REQUEST,
                 UNKNOWN_CANCELLATION_REQUEST,
             ),
+            unresolvable: Unresolvable::NotFound,
         },
         SingleAgreement {
             operation: "CancelAgreementCancellationRequest",
@@ -465,12 +499,14 @@ fn single_agreement_calls() -> Vec<SingleAgreement> {
                 AGREEMENT_CANCELLATION_REQUEST,
                 UNKNOWN_CANCELLATION_REQUEST,
             ),
+            unresolvable: Unresolvable::NotFound,
         },
         SingleAgreement {
             operation: "GetBillingAdjustmentRequest",
             member: "agreementId",
             others: json!({"billingAdjustmentRequestId": UNKNOWN_BILLING_ADJUSTMENT}),
             expect: Expect::ChildNotFound(BILLING_ADJUSTMENT_REQUEST, UNKNOWN_BILLING_ADJUSTMENT),
+            unresolvable: Unresolvable::NotFound,
         },
         SingleAgreement {
             operation: "ListAgreementInvoiceLineItems",
@@ -478,6 +514,7 @@ fn single_agreement_calls() -> Vec<SingleAgreement> {
             // `groupBy` is `@required` on this listing.
             others: json!({"groupBy": "INVOICE_ID"}),
             expect: Expect::Served("/agreementInvoiceLineItemGroupSummaries/0"),
+            unresolvable: Unresolvable::NotFound,
         },
         SingleAgreement {
             // "This parameter is required for all intents except NEW", and an
@@ -486,6 +523,7 @@ fn single_agreement_calls() -> Vec<SingleAgreement> {
             member: "sourceAgreementIdentifier",
             others: json!({"intent": "AMEND", "requestedTerms": [term("eula.v1")]}),
             expect: Expect::Served("/agreementRequestId"),
+            unresolvable: Unresolvable::NotFound,
         },
     ]
 }
@@ -630,10 +668,14 @@ async fn every_single_agreement_call_resolves_the_renewal_the_clock_owes() {
 }
 
 /// The complement: an `agreementId` no end date of the store could have created
-/// is still refused as the agreement that was looked for, by every one of those
-/// calls — settling admits the agreements the clock owed and nothing else.
+/// is still refused by every one of those calls — settling admits the agreements
+/// the clock owed and nothing else. Each call refuses it in its own class: the
+/// modelled not-found naming `Agreement` where the agreement is the resource the
+/// call looks for or acts upon, and the input fault on the member where the call
+/// acts on a payment request the agreement only scopes
+/// (`payment_request_agreement_ids`).
 #[tokio::test]
-async fn an_agreement_id_no_end_date_created_is_still_not_found() {
+async fn an_agreement_id_no_end_date_created_is_still_refused() {
     let row = Aged {
         case: "a month's purchase a day past its end date",
         requested: renewing_terms("P1M"),
@@ -645,7 +687,14 @@ async fn an_agreement_id_no_end_date_created_is_still_not_found() {
     for under_test in single_agreement_calls() {
         let case = under_test.operation;
         let answer = call(&router, case, under_test.request(UNKNOWN_AGREEMENT)).await;
-        assert_not_found(case, AGREEMENT, UNKNOWN_AGREEMENT, &answer);
+        match under_test.unresolvable {
+            Unresolvable::NotFound => {
+                assert_not_found(case, AGREEMENT, UNKNOWN_AGREEMENT, &answer)
+            }
+            Unresolvable::InputFault => {
+                assert_input_fault(case, INVALID_AGREEMENT_ID, under_test.member, &answer)
+            }
+        }
     }
 }
 
