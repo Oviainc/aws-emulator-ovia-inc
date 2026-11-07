@@ -13,6 +13,9 @@
 #[path = "all/create_conflict_wording.rs"]
 mod create_conflict_wording;
 
+#[path = "all/data_access_gate.rs"]
+mod data_access_gate;
+
 #[path = "all/directory_authorization.rs"]
 mod directory_authorization;
 

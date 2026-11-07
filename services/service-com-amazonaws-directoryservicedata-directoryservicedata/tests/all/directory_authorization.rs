@@ -45,12 +45,12 @@ use super::validation_envelope::{
 /// The error code the gate refuses with: the shape
 /// `com.amazonaws.directoryservicedata#AccessDeniedException`, `@httpError` 403, which all
 /// 17 operations declare.
-const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
+pub(super) const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
 
 /// The `AccessDeniedReason` such a refusal carries
 /// (`smithy_query(query="shape", shape="AccessDeniedReason")` — `IAM_AUTH`,
 /// `DIRECTORY_AUTH`, `DATA_DISABLED`).
-const IAM_AUTH: &str = "IAM_AUTH";
+pub(super) const IAM_AUTH: &str = "IAM_AUTH";
 
 /// The `ValidationExceptionReason` the attribute layer carries
 /// (`smithy_query(query="shape", shape="ValidationExceptionReason")` includes it).
@@ -58,7 +58,7 @@ const INVALID_ATTRIBUTE_VALUE: &str = "INVALID_ATTRIBUTE_VALUE";
 
 /// `DirectoryId`s inside `^d-[0-9a-f]{10}$` that NO account here holds — the gate's own
 /// case, varied along the digits so no row can pass on the shape of an id.
-const UNHELD_DIRECTORIES: [&str; 4] = [
+pub(super) const UNHELD_DIRECTORIES: [&str; 4] = [
     "d-0000000000",
     "d-ffffffffff",
     "d-4f8a1c07e2",
@@ -98,7 +98,7 @@ const LDAP_DISPLAY_NAME_PATTERN: &str = "[A-Za-z*][A-Za-z-*]*";
 /// Every route this service binds, with the `@required` members of each inside their own
 /// constraints — one row per operation (17, as `OPERATIONS.md` lists them), so a rule that
 /// holds for the service has to hold for every row.
-fn every_operation() -> Vec<(&'static str, Value)> {
+pub(super) fn every_operation() -> Vec<(&'static str, Value)> {
     let group = json!({"SAMAccountName": "engineering"});
     let user = json!({"SAMAccountName": "jdoe"});
     let membership = json!({"GroupName": "engineering", "MemberName": "jdoe"});
@@ -144,7 +144,7 @@ fn every_operation_carrying_attributes() -> [(&'static str, Value); 4] {
 
 /// The emulator over an engine the caller keeps, so a case can record a directory or drop
 /// one mid-test the way the control plane's create and delete do.
-fn emulator_over(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(super) fn emulator_over(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(engine)));
@@ -162,7 +162,7 @@ fn drop_directory(engine: &engine::InMemoryEngine, directory: &str) {
 /// The message a denial states: the calling principal, and nothing else. The principal is
 /// the one this emulator's credential speaks for, read from the shared definition STS and
 /// IAM answer for it from rather than spelled again here.
-fn not_authorized() -> String {
+pub(super) fn not_authorized() -> String {
     format!(
         "User: {principal} is not authorized to access this resource",
         principal = service_common::caller_principal::ambient_user_arn()

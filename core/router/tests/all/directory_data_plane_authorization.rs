@@ -11,16 +11,21 @@
 //! both reach the one shared inventory.
 //!
 //! The rule these rows pin: a data-plane request is served for a directory the control
-//! plane HOLDS — the one `ds:DescribeDirectories` reports — and refused for every other
+//! plane HOLDS — the one `ds:DescribeDirectories` reports — and whose DS Data feature that
+//! plane has turned ON (`ds:EnableDirectoryDataAccess`), and refused for every other
 //! well-formed `DirectoryId` with `AccessDeniedException` (HTTP 403, `Reason` `IAM_AUTH`),
 //! which discloses nothing about the directory. The lifecycle follows the control plane's:
 //! a directory it has deleted stops being served, whatever the data plane stored while it
 //! existed.
 //!
+//! The DISABLE direction of that switch — and the identity of the refusal a read, a write
+//! and a listing get behind it — is the sibling suite `directory_data_access_cycle`.
+//!
 //! Only this configuration — the Directory Service control plane and its data plane mounted
 //! on ONE engine, which is what `core/router` ships — makes the join observable at all.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -47,6 +52,11 @@ const IAM_AUTH: &str = "IAM_AUTH";
 /// suite ever mints, varied along their digits.
 const UNCREATED_DIRECTORIES: [&str; 3] = ["d-0000000000", "d-ffffffffff", "d-5e9207cba4"];
 
+/// Past one of the control plane's transition spans: a create answers before the directory
+/// is in service and the data-access toggle answers before the feature has moved, and the
+/// clock — not a later call — settles both.
+pub(super) const PAST_ONE_SPAN: Duration = Duration::from_millis(700);
+
 type DirectoryService =
     service_com_amazonaws_directoryservice_directoryservice_20150416::EmulatedService<
         engine::InMemoryEngine,
@@ -58,14 +68,14 @@ type DirectoryServiceData =
 
 /// One answer, reduced to what the rows assert on.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
-    body: Value,
+pub(super) struct Answer {
+    pub(super) status: u16,
+    pub(super) body: Value,
 }
 
 impl Answer {
     /// The wire error code (`__type`), or the empty string on a success.
-    fn error_code(&self) -> &str {
+    pub(super) fn error_code(&self) -> &str {
         self.body
             .get("__type")
             .and_then(Value::as_str)
@@ -73,7 +83,7 @@ impl Answer {
     }
 
     /// A string member of the answer, or the empty string when it carries none.
-    fn text(&self, member: &str) -> String {
+    pub(super) fn text(&self, member: &str) -> String {
         self.body
             .get(member)
             .and_then(Value::as_str)
@@ -83,12 +93,12 @@ impl Answer {
 }
 
 /// Both services, over ONE shared engine exactly as `router/src/lib.rs` mounts them.
-struct Emulator {
+pub(super) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These rows exercise handler behaviour, not request signing.
@@ -99,7 +109,7 @@ impl Emulator {
     }
 
     /// One control-plane call: `POST /` with the operation in `X-Amz-Target`.
-    async fn control_plane(&self, operation: &str, body: Value) -> Answer {
+    pub(super) async fn control_plane(&self, operation: &str, body: Value) -> Answer {
         self.dispatch(
             DS,
             "/",
@@ -110,7 +120,7 @@ impl Emulator {
     }
 
     /// One data-plane call: `POST <route>?DirectoryId=<id>` with a JSON body.
-    async fn data_plane(&self, route: &str, directory: &str, body: Value) -> Answer {
+    pub(super) async fn data_plane(&self, route: &str, directory: &str, body: Value) -> Answer {
         self.dispatch(
             DS_DATA,
             &format!("{route}?DirectoryId={directory}"),
@@ -158,7 +168,7 @@ impl Emulator {
 
 /// A minimal well-formed `CreateMicrosoftAD` body: the three members the operation
 /// requires, with one directory server per subnet.
-fn create_microsoft_ad(name: &str) -> Value {
+pub(super) fn create_microsoft_ad(name: &str) -> Value {
     json!({
         "Name": name,
         "Password": "P@ssw0rd-emulator-1",
@@ -213,6 +223,27 @@ async fn the_data_plane_serves_the_directories_the_control_plane_holds() {
         held, created,
         "expected DescribeDirectories to report the created directories, got {held:?}"
     );
+
+    // The data plane answers for a directory only while the control plane's DS Data feature
+    // is on for it, and a create leaves it off: the stage transition each create owes has to
+    // fall due before the enable is admitted, and the enable's own transition before the
+    // data plane serves anything.
+    tokio::time::sleep(PAST_ONE_SPAN).await;
+    for directory in &created {
+        let enabled = emulator
+            .control_plane(
+                "EnableDirectoryDataAccess",
+                json!({"DirectoryId": directory}),
+            )
+            .await;
+        assert_eq!(
+            enabled.status, 200,
+            "directory {directory:?}: EnableDirectoryDataAccess must be accepted, got {} \
+             with {:?}",
+            enabled.status, enabled.body
+        );
+    }
+    tokio::time::sleep(PAST_ONE_SPAN).await;
 
     // Each held directory serves the data plane's own lifecycle: a create, then a read of
     // that same record.

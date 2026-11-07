@@ -13,9 +13,18 @@
 //!
 //! This is that record: ONE inventory in the shared engine, written by the control plane
 //! when it creates a directory and cleared when it deletes one, read by the data plane.
-//! Nothing here names a wire shape — the inventory holds directory ids — and nothing here
-//! decides what a reader does with the answer: WHICH error a data-plane request gets for a
-//! directory the inventory does not hold is that service's own.
+//! Nothing here names a wire shape — the inventory holds directory ids and, per id, the
+//! one cross-plane fact the data plane cannot read anywhere else: WHETHER the control plane
+//! has turned the directory's data API on, and from WHEN. Nothing here decides what a
+//! reader does with the answer: WHICH error a data-plane request gets for a directory the
+//! inventory does not hold, or holds shut, is that service's own.
+//!
+//! The toggle is recorded as the CHANGE the control plane accepted and the instant it
+//! takes effect, because both toggles answer before the directory's data API has moved:
+//! the clock applies it, at the same instant the control plane's own transient status
+//! settles, so the two planes never disagree about whether the data API is in service. A
+//! directory the control plane has just created is out of service, which is the state every
+//! create leaves it in.
 //!
 //! The inventory is a record of what this emulator CREATED, so a reader asking about an id
 //! gets a yes or a no about this account's own directories and nothing else. It is BOUNDED
@@ -27,7 +36,8 @@
 //! holds this inventory while taking another store — so two services cannot invert the
 //! order between them.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
+use std::time::SystemTime;
 
 /// How many directories the inventory holds at once.
 ///
@@ -45,21 +55,63 @@ pub const MAX_RECORDED_DIRECTORIES: usize = 1_000;
 /// of each keeping its own copy.
 #[derive(Debug, Default)]
 pub struct AdDirectoryInventory {
-    /// The ids held, so the question a reader asks — does the account hold this directory —
-    /// is answered by one lookup.
-    held: HashSet<String>,
+    /// The ids held, each with its data-access toggle: one lookup answers both questions a
+    /// reader asks — does the account hold this directory, and does its data API answer.
+    held: HashMap<String, DataAccess>,
     /// Registration order, so the ceiling drops the oldest entry first.
     order: VecDeque<String>,
 }
 
+/// Whether one directory's data API is in service, and the change the clock still owes it.
+///
+/// The control plane's enable and disable both answer BEFORE the directory's data API has
+/// moved, so what a toggle records here is the change and the instant it takes effect; the
+/// clock — not a later call — is what applies it, at the same instant the control plane's
+/// own transient status settles. A directory a create has just registered is out of
+/// service: a create opens nothing.
+#[derive(Debug, Clone, Copy, Default)]
+struct DataAccess {
+    /// Whether the data API answers for the directory, before any change still owed.
+    in_service: bool,
+    /// The change the clock owes — whether the data API will answer, and the instant that
+    /// takes effect — or `None` when the toggle has nothing outstanding.
+    owed: Option<(bool, SystemTime)>,
+}
+
+impl DataAccess {
+    /// Whether the data API answers for the directory at `now`: the change the clock owes
+    /// once its instant has arrived, and what the toggle last settled on until then.
+    fn in_service_at(self, now: SystemTime) -> bool {
+        match self.owed {
+            Some((in_service, effective_at)) if now >= effective_at => in_service,
+            _ => self.in_service,
+        }
+    }
+
+    /// This toggle with a change the control plane just accepted recorded on it: the data
+    /// API is `in_service` from `effective_at` on, and until then stands as it stands at
+    /// `now` — so a change recorded while an earlier one is still outstanding does not
+    /// apply that earlier one early.
+    fn changing_to(self, in_service: bool, effective_at: SystemTime, now: SystemTime) -> Self {
+        Self {
+            in_service: self.in_service_at(now),
+            owed: Some((in_service, effective_at)),
+        }
+    }
+}
+
 impl AdDirectoryInventory {
-    /// Record that the account holds the directory `directory_id`.
+    /// Record that the account holds the directory `directory_id`, its data API out of
+    /// service as a create leaves it.
     ///
-    /// Recording an id the inventory already holds changes nothing and does not move its
-    /// place in the eviction order, so a control plane that re-registers a directory it
-    /// already told the inventory about cannot age another one out.
+    /// Recording an id the inventory already holds changes nothing — neither its place in
+    /// the eviction order nor its data-access toggle — so a control plane that re-registers
+    /// a directory it already told the inventory about cannot age another one out, and
+    /// cannot withdraw a directory whose data access it opened.
     pub fn register(&mut self, directory_id: &str) {
-        if self.held.insert(directory_id.to_string()) {
+        if !self.held.contains_key(directory_id) {
+            self.held
+                .insert(directory_id.to_string(), DataAccess::default());
             self.order.push_back(directory_id.to_string());
             while self.order.len() > MAX_RECORDED_DIRECTORIES {
                 if let Some(oldest) = self.order.pop_front() {
@@ -74,7 +126,7 @@ impl AdDirectoryInventory {
     ///
     /// A no-op for an id the inventory holds no record of, so a repeated delete is harmless.
     pub fn forget(&mut self, directory_id: &str) {
-        if self.held.remove(directory_id) {
+        if self.held.remove(directory_id).is_some() {
             self.order.retain(|recorded| recorded != directory_id);
         }
     }
@@ -82,7 +134,65 @@ impl AdDirectoryInventory {
     /// Whether the account holds the directory `directory_id`.
     #[must_use]
     pub fn holds(&self, directory_id: &str) -> bool {
-        self.held.contains(directory_id)
+        self.held.contains_key(directory_id)
+    }
+
+    /// Record the control plane's ENABLE of the directory's data API: it is in service from
+    /// `effective_at` on, which is when the transition that enable owes falls due.
+    ///
+    /// A no-op for an id the inventory holds no record of: a directory the account does not
+    /// hold has no data API to put in service, and recording one would claim the account
+    /// holds it.
+    pub fn enable_data_access(
+        &mut self,
+        directory_id: &str,
+        now: SystemTime,
+        effective_at: SystemTime,
+    ) {
+        self.change_data_access(directory_id, true, now, effective_at);
+    }
+
+    /// Record the control plane's DISABLE of it: the data API is out of service from
+    /// `effective_at` on, which is when the transition that disable owes falls due, and
+    /// serves nothing for the directory again until another enable.
+    ///
+    /// A no-op for an id the inventory holds no record of, as [`Self::enable_data_access`]
+    /// is.
+    pub fn disable_data_access(
+        &mut self,
+        directory_id: &str,
+        now: SystemTime,
+        effective_at: SystemTime,
+    ) {
+        self.change_data_access(directory_id, false, now, effective_at);
+    }
+
+    /// The one writer behind both toggles, so an enable and a disable record a change the
+    /// same way and differ only in what they change the data API to.
+    fn change_data_access(
+        &mut self,
+        directory_id: &str,
+        in_service: bool,
+        now: SystemTime,
+        effective_at: SystemTime,
+    ) {
+        if let Some(toggle) = self.held.get_mut(directory_id) {
+            *toggle = toggle.changing_to(in_service, effective_at, now);
+        }
+    }
+
+    /// Whether the directory's data API answers at `now`: the account holds the directory
+    /// and the control plane's toggle has it in service at that instant.
+    ///
+    /// `false` while an enable's transition is still outstanding and `true` while a
+    /// disable's is, so the data API is in service at exactly the instants the control
+    /// plane reports its data access as settled on — nothing is served for a directory the
+    /// account does not hold at all.
+    #[must_use]
+    pub fn data_access_is_in_service(&self, directory_id: &str, now: SystemTime) -> bool {
+        self.held
+            .get(directory_id)
+            .is_some_and(|toggle| toggle.in_service_at(now))
     }
 
     /// How many directories the inventory holds.
@@ -100,6 +210,8 @@ impl AdDirectoryInventory {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime};
+
     use super::{AdDirectoryInventory, MAX_RECORDED_DIRECTORIES};
 
     /// A `DirectoryId` of the form the models declare (`^d-[0-9a-f]{10}$`), one per rank.
@@ -184,6 +296,143 @@ mod tests {
             inventory.holds(&directory(MAX_RECORDED_DIRECTORIES))
                 && inventory.holds(&directory(1)),
             "case one past the ceiling: expected the newest and the next-oldest to be held"
+        );
+    }
+
+    /// RULE: a directory's data API is in service exactly while the control plane's toggle
+    /// has it so — from the instant an enable's transition falls due until a disable's does
+    /// — and a registration alone puts nothing in service.
+    #[test]
+    fn data_access_is_in_service_exactly_while_the_control_planes_toggle_has_it_so() {
+        let span = Duration::from_millis(500);
+        let enabled_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let enabled_from = enabled_at + span;
+        let hour = Duration::from_secs(3_600);
+
+        let mut inventory = AdDirectoryInventory::default();
+        inventory.register(&directory(1));
+        inventory.register(&directory(2));
+
+        // (case, the instant asked about, whether the data API answers)
+        let before_any_enable: [(&str, SystemTime, bool); 3] = [
+            ("the instant of the create", enabled_at, false),
+            ("one span later", enabled_from, false),
+            ("an hour later", enabled_from + hour, false),
+        ];
+        for (case, now, expected) in before_any_enable {
+            let in_service = inventory.data_access_is_in_service(&directory(1), now);
+            assert_eq!(
+                in_service, expected,
+                "case {case:?} on a registered directory nothing enabled: expected \
+                 {expected}, got {in_service}"
+            );
+        }
+
+        inventory.enable_data_access(&directory(1), enabled_at, enabled_from);
+        // (case, the instant asked about, whether the data API answers)
+        let after_enable: [(&str, SystemTime, bool); 4] = [
+            ("the instant of the enable", enabled_at, false),
+            (
+                "a moment before the enable's transition falls due",
+                enabled_from - Duration::from_millis(1),
+                false,
+            ),
+            ("the instant it falls due", enabled_from, true),
+            ("well past it", enabled_from + hour, true),
+        ];
+        for (case, now, expected) in after_enable {
+            let in_service = inventory.data_access_is_in_service(&directory(1), now);
+            assert_eq!(
+                in_service, expected,
+                "case {case:?} on an enabled directory: expected {expected}, got {in_service}"
+            );
+        }
+
+        // The toggle is per directory: the other registration is untouched.
+        assert!(
+            !inventory.data_access_is_in_service(&directory(2), enabled_from),
+            "case another directory of the same account: expected its data API to stay out \
+             of service"
+        );
+
+        // Re-registering a directory whose data access is on — which a control plane does
+        // for a directory it already recorded — must not withdraw it.
+        inventory.register(&directory(1));
+        assert!(
+            inventory.data_access_is_in_service(&directory(1), enabled_from),
+            "case a re-registered enabled directory: expected its data API to stay in service"
+        );
+
+        // A disable takes effect when ITS transition falls due, and not before: the data
+        // API is still in service the instant the disable is recorded.
+        let disabled_at = enabled_from + hour;
+        let disabled_from = disabled_at + span;
+        inventory.disable_data_access(&directory(1), disabled_at, disabled_from);
+        // (case, the instant asked about, whether the data API answers)
+        let after_disable: [(&str, SystemTime, bool); 4] = [
+            ("the instant of the disable", disabled_at, true),
+            (
+                "a moment before the disable's transition falls due",
+                disabled_from - Duration::from_millis(1),
+                true,
+            ),
+            ("the instant it falls due", disabled_from, false),
+            ("well past it", disabled_from + hour, false),
+        ];
+        for (case, now, expected) in after_disable {
+            let in_service = inventory.data_access_is_in_service(&directory(1), now);
+            assert_eq!(
+                in_service, expected,
+                "case {case:?} on a disabled directory: expected {expected}, got {in_service}"
+            );
+        }
+
+        // A disable recorded while an ENABLE is still outstanding does not apply that
+        // enable early: the data API stays out of service throughout.
+        inventory.register(&directory(3));
+        inventory.enable_data_access(&directory(3), enabled_at, enabled_from);
+        let cancelled_from = enabled_at + Duration::from_millis(100) + span;
+        inventory.disable_data_access(
+            &directory(3),
+            enabled_at + Duration::from_millis(100),
+            cancelled_from,
+        );
+        for (case, now) in [
+            ("the instant the first enable would have fallen due", enabled_from),
+            ("the instant the disable falls due", cancelled_from),
+            ("an hour later", cancelled_from + hour),
+        ] {
+            assert!(
+                !inventory.data_access_is_in_service(&directory(3), now),
+                "case {case:?} on a directory disabled while its enable was outstanding: \
+                 expected the data API to stay out of service"
+            );
+        }
+
+        // A re-enable puts it back in service on its own transition, and forgetting the
+        // directory closes every question about it.
+        let re_enabled_at = disabled_from + hour;
+        let re_enabled_from = re_enabled_at + span;
+        inventory.enable_data_access(&directory(1), re_enabled_at, re_enabled_from);
+        assert!(
+            inventory.data_access_is_in_service(&directory(1), re_enabled_from)
+                && !inventory.data_access_is_in_service(&directory(1), re_enabled_at),
+            "case a re-enabled directory: expected the second transition to decide, not the \
+             first"
+        );
+        inventory.forget(&directory(1));
+        assert!(
+            !inventory.data_access_is_in_service(&directory(1), re_enabled_from),
+            "case a forgotten directory: expected no data API at all"
+        );
+
+        // A directory the inventory never held gains no record from either toggle.
+        inventory.enable_data_access(&directory(7), re_enabled_at, re_enabled_from);
+        inventory.disable_data_access(&directory(8), re_enabled_at, re_enabled_from);
+        assert!(
+            !inventory.holds(&directory(7)) && !inventory.holds(&directory(8)),
+            "case the toggle on an unheld directory: expected no registration, got {} record(s)",
+            inventory.len()
         );
     }
 }

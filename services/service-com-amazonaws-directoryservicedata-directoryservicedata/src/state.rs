@@ -1038,13 +1038,14 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 }
 
 /// The SHARED AD directory inventory in the shared engine: which directories the account
-/// holds, as the control plane that creates and deletes them recorded it. Call it with a
-/// handler's `&*self.engine`.
+/// holds, as the control plane that creates and deletes them recorded it, and whether that
+/// plane has each directory's DS Data feature on. Call it with a handler's `&*self.engine`.
 ///
 /// This API creates no directory — `CreateDirectory` / `CreateMicrosoftAD` /
-/// `DeleteDirectory` belong to the Directory Service control plane — so whether a
-/// `DirectoryId` names a directory of this account is knowable here only from that plane's
-/// own record. It is ONE record under one shared type
+/// `DeleteDirectory` belong to the Directory Service control plane, as do
+/// `EnableDirectoryDataAccess` / `DisableDirectoryDataAccess` — so whether a `DirectoryId`
+/// names a directory of this account, and whether this whole API is in service for it, is
+/// knowable here only from that plane's own record. It is ONE record under one shared type
 /// ([`::service_common::ad_directories::AdDirectoryInventory`]) rather than a copy inside
 /// [`ComAmazonawsDirectoryservicedataDirectoryservicedataState`]: the engine keys state by
 /// TYPE, so a copy of its own here would be invisible to the plane that writes it.

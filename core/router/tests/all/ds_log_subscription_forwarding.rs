@@ -226,6 +226,18 @@ async fn directory_writes_reach_the_subscribed_log_group_while_the_subscription_
         .to_string();
     tokio::time::sleep(PAST_ONE_SPAN).await;
 
+    // The data plane answers for a directory only while the control plane's DS Data feature
+    // is on for it, and a create leaves it off: the enable goes through the control plane,
+    // and the transition it owes has to fall due before the writes below are served.
+    emulator
+        .ds(
+            "EnableDirectoryDataAccess",
+            json!({ "DirectoryId": &directory_id }),
+            "setup",
+        )
+        .await;
+    tokio::time::sleep(PAST_ONE_SPAN).await;
+
     // A write performed while NO subscription exists is never forwarded.
     emulator
         .ds_data(

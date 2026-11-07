@@ -22,10 +22,9 @@ mod cloudformation_fifo_resource_generated_names;
 // their line to.
 #[path = "all/directory_data_plane_authorization.rs"]
 mod directory_data_plane_authorization;
-// Declared here, beside the suite above it shares its two services with: what a subscribed
-// directory FORWARDS of the writes that plane makes.
-#[path = "all/ds_log_subscription_forwarding.rs"]
-mod ds_log_subscription_forwarding;
+// Declared here, in this same head region, for the reason the entries above record.
+#[path = "all/directory_data_access_cycle.rs"]
+mod directory_data_access_cycle;
 // appended tail and the sorted `k…` span are both regions concurrently landing suites add
 #[path = "all/kinesisvideo_discovered_data_plane.rs"]
 mod kinesisvideo_discovered_data_plane;
@@ -47,7 +46,6 @@ mod s3_address_forms;
 mod sns_lambda_subscription_pipeline;
 #[path = "all/cloudformation_refuses_s3vectors_vector_buckets.rs"]
 mod cloudformation_refuses_s3vectors_vector_buckets;
-// Declared here, in this same head region, for the reason the entries above record.
 #[path = "all/cloudfront_oac_kms_s3_origin_edge.rs"]
 mod cloudfront_oac_kms_s3_origin_edge;
 // appended tail and the sorted `a…` span (where the other apigateway suites land) are both
@@ -921,5 +919,9 @@ mod apigateway_account_cloudwatch_role;
 mod zz_probe_whole_emulator;
 #[path = "all/cloudformation_provisions_cognito_identity_pools.rs"]
 mod cloudformation_provisions_cognito_identity_pools;
+// Declared here, beside the suite above it shares its two services with: what a subscribed
+// directory FORWARDS of the writes that plane makes.
+#[path = "all/ds_log_subscription_forwarding.rs"]
+mod ds_log_subscription_forwarding;
 #[path = "all/sns_lambda_cdk_subscription_delivery.rs"]
 mod sns_lambda_cdk_subscription_delivery;

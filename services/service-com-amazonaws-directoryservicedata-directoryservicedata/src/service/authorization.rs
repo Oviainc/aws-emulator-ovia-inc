@@ -5,22 +5,34 @@
 //!
 //! Directory Service Data serves the objects INSIDE a directory and creates no directory:
 //! `CreateDirectory` / `CreateMicrosoftAD` / `DeleteDirectory` belong to the Directory
-//! Service control plane. So a `DirectoryId` the request carries is either one the account
-//! holds — which only that plane can say, through the inventory it writes
-//! ([`crate::state::ad_directory_inventory`]) — or one the caller cannot reach at all, and
-//! every operation here answers the second case the same way: `AccessDeniedException`,
-//! HTTP 403, `Reason` `IAM_AUTH`, naming the calling principal and NOTHING about the
-//! directory.
+//! Service control plane, and so does the switch that makes this API usable at all
+//! (`EnableDirectoryDataAccess` / `DisableDirectoryDataAccess`). So a `DirectoryId` the
+//! request carries is reachable here only on two facts only that plane can state, both read
+//! through the record it writes ([`crate::state::ad_directory_inventory`]):
+//!
+//! * the account HOLDS the directory — otherwise the caller cannot reach it at all, which
+//!   every operation here answers the same way: `AccessDeniedException`, HTTP 403, `Reason`
+//!   `IAM_AUTH`, naming the calling principal and NOTHING about the directory;
+//! * the directory's DS Data feature is on — otherwise this whole API is out of service for
+//!   it, which every operation here answers with the same `AccessDeniedException`, HTTP 403,
+//!   carrying `Reason` [`DATA_DISABLED`] and the sentence AWS words for a directory whose
+//!   feature has not been enabled. The feature is on from the instant the control plane's
+//!   enable settles until the instant its disable does, so the data plane answers for
+//!   exactly the directories whose `DataAccessStatus` that plane reports as `Enabled`.
+//!
+//! Both refusals are DIRECTORY-scoped rather than operation-scoped: an object read, a write
+//! and an inventory listing carry the identical error code and the identical message,
+//! because what is refused is the directory and not the call.
 //!
 //! That is the modelled shape's own documentation: "You don't have permission to perform
 //! the request or access the directory. It can also occur when the `DirectoryId` doesn't
 //! exist or the user, member, or group might be outside of your organizational unit (OU)"
 //! (`smithy_query(query="shape", shape="AccessDeniedException")`, `@httpError` 403, member
-//! `Reason` targeting `AccessDeniedReason`). A directory the caller cannot reach is
-//! therefore never reported as `ResourceNotFoundException` — the eleven operations that
-//! declare that error state it for an object MISSING INSIDE a directory the caller does
-//! reach — and never served as an empty answer: either would tell a caller whether a
-//! directory it may not see exists.
+//! `Reason` targeting `AccessDeniedReason`, whose values are `IAM_AUTH`, `DIRECTORY_AUTH`
+//! and `DATA_DISABLED`). A directory the caller cannot reach is therefore never reported as
+//! `ResourceNotFoundException` — the eleven operations that declare that error state it for
+//! an object MISSING INSIDE a directory the caller does reach — and never served as an empty
+//! answer: either would tell a caller whether a directory it may not see exists.
 //!
 //! WHERE the gate sits decides what a refused call is told, so the order is part of the
 //! rule:
@@ -31,12 +43,15 @@
 //! 3. THIS gate — ahead of every handler, so it precedes pagination-token parsing,
 //!    `ClientToken` idempotency and every object lookup: a fabricated `NextToken` or a
 //!    well-formed `ClientToken` on a directory the caller cannot reach is still this
-//!    refusal, and nothing of the request is persisted.
+//!    refusal, and nothing of the request is persisted — a write refused here creates
+//!    nothing, so the object inventory a later enable exposes does not carry it.
 //!
 //! The principal a refusal names is the one this emulator's credential speaks for
 //! (`service_common::caller_principal`), and the sentence is the tree's one statement of
 //! that denial (`service_common::iam_authorization::not_authorized_to_access_resource`), so
 //! no two services word it differently.
+
+use std::time::SystemTime;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use smithy_server_runtime::ServerHttpProtocol;
@@ -46,6 +61,19 @@ use smithy_server_runtime::ServerHttpProtocol;
 /// `crate::ops::types::ACCESS_DENIED_REASON_VALUES`), the one that names the authorization
 /// layer rather than the directory's own state.
 pub const IAM_AUTH: &str = "IAM_AUTH";
+
+/// The `AccessDeniedReason` a refusal of a directory whose DS Data feature is off carries:
+/// the modelled value that names the directory's own data-access state rather than the
+/// authorization layer.
+pub const DATA_DISABLED: &str = "DATA_DISABLED";
+
+/// The `Message` that refusal states: what AWS says for a directory the DS Data feature has
+/// not been enabled on, naming the control-plane call that enables it. Fixed text in full —
+/// nothing of the request appears in it, so a read, a write and a listing of any directory
+/// are refused with one identical sentence.
+pub const DATA_DISABLED_MESSAGE: &str =
+    "DS Data feature is not enabled on this directory. This feature must first be enabled \
+     by calling the EnableDirectoryDataAccess API.";
 
 /// The error code this service names for a caller that may not reach the directory: the
 /// shape `com.amazonaws.directoryservicedata#AccessDeniedException`, which every one of the
@@ -60,8 +88,9 @@ const ACCESS_DENIED_EXCEPTION_STATUS: u16 = 403;
 /// directory a request names is read from.
 const DIRECTORY_ID_PARAMETER: &str = "DirectoryId";
 
-/// The refusal `req` gets when the account does not hold the directory it names, or `None`
-/// when the request may go on to its handler.
+/// The refusal `req` gets when the account does not hold the directory it names or the
+/// control plane has that directory's DS Data feature off, or `None` when the request may go
+/// on to its handler.
 ///
 /// `None` for a request that names no directory at all: an absent `@required` member is the
 /// constraint layer's refusal, which runs before this gate, and an engine carrying no
@@ -73,14 +102,37 @@ pub fn refusing_request<Eng: Send + Sync + 'static>(
     req: &RtRequest,
 ) -> Option<RtResponse> {
     let named = directory_named(req.uri())?;
-    let held = crate::state::ad_directory_inventory(engine)
+    let now = SystemTime::now();
+    let (held, serving) = crate::state::ad_directory_inventory(engine)
         // The inventory is read and RELEASED here, before any handler takes this
         // service's own store: see the lock order on the accessor.
-        .is_some_and(|inventory| inventory.lock().holds(named));
-    if held {
-        return None;
+        .map(|inventory| {
+            let recorded = inventory.lock();
+            (
+                recorded.holds(named),
+                recorded.data_access_is_in_service(named, now),
+            )
+        })
+        .unwrap_or((false, false));
+    if !held {
+        return Some(access_denied(
+            protocol,
+            // The principal and nothing else: a denial must not tell a caller whether a
+            // directory it may not reach exists.
+            ::service_common::iam_authorization::not_authorized_to_access_resource(
+                &::service_common::caller_principal::ambient_user_arn(),
+            ),
+            IAM_AUTH,
+        ));
     }
-    Some(access_denied(protocol))
+    if !serving {
+        return Some(access_denied(
+            protocol,
+            DATA_DISABLED_MESSAGE.to_string(),
+            DATA_DISABLED,
+        ));
+    }
+    None
 }
 
 /// The directory `uri` names, percent-decoding nothing: the value is compared against the
@@ -97,24 +149,18 @@ fn directory_named(uri: &str) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-/// This service's answer to a caller that may not reach the directory: 403
-/// `AccessDeniedException` with `Reason` `IAM_AUTH` and the prose in the `Message` member
-/// the model declares, serialized through that shape's own schema.
+/// This service's answer to a caller whose request the gate refused: 403
+/// `AccessDeniedException` with `message` in the `Message` member the model declares and
+/// `reason` in its `Reason` member, serialized through that shape's own schema.
 ///
 /// An authorization decision never degrades into success, so this answers a response in
 /// every case: where the error cannot be serialized through its schema, the same status,
 /// error code and members are written directly, rather than letting the request fall
 /// through to a handler the gate decided not to reach.
-fn access_denied(protocol: &dyn ServerHttpProtocol) -> RtResponse {
+fn access_denied(protocol: &dyn ServerHttpProtocol, message: String, reason: &str) -> RtResponse {
     let refused = crate::ops::types::shared_types::AccessDeniedException {
-        // The principal and nothing else: a denial must not tell a caller whether a
-        // directory it may not reach exists.
-        message: Some(
-            ::service_common::iam_authorization::not_authorized_to_access_resource(
-                &::service_common::caller_principal::ambient_user_arn(),
-            ),
-        ),
-        reason: Some(IAM_AUTH.to_string()),
+        message: Some(message),
+        reason: Some(reason.to_string()),
     };
     protocol
         .serialize_error(

@@ -95,9 +95,10 @@
 //! 1. [`attribute_values`] — the semantic attribute layer: which member of the
 //!    `AttributeValue` union this service takes a value as.
 //! 2. [`authorization`] — the directory-authorization gate: a `DirectoryId` the account
-//!    does not hold is refused before any handler resolves anything inside it, so the
-//!    refusal precedes pagination-token parsing and `ClientToken` semantics and discloses
-//!    nothing about the directory.
+//!    does not hold, or one whose DS Data feature the control plane has not turned on, is
+//!    refused before any handler resolves anything inside it, so the refusal precedes
+//!    pagination-token parsing and `ClientToken` semantics and discloses nothing about the
+//!    directory.
 
 pub mod attribute_values;
 pub mod authorization;
@@ -275,8 +276,9 @@ where
             }
 
             // The directory-authorization gate, ahead of every handler: a directory the
-            // account does not hold is refused before anything inside it is resolved, and
-            // before a `NextToken` or a `ClientToken` is read.
+            // account does not hold, or one the control plane has this API switched off
+            // for, is refused before anything inside it is resolved, and before a
+            // `NextToken` or a `ClientToken` is read — so a refused write persists nothing.
             if let Some(refusal) = authorization::refusing_request(protocol, &*self.engine, req) {
                 return refusal;
             }

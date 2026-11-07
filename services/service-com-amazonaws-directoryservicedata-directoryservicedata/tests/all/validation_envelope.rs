@@ -18,6 +18,7 @@
 //! sets those rules generalise across; the harness below is shared with it.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -112,22 +113,29 @@ pub(super) fn emulator() -> MultiServiceRouter {
     router
 }
 
-/// Record that the account holds `directories`, as the AWS Directory Service CONTROL plane
-/// records a directory it creates.
+/// Record that the account holds `directories` with their DS Data feature ON, as the AWS
+/// Directory Service CONTROL plane records a directory it creates and then
+/// `EnableDirectoryDataAccess` turns the feature on for.
 ///
 /// The data plane under test creates no directory — `CreateDirectory` / `CreateMicrosoftAD`
-/// belong to the control plane — so a suite addressing a directory of this account puts it
-/// in the one shared inventory the gate reads
+/// belong to the control plane, as does the switch that makes this API usable at all — so a
+/// suite addressing a directory this API answers for puts it in the one shared inventory the
+/// gate reads
 /// (`service_com_amazonaws_directoryservicedata_directoryservicedata::state::ad_directory_inventory`),
-/// which is exactly what a create would have left there. An id NOT registered here is an id
-/// the account does not hold, which is the gate's own case.
+/// which is exactly what a create plus an enable would have left there. An id NOT registered
+/// here is an id the account does not hold, and a registered directory with the feature off
+/// is the data-access gate's own case; both are suites of their own.
 pub(super) fn hold_directories(engine: &engine::InMemoryEngine, directories: &[&str]) {
     let inventory = service_com_amazonaws_directoryservicedata_directoryservicedata::state::
         ad_directory_inventory(engine)
         .expect("the shared engine holds the AD directory inventory");
     let mut held = inventory.lock();
+    let now = SystemTime::now();
     for directory in directories {
         held.register(directory);
+        // In service from this instant on: the enable's own transition is the control
+        // plane's, and these suites are about what a served directory answers.
+        held.enable_data_access(directory, now, now);
     }
 }
 

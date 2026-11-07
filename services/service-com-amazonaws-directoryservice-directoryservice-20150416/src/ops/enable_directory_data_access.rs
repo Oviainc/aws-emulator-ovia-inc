@@ -9,6 +9,13 @@
 //! on [`crate::state::DATA_ACCESS_ENABLED`] once [`crate::state::TRANSITION_SPAN`] has
 //! elapsed. `DescribeDirectoryDataAccess` is what reports that status.
 //!
+//! That status is also the GATE the Directory Service DATA plane answers behind, and that
+//! plane cannot read this service's store, so the change is recorded in the one record both
+//! planes share (`service_common::ad_directories`) with the same due instant: the Data API
+//! starts answering for the directory exactly when this status settles on
+//! [`crate::state::DATA_ACCESS_ENABLED`], and `DisableDirectoryDataAccess` is the mirrored
+//! toggle that closes it again.
+//!
 //! The modelled `DirectoryId` pattern is refused by the framework's boundary validator
 //! BEFORE this handler runs, so a well-formed request reaches directory resolution: an
 //! id no directory is stored under is refused with `DirectoryDoesNotExistException`, a
@@ -221,8 +228,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Data access is not in service the instant this call answers: the move to
         // `Enabled` is owed by the clock, like a create's stage transition.
+        let due_at = now + crate::state::TRANSITION_SPAN;
         directory.data_access_status = crate::state::DATA_ACCESS_ENABLING.to_string();
-        directory.data_access_due_at = Some(now + crate::state::TRANSITION_SPAN);
+        directory.data_access_due_at = Some(due_at);
+
+        // The Directory Service DATA plane cannot read this store, and this toggle is the
+        // only thing that makes it answer for the directory at all, so the change goes into
+        // the one record both planes share, with the SAME instant it falls due at here —
+        // the data API is in service exactly when this status settles on `Enabled`. Taken
+        // while this service's own store is held, which is the lock order that record
+        // declares.
+        if let Some(inventory) = crate::state::ad_directory_inventory(&*self.engine) {
+            inventory
+                .lock()
+                .enable_data_access(&input.directory_id, now, due_at);
+        }
 
         Ok(EnableDirectoryDataAccessOutput {})
     }
