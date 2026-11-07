@@ -681,6 +681,59 @@ pub fn database_key(database: Option<&String>) -> String {
     database.cloned().unwrap_or_default()
 }
 
+/// The columns of the table `table` an UPSERT conflicts on: the key a duplicate-key
+/// condition is raised against, and empty for a table whose declaration holds no key at
+/// all — which can raise no such condition.
+///
+/// MySQL's `ON DUPLICATE KEY UPDATE` conflicts on ANY unique key of the table, while the
+/// engine behind this data plane spells an upsert with the conflicting key NAMED, so the
+/// key has to be read off the table itself. Both halves of it are:
+///
+/// * the PRIMARY KEY, from the engine's own schema (`pragma_table_info`, whose `pk` column
+///   is a column's one-based position in the primary key and 0 for a column outside it) —
+///   the same introspection [`Database::declared_column`] reads a declaration through, and
+///   the only one the engine's authorizer admits;
+/// * failing that, the first UNIQUE key the table's own DECLARATION carries, read out of
+///   the engine's schema and parsed ([`postgres::unique_key_columns`]) rather than
+///   inspected as text.
+///
+/// ONE key is reported, because the engine spells an upsert with ONE conflict target:
+/// where a table carries a primary key AND a further unique key, an insert that duplicates
+/// the second is answered by the engine's own constraint rather than updating the stored
+/// row. Both lookups match the table's name without regard to case, as every other
+/// introspection here does ([`Database::declared_column`]).
+fn conflict_key_columns(conn: &Connection, table: &str) -> Vec<String> {
+    let primary_key = query_column(
+        conn,
+        "SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk",
+        table,
+    );
+    if !primary_key.is_empty() {
+        return primary_key;
+    }
+    query_column(
+        conn,
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1 COLLATE NOCASE",
+        table,
+    )
+    .first()
+    .map(|declaration| postgres::unique_key_columns(declaration))
+    .unwrap_or_default()
+}
+
+/// The first column of every row `query` answers for `argument`, and empty where the
+/// engine would not answer it at all — a schema this cannot read decides nothing, exactly
+/// as [`Database::declared_column`] treats one.
+fn query_column(conn: &Connection, query: &str, argument: &str) -> Vec<String> {
+    let Ok(mut statement) = conn.prepare(query) else {
+        return Vec::new();
+    };
+    let Ok(rows) = statement.query_map([argument], |row| row.get::<_, String>(0)) else {
+        return Vec::new();
+    };
+    rows.filter_map(Result::ok).collect()
+}
+
 /// One SQL database, run by SQLite in this process.
 #[derive(Debug)]
 pub struct Database {
@@ -1017,9 +1070,15 @@ impl Database {
         sql: &str,
         parameters: &[SqlParameter],
     ) -> Result<StatementOutcome, SqlError> {
-        // The statement is PostgreSQL, so it is parsed as PostgreSQL and the
-        // engine is handed this plan's rendering of that parse.
-        let plan = postgres::plan(sql)?;
+        // The statement is parsed as the dialect the API's own engines speak and the
+        // engine is handed this plan's rendering of that parse. The plan is given the
+        // KEY of a table an upsert names, because the engine spells an upsert with the
+        // conflicting key named and only the table's own declaration holds it (see
+        // `postgres::plan_upsert`).
+        let plan = {
+            let keys = |table: &str| conflict_key_columns(&self.conn, table);
+            postgres::plan(sql, &keys)?
+        };
         let mut statement = self.conn.prepare(&plan.sql).map_err(SqlError::from_engine)?;
         let mut columns = self.describe(&statement, &plan);
         bind_named_parameters(&mut statement, parameters)?;

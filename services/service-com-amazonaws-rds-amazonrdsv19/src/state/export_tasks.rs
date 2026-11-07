@@ -10,11 +10,9 @@
 //! answers with ([`ExportTaskRecord::to_wire`]), so no two of them can disagree about a
 //! task.
 //!
-//! `StartExportTask` — the operation that inserts here — is still scaffolded in this crate
-//! and is its own stub issue, so this record is written by the cancel path and seeded by
-//! this crate's tests exactly as that create will write it; the reporting operations run
-//! against these records rather than against a canned answer, so they report exactly what
-//! is stored.
+//! `StartExportTask` is what inserts here, the cancel path is what moves a task on its way
+//! out, and the reporting operations run against these records rather than against a canned
+//! answer, so they report exactly what is stored.
 
 use std::time::Instant;
 

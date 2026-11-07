@@ -23,6 +23,16 @@
 //! statement, and the statement the engine runs is this module's rendering of that
 //! same parse.
 //!
+//! ## The dialect a statement is written in
+//!
+//! The Data API serves Aurora MySQL DB clusters as well as Aurora PostgreSQL ones, so a
+//! statement reaching it may be written in MySQL's dialect. Where the two dialects spell
+//! ONE statement differently, the rewrite below renders it as the statement the engine
+//! runs: MySQL's upsert (`INSERT … ON DUPLICATE KEY UPDATE`) is the engine's own
+//! `INSERT … ON CONFLICT (<key>) DO UPDATE SET` ([`plan_upsert`]), with the key the
+//! conflict is on named from the table's own declaration — which only the database holds,
+//! so the caller of [`plan`] supplies it.
+//!
 //! ## The type catalog
 //!
 //! [`pg_type`] maps a type as a declaration or a cast spells it to the type
@@ -40,8 +50,10 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    CastKind, ColumnOption, ColumnOptionDef, DataType, ExactNumberInfo, Expr, ObjectType,
-    SelectItem, SetExpr, Statement, Value, visit_expressions_mut,
+    CastKind, ColumnOption, ColumnOptionDef, ConflictTarget, DataType, DoUpdate, ExactNumberInfo,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectNamePart, ObjectType,
+    OnConflict, OnConflictAction, OnInsert, SelectItem, SetExpr, Statement, TableConstraint,
+    TableObject, Value, visit_expressions_mut,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::keywords::Keyword;
@@ -572,7 +584,7 @@ impl Plan {
 /// while the tree it builds is walked and dropped by recursion. The check runs on
 /// the tokens, which is a pass over the text that allocates nothing per level, so
 /// a statement past the bound is refused before a tree of it exists at all.
-pub fn plan(sql: &str) -> Result<Plan, SqlError> {
+pub fn plan(sql: &str, key_columns: &dyn Fn(&str) -> Vec<String>) -> Result<Plan, SqlError> {
     let dialect = PostgreSqlDialect {};
     let tokens = Tokenizer::new(&dialect, sql)
         .tokenize()
@@ -609,6 +621,11 @@ pub fn plan(sql: &str) -> Result<Plan, SqlError> {
     // PostgreSQL target type with the engine type that holds its values.
     let result_types = result_types(&statement);
     normalise(&mut statement);
+    // An upsert the caller wrote in MySQL's spelling is the same upsert the engine
+    // spells with the conflicting key named, which only the table's own declaration
+    // knows; done before the names are delimited, so the columns this builds are
+    // rendered the way the caller's own are.
+    plan_upsert(&mut statement, key_columns);
     // The names the statement uses are rendered as delimited identifiers, so a
     // word PostgreSQL admits as a name is one the engine's grammar reads as that
     // name too. Done AFTER the rewrites above, so the expressions they build are
@@ -749,6 +766,165 @@ fn normalise(statement: &mut Statement) {
 /// Whether a function call is PostgreSQL's reading of the statement's clock.
 fn is_now(name: &str) -> bool {
     name.eq_ignore_ascii_case("now")
+}
+
+/// MySQL's own name for the value an upsert's insert half would have stored, which
+/// the engine spells as a column of the `excluded` row.
+const MYSQL_INSERTED_VALUE_FUNCTION: &str = "VALUES";
+
+/// The row an upsert's update half reads the values it would have inserted from, as
+/// the engine names it.
+const EXCLUDED_ROW: &str = "excluded";
+
+/// Rewrite an upsert the caller wrote in MySQL's spelling into the one the engine
+/// spells.
+///
+/// The Data API serves Aurora MySQL DB clusters as well as Aurora PostgreSQL ones, so
+/// a statement reaching it may be written in MySQL's dialect, and
+/// `INSERT … ON DUPLICATE KEY UPDATE <assignments>` is MySQL's UPSERT: the row is
+/// inserted, and where it would duplicate a key the named columns of the row already
+/// there are updated instead. That is the same statement as the engine's
+/// `INSERT … ON CONFLICT (<key>) DO UPDATE SET <assignments>` — and PostgreSQL's own
+/// spelling of it — with two differences this closes:
+///
+/// * the engine NAMES the key the conflict is on, which MySQL leaves implicit ("any
+///   unique key"). The key comes from the table's own declaration, which only the
+///   database holds, so the caller supplies it (`key_columns`). A table whose
+///   declaration carries no key at all can raise no duplicate-key condition, so the
+///   clause can never fire: it is DROPPED, and the insert runs as the insert MySQL runs
+///   for such a table;
+/// * MySQL's `VALUES(<column>)` inside an assignment is "the value that would have
+///   been inserted", which the engine reads off the `excluded` row.
+///
+/// What this does NOT carry over is MySQL's affected-row COUNT: MySQL reports two rows
+/// affected for a row its clause UPDATED and one for a row it inserted, while
+/// `numberOfRecordsUpdated` reports what the engine behind this data plane counted, which
+/// is one either way.
+///
+/// Nothing here inspects SQL text: the parse is rewritten and re-rendered, like every
+/// other rewrite in this module.
+fn plan_upsert(statement: &mut Statement, key_columns: &dyn Fn(&str) -> Vec<String>) {
+    let Statement::Insert(insert) = statement else {
+        return;
+    };
+    if !matches!(insert.on, Some(OnInsert::DuplicateKeyUpdate(_))) {
+        return;
+    }
+    let TableObject::TableName(name) = &insert.table else {
+        return;
+    };
+    let Some(table) = name.0.last().and_then(|part| match part {
+        ObjectNamePart::Identifier(identifier) => Some(identifier.value.clone()),
+        _ => None,
+    }) else {
+        return;
+    };
+    let keys = key_columns(&table);
+    let Some(OnInsert::DuplicateKeyUpdate(mut assignments)) = insert.on.take() else {
+        return;
+    };
+    if keys.is_empty() {
+        // No key, so nothing the insert stores can duplicate one and the update half is
+        // unreachable: the statement is the insert alone, which is what the engine is
+        // handed.
+        return;
+    }
+    for assignment in &mut assignments {
+        read_inserted_values_off_the_excluded_row(&mut assignment.value);
+    }
+    insert.on = Some(OnInsert::OnConflict(OnConflict {
+        conflict_target: Some(ConflictTarget::Columns(
+            keys.into_iter().map(Ident::new).collect(),
+        )),
+        action: OnConflictAction::DoUpdate(DoUpdate {
+            assignments,
+            selection: None,
+        }),
+    }));
+}
+
+/// The columns of the FIRST unique key one table's own `CREATE TABLE` declares, and empty
+/// for a declaration that carries none.
+///
+/// MySQL's upsert conflicts on any unique key, and a UNIQUE declaration is the half of
+/// that the engine's permitted schema introspection does not report (`pragma_table_info`
+/// reports the primary key alone), so it is read out of the declaration the engine stored
+/// — PARSED, like every other statement this module reads, never inspected as text. A
+/// single-column `UNIQUE` and a table-level `UNIQUE (a, b)` are both keys; the primary key
+/// is not reported here, because its own reading already covers it. The FIRST such key is
+/// the answer, for the reason [`crate::state::conflict_key_columns`] gives: the engine
+/// spells an upsert with one conflict target.
+#[must_use]
+pub fn unique_key_columns(declaration: &str) -> Vec<String> {
+    let Some(Statement::CreateTable(create)) = Parser::new(&PostgreSqlDialect {})
+        .with_recursion_limit(MAX_PARSE_DEPTH)
+        .try_with_sql(declaration)
+        .and_then(|mut parser| parser.parse_statement())
+        .ok()
+    else {
+        return Vec::new();
+    };
+    for column in &create.columns {
+        if column.options.iter().any(|option| {
+            matches!(
+                option.option,
+                ColumnOption::Unique {
+                    is_primary: false,
+                    ..
+                }
+            )
+        }) {
+            return vec![column.name.value.clone()];
+        }
+    }
+    for constraint in &create.constraints {
+        if let TableConstraint::Unique { columns, .. } = constraint {
+            let named: Vec<String> = columns
+                .iter()
+                .filter_map(|column| match &column.column.expr {
+                    Expr::Identifier(name) => Some(name.value.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !named.is_empty() {
+                return named;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Rewrite every `VALUES(<column>)` in one assignment into the engine's reading of
+/// that same value: the column of the `excluded` row.
+fn read_inserted_values_off_the_excluded_row(value: &mut Expr) {
+    let _ = visit_expressions_mut(value, |expr| {
+        if let Expr::Function(function) = expr {
+            if function
+                .name
+                .to_string()
+                .eq_ignore_ascii_case(MYSQL_INSERTED_VALUE_FUNCTION)
+            {
+                if let Some(column) = sole_column_argument(&function.args) {
+                    *expr = Expr::CompoundIdentifier(vec![Ident::new(EXCLUDED_ROW), column]);
+                }
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// The one column a `VALUES(<column>)` names, or `None` for any other argument list —
+/// which is left as the caller wrote it, for the engine to answer.
+fn sole_column_argument(args: &FunctionArguments) -> Option<Ident> {
+    let FunctionArguments::List(list) = args else {
+        return None;
+    };
+    match list.args.as_slice() {
+        [FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(column)))] => {
+            Some(column.clone())
+        }
+        _ => None,
+    }
 }
 
 /// Parse one expression this module built, back into the tree the statement

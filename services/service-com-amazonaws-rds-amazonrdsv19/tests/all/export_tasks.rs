@@ -25,11 +25,11 @@
 //!
 //! Every call goes over the wire, through the same `MultiServiceRouter` the production
 //! router uses (`crate::db_instances`). The records the reads run against are SEEDED
-//! through this service's own state API: `StartExportTask`, the operation that creates an
-//! export task, is still scaffolded in this crate (its own stub issue — the RDS/S3 export
-//! issue, which also owns the S3 objects an export writes), so the seed writes exactly the
-//! records that create will write and the two implemented operations are exercised against
-//! real stored state rather than an empty map.
+//! through this service's own state API, which is how one suite can hold a task in each of
+//! the six statuses at once; the create that writes such a record — `StartExportTask`, and
+//! the objects it leaves in Amazon S3 — is driven end to end by
+//! [`crate::rds_s3_integration`], so the two implemented reads here run against real
+//! stored state rather than an empty map.
 
 use std::sync::Arc;
 

@@ -227,6 +227,11 @@ mod resource_tags;
 mod scratch_aurora_truth;
 #[path = "all/sibling_control_plane_clusters.rs"]
 mod sibling_control_plane_clusters;
+// Declared because the build enforces that every file under `tests/all/` is: the suite this
+// names is an INERT placeholder (see its own docs) whose subject — `StartExportTask` and the
+// objects it writes — is driven end to end by `rds_s3_integration` beside it.
+#[path = "all/snapshot_export_to_s3.rs"]
+mod snapshot_export_to_s3;
 #[path = "all/state_precondition_refusal_sentences.rs"]
 mod state_precondition_refusal_sentences;
 #[path = "all/state_roundtrip.rs"]
