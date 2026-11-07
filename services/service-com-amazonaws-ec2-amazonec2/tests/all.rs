@@ -50,7 +50,6 @@ mod serial_console_access;
 // `ResetNetworkInterfaceAttribute` puts back to its default, each read back through the
 // describes that report the same record. Declared beside `prefix_lists` for the reason the
 // note above gives: the sorted neighbourhood and the tail of this file are where every new
-// ec2 suite inserts its lines.
 #[path = "all/modify_network_interface_attribute.rs"]
 mod modify_network_interface_attribute;
 // Which network ACL a subnet is associated with, changed by `ReplaceNetworkAclAssociation`
@@ -171,8 +170,6 @@ mod describe_addresses_attribute;
 mod conversion_task_cancellation;
 // The two forms an instance id is read in before any lookup, and the two answers a value
 // inside and outside them gets, across a describe, a password read and a mutation. Declared
-// beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood and
-// the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/instance_id_forms.rs"]
 mod instance_id_forms;
 // What `CreateImageUsageReport` computes one AMI usage report from — the image, resource
@@ -191,7 +188,6 @@ mod create_image_usage_report;
 mod fast_snapshot_restore_lifecycle;
 // What `CopySnapshot` mints from a stored snapshot, which members it reads off the source and
 // which off the request, and what it refuses. Declared beside `prefix_lists` for the reason
-// the note above gives: the sorted neighbourhood and the tail of this file are where every new
 #[path = "all/copy_snapshot.rs"]
 mod copy_snapshot;
 // What `ModifyVerifiedAccessInstanceLoggingConfiguration` sets on one Verified Access
@@ -347,7 +343,6 @@ mod deleted_resources_and_dependencies;
 // compatible with the others named, and a resource something still occupies cannot be deleted
 // — and what a delete leaves readable. Declared beside the suite above rather than in sorted
 // position, for the reason the note above gives: the sorted neighbourhood and the tail are
-// where every new ec2 suite inserts its lines.
 #[path = "all/dependency_and_not_found_refusals.rs"]
 mod dependency_and_not_found_refusals;
 // What `CreateVpcEndpoint` stores for each endpoint type, and what it refuses. Declared here
@@ -1512,7 +1507,6 @@ mod host_reservation_purchase_preview;
 // reservation, the one half of `InvalidCapacityReservationId` they refuse every id they cannot
 // resolve with, and the empty group set a reservation no Resource Groups call has added to a
 // group is in. Declared at the tail of this file, which is where every new ec2 suite inserts
-// its lines.
 #[path = "all/capacity_reservation_reports.rs"]
 mod capacity_reservation_reports;
 // What `DescribeInstanceAttribute` reports for ONE attribute of one instance: the member
@@ -1531,6 +1525,11 @@ mod capacity_manager_metric_dimensions;
 // analysis store: the one analysis the request names, answered by its id, with the client
 // token that named it and the bytes it held released — and the ids and dry run it refuses
 // without removing anything. Declared at the tail of this file, which is where every new ec2
-// suite inserts its lines.
 #[path = "all/delete_network_insights_access_scope_analysis.rs"]
 mod delete_network_insights_access_scope_analysis;
+// What `DeprovisionIpamPoolCidr` takes back out of an IPAM pool — the transient state it
+// leaves a range in, the removal the clock then owes it — and the `IncorrectState` refusal a
+// deprovision of a range the pool holds no provisioned CIDR for gets. Declared at the tail of
+// this file, which is where every new ec2 suite inserts its lines.
+#[path = "all/deprovision_ipam_pool_cidr.rs"]
+mod deprovision_ipam_pool_cidr;

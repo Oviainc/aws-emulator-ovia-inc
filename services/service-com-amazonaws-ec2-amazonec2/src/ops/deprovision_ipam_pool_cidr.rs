@@ -6,6 +6,10 @@
 //! so the pool-CIDR dependency `DeleteIpamPool` is refused for is cleared and no later reader
 //! of the store reports a range the pool no longer holds.
 //!
+//! A range the pool holds no provisioned CIDR for is nothing this call can take back, so it is
+//! refused for the STATE of the resource the request names — EC2's `IncorrectState`, naming the
+//! range the request asked about — rather than answered as a deprovision that did nothing.
+//!
 //! The range is left in the transient `pending-deprovision` state the `IpamPoolCidrState`
 //! catalog carries and the clock owes it the removal one
 //! [`crate::state::TRANSITION_DELAY`] later, through
@@ -176,14 +180,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .ipam_pool_provisioned_cidrs(pool_id)
                     .into_iter()
                     .find(|held| *held == canonical);
-                vec![held.ok_or_else(|| state::invalid_cidr_not_found(cidr))?]
+                vec![held.ok_or_else(|| pool_cidr_does_not_exist(cidr))?]
             }
             None => store.ipam_pool_provisioned_cidrs(pool_id),
         };
         if ranges.is_empty() {
-            return Err(state::invalid_parameter_value(format!(
-                "The IPAM pool '{pool_id}' has no CIDR provisioned to it"
-            )));
+            return Err(pool_holds_no_cidr(pool_id));
         }
 
         // "If you deprovision a CIDR from a pool that has a source pool, the CIDR is recycled
@@ -216,4 +218,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ipam_pool_cidr: Some(view),
         })
     }
+}
+
+/// Refuse a deprovision of a range the pool holds no provisioned CIDR for: HTTP 400
+/// `IncorrectState`.
+///
+/// The pool itself resolves, so there is no id to report as not found; what is wrong is the
+/// STATE of the resource the request names — the pool holds nothing to take back — which is
+/// the class EC2 answers `IncorrectState` for ("The resource is not in the correct state for
+/// the request"), not the parameter-value class a value that is no range at all would be. The
+/// sentence is EC2's own "the specified action is not valid" wording for IPAM, which
+/// [`crate::ops::delete_ipam_pool`] and [`crate::ops::create_ipam_pool`] carry for their own
+/// refusals of this family, followed by what is not valid about it.
+///
+/// The range is named as the REQUEST spelled it rather than in the canonical form it was
+/// looked up by — nothing is stored for it, so the caller's own bytes are the only name it has
+/// — bounded by the ceiling every refusal of this crate echoes a CIDR block to
+/// ([`crate::ops::delete_coip_cidr::echoed_cidr`]).
+fn pool_cidr_does_not_exist(cidr: &str) -> DeprovisionIpamPoolCidrError {
+    crate::state::incorrect_state(format!(
+        "The specified action is not valid.The pool CIDR {cidr} does not exist.",
+        cidr = crate::ops::delete_coip_cidr::echoed_cidr(cidr),
+    ))
+}
+
+/// Refuse a deprovision of EVERY range of a pool that holds none: HTTP 400 `IncorrectState`,
+/// the same class as [`pool_cidr_does_not_exist`] for the same reason — a pool with nothing
+/// provisioned to it has nothing to take back.
+///
+/// The sentence is the pool-scoped form of that wording, "The specified action is not valid
+/// for `<pool>`." followed by what is wrong with the pool, which is how
+/// [`crate::ops::delete_ipam_pool`] words the opposite refusal over the same question ("There
+/// are one or more pool cidrs provisioned in the pool.") — the one reader of what a pool
+/// holds answers both.
+fn pool_holds_no_cidr(pool_id: &str) -> DeprovisionIpamPoolCidrError {
+    crate::state::incorrect_state(format!(
+        "The specified action is not valid for {pool_id}. There are no pool cidrs provisioned \
+         in the pool."
+    ))
 }
