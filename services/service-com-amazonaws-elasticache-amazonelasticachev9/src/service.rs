@@ -50,9 +50,9 @@
 //! Everything else about those paths — status, `<Type>`, `<Code>`, `<Message>` — stays
 //! with the framework.
 //!
-//! # How this service words three of its refusals
+//! # How this service words five of its refusals
 //!
-//! Three refusals are worded by more than one handler, and the words are the whole
+//! Five refusals are worded by more than one handler, and the words are the whole
 //! difference a client sees, so each is stated once beside this file rather than in the
 //! handlers that answer it:
 //!
@@ -64,11 +64,18 @@
 //!   and only an input that is not rule-list syntax keeps the generic sentence.
 //! * [`refusal_messages`] — the sentence a change that needs an ACTIVE user group is
 //!   refused with while the group carries another status, which four handlers answer.
+//! * [`identifier_length_rules`] — the length bound a handler states for the identifier it
+//!   is about to resolve, applied BEFORE the lookup, so an identifier no resource of this
+//!   service could carry is refused as the bad parameter it is.
+//! * [`replication_group_not_found`] — the second of the two templates the service answers
+//!   a `ReplicationGroupNotFoundFault` with, for the two operations that take it.
 
 pub mod access_string_categories;
 pub mod cache_parameter_group_not_found;
+pub mod identifier_length_rules;
 pub mod query_error_envelope;
 pub mod refusal_messages;
+pub mod replication_group_not_found;
 
 use query_error_envelope::{ElastiCacheDefinition, RequestIdEnvelopeOperation};
 use smithy_server_runtime::{

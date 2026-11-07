@@ -176,6 +176,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // The identifier BEFORE the group is resolved: a `UserGroupId` past the
+        // bound the service states for it names no group this service could have
+        // stored, so a caller that sent a malformed id is told which member is
+        // wrong rather than that the group is absent — the same rule the create
+        // that stores an id and the delete that resolves one apply
+        // (`crate::service::identifier_length_rules::user_group_id_refusal`).
+        if let Some(message) =
+            crate::service::identifier_length_rules::user_group_id_refusal(&input.user_group_id)
+        {
+            return Err(ModifyUserGroupErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // "Modifies the engine listed in a user group. The options are valkey or
         // redis" — the same access-control capability rule a group is created
         // under, so one implementation decides it

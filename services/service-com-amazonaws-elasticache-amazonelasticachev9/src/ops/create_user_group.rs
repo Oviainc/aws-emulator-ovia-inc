@@ -177,6 +177,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // The identifier the group will be STORED under, checked before anything
+        // else: a `UserGroupId` past the bound the service states for it is one
+        // no modify or delete would resolve afterwards, so a create that stored
+        // it would leave a group nothing could change or remove
+        // (`crate::service::identifier_length_rules::user_group_id_refusal`).
+        if let Some(message) =
+            crate::service::identifier_length_rules::user_group_id_refusal(&input.user_group_id)
+        {
+            return Err(CreateUserGroupErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // "Sets the engine listed in a user group. The options are valkey or
         // redis": access control is a Valkey / Redis OSS feature, so an engine
         // without it has no user groups to create — the capability rule the

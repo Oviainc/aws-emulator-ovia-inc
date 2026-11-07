@@ -160,6 +160,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // The identifier BEFORE the group is resolved: a `UserGroupId` past the
+        // bound the service states for it names no group this service could have
+        // stored, so such a delete is refused as the bad parameter it is rather
+        // than looking like a group that is already gone — the opposite
+        // conclusion for cleanup logic
+        // (`crate::service::identifier_length_rules::user_group_id_refusal`).
+        if let Some(message) =
+            crate::service::identifier_length_rules::user_group_id_refusal(&input.user_group_id)
+        {
+            return Err(DeleteUserGroupErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // One instant for the whole request: the clock's own settlements are
         // measured against it, and the removal it owes is due a span after it.
         let now = ::std::time::SystemTime::now();

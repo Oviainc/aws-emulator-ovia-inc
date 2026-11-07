@@ -203,6 +203,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  target of the migration.",
             )),
             (Some(replication_group_id), None) => {
+                // The identifier before the group is resolved: a value past the
+                // bound this operation states names no group this service could
+                // have stored, so the refusal reports the bound rather than the
+                // group being absent. This operation states the CLUSTER
+                // identifier bound (`crate::state::CLUSTER_ID_MAX_LEN`) and
+                // words it with that member's prose name, through the template
+                // every identifier refusal of this service goes through.
+                if let Some(message) = crate::state::identifier_refusal(
+                    "Cluster ID",
+                    "ReplicationGroupIdentifier",
+                    replication_group_id,
+                    crate::state::CLUSTER_ID_MAX_LEN,
+                ) {
+                    return Err(invalid_value(message));
+                }
                 // `AutoCutover` and `ClearTargetCacheData` are members of the
                 // SERVERLESS migration — the second one is documented as
                 // deleting "existing data in the serverless cache", and the

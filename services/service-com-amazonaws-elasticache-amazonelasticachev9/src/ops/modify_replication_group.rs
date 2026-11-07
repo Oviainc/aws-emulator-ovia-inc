@@ -253,20 +253,6 @@ impl From<ModifyReplicationGroupErrorModeled> for ModifyReplicationGroupError {
     }
 }
 
-/// How THIS operation words a replication group this account does not hold:
-/// `Replication group '<id>' not found` — the id single-quoted, and no trailing
-/// stop.
-///
-/// The wording is this operation's own. The describe that resolves the same
-/// member answers the other template the service has for that fault
-/// (`crate::state::replication_group_not_found_message`, `ReplicationGroup <id>
-/// not found.`), and the two are observable apart on the live service, so one
-/// template cannot serve both. The id is the one variable part and comes from the
-/// request, as the request spelled it.
-fn replication_group_not_found_message(replication_group_id: &str) -> String {
-    format!("Replication group '{replication_group_id}' not found")
-}
-
 /// The `ModifyReplicationGroup` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -327,6 +313,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // malformed value is reported as the bad parameter it is whatever status
         // the group happens to be in — a client told "wrong state" retries
         // forever instead of fixing its input.
+        //
+        // The identifier itself is the first of those: a `ReplicationGroupId`
+        // past the bound the member documents names no group this service could
+        // have stored, so the rule is stated before the lookup below rather than
+        // after it — a caller that sent a malformed id is told which member is
+        // wrong instead of that the group is absent. The bound and its wording
+        // are the service's own
+        // (`crate::service::identifier_length_rules::replication_group_id_refusal`).
+        if let Some(message) =
+            crate::service::identifier_length_rules::replication_group_id_refusal(
+                &input.replication_group_id,
+            )
+        {
+            return Err(invalid_value(message));
+        }
+
         if let Some(description) = input.replication_group_description.as_deref() {
             let length = description.chars().count();
             if length > crate::state::MAX_REPLICATION_GROUP_DESCRIPTION_LENGTH {
@@ -510,13 +512,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
+        // This operation words that fault `Replication group '<id>' not found`,
+        // the id single-quoted and no trailing stop, while the describe that
+        // resolves the same member answers the other template the service has
+        // for it (`crate::state::replication_group_not_found_message`). The two
+        // are observable apart on the live service, so the template this one
+        // takes is the shared
+        // `crate::service::replication_group_not_found::quoted_message`, which
+        // the Global datastore create answers with too.
         let Some(group) = store.replication_groups.get(&key) else {
             return Err(
                 ModifyReplicationGroupErrorModeled::ReplicationGroupNotFoundFault(
                     ReplicationGroupNotFoundFault {
-                        message: Some(replication_group_not_found_message(
-                            &input.replication_group_id,
-                        )),
+                        message: Some(
+                            crate::service::replication_group_not_found::quoted_message(
+                                &input.replication_group_id,
+                            ),
+                        ),
                     },
                 )
                 .into(),

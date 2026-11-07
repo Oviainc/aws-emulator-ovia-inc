@@ -176,35 +176,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // "The suffix name of a Global datastore … The suffix, combined with the
-        // auto-generated prefix, guarantees uniqueness of the Global datastore
-        // name across multiple regions": the suffix names a resource of this
-        // service, so it goes through the one identifier rule every identifier
-        // of this service is refused by. The STORED id is the region's prefix, a
-        // hyphen and the suffix, so the bound the suffix gets is the one this
-        // service's group identifiers carry
-        // (`crate::state::REPLICATION_GROUP_ID_MAX_LEN`) less those characters —
-        // what is left over for the part a caller chooses.
-        //
-        // (`ServiceLinkedRoleNotFoundFault` is the other refusal this operation
-        // models: this emulator provisions the Global datastore service-linked
-        // role for every account it serves, so no request is answered with it.)
-        if let Some(message) = crate::state::identifier_refusal(
-            "Global Replication Group ID Suffix",
-            "GlobalReplicationGroupIdSuffix",
-            &input.global_replication_group_id_suffix,
-            crate::state::REPLICATION_GROUP_ID_MAX_LEN - crate::state::GLOBAL_ID_PREFIX_LEN - 1,
-        ) {
-            return Err(
-                CreateGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some(message),
-                    },
-                )
-                .into(),
-            );
-        }
-
         // The tags the datastore is created with, refused through the one helper
         // every tag-bearing request of this service goes through.
         let tags = match crate::state::tag_pairs(input.tags) {
@@ -254,14 +225,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateGlobalReplicationGroupErrorModeled::ReplicationGroupNotFoundFault(
                     ReplicationGroupNotFoundFault {
-                        message: Some(crate::state::replication_group_not_found_message(
-                            &input.primary_replication_group_id,
-                        )),
+                        message: Some(
+                            crate::service::replication_group_not_found::quoted_message(
+                                &input.primary_replication_group_id,
+                            ),
+                        ),
                     },
                 )
                 .into(),
             );
         };
+
+        // "The suffix name of a Global datastore … The suffix, combined with the
+        // auto-generated prefix, guarantees uniqueness of the Global datastore
+        // name across multiple regions": the suffix names a resource of this
+        // service, so it goes through the one identifier rule every identifier
+        // of this service is refused by. The STORED id is the region's prefix, a
+        // hyphen and the suffix, so the bound the suffix gets is the one this
+        // service's group identifiers carry
+        // (`crate::state::REPLICATION_GROUP_ID_MAX_LEN`) less those characters —
+        // what is left over for the part a caller chooses.
+        //
+        // The suffix rule is applied AFTER the primary above is resolved: this
+        // operation builds a datastore AROUND an existing group, so the
+        // dependency it cannot find is reported before the name it was asked to
+        // give the new resource. The two are handled on different code paths by
+        // a caller (a missing dependency against a permanent input error), so the
+        // order is observable.
+        //
+        // (`ServiceLinkedRoleNotFoundFault` is the other refusal this operation
+        // models: this emulator provisions the Global datastore service-linked
+        // role for every account it serves, so no request is answered with it.)
+        if let Some(message) = crate::state::identifier_refusal(
+            "Global Replication Group ID Suffix",
+            "GlobalReplicationGroupIdSuffix",
+            &input.global_replication_group_id_suffix,
+            crate::state::REPLICATION_GROUP_ID_MAX_LEN - crate::state::GLOBAL_ID_PREFIX_LEN - 1,
+        ) {
+            return Err(
+                CreateGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // `InvalidReplicationGroupStateFault` is "the requested replication
         // group is not in the available state": a group still being created,
         // already being changed or on its way out cannot take on the primary

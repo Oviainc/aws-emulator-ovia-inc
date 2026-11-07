@@ -189,14 +189,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The FORM of the identifier before it is resolved, as every lookup in
         // this service does it: a value no replication group could ever carry is
-        // a bad parameter value rather than a group that does not exist. See
-        // `crate::state::identifier_refusal`.
-        if let Some(message) = crate::state::identifier_refusal(
-            "Replication Group ID",
-            "ReplicationGroupIdentifier",
-            &input.replication_group_id,
-            crate::state::LOOKUP_IDENTIFIER_MAX_LEN,
-        ) {
+        // a bad parameter value rather than a group that does not exist. The
+        // bound is the one `ReplicationGroupId` documents, and the sentence is
+        // the one this service states that bound in — both in
+        // `crate::service::identifier_length_rules::replication_group_id_refusal`.
+        if let Some(message) =
+            crate::service::identifier_length_rules::replication_group_id_refusal(
+                &input.replication_group_id,
+            )
+        {
             return Err(TestFailoverErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
                     message: Some(message),

@@ -193,6 +193,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // The identifier BEFORE anything else: a `ReplicationGroupId` past the
+        // bound the member documents names no group this service could have
+        // stored, so this operation states the bound it was given rather than
+        // reporting the group as missing. This operation words that bound with
+        // the PROSE name of the member, which is the template every identifier
+        // refusal of this service goes through
+        // (`crate::state::identifier_refusal`).
+        //
+        // The bound is this operation's own: `IncreaseReplicaCount` states NONE
+        // and reports an over-long id as a group that does not exist, so the rule
+        // is not shared with it.
+        if let Some(message) = crate::state::identifier_refusal(
+            "Replication Group ID",
+            "ReplicationGroupIdentifier",
+            &input.replication_group_id,
+            crate::state::REPLICATION_GROUP_ID_MAX_LEN,
+        ) {
+            return Err(DecreaseReplicaCountErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // `ApplyImmediately` is documented with one accepted value — "if True,
         // the number of replica nodes is decreased immediately.
         // ApplyImmediately=False is not currently supported" — so a deferred

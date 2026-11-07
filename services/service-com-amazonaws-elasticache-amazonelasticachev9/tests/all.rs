@@ -225,3 +225,8 @@ mod refusal_message_templates;
 // gets, which drives both writers of a rule list through the `ModifyUser` suite's reader.
 #[path = "all/access_string_category_refusal.rs"]
 mod access_string_category_refusal;
+
+// Appended for the same reason: the suite about WHICH refusal an operation answers when one
+// request is both malformed and names a resource this account does not hold.
+#[path = "all/identifier_length_precedence.rs"]
+mod identifier_length_precedence;
