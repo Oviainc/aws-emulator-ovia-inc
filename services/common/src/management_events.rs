@@ -1274,6 +1274,14 @@ pub struct DeliveringTrail {
     /// The Region the trail is homed in — the only Region a single-Region trail logs the
     /// REGIONAL services of.
     pub home_region: String,
+    /// The bucket the trail delivers its log files into (`Trail$S3BucketName`), where an
+    /// audit pipeline reads them ([`crate::trail_log_files`]).
+    pub s3_bucket_name: String,
+    /// The key prefix the trail's log files land under in that bucket
+    /// (`Trail$S3KeyPrefix`): "the Amazon S3 key prefix that comes after the name of the
+    /// bucket you have designated for log file delivery". `None` for a trail that carries
+    /// none, whose files land at the bucket's root.
+    pub s3_key_prefix: Option<String>,
     /// Whether the trail applies to every Region of the account
     /// (`Trail$IsMultiRegionTrail`).
     pub multi_region: bool,
@@ -1375,20 +1383,22 @@ impl ManagementEventLog {
         self.events.iter()
     }
 
-    /// Record `call` as [`record_answered`](Self::record_answered) does, and answer the
-    /// event the account's CloudTrail DELIVERS for it — or `None` when no trail of the
-    /// account logs a call of this kind in this Region.
+    /// Record `call` as [`record_answered`](Self::record_answered) does, and answer what the
+    /// account's CloudTrail DELIVERS for it — or `None` when no trail of the account logs a
+    /// call of this kind in this Region.
     ///
-    /// The two are one step because they are one fact: the event a rule on the default bus
-    /// matches is the CloudTrail record of the call, so the document published is the very
-    /// document `LookupEvents` reports and the two can never disagree. What decides whether
-    /// it is published at all is the trail projection
-    /// ([`trails_delivering`](Self::trails_delivering)): the fan-out is CloudTrail's, so it
-    /// runs while a trail of the Region is logging management events of the call's
-    /// read/write class and not otherwise.
+    /// Two deliveries, one decision. The event a rule on the default bus matches and the
+    /// log file an audit pipeline reads are both the CloudTrail record of the call, so the
+    /// document published and the documents written are the very document `LookupEvents`
+    /// reports and none of them can disagree. What decides whether anything is delivered at
+    /// all is the trail projection ([`trails_delivering`](Self::trails_delivering)): the
+    /// delivery is CloudTrail's, so it runs while a trail of the Region is logging
+    /// management events of the call's read/write class and not otherwise — one log file per
+    /// such trail, into the bucket that trail was created with.
     ///
-    /// Publishing is the CALLER's: a store holds no transport, and the publication must not
-    /// happen under this lock ([`crate::api_call_events::DeliveredApiCall::publish`]).
+    /// Delivering is the CALLER's: a store holds no transport, and neither the publication
+    /// nor the object write must happen under this lock
+    /// ([`crate::api_call_events::DeliveredApiCall::deliver`]).
     pub fn record_delivered(
         &mut self,
         call: ServedApiCall,
@@ -1397,17 +1407,45 @@ impl ManagementEventLog {
     ) -> Option<crate::api_call_events::DeliveredApiCall> {
         let read_only = call.read_only;
         let region = call.aws_region.clone();
+        let account_id = call.account_id.clone();
         let source = crate::api_call_events::event_source_of(&call.event_source);
         self.record_answered(call, at, request_id);
-        if !self.delivers(&region, read_only) {
+        let logging: Vec<DeliveringTrail> = self
+            .delivering_trails
+            .iter()
+            .filter(|trail| trail.logs(&region, read_only))
+            .cloned()
+            .collect();
+        if logging.is_empty() {
             return None;
         }
         let event = self.events.back()?;
+        let record = event.to_cloudtrail_event_json();
+        // One file per logging trail, each named for the minute the record belongs to and
+        // carrying that record — the file's own instant is the CALL's, not the instant the
+        // write is made.
+        let log_files = logging
+            .iter()
+            .filter(|trail| !trail.s3_bucket_name.is_empty())
+            .map(|trail| crate::trail_log_files::DeliveredLogFile {
+                bucket: trail.s3_bucket_name.clone(),
+                key: crate::trail_log_files::log_file_key(
+                    trail.s3_key_prefix.as_deref(),
+                    &account_id,
+                    &region,
+                    event.event_time,
+                    &crate::trail_log_files::unique_field(),
+                ),
+                region: region.clone(),
+                records: vec![record.clone()],
+            })
+            .collect();
         Some(crate::api_call_events::DeliveredApiCall {
             source,
             region,
             time_millis: event.event_time_millis(),
-            detail: event.to_cloudtrail_event_json(),
+            detail: record,
+            log_files,
         })
     }
 

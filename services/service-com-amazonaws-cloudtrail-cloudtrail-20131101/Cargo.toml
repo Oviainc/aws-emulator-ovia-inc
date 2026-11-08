@@ -87,6 +87,12 @@ emulator-core-build-support = { workspace = true }
 # Reads the base64 an `awsJson1_1` body carries a blob member in, so a suite can decode the
 # DER public key `ListPublicKeys` reported and parse it back.
 base64 = "0.22"
+# Lists and READS the log files a logging trail delivered, through Amazon S3's own API over
+# the in-process callback: a delivered object counts only if the object store answers with
+# it. Only the generated client is needed — the emulator supplies the transport.
+aws-sdk-s3 = { version = "1", default-features = false }
+# Gunzips a delivered log file, which is a gzip stream.
+flate2 = "1"
 
 [lints]
 workspace = true

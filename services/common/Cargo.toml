@@ -17,6 +17,19 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 # `api_call_events`: a publication that could not be made is traced rather than failing the
 # call it belongs to, so that path needs the workspace's logging facade.
 tracing = { workspace = true }
+# `s3_client`: the in-process Amazon S3 client a service DELIVERING an object into a bucket
+# a client named writes through — a logging trail's log files (`trail_log_files`) among
+# them — built once here for every service that writes one. Only the generated client is
+# needed: the emulator supplies the transport, so the SDK's own HTTPS stack is left out.
+aws-sdk-s3 = { version = "1", default-features = false }
+# `trail_log_files`: a CloudTrail log file IS a gzip stream, so it is written with the
+# maintained DEFLATE implementation this workspace already compresses with rather than by
+# laying out the framing here.
+flate2 = "1"
+# `trail_log_files`: the UTC calendar fields a log file's key is laid out by (the year,
+# month and day of its prefix and the minute in its name), from the maintained calendar
+# crate rather than by slicing a rendered timestamp.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 # `xray_segments`: the in-process X-Ray client a service REPORTS its own segments through —
 # the API Gateway stage that served a traced request, the Lambda invocation it reached — built
 # once here for every producer. Only the generated client is needed: the emulator supplies the

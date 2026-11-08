@@ -161,10 +161,10 @@ pub trait AuditedService: Send + Sync + 'static {
     /// `answered_as` is the request id the CALLER was answered under, which the record
     /// carries as its `requestID`.
     ///
-    /// Answers the event the account's CloudTrail DELIVERS for the call, when a trail of
-    /// the Region is logging one of its kind — which [`RecordedCall`] publishes onto the
-    /// default event bus. `None` is a call nothing is published for: no trail logs it, or
-    /// this engine carries no log at all.
+    /// Answers what the account's CloudTrail DELIVERS for the call, when a trail of the
+    /// Region is logging one of its kind — which [`RecordedCall`] publishes onto the default
+    /// event bus and writes into each logging trail's bucket. `None` is a call nothing is
+    /// delivered for: no trail logs it, or this engine carries no log at all.
     fn record(
         &self,
         call: ServedApiCall,
@@ -484,12 +484,12 @@ impl<W: ErasedOperation, S: AuditedService> ErasedOperation for RecordedCall<W, 
             let (resp, answered_as) = named_request(resp);
             if let Some(call) = pending {
                 // The record, and — while the account's CloudTrail is logging calls of its
-                // kind — the event that same record is fanned out onto the default event
-                // bus as. The publication is made OUTSIDE the log's lock, after the
-                // response the caller gets has been rendered, so it changes nothing about
-                // what this call answers.
+                // kind — the event that same record is fanned out onto the default event bus
+                // as and the log file each logging trail receives it as. Every delivery is
+                // made OUTSIDE the log's lock, after the response the caller gets has been
+                // rendered, so it changes nothing about what this call answers.
                 if let Some(delivered) = self.service.record(call, &answered_as) {
-                    delivered.publish(ctx.callback()).await;
+                    delivered.deliver(ctx.callback()).await;
                 }
             }
             resp

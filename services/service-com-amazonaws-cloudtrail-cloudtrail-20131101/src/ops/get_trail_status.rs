@@ -241,34 +241,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::TRAIL_NOT_FOUND_STATUS,
             )
         })?;
+        let status = record.status.clone();
+        let (bucket, key_prefix) = (
+            record.s3_bucket_name.clone(),
+            record.s3_key_prefix.clone(),
+        );
+        // The object store is asked about this trail's delivered log files, which is a
+        // read of ANOTHER service's store: this one's guard is released first, so no two
+        // stores are ever locked at once (`crate::state::referenced_resources`).
+        drop(store);
+
+        // WHAT this trail has delivered, read where those objects live. A trail reports a
+        // delivery exactly when the bucket holds the log file it delivered — the delivery
+        // itself is made while the trail is logging, by the recording path every served
+        // call passes through (`service_common::trail_log_files`).
+        let latest_delivery = crate::state::referenced_resources::latest_log_file_delivery(
+            &*self.engine,
+            &bucket,
+            key_prefix.as_deref(),
+        );
 
         Ok(GetTrailStatusOutput {
-            is_logging: Some(record.status.is_logging),
-            start_logging_time: record
-                .status
-                .start_logging_time
-                .map(::aws_smithy_types::DateTime::from),
-            stop_logging_time: record
-                .status
-                .stop_logging_time
-                .map(::aws_smithy_types::DateTime::from),
+            is_logging: Some(status.is_logging),
+            start_logging_time: status.start_logging_time.map(::aws_smithy_types::DateTime::from),
+            stop_logging_time: status.stop_logging_time.map(::aws_smithy_types::DateTime::from),
             // The deprecated string forms of the two instants above.
-            time_logging_started: record.status.start_logging_time.and_then(crate::state::iso8601),
-            time_logging_stopped: record.status.stop_logging_time.and_then(crate::state::iso8601),
-            // Nothing has delivered a log or digest file or sent a notification for
-            // this trail, so there is no delivery time, attempt or error to report.
+            time_logging_started: status.start_logging_time.and_then(crate::state::iso8601),
+            time_logging_stopped: status.stop_logging_time.and_then(crate::state::iso8601),
+            // "Specifies the date and time that CloudTrail last delivered log files to an
+            // account's Amazon S3 bucket": the newest log file this trail's bucket holds,
+            // and `None` for a trail none of whose calls has been delivered yet.
+            latest_delivery_time: latest_delivery.map(::aws_smithy_types::DateTime::from),
+            // The deprecated string forms of that same instant: the attempt CloudTrail
+            // made, and the one that succeeded — which, for a delivery whose object the
+            // bucket holds, are the same attempt.
+            latest_delivery_attempt_time: latest_delivery.and_then(crate::state::iso8601),
+            latest_delivery_attempt_succeeded: latest_delivery.and_then(crate::state::iso8601),
+            // Nothing has failed a delivery, delivered a digest file, written to
+            // CloudWatch Logs or sent a notification for this trail, so there is no error,
+            // digest, log-group delivery or notification to report.
             latest_delivery_error: None,
             latest_notification_error: None,
-            latest_delivery_time: None,
             latest_notification_time: None,
             latest_cloud_watch_logs_delivery_error: None,
             latest_cloud_watch_logs_delivery_time: None,
             latest_digest_delivery_time: None,
             latest_digest_delivery_error: None,
-            latest_delivery_attempt_time: None,
             latest_notification_attempt_time: None,
             latest_notification_attempt_succeeded: None,
-            latest_delivery_attempt_succeeded: None,
         })
     }
 }

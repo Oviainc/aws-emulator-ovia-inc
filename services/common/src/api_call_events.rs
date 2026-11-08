@@ -3,8 +3,8 @@
 //! The management-event FAN-OUT: a served control-plane call published onto the account's
 //! default EventBridge bus, as the event CloudTrail delivers for it.
 //!
-//! An account has two readers of its management events. One is CloudTrail's own
-//! `LookupEvents`, which reads the log [`crate::management_events`] holds. The other is
+//! An account has three readers of its management events. One is CloudTrail's own
+//! `LookupEvents`, which reads the log [`crate::management_events`] holds. The second is
 //! EventBridge: while a trail of the Region is logging management events, each call that
 //! trail logs is ALSO published onto the account's default event bus, under the
 //! `detail-type` [`API_CALL_DETAIL_TYPE`] with `source` `aws.<service>` and the CloudTrail
@@ -12,6 +12,8 @@
 //! of a service with no event source of its own has to an event-driven consumer, and it is
 //! what a rule like
 //! `{"source":["aws.cloudfront"],"detail-type":["AWS API Call via CloudTrail"]}` matches.
+//! The third reads the trail's own bucket, which is [`crate::trail_log_files`]' leg of the
+//! same delivery and travels with the event here.
 //!
 //! The publication therefore hangs off the SAME seam the recording does
 //! ([`crate::audited_operation`]): the service that served the call records it, the log
@@ -59,11 +61,11 @@ pub fn event_source_of(event_source: &str) -> String {
     format!("{AWS_SOURCE_PREFIX}{prefix}")
 }
 
-/// One recorded call, as the event the account's CloudTrail delivers for it.
+/// One recorded call, as what the account's CloudTrail delivers for it.
 ///
-/// Built by the log that recorded the call — so the `detail` is the very record
-/// `LookupEvents` reports and the two cannot disagree — and published by
-/// [`DeliveredApiCall::publish`].
+/// Built by the log that recorded the call — so both the `detail` and each log file's record
+/// are the very document `LookupEvents` reports and none of them can disagree — and
+/// delivered by [`DeliveredApiCall::deliver`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveredApiCall {
     /// The published event's `source`: `aws.<endpoint-prefix>` of the serving service.
@@ -77,14 +79,23 @@ pub struct DeliveredApiCall {
     /// The published event's `detail`: the CloudTrail record of the call
     /// ([`crate::management_events::ManagementEvent::to_cloudtrail_event_json`]).
     pub detail: serde_json::Value,
+    /// The log files the account's logging trails deliver this record as — one per trail
+    /// that logs the call, into the bucket that trail was created with
+    /// ([`crate::trail_log_files`]). Empty when no logging trail of the account has a
+    /// destination bucket.
+    pub log_files: Vec<crate::trail_log_files::DeliveredLogFile>,
 }
 
 impl DeliveredApiCall {
-    /// Publish this event onto the account's default event bus.
+    /// Deliver this record everywhere the account's CloudTrail delivers it: onto the
+    /// account's default event bus, and into the bucket of each trail that logs the call.
     ///
     /// Nothing about the call that produced it changes: a failure is traced and the
     /// operation's own answer stands, for the reason the module docs give.
-    pub async fn publish(self, callback: &EmbeddedEmulator) {
+    pub async fn deliver(self, callback: &EmbeddedEmulator) {
+        for log_file in self.log_files {
+            log_file.deliver(callback).await;
+        }
         let client = crate::eventbridge_client::eventbridge_client(callback, &self.region);
         let entry = ::aws_sdk_eventbridge::types::PutEventsRequestEntry::builder()
             .event_bus_name(DEFAULT_EVENT_BUS)

@@ -443,21 +443,23 @@ fn normalize_event_selectors(selectors: Vec<EventSelector>) -> Result<Vec<EventS
             // `EmulatedService::override_refusal`.
             for resource in selector.data_resources.iter().flatten() {
                 // "You can specify the following basic event selector resource
-                // types"; anything else needs advanced event selectors.
+                // types"; anything else needs advanced event selectors. The refusal
+                // is the service's one wording for a value outside the set its
+                // parameter admits (`crate::state::value_not_valid_message`): the
+                // parameter's API path and the value as the request sent it.
                 let resource_type = resource.r#type.as_deref().unwrap_or_default();
                 if !crate::state::BASIC_DATA_RESOURCE_TYPES.contains(&resource_type) {
-                    return Err(format!(
-                        "DataResource Type must be one of {}, not {resource_type:?}; every \
-                         other resource type needs AdvancedEventSelectors",
-                        crate::state::BASIC_DATA_RESOURCE_TYPES.join(", ")
+                    return Err(crate::state::value_not_valid_message(
+                        DATA_RESOURCE_TYPE_MEMBER,
+                        resource_type,
                     ));
                 }
             }
             for source in selector.exclude_management_event_sources.iter().flatten() {
                 if !crate::state::EXCLUDABLE_MANAGEMENT_EVENT_SOURCES.contains(&source.as_str()) {
-                    return Err(format!(
-                        "ExcludeManagementEventSources may name only {}, not {source:?}",
-                        crate::state::EXCLUDABLE_MANAGEMENT_EVENT_SOURCES.join(" or ")
+                    return Err(crate::state::value_not_valid_message(
+                        EXCLUDE_MANAGEMENT_EVENT_SOURCES_MEMBER,
+                        source,
                     ));
                 }
             }
@@ -480,6 +482,19 @@ fn normalize_event_selectors(selectors: Vec<EventSelector>) -> Result<Vec<EventS
         })
         .collect()
 }
+
+/// How a refusal names the basic data resource's `Type` parameter: the member's API path
+/// inside the event selector it sits in, which is how CloudTrail names a parameter in the
+/// `Value <value> for <Member> is invalid.` refusal
+/// ([`crate::state::value_not_valid_message`]). The collection step from `DataResources`
+/// into one of its entries is not part of the name — the parameter is the same one whichever
+/// entry carried the value.
+const DATA_RESOURCE_TYPE_MEMBER: &str = "DataResources.Type";
+
+/// How that same refusal names `EventSelector$ExcludeManagementEventSources`, whose value
+/// set is also a catalogue this handler checks against
+/// ([`crate::state::EXCLUDABLE_MANAGEMENT_EVENT_SOURCES`]).
+const EXCLUDE_MANAGEMENT_EVENT_SOURCES_MEMBER: &str = "ExcludeManagementEventSources";
 
 /// How CloudTrail words a basic selector that would log nothing: management events
 /// excluded and no data resource named, so the selector selects no event at all.

@@ -83,14 +83,15 @@ fn delivery_context(trail_arn: &str) -> Vec<(String, String)> {
 /// It is the resource a bucket policy's `s3:PutObject` grant is written over, so the
 /// permission question is asked about the keys this trail would really write rather than
 /// about the bucket as a whole — which is what makes a policy that grants the write
-/// somewhere else insufficient for this trail.
+/// somewhere else insufficient for this trail. The layout itself belongs to the delivery
+/// that writes those keys ([`service_common::trail_log_files`]), so it is read from there
+/// rather than written again here.
 fn log_file_key_prefix(s3_key_prefix: Option<&str>, region: &str) -> String {
-    let account = ::engine::emulator_account_id();
-    let tail = format!("AWSLogs/{account}/CloudTrail/{region}/");
-    match s3_key_prefix.map(|prefix| prefix.trim_matches('/')) {
-        Some(prefix) if !prefix.is_empty() => format!("{prefix}/{tail}"),
-        _ => tail,
-    }
+    ::service_common::trail_log_files::log_file_key_prefix(
+        s3_key_prefix,
+        ::engine::emulator_account_id(),
+        region,
+    )
 }
 
 /// What the account's object store says about a trail's log-delivery destination.
@@ -292,6 +293,39 @@ pub fn log_group_is_valid<Eng: Send + Sync + 'static>(
     };
     let store = state.lock();
     store.log_groups.contains_key(name)
+}
+
+/// What the object store holds of a trail's DELIVERED log files: the instant the newest one
+/// under this trail's own log-file area was written, or `None` for a trail that has
+/// delivered none.
+///
+/// It is read in the store that OWNS those objects rather than tracked here, so a trail
+/// reports a delivery exactly when the bucket really holds the file it delivered: the one
+/// account of what was delivered is the delivered object itself. The area read is the
+/// trail's whole log-file prefix ([`service_common::trail_log_files::trail_log_file_prefix`])
+/// — every Region the trail logs delivers under it — and only the objects a log file's name
+/// ends with are counted, so an unrelated object a client put under the same prefix is not
+/// read as a delivery.
+pub fn latest_log_file_delivery<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    bucket: &str,
+    s3_key_prefix: Option<&str>,
+) -> Option<::std::time::SystemTime> {
+    let state = ::service_com_amazonaws_s3_amazons3::state::service_state(engine)?;
+    let prefix = ::service_common::trail_log_files::trail_log_file_prefix(
+        s3_key_prefix,
+        ::engine::emulator_account_id(),
+    );
+    let store = state.lock();
+    store
+        .bucket(bucket)?
+        .objects()
+        .filter(|(key, _)| {
+            key.starts_with(&prefix)
+                && key.ends_with(::service_common::trail_log_files::LOG_FILE_SUFFIX)
+        })
+        .map(|(_, object)| object.last_modified)
+        .max()
 }
 
 /// The refusal text for `InsufficientS3BucketPolicyException`: the destination bucket

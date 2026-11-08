@@ -99,6 +99,20 @@ pub fn limit_not_valid_message(member: &str, bound: &str) -> String {
     format!("The limit at '{member}' is not valid: it must have value {bound}.")
 }
 
+/// How CloudTrail words a parameter whose value is outside the set that parameter admits:
+/// `Value <value> for <Member> is invalid.`
+///
+/// The fixed text is `Value ` and ` for <Member> is invalid.`, with two parts taken from the
+/// request: the value exactly as it was sent — bare, never quoted or escaped — and the
+/// parameter that carried it, named by its API path relative to the shape it sits in
+/// (`ReadWriteType`, `DataResources.Type`). It is one function for the whole service so that
+/// every such refusal is worded identically, wherever the value set comes from: a modelled
+/// enum the boundary walk checks (`crate::service`) or a catalogue a handler checks against
+/// itself.
+pub fn value_not_valid_message(member: &str, value: &str) -> String {
+    format!("Value {value} for {member} is invalid.")
+}
+
 /// An instant as whole milliseconds since the epoch — the resolution this service compares a
 /// recorded time and a caller-supplied window bound at.
 pub fn millis_of(at: SystemTime) -> i64 {
@@ -791,10 +805,19 @@ pub const TRAIL_SUBJECT: &str = "Trail";
 /// The subject noun of a refusal about an event data store.
 pub const EVENT_DATA_STORE_SUBJECT: &str = "Event data store";
 
-/// Render an instant the way the modelled string timestamp members carry it
-/// (ISO 8601, e.g. `2026-10-21T21:38:12Z`).
+/// Render an instant the way the modelled string timestamp members carry it:
+/// ISO 8601 at WHOLE-SECOND resolution, `2026-10-21T21:38:12Z`.
+///
+/// The resolution is part of the form, not an accident of the clock — the instants AWS
+/// reports in these members are `%Y-%m-%dT%H:%M:%SZ`, which is the pattern a consumer
+/// parses them with — so the instant is TRUNCATED to the second rather than rounded, and a
+/// rendered time never names an instant later than the one it reports.
 pub fn iso8601(at: SystemTime) -> Option<String> {
-    ::aws_smithy_types::DateTime::from(at)
+    let whole_seconds = at
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map(|since| ::std::time::UNIX_EPOCH + Duration::from_secs(since.as_secs()))
+        .unwrap_or(at);
+    ::aws_smithy_types::DateTime::from(whole_seconds)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .ok()
 }
@@ -3937,13 +3960,15 @@ impl<Eng: Send + Sync + 'static> Drop for LoggingTrailsRefreshed<'_, Eng> {
     }
 }
 
-/// One logging trail as the fan-out reads it: where it logs, and which management events
-/// its selectors admit.
+/// One logging trail as the fan-out reads it: where it DELIVERS, where it logs, and which
+/// management events its selectors admit.
 fn delivering_trail(trail: &TrailRecord) -> DeliveringTrail {
     let (management_events, event_class) = logged_management_events(trail);
     DeliveringTrail {
         trail_arn: trail.trail_arn.clone(),
         home_region: trail.home_region.clone(),
+        s3_bucket_name: trail.s3_bucket_name.clone(),
+        s3_key_prefix: trail.s3_key_prefix.clone(),
         multi_region: trail.is_multi_region_trail,
         global_service_events: trail.include_global_service_events,
         management_events,

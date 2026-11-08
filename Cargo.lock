@@ -1636,9 +1636,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-xray"
-version = "1.119.0"
+version = "1.121.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d491f0874ebd05a703588737ec85d2fdc515be275dbc51985d121556c058355d"
+checksum = "2e512fb27f7cf08374c55e6ee70ccbd8e0b7739f96df1b21e148f170c3ed84aa"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -3510,7 +3510,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6414,7 +6414,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6926,7 +6926,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9796,11 +9796,13 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-s3",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
  "base64 0.22.1",
  "bytes",
+ "flate2",
  "hex",
  "http",
  "md-5 0.10.6",
@@ -19097,12 +19099,15 @@ dependencies = [
  "aws-sdk-eventbridge",
  "aws-sdk-iam",
  "aws-sdk-kinesis",
+ "aws-sdk-s3",
  "aws-sdk-xray",
  "aws-sigv4",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
  "bumpalo",
+ "chrono",
+ "flate2",
  "http",
  "ipnet",
  "iso8601-duration",
@@ -20558,7 +20563,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

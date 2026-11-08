@@ -372,20 +372,19 @@ fn event_selector_member(path: &str) -> Option<&'static str> {
 /// `UpdateTrail`, `CreateEventDataStore`, `UpdateEventDataStore`), each of which
 /// declares that error.
 ///
-/// The message is built from the request: it names the member path the value sat at
-/// and the constraint it broke, which for an enumerated member is the value set the
-/// model declares.
+/// The message is built from the request: a value outside the SET its member admits — an
+/// enumerated member's value set here — is refused in this service's one wording for that
+/// class ([`crate::state::value_not_valid_message`]), naming the parameter and echoing the
+/// value as the request sent it. Every other class keeps the framework's own sentence,
+/// which already names the member and the bound it broke.
 fn invalid_event_selectors(violations: &[Violation]) -> Option<Refused> {
     violations.iter().find_map(|violation| {
         let member = event_selector_member(&violation.path)?;
         let message = match &violation.kind {
-            ViolationKind::EnumValue(allowed) => format!(
-                "Specify a valid value for {member} at '{}': the valid values are {}.",
-                violation.path,
-                allowed.join(", ")
+            ViolationKind::EnumValue(_) => crate::state::value_not_valid_message(
+                &refused_parameter(&violation.path, member),
+                violation.value.as_deref().unwrap_or_default(),
             ),
-            // Every other class keeps the framework's own sentence, which already
-            // names the member and the bound it broke; only the error code changes.
             _ => clause(violation),
         };
         Some(Refused {
@@ -393,6 +392,48 @@ fn invalid_event_selectors(violations: &[Violation]) -> Option<Refused> {
             message,
         })
     })
+}
+
+/// How a refusal names the parameter a constraint-violation path points at, as CloudTrail
+/// names one: the parameter's API path INSIDE the selector it sits in
+/// (`ReadWriteType`, `DataResources.Type`), in the model's own casing.
+///
+/// Two things are dropped from the walk's path, because neither is part of the parameter's
+/// name: the top-level list member the selectors arrived in (`top_level`, which is what the
+/// message is about anyway) and each step from a collection into one of its entries — the
+/// position and the [`COLLECTION_STEP`] marker — since the parameter is the same one
+/// whichever entry carried the value. What remains is re-cased from the walk's lowerCamel
+/// spelling to the model's own, which is the first character and nothing else. A path that
+/// names the list member itself leaves nothing inside it, and is named by that member.
+fn refused_parameter(path: &str, top_level: &'static str) -> String {
+    let segments: Vec<&str> = path.split('.').collect();
+    let mut named: Vec<String> = Vec::new();
+    for (position, segment) in segments.iter().enumerate().skip(1) {
+        let collection_step = *segment == COLLECTION_STEP
+            || segments.get(position + 1) == Some(&COLLECTION_STEP);
+        if !collection_step {
+            named.push(modelled_member_name(segment));
+        }
+    }
+    if named.is_empty() {
+        return top_level.to_string();
+    }
+    named.join(".")
+}
+
+/// The segment the validating walk writes between a collection and one of its entries
+/// ([`aws_smithy_schema_server::constraints::path`]), which no parameter is named by.
+const COLLECTION_STEP: &str = "member";
+
+/// A member name as the MODEL spells it, from the lowerCamel spelling a violation path
+/// carries it in: the walk lower-cases the first character of the Smithy name and changes
+/// nothing else, so upper-casing that one character recovers the model's name.
+fn modelled_member_name(segment: &str) -> String {
+    let mut characters = segment.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
+    }
 }
 
 /// The `com-amazonaws-cloudtrail-cloudtrail-20131101` emulated service: the generated [`ServiceDefinition`] plus

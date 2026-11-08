@@ -203,3 +203,11 @@ mod digest_signing_public_keys;
 // selector has to state.
 #[path = "all/referenced_resource_validation.rs"]
 mod referenced_resource_validation;
+// `selector_value_refusal_wording` pins how a value outside the set its event-selector
+// parameter admits is refused, over every such parameter and whichever side settles the set.
+#[path = "all/selector_value_refusal_wording.rs"]
+mod selector_value_refusal_wording;
+// `trail_log_file_delivery` pins what a LOGGING trail delivers into its bucket: the gzipped
+// log file each recorded call lands in, under the documented key layout.
+#[path = "all/trail_log_file_delivery.rs"]
+mod trail_log_file_delivery;
