@@ -3230,6 +3230,14 @@ fn apply_alarms<Eng: Send + Sync + 'static>(
                 Vec::new(),
             )
         });
+        // `CreationId` names the write that CREATED the alarm, so an alarm this policy
+        // already minted keeps the identity it was created with and a fresh one mints its
+        // own, exactly as PutMetricAlarm does.
+        let creation_id = store
+            .alarms
+            .get(&spec.name)
+            .map(|stored| stored.creation_id.clone())
+            .unwrap_or_else(|| cloudwatch::state::alarm_creation_id(now));
         let alarm = MetricAlarm {
             alarm_name: Some(spec.name.clone()),
             alarm_arn: Some(arn.clone()),
@@ -3276,6 +3284,7 @@ fn apply_alarms<Eng: Send + Sync + 'static>(
             cloudwatch::state::StoredAlarm {
                 alarm,
                 tags,
+                creation_id,
                 // The alarm CloudWatch evaluates from the stored metric data, the same span
                 // after this write as for one `PutMetricAlarm` created: "the alarm state is
                 // immediately set to INSUFFICIENT_DATA. The alarm is then evaluated and its

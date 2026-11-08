@@ -65,6 +65,13 @@ pub mod alarm_actions;
 /// A metric alarm's `StateValue`, computed from the datapoints this store holds.
 pub mod alarm_evaluation;
 
+/// What a READ of a metric alarm reports: the identity of the write that created it, and the
+/// metric identity it was configured with. Re-exported below, so a handler reaches them as
+/// `crate::state::…` like every other part of this store.
+pub mod alarm_reads;
+
+pub use alarm_reads::*;
+
 /// The Contributor Insights rule syntax a `RuleDefinition` carries, evaluated over the log
 /// events ingested into the log groups a rule names, and the report `GetInsightRuleReport`
 /// answers from what that evaluation collected.
@@ -1242,6 +1249,12 @@ pub struct StoredAlarm {
     pub alarm: MetricAlarm,
     /// The tags `PutMetricAlarm` was given for this alarm.
     pub tags: Vec<Tag>,
+    /// The `CreationId` of the write that CREATED this alarm, as every read of it reports the
+    /// alarm's creation identity ([`alarm_reads::alarm_creation_id`]).
+    ///
+    /// Stored rather than derived: it names the write that created the alarm, which a later
+    /// write that only replaces its configuration keeps.
+    pub creation_id: String,
     /// The instant, in epoch seconds, from which this alarm's next evaluation against the
     /// stored metric data is owed
     /// ([`ComAmazonawsCloudwatchGraniteserviceversion20100801State::evaluate_metric_alarms`]).

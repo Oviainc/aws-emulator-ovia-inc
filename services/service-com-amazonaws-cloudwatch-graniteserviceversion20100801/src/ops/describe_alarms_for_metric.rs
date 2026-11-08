@@ -171,11 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request lists it in names the same metric.
         let wanted_dimensions = crate::state::dimension_set(input.dimensions.as_deref());
 
-        let mut metric_alarms: Vec<MetricAlarm> = store
+        let mut metric_alarms: Vec<ReportedMetricAlarm> = store
             .alarms
             .values()
-            .map(|stored| &stored.alarm)
-            .filter(|alarm| {
+            .filter(|stored| {
+                let alarm = &stored.alarm;
                 // "This operation retrieves only standard alarms that are based on the
                 // specified metric. It does not return alarms based on math expressions that
                 // use the specified metric" — an alarm carrying a `Metrics` query array is
@@ -191,7 +191,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "To filter the results, specify a statistic, period, or unit." — each one given
             // narrows the answer to the alarms configured with it, and one left out filters
             // nothing.
-            .filter(|alarm| {
+            .filter(|stored| {
+                let alarm = &stored.alarm;
                 matches(input.statistic.as_deref(), alarm.statistic.as_deref())
                     && matches(
                         input.extended_statistic.as_deref(),
@@ -200,11 +201,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     && matches(input.unit.as_deref(), alarm.unit.as_deref())
                     && input.period.is_none_or(|period| alarm.period == Some(period))
             })
-            .cloned()
+            // Through the one projection every reader of a metric alarm reports it through:
+            // this operation reports the same alarm `DescribeAlarms` does, so it carries the
+            // same members — including the creation identity.
+            .map(crate::state::StoredAlarm::reported)
             .collect();
         // The alarm NAME is an alarm's identity, so it is the order this answer reports in:
         // the same metric's alarms are listed the same way for every caller.
-        metric_alarms.sort_by(|left, right| left.alarm_name.cmp(&right.alarm_name));
+        metric_alarms.sort_by(|left, right| left.alarm.alarm_name.cmp(&right.alarm.alarm_name));
 
         Ok(DescribeAlarmsForMetricOutput {
             metric_alarms: Some(metric_alarms),

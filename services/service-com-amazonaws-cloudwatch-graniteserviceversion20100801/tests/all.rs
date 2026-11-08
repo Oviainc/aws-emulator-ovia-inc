@@ -43,6 +43,8 @@ mod alarm_history_data;
 mod alarm_m_of_n_directions;
 #[path = "all/alarm_period_windows.rs"]
 mod alarm_period_windows;
+#[path = "all/alarm_read_projection.rs"]
+mod alarm_read_projection;
 #[path = "all/alarm_reason_datapoints.rs"]
 mod alarm_reason_datapoints;
 #[path = "all/alarm_reason_statistic.rs"]

@@ -1138,7 +1138,12 @@ impl State {
         budget: &mut EvaluationBudget,
     ) -> Option<Evaluation> {
         // An alarm over a PromQL query is not graded against a threshold of this store at all,
-        // so nothing is computed for it.
+        // so nothing is computed for it: the entries of its query's result vector are its
+        // contributors ("Each entry in the vector result represents an alarm contributor",
+        // `AlarmPromQLCriteria$Query`), this engine resolves no query of that language, and the
+        // state such an alarm reports is therefore the one the write that configured it left —
+        // `OK`, with the explanation of `OK` that write seeded
+        // ([`NO_CONTRIBUTOR_IN_ALARM_REASON`]).
         if alarm.evaluation_criteria.is_some() {
             return None;
         }
@@ -2105,6 +2110,18 @@ fn plural(count: usize) -> (&'static str, &'static str) {
         ("s", "were")
     }
 }
+
+/// The `StateReason` a QUERY-class alarm reports while no contributor of its query is in the
+/// alarm state: CloudWatch's own fixed sentence for that outcome.
+///
+/// Fixed text, not built from the request: what it states is that no entry of the query's
+/// result vector was in `ALARM`, which names neither the query nor any series. It is the
+/// explanation an alarm of this class is CREATED with, because it is created `OK`
+/// (`PutMetricAlarm`'s "For PromQL alarms, the alarm state is instead immediately set to OK")
+/// and this is what `OK` means for it. This engine resolves no query of that language, so no
+/// evaluation of such an alarm reaches a verdict of its own
+/// ([`State::metric_alarm_evaluation`]) and the explanation its write left stands.
+pub const NO_CONTRIBUTOR_IN_ALARM_REASON: &str = "No time series evaluated to ALARM";
 
 /// The `StateReason` an evaluated state reports: the DATAPOINTS the evaluation graded, how many
 /// of them read the way the state says against the threshold, the minimum the transition needed

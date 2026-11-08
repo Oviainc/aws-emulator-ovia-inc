@@ -905,19 +905,33 @@ fn write_alarm(
         })
         .into());
     }
-    let initial_state = if matches!(
+    // "When this operation creates an alarm, the alarm state is immediately set to
+    // INSUFFICIENT_DATA. For PromQL alarms, the alarm state is instead immediately set to
+    // OK." — and the reason reports WHY the alarm is in the state it was created in. An alarm
+    // created INSUFFICIENT_DATA is in it because nothing has checked it yet; an alarm created
+    // OK is in it because no contributor of its query is in ALARM
+    // ("Each entry in the vector result represents an alarm contributor",
+    // `AlarmPromQLCriteria$Query`), which is the explanation its own evaluation reaches for
+    // that state too (`crate::state::alarm_evaluation::NO_CONTRIBUTOR_IN_ALARM_REASON`).
+    let (initial_state, initial_reason) = if matches!(
         input.evaluation_criteria,
         Some(EvaluationCriteria::PromQLCriteria(_))
     ) {
-        "OK"
+        (
+            crate::state::ALARM_STATE_OK,
+            crate::state::alarm_evaluation::NO_CONTRIBUTOR_IN_ALARM_REASON,
+        )
     } else {
-        "INSUFFICIENT_DATA"
+        (
+            crate::state::ALARM_STATE_INSUFFICIENT_DATA,
+            crate::state::INITIAL_STATE_REASON,
+        )
     };
     let (state_value, state_reason, state_reason_data, state_updated, state_transitioned) =
         existing.unwrap_or_else(|| {
             (
                 Some(initial_state.to_string()),
-                Some(crate::state::INITIAL_STATE_REASON.to_string()),
+                Some(initial_reason.to_string()),
                 None,
                 Some(crate::state::to_timestamp(now)),
                 Some(crate::state::to_timestamp(now)),
@@ -956,7 +970,7 @@ fn write_alarm(
         evaluate_low_sample_count_percentile: input
             .evaluate_low_sample_count_percentile
             .clone(),
-        metrics: input.metrics.clone(),
+        metrics: crate::state::configured_queries(input.metrics.as_deref()),
         threshold_metric_id: input.threshold_metric_id.clone(),
         // No evaluation has run for this alarm yet: its state is the one this write left
         // it in until the first evaluation becomes due.
@@ -975,10 +989,22 @@ fn write_alarm(
     // what was written rather than what the request happened to name.
     let history_data = crate::state::configuration_update_history_data(previous.as_ref(), &alarm);
 
+    // "CreationId" names the write that CREATED this alarm, so a write that replaces the
+    // configuration of an alarm that already exists keeps the id the alarm was created with —
+    // exactly as it keeps the alarm's state ("When you update an existing alarm, its state is
+    // left unchanged, but the update completely overwrites the previous configuration of the
+    // alarm.") — while an alarm that was deleted and written again carries a new one.
+    let creation_id = store
+        .alarms
+        .get(&input.alarm_name)
+        .map(|stored| stored.creation_id.clone())
+        .unwrap_or_else(|| crate::state::alarm_creation_id(now));
+
     store.alarms.insert(
         input.alarm_name.clone(),
         crate::state::StoredAlarm {
             alarm,
+            creation_id,
             // "If you are using this operation to update an existing alarm, any tags you
             // specify in this parameter are ignored. To change the tags of an existing
             // alarm, use TagResource or UntagResource." (`PutMetricAlarmInput$Tags`) — so an

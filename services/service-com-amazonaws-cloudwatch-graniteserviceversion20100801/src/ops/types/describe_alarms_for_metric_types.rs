@@ -26,6 +26,9 @@ pub struct DescribeAlarmsForMetricInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.cloudwatch#DescribeAlarmsForMetricOutput")]
 #[derive(Debug, Clone, Default)]
 pub struct DescribeAlarmsForMetricOutput {
-    pub metric_alarms: Option<Vec<MetricAlarm>>,
+    /// The metric alarms, each as a read of one reports it: the modelled `MetricAlarm` plus
+    /// the `CreationId` the model does not declare (`ReportedMetricAlarm`), so this reader and
+    /// `DescribeAlarms` report the same alarm the same way.
+    pub metric_alarms: Option<Vec<ReportedMetricAlarm>>,
 }
 

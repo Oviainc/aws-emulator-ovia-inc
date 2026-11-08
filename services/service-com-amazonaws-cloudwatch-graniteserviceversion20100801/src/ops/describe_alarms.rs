@@ -291,7 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let next_token = page
                 .get(limit)
                 .map(|name| crate::state::encode_page_token(name));
-            let mut metric_alarms: Vec<MetricAlarm> = Vec::new();
+            let mut metric_alarms: Vec<ReportedMetricAlarm> = Vec::new();
             let mut composite_alarms: Vec<CompositeAlarm> = Vec::new();
             for name in page.iter().take(limit) {
                 // "Only the Alarm Name, ARN, StateValue (OK/ALARM/INSUFFICIENT_DATA), and
@@ -299,17 +299,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // use [ChildrenOfAlarmName]"; for `ParentsOfAlarmName`, "Only the Alarm Name
                 // and ARN are returned". A member this path does not report is absent, not
                 // defaulted, so a caller cannot read a stale value out of it.
+                //
+                // Wherever this path reports an alarm's STATE, it reports that state in full:
+                // the value, the instant the alarm was last updated AND the instant its value
+                // last changed (`MetricAlarm$StateTransitionedTimestamp` /
+                // `CompositeAlarm$StateTransitionedTimestamp`, "the date and time that the
+                // alarm's StateValue most recently changed"), so a client can age the state it
+                // is told. The parents path reports no state at all, so it reports none of the
+                // three.
                 if let Some(stored) = store.alarms.get(name) {
-                    metric_alarms.push(MetricAlarm {
-                        alarm_name: stored.alarm.alarm_name.clone(),
-                        alarm_arn: stored.alarm.alarm_arn.clone(),
-                        state_value: of_children
-                            .then(|| stored.alarm.state_value.clone())
-                            .flatten(),
-                        state_updated_timestamp: of_children
-                            .then_some(stored.alarm.state_updated_timestamp)
-                            .flatten(),
-                        ..MetricAlarm::default()
+                    metric_alarms.push(ReportedMetricAlarm {
+                        alarm: MetricAlarm {
+                            alarm_name: stored.alarm.alarm_name.clone(),
+                            alarm_arn: stored.alarm.alarm_arn.clone(),
+                            state_value: of_children
+                                .then(|| stored.alarm.state_value.clone())
+                                .flatten(),
+                            state_updated_timestamp: of_children
+                                .then_some(stored.alarm.state_updated_timestamp)
+                                .flatten(),
+                            state_transitioned_timestamp: of_children
+                                .then_some(stored.alarm.state_transitioned_timestamp)
+                                .flatten(),
+                            ..MetricAlarm::default()
+                        },
+                        // The creation identity is a member of the FULL alarm, which this
+                        // path does not report: "To get complete information about these
+                        // alarms, perform another DescribeAlarms operation".
+                        creation_id: None,
                     });
                 } else if let Some(stored) = store.composite_alarms.get(name) {
                     composite_alarms.push(CompositeAlarm {
@@ -320,6 +337,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .flatten(),
                         state_updated_timestamp: of_children
                             .then_some(stored.alarm.state_updated_timestamp)
+                            .flatten(),
+                        state_transitioned_timestamp: of_children
+                            .then_some(stored.alarm.state_transitioned_timestamp)
                             .flatten(),
                         ..CompositeAlarm::default()
                     });
@@ -355,7 +375,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 store
                     .alarms
                     .iter()
-                    .map(|(name, stored)| (name, Reported::Metric(&stored.alarm))),
+                    .map(|(name, stored)| (name, Reported::Metric(stored))),
             );
         }
         if wants(crate::state::ALARM_TYPE_COMPOSITE) {
@@ -418,12 +438,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(limit)
             .map(|(name, _)| crate::state::encode_page_token(name));
 
-        let mut metric_alarms: Vec<MetricAlarm> = Vec::new();
+        let mut metric_alarms: Vec<ReportedMetricAlarm> = Vec::new();
         let mut composite_alarms: Vec<CompositeAlarm> = Vec::new();
         let mut log_alarms: Vec<LogAlarm> = Vec::new();
         for (_, alarm) in page.iter().take(limit) {
             match alarm {
-                Reported::Metric(alarm) => metric_alarms.push((*alarm).clone()),
+                // Through the one projection every reader of a metric alarm reports it
+                // through, so this read and `DescribeAlarmsForMetric` cannot answer with
+                // different member sets for the same alarm.
+                Reported::Metric(stored) => metric_alarms.push(stored.reported()),
                 Reported::Composite(alarm) => composite_alarms.push((*alarm).clone()),
                 Reported::Log(alarm) => log_alarms.push((*alarm).clone()),
             }
@@ -445,7 +468,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// between the metric-alarm and composite-alarm lists.
 enum Reported<'a> {
     /// A metric alarm, reported under `MetricAlarms`.
-    Metric(&'a MetricAlarm),
+    Metric(&'a crate::state::StoredAlarm),
     /// A composite alarm, reported under `CompositeAlarms`.
     Composite(&'a CompositeAlarm),
     /// A log alarm, reported under `LogAlarms`.
@@ -456,7 +479,7 @@ impl Reported<'_> {
     /// The alarm's current state value.
     fn state_value(&self) -> Option<&str> {
         match self {
-            Self::Metric(alarm) => alarm.state_value.as_deref(),
+            Self::Metric(stored) => stored.alarm.state_value.as_deref(),
             Self::Composite(alarm) => alarm.state_value.as_deref(),
             Self::Log(alarm) => alarm.state_value.as_deref(),
         }
@@ -467,10 +490,10 @@ impl Reported<'_> {
     /// (`DescribeAlarmsInput$ActionPrefix`).
     fn uses_action(&self, prefix: &str) -> bool {
         let lists = match self {
-            Self::Metric(alarm) => [
-                &alarm.ok_actions,
-                &alarm.alarm_actions,
-                &alarm.insufficient_data_actions,
+            Self::Metric(stored) => [
+                &stored.alarm.ok_actions,
+                &stored.alarm.alarm_actions,
+                &stored.alarm.insufficient_data_actions,
             ],
             Self::Composite(alarm) => [
                 &alarm.ok_actions,

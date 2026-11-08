@@ -29,7 +29,9 @@ pub struct DescribeAlarmsInput {
 #[derive(Debug, Clone, Default)]
 pub struct DescribeAlarmsOutput {
     pub composite_alarms: Option<Vec<CompositeAlarm>>,
-    pub metric_alarms: Option<Vec<MetricAlarm>>,
+    /// The metric alarms, each as a read of one reports it: the modelled `MetricAlarm` plus
+    /// the `CreationId` the model does not declare (`ReportedMetricAlarm`).
+    pub metric_alarms: Option<Vec<ReportedMetricAlarm>>,
     pub log_alarms: Option<Vec<LogAlarm>>,
     pub next_token: Option<String>,
 }
