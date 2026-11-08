@@ -35,6 +35,10 @@ aws-sdk-lambda = { version = "1", default-features = false }
 # group, an Amazon Data Firehose stream and an Amazon S3 bucket. No network client
 # feature is enabled: the transport is the emulator's own.
 aws-sdk-cloudwatchlogs = { version = "1", default-features = false }
+# The key a pool's `LambdaConfig.KMSKeyID` names wraps the data key of the message a custom
+# sender trigger's code travels in (`src/state/lambda_triggers/custom_email.rs`), over the
+# in-process callback into this same emulator.
+aws-sdk-kms = { version = "1", default-features = false }
 # Pinned: from 1.127.0 this client requires `aws-smithy-http` 0.64.3, which the
 # workspace's signing stack does not resolve to; 1.126.0 is the newest release that
 # builds against the `aws-smithy-http` this lock already holds.
@@ -60,6 +64,9 @@ tracing = { workspace = true }
 ring = "0.17"
 # SHA-256 for the RFC 7638 JWK thumbprint used as the key's `kid`.
 sha2 = { workspace = true }
+# A custom sender trigger's event carries the encrypted code as text, so the message is
+# base64-encoded into it (`src/state/lambda_triggers/custom_email.rs`).
+base64 = "0.22"
 # Constant-time byte comparison, for checking a presented app client secret
 # against the stored one without leaking how much of it matched. `ring`'s own
 # `constant_time::verify_slices_are_equal` is deprecated, which this
@@ -71,10 +78,16 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }
-# A `ByteMatchStatement$SearchString` is a blob, which travels base64-encoded in an
-# awsJson body: the web-ACL suite encodes its search strings with the same coder the
-# wafv2 crate decodes them with.
-base64 = "0.22"
+# The custom-sender suite mounts the services that own the other halves of that trigger
+# beside this one on a single engine — exactly as the assembled emulator does — because the
+# trigger wraps the code with a key the key service holds and hands it to a function Lambda
+# holds, which in turn writes what it received to a queue.
+service-com-amazonaws-kms-trentservice = { workspace = true }
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# A deployment package is a .zip archive, and the trigger function's module is one entry in
+# it.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # The log-delivery suite mounts the services that OWN a user pool's log delivery
 # destinations beside this one on a single engine — exactly as the assembled emulator
 # does — because `SetLogDeliveryConfiguration` resolves each destination by calling

@@ -255,8 +255,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        // The registration is performed under this service's lock, and that lock is
+        // RELEASED before the pool's custom email sender is invoked: nothing else of this
+        // service can be served while a function is being waited for.
+        let registered = self.register(&input)?;
+
+        // A pool that routes its email to a custom sender delivers this sign-up's code by
+        // handing it to that function instead of mailing it, with the app client the
+        // registration was made through as the event's caller. A sign-up that sent no code
+        // at all — the pool verifies nothing the user holds a value for — hands over
+        // nothing either.
+        if let Some(issued_code) = registered.issued_code {
+            crate::state::lambda_triggers::custom_email::fire_custom_email_sender(
+                ctx,
+                &state,
+                &registered.user_pool_id,
+                &registered.username,
+                crate::state::lambda_triggers::custom_email::CustomEmailSource::SignUp,
+                crate::state::lambda_triggers::Caller::of(ctx.parts(), Some(&input.client_id)),
+                input.client_metadata.as_ref(),
+                &issued_code,
+            )
+            .await
+            .map_err(trigger_failed)?;
+        }
+
+        Ok(registered.answer)
+    }
+}
+
+/// What a completed registration left behind: the answer it owes its caller, which pool
+/// and user it wrote, and the code it issued for the pool's custom email sender to
+/// deliver.
+struct Registered {
+    /// The answer this registration owes, rendered from the stored user.
+    answer: SignUpOutput,
+    /// The pool the user was registered in.
+    user_pool_id: String,
+    /// The STORED username of that user, however the request named it.
+    username: String,
+    /// The code this sign-up issued, or `None` where it sent no message at all.
+    issued_code: Option<String>,
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SignUp<Eng> {
+    /// Register the user `input` asks for, and report what that left behind.
+    ///
+    /// Everything here happens under this service's lock, which this call OWNS: the lock
+    /// is taken and released inside it, so its caller holds none of it while it invokes a
+    /// trigger function.
+    fn register(&self, input: &SignUpInput) -> Result<Registered, SignUpError> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
@@ -468,29 +521,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::VerificationCode::issued(&attribute, &destination, now)
             });
         let user = pool.user_mut(&input.username).ok_or_else(internal_error)?;
-        let code_delivery_details = delivery.map(|code| {
-            user.issue_code(crate::state::CodePurpose::SignUpConfirmation, code)
-                .delivery_details()
-        });
+        let issued = delivery
+            .map(|code| user.issue_code(crate::state::CodePurpose::SignUpConfirmation, code));
+        let code_delivery_details = issued
+            .as_ref()
+            .and_then(crate::state::VerificationCode::delivery_details);
+        // The code itself is handed to the pool's custom email sender, which on a pool
+        // that configures one is the only place this code is delivered at all.
+        let issued_code = issued.map(|code| code.code);
 
         // Read back from the STORED user, so the response reports what a later read of
         // this pool reports.
         let stored = pool.users.get(&key).ok_or_else(internal_error)?;
-        Ok(SignUpOutput {
-            // "Indicates whether the user was automatically confirmed. You can
-            // auto-confirm users with a pre sign-up Lambda trigger" (`UserConfirmed`):
-            // the stored status is what decides it.
-            user_confirmed: stored.status == crate::state::UserStatus::Confirmed,
-            user_sub: stored.sub.clone(),
-            // "Information about the delivery destination for that link or code" of the
-            // message this sign-up sent, rendered from the code just stored, so a
-            // reported delivery is always one a `ConfirmSignUp` can answer.
-            code_delivery_details: code_delivery_details.flatten(),
-            // `Session` is "a session Id that you can pass to ConfirmSignUp when you
-            // want to immediately sign in your user with the USER_AUTH flow": that flow
-            // is not served here, so no session is started for it.
-            session: None,
+        Ok(Registered {
+            answer: SignUpOutput {
+                // "Indicates whether the user was automatically confirmed. You can
+                // auto-confirm users with a pre sign-up Lambda trigger" (`UserConfirmed`):
+                // the stored status is what decides it.
+                user_confirmed: stored.status == crate::state::UserStatus::Confirmed,
+                user_sub: stored.sub.clone(),
+                // "Information about the delivery destination for that link or code" of
+                // the message this sign-up sent, rendered from the code just stored, so a
+                // reported delivery is always one a `ConfirmSignUp` can answer.
+                code_delivery_details,
+                // `Session` is "a session Id that you can pass to ConfirmSignUp when you
+                // want to immediately sign in your user with the USER_AUTH flow": that
+                // flow is not served here, so no session is started for it.
+                session: None,
+            },
+            username: stored.username.clone(),
+            user_pool_id,
+            issued_code,
         })
+    }
+}
+
+/// What the pool's custom email sender's failure is for THIS operation: the modelled
+/// error each outcome amounts to, carrying the message the dispatch built.
+///
+/// The user is registered and its code recorded — the code is what `ConfirmSignUp` checks
+/// a presented one against — so what the failure changes is what this call ANSWERS: a
+/// function Lambda cannot invoke at all is "an unexpected exception with Lambda", and one
+/// that ran and reported an error is "a user validation exception with the Lambda service"
+/// (this service's model).
+fn trigger_failed(failure: crate::state::lambda_triggers::Failure) -> SignUpError {
+    match failure {
+        crate::state::lambda_triggers::Failure::Reported(message) => {
+            SignUpErrorModeled::UserLambdaValidationException(UserLambdaValidationException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::lambda_triggers::Failure::NotInvokable(message) => {
+            SignUpErrorModeled::UnexpectedLambdaException(UnexpectedLambdaException {
+                message: Some(message),
+            })
+            .into()
+        }
     }
 }
 

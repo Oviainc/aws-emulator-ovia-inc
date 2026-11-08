@@ -67,6 +67,8 @@ mod clock_dependent_state;
 mod code_delivery_destination_masking;
 #[path = "all/constraint_refusal_values.rs"]
 mod constraint_refusal_values;
+#[path = "all/custom_email_sender_trigger.rs"]
+mod custom_email_sender_trigger;
 #[path = "all/delete_group.rs"]
 mod delete_group;
 #[path = "all/delete_identity_provider.rs"]

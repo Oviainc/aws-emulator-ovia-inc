@@ -201,9 +201,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Request metadata only: the pool and the user are named in the body, and
-        // `ClientMetadata` is input for the Lambda triggers this action would invoke,
-        // which this emulator invokes none of.
-        let _ = ctx;
+        // `ClientMetadata` is input for the Lambda triggers this action reaches, which
+        // for a code-bearing message is the pool's custom email sender.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        // The code is issued under this service's lock, and that lock is RELEASED before
+        // the pool's custom email sender is invoked: nothing else of this service can be
+        // served while a function is being waited for.
+        let issued = self.begin_reset(&input)?;
+
+        // A pool that routes its email to a custom sender delivers this code by handing
+        // it to that function instead of mailing it. It is the same password-reset code
+        // `ForgotPassword` sends, so it is delivered under that stage's source; this
+        // operation is authorized by IAM credentials and names no app client, so the
+        // event reports none.
+        crate::state::lambda_triggers::custom_email::fire_custom_email_sender(
+            ctx,
+            &state,
+            &input.user_pool_id,
+            &issued.username,
+            crate::state::lambda_triggers::custom_email::CustomEmailSource::ForgotPassword,
+            crate::state::lambda_triggers::Caller::of(ctx.parts(), None),
+            input.client_metadata.as_ref(),
+            &issued.code,
+        )
+        .await
+        .map_err(trigger_failed)?;
+
+        // This operation's response models no member: what it did is in the state a
+        // later read renders, and the code itself is delivered out of band.
+        Ok(AdminResetUserPasswordOutput {})
+    }
+}
+
+/// One issued code and the stored user it was issued to.
+struct IssuedCode {
+    username: String,
+    code: String,
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminResetUserPassword<Eng> {
+    /// Begin the reset `input` asks for, and report the code it issued.
+    ///
+    /// Everything here happens under this service's lock, which this call OWNS: the lock
+    /// is taken and released inside it, so its caller holds none of it while it invokes a
+    /// trigger function.
+    fn begin_reset(
+        &self,
+        input: &AdminResetUserPasswordInput,
+    ) -> Result<IssuedCode, AdminResetUserPasswordError> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
@@ -271,12 +318,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // authorises setting one. The user's registration is complete (checked above),
         // so the status it sets is set whatever else the user held before.
         user.status = crate::state::UserStatus::ResetRequired;
-        user.issue_code(crate::state::CodePurpose::PasswordReset, code);
+        let stored = user.issue_code(crate::state::CodePurpose::PasswordReset, code);
         user.user_last_modified_date = now;
 
-        // This operation's response models no member: what it did is in the state a
-        // later read renders, and the code itself is delivered out of band.
-        Ok(AdminResetUserPasswordOutput {})
+        Ok(IssuedCode {
+            username,
+            code: stored.code,
+        })
+    }
+}
+
+/// What the pool's custom email sender's failure is for THIS operation: the modelled
+/// error each outcome amounts to, carrying the message the dispatch built.
+///
+/// The reset has begun and the code is recorded — it is what `ConfirmForgotPassword`
+/// checks a presented one against — so what the failure changes is what this call
+/// ANSWERS: a function Lambda cannot invoke at all is "an unexpected exception with
+/// Lambda", and one that ran and reported an error is "a user validation exception with
+/// the Lambda service" (this service's model).
+fn trigger_failed(
+    failure: crate::state::lambda_triggers::Failure,
+) -> AdminResetUserPasswordError {
+    match failure {
+        crate::state::lambda_triggers::Failure::Reported(message) => {
+            AdminResetUserPasswordErrorModeled::UserLambdaValidationException(
+                UserLambdaValidationException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::lambda_triggers::Failure::NotInvokable(message) => {
+            AdminResetUserPasswordErrorModeled::UnexpectedLambdaException(
+                UnexpectedLambdaException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }
 

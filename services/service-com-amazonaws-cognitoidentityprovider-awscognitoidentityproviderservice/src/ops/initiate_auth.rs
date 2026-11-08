@@ -326,7 +326,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .await
             }
             USER_AUTH => {
-                email_otp_sign_in(&mut state.lock(), &input.client_id, &auth_parameters, now)
+                // The code is minted under this service's lock, which this statement owns
+                // and releases: the pool's custom email sender is invoked on no lock at
+                // all, like every other trigger of this service.
+                let (answer, issued) = email_otp_sign_in(
+                    &mut state.lock(),
+                    &input.client_id,
+                    &auth_parameters,
+                    now,
+                )?;
+                // A pool that routes its email to a custom sender delivers this one-time
+                // password by handing it to that function instead of mailing it.
+                if let Some(issued) = issued {
+                    crate::state::lambda_triggers::custom_email::fire_custom_email_sender(
+                        ctx,
+                        &state,
+                        &issued.user_pool_id,
+                        &issued.username,
+                        crate::state::lambda_triggers::custom_email::CustomEmailSource::Authentication,
+                        caller,
+                        client_metadata,
+                        &issued.code,
+                    )
+                    .await
+                    .map_err(trigger_failed)?;
+                }
+                Ok(answer)
             }
             REFRESH_TOKEN_AUTH | REFRESH_TOKEN => {
                 refresh_sign_in(
@@ -705,7 +730,7 @@ fn email_otp_sign_in(
     client_id: &str,
     auth_parameters: &::std::collections::HashMap<String, String>,
     now: ::std::time::SystemTime,
-) -> Result<InitiateAuthOutput, InitiateAuthError> {
+) -> Result<(InitiateAuthOutput, Option<IssuedCode>), InitiateAuthError> {
     let username = auth_parameters
         .get("USERNAME")
         .ok_or_else(|| missing_auth_parameter("USERNAME", USER_AUTH))?;
@@ -773,6 +798,13 @@ fn email_otp_sign_in(
     // second challenge gets its own session and its own code.
     let code = crate::state::VerificationCode::issued_email_otp(EMAIL, &destination, now);
     let delivery = code.delivery_details();
+    // The code itself is handed to the pool's custom email sender, which on a pool that
+    // configures one is the only place this one-time password is delivered at all.
+    let issued = IssuedCode {
+        user_pool_id: user_pool_id.clone(),
+        username: stored_username.clone(),
+        code: code.code.clone(),
+    };
     let session = state.start_session(
         now,
         crate::state::AuthSession {
@@ -798,16 +830,26 @@ fn email_otp_sign_in(
             challenge_parameters.insert(CODE_DELIVERY_DESTINATION.to_string(), destination);
         }
     }
-    Ok(InitiateAuthOutput {
-        challenge_name: Some(EMAIL_OTP.to_string()),
-        session: Some(session),
-        challenge_parameters: Some(challenge_parameters),
-        authentication_result: None,
-        // "This response parameter prompts a user to select from multiple available
-        // challenges": this request named the challenge it wanted, so there is no
-        // selection to offer.
-        available_challenges: None,
-    })
+    Ok((
+        InitiateAuthOutput {
+            challenge_name: Some(EMAIL_OTP.to_string()),
+            session: Some(session),
+            challenge_parameters: Some(challenge_parameters),
+            authentication_result: None,
+            // "This response parameter prompts a user to select from multiple available
+            // challenges": this request named the challenge it wanted, so there is no
+            // selection to offer.
+            available_challenges: None,
+        },
+        Some(issued),
+    ))
+}
+
+/// One issued code and the stored user it was issued to.
+struct IssuedCode {
+    user_pool_id: String,
+    username: String,
+    code: String,
 }
 
 /// `AuthFlow=REFRESH_TOKEN_AUTH` and its `REFRESH_TOKEN` alias: "Receive new ID and

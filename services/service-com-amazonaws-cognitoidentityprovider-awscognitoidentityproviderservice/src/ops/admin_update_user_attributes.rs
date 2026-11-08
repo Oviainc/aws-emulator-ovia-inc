@@ -222,11 +222,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Request metadata only: the pool and the user are named in the body.
-        // `input.client_metadata` is read nowhere either — it is input for the
-        // Lambda triggers this update would invoke, and this emulator invokes
-        // none (its own filed issue), so it belongs to no workflow and is not
-        // the user's data to store.
-        let _ = ctx;
+        // `input.client_metadata` is input for the Lambda triggers this update
+        // reaches, which for a code-bearing message is the pool's custom email
+        // sender: the map is handed to the function along with the code, and is
+        // not the user's data to store.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        // The update is written under this service's lock, and that lock is
+        // RELEASED before the pool's custom email sender is invoked: nothing else
+        // of this service can be served while a function is being waited for.
+        let issued = self.write_update(&input)?;
+
+        // A pool that routes its email to a custom sender delivers each code this
+        // update sent by handing it to that function instead of mailing it — one
+        // invocation per message. This operation is authorized by IAM credentials
+        // and names no app client, so the event reports none.
+        for code in issued {
+            crate::state::lambda_triggers::custom_email::fire_custom_email_sender(
+                ctx,
+                &state,
+                &input.user_pool_id,
+                &code.username,
+                crate::state::lambda_triggers::custom_email::CustomEmailSource::UpdateUserAttribute,
+                crate::state::lambda_triggers::Caller::of(ctx.parts(), None),
+                input.client_metadata.as_ref(),
+                &code.code,
+            )
+            .await
+            .map_err(trigger_failed)?;
+        }
+
+        Ok(AdminUpdateUserAttributesOutput {})
+    }
+}
+
+/// One issued code and the stored user it was issued to.
+struct IssuedCode {
+    username: String,
+    code: String,
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminUpdateUserAttributes<Eng> {
+    /// Write the update `input` asks for, and report every code it issued.
+    ///
+    /// Everything here happens under this service's lock, which this call OWNS: the lock
+    /// is taken and released inside it, so its caller holds none of it while it invokes a
+    /// trigger function.
+    fn write_update(
+        &self,
+        input: &AdminUpdateUserAttributesInput,
+    ) -> Result<Vec<IssuedCode>, AdminUpdateUserAttributesError> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
@@ -277,7 +323,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|pool| pool.apply_attribute_update(&plan, now))
             .ok_or_else(internal_error)?;
 
-        Ok(AdminUpdateUserAttributesOutput {})
+        // Each code the write recorded is read back for the pool's custom email sender,
+        // which on a pool that configures one is the only place a code is delivered at
+        // all.
+        let pool = guard.pool(&plan.user_pool_id).ok_or_else(internal_error)?;
+        let user = pool.user(&plan.username).ok_or_else(internal_error)?;
+        Ok(plan
+            .verifications
+            .iter()
+            .filter_map(|(attribute, _)| {
+                let issued = user.outstanding_code(
+                    &crate::state::CodePurpose::AttributeVerification(attribute.clone()),
+                )?;
+                Some(IssuedCode {
+                    username: user.username.clone(),
+                    code: issued.code.clone(),
+                })
+            })
+            .collect())
+    }
+}
+
+/// What the pool's custom email sender's failure is for THIS operation: the modelled
+/// error each outcome amounts to, carrying the message the dispatch built.
+///
+/// The update is already written and each code already recorded — a recorded code is what
+/// `VerifyUserAttribute` checks a presented one against — so what the failure changes is
+/// what this call ANSWERS: a function Lambda cannot invoke at all is "an unexpected
+/// exception with Lambda", and one that ran and reported an error is "a user validation
+/// exception with the Lambda service" (this service's model).
+fn trigger_failed(
+    failure: crate::state::lambda_triggers::Failure,
+) -> AdminUpdateUserAttributesError {
+    match failure {
+        crate::state::lambda_triggers::Failure::Reported(message) => {
+            AdminUpdateUserAttributesErrorModeled::UserLambdaValidationException(
+                UserLambdaValidationException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::lambda_triggers::Failure::NotInvokable(message) => {
+            AdminUpdateUserAttributesErrorModeled::UnexpectedLambdaException(
+                UnexpectedLambdaException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }
 

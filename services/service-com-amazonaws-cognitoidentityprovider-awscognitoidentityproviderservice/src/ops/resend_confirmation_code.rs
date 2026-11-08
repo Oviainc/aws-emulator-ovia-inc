@@ -228,9 +228,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Request metadata only: the app client in the body names the pool, and
-        // `ClientMetadata` is input for the Lambda triggers this action would invoke,
-        // which this emulator invokes none of.
-        let _ = ctx;
+        // `ClientMetadata` is input for the Lambda triggers this action reaches, which
+        // for a code-bearing message is the pool's custom email sender.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        // The code is issued under this service's lock, and that lock is RELEASED before
+        // the pool's custom email sender is invoked: nothing else of this service can be
+        // served while a function is being waited for.
+        let resent = self.resend(&input)?;
+
+        // A pool that routes its email to a custom sender delivers this code by handing
+        // it to that function instead of mailing it, with the app client this request
+        // named as the event's caller. A request that issued no code at all — one naming
+        // a user the pool does not hold, answered with a simulated delivery — hands over
+        // nothing either.
+        if let Some(issued) = resent.issued {
+            crate::state::lambda_triggers::custom_email::fire_custom_email_sender(
+                ctx,
+                &state,
+                &issued.user_pool_id,
+                &issued.username,
+                crate::state::lambda_triggers::custom_email::CustomEmailSource::ResendCode,
+                crate::state::lambda_triggers::Caller::of(ctx.parts(), Some(&input.client_id)),
+                input.client_metadata.as_ref(),
+                &issued.code,
+            )
+            .await
+            .map_err(trigger_failed)?;
+        }
+
+        Ok(resent.answer)
+    }
+}
+
+/// What a resend left behind: the answer it owes its caller, and the code it issued for
+/// the pool's custom email sender to deliver.
+struct Resent {
+    /// The answer this resend owes, rendered from the record it stored.
+    answer: ResendConfirmationCodeOutput,
+    /// The code it issued, or `None` where it issued none at all.
+    issued: Option<IssuedCode>,
+}
+
+/// One issued code and the stored user it was issued to.
+struct IssuedCode {
+    user_pool_id: String,
+    username: String,
+    code: String,
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ResendConfirmationCode<Eng> {
+    /// Issue the code `input` asks to be resent, and report what that left behind.
+    ///
+    /// Everything here happens under this service's lock, which this call OWNS: the lock
+    /// is taken and released inside it, so its caller holds none of it while it invokes a
+    /// trigger function.
+    fn resend(&self, input: &ResendConfirmationCodeInput) -> Result<Resent, ResendConfirmationCodeError> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
@@ -260,8 +314,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // destination, since nothing was sent and no code is stored for a user
             // that does not exist. `LEGACY` answers `UserNotFoundException`.
             if hides_user_existence {
-                return Ok(ResendConfirmationCodeOutput {
-                    code_delivery_details: crate::state::simulated_code_delivery_details(),
+                return Ok(Resent {
+                    answer: ResendConfirmationCodeOutput {
+                        code_delivery_details: crate::state::simulated_code_delivery_details(),
+                    },
+                    issued: None,
                 });
             }
             return Err(user_not_found());
@@ -296,10 +353,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|pool| pool.user_mut(&username))
             .ok_or_else(internal_error)?;
         let stored = user.issue_code(crate::state::CodePurpose::SignUpConfirmation, code);
-
-        Ok(ResendConfirmationCodeOutput {
-            code_delivery_details: stored.delivery_details(),
+        Ok(Resent {
+            answer: ResendConfirmationCodeOutput {
+                code_delivery_details: stored.delivery_details(),
+            },
+            issued: Some(IssuedCode {
+                user_pool_id,
+                username,
+                code: stored.code,
+            }),
         })
+    }
+}
+
+/// What the pool's custom email sender's failure is for THIS operation: the modelled
+/// error each outcome amounts to, carrying the message the dispatch built.
+///
+/// The code is already recorded — it is what `ConfirmSignUp` checks a presented one
+/// against, and it already superseded the code before it — so what the failure changes is
+/// what this call ANSWERS: a function Lambda cannot invoke at all is "an unexpected
+/// exception with Lambda", and one that ran and reported an error is "a user validation
+/// exception with the Lambda service" (this service's model).
+fn trigger_failed(
+    failure: crate::state::lambda_triggers::Failure,
+) -> ResendConfirmationCodeError {
+    match failure {
+        crate::state::lambda_triggers::Failure::Reported(message) => {
+            ResendConfirmationCodeErrorModeled::UserLambdaValidationException(
+                UserLambdaValidationException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::lambda_triggers::Failure::NotInvokable(message) => {
+            ResendConfirmationCodeErrorModeled::UnexpectedLambdaException(
+                UnexpectedLambdaException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }
 

@@ -38,6 +38,13 @@ use ::serde_json::{Map, Value};
 
 use super::{User, UserPool};
 
+/// The custom email sender trigger, whose configured function every code-bearing message of
+/// a pool that configures one is routed to instead of being mailed.
+pub mod custom_email;
+
+/// The encrypted message a custom sender's code travels in.
+pub mod esdk;
+
 /// This service's state, as the operation that fires a trigger holds it under the lock.
 type State = super::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState;
 

@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
@@ -227,62 +227,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused whether or not anything has swept it.
         let now = ::std::time::SystemTime::now();
 
-        let mut guard = state.lock();
-        // This operation models no `UserPoolId` and no `Username`: the access token is
-        // what names the pool and the user whose attribute a code is sent for.
-        let (pool, user) = guard
-            .signed_in_user(&input.access_token, now)
-            .map_err(token_rejected)?;
-        let user_pool_id = pool.id.clone();
-        // The username as STORED, which a case-insensitive pool may case differently
-        // from the one the token's sign-in named.
-        let username = user.username.clone();
+        let (details, pending) = {
+            let mut guard = state.lock();
+            // This operation models no `UserPoolId` and no `Username`: the access token is
+            // what names the pool and the user whose attribute a code is sent for.
+            let (pool, user) = guard
+                .signed_in_user(&input.access_token, now)
+                .map_err(token_rejected)?;
+            let user_pool_id = pool.id.clone();
+            // The username as STORED, which a case-insensitive pool may case differently
+            // from the one the token's sign-in named.
+            let username = user.username.clone();
 
-        // A code is a message, so it needs an address to be sent to: only an attribute
-        // that IS such an address can carry one, and which attribute it is decides the
-        // medium the message travels over (`crate::state::delivery_medium`, the same
-        // rule `UpdateUserAttributes` reports a pending value's delivery by). The
-        // refusal states the permitted set and quotes nothing the request asked for.
-        let attribute_name = input.attribute_name.clone();
-        let Some(medium) = crate::state::delivery_medium(&attribute_name) else {
-            return Err(invalid_parameter(
-                crate::state::UNVERIFIABLE_ATTRIBUTE_MESSAGE.to_string(),
-            ));
+            // A code is a message, so it needs an address to be sent to: only an attribute
+            // that IS such an address can carry one, and which attribute it is decides the
+            // medium the message travels over (`crate::state::delivery_medium`, the same
+            // rule `UpdateUserAttributes` reports a pending value's delivery by). The
+            // refusal states the permitted set and quotes nothing the request asked for.
+            let attribute_name = input.attribute_name.clone();
+            let Some(medium) = crate::state::delivery_medium(&attribute_name) else {
+                return Err(invalid_parameter(
+                    crate::state::UNVERIFIABLE_ATTRIBUTE_MESSAGE.to_string(),
+                ));
+            };
+            // The destination is the attribute's STORED value, so a user holding no value
+            // for it has nowhere for a code to be sent — the same refusal, in the one
+            // wording of `crate::state::undeliverable_medium_message`, that every request
+            // asking for a delivery it holds no address for earns.
+            let Some(destination) = user.destination_of(&attribute_name) else {
+                return Err(invalid_parameter(
+                    crate::state::undeliverable_medium_message(medium, &attribute_name),
+                ));
+            };
+
+            // `ClientMetadata` is "input for any custom workflows that this action
+            // triggers" — the Lambda triggers this stage reaches, which for a code-bearing
+            // message is the pool's custom email sender: the map is handed to the function
+            // along with the code.
+
+            // Sending the code is what this operation DOES, so the code it issued is
+            // recorded against the attribute it was issued for; a later code for the same
+            // attribute replaces this one.
+            let stored =
+                crate::state::VerificationCode::issued(&attribute_name, &destination, now);
+            let user = guard
+                .pool_mut(&user_pool_id)
+                .and_then(|pool| pool.user_mut(&username))
+                .ok_or_else(internal_error)?;
+            let stored = user.issue_code(
+                crate::state::CodePurpose::AttributeVerification(attribute_name.clone()),
+                stored,
+            );
+            let details = stored.delivery_details();
+
+            // A pool that routes its email to a custom sender delivers this code by
+            // handing it to that function instead of mailing it. The event is built from
+            // the pool and the user as this call left them, under the lock they are read
+            // from; the app client is the one the access token was issued to, since this
+            // operation names none.
+            let client_id = guard
+                .token(&input.access_token)
+                .map(|record| record.client_id.clone());
+            let pool = guard.pool(&user_pool_id).ok_or_else(internal_error)?;
+            let user = pool.user(&username).ok_or_else(internal_error)?;
+            let pending = crate::state::lambda_triggers::custom_email::custom_email_sender(
+                pool,
+                user,
+                crate::state::lambda_triggers::custom_email::CustomEmailSource::VerifyUserAttribute,
+                crate::state::lambda_triggers::Caller::of(ctx.parts(), client_id.as_deref()),
+                input.client_metadata.as_ref(),
+                &stored.code,
+            );
+            (details, pending)
         };
-        // The destination is the attribute's STORED value, so a user holding no value
-        // for it has nowhere for a code to be sent — the same refusal, in the one
-        // wording of `crate::state::undeliverable_medium_message`, that every request
-        // asking for a delivery it holds no address for earns.
-        let Some(destination) = user.destination_of(&attribute_name) else {
-            return Err(invalid_parameter(
-                crate::state::undeliverable_medium_message(medium, &attribute_name),
-            ));
-        };
 
-        // `ClientMetadata` is "input for any custom workflows that this action
-        // triggers" — Lambda triggers, which this emulator invokes none of, so the map
-        // is accepted and nothing reads it.
-
-        // Sending the code is what this operation DOES, so the code it issued is
-        // recorded against the attribute it was issued for; a later code for the same
-        // attribute replaces this one.
-        let stored = crate::state::VerificationCode::issued(&attribute_name, &destination, now);
-        let user = guard
-            .pool_mut(&user_pool_id)
-            .and_then(|pool| pool.user_mut(&username))
-            .ok_or_else(internal_error)?;
-        let stored = user.issue_code(
-            crate::state::CodePurpose::AttributeVerification(attribute_name.clone()),
-            stored,
-        );
+        if let Some(pending) = pending {
+            crate::state::lambda_triggers::custom_email::invoke_custom_email_sender(ctx, pending)
+                .await
+                .map_err(trigger_failed)?;
+        }
 
         // Rendered from the record just stored, through the delivery-details rule every
         // operation that reports a sent code shares: the destination is the stored
         // attribute value, reported masked, and the medium the one that value is
         // reached over.
         Ok(GetUserAttributeVerificationCodeOutput {
-            code_delivery_details: stored.delivery_details(),
+            code_delivery_details: details,
         })
+    }
+}
+
+/// What the pool's custom email sender's failure is for THIS operation: the modelled error
+/// each outcome amounts to, carrying the message the dispatch built.
+///
+/// The code is issued and recorded either way — it is what `VerifyUserAttribute` checks a
+/// presented code against — so what the failure changes is what this call ANSWERS: a
+/// function Lambda cannot invoke at all is "an unexpected exception with Lambda", and one
+/// that ran and reported an error is "a user validation exception with the Lambda service"
+/// (this service's model).
+fn trigger_failed(
+    failure: crate::state::lambda_triggers::Failure,
+) -> GetUserAttributeVerificationCodeError {
+    match failure {
+        crate::state::lambda_triggers::Failure::Reported(message) => {
+            GetUserAttributeVerificationCodeErrorModeled::UserLambdaValidationException(
+                UserLambdaValidationException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::lambda_triggers::Failure::NotInvokable(message) => {
+            GetUserAttributeVerificationCodeErrorModeled::UnexpectedLambdaException(
+                UnexpectedLambdaException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }
 

@@ -10306,6 +10306,7 @@ dependencies = [
  "aws-emulator-smithy-server-runtime",
  "aws-sdk-cloudwatchlogs",
  "aws-sdk-firehose",
+ "aws-sdk-kms",
  "aws-sdk-lambda",
  "aws-sdk-s3",
  "aws-smithy-runtime-api",
@@ -10320,13 +10321,17 @@ dependencies = [
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-firehose-firehose-20150804",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
+ "service-com-amazonaws-kms-trentservice",
+ "service-com-amazonaws-lambda-awsgirapiservice",
  "service-com-amazonaws-s3-amazons3",
+ "service-com-amazonaws-sqs-amazonsqs",
  "service-com-amazonaws-wafv2-awswaf-20190729",
  "service-common",
  "sha2 0.10.9",
  "subtle",
  "tokio",
  "tracing",
+ "zip",
 ]
 
 [[package]]

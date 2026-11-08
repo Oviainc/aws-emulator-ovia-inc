@@ -248,12 +248,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only: the user is named by the access token in the
-        // body, not by the request's signature. `input.client_metadata` is read
-        // nowhere either — it is input for the Lambda triggers this update
-        // would invoke, and this emulator invokes none (its own filed issue),
-        // so it belongs to no workflow and is not the user's data to store.
-        let _ = ctx;
+        // Request metadata only for the user's identity: the user is named by the
+        // access token in the body, not by the request's signature.
+        // `input.client_metadata` is "input for any custom workflows that this
+        // action triggers" — the Lambda triggers this stage reaches, which for a
+        // code-bearing message is the pool's custom email sender: the map is
+        // handed to the function along with the code, and is not the user's data
+        // to store.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
@@ -261,32 +262,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // token is refused whether or not anything has swept it.
         let now = ::std::time::SystemTime::now();
 
-        let mut guard = state.lock();
-        // Decide the whole update against the STORED pool and user FIRST: every
-        // refusal below leaves the user exactly as it was, so a rejected
-        // request writes nothing.
-        let plan = {
-            let (pool, user) = guard
-                .signed_in_user(&input.access_token, now)
-                .map_err(token_rejected)?;
-            crate::state::plan_attribute_update(
-                pool,
-                user,
-                &input.user_attributes,
-                // The caller IS the user whose values these are, so a verified
-                // flag it submits is stored as the value of a `Boolean`
-                // attribute and asserts nothing about the value beside it.
-                crate::state::VerifiedFlagAuthority::Records,
-            )
-            .map_err(refused)?
+        let (deliveries, pending) = {
+            let mut guard = state.lock();
+            // Decide the whole update against the STORED pool and user FIRST: every
+            // refusal below leaves the user exactly as it was, so a rejected
+            // request writes nothing.
+            let plan = {
+                let (pool, user) = guard
+                    .signed_in_user(&input.access_token, now)
+                    .map_err(token_rejected)?;
+                crate::state::plan_attribute_update(
+                    pool,
+                    user,
+                    &input.user_attributes,
+                    // The caller IS the user whose values these are, so a verified
+                    // flag it submits is stored as the value of a `Boolean`
+                    // attribute and asserts nothing about the value beside it.
+                    crate::state::VerifiedFlagAuthority::Records,
+                )
+                .map_err(refused)?
+            };
+
+            // The write moves an alias value this update takes from another user of
+            // the pool, so it is applied to the POOL rather than to the one user.
+            let deliveries = guard
+                .pool_mut(&plan.user_pool_id)
+                .and_then(|pool| pool.apply_attribute_update(&plan, now))
+                .ok_or_else(internal_error)?;
+
+            // A pool that routes its email to a custom sender delivers each code this
+            // update sent by handing it to that function instead of mailing it — one
+            // invocation per message, read back from the codes the write recorded. The
+            // app client is the one the access token was issued to, since this
+            // operation names none.
+            let client_id = guard
+                .token(&input.access_token)
+                .map(|record| record.client_id.clone());
+            let pool = guard.pool(&plan.user_pool_id).ok_or_else(internal_error)?;
+            let user = pool.user(&plan.username).ok_or_else(internal_error)?;
+            let pending: Vec<_> = plan
+                .verifications
+                .iter()
+                .filter_map(|(attribute, _)| {
+                    let issued = user.outstanding_code(
+                        &crate::state::CodePurpose::AttributeVerification(attribute.clone()),
+                    )?;
+                    crate::state::lambda_triggers::custom_email::custom_email_sender(
+                        pool,
+                        user,
+                        crate::state::lambda_triggers::custom_email::CustomEmailSource::UpdateUserAttribute,
+                        crate::state::lambda_triggers::Caller::of(ctx.parts(), client_id.as_deref()),
+                        input.client_metadata.as_ref(),
+                        &issued.code,
+                    )
+                })
+                .collect();
+            (deliveries, pending)
         };
 
-        // The write moves an alias value this update takes from another user of
-        // the pool, so it is applied to the POOL rather than to the one user.
-        let deliveries = guard
-            .pool_mut(&plan.user_pool_id)
-            .and_then(|pool| pool.apply_attribute_update(&plan, now))
-            .ok_or_else(internal_error)?;
+        for invocation in pending {
+            crate::state::lambda_triggers::custom_email::invoke_custom_email_sender(
+                ctx, invocation,
+            )
+            .await
+            .map_err(trigger_failed)?;
+        }
+
         // Delivery details report the messages this update actually sent, so
         // when it sent none there is nothing to report and the member is
         // OMITTED rather than serialised as an empty list — the same answer
@@ -294,6 +335,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(UpdateUserAttributesOutput {
             code_delivery_details_list: Some(deliveries).filter(|sent| !sent.is_empty()),
         })
+    }
+}
+
+/// What the pool's custom email sender's failure is for THIS operation: the modelled
+/// error each outcome amounts to, carrying the message the dispatch built.
+///
+/// The update is already written and each code already recorded — a recorded code is
+/// what `VerifyUserAttribute` checks a presented one against — so what the failure
+/// changes is what this call ANSWERS: a function Lambda cannot invoke at all is "an
+/// unexpected exception with Lambda", and one that ran and reported an error is "a user
+/// validation exception with the Lambda service" (this service's model).
+fn trigger_failed(failure: crate::state::lambda_triggers::Failure) -> UpdateUserAttributesError {
+    match failure {
+        crate::state::lambda_triggers::Failure::Reported(message) => {
+            UpdateUserAttributesErrorModeled::UserLambdaValidationException(
+                UserLambdaValidationException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::lambda_triggers::Failure::NotInvokable(message) => {
+            UpdateUserAttributesErrorModeled::UnexpectedLambdaException(
+                UnexpectedLambdaException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }
 
