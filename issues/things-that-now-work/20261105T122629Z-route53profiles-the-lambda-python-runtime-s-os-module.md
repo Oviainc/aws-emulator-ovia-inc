@@ -13,6 +13,23 @@ Issue-Commit: 9de1430d35a30df63dfe38bccf7c2cf4feacacf3
 ## Operation
 Invoke
 
+## Resolution note
+The cause this report names — the Lambda Python runtime's `os` module lacking
+`register_at_fork` — is fixed: the runtime's operating-system module now presents the
+surface the platform it reports itself to be presents (the calls `os` builds itself out of,
+and the data it re-exports: the open flags, the access modes, the `stat_result` type), so a
+handler module built only out of the standard library imports cleanly. Step 2 below, whose
+module body does `import random`, `import socket` and `import struct`, now imports and the
+handler RUNS.
+
+The trace this report carries is still blocked one layer further on, by a different cause
+this report does not name: the querier's DNS query has nothing in the VPC to reach. The
+invocation now answers the handler's own `OSError` ("a Lambda function in this emulator has
+no host network to reach") from inside the handler rather than an import error, because the
+emulator serves no in-VPC DNS resolver for the VPC resolver address — an emulator-owned
+resolver answering from Route 53 Resolver firewall rules wired through a Route 53 Profile
+association is a layer of its own and has no report of its own yet.
+
 ## Description
 One net-new root cause, reached by 1 check.
 

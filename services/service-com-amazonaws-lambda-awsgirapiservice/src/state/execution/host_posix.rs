@@ -20,7 +20,9 @@
 //!   a Lambda function's code is at; there is no host directory to be in;
 //! * `urandom` answers bytes from the host's own generator, which is where a Python
 //!   program's randomness comes from; no host device is opened for it;
-//! * `getpid` answers the single process id a function sees.
+//! * `getpid` answers the single process id a function sees;
+//! * `register_at_fork` accepts a registration of the callables a caller wants run around a
+//!   `fork` and runs none of them, because nothing here ever forks.
 //!
 //! Every other CALL a Python program may look for on `posix` is simply ABSENT, so it raises
 //! where the guest reaches for it: there is no file to open, no directory to list, no
@@ -167,13 +169,21 @@ pub(crate) mod module {
 
     /// The live `environ` mapping of this interpreter's `posix` module.
     fn environ_of(vm: &VirtualMachine) -> PyResult<PyDictRef> {
-        let module = vm.import("posix", 0)?;
-        let environ = module.get_attr("environ", vm)?;
+        let environ = attribute_of(vm, "environ")?;
         environ
             .downcast::<::rustpython_vm::builtins::PyDict>()
             .map_err(|_| vm.new_runtime_error("the environment mapping is not a mapping"))
     }
+
+    /// One attribute of this interpreter's `posix` module, by name.
+    fn attribute_of(vm: &VirtualMachine, name: &'static str) -> PyResult<PyObjectRef> {
+        let module = vm.import("posix", 0)?;
+        module.get_attr(name, vm)
+    }
 }
+
+#[cfg(test)]
+mod tests;
 
 /// The flag NUMBERS a POSIX module carries, as the platform's own C headers define them —
 /// read from `libc` rather than written out here, so what a run sees is this machine's.
