@@ -244,6 +244,39 @@ pub const APIS: &[Api] = &[
             json_version: "1.1",
         },
     },
+    // `services/service-com-amazonaws-sfn-awsstepfunctions/smithy-model/
+    // com-amazonaws-sfn-awsstepfunctions.json`: awsJson1_0, sigv4Name `states`,
+    // endpointPrefix `states`, sdkId `SFN`, service shape `AWSStepFunctions`.
+    //
+    // A STATE MACHINE'S OWN TASK is the other half of a Step Functions workflow: a `Task`
+    // state invokes a function, and the function carries the workflow on by starting,
+    // stopping or reporting on an execution — and a callback task reports its outcome back
+    // through `SendTaskSuccess`/`SendTaskFailure` — so a handler that cannot reach this
+    // service cannot take part in one.
+    //
+    // The token is the one an SDK client names this service by: the AWS SDK for Python's
+    // own name for it is `stepfunctions`, which is what `boto3.client("stepfunctions")` is
+    // given.
+    Api {
+        sdk_token: "stepfunctions",
+        signing_name: "states",
+        endpoint_prefix: "states",
+        protocol: Protocol::AwsJson {
+            target_prefix: "AWSStepFunctions",
+            json_version: "1.0",
+        },
+    },
+    // The same service under the token its own SDK id gives it, as EventBridge and
+    // CloudWatch Logs are above.
+    Api {
+        sdk_token: "sfn",
+        signing_name: "states",
+        endpoint_prefix: "states",
+        protocol: Protocol::AwsJson {
+            target_prefix: "AWSStepFunctions",
+            json_version: "1.0",
+        },
+    },
     // `services/service-com-amazonaws-sesv2-simpleemailservice-v2/smithy-model/
     // com-amazonaws-sesv2-simpleemailservice-v2.json`: restJson1, sigv4Name `ses`,
     // endpointPrefix `email`, sdkId `SESv2`. Its requests are bound per operation out of

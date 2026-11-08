@@ -208,6 +208,9 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # A handler's SDK call to a REST-bound service is asserted against the service that answers
 # it, so Amazon API Gateway is mounted beside lambda on ONE engine for those tests.
 service-com-amazonaws-apigateway-backplanecontrolservice = { workspace = true }
+# A handler's SDK call to AWS Step Functions is asserted against the execution that service
+# started, so Step Functions is mounted beside lambda on ONE engine for that test.
+service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
 # The same for Amazon SES API v2, the other REST-bound service a handler's SDK reaches: the
 # identity, configuration set and message a handler's calls produce are read back through
 # that service's own API, mounted beside lambda on ONE engine.

@@ -13497,6 +13497,7 @@ dependencies = [
  "service-com-amazonaws-kms-trentservice",
  "service-com-amazonaws-s3-amazons3",
  "service-com-amazonaws-sesv2-simpleemailservice-v2",
+ "service-com-amazonaws-sfn-awsstepfunctions",
  "service-com-amazonaws-sqs-amazonsqs",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",
