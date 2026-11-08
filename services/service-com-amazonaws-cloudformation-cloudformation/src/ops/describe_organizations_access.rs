@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeOrganizationsAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeOrganizationsAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeOrganizationsAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports this organization's TRUSTED ACCESS with Organizations: the one setting
+//! `ActivateOrganizationsAccess` and `DeactivateOrganizationsAccess` write, held in this
+//! service's store ([`crate::state::organizations_access`]) rather than derived from anything
+//! in the request, so the status this answers is the one the last write left.
+//!
+//! A pure report: it reads that setting and writes nothing. The one thing it refuses is a
+//! request that says it was made as a DELEGATED ADMINISTRATOR — a claim no caller of this
+//! emulator can make good on, see that module — which is the modelled
+//! `InvalidOperationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +149,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeOrganizationsAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeOrganizationsAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeOrganizationsAccess"))
+        // Trusted access is the ORGANIZATION's, not one Region's: the Region the request was
+        // signed for selects nothing here.
+        let _ = ctx;
+
+        // "[Service-managed permissions] Specifies whether you are acting as an account
+        // administrator in the organization's management account or as a delegated
+        // administrator in a member account", where the latter requires that "your Amazon Web
+        // Services account must be registered as a delegated administrator in the management
+        // account". The account this emulator stands for is the management account of its
+        // organization, which is never a delegated administrator of it, so the claim is
+        // refused with the modelled `InvalidOperationException` before any read: that refusal
+        // is a property of the request rather than of what the store holds.
+        if crate::state::organizations_access::claims_delegated_administrator(
+            input.call_as.as_deref(),
+        ) {
+            return Err(
+                DescribeOrganizationsAccessErrorModeled::InvalidOperationException(
+                    InvalidOperationException {
+                        message: Some(
+                            crate::state::organizations_access::NOT_A_DELEGATED_ADMINISTRATOR
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no store holding the setting, so this
+            // answers 501 rather than a status nothing stands behind.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeOrganizationsAccess",
+            ));
+        };
+        // A pure report: nothing here writes, and there is no `settle` call either, because
+        // trusted access carries no status the clock owes — it moves only when a call
+        // activates or deactivates it.
+        let status = state.lock().organizations_access.status();
+
+        Ok(DescribeOrganizationsAccessOutput {
+            // "Presents the status of the OrganizationAccess", off the stored setting.
+            status: Some(status.to_string()),
+        })
     }
 }

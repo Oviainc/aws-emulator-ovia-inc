@@ -115,8 +115,12 @@ const ERROR_CASES: &[ErrorCase] = &[
         code: "ValidationError",
     },
     ErrorCase {
+        // Any operation this emulator has not implemented yet serves this row; it named
+        // `DescribeOrganizationsAccess` until that one was implemented
+        // (`organizations_access.rs`), so it names a stub that IS still one
+        // (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' src/ops/`).
         case: "scaffolded operation, which answers the 501 channel",
-        action: "DescribeOrganizationsAccess",
+        action: "ListStackRefactors",
         members: &[],
         status: 501,
         code: "NotImplemented",

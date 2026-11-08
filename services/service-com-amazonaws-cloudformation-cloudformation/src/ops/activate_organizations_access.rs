@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ActivateOrganizationsAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ActivateOrganizationsAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ActivateOrganizationsAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ACTIVATES this organization's trusted access with Organizations: the one setting
+//! `DescribeOrganizationsAccess` reads back, held in this service's store
+//! ([`crate::state::organizations_access`]).
+//!
+//! The write is the whole operation — the model gives it no input and no output members — and
+//! it is the management account's to make, which is the account every request reaching this
+//! emulator is made by.
 //!
 //! ## Shape of an operation
 //!
@@ -131,18 +130,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ActivateOrganizationsAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ActivateOrganizationsAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ActivateOrganizationsAccess"))
+        // Trusted access is the ORGANIZATION's, not one Region's, and the operation takes no
+        // input: neither the Region the request was signed for nor the request itself selects
+        // anything here.
+        let _ = (&input, ctx);
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no store to activate trusted access
+            // in, so this answers 501 rather than a success a later read would contradict.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ActivateOrganizationsAccess",
+            ));
+        };
+        // No `settle` call: trusted access belongs to no stack and carries no status the clock
+        // owes — the modelled `OrganizationStatus` has no in-progress value, so the activation
+        // is in force for the next read.
+        state.lock().organizations_access.activate();
+
+        Ok(ActivateOrganizationsAccessOutput {})
     }
 }

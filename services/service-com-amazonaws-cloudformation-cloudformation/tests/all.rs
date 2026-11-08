@@ -227,6 +227,8 @@ mod nested_stacks;
 mod no_echo_parameters;
 #[path = "all/operation_events.rs"]
 mod operation_events;
+#[path = "all/organizations_access.rs"]
+mod organizations_access;
 #[path = "all/out_of_band_resource_scan.rs"]
 mod out_of_band_resource_scan;
 #[path = "all/parameter_and_change_set_conflicts.rs"]

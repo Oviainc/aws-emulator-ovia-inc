@@ -224,9 +224,11 @@ async fn every_served_call_is_recorded_and_an_unimplemented_one_is_not() {
         ),
         (
             // Still a stub in this emulator: it answers 501, so nothing was served and
-            // nothing is recorded.
+            // nothing is recorded. This row named `ActivateOrganizationsAccess` until that
+            // one was implemented (`organizations_access.rs`), so it names a stub that IS
+            // still one (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' src/ops/`).
             "an unimplemented operation",
-            "ActivateOrganizationsAccess",
+            "ListStackRefactors",
             vec![],
             501,
             None,

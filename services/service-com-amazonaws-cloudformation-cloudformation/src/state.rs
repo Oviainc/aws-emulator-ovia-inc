@@ -410,6 +410,11 @@ pub mod service_role;
 /// which `ListStackSetOperations` reports summaries of.
 pub mod stack_sets;
 
+/// TRUSTED ACCESS with Organizations: the organization-wide setting the StackSets
+/// organizations-access operations write and read back, and who may call them as a delegated
+/// administrator.
+pub mod organizations_access;
+
 /// Rolling one stack-set `UPDATE` out over the stack instances it acts on: the half
 /// `UpdateStackSet` and `UpdateStackInstances` share.
 pub mod stack_set_rollout;
@@ -2211,6 +2216,14 @@ pub struct ComAmazonawsCloudformationCloudformationState {
     /// the clock owes it is its own creation concluding, which [`Self::settle`] materialises,
     /// and it is bounded at [`stack_refactors::MAX_STACK_REFACTORS`], oldest reclaimed first.
     pub stack_refactors: Vec<stack_refactors::StoredStackRefactor>,
+    /// Whether trusted access between StackSets and Organizations is activated, which
+    /// `ActivateOrganizationsAccess` / `DeactivateOrganizationsAccess` write and
+    /// `DescribeOrganizationsAccess` reads back (see [`organizations_access`]).
+    ///
+    /// A property of the ORGANIZATION rather than of a Region's stacks, so there is one of
+    /// these and it is not namespaced by Region; it belongs to no stack, so it is neither
+    /// settled nor reclaimed with one.
+    pub organizations_access: organizations_access::TrustedAccess,
 }
 
 impl ComAmazonawsCloudformationCloudformationState {
