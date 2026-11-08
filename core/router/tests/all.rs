@@ -1029,3 +1029,8 @@ mod cloudformation_imports_an_existing_queue;
 mod logs_subscription_filter_to_firehose_s3;
 #[path = "all/zz_opensearch_fgac_probe.rs"]
 mod zz_opensearch_fgac_probe;
+// Declared here, in this same head region, for the reason the entries above record: this
+// suite holds THIS list to one declaration per suite, so it belongs to no service's span of
+// the sorted list either.
+#[path = "all/all_rs_declares_each_suite_once.rs"]
+mod all_rs_declares_each_suite_once;
