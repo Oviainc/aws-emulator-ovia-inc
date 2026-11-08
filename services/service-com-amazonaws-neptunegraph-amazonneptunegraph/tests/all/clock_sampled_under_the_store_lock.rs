@@ -24,7 +24,7 @@
 //! handler's own waiting, not the wall clock's, so nothing here is raced. The tables span
 //! what the rule generalises over — each kind of transition this service owes (a stop, a
 //! start, a provisioning, a reconfiguration, a snapshot, a reset, a deletion, a query's
-//! run span), and the reporting, writing and listing operations that read the store
+//! timeout), and the reporting, writing and listing operations that read the store
 //! afterwards — rather than re-running one recorded request.
 
 use std::sync::mpsc;
@@ -35,12 +35,12 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::state::{
     ComAmazonawsNeptunegraphAmazonneptunegraphState as Store, DELETION_SPAN, PROVISIONING_SPAN,
-    QUERY_RUN_SPAN,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::query_cancellation::{
-    admit_query, call, emulator, error_code, graph_in_service, REGION,
+    admit_query_with_timeout, assert_invalid_query_id, call, emulator, error_code,
+    graph_in_service, REGION,
 };
 use crate::resource_tagging::encode;
 
@@ -626,10 +626,10 @@ async fn every_operation_reads_a_store_whose_owed_deletion_was_carried_out_first
 async fn the_query_operations_read_a_store_whose_owed_terminations_were_reaped_first() {
     // The id forms the model allows (`queryId` is a plain `String` with no pattern), one
     // per probe, so each row drives a query of its own on a store of its own. The last
-    // row is a LISTING, which answers an empty page rather than a 404.
+    // row is a LISTING, which answers an empty page rather than a refusal.
     let rows: Vec<(&str, &str, Step, bool)> = vec![
         (
-            "GetQuery reports no query whose run span ran out",
+            "GetQuery reports no query whose timeout ran out",
             "6f3a1b2c-4d5e-4f60-8a91-b2c3d4e5f607",
             header_step("GET", "/queries/6f3a1b2c-4d5e-4f60-8a91-b2c3d4e5f607", None),
             false,
@@ -641,13 +641,17 @@ async fn the_query_operations_read_a_store_whose_owed_terminations_were_reaped_f
             false,
         ),
         (
-            "ListQueries walks no query whose run span ran out",
+            "ListQueries walks no query whose timeout ran out",
             "q",
             header_step("GET", "/queries?maxResults=100", None),
             true,
         ),
     ];
 
+    // The timeout the admitting request asks for
+    // (`ExecuteQuery$queryTimeoutMilliseconds`), short enough to fall due while the
+    // request under test waits for the store.
+    let timeout = Duration::from_millis(250);
     for (case, query_id, probe, listing) in rows {
         let (router, engine) = emulator();
         let graph = graph_in_service(&router, "query-clock-graph").await;
@@ -655,15 +659,15 @@ async fn the_query_operations_read_a_store_whose_owed_terminations_were_reaped_f
             .as_str()
             .unwrap_or_else(|| panic!("case {case:?}: a created graph has an ARN"))
             .to_string();
-        // Admitted the way the still-scaffolded `ExecuteQuery` will, so its run span
+        // Admitted the way the still-scaffolded `ExecuteQuery` will, so its timeout
         // starts now and falls due while the request under test waits for the store.
-        admit_query(&engine, &graph, query_id, "MATCH (n) RETURN n", true);
+        admit_query_with_timeout(&engine, &graph, query_id, "MATCH (n) RETURN n", true, timeout);
 
         let issued_at = Instant::now();
-        let holder = hold_store_lock(&engine, QUERY_RUN_SPAN + MARGIN);
+        let holder = hold_store_lock(&engine, timeout + MARGIN);
         let (status, answered) = dispatch(&router, &probe, &graph, &arn).await;
         let released = released_at(holder);
-        assert_window(case, issued_at, released, QUERY_RUN_SPAN);
+        assert_window(case, issued_at, released, timeout);
 
         if listing {
             assert_eq!(
@@ -676,16 +680,9 @@ async fn the_query_operations_read_a_store_whose_owed_terminations_were_reaped_f
                 "case {case:?}: the terminated query must not be listed, got {answered}"
             );
         } else {
-            assert_eq!(
-                status, 404,
-                "case {case:?}: the run span was out before the request read the store, \
-                 so the query is gone, got {status}: {answered}"
-            );
-            assert_eq!(
-                error_code(&answered),
-                "ResourceNotFoundException",
-                "case {case:?}: unexpected error code in {answered}"
-            );
+            // The timeout was out before the request read the store, so the id names no
+            // query at all.
+            assert_invalid_query_id(case, query_id, status, &answered);
         }
 
         // The graph the query ran on is untouched by the reaping: it is still in service

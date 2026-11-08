@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::state::{
-    ComAmazonawsNeptunegraphAmazonneptunegraphState as Store, MAX_QUERY_STRING_CHARS,
-    QUERY_RUN_SPAN,
+    ComAmazonawsNeptunegraphAmazonneptunegraphState as Store, DEFAULT_QUERY_TIMEOUT,
+    MAX_QUERY_STRING_CHARS,
 };
 
 use super::query_cancellation::{
@@ -46,14 +46,14 @@ const OUTPUT_MEMBERS: &[&str] = &["id", "queryString", "state", "waited", "elaps
 /// passed is not a race with the emulator's own scheduling.
 const DURATION_SLACK_MILLIS: i64 = 5;
 
-/// The milliseconds of `QUERY_RUN_SPAN`, the upper bound on how long a query this store
-/// still reports can have been in flight.
-fn run_span_millis() -> i64 {
-    i64::try_from(QUERY_RUN_SPAN.as_millis()).expect("the run span fits in an i64")
+/// The milliseconds of `DEFAULT_QUERY_TIMEOUT`, the upper bound on how long a query this
+/// store still reports can have been in flight.
+fn query_timeout_millis() -> i64 {
+    i64::try_from(DEFAULT_QUERY_TIMEOUT.as_millis()).expect("the timeout fits in an i64")
 }
 
-/// The instant the stored query is over on its own, as the store holds it.
-fn completion_due(
+/// The instant the stored query's own timeout runs out, as the store holds it.
+fn timeout_due(
     engine: &Arc<engine::InMemoryEngine>,
     graph_id: &str,
     query_id: &str,
@@ -64,12 +64,12 @@ fn completion_due(
         .queries
         .get(graph_id)
         .and_then(|queries| queries.get(query_id))
-        .map(|query| query.completes_at)
+        .map(|query| query.times_out_at)
 }
 
 /// (case, admitted RUNNING, the span of clock the caller lets pass before reading). Each
-/// span stays well inside `QUERY_RUN_SPAN`, so the query is still in flight when it is
-/// read.
+/// span stays well inside `DEFAULT_QUERY_TIMEOUT`, so the query is still in flight when
+/// it is read.
 const DURATION_CASES: &[(&str, bool, u64)] = &[
     ("running, read at once", true, 0),
     ("running, read after a short span", true, 80),
@@ -117,9 +117,9 @@ async fn the_reported_durations_measure_the_clock_against_the_stored_instants() 
                 "case {case:?}: expected elapsed of at least {floor}ms after {span}ms, got {elapsed}"
             );
             assert!(
-                elapsed < run_span_millis(),
+                elapsed < query_timeout_millis(),
                 "case {case:?}: a query still in flight has run for less than {}ms, got {elapsed}",
-                run_span_millis()
+                query_timeout_millis()
             );
         } else {
             // A query that has not started has run for no time at all, and the span it
@@ -133,9 +133,9 @@ async fn the_reported_durations_measure_the_clock_against_the_stored_instants() 
                 "case {case:?}: expected waited of at least {floor}ms after {span}ms, got {waited}"
             );
             assert!(
-                waited < run_span_millis(),
+                waited < query_timeout_millis(),
                 "case {case:?}: a query still in flight has waited less than {}ms, got {waited}",
-                run_span_millis()
+                query_timeout_millis()
             );
         }
     }
@@ -267,13 +267,13 @@ async fn reading_a_query_changes_nothing_a_later_caller_sees() {
             expected_state = "CANCELLING";
         }
 
-        // What the record owes the clock before anybody reads it: when the query is over
-        // on its own, and when its accepted cancellation (if any) falls due.
-        let completes_at = completion_due(&engine, &graph, query_id);
+        // What the record owes the clock before anybody reads it: when its own timeout
+        // runs out, and when its accepted cancellation (if any) falls due.
+        let times_out_at = timeout_due(&engine, &graph, query_id);
         let terminates_at = termination_due(&engine, &graph, query_id);
         assert!(
-            completes_at.is_some(),
-            "case {case:?}: an admitted query is owed an end, got {completes_at:?}"
+            times_out_at.is_some(),
+            "case {case:?}: an admitted query runs under a timeout, got {times_out_at:?}"
         );
         assert_eq!(
             terminates_at.is_some(),
@@ -313,9 +313,9 @@ async fn reading_a_query_changes_nothing_a_later_caller_sees() {
             // Reading neither shortens the query's life nor starts a termination the
             // caller never asked for.
             assert_eq!(
-                completion_due(&engine, &graph, query_id),
-                completes_at,
-                "case {case:?} (read {read}): a read must not move when the query ends"
+                timeout_due(&engine, &graph, query_id),
+                times_out_at,
+                "case {case:?} (read {read}): a read must not move when the query times out"
             );
             assert_eq!(
                 termination_due(&engine, &graph, query_id),

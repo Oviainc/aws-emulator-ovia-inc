@@ -192,11 +192,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetQueryErrorModeled::ValidationException(refused).into());
         }
 
+        // A query id names a query only while that query is in flight: once it is over,
+        // the value names nothing the service can resolve at all, which is an invalid
+        // ARGUMENT rather than a resource that is missing — the one refusal
+        // `crate::state::invalid_query_id` states for every operation addressed by
+        // `queryId`.
         let Some(query) = store.live_query(&input.graph_identifier, &input.query_id, now) else {
-            return Err(GetQueryErrorModeled::ResourceNotFoundException(
-                crate::state::query_not_found(&input.graph_identifier, &input.query_id),
-            )
-            .into());
+            return Err(
+                GetQueryErrorModeled::ValidationException(crate::state::invalid_query_id(
+                    &input.query_id,
+                ))
+                .into(),
+            );
         };
 
         // Every member is read off the stored record, and the two durations are read

@@ -1004,6 +1004,15 @@ mod medical_imaging_dicom_import;
 // answered with, and the one stream record each new item they write carries.
 #[path = "all/apigateway_repeated_stage_requests.rs"]
 mod apigateway_repeated_stage_requests;
+// Several suites that stood here are each ALREADY declared above, in the sorted head: two
+// concurrent changes appended the same entry, which is a redefinition and stops this target
+// from compiling, so the duplicate lines are removed and the first declaration of each
+// stands. Add a NEW suite in the sorted span its name belongs to, and check it is not
+// already declared before appending it here.
+// Declared HERE, beside the sibling suites above in the same quiet `n`/`o` gap, for the
+// reason those entries record: the appended tail at the end of this file and the `e…` span
+#[path = "all/eks_control_plane_logs.rs"]
+mod eks_control_plane_logs;
 // Declared HERE, beside the sibling suites above in the same quiet `n`/`o` gap, for the
 // reason those entries record: the appended tail at the end of this file and the `e…` span
 #[path = "all/eks_control_plane_logs.rs"]

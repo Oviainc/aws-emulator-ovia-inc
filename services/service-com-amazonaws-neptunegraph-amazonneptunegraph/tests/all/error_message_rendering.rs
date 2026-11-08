@@ -14,11 +14,11 @@
 //!    reports the account the lookup resolved in as well as the identifier requested.
 //!    The rows span every operation that resolves a `graphIdentifier` and several
 //!    well-formed identifiers.
-//! 3. That account-scoped wording names the KIND of resource that was looked for, spelled
-//!    the same way in the identifier clause as in the opening clause, for every
-//!    account-scoped namespace this service resolves in — not just graphs. The rows span
-//!    every resource kind, each of its implemented lookups, and several well-formed
-//!    identifiers per kind.
+//! 3. That account-scoped wording names the KIND of resource that was looked for, and
+//!    then the identifier clause as the OPERATION words it: every lookup but a task
+//!    CANCEL spells the resource kind in front of that clause, while `CancelImportTask`
+//!    and `CancelExportTask` carry the bare `task id`. The rows span every resource kind,
+//!    each of its implemented lookups, and several well-formed identifiers per kind.
 
 use std::sync::Arc;
 
@@ -434,22 +434,29 @@ async fn a_missing_graph_is_reported_against_the_account_and_the_requested_id() 
 }
 
 /// One implemented lookup of a resource kind: the operation, its HTTP method, its path
-/// template (with `{id}` where the identifier goes) and the body it needs.
-type Lookup = (&'static str, &'static str, &'static str, Option<Value>);
+/// template (with `{id}` where the identifier goes), the body it needs, and the
+/// identifier clause this operation words its refusal with.
+type Lookup = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<Value>,
+    &'static str,
+);
 
-/// One account-scoped resource kind: the kind as the service names it, the kind of
-/// identifier it is addressed by, the lookups that resolve it, and identifiers that name
-/// nothing.
-type ResourceClass = (&'static str, &'static str, Vec<Lookup>, Vec<String>);
+/// One account-scoped resource kind: the kind as the service names it, the lookups that
+/// resolve it, and identifiers that name nothing.
+type ResourceClass = (&'static str, Vec<Lookup>, Vec<String>);
 
-/// Every account-scoped lookup words "this account holds no such resource" the same way,
-/// and names the KIND of resource it searched for in both clauses of that wording.
+/// Every account-scoped lookup words "this account holds no such resource" the same way:
+/// the KIND of resource it searched for, the account it searched in, and the identifier
+/// clause its own operation words.
 ///
 /// The table spans what the rule generalises over: the resource kind (graph, snapshot,
 /// import task, export task, and a resource addressed by ARN), the operation that
-/// resolves it (read and delete/cancel, GET, DELETE and POST), and the identifier value
-/// (the extremes of each id space, plus a mixed one, and for an ARN a changed resource
-/// type, resource id and partition).
+/// resolves it (read and delete/cancel, GET, DELETE and POST) and so the clause each
+/// words, and the identifier value (the extremes of each id space, plus a mixed one, and
+/// for an ARN a changed resource type, resource id and partition).
 #[tokio::test]
 async fn every_missing_resource_is_reported_with_its_own_resource_kind() {
     let router = emulator();
@@ -488,71 +495,105 @@ async fn every_missing_resource_is_reported_with_its_own_resource_kind() {
         format!("arn:aws-cn:neptune-graph:cn-north-1:{account}:graph:g-a1b2c3d4e5"),
     ];
 
-    // (resource kind as the service names it, the kind of identifier it is addressed by,
-    // the implemented lookups that resolve it, the identifiers that name nothing)
+    // (resource kind as the service names it, the implemented lookups that resolve it
+    // with the identifier clause each words, the identifiers that name nothing)
     let classes: Vec<ResourceClass> = vec![
         (
             "graph",
-            "id",
             vec![
-                ("GetGraph", "GET", "/graphs/{id}", None),
+                ("GetGraph", "GET", "/graphs/{id}", None, "graph id"),
                 (
                     "UpdateGraph",
                     "PATCH",
                     "/graphs/{id}",
                     Some(json!({"provisionedMemory": 32})),
+                    "graph id",
                 ),
                 (
                     "DeleteGraph",
                     "DELETE",
                     "/graphs/{id}?skipSnapshot=true",
                     None,
+                    "graph id",
                 ),
             ],
             graph_ids.iter().map(|id| (*id).to_string()).collect(),
         ),
         (
             "snapshot",
-            "id",
-            vec![("GetGraphSnapshot", "GET", "/snapshots/{id}", None)],
+            vec![(
+                "GetGraphSnapshot",
+                "GET",
+                "/snapshots/{id}",
+                None,
+                "snapshot id",
+            )],
             snapshot_ids.iter().map(|id| (*id).to_string()).collect(),
         ),
         (
             "import task",
-            "id",
             vec![
-                ("GetImportTask", "GET", "/importtasks/{id}", None),
-                ("CancelImportTask", "DELETE", "/importtasks/{id}", None),
+                (
+                    "GetImportTask",
+                    "GET",
+                    "/importtasks/{id}",
+                    None,
+                    "import task id",
+                ),
+                (
+                    "CancelImportTask",
+                    "DELETE",
+                    "/importtasks/{id}",
+                    None,
+                    "task id",
+                ),
             ],
             task_ids.iter().map(|id| (*id).to_string()).collect(),
         ),
         (
             "export task",
-            "id",
             vec![
-                ("GetExportTask", "GET", "/exporttasks/{id}", None),
-                ("CancelExportTask", "DELETE", "/exporttasks/{id}", None),
+                (
+                    "GetExportTask",
+                    "GET",
+                    "/exporttasks/{id}",
+                    None,
+                    "export task id",
+                ),
+                (
+                    "CancelExportTask",
+                    "DELETE",
+                    "/exporttasks/{id}",
+                    None,
+                    "task id",
+                ),
             ],
             task_ids.iter().map(|id| (*id).to_string()).collect(),
         ),
         (
             "resource",
-            "arn",
             vec![
-                ("ListTagsForResource", "GET", "/tags/{id}", None),
+                (
+                    "ListTagsForResource",
+                    "GET",
+                    "/tags/{id}",
+                    None,
+                    "resource arn",
+                ),
                 (
                     "TagResource",
                     "POST",
                     "/tags/{id}",
                     Some(json!({"tags": {"owner": "tests"}})),
+                    "resource arn",
                 ),
             ],
             absent_arns.to_vec(),
         ),
     ];
 
-    for (resource, identifier_kind, operations, identifiers) in classes {
-        for (operation, method, template, body) in operations {
+    for (resource, operations, identifiers) in classes {
+        for (operation, method, template, body, clause) in operations {
             for identifier in &identifiers {
                 let case = format!("{operation} for {identifier}");
                 let path = template.replace("{id}", identifier);
@@ -568,8 +609,7 @@ async fn every_missing_resource_is_reported_with_its_own_resource_kind() {
                 );
                 let actual = message(&answer);
                 let expected = format!(
-                    "No {resource} found for customer [{account}] with {resource} \
-                     {identifier_kind} [{identifier}]"
+                    "No {resource} found for customer [{account}] with {clause} [{identifier}]"
                 );
                 assert_eq!(
                     actual, expected,

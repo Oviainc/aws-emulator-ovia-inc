@@ -3,18 +3,22 @@
 //! How a task lookup words "this account holds no such task", driven over the wire
 //! (`restJson1`) through the same router the emulator serves from.
 //!
-//! The rule: an account-scoped lookup that resolves nothing reports the KIND of
-//! resource it searched for, spelled identically in the opening clause and in front of
-//! the identifier clause — so a task read never falls back to a kind-less "task id"
-//! clause that would leave a caller unable to tell which namespace was searched.
+//! The rule: an account-scoped lookup that resolves nothing reports the KIND of resource
+//! it searched for and the account it searched in, and then the identifier clause AS THE
+//! OPERATION WORDS IT — the operations that READ a task (`GetImportTask`,
+//! `GetExportTask`) spell the task's own kind in front of that clause, the operations
+//! that CANCEL one (`CancelImportTask`, `CancelExportTask`) carry the bare `task id`.
+//! Neither inherits the other's wording, so a client that matches the refusal of one
+//! operation recognises it.
 //!
 //! Import tasks and export tasks share ONE modelled identifier space (`TaskId` and
-//! `ExportTaskId` are both `^t-[a-z0-9]{10}$`) while living in two namespaces, so this
-//! rule is what distinguishes their refusals. The table below therefore spans:
+//! `ExportTaskId` are both `^t-[a-z0-9]{10}$`) while living in two namespaces, which is
+//! why the READ spells the kind out: on a read that prefix is the only thing in the
+//! message that says which namespace was searched. The table below therefore spans:
 //!
 //! * the namespace (import, export) and so the kind word each reports;
 //! * the operation that resolves the identifier (the read and the cancel of each kind,
-//!   over GET and DELETE);
+//!   over GET and DELETE), and so the identifier clause each words;
 //! * the identifier value — the extremes of the shared id space, a mixed one, and the
 //!   id of a task that really exists IN THE SIBLING NAMESPACE, which is the one value
 //!   that is well formed, stored, and still not found by this lookup.
@@ -186,12 +190,13 @@ async fn stored_export_task(router: &MultiServiceRouter, graph_name: &str) -> St
         .to_string()
 }
 
-/// One lookup of a task namespace: the operation, its HTTP method and its path template
-/// with `{id}` where the identifier goes.
-type Lookup = (&'static str, &'static str, &'static str);
+/// One lookup of a task namespace: the operation, its HTTP method, its path template
+/// with `{id}` where the identifier goes, and whether that operation spells the task's
+/// kind in front of the identifier clause (the reads do, the cancels do not).
+type Lookup = (&'static str, &'static str, &'static str, bool);
 
 #[tokio::test]
-async fn a_task_lookup_that_resolves_nothing_names_its_own_task_kind() {
+async fn a_task_lookup_that_resolves_nothing_words_its_operations_identifier_clause() {
     let router = emulator();
 
     // One task really stored in each namespace, so the refusals below are about the
@@ -215,16 +220,16 @@ async fn a_task_lookup_that_resolves_nothing_names_its_own_task_kind() {
         (
             "import task",
             vec![
-                ("GetImportTask", "GET", "/importtasks/{id}"),
-                ("CancelImportTask", "DELETE", "/importtasks/{id}"),
+                ("GetImportTask", "GET", "/importtasks/{id}", true),
+                ("CancelImportTask", "DELETE", "/importtasks/{id}", false),
             ],
             export_task.as_str(),
         ),
         (
             "export task",
             vec![
-                ("GetExportTask", "GET", "/exporttasks/{id}"),
-                ("CancelExportTask", "DELETE", "/exporttasks/{id}"),
+                ("GetExportTask", "GET", "/exporttasks/{id}", true),
+                ("CancelExportTask", "DELETE", "/exporttasks/{id}", false),
             ],
             import_task.as_str(),
         ),
@@ -233,7 +238,7 @@ async fn a_task_lookup_that_resolves_nothing_names_its_own_task_kind() {
     for (kind, lookups, sibling_id) in namespaces {
         let mut identifiers: Vec<&str> = unminted.to_vec();
         identifiers.push(sibling_id);
-        for (operation, method, template) in lookups {
+        for (operation, method, template, spells_the_kind) in lookups {
             for identifier in &identifiers {
                 let case = format!("{operation} for {identifier}");
                 let path = template.replace("{id}", identifier);
@@ -248,17 +253,16 @@ async fn a_task_lookup_that_resolves_nothing_names_its_own_task_kind() {
                     "case {case:?}: expected ResourceNotFoundException, got {answer}"
                 );
                 let actual = message(&answer);
-                let expected = format!(
-                    "No {kind} found for customer [{account}] with {kind} id [{identifier}]"
-                );
+                let clause = if spells_the_kind {
+                    format!("{kind} id")
+                } else {
+                    "task id".to_string()
+                };
+                let expected =
+                    format!("No {kind} found for customer [{account}] with {clause} [{identifier}]");
                 assert_eq!(
                     actual, expected,
                     "case {case:?}: expected {expected:?}, got {actual:?}"
-                );
-                assert!(
-                    !actual.contains("with task id ["),
-                    "case {case:?}: the identifier clause must name the resource kind, \
-                     got {actual:?}"
                 );
             }
         }

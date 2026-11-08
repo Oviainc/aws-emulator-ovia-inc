@@ -230,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::pass_role_denial`, which every operation taking a pass-role
         // member reaches, and `crate::service::pass_role` takes it on requests the
         // boundary's constraint walk would otherwise refuse ahead of this handler.
-        if let Some(denial) = crate::state::pass_role_denial(ctx, &input.role_arn) {
+        if let Some(denial) = crate::state::pass_role_denial(&*self.engine, ctx, &input.role_arn) {
             return Err(
                 CreateGraphUsingImportTaskErrorModeled::AccessDeniedException(denial).into(),
             );
@@ -510,6 +510,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
 
     fn pass_role_denied(denial: AccessDeniedException) -> Self::Error {
         CreateGraphUsingImportTaskErrorModeled::AccessDeniedException(denial).into()
+    }
+
+    fn pass_role_denial(
+        &self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        role_arn: &str,
+    ) -> Option<AccessDeniedException> {
+        crate::state::pass_role_denial(&*self.engine, ctx, role_arn)
     }
 }
 

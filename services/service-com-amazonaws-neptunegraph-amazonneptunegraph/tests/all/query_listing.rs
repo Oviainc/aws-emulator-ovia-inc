@@ -31,10 +31,10 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_neptunegraph_amazonneptunegraph::state::QUERY_RUN_SPAN;
 
 use super::query_cancellation::{
-    admit_query, call, cancel_query, emulator, error_code, graph_in_service,
+    admit_query, admit_query_with_timeout, call, cancel_query, emulator, error_code,
+    graph_in_service,
 };
 
 /// Room for the emulator's own scheduling on top of a span the clock owes, so a wait for
@@ -386,8 +386,11 @@ async fn a_graph_whose_queries_are_over_lists_none_of_them() {
         "case a graph with no queries: expected an empty list, got {body}"
     );
 
+    // Each query is admitted under a timeout of its own, the way a request naming
+    // `queryTimeoutMilliseconds` admits one, so the listing can be watched past it.
+    let timeout = Duration::from_millis(250);
     for (query_id, query_string, running) in FLEET {
-        admit_query(&engine, &graph, query_id, query_string, *running);
+        admit_query_with_timeout(&engine, &graph, query_id, query_string, *running, timeout);
     }
     let (_, listed) = list_queries(&router, &graph, 100, None).await;
     assert_eq!(
@@ -396,17 +399,32 @@ async fn a_graph_whose_queries_are_over_lists_none_of_them() {
         "case queries in flight: every admitted query must be listed, got {listed}"
     );
 
-    // Nothing is cancelled here: the queries are over because their own run span is, and
+    // Nothing is cancelled here: the queries are over because their own timeout is, and
     // a listing never reports a query that has stopped.
-    tokio::time::sleep(QUERY_RUN_SPAN + SETTLE_MARGIN).await;
+    tokio::time::sleep(timeout + SETTLE_MARGIN).await;
     let (status, emptied) = list_queries(&router, &graph, 100, None).await;
     assert_eq!(
         status, 200,
-        "case the run span is out: expected 200, got {status}: {emptied}"
+        "case the timeout is out: expected 200, got {status}: {emptied}"
     );
     assert_eq!(
         reported_ids(&emptied),
         Vec::<String>::new(),
-        "case the run span is out: expected an empty list, got {emptied}"
+        "case the timeout is out: expected an empty list, got {emptied}"
+    );
+
+    // A query nobody cancelled and whose timeout has NOT run out stays listed, so the
+    // listing is what a caller manages in-flight work through.
+    admit_query(&engine, &graph, "q-still-running", "MATCH (n) RETURN n", true);
+    tokio::time::sleep(timeout + SETTLE_MARGIN).await;
+    let (status, still_listed) = list_queries(&router, &graph, 100, None).await;
+    assert_eq!(
+        status, 200,
+        "case a query under the default timeout: expected 200, got {status}: {still_listed}"
+    );
+    assert_eq!(
+        reported_ids(&still_listed),
+        vec!["q-still-running".to_string()],
+        "case a query under the default timeout: it must still be listed, got {still_listed}"
     );
 }

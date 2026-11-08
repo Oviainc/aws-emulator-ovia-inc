@@ -54,6 +54,19 @@ pub trait PassesRole: Operation {
     /// `denial` lifted into this operation's error channel, which is what fixes the
     /// wire code and the modelled 403 status the gate answers with.
     fn pass_role_denied(denial: AccessDeniedException) -> Self::Error;
+
+    /// This operation's own pass-role decision on `role_arn`, taken through
+    /// [`crate::state::pass_role_denial`].
+    ///
+    /// Reached through the OPERATION because the decision needs the engine the operation
+    /// was constructed from: a denial names the principal the request's credential speaks
+    /// for, which is resolved through the identity stores on that engine, and the gate
+    /// holds the operation rather than the engine.
+    fn pass_role_denial(
+        &self,
+        ctx: &OperationContext<'_>,
+        role_arn: &str,
+    ) -> Option<AccessDeniedException>;
 }
 
 /// One pass-role operation, served so the authorization decision on its role is
@@ -85,7 +98,7 @@ impl<Inner: PassesRole + ErasedOperation> ErasedOperation for PassRoleGate<Inner
             // The service definition is read, used and dropped inside this one
             // statement: `&dyn ErasedServiceDefinition` is not `Sync`, so holding it
             // across the await below would make this future non-`Send`.
-            if let Some(denied) = denial_response::<Inner>(svc, req, ctx) {
+            if let Some(denied) = denial_response(&self.operation, svc, req, ctx) {
                 return denied;
             }
             // The refusal `super::constraints::ConstraintGate` answers for every other
@@ -125,6 +138,7 @@ impl<Inner: PassesRole + ErasedOperation> ErasedOperation for PassRoleGate<Inner
 /// cannot be serialized renders through the service's own framework-error envelope
 /// rather than falling through to the walk whose 400 this exists to reclassify.
 fn denial_response<O: PassesRole>(
+    operation: &O,
     svc: &dyn Service,
     req: &RtRequest,
     ctx: &OperationContext<'_>,
@@ -134,7 +148,7 @@ fn denial_response<O: PassesRole>(
     let read = <O::Input as DeserializableStruct>::deserialize(&mut *deserializer);
     drop(deserializer);
     let input = read.ok()?;
-    let denial = crate::state::pass_role_denial(ctx, O::passed_role(&input))?;
+    let denial = operation.pass_role_denial(ctx, O::passed_role(&input))?;
     let error = O::pass_role_denied(denial);
     // The record the per-operation sequence would have made: the gate answers ahead of
     // `ErasedOperation::run`, which is where the framework classifies an operation's

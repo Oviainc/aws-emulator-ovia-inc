@@ -18,7 +18,8 @@
 //!   `smithy_query(query="shape",shape="AccessDeniedException")`), because the service
 //!   can establish no trust relationship with it;
 //! * a value that names no IAM role at all is refused with the same 403, naming the
-//!   principal that made the call rather than the shape the value broke;
+//!   principal that made the call rather than the shape the value broke — WHICH principal
+//!   that is is `tests/all/pass_role_denial_principal.rs`;
 //! * either refusal holds whatever ELSE the request breaks — a member outside its
 //!   modelled pattern does not turn the denial into a 400 — and leaves the store
 //!   untouched, so no task and no graph comes into existence.
@@ -42,8 +43,8 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region the test's SigV4 credential scope names.
 const REGION: &str = "us-east-1";
 
-/// The access key id most of these calls are signed with: it is what the denial of a
-/// value naming no role reports as the principal.
+/// The access key id most of these calls are signed with. No store of this emulator
+/// holds it, which is the position the long-term credential the emulator publishes is in.
 const ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
 
 /// The smallest `provisionedMemory` the model allows (`range 16..24576`), which is all
@@ -72,18 +73,21 @@ fn own_role_arn(path: &str) -> String {
     role_arn("aws", engine::emulator_account_id(), path)
 }
 
-/// The IAM principal a denial names for a call signed with `access_key_id`: this
-/// emulator sees an access key id and no role session, so the id is rendered as the IAM
-/// user that holds it, in the one account it serves.
-fn caller_principal(access_key_id: &str) -> String {
-    engine::emulator_arn("iam", "", &format!("user/{access_key_id}"))
+/// The IAM principal a denial names for every call this suite makes: the identity the
+/// credential resolves to, which for a key no store of this emulator holds is the account's
+/// own published principal — the one `sts:GetCallerIdentity` answers with. This test binary
+/// mounts this service alone, so every key it signs with is such a key, and the expectation
+/// does not vary with the key; `tests/all/pass_role_denial_principal.rs` drives the keys that
+/// resolve to a user or a session, against STS itself.
+fn expected_principal() -> String {
+    service_com_amazonaws_sts_awssecuritytokenservicev20110615::state::ambient_identity().arn
 }
 
 /// The sentence AWS refuses a value that names no role the caller may pass with.
-fn not_authorized_denial(access_key_id: &str) -> String {
+fn not_authorized_denial() -> String {
     format!(
         "User: {} is not authorized to perform: null",
-        caller_principal(access_key_id)
+        expected_principal()
     )
 }
 
@@ -481,16 +485,17 @@ async fn a_value_naming_no_iam_role_is_denied_and_names_the_caller() {
             );
             assert_eq!(
                 answered["message"],
-                json!(not_authorized_denial(ACCESS_KEY_ID)),
+                json!(not_authorized_denial()),
                 "case {case:?}: expected {:?}, got {}",
-                not_authorized_denial(ACCESS_KEY_ID),
+                not_authorized_denial(),
                 answered["message"]
             );
         }
     }
 
-    // The principal is the one that made THIS call, so a second caller is named as
-    // itself rather than as whoever called before it.
+    // Every caller of this suite signs with a key no store holds, so each is the
+    // account's own published principal; a key that resolves to a user or a session is
+    // driven by `tests/all/pass_role_denial_principal.rs`.
     for access_key_id in ["AKIDSECONDCALLER", "AKIDTHIRDCALLER"] {
         for operation in PassRoleOperation::ALL {
             let case = format!("{operation:?} signed by {access_key_id}");
@@ -503,9 +508,9 @@ async fn a_value_naming_no_iam_role_is_denied_and_names_the_caller() {
             );
             assert_eq!(
                 answered["message"],
-                json!(not_authorized_denial(access_key_id)),
+                json!(not_authorized_denial()),
                 "case {case:?}: expected {:?}, got {}",
-                not_authorized_denial(access_key_id),
+                not_authorized_denial(),
                 answered["message"]
             );
         }

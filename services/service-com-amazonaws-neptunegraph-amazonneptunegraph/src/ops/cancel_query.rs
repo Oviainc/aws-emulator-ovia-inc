@@ -212,12 +212,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Only a query still in flight on THAT graph can be cancelled: one that has
         // already terminated (including through an earlier cancel the clock has since
-        // made due) is gone, and the same id on another graph names nothing here.
+        // made due) is gone, and the same id on another graph names nothing here. Such
+        // an id names no query the service can resolve at all, which is an invalid
+        // ARGUMENT rather than a resource that is missing — the one refusal
+        // `crate::state::invalid_query_id` states for every operation addressed by
+        // `queryId`.
         let Some(query) = store.live_query_mut(&input.graph_identifier, &input.query_id, now) else {
-            return Err(CancelQueryErrorModeled::ResourceNotFoundException(
-                crate::state::query_not_found(&input.graph_identifier, &input.query_id),
-            )
-            .into());
+            return Err(
+                CancelQueryErrorModeled::ValidationException(crate::state::invalid_query_id(
+                    &input.query_id,
+                ))
+                .into(),
+            );
         };
 
         // The cancel is accepted, not finished: the query reports `CANCELLING` until

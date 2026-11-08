@@ -5,16 +5,19 @@
 //! the same router the emulator serves from.
 //!
 //! The rule every assertion here is about: a query is addressed as a query OF one
-//! graph, so both operations resolve `graphIdentifier` and then `queryId` within it and
-//! answer `ResourceNotFoundException` (404) when either names nothing in flight;
+//! graph, so both operations resolve `graphIdentifier` first — answering
+//! `ResourceNotFoundException` (404) when it names no graph — and then `queryId` within
+//! it, answering `ValidationException` (400) "Supplied queryId <id> is invalid" when that
+//! names nothing in flight: a query id is not a resource identifier a caller can hold on
+//! to, so once the query is over the id resolves to nothing at all.
 //! `GetQuery` reports the stored record (its id, its text, its state and the
 //! milliseconds it waited and has been running) and changes none of it, while
 //! `CancelQuery` accepts the cancel with an empty 200, after which the query reports
 //! `CANCELLING` until the clock makes its termination due and is then no longer a query
-//! either operation can name (which an in-flight query nobody cancels reaches on its own
-//! once its run span is out) — and, the operation being `@idempotent`, a repeated cancel
+//! either operation can name — and, the operation being `@idempotent`, a repeated cancel
 //! of a query already stopping is the same empty 200 and does not postpone that
-//! termination.
+//! termination. A query NOBODY cancels is reported for as long as it may run: only its
+//! own timeout ends it.
 //!
 //! So the tables below span what that rule generalises over: the forms a `queryId` takes
 //! (the model puts no pattern on it), both states a query can be cancelled from
@@ -34,7 +37,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::state::{
     ComAmazonawsNeptunegraphAmazonneptunegraphState as Store, Query, CANCELLATION_SPAN,
-    DELETION_SPAN, PROVISIONING_SPAN, QUERY_RUN_SPAN,
+    DEFAULT_QUERY_TIMEOUT, DELETION_SPAN, PROVISIONING_SPAN,
 };
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -173,13 +176,34 @@ pub(crate) async fn graph_in_service(router: &MultiServiceRouter, name: &str) ->
 }
 
 /// Admit a query on `graph_id` the way `ExecuteQuery` will, in the state the case asks
-/// for.
+/// for — under the timeout a request that names none runs under.
 pub(crate) fn admit_query(
     engine: &Arc<engine::InMemoryEngine>,
     graph_id: &str,
     query_id: &str,
     query_string: &str,
     running: bool,
+) {
+    admit_query_with_timeout(
+        engine,
+        graph_id,
+        query_id,
+        query_string,
+        running,
+        DEFAULT_QUERY_TIMEOUT,
+    );
+}
+
+/// [`admit_query`] under the timeout `timeout`: what a request naming its own
+/// `queryTimeoutMilliseconds` admits, and what lets a test watch a query time out without
+/// waiting out the default.
+pub(crate) fn admit_query_with_timeout(
+    engine: &Arc<engine::InMemoryEngine>,
+    graph_id: &str,
+    query_id: &str,
+    query_string: &str,
+    running: bool,
+    timeout: Duration,
 ) {
     let now = Instant::now();
     let query = if running {
@@ -190,8 +214,34 @@ pub(crate) fn admit_query(
     engine
         .state::<Store>()
         .lock()
-        .insert_query(query)
+        .insert_query(query.with_timeout(timeout))
         .expect("the store admits the query under test");
+}
+
+/// The sentence either query operation refuses an id that names no query in flight with.
+pub(crate) fn invalid_query_id_message(query_id: &str) -> String {
+    format!("Supplied queryId {query_id} is invalid")
+}
+
+/// Assert that `answer` is the refusal of a `queryId` that names no query in flight.
+pub(crate) fn assert_invalid_query_id(case: &str, query_id: &str, status: u16, answer: &Value) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected 400 for a queryId naming nothing in flight, \
+         got {status}: {answer}"
+    );
+    assert_eq!(
+        error_code(answer),
+        "ValidationException",
+        "case {case:?}: unexpected error code in {answer}"
+    );
+    assert_eq!(
+        answer["message"],
+        json!(invalid_query_id_message(query_id)),
+        "case {case:?}: expected {:?}, got {}",
+        invalid_query_id_message(query_id),
+        answer["message"]
+    );
 }
 
 /// The instant the stored query's termination is due, as the store holds it.
@@ -352,22 +402,15 @@ async fn get_reports_an_admitted_query_and_a_cancel_stops_it_once_the_clock_says
             "case {case:?}: a cancel must not rewrite the record, got {stopping}"
         );
 
-        // Only the clock finishes it, after which the query is gone for both operations.
+        // Only the clock finishes it, after which the query is gone for both operations
+        // — and an id that names nothing in flight is an invalid argument, not a missing
+        // resource.
         tokio::time::sleep(CANCELLATION_SPAN + SETTLE_MARGIN).await;
         for (operation, (status, body)) in [
             ("GetQuery", get_query(&router, &graph, query_id).await),
             ("CancelQuery", cancel_query(&router, &graph, query_id).await),
         ] {
-            assert_eq!(
-                status, 404,
-                "case {case:?}: expected 404 from {operation} on a terminated query, \
-                 got {status}: {body}"
-            );
-            assert_eq!(
-                error_code(&body),
-                "ResourceNotFoundException",
-                "case {case:?}: unexpected error code from {operation} in {body}"
-            );
+            assert_invalid_query_id(&format!("{case} / {operation}"), query_id, status, &body);
         }
     }
 }
@@ -432,20 +475,11 @@ async fn both_operations_refuse_a_graph_or_a_query_the_store_does_not_hold() {
     );
 
     // (case, graphIdentifier, queryId): every way a request can name a query that is
-    // not in flight on the graph it named. Well-formed graph ids no graph holds, ids no
-    // query holds on a graph that exists, and the known query addressed on the OTHER
-    // graph — a query belongs to one graph.
-    let cases: Vec<(String, String, String)> = vec![
-        (
-            "graph id no graph holds".to_string(),
-            "g-0000000000".to_string(),
-            "6f3a1b2c-4d5e-4f60-8a91-b2c3d4e5f607".to_string(),
-        ),
-        (
-            "another graph id no graph holds".to_string(),
-            "g-zzzzzzzzzz".to_string(),
-            "1234567890".to_string(),
-        ),
+    // not in flight on the graph it named, with the graph the request named HELD by the
+    // store — so what is refused is the query id, as the invalid-argument the value is.
+    // Ids no query holds on a graph that exists, and the known query addressed on the
+    // OTHER graph — a query belongs to one graph.
+    let unknown_queries: Vec<(String, String, String)> = vec![
         (
             "known graph, unknown query id".to_string(),
             graph.clone(),
@@ -457,13 +491,40 @@ async fn both_operations_refuse_a_graph_or_a_query_the_store_does_not_hold() {
             "unknown".to_string(),
         ),
         (
+            "known graph, punctuated query id".to_string(),
+            graph.clone(),
+            "aq_2026.10-24~01".to_string(),
+        ),
+        (
             "known query addressed on another graph".to_string(),
             other.clone(),
             "6f3a1b2c-4d5e-4f60-8a91-b2c3d4e5f607".to_string(),
         ),
     ];
 
-    for (case, graph_identifier, query_id) in &cases {
+    for (case, graph_identifier, query_id) in &unknown_queries {
+        for (operation, (status, body)) in [
+            ("GetQuery", get_query(&router, graph_identifier, query_id).await),
+            (
+                "CancelQuery",
+                cancel_query(&router, graph_identifier, query_id).await,
+            ),
+        ] {
+            assert_invalid_query_id(&format!("{case} / {operation}"), query_id, status, &body);
+        }
+    }
+
+    // The GRAPH is resolved first and is a resource: a well-formed graph id the store
+    // does not hold is the 404 that names it, whatever query id the request carried.
+    let absent_graphs: Vec<(&str, &str, &str)> = vec![
+        (
+            "graph id no graph holds",
+            "g-0000000000",
+            "6f3a1b2c-4d5e-4f60-8a91-b2c3d4e5f607",
+        ),
+        ("another graph id no graph holds", "g-zzzzzzzzzz", "1234567890"),
+    ];
+    for (case, graph_identifier, query_id) in &absent_graphs {
         for (operation, (status, body)) in [
             ("GetQuery", get_query(&router, graph_identifier, query_id).await),
             (
@@ -576,40 +637,58 @@ async fn a_cancel_touches_only_the_query_it_names() {
     );
 }
 
+/// A query nobody cancels is reported for as long as it may RUN: only its own timeout
+/// ends it, so nothing takes a query out of the store while a caller is still listing it,
+/// cancelling it and polling the id.
 #[tokio::test]
-async fn a_query_nobody_cancels_is_over_once_its_own_run_span_is_out() {
+async fn only_its_own_timeout_ends_a_query_nobody_cancels() {
     let (router, engine) = emulator();
     let graph = graph_in_service(&router, "self-terminating-query-graph").await;
 
+    // The timeout is the request's own when it names one
+    // (`queryTimeoutMilliseconds`), so the rows differ in the timeout the admitting
+    // request asked for: short enough to watch run out, and the default a request that
+    // names none runs under.
+    let short = Duration::from_millis(250);
     for (case, query_id, query_string, running) in CASES {
-        admit_query(&engine, &graph, query_id, query_string, *running);
+        admit_query_with_timeout(&engine, &graph, query_id, query_string, *running, short);
         let (status, body) = get_query(&router, &graph, query_id).await;
         assert_eq!(
             status, 200,
             "case {case:?}: the query under test must be readable, got {status}: {body}"
         );
     }
+    // A query admitted under the default timeout, which is the one under test below.
+    admit_query(&engine, &graph, "q-default-timeout", "MATCH (n) RETURN n", true);
 
-    // Nothing is cancelled here: the queries are over because their own run span is,
-    // which is also what keeps the store from holding a record per request forever.
-    tokio::time::sleep(QUERY_RUN_SPAN + SETTLE_MARGIN).await;
+    // Nothing is cancelled here: the queries with the short timeout are over because
+    // that timeout is, which is also what keeps the store from holding a record per
+    // request forever.
+    tokio::time::sleep(short + SETTLE_MARGIN).await;
     for (case, query_id, _, _) in CASES {
         let (status, body) = get_query(&router, &graph, query_id).await;
-        assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404 from GetQuery once the run span is out, \
-             got {status}: {body}"
-        );
-        assert_eq!(
-            error_code(&body),
-            "ResourceNotFoundException",
-            "case {case:?}: unexpected error code in {body}"
-        );
+        assert_invalid_query_id(case, query_id, status, &body);
     }
+
+    // The query whose timeout has NOT run out is still in flight: a caller that submitted
+    // it and never cancelled it can still find, read and cancel it.
+    let (status, still_running) = get_query(&router, &graph, "q-default-timeout").await;
+    assert_eq!(
+        status, 200,
+        "case the default timeout: a query nobody cancelled must still be reported, \
+         got {status}: {still_running}"
+    );
+    assert_eq!(
+        still_running["state"],
+        json!("RUNNING"),
+        "case the default timeout: expected RUNNING, got {}",
+        still_running["state"]
+    );
     assert_eq!(
         engine.state::<Store>().lock().query_count(),
-        0,
-        "case run span out: every record must be reclaimed, not orphaned"
+        1,
+        "case the short timeouts are out: every timed-out record must be reclaimed, \
+         and only those"
     );
 }
 

@@ -8,6 +8,28 @@ Issue-Key: neptune-graph.import-task-invalid-role-arn-rejected|run#7|AssertionEr
 Issue-Key: neptune-graph.neptune-graph-query-cancel-transitions-state|_poll_until#7|AssertionError|raise AssertionError(f"condition not met within {timeout_s}s; last={last!r}")
 Issue-Commit: 92c3b140342b1bc1fab2a232b8cee3f25ea78ff5
 
+## Resolution note
+
+Causes 1 and 2 are fixed, and cause 3 is fixed in the two divergences that live in
+`crate::state`: a query record's life is now its own timeout (the request's
+`queryTimeoutMilliseconds`, else the service default) rather than a 750ms span the emulator
+chose, and `GetQuery`/`CancelQuery` refuse a `queryId` that names no query in flight with
+the modelled `ValidationException` (400) `Supplied queryId <id> is invalid`.
+
+Cause 3's remaining divergence — nothing ADMITS a query record, so
+`ListQueries(state='RUNNING')` reports none — is NOT fixed: admitting a `RUNNING` record
+means reporting a status for work an engine has to run, and this emulator has no openCypher
+engine, so it waits on the `ExecuteQuery` data plane. That is the open issue
+`issues/things-that-do-not-work/20261023T175427Z-neptune-graph-executequery-stub.md`, and
+the replay key
+`neptune-graph.neptune-graph-query-cancel-transitions-state|_poll_until#7` still fails
+through it. `ExecuteQuery` keeps its 501 and its `SCAFFOLDED, NOT IMPLEMENTED` census line.
+
+The key `neptune-graph.import-task-invalid-role-arn-rejected|run#7` is fixed; that check now
+fails on a LATER assertion (`run#13`, which expects `ValidationException` where this service
+answers `ResourceNotFoundException` for a graph the store does not hold) — a different cause
+of `StartImportTask`, for its own issue.
+
 # neptune-graph: 3 net-new fidelity causes — Cancel{Import,Export}Task not-found message over-spells the identifier clause, StartImportTask's AccessDenied names the access key id instead of the caller principal, and no query is ever in flight for ListQueries/CancelQuery/GetQuery
 
 > _Note: this issue was identified against the code base at commit `92c3b140342b1bc1fab2a232b8cee3f25ea78ff5`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._

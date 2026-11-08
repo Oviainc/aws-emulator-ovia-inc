@@ -184,8 +184,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // than on the status it was accepted with.
         let Some(task) = store.settled_export_task_mut(&input.task_identifier, &region, now)
         else {
+            // The CANCEL operations word the identifier clause of this refusal as the
+            // bare `task id`, where the READ operations spell the task's own kind in
+            // front of it: one builder per operation in `crate::state`, so neither can
+            // inherit the other's wording.
             return Err(CancelExportTaskErrorModeled::ResourceNotFoundException(
-                crate::state::export_task_not_found(&input.task_identifier),
+                crate::state::export_task_not_found_on_cancel(&input.task_identifier),
             )
             .into());
         };
